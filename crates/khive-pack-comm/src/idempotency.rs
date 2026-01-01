@@ -48,6 +48,7 @@ impl MessageIdentity {
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
         holder: Uuid,
+        attachments: &[khive_storage::NewAttachment],
     ) -> Result<Note, RuntimeError> {
         let store = runtime.notes(token)?;
         let first = store
@@ -118,6 +119,25 @@ impl MessageIdentity {
             });
         if !valid {
             return Err(self.conflict(holder));
+        }
+        for note in [outbound, inbound] {
+            let rows = crate::file_attachments::rows(runtime, note.id).await?;
+            if rows.unreadable_count > 0
+                || rows.unreadable_reason.is_some()
+                || rows.attachments.len() != attachments.len()
+                || !rows
+                    .attachments
+                    .iter()
+                    .zip(attachments)
+                    .all(|(row, expected)| {
+                        row.role == expected.role
+                            && row.content_ref == expected.content_ref
+                            && row.size_bytes == expected.size_bytes
+                            && row.media_type == expected.media_type
+                    })
+            {
+                return Err(self.conflict(holder));
+            }
         }
         Ok(outbound.clone())
     }

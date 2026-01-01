@@ -67,7 +67,7 @@ pub(crate) fn blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, R
     })
 }
 
-fn blob_hydrator(runtime: &KhiveRuntime) -> Result<Arc<BlobHydrator>, RuntimeError> {
+pub(crate) fn blob_hydrator(runtime: &KhiveRuntime) -> Result<Arc<BlobHydrator>, RuntimeError> {
     runtime.blob_hydrator().ok_or_else(|| {
         RuntimeError::Unconfigured(
             "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or \
@@ -169,7 +169,10 @@ struct UploadParams {
     upload_id: String,
 }
 
-fn parse_params<T: DeserializeOwned>(params: Value, verb: &str) -> Result<T, RuntimeError> {
+pub(crate) fn parse_params<T: DeserializeOwned>(
+    params: Value,
+    verb: &str,
+) -> Result<T, RuntimeError> {
     if !params.is_object() {
         return Err(RuntimeError::InvalidInput(format!(
             "{verb} arguments must be a JSON object"
@@ -179,7 +182,7 @@ fn parse_params<T: DeserializeOwned>(params: Value, verb: &str) -> Result<T, Run
         .map_err(|error| RuntimeError::InvalidInput(format!("invalid {verb} arguments: {error}")))
 }
 
-fn parse_content_ref(raw: &str, verb: &str) -> Result<ContentRef, RuntimeError> {
+pub(crate) fn parse_content_ref(raw: &str, verb: &str) -> Result<ContentRef, RuntimeError> {
     ContentRef::from_hex(raw)
         .map_err(|e| RuntimeError::InvalidInput(format!("{verb}: invalid content_ref: {e}")))
 }

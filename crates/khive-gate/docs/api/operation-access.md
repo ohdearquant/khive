@@ -32,6 +32,7 @@ Its bounded scope and internal-only visibility do not make that deletion a read.
 Revision `domain-effects-v8` classifies `session.stats` as `Read` because it
 calculates aggregate store statistics without a domain write, and
 `session.vacuum` as `Write` because it explicitly compacts the store.
+Revision `domain-effects-v9` classifies `blob.import` and `blob.export` as `Write`: importing publishes an object and exporting writes a server file.
 
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
@@ -43,7 +44,9 @@ calculates aggregate store statistics without a domain write, and
 | `blob.abort`                 | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L133)              |
 | `blob.begin`                 | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L67)               |
 | `blob.commit`                | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L118)              |
+| `blob.export` | Write | Verb | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs) |
 | `blob.get`                   | Read   | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L28)               |
+| `blob.import` | Write | Verb | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs) |
 | `blob.put`                   | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L13)               |
 | `blob.put_part`              | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L89)               |
 | `blob.stat`                  | Read   | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L52)               |

@@ -43,6 +43,7 @@ fn build_runtime() -> KhiveRuntime {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime")
 }

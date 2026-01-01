@@ -206,6 +206,7 @@ fn rt_with_fake_embedder() -> KhiveRuntime {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("in-memory runtime");
     rt.register_embedder(FakeDimProvider);
@@ -238,6 +239,7 @@ fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("in-memory runtime");
     rt.register_embedder(ControlledRankingProvider { fail_fresh_rerank });
@@ -274,6 +276,7 @@ pub(super) fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRu
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("file-backed runtime");
     rt.register_embedder(FakeDimProvider);

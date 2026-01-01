@@ -3217,6 +3217,7 @@ mod cursor_retry_tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("file-backed runtime");
         (rt, dir)

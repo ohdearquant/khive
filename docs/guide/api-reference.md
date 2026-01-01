@@ -30,7 +30,7 @@ An always-machine-readable copy of this page is at
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
-| `blob`      | 7     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
+| `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 | `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
 | `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
@@ -69,15 +69,17 @@ or annotation-edge ID is skipped even when its row is soft-deleted, so neither
 real re-ingest nor `--dry-run` treats a tombstone as a new record or resurrects
 it.
 
-`blob` registers no note or entity kinds; its seven verbs (`blob.put` / `blob.get` /
-`blob.stat` / `blob.begin` / `blob.put_part` / `blob.commit` / `blob.abort`) expose
-content-addressed storage and sequential uploads (ADR-111, ADR-173). A
-normal file-backed boot installs a default `FsBlobStore` rooted beside the database file
-even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs only stay
+`blob` registers no note or entity kinds; its nine verbs (`blob.put` / `blob.get` /
+`blob.stat` / `blob.begin` / `blob.put_part` / `blob.commit` / `blob.abort` /
+`blob.import` / `blob.export`) expose content-addressed storage, sequential uploads
+and server file transfers (ADR-111, ADR-173). A normal file-backed boot installs a
+default `FsBlobStore` rooted beside the database file even with no `[storage.blob]`
+section and no `KHIVE_BLOB_ROOT` set; the storage and upload verbs only stay
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside. Staged uploads currently
 use the filesystem backend; the S3 backend retains `blob.put` / `blob.get` / `blob.stat`
-and refuses creation of new staging with `Unsupported`.
+and refuses creation of new staging with `Unsupported`. Server file transfers
+require a separate opt-in.
 
 `tool` (`tool.register`, `tool.ingest`, `tool.suggest`, `tool.describe`, `tool.list`, `tool.check`,
 `tool.request`, `tool.grant`, `tool.deny`, `tool.revoke`, `tool.requests`, `tool.policy`, `tool.policies`)
@@ -2992,12 +2994,13 @@ reporting surface over a code-map database.
 
 ---
 
-## `blob` pack — 7 verbs
+## `blob` pack — 9 verbs
 
-Content-addressed binary object storage and sequential uploads (ADR-111, ADR-173). Optional; load with
-`KHIVE_PACKS=kg,blob`. Registers no note or entity kinds. A normal file-backed boot
-installs a default `FsBlobStore` rooted beside the database file even with no
-`[storage.blob]` section in `khive.toml` and no `KHIVE_BLOB_ROOT` set; the verbs stay
+Content-addressed binary object storage, sequential uploads and server file transfers
+(ADR-111, ADR-173). Optional; load with `KHIVE_PACKS=kg,blob`. Registers no note or
+entity kinds. A normal file-backed boot installs a default `FsBlobStore` rooted
+beside the database file even with no `[storage.blob]` section in `khive.toml` and
+no `KHIVE_BLOB_ROOT` set; the storage and upload verbs stay
 unconfigured (erroring until a backend is installed) only when the server boots against
 an in-memory backend, which has no directory to default a root beside.
 
@@ -3005,6 +3008,15 @@ Staged uploads currently use `FsBlobStore`; S3 supports the existing whole-objec
 operations but returns `Unsupported` when new staging is required. The known-reference
 shortcut in `blob.begin` can return an existing object without staging. `blob.put` and
 all four upload verbs refuse on a read-only runtime.
+
+`blob.import` and `blob.export` are disabled by default. Before starting the
+server, enable them by setting `file_transfers = true` in the `[blob]` section of
+`khive.toml`, or set `KHIVE_FILE_TRANSFERS=1` (exactly `1`). When disabled, both
+refuse with `InvalidInput` and instructions to enable server file transfers.
+Both also refuse on a read-only runtime and require disjoint canonical import
+and export roots. Paths refer to the server's filesystem. See
+[Server file transfers](../../crates/khive-pack-blob/docs/api/file-transfers.md)
+for confinement, upload cleanup and filesystem limits.
 
 ### `blob.put` — Commissive
 
@@ -3038,6 +3050,30 @@ no bytes hydrated.
 | Param         | Type   | Required | Notes                                                                                   |
 | ------------- | ------ | -------- | --------------------------------------------------------------------------------------- |
 | `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put` or `blob.commit`. |
+
+### `blob.import` — Commissive
+
+Stream a regular file beneath the server import root into the blob store, at
+most 64 MiB. Returns `{content_ref, size}` and, when supplied, `media_type`, never
+file bytes. Import uses the staged-upload manager and requires a backend that
+supports staging.
+
+| Param        | Type   | Required | Notes                                                                                                                           |
+| ------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `path`       | string | yes      | Server file relative to `~/.khive/imports` or absolute beneath its canonical root. `KHIVE_IMPORT_FROM_ROOT` overrides the root. |
+| `media_type` | string | no       | Optional media type echoed in the receipt; it is not persisted for the object.                                                  |
+
+### `blob.export` — Commissive
+
+Verify an existing object, at most 64 MiB, and atomically write it beneath the
+server export root using the `save_to` path policy. Returns `{path, size}`, with
+the resolved destination path and verified byte length, never file bytes. An
+existing regular destination is replaced only by the complete file.
+
+| Param         | Type   | Required | Notes                                                                                                                              |
+| ------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `content_ref` | string | yes      | 64-character lowercase-hex BLAKE3 reference to an existing object.                                                                 |
+| `path`        | string | yes      | Server destination relative to `~/.khive/exports` or absolute beneath its canonical root. `KHIVE_SAVE_TO_ROOT` overrides the root. |
 
 ### `blob.begin` — Declaration
 

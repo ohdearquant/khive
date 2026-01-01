@@ -425,6 +425,9 @@ pub struct RuntimeConfig {
     /// instead of re-running config discovery (which would ignore an
     /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
     pub git_write: crate::engine_config::GitWriteSectionConfig,
+    /// Effective `[blob]` file-transfer opt-in, resolved with the exact environment
+    /// opt-in during construction and retained by the blob pack.
+    pub blob: crate::engine_config::BlobSectionConfig,
     /// Resolved `[exec]` sandbox section (ADR-181), threaded through like
     /// `git_write` so the exec pack reads an already-resolved config.
     pub exec: crate::engine_config::ExecSectionConfig,
@@ -555,6 +558,11 @@ impl Default for RuntimeConfig {
             actor_id,
             brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
+            blob: crate::engine_config::BlobSectionConfig {
+                file_transfers: std::env::var("KHIVE_FILE_TRANSFERS")
+                    .map(|value| value == "1")
+                    .unwrap_or(false),
+            },
             exec: crate::engine_config::ExecSectionConfig::default(),
             telemetry: crate::telemetry_config::TelemetryConfig::default(),
             mounts: Vec::new(),
@@ -972,6 +980,9 @@ pub fn runtime_config_from_khive_config(
 
     let brain = khive_cfg.brain.clone();
     let git_write = khive_cfg.git_write.clone();
+    let blob = crate::engine_config::BlobSectionConfig {
+        file_transfers: khive_cfg.blob.file_transfers || base.blob.file_transfers,
+    };
     let exec = khive_cfg.exec.clone();
     let telemetry = khive_cfg.telemetry.clone();
     let web = khive_cfg.web.clone();
@@ -1001,6 +1012,7 @@ pub fn runtime_config_from_khive_config(
             gate,
             brain,
             git_write,
+            blob,
             exec,
             telemetry,
             mounts,
@@ -1044,6 +1056,7 @@ pub fn runtime_config_from_khive_config(
         gate,
         brain,
         git_write,
+        blob,
         exec,
         telemetry,
         mounts,

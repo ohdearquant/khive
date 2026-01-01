@@ -3047,6 +3047,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let rt = KhiveRuntime::new_for_test(config).expect("file runtime");
         let data_dir = rt
@@ -3093,6 +3094,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let rt = KhiveRuntime::new_for_test(config).expect("file runtime");
 
@@ -3157,6 +3159,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert!(rt.backend_data_dir().is_none());
@@ -3209,6 +3212,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let rt = KhiveRuntime::new_for_test(config).expect("file runtime should create");
         assert!(path.exists());
@@ -3247,6 +3251,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         {
             let writable =
@@ -3317,6 +3322,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         KhiveRuntime::new_for_test(config.clone()).expect("create migrated database");
         #[cfg(unix)]
@@ -3473,6 +3479,7 @@ mod tests {
             actor_id: None,
             events_split: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         KhiveRuntime::new_for_test(config.clone()).expect("create migrated database");
         #[cfg(unix)]
@@ -3720,6 +3727,7 @@ mod tests {
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
                 exec: Default::default(),
+                ..crate::RuntimeConfig::no_embeddings()
             };
 
             let tilde_cfg = make_config(tilde_anchor.clone());
@@ -3778,6 +3786,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let rt = KhiveRuntime::from_backend(backend, config);
         assert_eq!(rt.backend_id().as_str(), "lore");
@@ -4071,6 +4080,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let cfg = khive_cfg_with_actor("lambda:khive");
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -4108,6 +4118,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let cfg = KhiveConfig {
             engines: vec![],
@@ -4153,6 +4164,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let cfg = KhiveConfig::default(); // no actor.id
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -4190,6 +4202,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let cfg = KhiveConfig {
             engines: vec![crate::engine_config::EngineConfig {
@@ -4245,6 +4258,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let cfg = KhiveConfig {
             display: crate::engine_config::DisplaySectionConfig {
@@ -4287,6 +4301,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
         let cfg = KhiveConfig::default(); // no [display] section
         let result = runtime_config_from_khive_config(&cfg, base);
@@ -4443,6 +4458,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            ..crate::RuntimeConfig::no_embeddings()
         }
     }
 
@@ -4532,6 +4548,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..crate::RuntimeConfig::no_embeddings()
         };
 
         let rt_main = KhiveRuntime::from_backend(main_arc.clone(), main_config);
@@ -4681,6 +4698,7 @@ mod tests {
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
                 exec: Default::default(),
+                ..crate::RuntimeConfig::no_embeddings()
             },
         );
         // from_backend with backend_id="lore" and no core_backend: core() returns

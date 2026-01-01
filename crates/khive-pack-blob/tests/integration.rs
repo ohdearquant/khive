@@ -101,10 +101,14 @@ impl BlobStore for BoundedOnlyBlobStore {
 }
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime, tempfile::TempDir) {
+    build_registry_with_runtime(KhiveRuntime::memory().expect("in-memory runtime"))
+}
+
+fn build_registry_with_runtime(
+    runtime: KhiveRuntime,
+) -> (VerbRegistry, KhiveRuntime, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = FsBlobStore::new(dir.path().to_path_buf(), 0).expect("fs blob store");
-
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     runtime
         .install_blob_store(std::sync::Arc::new(store))
         .expect("install blob store");
@@ -726,7 +730,16 @@ fn blob_files(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>
 #[tokio::test]
 async fn every_blob_verb_rejects_unknown_arguments_before_side_effects() {
     use serde_json::json;
-    let (registry, _runtime, dir) = build_registry();
+    let file_policy: khive_runtime::KhiveConfig =
+        serde_json::from_value(json!({"blob": {"file_transfers": true}})).unwrap();
+    let mut base = khive_runtime::RuntimeConfig::no_embeddings();
+    base.db_path = None;
+    base.packs = vec!["kg".to_owned()];
+    base.brain_profile = None;
+    base.actor_id = None;
+    let config = khive_runtime::runtime::runtime_config_from_khive_config(&file_policy, base);
+    let runtime = KhiveRuntime::new(config).expect("in-memory runtime with file transfers");
+    let (registry, _runtime, dir) = build_registry_with_runtime(runtime);
     let existing = registry
         .dispatch("blob.put", json!({"bytes": BASE64.encode(b"existing")}))
         .await
@@ -737,7 +750,22 @@ async fn every_blob_verb_rejects_unknown_arguments_before_side_effects() {
         .unwrap();
     let id = upload["upload_id"].as_str().unwrap();
     let reference = existing["content_ref"].as_str().unwrap();
+    let import_path = dir.path().join("refused-import.bin");
+    let export_path = dir.path().join("refused-export.bin");
+    std::fs::write(&import_path, b"refused file import").unwrap();
+    assert!(std::fs::metadata(&import_path).unwrap().is_file());
+    assert!(!export_path.exists());
+    // File cases validate argument shape before confinement; transfer success
+    // is covered by the file-transfer round trip with isolated roots.
     let cases = [
+        (
+            "blob.import",
+            json!({"path": import_path, "media_type": null}),
+        ),
+        (
+            "blob.export",
+            json!({"content_ref": reference, "path": export_path}),
+        ),
         (
             "blob.put",
             json!({"bytes": BASE64.encode(b"refused object")}),
@@ -762,6 +790,8 @@ async fn every_blob_verb_rejects_unknown_arguments_before_side_effects() {
         "every registered verb needs a valid fixture"
     );
     for (verb, params) in [
+        ("blob.import", json!([import_path, null])),
+        ("blob.export", json!([reference, export_path])),
         ("blob.put", json!([BASE64.encode(b"refused object")])),
         ("blob.get", json!([reference, null])),
         ("blob.stat", json!([reference])),

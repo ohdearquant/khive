@@ -554,6 +554,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("file-backed runtime");
 
@@ -672,6 +673,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("file-backed runtime");
         (rt, dir)
