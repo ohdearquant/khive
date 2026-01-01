@@ -498,22 +498,6 @@ fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
     })
 }
 
-/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
-/// character itself (`\`) so a caller-supplied name is matched literally
-/// under `LIKE ... ESCAPE '\'` rather than as a pattern (#818: an
-/// entity named e.g. `a_b` must not also match `aXb`, and a name containing
-/// `%` must not silently widen into a broad substring scan).
-fn escape_like(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 fn build_entity_where(
     namespace: &str,
     filter: &EntityFilter,
@@ -628,7 +612,10 @@ fn build_entity_where(
     }
 
     if let Some(ref prefix) = filter.name_prefix {
-        params.push(Box::new(format!("{}%", escape_like(prefix))));
+        params.push(Box::new(format!(
+            "{}%",
+            khive_types::escape_like_literal(prefix)
+        )));
         conditions.push(format!("name LIKE ?{} ESCAPE '\\'", params.len()));
     }
 

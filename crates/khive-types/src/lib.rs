@@ -31,6 +31,7 @@ pub mod note;
 pub mod operation;
 pub mod pack;
 pub mod refusal;
+pub mod sql_like;
 pub mod substrate;
 pub mod timestamp;
 pub mod vector;
@@ -73,6 +74,7 @@ pub use pack::{
     RESERVED_ENVELOPE_ARGS,
 };
 pub use refusal::RefusalReason;
+pub use sql_like::escape_like_literal;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;
