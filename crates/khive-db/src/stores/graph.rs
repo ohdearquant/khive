@@ -1941,11 +1941,7 @@ fn canonical_edge_endpoints(
     source_id: Uuid,
     target_id: Uuid,
 ) -> (Uuid, Uuid) {
-    if relation.is_symmetric() && target_id < source_id {
-        (target_id, source_id)
-    } else {
-        (source_id, target_id)
-    }
+    relation.canonical_endpoints(source_id, target_id)
 }
 
 /// Standalone existence probe for both endpoints of a would-be edge (#769),
