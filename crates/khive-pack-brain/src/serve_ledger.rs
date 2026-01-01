@@ -18,7 +18,7 @@ pub use khive_brain_core::compute_query_class;
 use khive_brain_core::ServeAttribution;
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::Internal(format!("serve ledger {context}: {e}"))
+    RuntimeError::internal_with_context(format!("serve ledger {context}"), e)
 }
 
 /// One row of `brain_serve_ledger` (ADR-081 §4 normative schema).
@@ -765,5 +765,15 @@ mod tests {
             .expect("record_task must not panic")
             .expect("record_serve must succeed once unblocked");
         assert!(inserted, "record_serve must report a fresh row insert");
+    }
+
+    #[test]
+    fn serve_ledger_sql_err_message_is_prefixed_context_and_error() {
+        match sql_err("insert", "boom") {
+            RuntimeError::Internal(message) => {
+                assert_eq!(message, "serve ledger insert: boom");
+            }
+            other => panic!("expected RuntimeError::Internal, got {other:?}"),
+        }
     }
 }

@@ -955,6 +955,14 @@ impl RuntimeError {
         }
     }
 
+    /// An [`Internal`](Self::Internal) error whose message is `context: source`.
+    ///
+    /// Storage and SQL failures that have no typed variant of their own use
+    /// this shape, so the rendered text is defined here once.
+    pub fn internal_with_context(context: impl fmt::Display, source: impl fmt::Display) -> Self {
+        Self::Internal(format!("{context}: {source}"))
+    }
+
     /// Classify a failed inbound channel write without inspecting rendered
     /// error text.
     ///
