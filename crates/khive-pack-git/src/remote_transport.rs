@@ -173,10 +173,6 @@ async fn bare(program: &Path) -> Result<tempfile::TempDir, RemoteError> {
     Ok(dir)
 }
 
-fn valid_oid(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 impl GhTransport {
     pub fn new(program: PathBuf) -> Self {
         Self { program }
@@ -288,7 +284,10 @@ impl RemoteTransport for GhTransport {
             .next()
             .and_then(|row| row.split_once('\t'))
             .ok_or(RemoteError::InvalidResponse)?;
-        if actual_ref != reference || !valid_oid(sha) || rows.next().is_some() {
+        if actual_ref != reference
+            || !crate::object_id::is_40_hex(sha.as_bytes())
+            || rows.next().is_some()
+        {
             return Err(RemoteError::InvalidResponse);
         }
         Ok(Some(sha.to_ascii_lowercase()))
