@@ -15125,3 +15125,7 @@ mod issue_2537_tests {
 #[cfg(test)]
 #[path = "server_operation_attribution_tests.rs"]
 mod operation_attribution_tests;
+
+#[cfg(test)]
+#[path = "event_row_usage_tests.rs"]
+mod event_row_usage_tests;

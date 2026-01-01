@@ -123,7 +123,6 @@ impl BrainPack {
         .ok_or_else(|| {
             RuntimeError::InvalidInput("direct section feedback unexpectedly deduplicated".into())
         })?;
-        khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
         Ok(json!({
             "emitted": true,
             "event_id": event.id,

@@ -304,15 +304,16 @@ impl ProposalsProjectionWorker {
         let event_stmt = build_conditional_event_insert(&event);
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let total_rows = writer
+        let result = writer
             .execute_batch(vec![projection_stmt, event_stmt])
-            .await
-            .map_err(RuntimeError::Storage)?;
+            .await;
+        khive_storage::usage::account_event_write(
+            result
+                .as_ref()
+                .map(|total_rows| u64::from(*total_rows == 2)),
+        );
+        let total_rows = result.map_err(RuntimeError::Storage)?;
         let event_inserted = total_rows == 2;
-        if event_inserted {
-            // The guarded INSERT bypasses EventStore's successful-append accounting.
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
-        }
         Ok(event_inserted)
     }
 
