@@ -470,3 +470,147 @@ fn connection_can_outlive_pool_and_observation_without_a_dangling_context() {
         89
     );
 }
+
+#[test]
+fn no_active_observation_burst_takes_no_trace_locks_or_records() {
+    const NAME: &str =
+        "statement_observer::tests::no_active_observation_burst_takes_no_trace_locks_or_records";
+    const CHILD: &str = "KHIVE_STATEMENT_OBSERVER_IDLE_CHILD";
+    const RECEIPT: &str = "STATEMENT_OBSERVER_IDLE_BURST statements=128 locks=0 records=0";
+    // Other unit tests can observe private pools concurrently. A fresh test
+    // process guarantees that the process-wide count is actually zero.
+    if std::env::var(CHILD).ok().as_deref() != Some(NAME) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, NAME)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated no-observation burst failed:\n{stdout}\n{stderr}"
+        );
+        assert!(stdout.contains(RECEIPT), "burst did not execute: {stdout}");
+        print!("{stdout}");
+        return;
+    }
+
+    let (_dir, pool) = fixture(false, false, false);
+    let writer = pool.writer().unwrap();
+    trace_counters::reset();
+    for value in 0..64 {
+        let sql = format!("SELECT {value} AS never_observed");
+        assert_eq!(
+            writer
+                .conn()
+                .query_row(&sql, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            value
+        );
+    }
+    assert_eq!(trace_counters::snapshot(), (0, 0));
+
+    let observation = pool.observe_test_statement_starts(128).unwrap();
+    let retained = Arc::clone(&observation.probe);
+    drop(observation);
+    assert_eq!(ACTIVE_OBSERVERS.load(Ordering::Acquire), 0);
+    for value in 0..64 {
+        let sql = format!("SELECT {value} AS observation_dropped");
+        assert_eq!(
+            writer
+                .conn()
+                .query_row(&sql, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            value
+        );
+    }
+    assert_eq!(trace_counters::snapshot(), (0, 0));
+    let records = retained.records.lock();
+    assert!(records.statements.is_empty());
+    assert!(!records.lost);
+    println!("{RECEIPT}");
+}
+
+#[test]
+fn active_observation_records_the_exact_statement_burst() {
+    let (_dir, pool) = fixture(false, false, false);
+    let observation = pool.observe_test_statement_starts(64).unwrap();
+    let writer = pool.writer().unwrap();
+    let expected: Vec<_> = (0..64)
+        .map(|value| StartedStatement {
+            sql: format!("SELECT {value} AS active_burst"),
+            readonly: true,
+        })
+        .collect();
+    trace_counters::reset();
+    for (value, statement) in expected.iter().enumerate() {
+        assert_eq!(
+            writer
+                .conn()
+                .query_row(&statement.sql, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            value as i64
+        );
+    }
+    assert_eq!(observation.started_statements().unwrap(), expected);
+    assert_eq!(trace_counters::snapshot(), (64 * 3, 64));
+}
+
+#[test]
+fn observation_drop_on_another_thread_keeps_other_pools_active() {
+    let (_dir, first_pool) = fixture(false, false, false);
+    let (_other_dir, second_pool) = fixture(false, false, false);
+    let first = first_pool.observe_test_statement_starts(8).unwrap();
+    let second = second_pool.observe_test_statement_starts(8).unwrap();
+    assert!(first_pool.observe_test_statement_starts(8).is_err());
+    let worker_pool = Arc::clone(&first_pool);
+    std::thread::spawn(move || {
+        let sql = "SELECT 71 AS moved_guard";
+        worker_pool
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row(sql, [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(
+            first.started_statements().unwrap(),
+            vec![StartedStatement {
+                sql: sql.to_owned(),
+                readonly: true,
+            }]
+        );
+        drop(first);
+    })
+    .join()
+    .unwrap();
+    let sql = "SELECT 72 AS other_pool_still_active";
+    second_pool
+        .writer()
+        .unwrap()
+        .conn()
+        .query_row(sql, [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(
+        second.started_statements().unwrap(),
+        vec![StartedStatement {
+            sql: sql.to_owned(),
+            readonly: true,
+        }]
+    );
+    let again = first_pool.observe_test_statement_starts(8).unwrap();
+    let sql = "SELECT 73 AS reregistered_guard";
+    first_pool
+        .writer()
+        .unwrap()
+        .conn()
+        .query_row(sql, [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(
+        again.started_statements().unwrap(),
+        vec![StartedStatement {
+            sql: sql.to_owned(),
+            readonly: true,
+        }]
+    );
+}
