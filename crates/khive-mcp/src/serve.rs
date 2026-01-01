@@ -2928,12 +2928,12 @@ fn plan_configured_storage_targets(
                 canonical_backend_path(selected)?,
                 canonical_backend_path(main)?,
             ) {
-                (Some(selected), Some(main)) => {
-                    match (file_identity(&selected), file_identity(&main)) {
-                        (Some(selected), Some(main)) => selected == main,
-                        _ => selected == main,
-                    }
-                }
+                (Some(selected), Some(main)) => same_database_target(
+                    &selected,
+                    &main,
+                    file_identity(&selected),
+                    file_identity(&main),
+                ),
                 // A force-memory override intentionally creates one distinct
                 // ephemeral backend per configured name; only the literal
                 // main name is the canonical-main target in that mode.
@@ -2947,6 +2947,25 @@ fn plan_configured_storage_targets(
         effective_backends,
         full_topology,
     })
+}
+
+/// Whether two backends resolve to one database file.
+///
+/// Equal canonical paths name the same file by construction, so a file
+/// identity read that disagrees (the file was replaced between the two reads)
+/// never separates them. A matching identity is an additional way to be equal,
+/// joining distinct paths such as hard links.
+fn same_database_target(
+    selected: &std::path::Path,
+    main: &std::path::Path,
+    selected_identity: Option<FileIdentity>,
+    main_identity: Option<FileIdentity>,
+) -> bool {
+    selected == main
+        || matches!(
+            (selected_identity, main_identity),
+            (Some(selected_id), Some(main_id)) if selected_id == main_id
+        )
 }
 
 /// Return the configured backend names a read-only schema check must inspect.
@@ -10877,6 +10896,49 @@ region = "us-east-1"
             vec!["alias".to_string()],
             "forced-memory configured names are distinct ephemeral databases"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn equal_canonical_paths_stay_one_target_when_identity_reads_differ() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::fs::write(&a, b"").expect("first file");
+        std::fs::write(&b, b"").expect("second file");
+        let a_id = file_identity(&a).expect("first identity");
+        let b_id = file_identity(&b).expect("second identity");
+        assert_ne!(a_id, b_id);
+
+        // The file was replaced between the two identity reads: the paths are
+        // equal, so the identities must not separate them.
+        assert!(same_database_target(&a, &a, Some(a_id), Some(b_id)));
+        // One or both identity reads failed.
+        assert!(same_database_target(&a, &a, Some(a_id), None));
+        assert!(same_database_target(&a, &a, None, Some(a_id)));
+        assert!(same_database_target(&a, &a, None, None));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn matching_identity_joins_distinct_paths_but_a_missing_identity_does_not() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::fs::write(&a, b"").expect("first file");
+        std::fs::write(&b, b"").expect("second file");
+        let a_id = file_identity(&a).expect("first identity");
+        let b_id = file_identity(&b).expect("second identity");
+        assert_ne!(a_id, b_id);
+
+        // Distinct paths with one physical identity (a hard link) are one database.
+        assert!(same_database_target(&a, &b, Some(a_id), Some(a_id)));
+        // Distinct paths with distinct identities are two databases.
+        assert!(!same_database_target(&a, &b, Some(a_id), Some(b_id)));
+        // Distinct paths cannot be joined without both identities.
+        assert!(!same_database_target(&a, &b, Some(a_id), None));
+        assert!(!same_database_target(&a, &b, None, Some(b_id)));
+        assert!(!same_database_target(&a, &b, None, None));
     }
 
     fn memory_main_backend_config() -> KhiveConfig {
