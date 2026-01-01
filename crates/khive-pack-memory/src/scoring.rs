@@ -2,6 +2,7 @@
 //! See `crates/khive-pack-memory/docs/api/scoring.md` for the complete scoring model.
 use std::collections::{HashMap, HashSet};
 
+pub use khive_text::is_cjk_char;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -563,21 +564,6 @@ impl ScoringConfig {
 }
 
 // ── Utility functions ─────────────────────────────────────────────────────────
-
-/// Returns `true` if `c` is a CJK character (Unified, Extension A/B, Hiragana,
-/// Katakana, Hangul).
-#[inline]
-pub fn is_cjk_char(c: char) -> bool {
-    matches!(c,
-        '\u{4E00}'..='\u{9FFF}'       // CJK Unified Ideographs
-        | '\u{3400}'..='\u{4DBF}'     // CJK Extension A
-        | '\u{F900}'..='\u{FAFF}'     // CJK Compatibility Ideographs
-        | '\u{3040}'..='\u{309F}'     // Hiragana
-        | '\u{30A0}'..='\u{30FF}'     // Katakana
-        | '\u{20000}'..='\u{2A6DF}'   // CJK Extension B
-        | '\u{AC00}'..='\u{D7AF}'     // Hangul Syllables
-    )
-}
 
 /// Returns `true` when >15% of the query's characters are CJK.
 pub fn contains_cjk(text: &str) -> bool {

@@ -1,10 +1,8 @@
 //! Pure, fail-closed `findings.json` to deterministic KG-record mapping.
 
-use std::collections::BTreeMap;
-
 use chrono::{DateTime, Utc};
 use khive_storage::{Edge, Entity, LinkId, Note};
-use khive_types::EdgeRelation;
+use khive_types::{canonical_json_bytes, EdgeRelation};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -42,25 +40,6 @@ pub struct CodeIngestBatch {
 fn uuid5_tuple<T: serde::Serialize>(parts: &T) -> Result<Uuid, CodeIngestError> {
     let bytes = serde_json::to_vec(parts)?;
     Ok(Uuid::new_v5(&CODE_INGEST_NAMESPACE, &bytes))
-}
-
-/// Recursively sort object keys while preserving content-significant array order.
-fn sort_json_keys(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let sorted: BTreeMap<&str, Value> = map
-                .iter()
-                .map(|(k, v)| (k.as_str(), sort_json_keys(v)))
-                .collect();
-            let mut out = Map::with_capacity(sorted.len());
-            for (k, v) in sorted {
-                out.insert(k.to_string(), v);
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(sort_json_keys).collect()),
-        other => other.clone(),
-    }
 }
 
 /// Render strings verbatim, other JSON canonically, and absent values as empty text.
@@ -439,7 +418,7 @@ pub fn ingest_findings_json(
         // Retain the exact v1 tuple as an audit witness, but mint v2 from the
         // repository/project-scoped extension so identical producer runs in
         // different repositories can never share a finding note.
-        let legacy_identity_value = sort_json_keys(&json!({
+        let legacy_identity_value = json!({
             "kind": "code-finding",
             "schema_version": 1,
             "namespace": options.namespace,
@@ -460,8 +439,9 @@ pub fn ingest_findings_json(
             "audit_status": finding.audit_status,
             "refs": finding.refs,
             "raw": finding.raw,
-        }));
-        let legacy_id_v1 = uuid5_tuple(&legacy_identity_value)?;
+        });
+        let legacy_identity_bytes = canonical_json_bytes(&legacy_identity_value)?;
+        let legacy_id_v1 = Uuid::new_v5(&CODE_INGEST_NAMESPACE, &legacy_identity_bytes);
         let mut identity_object = legacy_identity_value
             .as_object()
             .expect("finding identity is constructed as an object")
@@ -469,9 +449,10 @@ pub fn ingest_findings_json(
         identity_object.insert("schema_version".into(), json!(2));
         identity_object.insert("repo".into(), json!(audit.repo));
         identity_object.insert("project_id".into(), json!(project_id));
-        let identity_value = sort_json_keys(&Value::Object(identity_object));
-        let finding_id = uuid5_tuple(&identity_value)?;
-        let finding_external_id = serde_json::to_string(&identity_value)?;
+        let identity_bytes = canonical_json_bytes(&Value::Object(identity_object))?;
+        let finding_id = Uuid::new_v5(&CODE_INGEST_NAMESPACE, &identity_bytes);
+        let finding_external_id =
+            String::from_utf8(identity_bytes).expect("serde_json produces valid UTF-8");
 
         let mut props = Map::new();
         props.insert("external_id".into(), json!(finding_external_id));
