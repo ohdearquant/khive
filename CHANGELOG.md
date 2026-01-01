@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `[actor].mailbox_readers` and select that mailbox, or explicitly set
   `KHIVE_EMAIL_DEFAULT_ACTOR=local` to retain the previous routing. Correlated
   replies still route to the original sender.
+- `khive-retrieval` no longer compiles `khive-hnsw`, `khive-bm25` or `khive-db` by default. The
+  `khive-hnsw` and `khive-bm25` types it re-exports at the crate root (`HnswIndex`, `HnswConfig`,
+  `Bm25Index`, `Bm25Config` and the rest) are now behind the new `hnsw` and `bm25` features, so a
+  Rust consumer that uses them must enable the matching feature. `persist` implies both and
+  `checkpoint` implies `hnsw`, so those consumers need no change. `khive-db` is now a
+  dev-dependency only.
 
 ## [0.9.0] - 2026-09-27
 
