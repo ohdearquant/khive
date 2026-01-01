@@ -49,8 +49,8 @@ pub(super) fn checkpoint_policy(ann: &SharedAnn) -> CheckpointPolicy {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The replay-versus-rebuild cost boundary is independent of the cumulative
-/// delta-chain compaction limit (ADR-079 Amendment 1, restart rule 7).
+/// The raw-tail work limit is independent of cumulative delta-chain compaction.
+/// See ADR-079's `ann_rebuild_threshold` default rationale and restart rule 7.
 pub(super) fn replay_limit(live: u64, rebuild_fraction: f64) -> u64 {
     (rebuild_fraction * live as f64).ceil() as u64
 }
@@ -205,8 +205,8 @@ pub(super) async fn maintain_installed(
         return Ok(InstalledMaintenance::Absent);
     };
     let policy = checkpoint_policy(ann);
-    // Bound this *tail* by replay cost. Cumulative delta headroom only chooses
-    // whether the accepted tail publishes another chunk or a full checkpoint.
+    // Apply ADR-079's raw-tail work limit (see its default rationale).
+    // Delta headroom chooses a chunk or full checkpoint after accepting the tail.
     let max_delta = replay_limit(live as u64, policy.rebuild_fraction);
     let IncrementalTail {
         ops,
