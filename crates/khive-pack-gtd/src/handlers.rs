@@ -1478,7 +1478,17 @@ impl GtdPack {
         if replayed {
             response["replayed"] = json!(true);
         }
-        if embedding_truncation.any_truncated() {
+        // Replay skips embedding, but an identical retry still needs the
+        // disclosure if the stored content exceeds a selected model's budget.
+        let replayed_input_truncated = replayed
+            && self
+                .runtime()
+                .embedding_models_for_note_kind(&note.kind)
+                .iter()
+                .any(|model| {
+                    note.content.len() > khive_runtime::retrieval::document_embedding_budget(model)
+                });
+        if embedding_truncation.any_truncated() || replayed_input_truncated {
             response["warnings"] =
                 json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         }
