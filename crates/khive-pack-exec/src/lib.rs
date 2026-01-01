@@ -12,6 +12,7 @@ mod membership;
 #[cfg(test)]
 mod membership_tests;
 mod pack;
+mod process_cleanup;
 mod receipts;
 pub mod sandbox;
 pub mod tree;
