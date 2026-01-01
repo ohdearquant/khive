@@ -553,6 +553,61 @@ impl SqlNoteStore {
         .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
     }
 
+    async fn get_notes_batch_inner(
+        &self,
+        ids: &[Uuid],
+        include_deleted: bool,
+    ) -> Result<Vec<Note>, StorageError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let operation = if include_deleted {
+            "get_notes_batch_including_deleted"
+        } else {
+            "get_notes_batch"
+        };
+        let deletion_filter = if include_deleted {
+            ""
+        } else {
+            " AND deleted_at IS NULL"
+        };
+        // SQLite SQLITE_MAX_VARIABLE_NUMBER defaults to 999; chunk below that
+        // ceiling so callers can safely hydrate arbitrarily large ID sets.
+        const CHUNK: usize = 900;
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+
+        let mut result = Vec::with_capacity(ids.len());
+        for chunk in id_strings.chunks(CHUNK) {
+            let chunk_owned = chunk.to_vec();
+            let notes = self
+                .with_reader(operation, move |conn| {
+                    let placeholders: String = (1..=chunk_owned.len())
+                        .map(|i| format!("?{i}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+                         properties, created_at, updated_at, deleted_at, key, version \
+                         FROM notes WHERE id IN ({placeholders}){deletion_filter}"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let params: Vec<&dyn rusqlite::types::ToSql> = chunk_owned
+                        .iter()
+                        .map(|s| s as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    let rows = stmt.query_map(params.as_slice(), read_note)?;
+                    let mut notes = Vec::new();
+                    for row in rows {
+                        notes.push(row?);
+                    }
+                    Ok(notes)
+                })
+                .await?;
+            result.extend(notes);
+        }
+        Ok(result)
+    }
+
     async fn with_reader<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -1967,44 +2022,14 @@ impl NoteStore for SqlNoteStore {
     }
 
     async fn get_notes_batch(&self, ids: &[Uuid]) -> Result<Vec<Note>, StorageError> {
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-        // SQLite SQLITE_MAX_VARIABLE_NUMBER defaults to 999; chunk below that
-        // ceiling so callers can safely hydrate arbitrarily large ID sets.
-        const CHUNK: usize = 900;
-        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        self.get_notes_batch_inner(ids, false).await
+    }
 
-        let mut result = Vec::with_capacity(ids.len());
-        for chunk in id_strings.chunks(CHUNK) {
-            let chunk_owned = chunk.to_vec();
-            let notes = self
-                .with_reader("get_notes_batch", move |conn| {
-                    let placeholders: String = (1..=chunk_owned.len())
-                        .map(|i| format!("?{i}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let sql = format!(
-                        "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                         properties, created_at, updated_at, deleted_at, key, version \
-                         FROM notes WHERE id IN ({placeholders}) AND deleted_at IS NULL"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let params: Vec<&dyn rusqlite::types::ToSql> = chunk_owned
-                        .iter()
-                        .map(|s| s as &dyn rusqlite::types::ToSql)
-                        .collect();
-                    let rows = stmt.query_map(params.as_slice(), read_note)?;
-                    let mut notes = Vec::new();
-                    for row in rows {
-                        notes.push(row?);
-                    }
-                    Ok(notes)
-                })
-                .await?;
-            result.extend(notes);
-        }
-        Ok(result)
+    async fn get_notes_batch_including_deleted(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Vec<Note>, StorageError> {
+        self.get_notes_batch_inner(ids, true).await
     }
 
     async fn get_note_visibility_batch(

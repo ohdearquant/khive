@@ -1079,6 +1079,18 @@ pub trait NoteStore: Send + Sync + 'static {
         Ok(out)
     }
 
+    /// Fetch multiple notes, including soft-deleted rows, for mutation policy checks.
+    /// Missing IDs are omitted; callers correlate rows by ID rather than result order.
+    async fn get_notes_batch_including_deleted(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(note) = self.get_note_including_deleted(id).await? {
+                out.push(note);
+            }
+        }
+        Ok(out)
+    }
+
     /// Fetch only the columns needed for note visibility checks by UUID.
     /// Missing IDs are omitted; soft-deleted rows retain their deletion time.
     async fn get_note_visibility_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<NoteVisibility>> {

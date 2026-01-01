@@ -12,6 +12,206 @@ fn assert_secret_gate_refusal(error: StorageError) {
 }
 
 #[tokio::test]
+async fn atomic_property_patch_batches_real_policy_reads() {
+    for count in [1_usize, 128, 129, 500] {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token = NamespaceToken::local();
+        let notes: Vec<_> = (0..count)
+            .map(|_| {
+                Note::new("local", "observation", "policy batch")
+                    .with_properties(json!({"read": false}))
+            })
+            .collect();
+        runtime
+            .raw_notes(&token)
+            .unwrap()
+            .upsert_notes(notes.clone())
+            .await
+            .unwrap();
+        let store = runtime.notes(&token).unwrap();
+        let before = runtime
+            .backend()
+            .pool()
+            .reader_acquisition_snapshot()
+            .acquisitions;
+        store
+            .patch_note_property_atomic(
+                notes.iter().map(|note| note.id).collect(),
+                "local",
+                &NoteFilter::default(),
+                "$.read",
+                json!(true),
+                notes[0].updated_at + 1,
+            )
+            .await
+            .unwrap();
+        let acquired = runtime
+            .backend()
+            .pool()
+            .reader_acquisition_snapshot()
+            .acquisitions
+            - before;
+        let windows = count.div_ceil(128) as u64;
+        assert!(acquired >= windows, "the real policy reader must execute");
+        assert!(
+            acquired <= windows + 6,
+            "{count} targets acquired {acquired} readers; policy reads must follow {windows} windows"
+        );
+        for note in notes {
+            assert_eq!(
+                store
+                    .get_note(note.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .properties
+                    .unwrap()["read"],
+                true
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn atomic_property_batch_keeps_soft_deleted_policy_evidence() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let ordinary = seed_patch_target(&runtime, json!({"read": false})).await;
+    let reserved = seed_patch_target(&runtime, json!({"khive:secret_gate": "legacy"})).await;
+    let token = NamespaceToken::local();
+    let raw = runtime.raw_notes(&token).unwrap();
+    assert!(raw
+        .delete_note(reserved.id, DeleteMode::Soft)
+        .await
+        .unwrap());
+    let store = runtime.notes(&token).unwrap();
+    let error = store
+        .patch_note_property_atomic(
+            vec![ordinary.id, reserved.id],
+            "local",
+            &NoteFilter::default(),
+            "$.read",
+            json!(true),
+            ordinary.updated_at + 1,
+        )
+        .await
+        .unwrap_err();
+    assert_secret_gate_refusal(error);
+    assert_eq!(
+        raw.get_note(ordinary.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .properties
+            .unwrap()["read"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn atomic_property_batch_web_refusal_outranks_secret_across_windows() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let mut notes: Vec<_> = (0..129)
+        .map(|_| {
+            Note::new("local", "observation", "window priority")
+                .with_properties(json!({"read": false}))
+        })
+        .collect();
+    notes[0].properties = Some(json!({"khive:secret_gate": "legacy"}));
+    notes[128].properties = Some(json!({"khive:web_receipt": "v1"}));
+    let token = NamespaceToken::local();
+    let raw = runtime.raw_notes(&token).unwrap();
+    raw.upsert_notes(notes.clone()).await.unwrap();
+    let store = runtime.notes(&token).unwrap();
+    let error = store
+        .patch_note_property_atomic(
+            notes.iter().map(|note| note.id).collect(),
+            "local",
+            &NoteFilter::default(),
+            "$.read",
+            json!(true),
+            notes[1].updated_at + 1,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StorageError::InvalidInput { ref message, .. } if message.contains("web receipt provenance")),
+        "a later-window web refusal must precede an earlier secret refusal: {error}"
+    );
+    assert_eq!(
+        raw.get_note(notes[1].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .properties
+            .unwrap()["read"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn atomic_property_batch_decode_failure_preserves_first_error() {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    let runtime = KhiveRuntime::memory().unwrap();
+    let receipt = seed_patch_target(&runtime, json!({"khive:web_receipt": "v1"})).await;
+    let malformed = seed_patch_target(&runtime, json!({"read": false})).await;
+    runtime
+        .sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET content = ?1 WHERE id = ?2".into(),
+            params: vec![
+                SqlValue::Blob(vec![0xff]),
+                SqlValue::Text(malformed.id.to_string()),
+            ],
+            label: Some("note-policy-fixture-corrupt-content".into()),
+        })
+        .await
+        .unwrap();
+    let token = NamespaceToken::local();
+    let raw = runtime.raw_notes(&token).unwrap();
+    let expected_decode = raw
+        .get_note_including_deleted(malformed.id)
+        .await
+        .unwrap_err()
+        .to_string();
+    let store = runtime.notes(&token).unwrap();
+    let error = store
+        .patch_note_property_atomic(
+            vec![receipt.id, malformed.id],
+            "local",
+            &NoteFilter::default(),
+            "$.read",
+            json!(true),
+            receipt.updated_at + 1,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StorageError::InvalidInput { ref message, .. } if message.contains("web receipt provenance")),
+        "the earlier web refusal must survive a later full-row decoder error: {error}"
+    );
+    let error = store
+        .patch_note_property_atomic(
+            vec![malformed.id, receipt.id],
+            "local",
+            &NoteFilter::default(),
+            "$.read",
+            json!(true),
+            receipt.updated_at + 1,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        expected_decode,
+        "first scalar decoder error bytes must stay unchanged"
+    );
+}
+
+#[tokio::test]
 async fn public_note_store_refuses_reserved_property_on_every_whole_object_route() {
     let runtime = KhiveRuntime::memory().unwrap();
     let token = NamespaceToken::local();
