@@ -120,6 +120,39 @@ fn make_note(namespace: &str, kind: &str, content: &str) -> Note {
     Note::new(namespace, kind, content)
 }
 
+#[tokio::test]
+async fn note_batch_including_deleted_keeps_tombstones_and_chunk_boundaries() {
+    let store = setup_memory_store();
+    let notes: Vec<_> = (0..901)
+        .map(|_| make_note("local", "observation", "batch row"))
+        .collect();
+    store.upsert_notes(notes.clone()).await.unwrap();
+    assert!(store
+        .delete_note(notes[0].id, DeleteMode::Soft)
+        .await
+        .unwrap());
+    let mut ids: Vec<_> = notes.iter().map(|note| note.id).collect();
+    ids.push(notes[0].id);
+    ids.push(Uuid::new_v4());
+    let fetched = store.get_notes_batch_including_deleted(&ids).await.unwrap();
+    let fetched_ids: HashSet<_> = fetched.iter().map(|note| note.id).collect();
+    assert_eq!(fetched_ids, notes.iter().map(|note| note.id).collect());
+    assert!(fetched
+        .iter()
+        .find(|note| note.id == notes[0].id)
+        .unwrap()
+        .deleted_at
+        .is_some());
+    let live = store.get_notes_batch(&ids).await.unwrap();
+    assert_eq!(live.len(), 900);
+    assert!(live.iter().all(|note| note.deleted_at.is_none()));
+    assert!(store
+        .get_notes_batch_including_deleted(&[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 fn keyed_note(namespace: &str, kind: &str, key: &str) -> Note {
     let mut note = make_note(namespace, kind, key);
     note.key = Some(key.to_string());
