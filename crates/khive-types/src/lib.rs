@@ -23,6 +23,8 @@ pub mod event;
 pub mod hash;
 pub mod header;
 pub mod id;
+#[cfg(feature = "serde")]
+pub mod json_type;
 pub mod khive_error;
 pub mod namespace;
 pub mod note;
@@ -54,6 +56,8 @@ pub use event::{
 pub use hash::Hash32;
 pub use header::Header;
 pub use id::{Id128, ParseIdError};
+#[cfg(feature = "serde")]
+pub use json_type::json_type_name;
 pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};
 pub use namespace::Namespace;
 pub use note::{Note, NoteStatus};

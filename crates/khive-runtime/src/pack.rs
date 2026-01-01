@@ -24,7 +24,7 @@ use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{
-    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode,
+    json_type_name, EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode,
     NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec,
     PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory,
     VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
@@ -5792,19 +5792,6 @@ pub fn resolve_explicit_namespace(
             "invalid namespace: expected string when present, got {}",
             json_type_name(other),
         ))),
-    }
-}
-
-/// JSON type name for error messages: describes a present-but-malformed
-/// `namespace` value without echoing its contents.
-pub fn json_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
     }
 }
 
