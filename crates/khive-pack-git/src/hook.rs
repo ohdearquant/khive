@@ -214,15 +214,6 @@ impl KindHook for CommitHook {
         Ok(())
     }
 
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-
     async fn validate_note_update(
         &self,
         _runtime: &KhiveRuntime,
@@ -399,15 +390,6 @@ impl KindHook for IssueLikeHook {
             Value::String(project_uuid.as_hyphenated().to_string()),
         );
 
-        Ok(())
-    }
-
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 

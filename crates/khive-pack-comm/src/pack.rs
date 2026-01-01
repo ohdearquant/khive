@@ -191,15 +191,6 @@ impl KindHook for MessageHook {
         Ok(())
     }
 
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: uuid::Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-
     async fn validate_note_update(
         &self,
         _runtime: &KhiveRuntime,
@@ -255,15 +246,6 @@ impl KindHook for ChannelHealthHook {
              channel; use `comm.heartbeat` instead"
                 .into(),
         ))
-    }
-
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: uuid::Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
     }
 
     async fn validate_note_update(
