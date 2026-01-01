@@ -238,6 +238,27 @@ const RECIPIENT_TRANSPORT_VERSION: u32 = 45;
 const V45_UP: &str = include_str!("../sql/045-recipient-transport.sql");
 const V46_UP: &str = include_str!("../sql/046-memory-visibility-receipts.sql");
 const V47_UP: &str = include_str!("../sql/047-attachment-role-quarantine.sql");
+const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
+const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
+    include_str!("../sql/048-acknowledgement-journal-b-index.sql");
+
+/// A ledger-tail replay keeps already-current journal state and retry metadata.
+pub(crate) fn migrate_acknowledgement_journal(
+    tx: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let columns: i64 = tx.query_row(
+        "SELECT count(*) FROM pragma_table_info('comm_ack_work') \
+         WHERE name IN ('attempt_count','not_before','retirement_reason')",
+        [],
+        |row| row.get(0),
+    )?;
+    match columns {
+        0 => tx.execute_batch(V48_UP)?,
+        3 => {}
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    }
+    tx.execute_batch(ACKNOWLEDGEMENT_JOURNAL_INDEX)
+}
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -532,6 +553,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 47,
         name: "attachment_role_quarantine",
         up: V47_UP,
+    },
+    VersionedMigration {
+        version: 48,
+        name: "acknowledgement_journal",
+        up: V48_UP,
     },
 ];
 
@@ -1583,6 +1609,11 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             })?;
         } else if migration.version == 44 {
             migrate_outbound_due_key(&tx).map_err(|error| SqliteError::Migration {
+                version: migration.version,
+                error: error.to_string(),
+            })?;
+        } else if migration.version == 48 {
+            migrate_acknowledgement_journal(&tx).map_err(|error| SqliteError::Migration {
                 version: migration.version,
                 error: error.to_string(),
             })?;

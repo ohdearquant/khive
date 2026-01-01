@@ -5,6 +5,9 @@ use crate::StorageBackend;
 use khive_storage::{DeleteMode, NoteStore};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
+#[path = "acknowledgement_journal_tests.rs"]
+mod acknowledgement_journal_tests;
+
 fn fixture() -> (StorageBackend, RecipientCommit) {
     let backend = StorageBackend::memory().unwrap();
     crate::run_migrations(backend.pool().writer().unwrap().conn_mut()).unwrap();

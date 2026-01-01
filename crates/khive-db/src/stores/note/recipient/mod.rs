@@ -14,6 +14,32 @@ pub enum RecipientDisposition {
     Stored,
     Quarantined,
 }
+
+/// Closed class of terminal acknowledgement refusals from ADR-105 A.9.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcknowledgementRetirementReason {
+    PermanentTransport,
+}
+impl AcknowledgementRetirementReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PermanentTransport => "permanent_transport",
+        }
+    }
+}
+
+/// Unsigned binding and disposition read from the durable acknowledgement journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AckJournalEntry {
+    pub delivery_attempt_id: Uuid,
+    pub binding: Value,
+    pub disposition: RecipientDisposition,
+    pub attempt_count: u64,
+    pub not_before: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
 impl RecipientDisposition {
     fn as_str(self) -> &'static str {
         match self {
@@ -279,6 +305,59 @@ fn evict_to_bound(
 const ACK_LOOKUP_SQL: &str =
     "SELECT binding,disposition FROM comm_ack_work WHERE delivery_attempt_id=?1";
 
+const ACK_DUE_SQL: &str = concat!(
+    "SELECT delivery_attempt_id,binding,disposition,attempt_count,not_before,",
+    "created_at,updated_at FROM comm_ack_work WHERE state='pending' ",
+    "AND (not_before IS NULL OR not_before<=?1) ",
+    "ORDER BY created_at,delivery_attempt_id LIMIT ?2",
+);
+
+const ACK_FINISH_SQL: &str = concat!(
+    "UPDATE comm_ack_work SET state='acknowledged',updated_at=?2 ",
+    "WHERE delivery_attempt_id=?1 AND state='pending'",
+);
+
+const ACK_FAILED_TRY_SQL: &str = concat!(
+    "UPDATE comm_ack_work SET attempt_count=attempt_count+1,not_before=?2,updated_at=?3 ",
+    "WHERE delivery_attempt_id=?1 AND state='pending'",
+);
+
+const ACK_RETIRE_SQL: &str = concat!(
+    "UPDATE comm_ack_work SET state='retired',retirement_reason=?2,updated_at=?3 ",
+    "WHERE delivery_attempt_id=?1 AND state='pending'",
+);
+
+fn read_ack_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<AckJournalEntry> {
+    let attempt: String = row.get(0)?;
+    let delivery_attempt_id = Uuid::parse_str(&attempt).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let binding: String = row.get(1)?;
+    let binding = serde_json::from_str(&binding).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let disposition: String = row.get(2)?;
+    let disposition = serde_json::from_value(Value::String(disposition)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let attempt_count = u64::try_from(row.get::<_, i64>(3)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    Ok(AckJournalEntry {
+        delivery_attempt_id,
+        binding,
+        disposition,
+        attempt_count,
+        not_before: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
 const INSERT_ACK_SQL: &str = concat!(
     "INSERT INTO comm_ack_work ",
     "(delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,",
@@ -339,6 +418,90 @@ impl RecipientTransportStore {
         Self {
             notes: SqlNoteStore::new(pool, false),
         }
+    }
+
+    /// Pending entries at or before `now` (UTC microseconds), oldest first.
+    /// Pages are bounded to 1,000 entries; a zero limit returns no entries.
+    pub async fn list_due_acknowledgements(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> StorageResult<Vec<AckJournalEntry>> {
+        let limit = limit.min(1000) as i64;
+        self.notes
+            .with_reader("recipient_acknowledgement_due", move |conn| {
+                let mut statement = conn.prepare(ACK_DUE_SQL)?;
+                let entries = statement
+                    .query_map(params![now, limit], read_ack_entry)?
+                    .collect();
+                entries
+            })
+            .await
+    }
+
+    /// Finish a pending entry; terminal or absent entries return `false` unchanged.
+    pub async fn finish_acknowledgement(&self, delivery_attempt_id: Uuid) -> StorageResult<bool> {
+        self.notes
+            .with_writer_tx_storage("recipient_acknowledgement_finish", move |conn| {
+                let changed = conn
+                    .execute(
+                        ACK_FINISH_SQL,
+                        params![
+                            delivery_attempt_id.to_string(),
+                            chrono::Utc::now().timestamp_micros()
+                        ],
+                    )
+                    .map_err(|error| map_err(error, "recipient_acknowledgement_finish"))?;
+                Ok(changed != 0)
+            })
+            .await
+    }
+
+    /// Persist one failed try and its next eligible UTC-microsecond deadline.
+    /// The integer constraint aborts a counter overflow without changing the row.
+    pub async fn record_acknowledgement_failed_try(
+        &self,
+        delivery_attempt_id: Uuid,
+        not_before: i64,
+    ) -> StorageResult<bool> {
+        self.notes
+            .with_writer_tx_storage("recipient_acknowledgement_failed_try", move |conn| {
+                let changed = conn
+                    .execute(
+                        ACK_FAILED_TRY_SQL,
+                        params![
+                            delivery_attempt_id.to_string(),
+                            not_before,
+                            chrono::Utc::now().timestamp_micros()
+                        ],
+                    )
+                    .map_err(|error| map_err(error, "recipient_acknowledgement_failed_try"))?;
+                Ok(changed != 0)
+            })
+            .await
+    }
+
+    /// Retire a pending acknowledgement without touching its message or replay claim.
+    pub async fn retire_acknowledgement(
+        &self,
+        delivery_attempt_id: Uuid,
+        reason: AcknowledgementRetirementReason,
+    ) -> StorageResult<bool> {
+        self.notes
+            .with_writer_tx_storage("recipient_acknowledgement_retire", move |conn| {
+                let changed = conn
+                    .execute(
+                        ACK_RETIRE_SQL,
+                        params![
+                            delivery_attempt_id.to_string(),
+                            reason.as_str(),
+                            chrono::Utc::now().timestamp_micros()
+                        ],
+                    )
+                    .map_err(|error| map_err(error, "recipient_acknowledgement_retire"))?;
+                Ok(changed != 0)
+            })
+            .await
     }
     /// Answer an already committed logical message before its plaintext is
     /// interpreted again. The authenticated caller supplies the current local
