@@ -22,7 +22,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use khive_pack_tool::policy::{
-    actor_label, decide_with_receipt, DecisionCaller, DecisionInvocation,
+    actor_label, decide_with_receipt, opt_u32 as opt_limit, DecisionCaller, DecisionInvocation,
 };
 use khive_pack_tool::{registry_policy_inputs, RegistryPin};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
@@ -62,16 +62,6 @@ fn req_str(params: &Value, key: &str) -> Result<String, RuntimeError> {
     match opt_str(params, key)? {
         Some(s) if !s.trim().is_empty() => Ok(s),
         _ => Err(RuntimeError::InvalidInput(format!("{key} is required"))),
-    }
-}
-
-fn opt_limit(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
-    match params.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(v) => v
-            .as_u64()
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
-            .ok_or_else(|| RuntimeError::InvalidInput(format!("{key} must be a positive integer"))),
     }
 }
 
@@ -2002,6 +1992,10 @@ fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
         _ => json!({}),
     }
 }
+
+#[cfg(test)]
+#[path = "parameter_helpers_tests.rs"]
+mod parameter_helpers_tests;
 
 #[cfg(test)]
 #[path = "process_cleanup_tests.rs"]
