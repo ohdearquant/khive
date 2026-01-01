@@ -26,8 +26,9 @@ into a dedicated map database, ADR-085 Amendment 2); its `finding` note kind is 
 written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amendment 3);
 the `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
 `contains` endpoint rules to git/gtd/session notes (#873); the `blob` pack contributes
-seven verbs, `blob.put` / `blob.get` / `blob.stat` plus `blob.begin` / `blob.put_part` /
-`blob.commit` / `blob.abort`, over content-addressed storage and staged uploads.
+nine verbs, `blob.put` / `blob.get` / `blob.stat` plus `blob.begin` / `blob.put_part` /
+`blob.commit` / `blob.abort`, and `blob.import` / `blob.export`, over content-addressed
+storage, staged uploads, and opt-in local file transfers.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
 

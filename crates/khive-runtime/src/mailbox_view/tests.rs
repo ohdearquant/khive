@@ -33,6 +33,7 @@ fn config(gate: GateRef) -> RuntimeConfig {
         allowed_outbound_namespaces: vec![],
         actor_id: Some("lambda:owner".into()),
         exec: Default::default(),
+        ..crate::RuntimeConfig::no_embeddings()
     }
 }
 

@@ -6,6 +6,72 @@ Technical reference for the `comm` pack's message write, threading, and read pat
 spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes in
 `vocab.rs`.
 
+## File attachments on local messages
+
+`comm.send` and `comm.reply` accept optional `attachments: [content_ref, ...]`.
+The list contains at most eight distinct, strict lowercase BLAKE3 references.
+Every object must already exist in the runtime's installed BlobStore, and
+their combined stat sizes must not exceed 64 MiB. A missing object refuses
+with a bad-argument refusal naming its reference. Invalid, duplicate, oversized and
+missing lists write no message notes or attachment rows.
+
+File attachments require a local recipient and the canonical main comm
+backend. Attached sends or replies to `email:`, `telegram:` or `khive1:`
+addresses refuse the entire operation. Attachment-free routing is unchanged.
+A comm runtime on a secondary backend refuses attached writes before any
+note preparation or writer request; it does not split note and attachment
+ownership across databases.
+
+Each outbound and inbound note owns a Note-substrate row for every reference.
+Roles are `message-attachment:0` through `message-attachment:7`, preserving the
+caller order and staying distinct from `quarantine-original`. The complete
+note/index plans and attachment statements run in the same AtomicUnit writer
+transaction. On keyed writes these statements precede the final outbound key
+claim, so a competing claim rolls back the attempted notes and attachments.
+An exact replay returns the original pair only when both copies still have
+the complete expected attachment metadata; an incomplete pair refuses with
+`key_conflict` and is not repaired by the replay.
+
+Blob stat is a metadata pre-check, not a lease. The BlobStore does not share
+the comm SQL transaction, including when a blob pack is routed separately.
+An object removed after the pre-check can become unavailable before the
+message commits or is later exported. This API does not add blob deletion or
+reclaim on message deletion.
+
+`comm.inbox` and `comm.thread` return `attachments: [{content_ref, size,
+media_type}]` on each message, using `[]` when none exist; `attachments` is
+also an accepted projection field. Only the exact indexed roles above are
+read, sorted by index. Other roles and malformed suffixes are ignored.
+`comm.read` returns the same metadata when `body=true` (the default), while
+`body=false` preserves the acknowledgement-only response. No comm response
+contains file bytes. Media type is nullable because references carry no MIME
+catalog metadata; size is the stored per-message stat observation.
+
+An unreadable attachment row leaves its message and readable attachments
+available. Inbox, thread and body-bearing read responses add
+`attachments_error: {count, reason: "unreadable_attachment"}` to that message.
+The marker is also an accepted projection field. The count includes
+unreadable rows preserved by migration 047 in
+`attachment_quarantine`; a clean message omits the marker. The migration
+preserves every column of an invalid-role row and its blob reference while
+tightening the attachment role CHECK to reject empty roles and C0, DEL and
+C1 control characters. Quarantined references remain blob owners in the GC
+liveness predicate,
+including after deletion of their original record; this preserves the bytes
+until the quarantined metadata can be repaired. GC admission still requires
+the exact completed V21 epoch: migrated V47 stores remain refused until
+later epoch ownership has been reviewed.
+
+A failure of the attachment lookup itself still returns an error. Bulk
+`comm.read(body=true)` reads every target's fields before marking the first
+target, so that error does not change any target's read flag. Mark failures
+remain per-item statuses. `body=false` does not read attachment metadata.
+
+Use [blob.import and blob.export](../../../khive-pack-blob/docs/api/file-transfers.md)
+to move files between server directories and the blob store without returning
+bytes through those tools. `blob.get` keeps its existing small-object base64
+behavior.
+
 ## `message.rs::resolve_id`
 
 Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix. The prefix

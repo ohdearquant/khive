@@ -952,6 +952,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: Some("leo".to_string()),
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime with actor");
 

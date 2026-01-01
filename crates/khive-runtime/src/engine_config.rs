@@ -558,6 +558,15 @@ pub enum BlobConfig {
     },
 }
 
+/// `[blob]` pack policy, separate from the `[storage.blob]` backend selector.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BlobSectionConfig {
+    /// Permit server-local file transfers. Absent means disabled.
+    #[serde(default)]
+    pub file_transfers: bool,
+}
+
 /// `[storage]` section in `khive.toml`. Holds storage-layer config not
 /// already covered by `[[backends]]` (ADR-028).
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1255,9 +1264,10 @@ impl WebSectionConfig {
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
 /// - `[display]`: rendering timezone (ADR-169)
+/// - `[blob]`: server-local file-transfer opt-in
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[actor]`, `[gate]`, `[brain]`, and `[telemetry]` tables are closed
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, and `[telemetry]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
@@ -1320,6 +1330,10 @@ pub struct KhiveConfig {
     /// unavailable until this section is populated.
     #[serde(default)]
     pub git_write: GitWriteSectionConfig,
+
+    /// Server-local file-transfer opt-in. Other blob verbs are unaffected.
+    #[serde(default)]
+    pub blob: BlobSectionConfig,
 
     /// Storage-layer config not covered by `[[backends]]` (ADR-111
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).

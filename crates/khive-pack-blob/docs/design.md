@@ -2,20 +2,21 @@
 
 ## Purpose
 
-`khive-pack-blob` exposes the runtime's installed content-addressed blob service through seven MCP
+`khive-pack-blob` exposes the runtime's installed content-addressed blob service through nine MCP
 verbs: `blob.put`, `blob.get`, `blob.stat`, `blob.begin`, `blob.put_part`, `blob.commit` and
-`blob.abort`. It adapts `BlobStore` and
+`blob.abort`, plus confined server file transfers `blob.import` and `blob.export`. It adapts `BlobStore` and
 `BlobHydrator`; it does not implement a storage backend, schema, or graph vocabulary.
 
 ## Key types and modules
 
 - `BlobPack` holds the runtime and one shared upload manager. The daemon obtains that same
   manager from the registered pack instance; constructing another pack would lose the upload map.
-- `pack.rs` declares the seven agent-visible verbs, inventory-registers the factory, and dispatches
+- `pack.rs` declares the nine agent-visible verbs, inventory-registers the factory, and dispatches
   calls to `handlers.rs`.
 - `handlers.rs` validates base64 payloads, strict content references and optional ranges, enforces
   memory/wire bounds, and shapes verb responses.
 - `uploads.rs` owns sequential part accounting, incremental hashing, tail retries and expiry.
+- `file_handlers.rs` uses the shared runtime file policy for confined imports and atomic exports.
 - `ContentRef` is the canonical lowercase-hex BLAKE3 identity supplied by `khive-storage`.
 - `vocab.rs` contributes no entity or note kinds; typed artifact/reference modeling is a separate
   layer.
@@ -42,11 +43,15 @@ still apply after argument parsing.
 - `blob.commit(upload_id)` checks the complete length and optional expected reference, publishes
   the object, and returns `{content_ref, size}` while consuming the upload id.
 - `blob.abort(upload_id)` discards staging, consumes the upload id, and returns `{aborted: true}`.
+- `blob.import(path, media_type?)` streams a confined server file through staged upload and returns
+  reference and size. `blob.export(content_ref, path)` atomically writes a verified blob into the
+  export root and returns path and size. Neither result contains bytes. See
+  [server file transfers](api/file-transfers.md) for deployment and path requirements.
 
 ## Invariants
 
-- The verb surface accepts bytes, never a server-local file path. This prevents a remote caller
-  from turning `blob.put` into host-file exfiltration.
+- `blob.put` accepts base64 bytes only. The separate file-transfer verbs confine paths to disjoint
+  operator-configured import and export roots; multitenant deployments must not expose them.
 - Put and whole-object hydration share ADR-111's 64 MiB object ceiling, giving filesystem and S3
   backends the same externally visible acceptance limit.
 - A `blob.get` response must also fit the daemon frame limit after base64 expansion. Callers use a

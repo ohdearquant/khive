@@ -9,7 +9,27 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
 use crate::{handlers, BlobPack, PACK_NAME};
 
-pub(crate) static BLOB_HANDLERS: [HandlerDef; 7] = [
+pub(crate) static BLOB_HANDLERS: [HandlerDef; 9] = [
+    HandlerDef {
+        name: "blob.import",
+        description: "Stream a regular file beneath the server import root into the blob store; return content_ref and size, never bytes.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "path", param_type: "string", required: true, description: "Server path under ~/.khive/imports or KHIVE_IMPORT_FROM_ROOT; no traversal or symlinks.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "media_type", param_type: "string", required: false, description: "Optional media type echoed in the import receipt.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "blob.export",
+        description: "Atomically write a blob beneath the server export root; return path and size, never bytes.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "content_ref", param_type: "string", required: true, description: "64-character lowercase hex BLAKE3 content reference.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "path", param_type: "string", required: true, description: "Server destination under ~/.khive/exports or KHIVE_SAVE_TO_ROOT, using save_to path policy.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
     HandlerDef {
         name: "blob.put",
         description: "Store bytes (base64) in the content-addressed \
@@ -196,7 +216,17 @@ impl PackRuntime for BlobPack {
         _registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
+        if matches!(verb, "blob.import" | "blob.export") && !self.file_transfers_enabled {
+            return Err(RuntimeError::InvalidInput(format!(
+                "{verb}: server file transfers are disabled; enable [blob] file_transfers = true or KHIVE_FILE_TRANSFERS=1"
+            )));
+        }
         match verb {
+            "blob.import" => {
+                crate::file_handlers::handle_import(self.runtime(), &self.uploads, token, params)
+                    .await
+            }
+            "blob.export" => crate::file_handlers::handle_export(self.runtime(), params).await,
             "blob.put" => handlers::handle_put(self.runtime(), token, params).await,
             "blob.get" => handlers::handle_get(self.runtime(), token, params).await,
             "blob.stat" => handlers::handle_stat(self.runtime(), token, params).await,

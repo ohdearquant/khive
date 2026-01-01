@@ -124,6 +124,7 @@ fn fixture() -> Fixture {
         allowed_outbound_namespaces: Vec::new(),
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("in-memory knowledge runtime");
     let control = Arc::new(Control::new());

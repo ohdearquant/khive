@@ -24,11 +24,11 @@ base64 = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 khive-db = { version = "0.9.0", path = "../khive-db" }
 rusqlite = { workspace = true }
-tempfile = { workspace = true }
 
 [[test]]
 name = "integration"

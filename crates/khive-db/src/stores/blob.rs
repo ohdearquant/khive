@@ -2140,6 +2140,28 @@ async fn release_abandoned_blob_gc_claim_batch(sql: &dyn SqlAccess) -> StorageRe
     })
 }
 
+/// Candidate ownership for every GC accounting and claim site.
+///
+/// The exact-V21 admission gate remains unchanged. Its legacy schema has no
+/// quarantine table, so callers select the canonical-only fragment when that
+/// table is absent rather than preparing a reference to a missing table.
+fn blob_gc_unowned_attachment_predicate(quarantine_present: bool) -> &'static str {
+    if quarantine_present {
+        "NOT EXISTS ( \
+           SELECT 1 FROM attachments \
+           WHERE content_ref = candidate.value \
+         ) AND NOT EXISTS ( \
+           SELECT 1 FROM attachment_quarantine \
+           WHERE content_ref = candidate.value \
+         )"
+    } else {
+        "NOT EXISTS ( \
+           SELECT 1 FROM attachments \
+           WHERE content_ref = candidate.value \
+         )"
+    }
+}
+
 async fn claim_blob_gc_batch(
     sql: &dyn SqlAccess,
     root_key: String,
@@ -2170,15 +2192,34 @@ async fn claim_blob_gc_batch(
     let claimed_at = chrono::Utc::now().timestamp_micros();
     let op: AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
+            let quarantine_present = required_nonnegative_count(
+                writer
+                    .query_scalar(SqlStatement {
+                        sql: "SELECT COUNT(*) FROM sqlite_master \
+                              WHERE type = 'table' AND name = 'attachment_quarantine'"
+                            .to_string(),
+                        params: vec![],
+                        label: Some("blob_gc_quarantine_table_present".to_string()),
+                    })
+                    .await?,
+                "blob_gc_quarantine_table_present",
+            )?;
+            let ownership_predicate = match quarantine_present {
+                0 => blob_gc_unowned_attachment_predicate(false),
+                1 => blob_gc_unowned_attachment_predicate(true),
+                _ => {
+                    return Err(StorageError::Internal(
+                        "blob GC quarantine table presence returned an invalid count".into(),
+                    ));
+                }
+            };
             let grace_period_skipped = required_nonnegative_count(
                 writer
                     .query_scalar(SqlStatement {
-                        sql: "SELECT COUNT(*) FROM json_each(?1) AS candidate \
-                              WHERE NOT EXISTS ( \
-                                SELECT 1 FROM attachments \
-                                WHERE content_ref = candidate.value \
-                              )"
-                        .to_string(),
+                        sql: format!(
+                            "SELECT COUNT(*) FROM json_each(?1) AS candidate \
+                             WHERE {ownership_predicate}"
+                        ),
                         params: vec![SqlValue::Text(grace_json)],
                         label: Some("blob_gc_count_grace_candidates_batch".to_string()),
                     })
@@ -2190,12 +2231,10 @@ async fn claim_blob_gc_batch(
                 let would_delete = required_nonnegative_count(
                     writer
                         .query_scalar(SqlStatement {
-                            sql: "SELECT COUNT(*) FROM json_each(?1) AS candidate \
-                                  WHERE NOT EXISTS ( \
-                                    SELECT 1 FROM attachments \
-                                    WHERE content_ref = candidate.value \
-                                  )"
-                            .to_string(),
+                            sql: format!(
+                                "SELECT COUNT(*) FROM json_each(?1) AS candidate \
+                                 WHERE {ownership_predicate}"
+                            ),
                             params: vec![SqlValue::Text(eligible_json)],
                             label: Some("blob_gc_count_dry_run_candidates_batch".to_string()),
                         })
@@ -2211,14 +2250,12 @@ async fn claim_blob_gc_batch(
 
             writer
                 .execute(SqlStatement {
-                    sql: "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
-                          SELECT ?1, candidate.value, ?3 \
-                          FROM json_each(?2) AS candidate \
-                          WHERE NOT EXISTS ( \
-                            SELECT 1 FROM attachments \
-                            WHERE content_ref = candidate.value \
-                          )"
-                    .to_string(),
+                    sql: format!(
+                        "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                         SELECT ?1, candidate.value, ?3 \
+                         FROM json_each(?2) AS candidate \
+                         WHERE {ownership_predicate}"
+                    ),
                     params: vec![
                         SqlValue::Text(root_key.clone()),
                         SqlValue::Text(eligible_json),
@@ -3458,6 +3495,10 @@ mod db_ownership_sync_hook {
             .and_then(VecDeque::pop_front)
     }
 }
+
+#[cfg(test)]
+#[path = "blob/quarantine_liveness_tests.rs"]
+mod quarantine_liveness_tests;
 
 #[cfg(test)]
 mod tests {

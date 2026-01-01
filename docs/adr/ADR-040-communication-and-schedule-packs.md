@@ -1059,7 +1059,7 @@ Refs: #3322.
 
 ## Amendment (proposed): comm message file attachments (2026-10-02)
 
-**Status**: proposed. Acceptance is required before dependent implementation merges.
+**Status**: accepted (2026-10-02, ratified by the maintainer).
 
 The requirement is "file bytes never enter a tool result", with files moved on a local server by
 `blob.import(path)` and `blob.export(content_ref, path)` and on a remote MCP surface by "refs plus
@@ -1073,7 +1073,8 @@ return each message's references with their sizes. File bytes never appear in a 
 result. Bytes move through the blob pack: the existing upload verbs and `blob.get`, plus two new
 verbs, `blob.import` and `blob.export`, that move a file between the server's disk and the blob
 store inside configured directories. A message sent without attachments behaves exactly as it did
-before, and no schema migration is needed.
+before. Core migration 047 preserves rows with invalid roles in `attachment_quarantine` and
+tightens the attachment role constraints.
 
 The "Message-to-entity attachment" section above covers linking a message to a knowledge-graph
 entity with the `annotates` relation. It is a different feature and is unchanged. In this amendment
@@ -1086,10 +1087,11 @@ entity with the `annotates` relation. It is a different feature and is unchanged
    one stored object however many messages, copies or recipients name them.
 2. **The references are Attachment rows.** [ADR-121](ADR-121-attachments-first-class.md) defines the
    `attachments` table on the canonical main backend. It is keyed by `(record_uuid, role)`, carries
-   `content_ref`, `media_type`, `size_bytes` and `created_at`, and is the only source of liveness
-   for blob garbage collection. Each attachment of a message is one row on the Note substrate,
-   owned by the message note. The note's `properties` gain no attachment key, because a property
-   that names a blob does not keep the blob from being reclaimed (see
+   `content_ref`, `media_type`, `size_bytes` and `created_at`, and is a source of liveness for blob
+   garbage collection. Rows retained in `attachment_quarantine` also keep their referenced objects
+   live until an administrative sweep removes those rows. Each attachment of a message is one row
+   on the Note substrate, owned by the message note. The note's `properties` gain no attachment key,
+   because a property that names a blob does not keep the blob from being reclaimed (see
    [Retention and garbage collection](#retention-and-garbage-collection)).
 3. **Roles are positional.** The table holds one row per role per record. The reference at
    zero-based position `n` of the caller's list is therefore stored under the role
@@ -1253,14 +1255,16 @@ server. Each verb is confined to one directory.
 - The checks do not stop another local process from swapping a directory between the check and the
   use. An operator configures the two directories and their ancestors so that only trusted
   processes can change them.
-- The server has no signal that identifies a hosted or multi-tenant surface. A deployment that
-  serves callers it does not trust must not expose either verb.
+- Both verbs are disabled by default. A local deployment opts in with `[blob] file_transfers = true`
+  in configuration or `KHIVE_FILE_TRANSFERS=1` in the server environment. The setting is resolved
+  once at host boot when runtime configuration is constructed; pack initialization uses that
+  resolved snapshot. Without opt-in, either verb refuses and names the setting.
+  A deployment that serves callers it does not trust keeps both verbs disabled.
 
 ADR-121 §3 accepts a local file path only on local stdio deployments and rejects it elsewhere with
-an error that names the constraint. The blob pack has no signal that identifies such a deployment,
-so confinement to the configured directories is the control in every deployment. If a signal is
-added later, both rules should use it. `blob.put` still accepts base64 bytes only and never a
-path.
+an error that names the constraint. Explicit opt-in is the blob pack's signal that an operator has
+enabled these server-local file transfers. It does not relax confinement or the read-only refusal.
+`blob.put` remains available without that opt-in and still accepts base64 bytes only, never a path.
 
 ### External channels
 
@@ -1307,8 +1311,10 @@ Per-tenant read control is out of scope here (see below).
 ### Retention and garbage collection
 
 Attachment rows are what keep an attached object alive. The blob sweep treats an object as live
-when at least one row in the main database's `attachments` table names its reference (ADR-121 §5,
-ADR-111 §8).
+when at least one row in the main database's `attachments` or `attachment_quarantine` table names
+its reference (ADR-121 §5, ADR-111 §8). A quarantined row continues to pin its object after hard
+deletion of the original record; an administrative sweep retires that ownership by removing the
+quarantine row. This ownership accounting does not change the sweep's admission rules.
 
 - **Rows belong to copies.** Each copy of a message owns its rows. Deleting the sender's copy
   releases only the sender's rows, and the recipient's rows keep the object alive.
@@ -1405,12 +1411,14 @@ row check, writes rows on one copy only, or writes rows after the commit.
 
 - **Carry bytes in comm requests and results.** Rejected. Every inbox read would grow with every
   attachment, and the daemon frame bounds the size of any one call (ADR-173).
-- **Record the references in a message property.** Rejected. Garbage collection reads only the
-  `attachments` table, so a property would leave the object open to reclamation after the grace
-  period.
+- **Record the references in a message property.** Rejected. Garbage collection reads the
+  `attachments` and `attachment_quarantine` ownership rows rather than message properties, so a
+  property would leave the object open to reclamation after the grace period.
 - **Change the attachment table to allow several rows per role.** Deferred. Positional roles fit
-  the existing table and need no migration, at the cost of a role that records a position. A later
-  amendment can change this if a second consumer needs a multi-valued role.
+  the existing table without a layout migration, at the cost of a role that records a position.
+  Migration 047 tightens role validation and preserves rejected rows, independently of that
+  positional layout. A later amendment can change the layout if a second consumer needs a
+  multi-valued role.
 - **Send the text and drop the files for external recipients.** Rejected. The loss would be silent,
   and the reference would travel outside the deployment.
 - **Write the attachment rows after the notes commit.** Rejected. It leaves a window in which a

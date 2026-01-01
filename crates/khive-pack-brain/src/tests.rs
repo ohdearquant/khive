@@ -2706,6 +2706,7 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: Some(actor_id.to_string()),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("in-memory runtime with actor");
     let pack = BrainPack::new(rt.clone());
