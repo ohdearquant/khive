@@ -3,7 +3,6 @@
 
 use std::any::Any;
 
-use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -28,9 +27,7 @@ pub fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32,
     }
 }
 
-pub fn now_micros() -> i64 {
-    Utc::now().timestamp_micros()
-}
+pub use khive_storage::now_micros;
 
 /// The caller's actor as one label, `kind:id`, except that the plain `actor`
 /// kind collapses to its id so a configured `lambda:khive` reads back as

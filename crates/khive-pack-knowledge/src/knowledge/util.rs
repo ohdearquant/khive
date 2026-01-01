@@ -1,6 +1,5 @@
 //! Shared SQL helpers and row-to-type converters for knowledge handlers.
 
-use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -118,9 +117,7 @@ pub(super) fn estimate_compose_item_tokens(title: &str, content: &str) -> usize 
 
 // ─── SQL helpers ─────────────────────────────────────────────────────────────
 
-pub(super) fn now_us() -> i64 {
-    Utc::now().timestamp_micros()
-}
+pub(super) use khive_storage::now_micros as now_us;
 
 pub(super) fn new_id() -> String {
     Uuid::new_v4().to_string()
