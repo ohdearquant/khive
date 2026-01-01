@@ -1206,6 +1206,14 @@ implementation.
 | a step 9 record that commits but whose outcome the service cannot confirm | `503 capacity_exhausted`, nothing forwarded, A.6.5 answers `unknown`; the client's resubmission of the same bytes is not charged again, and is admitted whenever a first submit of the same body would be, except that no credit is needed |
 | a re-encryption after `recipient_key_changed` and the owner's confirmation, to a replacement device whose key epoch number equals the old device's, no receipt having been recorded for the first admission; the re-encryption being one that, as a first submit, would be admitted, credit aside | admitted, not charged again |
 | a poll page whose first receipt fails verification | that message stays `pending`, the receipts after it are processed, and `receipts_after` advances past all of them |
+| a plaintext whose `sent_at` is `2026-09-23T20:00:00+01:00` | `quarantined` receipt, no message note |
+| a plaintext whose `sent_at` is `2026-09-23 20:00:00Z` | `quarantined` receipt, no message note |
+| a plaintext whose `sent_at` is `2026-09-23T20:00:00-00:00` | `quarantined` receipt, no message note |
+| a server timestamp `2026-09-24T01:30:00+05:30` | accepted and normalized to `2026-09-23T20:00:00Z` |
+| an identity-point signing key `01` followed by 31 zero bytes | refused at enrolment and at pin |
+| a non-canonical signing key encoding: identity with the sign bit set, or `y = p + 1` | refused at enrolment and at pin |
+| a plaintext with duplicate `x` members inside an ignored `extension` object | `quarantined` receipt, no message note |
+| a poll page whose first delivery has `delivery_attempt_id` `not-a-uuid`, beside a valid delivery and receipt | malformed delivery reported and skipped with no receipt; valid items and cursor remain readable |
 
 The seeds above are `SHA-256` of the ASCII labels `khive-node-v1 vector sender kem`,
 `khive-node-v1 vector recipient kem`, `khive-node-v1 vector sender sig`,
