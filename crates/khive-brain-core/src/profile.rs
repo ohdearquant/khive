@@ -246,40 +246,7 @@ impl BalancedRecallState {
             }
         }
 
-        // Salience posterior — driven by explicit feedback signal
-        if let BrainSignal::Feedback { signal: ref fb, .. } = signal {
-            match fb {
-                FeedbackSignal::Useful => self.salience.update_success(),
-                FeedbackSignal::NotUseful | FeedbackSignal::Wrong => self.salience.update_failure(),
-            }
-        }
-
-        // Semantic feedback: weighted posterior updates.
-        //
-        // ADR-081 §2: `effective_weight` can be `0.0` when the fold gate clamps
-        // an over-cap implicit event. `update_*_weighted` requires a strictly
-        // positive weight (it asserts), so a zero-weight event still counts
-        // toward `total_events` (above) — it happened and was folded — but
-        // contributes no posterior movement at all, matching "folded at zero
-        // weight" literally rather than passing 0 into the weighted update.
-        if let BrainSignal::SemanticFeedback {
-            event_kind: ref ek,
-            effective_weight,
-            ..
-        } = signal
-        {
-            let w = *effective_weight;
-            if w > 0.0 {
-                if ek.is_positive() {
-                    self.salience.update_success_weighted(w);
-                } else {
-                    self.salience.update_failure_weighted(w);
-                }
-                if *ek == FeedbackEventKind::Correction {
-                    self.relevance.update_failure_weighted(w);
-                }
-            }
-        }
+        self.apply_feedback_posteriors(signal);
 
         // Temporal posterior — driven by recall latency
         const FAST_US: i64 = 50_000;
@@ -295,26 +262,13 @@ impl BalancedRecallState {
             _ => {}
         }
 
-        // Per-entity posterior updates
-        if let BrainSignal::SemanticFeedback {
-            target_id: eid,
-            event_kind: ref ek,
-            effective_weight,
-            ..
-        } = signal
-        {
-            let w = *effective_weight;
-            if w > 0.0 {
-                let posterior = self
-                    .entity_posteriors
-                    .get_or_insert(*eid, || BetaPosterior::new(1.0, 1.0));
-                if ek.is_positive() {
-                    posterior.update_success_weighted(w);
-                } else {
-                    posterior.update_failure_weighted(w);
-                }
-            }
-        } else if let Some((entity_id, positive)) = entity_signal(signal) {
+        if matches!(
+            signal,
+            BrainSignal::Feedback { .. } | BrainSignal::SemanticFeedback { .. }
+        ) {
+            return;
+        }
+        if let Some((entity_id, positive)) = entity_signal(signal) {
             let posterior = self
                 .entity_posteriors
                 .get_or_insert(entity_id, || BetaPosterior::new(1.0, 1.0));
@@ -323,6 +277,56 @@ impl BalancedRecallState {
             } else {
                 posterior.update_failure();
             }
+        }
+    }
+
+    /// Update feedback posteriors without changing counters or exploration state.
+    /// Non-feedback signals and nonpositive semantic weights leave them untouched.
+    pub fn apply_feedback_posteriors(&mut self, signal: &BrainSignal) {
+        match signal {
+            BrainSignal::Feedback {
+                target_id, signal, ..
+            } => {
+                let positive = matches!(signal, FeedbackSignal::Useful);
+                if positive {
+                    self.salience.update_success();
+                } else {
+                    self.salience.update_failure();
+                }
+                let posterior = self
+                    .entity_posteriors
+                    .get_or_insert(*target_id, || BetaPosterior::new(1.0, 1.0));
+                if positive {
+                    posterior.update_success();
+                } else {
+                    posterior.update_failure();
+                }
+            }
+            BrainSignal::SemanticFeedback {
+                target_id,
+                event_kind,
+                effective_weight,
+                ..
+            } if *effective_weight > 0.0 => {
+                let weight = *effective_weight;
+                if event_kind.is_positive() {
+                    self.salience.update_success_weighted(weight);
+                } else {
+                    self.salience.update_failure_weighted(weight);
+                }
+                if *event_kind == FeedbackEventKind::Correction {
+                    self.relevance.update_failure_weighted(weight);
+                }
+                let posterior = self
+                    .entity_posteriors
+                    .get_or_insert(*target_id, || BetaPosterior::new(1.0, 1.0));
+                if event_kind.is_positive() {
+                    posterior.update_success_weighted(weight);
+                } else {
+                    posterior.update_failure_weighted(weight);
+                }
+            }
+            _ => {}
         }
     }
 }
