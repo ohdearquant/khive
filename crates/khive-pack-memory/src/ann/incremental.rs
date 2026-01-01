@@ -150,6 +150,43 @@ pub(super) async fn protected_tail(
     })
 }
 
+pub(super) struct MaintenanceFence {
+    incarnation: Arc<()>,
+    applied: u64,
+    epoch: u64,
+    generation: u64,
+    published_seq: u64,
+    dirty_ops: u64,
+    commit_digest: Option<[u8; 32]>,
+    last_delta_nonce: Option<Uuid>,
+}
+
+impl MaintenanceFence {
+    pub(super) fn capture(bridge: &AnnBridge) -> Self {
+        Self {
+            incarnation: Arc::clone(&bridge.incarnation),
+            applied: bridge.index.last_applied_seq().unwrap_or(0),
+            epoch: bridge.epoch_baseline,
+            generation: bridge.generation,
+            published_seq: bridge.published_seq,
+            dirty_ops: bridge.dirty_ops,
+            commit_digest: bridge.commit_digest,
+            last_delta_nonce: bridge.last_delta_nonce,
+        }
+    }
+
+    pub(super) fn matches(&self, bridge: &AnnBridge) -> bool {
+        Arc::ptr_eq(&self.incarnation, &bridge.incarnation)
+            && self.applied == bridge.index.last_applied_seq().unwrap_or(0)
+            && self.epoch == bridge.epoch_baseline
+            && self.generation == bridge.generation
+            && self.published_seq == bridge.published_seq
+            && self.dirty_ops == bridge.dirty_ops
+            && self.commit_digest == bridge.commit_digest
+            && self.last_delta_nonce == bridge.last_delta_nonce
+    }
+}
+
 pub(super) async fn maintain_installed(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
@@ -187,39 +224,95 @@ pub(super) async fn maintain_installed(
         return Ok(InstalledMaintenance::Rebuild);
     }
     details.ops_applied = ops.len() as u64;
-    let publish = {
-        let mut indexes = ann.indexes.write().await;
-        let Some(bridge) = indexes.get_mut(key) else {
+    let no_work = if raw_count == 0 {
+        let indexes = ann.indexes.read().await;
+        let Some(bridge) = indexes.get(key) else {
             return Ok(InstalledMaintenance::Absent);
         };
         if bridge.index.last_applied_seq().unwrap_or(0) != applied || bridge.epoch_baseline != epoch
         {
             return Ok(InstalledMaintenance::Absent);
         }
-        if raw_count > 0 {
-            let recorded_ops = ops.clone();
-            if let Err(error) = bridge.apply_final_ops(ops, new_s) {
+        let publish = policy.due(bridge);
+        let consolidate = publish
+            && bridge.needs_full_compaction()
+            && (bridge.index.needs_consolidation()
+                || bridge.index.ops_since_consolidation() >= policy.consolidate_tau);
+        (!consolidate).then(|| (MaintenanceFence::capture(bridge), publish))
+    } else {
+        None
+    };
+    let (publish, publication_incarnation) = if let Some((fence, publish)) = no_work {
+        let mut indexes = ann.indexes.write().await;
+        let Some(bridge) = indexes.get_mut(key) else {
+            return Ok(InstalledMaintenance::Absent);
+        };
+        if !fence.matches(bridge) {
+            return Ok(InstalledMaintenance::Absent);
+        }
+        khive_storage::ensure_request_read_active("memory.ann.incremental")?;
+        bridge.generation = generation;
+        (publish, Arc::clone(&bridge.incarnation))
+    } else {
+        let shared = Arc::clone(ann);
+        let maintenance_key = key.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let indexes = shared.indexes.blocking_read();
+            let Some(incumbent) = indexes.get(&maintenance_key) else {
+                return Ok(None);
+            };
+            if incumbent.index.last_applied_seq().unwrap_or(0) != applied
+                || incumbent.epoch_baseline != epoch
+            {
+                return Ok(None);
+            }
+            let fence = MaintenanceFence::capture(incumbent);
+            let mut bridge = incumbent.fork_for_maintenance();
+            drop(indexes);
+            if raw_count > 0 {
+                let recorded_ops = ops.clone();
+                bridge.apply_final_ops(ops, new_s)?;
+                bridge.record_delta_batch(recorded_ops, new_s, raw_count);
+            }
+            bridge.generation = generation;
+            bridge.dirty_ops = bridge.dirty_ops.saturating_add(raw_count);
+            if raw_count > 0 {
+                bridge.namespace_set.clear();
+            }
+            let publish = policy.due(&bridge) || (raw_count > 0 && bridge.needs_full_compaction());
+            if publish && bridge.needs_full_compaction() {
+                bridge.consolidate_if_needed(policy.consolidate_tau)?;
+            }
+            Ok::<_, String>(Some((fence, bridge, publish)))
+        })
+        .await
+        .map_err(|error| RuntimeError::Internal(format!("memory ANN maintenance task: {error}")))?;
+        let (fence, candidate, publish) = match prepared {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Ok(InstalledMaintenance::Absent),
+            Err(error) => {
                 tracing::warn!(%error, model, "memory ANN incremental apply failed; rebuilding");
-                indexes.remove(key);
                 return Ok(InstalledMaintenance::Rebuild);
             }
-            bridge.record_delta_batch(recorded_ops, new_s, raw_count);
+        };
+        khive_storage::ensure_request_read_active("memory.ann.incremental")?;
+        if durable_epoch(rt).await != epoch {
+            return Ok(InstalledMaintenance::Rebuild);
         }
-        bridge.generation = generation;
-        bridge.dirty_ops = bridge.dirty_ops.saturating_add(raw_count);
-        if raw_count > 0 {
-            // Deltas span all namespaces. Empty is the conservative over-fetch policy.
-            bridge.namespace_set.clear();
-        }
-        // Crossing the chain limit must compact the already-applied bridge in
-        // this pass. It is not a reason to rescan and rebuild the corpus.
-        let publish = policy.due(bridge) || (raw_count > 0 && bridge.needs_full_compaction());
-        if publish && bridge.needs_full_compaction() {
-            bridge
-                .consolidate_if_needed(policy.consolidate_tau)
-                .map_err(RuntimeError::Internal)?;
-        }
-        publish
+        let publication_incarnation = Arc::clone(&candidate.incarnation);
+        let retired = {
+            let mut indexes = ann.indexes.write().await;
+            let Some(incumbent) = indexes.get(key) else {
+                return Ok(InstalledMaintenance::Absent);
+            };
+            if !fence.matches(incumbent) {
+                return Ok(InstalledMaintenance::Absent);
+            }
+            khive_storage::ensure_request_read_active("memory.ann.incremental")?;
+            indexes.insert(key.clone(), candidate)
+        };
+        drop(retired);
+        (publish, publication_incarnation)
     };
     details.path = "incremental_in_place";
     if !publish {
@@ -232,6 +325,10 @@ pub(super) async fn maintain_installed(
         let Some(bridge) = indexes.get(key) else {
             return Ok(InstalledMaintenance::Absent);
         };
+        if !Arc::ptr_eq(&bridge.incarnation, &publication_incarnation) {
+            return Ok(InstalledMaintenance::Absent);
+        }
+        let publication_fence = MaintenanceFence::capture(bridge);
         let publication =
             persist_file_checkpoint(rt, ann, model, &dir, bridge, WatermarkAuthority::Active).await;
         drop(indexes);
@@ -242,19 +339,38 @@ pub(super) async fn maintain_installed(
             }) => {
                 reopened.generation = generation;
                 reopened.epoch_baseline = epoch;
-                install_replacing(ann, key, *reopened).await;
+                let retired = {
+                    let mut indexes = ann.indexes.write().await;
+                    if indexes
+                        .get(key)
+                        .is_some_and(|bridge| publication_fence.matches(bridge))
+                    {
+                        indexes.insert(key.clone(), *reopened)
+                    } else {
+                        return Ok(InstalledMaintenance::Absent);
+                    }
+                };
+                drop(retired);
             }
             Ok(CheckpointResult::Full {
                 reopened: None,
                 base_digest,
             }) => {
-                if let Some(bridge) = ann.indexes.write().await.get_mut(key) {
+                let mut indexes = ann.indexes.write().await;
+                if let Some(bridge) = indexes
+                    .get_mut(key)
+                    .filter(|bridge| publication_fence.matches(bridge))
+                {
                     bridge.mark_full_checkpoint_base(base_digest);
                     bridge.mark_checkpointed();
                 }
             }
             Ok(CheckpointResult::Delta(publication)) => {
-                if let Some(bridge) = ann.indexes.write().await.get_mut(key) {
+                let mut indexes = ann.indexes.write().await;
+                if let Some(bridge) = indexes
+                    .get_mut(key)
+                    .filter(|bridge| publication_fence.matches(bridge))
+                {
                     bridge.mark_delta_checkpoint(&publication);
                     bridge.mark_checkpointed();
                 }
@@ -295,7 +411,12 @@ pub(super) async fn maintain_installed(
             ann.pathless_post_watermark_release.notified().await;
         }
         let mut indexes = ann.indexes.write().await;
-        if let Some(bridge) = indexes.get_mut(key) {
+        if let Some(bridge) = indexes.get_mut(key).filter(|bridge| {
+            Arc::ptr_eq(&bridge.incarnation, &publication_incarnation)
+                && bridge.index.last_applied_seq().unwrap_or(0) == new_s
+                && bridge.epoch_baseline == epoch
+                && bridge.generation == generation
+        }) {
             // A pathless publication has no delta chain to retain or compact.
             bridge.delta_batches.clear();
             bridge.delta_raw_ops = 0;
