@@ -92,7 +92,7 @@ async fn note_search_retains_keyword_evidence_through_salience_weighting() {
 async fn entity_search_retains_keyword_evidence_separately_from_title_boost() {
     let (runtime, token) = runtime();
     let entity = runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -102,6 +102,7 @@ async fn entity_search_retains_keyword_evidence_separately_from_title_boost() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     let raw = runtime
         .text(&token)

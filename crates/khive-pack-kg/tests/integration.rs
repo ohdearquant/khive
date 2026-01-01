@@ -1697,15 +1697,33 @@ async fn neighbors_dispatch_accepts_foreign_full_uuid_and_scopes_edge_results() 
         .authorize(owner.clone())
         .expect("authorize owner namespace");
     let src = rt
-        .create_entity(&owner_token, "concept", None, "Source", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &owner_token,
+            "concept",
+            None,
+            "Source",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let tgt = rt
-        .create_entity(&owner_token, "concept", None, "Target", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &owner_token,
+            "concept",
+            None,
+            "Target",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let isolated = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &owner_token,
             "concept",
             None,
@@ -1715,11 +1733,12 @@ async fn neighbors_dispatch_accepts_foreign_full_uuid_and_scopes_edge_results() 
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let caller = Namespace::parse("neighbor-dispatch-caller").unwrap();
     let caller_token = rt.authorize(caller.clone()).expect("authorize caller");
     let caller_target = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &caller_token,
             "concept",
             None,
@@ -1729,6 +1748,7 @@ async fn neighbors_dispatch_accepts_foreign_full_uuid_and_scopes_edge_results() 
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(
         &owner_token,
@@ -3135,15 +3155,16 @@ async fn link_by_name_exact_match_wins_over_many_prefix_matching_decoys() {
     };
 
     // The exact-match entity is created first (oldest by created_at).
-    rt.create_entity(&token, "concept", None, "Base", None, None, vec![])
+    rt.create_entity_with_embedding_report(&token, "concept", None, "Base", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create 'Base' must succeed");
 
     // 150 decoys that genuinely match the name-prefix "Base" (no wildcard
     // chars), created after "Base", seeded directly through the runtime to
     // skip dispatch overhead.
     for i in 0..150 {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -3153,6 +3174,7 @@ async fn link_by_name_exact_match_wins_over_many_prefix_matching_decoys() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create decoy must succeed");
     }
 
@@ -6015,7 +6037,7 @@ async fn get_edge_returns_annotations_beyond_sqlite_bind_limit() {
 
     let (pack, runtime, token) = pack_and_runtime();
     let source = runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -6025,9 +6047,10 @@ async fn get_edge_returns_annotations_beyond_sqlite_bind_limit() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create source");
     let target = runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -6037,6 +6060,7 @@ async fn get_edge_returns_annotations_beyond_sqlite_bind_limit() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create target");
     let edge = runtime
         .link(
@@ -14409,7 +14433,7 @@ async fn list_tags_filter_rejects_substrates_without_tags() {
 async fn list_entity_limit_under_cap_honored_exactly() {
     let (pack, rt, tok) = pack_and_runtime();
     for i in 0..5u32 {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -14419,6 +14443,7 @@ async fn list_entity_limit_under_cap_honored_exactly() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
     }
 
@@ -14444,7 +14469,7 @@ async fn list_entity_limit_under_cap_honored_exactly() {
 async fn list_entity_limit_over_cap_reports_effective_limit() {
     let (pack, rt, tok) = pack_and_runtime();
     for i in 0..10u32 {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -14454,6 +14479,7 @@ async fn list_entity_limit_over_cap_reports_effective_limit() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
     }
 
@@ -14480,7 +14506,7 @@ async fn list_entity_limit_over_cap_reports_effective_limit() {
 async fn list_entity_limit_over_cap_truncates_with_metadata() {
     let (pack, rt, tok) = pack_and_runtime();
     for i in 0..501u32 {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -14490,6 +14516,7 @@ async fn list_entity_limit_over_cap_truncates_with_metadata() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
     }
 
@@ -14654,7 +14681,7 @@ async fn list_edge_offset_mode_limit_under_cap_honored_exactly() {
     let mut node_ids = Vec::new();
     for i in 0..6u32 {
         let e = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &tok,
                 "concept",
                 None,
@@ -14664,6 +14691,7 @@ async fn list_edge_offset_mode_limit_under_cap_honored_exactly() {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .unwrap_or_else(|e| panic!("create node {i} must succeed: {e}"));
         node_ids.push(e.id);
     }
@@ -14701,7 +14729,7 @@ async fn list_edge_zero_limit_matches_its_metadata_and_returns_no_rows() {
 
     let (pack, rt, tok) = pack_and_runtime();
     let source = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -14711,9 +14739,10 @@ async fn list_edge_zero_limit_matches_its_metadata_and_returns_no_rows() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create source");
     let target = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -14723,6 +14752,7 @@ async fn list_edge_zero_limit_matches_its_metadata_and_returns_no_rows() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create target");
     rt.link(&tok, source.id, target.id, EdgeRelation::Extends, 1.0, None)
         .await
@@ -14754,7 +14784,7 @@ async fn list_edge_limit_over_cap_truncates_with_metadata_in_both_modes() {
     let mut node_ids = Vec::with_capacity(n_nodes);
     for i in 0..n_nodes {
         let e = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &tok,
                 "concept",
                 None,
@@ -14764,6 +14794,7 @@ async fn list_edge_limit_over_cap_truncates_with_metadata_in_both_modes() {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .unwrap_or_else(|e| panic!("create node {i} must succeed: {e}"));
         node_ids.push(e.id);
     }
@@ -15175,7 +15206,7 @@ async fn search_entity_emits_exactly_one_search_executed_event() {
     let ns = Namespace::local();
     let token = rt.authorize(ns.clone()).expect("authorize local");
 
-    rt.create_entity(
+    rt.create_entity_with_embedding_report(
         &token,
         "concept",
         None,
@@ -15185,6 +15216,7 @@ async fn search_entity_emits_exactly_one_search_executed_event() {
         vec![],
     )
     .await
+    .map(|(record, _report)| record)
     .expect("create entity");
 
     let mut builder = VerbRegistryBuilder::new();
@@ -16742,7 +16774,7 @@ async fn stats_separates_structure_from_provenance_in_its_edge_counts() {
 async fn list_entity_a_full_page_is_distinguishable_from_a_complete_one() {
     let (pack, rt, tok) = pack_and_runtime();
     for i in 0..10u32 {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -16752,6 +16784,7 @@ async fn list_entity_a_full_page_is_distinguishable_from_a_complete_one() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
     }
 
@@ -16805,7 +16838,7 @@ async fn list_entity_a_full_page_is_distinguishable_from_a_complete_one() {
 async fn list_entity_at_the_cap_reports_the_population_it_did_not_return() {
     let (pack, rt, tok) = pack_and_runtime();
     for i in 0..501u32 {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -16815,6 +16848,7 @@ async fn list_entity_at_the_cap_reports_the_population_it_did_not_return() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
     }
 

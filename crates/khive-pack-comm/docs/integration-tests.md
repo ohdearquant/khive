@@ -112,7 +112,7 @@ A child process spawned in the same project scope resolves its actor identity fr
 
 ### send-single-txn: atomic dual-write coverage
 
-`dual_write_message` commits both message copies (row + FTS + one vector row in the configured default model for each copy) through `khive_runtime::create_notes_atomic` in one writer transaction. The policy regression also checks that an ordinary note still writes every configured model.
+`dual_write_message` commits both message copies (row + FTS + one vector row in the configured default model for each copy) through `khive_runtime::create_notes_atomic_with_report` in one writer transaction. The policy regression also checks that an ordinary note still writes every configured model.
 
 ## Extended per-test notes
 

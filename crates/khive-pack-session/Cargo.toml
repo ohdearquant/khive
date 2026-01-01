@@ -41,6 +41,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+lattice-embed = { workspace = true }
 rusqlite = { workspace = true }
 khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
 tempfile = { workspace = true }

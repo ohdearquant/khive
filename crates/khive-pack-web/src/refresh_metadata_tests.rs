@@ -124,6 +124,187 @@ async fn refresh(
     .unwrap()
 }
 
+struct CapturingRefreshEmbedder(Arc<std::sync::Mutex<Vec<String>>>);
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for CapturingRefreshEmbedder {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        self.0.lock().unwrap().extend_from_slice(texts);
+        Ok(texts.iter().map(|_| vec![1.0; 4]).collect())
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "web-refresh-capture"
+    }
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for CapturingRefreshEmbedder {
+    fn name(&self) -> &str {
+        "web-refresh-capture"
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    async fn build(
+        &self,
+    ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+        Ok(Arc::new(Self(Arc::clone(&self.0))))
+    }
+}
+
+// Controls: independently restore each legacy guarded update, or discard its
+// returned report; its metadata/body/redirect arm must fail. Removing only the
+// receipt's report field must fail even while the reply still discloses it.
+#[tokio::test]
+async fn refresh_discloses_bounded_embeddings_in_reply_and_receipt_for_each_update_path() {
+    for (arm, long) in [
+        ("metadata", true),
+        ("body", true),
+        ("redirect", true),
+        ("metadata", false),
+    ] {
+        let (runtime, token, _dir) = fixture();
+        let source = Url::parse("https://metadata.example/embedding-source").unwrap();
+        let terminal = Url::parse("https://metadata.example/embedding-terminal").unwrap();
+        let source_id = seed(&runtime, &token, &source, &[]).await;
+        let target_id = if arm == "redirect" {
+            seed(&runtime, &token, &terminal, &[]).await
+        } else {
+            source_id
+        };
+        let budget = khive_runtime::retrieval::document_embedding_budget("web-refresh-capture");
+        let name = if long {
+            "n".repeat(budget + 1)
+        } else {
+            "short refresh name".to_string()
+        };
+        runtime
+            .update_entity_with_embedding_report(
+                &token,
+                target_id,
+                khive_runtime::EntityPatch {
+                    name: Some(name.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime.register_embedder(CapturingRefreshEmbedder(Arc::clone(&captured)));
+        let before = entity(&runtime, &token, source_id)
+            .await
+            .properties
+            .unwrap();
+        let sent = refresh_request_headers(&before).unwrap();
+        let mut headers = response_headers();
+        headers.insert("content-type", "text/html".parse().unwrap());
+        let hops = if arm == "redirect" {
+            vec![crate::fetch::RedirectHop {
+                from: source.clone(),
+                to: terminal.clone(),
+                status: 302,
+            }]
+        } else {
+            vec![]
+        };
+        let reply = settle_refresh_with_request_headers(
+            &runtime,
+            &token,
+            source_id,
+            before["url"].as_str().unwrap(),
+            before["blob_ref"].as_str().unwrap(),
+            HopOutcome {
+                status: if arm == "metadata" { 304 } else { 200 },
+                final_url: if arm == "redirect" { terminal } else { source },
+                headers,
+                redirect_to: None,
+                body: if arm == "metadata" {
+                    None
+                } else {
+                    Some((b"changed representation bytes".to_vec(), false))
+                },
+            },
+            &hops,
+            &sent,
+        )
+        .await
+        .expect("refresh must retain its bounded embedding result");
+        let request = receipt(&runtime, &token, &reply).await;
+        if long {
+            let expected = json!({"truncated": 1, "discarded_bytes": 1});
+            assert_eq!(
+                reply["embedding_truncation_report"], expected,
+                "reply {arm}"
+            );
+            assert_eq!(
+                request["embedding_truncation_report"], expected,
+                "receipt {arm}"
+            );
+        } else {
+            assert!(reply.get("embedding_truncation_report").is_none());
+            assert!(request.get("embedding_truncation_report").is_none());
+        }
+        let embedded = if long {
+            "n".repeat(budget)
+        } else {
+            name.clone()
+        };
+        {
+            let seen = captured.lock().unwrap();
+            let entity_inputs: Vec<_> = seen
+                .iter()
+                .filter(|text| text.starts_with(if long { "nnn" } else { name.as_str() }))
+                .collect();
+            assert_eq!(entity_inputs, vec![&embedded], "exact provider input {arm}");
+            assert_eq!(
+                entity_inputs[0].len(),
+                if long { budget } else { name.len() }
+            );
+            if long {
+                let discarded = (name.len() - entity_inputs[0].len()) as u64;
+                assert_eq!(
+                    reply["embedding_truncation_report"]["discarded_bytes"],
+                    discarded
+                );
+                assert_eq!(
+                    request["embedding_truncation_report"]["discarded_bytes"],
+                    discarded
+                );
+            }
+        }
+        let stored = entity(&runtime, &token, target_id).await;
+        assert_eq!(stored.name, name);
+        assert_eq!(stored.entity_type.as_deref(), Some("page"));
+        assert_eq!(reply["lost_race"], false);
+        if arm != "metadata" {
+            let body_ref = stored.properties.as_ref().unwrap()["blob_ref"]
+                .as_str()
+                .unwrap();
+            let (capture_id, capture_request) =
+                crate::receipt::capture_for_body(&runtime, &token, &stored, body_ref)
+                    .await
+                    .unwrap()
+                    .expect("the receipt with an embedding report still owns this body");
+            assert_eq!(capture_id.to_string(), reply["receipt_id"]);
+            assert_eq!(
+                capture_request["embedding_truncation_report"],
+                request["embedding_truncation_report"]
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn first_fetch_then_refresh_keeps_negotiation_on_the_rooted_body() {
     let (runtime, token, _dir) = fixture();

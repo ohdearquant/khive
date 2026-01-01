@@ -29,6 +29,7 @@
 //! the content — `id` itself when there was no redirect, the terminal row
 //! otherwise.
 
+use khive_runtime::retrieval::EmbeddingTruncationReport;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{EdgeRelation, Entity};
 use serde_json::{json, Value};
@@ -93,10 +94,10 @@ async fn apply_refresh_metadata(
     status: u16,
     headers: &reqwest::header::HeaderMap,
     request_context: Option<&[(String, String)]>,
-) -> Result<bool, RuntimeError> {
+) -> Result<(bool, EmbeddingTruncationReport), RuntimeError> {
     let properties = expected.properties.clone().unwrap_or(Value::Null);
     if properties.get("blob_ref").and_then(Value::as_str) != Some(expected_content_ref) {
-        return Ok(false);
+        return Ok((false, EmbeddingTruncationReport::default()));
     }
     let mut patch = serde_json::Map::new();
     let mut entity_type = None;
@@ -147,8 +148,8 @@ async fn apply_refresh_metadata(
             patch.insert("request_headers".to_string(), selected);
         }
     }
-    match runtime
-        .update_entity_if_unchanged(
+    let embedding = match runtime
+        .update_entity_if_unchanged_with_embedding_report(
             token,
             expected,
             khive_runtime::EntityPatch {
@@ -160,13 +161,13 @@ async fn apply_refresh_metadata(
         )
         .await
     {
-        Ok(_) => {}
+        Ok((_, embedding)) => embedding,
         Err(RuntimeError::Khive(error)) if error.kind() == khive_types::ErrorKind::Conflict => {
-            return Ok(false);
+            return Ok((false, EmbeddingTruncationReport::default()));
         }
         Err(error) => return Err(error),
-    }
-    Ok(true)
+    };
+    Ok((true, embedding))
 }
 
 fn stored_request_url(properties: &Value) -> Result<Url, RuntimeError> {
@@ -679,6 +680,7 @@ async fn settle_refresh_from_snapshot(
     }
 
     let mut changed = false;
+    let mut embedding_truncation_report = EmbeddingTruncationReport::default();
     let mut was_truncated = prior_truncated;
     let body_present = outcome.body.is_some();
     let body_bytes = outcome
@@ -724,8 +726,8 @@ async fn settle_refresh_from_snapshot(
                     let expected = metadata_snapshot
                         .as_ref()
                         .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
-                    let mut settled = runtime
-                        .update_entity_if_unchanged(
+                    let (mut settled, embedding) = runtime
+                        .update_entity_if_unchanged_with_embedding_report(
                             token,
                             expected,
                             khive_runtime::EntityPatch {
@@ -736,6 +738,7 @@ async fn settle_refresh_from_snapshot(
                             &[],
                         )
                         .await?;
+                    embedding_truncation_report.merge(embedding);
                     if body_changed {
                         crate::fetch::root_body(
                             runtime,
@@ -779,7 +782,7 @@ async fn settle_refresh_from_snapshot(
                     let settled = match terminal_body_guard.as_ref() {
                         Some(expected) => {
                             match runtime
-                                .update_entity_if_unchanged(
+                                .update_entity_if_unchanged_with_embedding_report(
                                     token,
                                     expected,
                                     khive_runtime::EntityPatch {
@@ -791,7 +794,10 @@ async fn settle_refresh_from_snapshot(
                                 )
                                 .await
                             {
-                                Ok(entity) => Some(entity),
+                                Ok((entity, embedding)) => {
+                                    embedding_truncation_report.merge(embedding);
+                                    Some(entity)
+                                }
                                 Err(RuntimeError::Khive(error))
                                     if error.kind() == khive_types::ErrorKind::Conflict =>
                                 {
@@ -842,7 +848,7 @@ async fn settle_refresh_from_snapshot(
     }
 
     after_body_settlement.await;
-    let metadata_applied = match metadata_snapshot.as_ref() {
+    let (metadata_applied, metadata_embedding) = match metadata_snapshot.as_ref() {
         Some(expected) => {
             apply_refresh_metadata(
                 runtime,
@@ -866,8 +872,9 @@ async fn settle_refresh_from_snapshot(
             )
             .await?
         }
-        None => false,
+        None => (false, EmbeddingTruncationReport::default()),
     };
+    embedding_truncation_report.merge(metadata_embedding);
     let lost_race = !metadata_applied;
     if lost_race && !redirect_hops.is_empty() {
         // The response's bytes were not committed as the terminal row's
@@ -882,7 +889,7 @@ async fn settle_refresh_from_snapshot(
         })
         .collect();
 
-    let request_record = json!({
+    let mut request_record = json!({
         "verb": "web.refresh",
         "url": url_str,
         "final_url": final_url_str,
@@ -897,6 +904,9 @@ async fn settle_refresh_from_snapshot(
         "redirects": redirect_hops.len() as u32,
         "redirect_chain": redirect_chain,
     });
+    if embedding_truncation_report.any_truncated() {
+        request_record["embedding_truncation_report"] = json!(embedding_truncation_report);
+    }
     let receipt_id = write_receipt(
         runtime,
         token,
@@ -925,7 +935,7 @@ async fn settle_refresh_from_snapshot(
             .await?;
     }
 
-    Ok(json!({
+    let mut reply = json!({
         "id": id.to_string(),
         "status": outcome.status,
         "changed": changed,
@@ -934,7 +944,11 @@ async fn settle_refresh_from_snapshot(
         "receipt_id": receipt_id.to_string(),
         "redirects": redirect_hops.len() as u32,
         "final_id": final_id.to_string(),
-    }))
+    });
+    if embedding_truncation_report.any_truncated() {
+        reply["embedding_truncation_report"] = json!(embedding_truncation_report);
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]

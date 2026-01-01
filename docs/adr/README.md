@@ -267,6 +267,7 @@ Amendments whose own status reads Proposed. Each needs the sign-off described un
 Amendments to accepted records:
 
 - [ADR-005 amendment: shared streaming event cursor walk](ADR-005-storage-capability-traits.md#amendment-shared-streaming-event-cursor-walk-2026-10-01) (2026-10-01): proposed runtime cursor walk over the existing EventStore capability, shared by brain and moodboard (#3709, #3729).
+- [ADR-031 Amendment 4](ADR-031-multi-engine-retrieval.md#amendment-4-2026-09-30-disclose-bounded-document-embedding-input-at-the-rust-runtime-boundary) (2026-09-30): document-embedding truncation disclosure and Rust runtime API migration.
 - [ADR-017](ADR-017-pack-standard.md#amendment-2026-09-12-a-runtime-owned-adapter-because-static-declarations-are-not-an-install-format) (2026-09-12): a runtime-owned adapter, because static declarations are not an install format.
 - [ADR-019 Amendment 3](ADR-019-gtd-pack.md#amendment-3-proposed-2026-09-14-additive-task-query-filters-2678) (2026-09-14): additive task-query filters (#2678).
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-an-independently-installed-distribution-is-a-pack-2026-09-12) (2026-09-12): an independently installed distribution is a pack.
