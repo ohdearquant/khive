@@ -1,10 +1,12 @@
 //! `neighbors`, `traverse`, and `query` verb handlers.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{NamespaceToken, RuntimeError};
+use khive_runtime::{KgNeighborRead, NamespaceToken, Resolved, RuntimeError, VerbRegistry};
 use khive_storage::types::{
     LimitReport, NeighborCursor, NeighborHit, NeighborQuery, TraversalExecutionBudget,
     TraversalOptions, TraversalRequest, DEFAULT_TRAVERSAL_LIMIT, MAX_TRAVERSAL_DEPTH,
@@ -15,9 +17,13 @@ use super::common::{
     deser, parse_direction, parse_relation, render_query_result, resolve_uuid_async, to_json,
     NeighborProjection, NeighborsParams, QueryParams, TraverseParams, HARD_CAP,
 };
+use super::message_scope::{
+    message_endpoint_permitted, message_neighbor_permitted, resolve_mailbox_graph_id,
+};
 use crate::KgPack;
 
 const NEIGHBOR_LIMIT_CAP: u32 = 1000;
+const MESSAGE_NEIGHBOR_SCAN_CAP: u32 = 10_000;
 
 #[derive(Serialize)]
 struct NeighborHitResponse {
@@ -38,9 +44,14 @@ impl KgPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        let mailbox_view =
+            self.runtime
+                .authorize_mailbox_view(token, "neighbors", None, &params)?;
         let p: NeighborsParams = deser(params)?;
-        let node_id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
+        let node_id =
+            resolve_mailbox_graph_id(&self.runtime, registry, token, &mailbox_view, &p.id).await?;
         let direction = parse_direction(p.direction.as_deref())?;
         let relations = p
             .relations
@@ -87,22 +98,126 @@ impl KgPack {
             limit: effective_limit.map(|limit| limit.saturating_add(1)),
             min_weight: p.min_weight,
         };
-        let mut hits = if page_mode {
-            self.runtime
-                .neighbors_with_query_page(
-                    token,
-                    node_id,
-                    query.clone(),
-                    after,
-                    neighbor_kinds,
-                    enrich,
-                )
-                .await?
-        } else {
+        let origin = match self.runtime.resolve_by_id(token, node_id).await? {
+            Some(origin) => Some(origin),
+            None => {
+                registry
+                    .resolve_kg_read_by_id(&self.runtime, token, node_id, false)
+                    .await?
+            }
+        };
+        let anchor_permitted = match &origin {
+            Some(Resolved::Note(note)) => mailbox_view.permits_message_note(token, note),
+            Some(_) => true,
+            None => {
+                message_endpoint_permitted(&self.runtime, registry, token, &mailbox_view, node_id)
+                    .await?
+            }
+        };
+        let mut permitted = HashMap::from([(node_id, anchor_permitted)]);
+        if !page_mode {
             query.limit = None;
-            self.runtime
-                .neighbors_with_query(token, node_id, query)
-                .await?
+        }
+        let admitted_target = query.limit;
+        let (mut hits, scan_incomplete) = if !anchor_permitted {
+            (Vec::new(), false)
+        } else {
+            let namespaces = if admitted_target.is_some() {
+                token
+                    .visible_namespaces()
+                    .iter()
+                    .cloned()
+                    .map(Some)
+                    .collect()
+            } else {
+                vec![None]
+            };
+            let mut merged = Vec::new();
+            let mut scan_incomplete = false;
+            for namespace in namespaces {
+                query.limit = admitted_target;
+                loop {
+                    let options = KgNeighborRead {
+                        query: query.clone(),
+                        after,
+                        neighbor_kinds: neighbor_kinds.clone(),
+                        enrich,
+                        namespace: namespace.clone(),
+                    };
+                    let (raw_hits, entity_kinds) = if origin.is_some() {
+                        self.runtime
+                            .neighbors_for_resolved_kg_read_with_entity_kinds(
+                                token, node_id, options,
+                            )
+                            .await?
+                    } else {
+                        registry
+                            .neighbors_for_kg_read_with_entity_kinds(
+                                &self.runtime,
+                                token,
+                                node_id,
+                                options,
+                            )
+                            .await?
+                    };
+                    let raw_count = raw_hits.len();
+                    let mut visible_hits = Vec::with_capacity(raw_count);
+                    for hit in raw_hits {
+                        let allowed = match permitted.get(&hit.node_id) {
+                            Some(allowed) => *allowed,
+                            None => {
+                                let allowed = if entity_kinds
+                                    .get(&hit.node_id)
+                                    .is_some_and(|kind| kind != "message")
+                                {
+                                    true
+                                } else {
+                                    message_neighbor_permitted(
+                                        &self.runtime,
+                                        registry,
+                                        token,
+                                        &mailbox_view,
+                                        &hit,
+                                    )
+                                    .await?
+                                };
+                                permitted.insert(hit.node_id, allowed);
+                                allowed
+                            }
+                        };
+                        if allowed {
+                            visible_hits.push(hit);
+                        }
+                    }
+                    let Some(window) = query.limit else {
+                        merged.extend(visible_hits);
+                        break;
+                    };
+                    if visible_hits.len() >= admitted_target.unwrap_or(window) as usize
+                        || raw_count < window as usize
+                    {
+                        visible_hits.truncate(admitted_target.unwrap_or(window) as usize);
+                        merged.extend(visible_hits);
+                        break;
+                    }
+                    if window >= MESSAGE_NEIGHBOR_SCAN_CAP {
+                        merged.extend(visible_hits);
+                        scan_incomplete = true;
+                        break;
+                    }
+                    query.limit = Some(window.saturating_mul(2).min(MESSAGE_NEIGHBOR_SCAN_CAP));
+                }
+            }
+            merged.sort_by_key(|hit| (hit.node_id, hit.edge_id));
+            merged.dedup_by_key(|hit| (hit.node_id, hit.edge_id));
+            merged.sort_by(|a, b| {
+                b.weight
+                    .partial_cmp(&a.weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.node_id.cmp(&b.node_id))
+                    .then(a.edge_id.cmp(&b.edge_id))
+            });
+            (merged, scan_incomplete)
         };
         // entity_type is a cheap String field already fetched in the same
         // entity batch, so the clear happens handler-side rather than
@@ -179,6 +294,9 @@ impl KgPack {
                 "next_after": next_after.map(|cursor| serde_json::to_string(&cursor)).transpose()
                     .map_err(|error| RuntimeError::Internal(format!("serialize neighbor cursor: {error}")))?,
             });
+            if scan_incomplete {
+                response["scan_incomplete"] = serde_json::json!(true);
+            }
             if let Some(fields) = report.as_object() {
                 response
                     .as_object_mut()
