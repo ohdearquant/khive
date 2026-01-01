@@ -34,6 +34,9 @@ calculates aggregate store statistics without a domain write, and
 `session.vacuum` as `Write` because it explicitly compacts the store.
 Revision `domain-effects-v9` classifies `blob.import` and `blob.export` as `Write`: importing publishes an object and exporting writes a server file.
 
+Revision `domain-effects-v10` classifies `comm.transport_status` as `Read`: it reads
+namespace-scoped sender records and receipts without changing transport metadata.
+
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
 | `agent.kill`                 | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)            |
@@ -86,6 +89,7 @@ Revision `domain-effects-v9` classifies `blob.import` and `blob.export` as `Writ
 | `comm.reply`                 | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L300)            |
 | `comm.send`                  | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L47)             |
 | `comm.thread`                | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L336)            |
+| `comm.transport_status` | Read | Verb | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L139) |
 | `comm.unread`                | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L293)            |
 | `context`                    | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1091) |
 | `create`                     | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L71)   |

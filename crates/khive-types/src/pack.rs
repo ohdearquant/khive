@@ -223,7 +223,7 @@ pub enum VerbPresentationPolicy {
     ///
     /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`,
     /// `brain.feedback`, `brain.auto_feedback`, `memory.feedback`,
-    /// `comm.delivered`, `git.digest`, `git.ingest_cursor`.
+    /// `comm.delivered`, `comm.transport_status`, `git.digest`, `git.ingest_cursor`.
     ///
     /// `link` is included because the returned edge ID is the only handle for
     /// follow-up `neighbors`/`traverse` calls; short-form IDs risk prefix
@@ -238,6 +238,7 @@ pub enum VerbPresentationPolicy {
     /// feeds those strict paths, so it carries the same guarantee.
     /// `comm.delivered` is included because its `id` is an exact correlation
     /// key and the verb deliberately rejects prefix resolution (#1482).
+    /// `comm.transport_status` preserves the same exact outbound correlation key.
     ///
     /// `git.digest` is included because its successful response is also the
     /// durable receipt payload. Presentation must not shorten `receipt_id` or
@@ -272,6 +273,7 @@ impl HandlerDef {
             | "brain.auto_feedback"
             | "memory.feedback"
             | "comm.delivered"
+            | "comm.transport_status"
             | "git.digest"
             | "git.ingest_cursor" => VerbPresentationPolicy::AlwaysVerbose,
             "stream.append" => VerbPresentationPolicy::StreamAppendReceipt,
@@ -740,6 +742,7 @@ mod tests {
             "brain.auto_feedback",
             "memory.feedback",
             "comm.delivered",
+            "comm.transport_status",
             "git.digest",
             "git.ingest_cursor",
         ];

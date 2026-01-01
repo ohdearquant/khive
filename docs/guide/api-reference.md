@@ -23,7 +23,7 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 11    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -1889,7 +1889,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 10 verbs
+## `comm` pack — 11 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -1936,6 +1936,29 @@ outside this operation's contract.
 
 ```
 request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
+```
+
+### `comm.transport_status` — Assertive
+
+Read sender-local transport status from the runtime's own records and verified
+recipient receipts. The operation reads only the caller's primary namespace.
+
+| Param | Type | Required | Notes                                                                            |
+| ----- | ---- | -------- | -------------------------------------------------------------------------------- |
+| `id`  | uuid | yes      | Full outbound UUID from `comm.send` or `comm.reply`; short prefixes are refused. |
+
+Returns exactly `{id, status}`. `id` remains a canonical full UUID in Agent mode.
+`status` is `pending`, `recipient_stored`, `recipient_quarantined`, `failed`,
+or `unknown`. A service admission or hold remains `pending`; a verified receipt
+can supersede a local permanent failure. No record in the primary namespace
+returns `unknown`, including when another namespace contains that UUID.
+
+Across re-encrypted envelopes, a receipt row wins; otherwise the highest local
+envelope sequence wins. The read preserves envelope bytes and retry timestamps.
+`comm.delivered` keeps its separate internal dual-write confirmation contract.
+
+```
+request(ops="comm.transport_status(id=\"<full-outbound-uuid>\")")
 ```
 
 ### `comm.inbox` — Assertive

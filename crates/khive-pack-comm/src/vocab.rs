@@ -54,7 +54,7 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     PRIMARY KEY (channel_kind, channel_slug)\
 )";
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 16] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded. Returns the outbound message ID; the recipient receives a different inbound ID whose properties.outbound_ref links to the outbound ID. comm.read takes the inbound ID.",
@@ -132,6 +132,23 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
             description: "Full UUID returned as full_id by comm.send or comm.reply, or surfaced \
                           as outbound_id in an ambiguous atomic-write error. A full UUID is \
                           required because it is the exact correlation key.",
+            resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
+        }],
+    },
+    HandlerDef {
+        name: "comm.transport_status",
+        description: "Read sender-local transport status for an outbound UUID: pending, \
+                      recipient_stored, recipient_quarantined, failed or unknown. Holds \
+                      remain pending; absence in the caller's namespace is unknown.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "id",
+            param_type: "uuid",
+            required: true,
+            description: "Full outbound UUID returned as full_id by comm.send or comm.reply, \
+                          or as outbound_id in an ambiguous atomic-write error. Prefixes \
+                          require scoped resolution and are refused.",
             resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
         }],
     },

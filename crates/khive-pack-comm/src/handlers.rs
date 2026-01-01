@@ -1,7 +1,8 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! All ten public verbs (`send`, `delivered`, `inbox`, `unread`, `read`, `mark_read`,
-//! `reply`, `thread`, `health`, `probe`) store or query comm state. Message-specific metadata lives
+//! All eleven public verbs (`send`, `delivered`, `transport_status`, `inbox`, `unread`,
+//! `read`, `mark_read`, `reply`, `thread`, `health`, `probe`) store or query comm state.
+//! Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
 use std::collections::{HashMap, HashSet};
@@ -29,7 +30,7 @@ use crate::message::{
 use crate::params::{
     deser, CleanupExpiredQuarantineParams, CursorCommitParams, CursorGetParams, DeliveredParams,
     HeartbeatParams, InboxParams, IngestParams, MarkReadParams, ProbeParams, QuarantineCleanupMode,
-    ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
+    ReadParams, ReplyParams, SendParams, ThreadParams, TransportStatusParams, UnreadParams,
 };
 
 fn add_embedding_truncation_warning(
@@ -489,6 +490,25 @@ pub(crate) async fn handle_delivered(
         "delivered": delivered,
         "inbound_count": inbound_count,
     }))
+}
+
+/// Read the runtime's own transport records and verified recipient outcomes.
+pub(crate) async fn handle_transport_status(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: TransportStatusParams = deser(params)?;
+    let outbound_id = Uuid::parse_str(p.id.trim()).map_err(|_| {
+        RuntimeError::InvalidInput(
+            "transport_status: a short prefix would require scoped resolution; `id` must \
+             be the full outbound UUID returned as `full_id` by comm.send or comm.reply, \
+             or surfaced as `outbound_id` in an ambiguous atomic-write error"
+                .into(),
+        )
+    })?;
+    let status = runtime.sender_transport_status(token, outbound_id).await?;
+    Ok(json!({"id": outbound_id, "status": status}))
 }
 
 fn caller_inherits_legacy_pool(token: &NamespaceToken) -> bool {
