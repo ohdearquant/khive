@@ -1,6 +1,6 @@
 # ADR-117a: Session Identity and Tenant Isolation
 
-**Status**: accepted (amended 2026-09-24)
+**Status**: accepted (amended 2026-09-24); Amendment 3 proposed (2026-11-16)
 **Date**: 2026-07-19
 **Authors**: khive maintainers
 **Implements**: [ADR-117](ADR-117-session-continuity-search.md) D1, D2, D4 (the direction ADR names
@@ -381,3 +381,136 @@ deliverables land together or not at all.
 connection-identity mechanism exists today, and building one (peer-credential capture, connection principal in
 `GateRequest`) is a separately gated ADR. This ADR makes the predicate correct and fail-closed so it composes
 with that work; it does not pre-empt it.
+
+---
+
+## Amendment 3 (2026-11-16): caller-attributed transcript ownership
+
+**Status: Proposed (2026-11-16).** Refs #6506.
+
+> No maintainer instruction; this amendment follows issue #6506.
+
+Within one uid, an actor label is self-reported. The own-only default reduces accidental reads of another
+actor's transcripts; it does not authenticate the caller as that actor or protect against a same-uid
+process choosing another label. Tenant isolation remains store-per-tenant, as required by ADR-007 Rule 9.
+
+This proposal adds a persistent transcript owner and owner-qualified reads inside the selected tenant
+store. It replaces the namespace-only ownership and local-exposure assumptions identified in the
+contract diff below. Namespace remains attribution; namespace visibility does not authorize a transcript
+read. The accepted base and Amendments 1 and 2 remain historical records, with the changes below proposed
+as Amendment 3. Neither this proposal nor the privacy implementation alone enables public search.
+
+### Operator-owned ingestion assignments
+
+Only operator-controlled configuration assigns transcript ownership: a dedicated source root mapped to
+an actor, or an explicitly enumerated transcript mapped to an actor. Transcript content, `cwd`, provider
+identifiers and request arguments never choose or override the owner. Ingestion resolves the mapping
+before storing transcript rows and retains trusted source provenance sufficient to identify the
+assignment's origin.
+
+An unmapped input or conflicting assignment is not ingested, and its cursor is not advanced. Mirror
+status reports the number of refused inputs and their affected roots, distinguishing missing mappings
+from conflicting mappings. Skipping these inputs silently, or reporting successful ingestion with an
+empty result, does not satisfy this requirement.
+
+### Persistent owner, complete identity and migration
+
+Each session and event has a `NOT NULL` owner. Exactly one reserved value represents unowned data; it is
+not SQL `NULL`, an anonymous caller, or a readable owner. The identity gate refuses this value as an
+actor identifier, and it cannot be used as a grant target to read unattributed rows. The implementation
+defines one representation consistently across storage, ingestion, grants and caller validation.
+
+Owner participates in both operative identities, in addition to the existing namespace and source:
+
+- sessions: `(namespace, owner, source, provider_session_id)`;
+- session messages: `(namespace, owner, source, session_id, id)`.
+
+Provider identifier values stay unchanged. The source-qualified identity and insert-once replay
+contract of Amendment 1 remain; `content_hash` remains an adjunct, never the identity. The existing
+source value `unknown` for orphaned messages is independent of the new unowned value and grants no
+access to an unowned row.
+
+Every derived lookup, join, grouping, parent link, ranking input and snippet reconstruction that
+identifies these records carries the same owner dimension. Equal provider identifiers under different
+owners must neither collapse records nor mix metadata or snippets. A single owner predicate cannot
+substitute for owner-qualified keys and joins. Owner restriction applies before ranking, limiting and
+paging; all additional filters can only narrow the permitted owner set.
+
+Ingestion checkpoints bind the owner as well as the source file and its identity. An owner change must
+not reuse another owner's progress, including after restart or retry. Any search continuation token
+likewise binds its permitted owner scope and cannot widen a later request's access. Existing file
+replacement detection remains required.
+
+Legacy rows are retained, initially unattributed and unreadable. An operator mapping that covers a
+row's recorded source root may attribute that row only when the recorded provenance establishes the
+association unambiguously. Missing or conflicting provenance leaves the row unowned; it is never
+reconstructed from transcript `cwd`, provider identifiers or an assumed relation between a cursor and a
+stored session. The current session and message schema does not record a source root, so this contract
+does not promise that every legacy row can be attributed. Source-path cursor records alone are not
+proof of every stored row's origin.
+
+The privacy migration is a new versioned step in the global `MIGRATIONS` ledger, preserving Amendment
+2's placement. It lands **after #5955**. At that point the implementation refreshes the ledger and takes
+the next free version; this amendment reserves no number. Migration version 40 is unchanged. Both the
+upgraded schema and the schema for a new store must enforce the same owner and identity contract. The
+transition retains every legacy row and provider identifier, without a nullable ownership `UNIQUE`
+constraint or an automatic assignment to whichever actor happens to run the migration.
+
+### Read grants and refusal before SQL
+
+Reads default to the resolved caller's own owner identifier. Wider reads require a finite,
+operator-controlled actor-to-owner grant. Request arguments, transcript fields and namespace visibility
+cannot create or enlarge such a grant. The effective permitted owner set is computed from that
+configuration and the resolved caller, and is bound into every transcript query and derived identity.
+
+An anonymous, unresolvable or reserved-unowned caller receives typed `PermissionDenied` before any
+SQL, including candidate selection, ranking, snippets, counts or cursor lookup. An empty
+successful result is not a substitute. The query constructor must retain this refusal and the owner
+predicate independently of a permissive Gate decision.
+
+This owner rule is additional selection inside one tenant store. It does not discharge ADR-018's
+positive authenticated tenant-scope requirement or ADR-096's hosted connection-identity prerequisite.
+ADR-096 Amendment 2's peer-uid check and fail-closed socket permissions remain unchanged; same-uid actor
+labels remain attribution, and hosted or multi-uid serving remains separately gated.
+
+### Public availability
+
+The required refusal wording is **"session.search is unavailable in this build"**. This is a requirement
+for the later implementation; the existing handler currently returns a longer refusal mentioning
+deletion and resume/export support. This documentation change does not change that handler.
+
+Public search remains unavailable while the privacy implementation is prepared and validated. Enabling
+it requires a separate sign-off after the privacy implementation pull request has merged with the
+two-actor same-store proof below in that pull request. The deletion contract of ADR-117b, the
+resume/export continuity contract of ADR-117c and the hosted-authentication prerequisites remain
+independent requirements. A migration, an owner column or a passing query test alone enables nothing.
+
+### Required implementation evidence
+
+The privacy implementation pull request must name executable tests for each group below. The suggested
+names describe future witnesses, not tests claimed to exist or pass today. Each independent removal
+must build successfully and make its named behavioral assertion fail; compilation errors, fixture
+failures, zero selected tests and external timeouts are not evidence of the required behavior.
+
+| Group and suggested test                                                             | Required fixture and result                                                                                                                                                                                                                               | Independent removal                                                                                                                                                                                          |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Ownership persistence: `session_owner_persists_across_restart_and_legacy_backfill`   | Two mapped actors share one store, namespace and source, with equal provider session and event identifiers. Both records survive restart with their assigned owners. Legacy rows remain present; only rows with proven mapped provenance become readable. | Remove persistence of the assigned owner while retaining valid storage. The ownership and readable-row assertions must fail after restart.                                                                   |
+| Query predicate: `session_search_owner_predicate_precedes_ranking_and_paging`        | Both owners have matching text, including a higher-ranked foreign hit at a page boundary. Each caller receives only its permitted sessions and snippets; finite grants and namespace-only visibility are separate cases.                                  | Remove the owner predicate from candidate selection while keeping valid SQL. The literal hit or snippet set must become wrong.                                                                               |
+| Owner join/key: `session_owner_qualifies_colliding_keys_and_derived_joins`           | Equal namespace/source/provider identifiers under two owners retain distinct metadata and snippets while the owner predicate remains enabled.                                                                                                             | Remove owner from the operative key and from a derived join in separate variants. The coexistence assertion must fail for the key variant; the metadata or snippet assertion must fail for the join variant. |
+| Cursor binding: `session_cursor_is_bound_to_owner_and_refused_inputs_do_not_advance` | A transcript path has an owner-bound checkpoint, then an operator mapping changes or conflicts. Retry and restart preserve ownership; unmapped and conflicting inputs do not advance progress and appear in status counts and roots.                      | Remove owner qualification from cursor lookup/update while retaining file identity checks. Reusing another owner's progress must fail the named assertion.                                                   |
+
+Additional assertions cover anonymous, unresolvable and reserved-unowned identities with a no-SQL
+witness; grant limits; namespace visibility without a grant; retained unowned legacy rows; every
+operator-mapping refusal and its status report; source-qualified replay; and the unchanged public
+availability gates. The same-store actor fixtures demonstrate bounded owner selection, not protection
+from a hostile process within the same uid.
+
+### Contract diff
+
+| Contract                                                | Changes or additions in this proposal                                                                                                                                                                                                                                                                                  | Unchanged requirements                                                                                                                                       |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Accepted ADR-117a D1/D4 and local-exposure consequences | Replace namespace-only transcript ownership and the assertion that a local socket alone makes search safe to expose with operator-assigned owners, finite read grants, pre-SQL caller refusal and separate public activation. Explicitly supersede the corresponding local-exposure assurances in D4 and Consequences. | Handler-side construction of restricted queries, refusal on missing authority, deletion and resume/export prerequisites, and separate hosted authentication. |
+| Accepted ADR-117a D2 and Amendment 1                    | Add owner to session/event identity and all derived joins, grouping and cursors. Supersede the historical rejection of a separate scope column for this owner dimension. Existing namespace/source dimensions remain attribution and identity components.                                                              | Retain rows and provider values; preserve source-qualified replay, the source-orphan rule and content-hash adjunct.                                          |
+| Accepted ADR-117a Amendment 2                           | Add a new ownership migration after #5955, choosing the next free version on the refreshed ledger.                                                                                                                                                                                                                     | Global migration placement; version 40 remains immutable.                                                                                                    |
+| ADR-096 Amendment 2                                     | Add transcript-owner selection within its existing same-uid trust domain; add no authentication mechanism.                                                                                                                                                                                                             | Peer-uid enforcement, fail-closed socket permissions, self-reported same-uid attribution and the hosted/multi-uid serving hold.                              |
+| ADR-007 Rule 9 and ADR-018's fail-closed class          | Owner filtering is an additional bounded read rule, not a replacement tenant boundary or authenticated scope.                                                                                                                                                                                                          | Store-per-tenant deployment and positive authenticated tenant scope remain separate requirements.                                                            |
