@@ -31,6 +31,8 @@ use khive_storage::ContentRef;
 
 #[cfg(unix)]
 use crate::capture::{drain_until, walk, CaptureRead, CaptureRoot, DrainStop, Drained, Tail};
+#[cfg(unix)]
+use crate::group_child::GroupChild;
 use crate::membership::{MembershipWork, SuppliedRefs};
 use crate::process_cleanup::{ProcessCleanup, TreeQuiescence};
 use crate::receipts;
@@ -1495,8 +1497,7 @@ async fn execute(
         .current_dir(&work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     let prepared_limits = PreparedLimits::new(&cfg.limits);
     let (limit_reader, limit_writer) = limit_pipe()?;
     // SAFETY: the forked child uses fixed-size stack storage and only calls
@@ -1526,7 +1527,7 @@ async fn execute(
     let started = Instant::now();
     let wall_started = tokio::time::Instant::now();
     receipt.started_at = Some(receipts::now_micros());
-    let spawn = command.spawn();
+    let spawn = GroupChild::spawn(&mut command);
     // Parent side of the pipe: close the writer, read the child's report.
     unsafe {
         libc::close(limit_writer);
@@ -1544,7 +1545,7 @@ async fn execute(
         }
     };
     let report_wait = req.timeout.min(Duration::from_secs(1));
-    let pid = child.id().unwrap_or_default() as i32;
+    let pid = child.id() as i32;
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
     if let Err(error) = receipts::event(
         rt,
@@ -1558,8 +1559,8 @@ async fn execute(
         append_failure_reason(receipt, format!("launched event write failed: {error}"));
     }
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let stdout = child.take_stdout().expect("stdout piped");
+    let stderr = child.take_stderr().expect("stderr piped");
     let cap = cfg.max_output_bytes;
     let deadline = wall_started + req.timeout;
     let out_task = tokio::spawn(async move { drain_until(stdout, cap, deadline).await });
@@ -1569,12 +1570,23 @@ async fn execute(
         wall_started,
         req.timeout,
         collect_limit_report(limit_reader, report_wait),
-        child.wait(),
+        child.wait_unreaped(),
     )
     .await;
     receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
-    let status = match waited {
-        Ok(Ok(status)) => {
+    let observed_exit = match waited {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            append_failure_reason(receipt, format!("child exit observation failed: {error}"));
+            false
+        }
+        Err(_) => {
+            receipt.timed_out = true;
+            false
+        }
+    };
+    let status = match child.finish().await {
+        Ok(status) if observed_exit => {
             use std::os::unix::process::ExitStatusExt;
             // Only the delivered signal for a configured limit is observable
             // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
@@ -1586,17 +1598,12 @@ async fn execute(
             };
             Some(status)
         }
-        Ok(Err(_)) => None,
-        Err(_) => {
-            receipt.timed_out = true;
-            kill_group(pid);
-            let _ = child.wait().await;
+        Ok(_) => None,
+        Err(error) => {
+            append_failure_reason(receipt, format!("process group cleanup failed: {error}"));
             None
         }
     };
-    // Signal any remaining members of the initial group. A descendant that
-    // called setsid is outside this group and can outlive the run.
-    kill_group(pid);
     let out = collect_stream(out_task, deadline, cap).await;
     let err = collect_stream(err_task, deadline, cap).await;
     if out.stop == DrainStop::Deadline || err.stop == DrainStop::Deadline {
@@ -1853,11 +1860,6 @@ fn finish_cleanup(receipt: &mut Receipt, run_dir: &Path, profile_path: &Path, ke
     for failure in cleanup(run_dir, profile_path, keep) {
         append_failure_reason(receipt, format!("exec cleanup failed: {failure}"));
     }
-}
-
-#[cfg(unix)]
-fn kill_group(pid: i32) {
-    let _ = khive_runtime::process_group::signal_process_group(pid, libc::SIGKILL);
 }
 
 #[cfg(unix)]
