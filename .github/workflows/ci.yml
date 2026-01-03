@@ -461,11 +461,12 @@ jobs:
       fail-fast: false
       # The workspace test suite is nextest-partitioned 2-way per OS (see the
       # "Workspace tests" step below). Non-partitioned phases run exactly once
-      # per OS: forward-deployed checks and Clippy run on shard 2, the lints
-      # and the no-default-features check on shard 1. The release build with
-      # the checks that run its binary, and the channel feature tests, run in
-      # their own jobs (release-checks, channel-tests) beside the shards, so
-      # neither sits on a shard's critical path.
+      # per OS: the daemon recovery flake gate and the production audit batch
+      # run on shard 2, the lints and the no-default-features check on shard 1.
+      # The release build with the checks that run its binary, the channel
+      # feature tests, and Clippy with the forward-deployed checks run in their
+      # own jobs (release-checks, channel-tests, clippy-checks) beside the
+      # shards, so none of them sits on a shard's critical path.
       #
       # On a pull request CI_SUITE is `macos-pr` for macos-latest, and every
       # macos-pr step is gated `matrix.shard == 1`, so there is no second
@@ -569,10 +570,9 @@ jobs:
           # Cache key bump: artifacts built with full debuginfo predate the
           # line-tables-only profile; restoring them would defeat the disk cap.
           # Sharded into the key: the shards build different profiles and
-          # features (the no-default-features check runs on shard 1; Clippy
-          # and the forward-deployed checks run on shard 2). With one shared
-          # key the first shard to finish saved and the other's artifacts
-          # never reached the cache.
+          # features (the no-default-features check runs on shard 1). With
+          # one shared key the first shard to finish saved and the other's
+          # artifacts never reached the cache.
           key: line-tables-shard${{ matrix.shard }}
       # EMBEDDING MODEL CACHE. The embedder fetches its weights from
       # huggingface.co the first time it is built. Fetching per run made this
@@ -635,18 +635,12 @@ jobs:
       - name: Lockfile freshness
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh lockfile
-      - name: Forward-deployed crate checks
-        if: env.CI_SUITE == 'full' && matrix.shard == 2
-        run: ../scripts/ci.sh forward-deployed
       - name: Format, SQL, and ADR lints
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh lint
       - name: No-stub guard
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-stubs
-      - name: Clippy
-        if: env.CI_SUITE == 'full' && matrix.shard == 2
-        run: ../scripts/ci.sh clippy
       # Rustdoc is already the separately gated doc-build job below; keep it in
       # ci.sh's local all-mode without paying for duplicate per-OS CI builds.
       - name: Install cargo-nextest
@@ -895,6 +889,89 @@ jobs:
         run: ../scripts/ci.sh no-stubs-scan
       - name: Channel-email feature tests
         run: ../scripts/ci.sh channel-email
+
+  # Clippy (default and all features) and the forward-deployed crate checks, moved off shard 2: about 10
+  # of that shard's 37 minutes, compiled in check mode, so they share no artifacts with the test build.
+  clippy-checks:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Clippy and forward-deployed checks (${{ matrix.os }})
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # The operating systems on which the ci job's full suite ran these steps: ubuntu on every pull
+      # request (a macOS pull-request job runs the focused macos-pr lane) and on train pushes, and
+      # macOS as well on every other run.
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'pull_request'
+          || github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/train-'))
+          && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest"]') }}
+    defaults:
+      run:
+        working-directory: crates
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The scope the ci job runs under (ADR-205); each phase skips itself when its crate is out of scope.
+      TEST_SCOPE: ${{ needs.changed-paths.outputs.test_scope || 'full' }}
+      # With this set the embedding model cache below is load-bearing: a missing model fails by name.
+      LATTICE_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
+      - name: Free runner disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          # Pull requests restore main's cache and save nothing, as in the ci job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: line-tables-clippy
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # SECURITY ORDERING (#560), as in the ci job: the scan reads the pristine checkout before any
+      # PR-controlled build script or proc-macro runs.
+      - name: No-stub placeholder scan (before any cargo)
+        run: ../scripts/ci.sh no-stubs-scan
+      - name: Forward-deployed crate checks
+        run: ../scripts/ci.sh forward-deployed
+      - name: Clippy
+        run: ../scripts/ci.sh clippy
 
   khive-py:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
@@ -2364,6 +2441,7 @@ jobs:
       - release-checks
       - channel-tests
       - s3-blob-tests
+      - clippy-checks
     if: always()
     steps:
       # DRAFT. A draft pull request runs the lint and classify jobs only; the heavy jobs skip until it is
@@ -2397,7 +2475,7 @@ jobs:
                      "dependency-review", "coverage-measurement", "coverage-ratchet",
                      "wasm-parity", "vamana-portability", "minio-blob-compat",
                      "msrv-check", "core-only", "release-checks", "channel-tests",
-                     "s3-blob-tests"]
+                     "s3-blob-tests", "clippy-checks"]
                else [] end) as $docs_lane_skips
             | (.["changed-paths"].outputs.test_scope // "") as $scope
             | (if .["changed-paths"].result == "success"
