@@ -22,28 +22,21 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Notes, op, e)
 }
 
-/// A NoteStore backed by SQLite, scoped to a single namespace.
+/// A NoteStore backed by SQLite. Namespace is the caller's responsibility.
 ///
-/// Reads and deletes are restricted to `self.namespace`. Writes accept notes
-/// whose `namespace` field is used directly (no override), but `get_note` and
-/// `delete_note` only operate on records that belong to this store's namespace.
+/// UUID is globally unique — get/delete by ID alone. Query/count use the
+/// namespace parameter as passed. The store is just a pool + is_file_backed.
 pub struct SqlNoteStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
-    namespace: String,
 }
 
 impl SqlNoteStore {
-    /// Create a new store scoped to `namespace`.
-    pub fn new_scoped(
-        pool: Arc<ConnectionPool>,
-        is_file_backed: bool,
-        namespace: impl Into<String>,
-    ) -> Self {
+    /// Create a new store.
+    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
         Self {
             pool,
             is_file_backed,
-            namespace: namespace.into(),
         }
     }
 
@@ -193,8 +186,7 @@ fn build_note_where(
 
 #[async_trait]
 impl NoteStore for SqlNoteStore {
-    async fn upsert_note(&self, mut note: Note) -> Result<(), StorageError> {
-        note.namespace.clone_from(&self.namespace);
+    async fn upsert_note(&self, note: Note) -> Result<(), StorageError> {
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();
         let kind_str = note.kind.to_string();
@@ -228,10 +220,7 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
-    async fn upsert_notes(&self, mut notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
-        for n in &mut notes {
-            n.namespace.clone_from(&self.namespace);
-        }
+    async fn upsert_notes(&self, notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = notes.len() as u64;
 
         self.with_writer("upsert_notes", move |conn| {
@@ -293,15 +282,14 @@ impl NoteStore for SqlNoteStore {
 
     async fn get_note(&self, id: Uuid) -> Result<Option<Note>, StorageError> {
         let id_str = id.to_string();
-        let namespace = self.namespace.clone();
 
         self.with_reader("get_note", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
-                 FROM notes WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL",
+                 FROM notes WHERE id = ?1 AND deleted_at IS NULL",
             )?;
-            let mut rows = stmt.query(rusqlite::params![id_str, namespace])?;
+            let mut rows = stmt.query(rusqlite::params![id_str])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_note(row)?)),
                 None => Ok(None),
@@ -312,7 +300,6 @@ impl NoteStore for SqlNoteStore {
 
     async fn delete_note(&self, id: Uuid, mode: DeleteMode) -> Result<bool, StorageError> {
         let id_str = id.to_string();
-        let namespace = self.namespace.clone();
 
         match mode {
             DeleteMode::Soft => {
@@ -320,8 +307,8 @@ impl NoteStore for SqlNoteStore {
                     let now = chrono::Utc::now().timestamp_micros();
                     let deleted = conn.execute(
                         "UPDATE notes SET deleted_at = ?1 \
-                         WHERE id = ?2 AND namespace = ?3 AND deleted_at IS NULL",
-                        rusqlite::params![now, id_str, namespace],
+                         WHERE id = ?2 AND deleted_at IS NULL",
+                        rusqlite::params![now, id_str],
                     )?;
                     Ok(deleted > 0)
                 })
@@ -329,10 +316,8 @@ impl NoteStore for SqlNoteStore {
             }
             DeleteMode::Hard => {
                 self.with_writer("delete_note_hard", move |conn| {
-                    let deleted = conn.execute(
-                        "DELETE FROM notes WHERE id = ?1 AND namespace = ?2",
-                        rusqlite::params![id_str, namespace],
-                    )?;
+                    let deleted =
+                        conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![id_str])?;
                     Ok(deleted > 0)
                 })
                 .await
@@ -413,10 +398,9 @@ impl NoteStore for SqlNoteStore {
 
     async fn upsert_note_if_below_quota(
         &self,
-        mut note: Note,
+        note: Note,
         max_notes: u64,
     ) -> Result<bool, StorageError> {
-        note.namespace.clone_from(&self.namespace);
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();
         let kind_str = note.kind.to_string();
@@ -505,11 +489,7 @@ mod tests {
     }
 
     fn setup_memory_store() -> SqlNoteStore {
-        SqlNoteStore::new_scoped(setup_pool(), false, "default")
-    }
-
-    fn setup_memory_store_ns(ns: &str) -> SqlNoteStore {
-        SqlNoteStore::new_scoped(setup_pool(), false, ns)
+        SqlNoteStore::new(setup_pool(), false)
     }
 
     fn make_note(namespace: &str, kind: NoteKind, content: &str) -> Note {
@@ -567,75 +547,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_count_notes() {
+    async fn test_hard_delete() {
+        let store = setup_memory_store();
+
+        let note = make_note("default", NoteKind::Observation, "to be hard deleted");
+        let id = note.id;
+        store.upsert_note(note).await.unwrap();
+
+        let deleted = store.delete_note(id, DeleteMode::Hard).await.unwrap();
+        assert!(deleted);
+
+        let fetched = store.get_note(id).await.unwrap();
+        assert!(fetched.is_none());
+    }
+
+    /// Namespace isolation: one store, two namespaces — each query sees only its own.
+    #[tokio::test]
+    async fn test_namespace_isolation() {
         let pool = setup_pool();
-        let store_ns1 = SqlNoteStore::new_scoped(Arc::clone(&pool), false, "ns1");
-        let store_ns2 = SqlNoteStore::new_scoped(Arc::clone(&pool), false, "ns2");
+        let store = SqlNoteStore::new(Arc::clone(&pool), false);
 
         for _ in 0..3 {
-            store_ns1
+            store
                 .upsert_note(make_note("ns1", NoteKind::Observation, "content"))
                 .await
                 .unwrap();
         }
+        store
+            .upsert_note(make_note("ns2", NoteKind::Observation, "other"))
+            .await
+            .unwrap();
 
-        let count = store_ns1.count_notes("ns1", None).await.unwrap();
-        assert_eq!(count, 3);
+        let count_ns1 = store.count_notes("ns1", None).await.unwrap();
+        assert_eq!(count_ns1, 3);
 
-        let count_other = store_ns2.count_notes("ns2", None).await.unwrap();
-        assert_eq!(count_other, 0);
-    }
-
-    /// A store scoped to "ns_a" must not see or delete notes belonging to "ns_b".
-    #[tokio::test]
-    async fn test_cross_namespace_isolation_get_and_delete() {
-        let config = PoolConfig {
-            path: None,
-            ..PoolConfig::default()
-        };
-        let pool = Arc::new(ConnectionPool::new(config).unwrap());
-        {
-            let writer = pool.writer().unwrap();
-            writer.conn().execute_batch(NOTES_DDL).unwrap();
-        }
-
-        let store_a = SqlNoteStore::new_scoped(Arc::clone(&pool), false, "ns_a");
-        let store_b = SqlNoteStore::new_scoped(Arc::clone(&pool), false, "ns_b");
-
-        // Write a note that belongs to ns_b via store_b.
-        let note_b = make_note("ns_b", NoteKind::Observation, "secret note");
-        let id_b = note_b.id;
-        store_b.upsert_note(note_b).await.unwrap();
-
-        // store_a (scoped to ns_a) must not see the ns_b note.
-        let result = store_a.get_note(id_b).await.unwrap();
-        assert!(result.is_none(), "store_a must not read a note from ns_b");
-
-        // store_a must not be able to soft-delete the ns_b note.
-        let deleted_soft = store_a.delete_note(id_b, DeleteMode::Soft).await.unwrap();
-        assert!(
-            !deleted_soft,
-            "store_a must not soft-delete a note from ns_b"
-        );
-
-        // store_a must not be able to hard-delete the ns_b note.
-        let deleted_hard = store_a.delete_note(id_b, DeleteMode::Hard).await.unwrap();
-        assert!(
-            !deleted_hard,
-            "store_a must not hard-delete a note from ns_b"
-        );
-
-        // The note must still be visible to store_b.
-        let still_there = store_b.get_note(id_b).await.unwrap();
-        assert!(
-            still_there.is_some(),
-            "note must still exist in ns_b after cross-namespace delete attempts"
-        );
+        let count_ns2 = store.count_notes("ns2", None).await.unwrap();
+        assert_eq!(count_ns2, 1);
     }
 
     #[tokio::test]
     async fn test_quota() {
-        let store = setup_memory_store_ns("quota_ns");
+        let pool = setup_pool();
+        let store = SqlNoteStore::new(Arc::clone(&pool), false);
 
         for _ in 0..3 {
             let inserted = store
@@ -650,5 +603,40 @@ mod tests {
             .await
             .unwrap();
         assert!(!inserted);
+    }
+
+    /// query_notes and count_notes use the namespace parameter as passed.
+    #[tokio::test]
+    async fn test_query_and_count_use_caller_namespace() {
+        let pool = setup_pool();
+        let store = SqlNoteStore::new(Arc::clone(&pool), false);
+
+        store
+            .upsert_note(make_note("ns_a", NoteKind::Observation, "A"))
+            .await
+            .unwrap();
+        store
+            .upsert_note(make_note("ns_b", NoteKind::Insight, "B"))
+            .await
+            .unwrap();
+
+        let page_a = store
+            .query_notes("ns_a", None, PageRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(page_a.items.len(), 1);
+        assert_eq!(page_a.items[0].content, "A");
+
+        let page_b = store
+            .query_notes("ns_b", None, PageRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(page_b.items.len(), 1);
+        assert_eq!(page_b.items[0].content, "B");
+
+        let count_a = store.count_notes("ns_a", None).await.unwrap();
+        let count_b = store.count_notes("ns_b", None).await.unwrap();
+        assert_eq!(count_a, 1);
+        assert_eq!(count_b, 1);
     }
 }

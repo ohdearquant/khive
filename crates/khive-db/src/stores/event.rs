@@ -217,8 +217,12 @@ fn build_event_filter_sql(
     let mut conditions: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
+    // If filter.namespaces is non-empty, use those; otherwise fall back to default_namespace.
     if filter.namespaces.is_empty() {
         params.push(Box::new(default_namespace.to_string()));
+        conditions.push(format!("namespace = ?{}", params.len()));
+    } else if filter.namespaces.len() == 1 {
+        params.push(Box::new(filter.namespaces[0].clone()));
         conditions.push(format!("namespace = ?{}", params.len()));
     } else {
         let placeholders: Vec<String> = filter

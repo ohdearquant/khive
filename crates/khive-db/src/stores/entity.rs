@@ -23,29 +23,21 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Entities, op, e)
 }
 
-/// An EntityStore backed by SQLite, scoped to a single namespace.
+/// An EntityStore backed by SQLite. Namespace is the caller's responsibility.
 ///
-/// Reads and deletes are restricted to `self.namespace`. Writes accept
-/// entities whose `namespace` field may differ (cross-namespace writes are
-/// allowed intentionally for bulk import scenarios), but `get_entity` and
-/// `delete_entity` will only see records that belong to this store's namespace.
+/// UUID is globally unique — get/delete by ID alone. Query/count use the
+/// namespace parameter as passed. The store is just a pool + is_file_backed.
 pub struct SqlEntityStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
-    namespace: String,
 }
 
 impl SqlEntityStore {
-    /// Create a new store scoped to `namespace`.
-    pub fn new_scoped(
-        pool: Arc<ConnectionPool>,
-        is_file_backed: bool,
-        namespace: impl Into<String>,
-    ) -> Self {
+    /// Create a new store.
+    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
         Self {
             pool,
             is_file_backed,
-            namespace: namespace.into(),
         }
     }
 
@@ -211,6 +203,21 @@ fn build_entity_where(
         conditions.push(format!("name LIKE ?{}", params.len()));
     }
 
+    if !filter.tags_any.is_empty() {
+        let placeholders: Vec<String> = filter
+            .tags_any
+            .iter()
+            .map(|t| {
+                params.push(Box::new(t.clone()));
+                format!("?{}", params.len())
+            })
+            .collect();
+        conditions.push(format!(
+            "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value IN ({}))",
+            placeholders.join(", ")
+        ));
+    }
+
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     (clause, params)
 }
@@ -221,8 +228,7 @@ fn build_entity_where(
 
 #[async_trait]
 impl EntityStore for SqlEntityStore {
-    async fn upsert_entity(&self, mut entity: Entity) -> Result<(), StorageError> {
-        entity.namespace.clone_from(&self.namespace);
+    async fn upsert_entity(&self, entity: Entity) -> Result<(), StorageError> {
         let namespace = entity.namespace.clone();
         let id_str = entity.id.to_string();
         let properties_str = entity
@@ -257,11 +263,8 @@ impl EntityStore for SqlEntityStore {
 
     async fn upsert_entities(
         &self,
-        mut entities: Vec<Entity>,
+        entities: Vec<Entity>,
     ) -> Result<BatchWriteSummary, StorageError> {
-        for e in &mut entities {
-            e.namespace.clone_from(&self.namespace);
-        }
         let attempted = entities.len() as u64;
 
         self.with_writer("upsert_entities", move |conn| {
@@ -323,15 +326,14 @@ impl EntityStore for SqlEntityStore {
 
     async fn get_entity(&self, id: Uuid) -> Result<Option<Entity>, StorageError> {
         let id_str = id.to_string();
-        let namespace = self.namespace.clone();
 
         self.with_reader("get_entity", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, name, description, properties, tags, \
                  created_at, updated_at, deleted_at \
-                 FROM entities WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL",
+                 FROM entities WHERE id = ?1 AND deleted_at IS NULL",
             )?;
-            let mut rows = stmt.query(rusqlite::params![id_str, namespace])?;
+            let mut rows = stmt.query(rusqlite::params![id_str])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_entity(row)?)),
                 None => Ok(None),
@@ -342,7 +344,6 @@ impl EntityStore for SqlEntityStore {
 
     async fn delete_entity(&self, id: Uuid, mode: DeleteMode) -> Result<bool, StorageError> {
         let id_str = id.to_string();
-        let namespace = self.namespace.clone();
 
         match mode {
             DeleteMode::Soft => {
@@ -350,8 +351,8 @@ impl EntityStore for SqlEntityStore {
                     let now = chrono::Utc::now().timestamp_micros();
                     let deleted = conn.execute(
                         "UPDATE entities SET deleted_at = ?1 \
-                         WHERE id = ?2 AND namespace = ?3 AND deleted_at IS NULL",
-                        rusqlite::params![now, id_str, namespace],
+                         WHERE id = ?2 AND deleted_at IS NULL",
+                        rusqlite::params![now, id_str],
                     )?;
                     Ok(deleted > 0)
                 })
@@ -360,8 +361,8 @@ impl EntityStore for SqlEntityStore {
             DeleteMode::Hard => {
                 self.with_writer("delete_entity_hard", move |conn| {
                     let deleted = conn.execute(
-                        "DELETE FROM entities WHERE id = ?1 AND namespace = ?2",
-                        rusqlite::params![id_str, namespace],
+                        "DELETE FROM entities WHERE id = ?1",
+                        rusqlite::params![id_str],
                     )?;
                     Ok(deleted > 0)
                 })
@@ -486,11 +487,11 @@ mod tests {
     }
 
     fn setup_memory_store() -> SqlEntityStore {
-        SqlEntityStore::new_scoped(setup_pool(), false, "default")
+        SqlEntityStore::new(setup_pool(), false)
     }
 
-    fn setup_memory_store_ns(ns: &str) -> SqlEntityStore {
-        SqlEntityStore::new_scoped(setup_pool(), false, ns)
+    fn setup_memory_store_ns(_ns: &str) -> SqlEntityStore {
+        SqlEntityStore::new(setup_pool(), false)
     }
 
     fn make_entity(namespace: &str, kind: EntityKind, name: &str) -> Entity {
@@ -666,6 +667,8 @@ mod tests {
             .unwrap();
         assert_eq!(count, 5);
 
+        // Namespace is the caller's responsibility — querying "ns2" returns 0
+        // because no entities were inserted in that namespace.
         let count_other = store
             .count_entities("ns2", EntityFilter::default())
             .await
@@ -693,26 +696,27 @@ mod tests {
         assert_eq!(count, 10);
     }
 
+    /// One store, two namespaces — each query sees only its own.
     #[tokio::test]
     async fn test_namespace_isolation() {
         let pool = setup_pool();
-        let store_a = SqlEntityStore::new_scoped(Arc::clone(&pool), false, "ns_a");
-        let store_b = SqlEntityStore::new_scoped(Arc::clone(&pool), false, "ns_b");
+        let store = SqlEntityStore::new(Arc::clone(&pool), false);
 
-        store_a
+        store
             .upsert_entity(make_entity("ns_a", EntityKind::Concept, "EntityA"))
             .await
             .unwrap();
-        store_b
+        store
             .upsert_entity(make_entity("ns_b", EntityKind::Concept, "EntityB"))
             .await
             .unwrap();
 
-        let count_a = store_a
+        // Namespace is the caller's responsibility — pass it in the query.
+        let count_a = store
             .count_entities("ns_a", EntityFilter::default())
             .await
             .unwrap();
-        let count_b = store_b
+        let count_b = store
             .count_entities("ns_b", EntityFilter::default())
             .await
             .unwrap();
@@ -720,62 +724,79 @@ mod tests {
         assert_eq!(count_a, 1);
         assert_eq!(count_b, 1);
 
-        let page_a = store_a
+        let page_a = store
             .query_entities("ns_a", EntityFilter::default(), PageRequest::default())
             .await
             .unwrap();
         assert_eq!(page_a.items[0].name, "EntityA");
+
+        let page_b = store
+            .query_entities("ns_b", EntityFilter::default(), PageRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(page_b.items[0].name, "EntityB");
     }
 
-    /// A store scoped to "ns_a" must not see or delete entities belonging to "ns_b".
     #[tokio::test]
-    async fn test_cross_namespace_isolation_get_and_delete() {
-        // Both stores share the same pool so rows are physically in the same DB.
-        let config = PoolConfig {
-            path: None,
-            ..PoolConfig::default()
-        };
-        let pool = Arc::new(ConnectionPool::new(config).unwrap());
-        {
-            let writer = pool.writer().unwrap();
-            writer.conn().execute_batch(ENTITIES_DDL).unwrap();
-        }
+    async fn test_query_by_tags() {
+        let store = setup_memory_store_ns("tags_ns");
 
-        let store_a = SqlEntityStore::new_scoped(Arc::clone(&pool), false, "ns_a");
-        let store_b = SqlEntityStore::new_scoped(Arc::clone(&pool), false, "ns_b");
+        let mut e1 = make_entity("tags_ns", EntityKind::Concept, "Tagged1");
+        e1.tags = vec!["rust".to_string(), "systems".to_string()];
+        let mut e2 = make_entity("tags_ns", EntityKind::Concept, "Tagged2");
+        e2.tags = vec!["python".to_string(), "ml".to_string()];
+        let mut e3 = make_entity("tags_ns", EntityKind::Concept, "Tagged3");
+        e3.tags = vec!["rust".to_string(), "ml".to_string()];
 
-        // Write an entity that belongs to ns_b via store_b.
-        let entity_b = make_entity("ns_b", EntityKind::Concept, "SecretB");
-        let id_b = entity_b.id;
-        store_b.upsert_entity(entity_b).await.unwrap();
+        store.upsert_entity(e1).await.unwrap();
+        store.upsert_entity(e2).await.unwrap();
+        store.upsert_entity(e3).await.unwrap();
 
-        // store_a (scoped to ns_a) must not see the ns_b entity.
-        let result = store_a.get_entity(id_b).await.unwrap();
-        assert!(
-            result.is_none(),
-            "store_a must not read an entity from ns_b"
-        );
+        // Filter by "rust" tag — should match Tagged1 and Tagged3
+        let result = store
+            .query_entities(
+                "tags_ns",
+                EntityFilter {
+                    tags_any: vec!["rust".to_string()],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Tagged1"));
+        assert!(names.contains(&"Tagged3"));
+        assert!(!names.contains(&"Tagged2"));
 
-        // store_a must not be able to soft-delete the ns_b entity.
-        let deleted_soft = store_a.delete_entity(id_b, DeleteMode::Soft).await.unwrap();
-        assert!(
-            !deleted_soft,
-            "store_a must not soft-delete an entity from ns_b"
-        );
+        // Filter by "ml" tag — should match Tagged2 and Tagged3
+        let result = store
+            .query_entities(
+                "tags_ns",
+                EntityFilter {
+                    tags_any: vec!["ml".to_string()],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
 
-        // store_a must not be able to hard-delete the ns_b entity.
-        let deleted_hard = store_a.delete_entity(id_b, DeleteMode::Hard).await.unwrap();
-        assert!(
-            !deleted_hard,
-            "store_a must not hard-delete an entity from ns_b"
-        );
-
-        // The entity must still be visible to store_b.
-        let still_there = store_b.get_entity(id_b).await.unwrap();
-        assert!(
-            still_there.is_some(),
-            "entity must still exist in ns_b after cross-namespace delete attempts"
-        );
+        // Filter by both "rust" and "python" (union) — should match all three
+        let result = store
+            .query_entities(
+                "tags_ns",
+                EntityFilter {
+                    tags_any: vec!["rust".to_string(), "python".to_string()],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.items.len(), 3);
     }
 
     #[tokio::test]
@@ -807,5 +828,69 @@ mod tests {
         assert!(names.contains(&"E1"));
         assert!(names.contains(&"E3"));
         assert!(!names.contains(&"E2"));
+    }
+
+    /// UUID is globally unique (id TEXT PRIMARY KEY). Upserting the same UUID in a
+    /// different namespace overwrites the row (INSERT OR REPLACE). get_entity by ID
+    /// returns whichever namespace currently owns that UUID.
+    #[tokio::test]
+    async fn test_same_id_upsert_replaces_row() {
+        let pool = setup_pool();
+        let store = SqlEntityStore::new(Arc::clone(&pool), false);
+
+        let shared_id = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp_micros();
+
+        let entity_a = Entity {
+            id: shared_id,
+            namespace: "ns_a".to_string(),
+            kind: EntityKind::Concept,
+            name: "SharedInA".to_string(),
+            description: None,
+            properties: None,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_entity(entity_a).await.unwrap();
+
+        // At this point the row is in ns_a.
+        let fetched = store.get_entity(shared_id).await.unwrap().unwrap();
+        assert_eq!(fetched.namespace, "ns_a");
+        assert_eq!(fetched.name, "SharedInA");
+
+        // Upsert same UUID into ns_b — INSERT OR REPLACE replaces the row.
+        let entity_b = Entity {
+            id: shared_id,
+            namespace: "ns_b".to_string(),
+            kind: EntityKind::Concept,
+            name: "SharedInB".to_string(),
+            description: None,
+            properties: None,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_entity(entity_b).await.unwrap();
+
+        // Now the row is in ns_b — get_entity returns ns_b regardless of which namespace
+        // you query from (namespace is caller's responsibility).
+        let fetched = store.get_entity(shared_id).await.unwrap().unwrap();
+        assert_eq!(fetched.namespace, "ns_b");
+        assert_eq!(fetched.name, "SharedInB");
+
+        // ns_a now has 0 entities; ns_b has 1.
+        let count_a = store
+            .count_entities("ns_a", EntityFilter::default())
+            .await
+            .unwrap();
+        let count_b = store
+            .count_entities("ns_b", EntityFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(count_a, 0);
+        assert_eq!(count_b, 1);
     }
 }

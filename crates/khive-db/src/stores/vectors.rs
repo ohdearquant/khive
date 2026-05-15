@@ -182,7 +182,7 @@ impl VectorStore for SqliteVecStore {
     ) -> Result<(), StorageError> {
         let table = self.table_name.clone();
         let dims = self.dimensions;
-        let namespace = namespace.to_owned();
+        let namespace = namespace.to_string();
         let kind_str = kind.to_string();
 
         if embedding.len() == dims {
@@ -257,6 +257,7 @@ impl VectorStore for SqliteVecStore {
                 let blob = f32_slice_as_bytes(&record.embedding);
                 let id_str = record.subject_id.to_string();
                 let kind_str = record.kind.to_string();
+                // Use the record's own namespace — the caller is responsible for namespace.
                 let _ = conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace]);
                 match conn.execute(
                     &ins_sql,
@@ -314,7 +315,7 @@ impl VectorStore for SqliteVecStore {
     ) -> Result<Vec<VectorSearchHit>, StorageError> {
         let table = self.table_name.clone();
         let dims = self.dimensions;
-        // Use the request namespace if provided, fall back to the store's namespace.
+        // Use request.namespace if present; fall back to self.namespace.
         let namespace = request
             .namespace
             .clone()

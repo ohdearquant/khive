@@ -125,6 +125,62 @@ does not break callers.
 - Migration to typed namespaces (if ever needed) is a transparent change at the storage layer —
   every SQL query already uses `WHERE namespace = ?` as a string parameter.
 
+## Storage-Layer Design: Namespace as Caller-Supplied Parameter
+
+This section records the Option B decision for how namespace is handled in `khive-storage` and
+`khive-db`. It supersedes any earlier wording that implied "stores are namespace-scoped handles."
+
+### Decision
+
+**Stores are unscoped database connections. Namespace is a caller-supplied parameter, not a
+store-level boundary.**
+
+```rust
+// Option A (rejected): namespace baked into the store handle
+struct EntityStore { namespace: Namespace, pool: Pool }
+
+// Option B (chosen): namespace is a call-site parameter
+struct EntityStore { pool: Pool }
+impl EntityStore {
+    async fn query(&self, namespace: &str, ...) -> Vec<Entity> { ... }
+    async fn get(&self, id: Uuid) -> Option<Entity> { ... }  // no namespace: UUID is global
+}
+```
+
+### Rules
+
+1. **Methods that operate on multiple records** (query, count, search, list) take `namespace` as an
+   explicit parameter. The caller decides which namespace to query.
+
+2. **Methods that operate on a single record by ID** (get, delete, upsert) do not take a namespace
+   parameter. UUID v4 is globally unique across all namespaces — there is no ambiguity, and no
+   namespace filter is needed.
+
+3. **Records carry their own namespace.** `Entity.namespace`, `Note.namespace`, `Event.namespace` —
+   the record's namespace field is authoritative. `upsert` writes the namespace stored in the record
+   as-is; it does not override it from a store-level setting.
+
+4. **Isolation is enforced at the service/runtime layer**, not the storage layer. The runtime
+   (`khive-runtime`) ensures that MCP verbs only access namespaces the authenticated caller owns.
+   Storage is a dumb persistence layer that executes what it is told.
+
+5. **Exception — EventStore and GraphStore**: their trait methods don't take per-call namespace
+   (upstream trait constraints). These stores accept a default namespace at construction as a
+   convenience. This is not an enforcement boundary — it is a default that can be overridden via
+   event filter parameters for reads that need to span namespaces.
+
+### Why not store-level scoping (Option A)?
+
+| Problem                         | Detail                                                                                                                                                                            |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| False security                  | The store struct has no auth context and cannot make access decisions. Scoping it feels safe but doesn't enforce anything.                                                        |
+| API inconsistency               | Some methods take namespace, others use `self.namespace` — callers have to remember which is which.                                                                               |
+| Parameter-ignoring anti-pattern | When a method signature accepts a namespace parameter but the implementation ignores it in favor of `self.namespace`, implementors are confused and bugs are introduced silently. |
+| Inflexibility                   | A store scoped to namespace X cannot serve a cross-namespace admin query without constructing a second store or bypassing the scope.                                              |
+
+Store-level scoping is the wrong abstraction. Access control belongs to the layer that has the
+authority context — the service/runtime — not the layer that has the database connection.
+
 ## Implementation
 
 In `khive-types`:
@@ -140,17 +196,26 @@ pub struct Namespace(String);
 
 In `khive-storage`:
 
-- All store traits accept `&str` for namespace parameters.
-- All SQL queries include `WHERE namespace = ?`.
+- Store traits are unscoped database connections — no `namespace` field on the struct.
+- Methods over multiple records accept `namespace: &str` as an explicit caller-supplied parameter.
+- Methods over a single record by ID (get, delete, upsert) do not take a namespace parameter.
 - No namespace validation at the storage layer.
+
+In `khive-db`:
+
+- SQL queries for multi-record operations include `WHERE namespace = ?` with the caller-supplied
+  value.
+- SQL queries for single-record operations use `WHERE id = ?` only.
 
 In services (when ported):
 
 - Validate namespace format at ingress (e.g., regex, length limits) before passing to storage.
 - Derive namespace from auth context for multi-tenant scenarios.
+- Enforce that the authenticated caller's namespace matches the requested namespace before calling
+  storage.
 
 ## References
 
 - ADR-003: Four-Layer Architecture (namespace flows top-down through layers)
-- ADR-004: Substrate Observables (every observable is namespace-scoped)
+- ADR-004: Substrate Observables (every observable carries a namespace field)
 - `crates/khive-types/src/namespace.rs`: implementation

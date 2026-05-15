@@ -102,7 +102,7 @@ impl Fts5TextSearch {
     /// Create a new FTS5 text search instance.
     ///
     /// The FTS5 virtual table must already exist (created by `StorageBackend::text()`).
-    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool, table_key: String) -> Self {
+    pub(crate) fn new(pool: Arc<ConnectionPool>, is_file_backed: bool, table_key: String) -> Self {
         let table_name = format!("fts_{}", table_key);
         Self {
             pool,
@@ -351,11 +351,7 @@ impl TextSearch for Fts5TextSearch {
                 table
             );
             let tags_json = tags_to_json(&document.tags);
-            let metadata_json = document
-                .metadata
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "{}".to_string());
+            let metadata_json: Option<String> = document.metadata.as_ref().map(|v| v.to_string());
 
             if let Err(e) = conn.execute(
                 &ins_sql,
@@ -411,11 +407,8 @@ impl TextSearch for Fts5TextSearch {
                     conn.execute(&del_sql, rusqlite::params![namespace, &id_str])?;
 
                     let tags_json = tags_to_json(&doc.tags);
-                    let metadata_json = doc
-                        .metadata
-                        .as_ref()
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "{}".to_string());
+                    let metadata_json: Option<String> =
+                        doc.metadata.as_ref().map(|v| v.to_string());
 
                     conn.execute(
                         &ins_sql,
@@ -503,7 +496,7 @@ impl TextSearch for Fts5TextSearch {
                     let body: String = row.get(3)?;
                     let tags_json: String = row.get(4)?;
                     let ns: String = row.get(5)?;
-                    let metadata_json: String = row.get(6)?;
+                    let metadata_json: Option<String> = row.get(6)?;
                     let updated_at_micros: i64 = row.get(7)?;
 
                     let sid = Uuid::parse_str(&id_str).map_err(|e| {
@@ -529,7 +522,7 @@ impl TextSearch for Fts5TextSearch {
                         body,
                         tags: tags_from_json(&tags_json),
                         namespace: ns,
-                        metadata: serde_json::from_str(&metadata_json).ok(),
+                        metadata: metadata_json.and_then(|s| serde_json::from_str(&s).ok()),
                         updated_at: micros_to_dt(updated_at_micros),
                     }))
                 }
@@ -721,7 +714,8 @@ impl Fts5TextSearch {
     /// Callers must invoke this after any SQL-level namespace change on the
     /// backing entity table so that FTS5 keyword search stays consistent with
     /// the entity store.
-    pub async fn rename_namespace(
+    #[allow(dead_code)]
+    pub(crate) async fn rename_namespace(
         &self,
         old_namespace: &str,
         new_namespace: &str,
@@ -745,7 +739,7 @@ impl Fts5TextSearch {
                 title: String,
                 body: String,
                 tags: String,
-                metadata: String,
+                metadata: Option<String>,
                 updated_at: i64,
             }
             let rows: Vec<Row> = {
@@ -1305,6 +1299,25 @@ mod tests {
             .await
             .unwrap();
         assert!(after_old.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_metadata_none_roundtrip() {
+        let store = setup_memory_store("meta_none");
+        let id = uuid::Uuid::new_v4();
+        let doc = TextDocument {
+            subject_id: id,
+            kind: SubstrateKind::Note,
+            namespace: "test_ns".to_string(),
+            title: None,
+            body: "no metadata".to_string(),
+            tags: vec![],
+            metadata: None,
+            updated_at: Utc::now(),
+        };
+        store.upsert_document(doc).await.unwrap();
+        let fetched = store.get_document("test_ns", id).await.unwrap().unwrap();
+        assert!(fetched.metadata.is_none());
     }
 
     #[tokio::test]

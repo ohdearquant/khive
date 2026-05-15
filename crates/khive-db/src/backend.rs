@@ -90,15 +90,16 @@ impl StorageBackend {
         crate::migrations::apply_schema_plan(writer.conn(), plan)
     }
 
-    /// Get an EntityStore for the default namespace.
+    /// Get an EntityStore. Applies the entities DDL if not already present.
     ///
-    /// Creates the `entities` table (with indexes) if it does not already
-    /// exist. Idempotent — safe to call multiple times.
+    /// Idempotent — safe to call multiple times.
     pub fn entities(&self) -> Result<Arc<dyn khive_storage::EntityStore>, SqliteError> {
         self.entities_for_namespace("default")
     }
 
-    /// Get an EntityStore scoped to a namespace.
+    /// Get an EntityStore. The namespace parameter is validated (non-empty) and
+    /// the entities schema is applied, but the store itself is unscoped — namespace
+    /// is the caller's responsibility on each query/delete call.
     pub fn entities_for_namespace(
         &self,
         namespace: &str,
@@ -111,10 +112,9 @@ impl StorageBackend {
         let writer = self.pool.try_writer()?;
         entity::ensure_entities_schema(writer.conn())?;
 
-        Ok(Arc::new(entity::SqlEntityStore::new_scoped(
+        Ok(Arc::new(entity::SqlEntityStore::new(
             Arc::clone(&self.pool),
             self.is_file_backed,
-            namespace.trim().to_string(),
         )))
     }
 
@@ -146,15 +146,16 @@ impl StorageBackend {
         )))
     }
 
-    /// Get a NoteStore for the default namespace.
+    /// Get a NoteStore. Applies the notes DDL if not already present.
     ///
-    /// Creates the `notes` table (with indexes) if it does not already exist.
     /// Idempotent — safe to call multiple times.
     pub fn notes(&self) -> Result<Arc<dyn khive_storage::NoteStore>, SqliteError> {
         self.notes_for_namespace("default")
     }
 
-    /// Get a NoteStore scoped to a namespace.
+    /// Get a NoteStore. The namespace parameter is validated (non-empty) and
+    /// the notes schema is applied, but the store itself is unscoped — namespace
+    /// is the caller's responsibility on each query/delete call.
     pub fn notes_for_namespace(
         &self,
         namespace: &str,
@@ -167,10 +168,9 @@ impl StorageBackend {
         let writer = self.pool.try_writer()?;
         note::ensure_notes_schema(writer.conn())?;
 
-        Ok(Arc::new(note::SqlNoteStore::new_scoped(
+        Ok(Arc::new(note::SqlNoteStore::new(
             Arc::clone(&self.pool),
             self.is_file_backed,
-            namespace.trim().to_string(),
         )))
     }
 
