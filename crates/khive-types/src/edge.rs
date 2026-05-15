@@ -246,8 +246,13 @@ mod tests {
 
     #[test]
     fn all_categories_covered() {
-        use std::collections::HashSet;
-        let cats: HashSet<_> = EdgeRelation::ALL.iter().map(|r| r.category()).collect();
+        let mut cats = alloc::vec::Vec::new();
+        for r in EdgeRelation::ALL {
+            let c = r.category();
+            if !cats.contains(&c) {
+                cats.push(c);
+            }
+        }
         assert_eq!(cats.len(), 6, "all 6 categories must be represented");
     }
 

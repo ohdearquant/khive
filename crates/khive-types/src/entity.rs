@@ -114,7 +114,10 @@ pub struct Link {
     pub weight: f64,
 }
 
-/// Property values stored on entities and links.
+/// Property values stored on entities, links, and notes.
+///
+/// Recursive: supports arrays and nested objects for free-form JSON properties
+/// (e.g. `entity_ids[]`, `alternatives_considered[]` per ADR-019).
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(untagged))]
@@ -123,6 +126,8 @@ pub enum PropertyValue {
     Integer(i64),
     Float(f64),
     Boolean(bool),
+    Array(Vec<PropertyValue>),
+    Object(BTreeMap<String, PropertyValue>),
     Null,
 }
 
@@ -133,6 +138,8 @@ impl fmt::Display for PropertyValue {
             Self::Integer(n) => write!(f, "{n}"),
             Self::Float(n) => write!(f, "{n}"),
             Self::Boolean(b) => write!(f, "{b}"),
+            Self::Array(arr) => write!(f, "[{} items]", arr.len()),
+            Self::Object(obj) => write!(f, "{{{} keys}}", obj.len()),
             Self::Null => f.write_str("null"),
         }
     }

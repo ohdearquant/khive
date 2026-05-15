@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::entity::PropertyValue;
-use crate::{Header, Id128, Timestamp};
+use crate::{Header, Timestamp};
 
 /// Closed taxonomy for note classification (ADR-019).
 ///
@@ -117,13 +117,12 @@ pub struct Note {
     pub salience: f64,
     pub decay_factor: f64,
     pub expires_at: Option<Timestamp>,
-    pub embedding_id: Option<Id128>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Namespace;
+    use crate::{Id128, Namespace};
 
     fn test_header() -> Header {
         Header::new(
@@ -193,7 +192,6 @@ mod tests {
             salience: 0.8,
             decay_factor: 0.01,
             expires_at: None,
-            embedding_id: None,
         };
         assert_eq!(note.kind, NoteKind::Decision);
         assert_eq!(note.tags.len(), 1);
