@@ -1,0 +1,19 @@
+[package]
+name = "khive-types"
+description = "Core type primitives: Id128, Timestamp, Namespace, and the 3 substrate data types (Note, Entity, Event)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["serde", "std"]
+serde = ["dep:serde"]
+std = []
+
+[dependencies]
+serde = { workspace = true, optional = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
