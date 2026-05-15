@@ -40,22 +40,8 @@ pub fn sum_scores(scores: &[DeterministicScore]) -> DeterministicScore {
     if scores.is_empty() {
         return DeterministicScore::ZERO;
     }
-    let n = scores.len() as u64;
-    let mut max_abs: u64 = 0;
-    for &s in scores {
-        let abs = s.to_raw().unsigned_abs();
-        if abs > max_abs {
-            max_abs = abs;
-        }
-    }
-    if max_abs <= (i64::MAX as u64) / n {
-        let sum: i128 = scores.iter().map(|s| s.to_raw() as i128).sum();
-        DeterministicScore::from_raw(sum as i64)
-    } else {
-        scores
-            .iter()
-            .fold(DeterministicScore::ZERO, |acc, &s| acc + s)
-    }
+    let sum: i128 = scores.iter().map(|s| s.to_raw() as i128).sum();
+    DeterministicScore::from_raw(sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
 }
 
 #[inline]

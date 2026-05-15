@@ -22,11 +22,7 @@ impl<T: Ord + Copy> QuantKey<T> {
 
     #[inline]
     pub fn new(score: f32, id: T) -> Self {
-        let s = if score.is_nan() {
-            f32::NEG_INFINITY
-        } else {
-            score
-        };
+        let s = if score.is_nan() { 0.0 } else { score };
         let q = (s * Self::SCALE)
             .round()
             .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
@@ -100,9 +96,9 @@ mod tests {
     }
 
     #[test]
-    fn nan_sorts_last() {
+    fn nan_maps_to_zero() {
         let nan_key = QuantKey::new(f32::NAN, 1u32);
-        let regular = QuantKey::new(0.5, 2u32);
-        assert!(nan_key < regular);
+        let zero_key = QuantKey::new(0.0, 1u32);
+        assert_eq!(nan_key.quantized_score(), zero_key.quantized_score());
     }
 }
