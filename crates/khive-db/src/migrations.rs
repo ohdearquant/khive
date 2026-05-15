@@ -112,6 +112,7 @@ const V1_UP: &str = "\
         relation TEXT NOT NULL,\
         weight REAL NOT NULL DEFAULT 1.0,\
         created_at INTEGER NOT NULL,\
+        metadata TEXT,\
         PRIMARY KEY (namespace, id)\
     );\
     CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_source ON graph_edges(namespace, source_id);\
@@ -138,16 +139,18 @@ const V1_UP: &str = "\
     CREATE TABLE IF NOT EXISTS events (\
         id TEXT PRIMARY KEY,\
         namespace TEXT NOT NULL,\
-        kind TEXT NOT NULL,\
-        actor_id TEXT,\
-        agent_id TEXT,\
-        query_text TEXT,\
+        verb TEXT NOT NULL,\
+        substrate TEXT NOT NULL,\
+        actor TEXT NOT NULL,\
         outcome TEXT NOT NULL,\
-        payload TEXT NOT NULL DEFAULT '{}',\
+        data TEXT,\
+        duration_us INTEGER NOT NULL DEFAULT 0,\
+        target_id TEXT,\
         created_at INTEGER NOT NULL\
     );\
     CREATE INDEX IF NOT EXISTS idx_events_namespace ON events(namespace);\
-    CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);\
+    CREATE INDEX IF NOT EXISTS idx_events_verb ON events(verb);\
+    CREATE INDEX IF NOT EXISTS idx_events_substrate ON events(substrate);\
     CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);\
 ";
 

@@ -23,7 +23,12 @@ rusqlite = { version = "0.33", features = ["bundled", "column_decltype"] }
 crossbeam-queue = "0.3"
 parking_lot = "0.12"
 tempfile = "3"
+sqlite-vec = { version = "0.1.9", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = "3"
+
+[features]
+default = []
+vectors = ["dep:sqlite-vec"]

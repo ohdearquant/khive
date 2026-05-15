@@ -22,23 +22,28 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Notes, op, e)
 }
 
-/// A NoteStore backed by SQLite.
+/// A NoteStore backed by SQLite, scoped to a single namespace.
+///
+/// Reads and deletes are restricted to `self.namespace`. Writes accept notes
+/// whose `namespace` field is used directly (no override), but `get_note` and
+/// `delete_note` only operate on records that belong to this store's namespace.
 pub struct SqlNoteStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
+    namespace: String,
 }
 
 impl SqlNoteStore {
-    /// Create a new store. The `_namespace` parameter is accepted for API
-    /// symmetry but ignored: notes carry their own namespace field.
+    /// Create a new store scoped to `namespace`.
     pub fn new_scoped(
         pool: Arc<ConnectionPool>,
         is_file_backed: bool,
-        _namespace: impl Into<String>,
+        namespace: impl Into<String>,
     ) -> Self {
         Self {
             pool,
             is_file_backed,
+            namespace: namespace.into(),
         }
     }
 
@@ -284,14 +289,15 @@ impl NoteStore for SqlNoteStore {
 
     async fn get_note(&self, id: Uuid) -> Result<Option<Note>, StorageError> {
         let id_str = id.to_string();
+        let namespace = self.namespace.clone();
 
         self.with_reader("get_note", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
-                 FROM notes WHERE id = ?1 AND deleted_at IS NULL",
+                 FROM notes WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL",
             )?;
-            let mut rows = stmt.query(rusqlite::params![id_str])?;
+            let mut rows = stmt.query(rusqlite::params![id_str, namespace])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_note(row)?)),
                 None => Ok(None),
@@ -302,6 +308,7 @@ impl NoteStore for SqlNoteStore {
 
     async fn delete_note(&self, id: Uuid, mode: DeleteMode) -> Result<bool, StorageError> {
         let id_str = id.to_string();
+        let namespace = self.namespace.clone();
 
         match mode {
             DeleteMode::Soft => {
@@ -309,8 +316,8 @@ impl NoteStore for SqlNoteStore {
                     let now = chrono::Utc::now().timestamp_micros();
                     let deleted = conn.execute(
                         "UPDATE notes SET deleted_at = ?1 \
-                         WHERE id = ?2 AND deleted_at IS NULL",
-                        rusqlite::params![now, id_str],
+                         WHERE id = ?2 AND namespace = ?3 AND deleted_at IS NULL",
+                        rusqlite::params![now, id_str, namespace],
                     )?;
                     Ok(deleted > 0)
                 })
@@ -318,8 +325,10 @@ impl NoteStore for SqlNoteStore {
             }
             DeleteMode::Hard => {
                 self.with_writer("delete_note_hard", move |conn| {
-                    let deleted =
-                        conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![id_str])?;
+                    let deleted = conn.execute(
+                        "DELETE FROM notes WHERE id = ?1 AND namespace = ?2",
+                        rusqlite::params![id_str, namespace],
+                    )?;
                     Ok(deleted > 0)
                 })
                 .await
@@ -562,6 +571,53 @@ mod tests {
 
         let count_other = store.count_notes("ns2", None).await.unwrap();
         assert_eq!(count_other, 0);
+    }
+
+    /// A store scoped to "ns_a" must not see or delete notes belonging to "ns_b".
+    #[tokio::test]
+    async fn test_cross_namespace_isolation_get_and_delete() {
+        let config = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let writer = pool.writer().unwrap();
+            writer.conn().execute_batch(NOTES_DDL).unwrap();
+        }
+
+        let store_a = SqlNoteStore::new_scoped(Arc::clone(&pool), false, "ns_a");
+        let store_b = SqlNoteStore::new_scoped(Arc::clone(&pool), false, "ns_b");
+
+        // Write a note that belongs to ns_b via store_b.
+        let note_b = make_note("ns_b", NoteKind::Observation, "secret note");
+        let id_b = note_b.id;
+        store_b.upsert_note(note_b).await.unwrap();
+
+        // store_a (scoped to ns_a) must not see the ns_b note.
+        let result = store_a.get_note(id_b).await.unwrap();
+        assert!(result.is_none(), "store_a must not read a note from ns_b");
+
+        // store_a must not be able to soft-delete the ns_b note.
+        let deleted_soft = store_a.delete_note(id_b, DeleteMode::Soft).await.unwrap();
+        assert!(
+            !deleted_soft,
+            "store_a must not soft-delete a note from ns_b"
+        );
+
+        // store_a must not be able to hard-delete the ns_b note.
+        let deleted_hard = store_a.delete_note(id_b, DeleteMode::Hard).await.unwrap();
+        assert!(
+            !deleted_hard,
+            "store_a must not hard-delete a note from ns_b"
+        );
+
+        // The note must still be visible to store_b.
+        let still_there = store_b.get_note(id_b).await.unwrap();
+        assert!(
+            still_there.is_some(),
+            "note must still exist in ns_b after cross-namespace delete attempts"
+        );
     }
 
     #[tokio::test]

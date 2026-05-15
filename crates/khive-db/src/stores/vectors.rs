@@ -176,13 +176,14 @@ impl VectorStore for SqliteVecStore {
     async fn insert(
         &self,
         subject_id: Uuid,
-        _kind: SubstrateKind,
+        kind: SubstrateKind,
         namespace: &str,
         embedding: Vec<f32>,
     ) -> Result<(), StorageError> {
         let table = self.table_name.clone();
         let dims = self.dimensions;
         let namespace = namespace.to_owned();
+        let kind_str = kind.to_string();
 
         if embedding.len() == dims {
             if let Some(idx) = non_finite_index(&embedding) {
@@ -200,7 +201,7 @@ impl VectorStore for SqliteVecStore {
 
             // vec0 does not support INSERT OR REPLACE — delete then insert.
             let del_sql = format!(
-                "DELETE FROM {} WHERE entity_id = ?1 AND namespace = ?2",
+                "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
                 table
             );
             conn.execute(
@@ -209,13 +210,13 @@ impl VectorStore for SqliteVecStore {
             )?;
 
             let ins_sql = format!(
-                "INSERT INTO {} (entity_id, namespace, embedding) VALUES (?1, ?2, ?3)",
+                "INSERT INTO {} (subject_id, namespace, kind, embedding) VALUES (?1, ?2, ?3, ?4)",
                 table
             );
             let blob = f32_slice_as_bytes(&embedding);
             conn.execute(
                 &ins_sql,
-                rusqlite::params![subject_id.to_string(), &namespace, blob],
+                rusqlite::params![subject_id.to_string(), &namespace, &kind_str, blob],
             )?;
             Ok(())
         })
@@ -232,11 +233,11 @@ impl VectorStore for SqliteVecStore {
 
         self.with_writer("vec_insert_batch", move |conn| {
             let del_sql = format!(
-                "DELETE FROM {} WHERE entity_id = ?1 AND namespace = ?2",
+                "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
                 table
             );
             let ins_sql = format!(
-                "INSERT INTO {} (entity_id, namespace, embedding) VALUES (?1, ?2, ?3)",
+                "INSERT INTO {} (subject_id, namespace, kind, embedding) VALUES (?1, ?2, ?3, ?4)",
                 table
             );
 
@@ -255,10 +256,11 @@ impl VectorStore for SqliteVecStore {
                 }
                 let blob = f32_slice_as_bytes(&record.embedding);
                 let id_str = record.subject_id.to_string();
+                let kind_str = record.kind.to_string();
                 let _ = conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace]);
                 match conn.execute(
                     &ins_sql,
-                    rusqlite::params![&id_str, &record.namespace, blob],
+                    rusqlite::params![&id_str, &record.namespace, &kind_str, blob],
                 ) {
                     Ok(_) => affected += 1,
                     Err(_) => failed += 1,
@@ -283,7 +285,7 @@ impl VectorStore for SqliteVecStore {
 
         self.with_writer("vec_delete", move |conn| {
             let sql = format!(
-                "DELETE FROM {} WHERE entity_id = ?1 AND namespace = ?2",
+                "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
                 table
             );
             let deleted =
@@ -317,6 +319,7 @@ impl VectorStore for SqliteVecStore {
             .namespace
             .clone()
             .unwrap_or_else(|| self.namespace.clone());
+        let kind_filter = request.kind.map(|k| k.to_string());
 
         if request.query_embedding.len() == dims {
             if let Some(idx) = non_finite_index(&request.query_embedding) {
@@ -336,30 +339,56 @@ impl VectorStore for SqliteVecStore {
                 ));
             }
 
-            // Restrict candidate set to namespace via subquery, then MATCH-rank.
+            // Restrict candidate set to namespace (and optionally kind) via subquery,
+            // then MATCH-rank by embedding distance.
+            let subquery_kind_clause = if kind_filter.is_some() {
+                "AND kind = ?4"
+            } else {
+                ""
+            };
             let sql = format!(
-                "SELECT entity_id, distance \
+                "SELECT subject_id, distance \
                  FROM {t} \
                  WHERE embedding MATCH ?1 \
-                   AND entity_id IN (SELECT entity_id FROM {t} WHERE namespace = ?3) \
+                   AND subject_id IN (\
+                     SELECT subject_id FROM {t} WHERE namespace = ?3 {kind_clause}\
+                   ) \
                  ORDER BY distance \
                  LIMIT ?2",
-                t = table
+                t = table,
+                kind_clause = subquery_kind_clause
             );
 
             let query_blob = f32_slice_as_bytes(&request.query_embedding);
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                rusqlite::params![query_blob, request.top_k, &namespace],
-                |row| {
-                    let id_str: String = row.get(0)?;
-                    let distance: f64 = row.get(1)?;
-                    Ok((id_str, distance))
-                },
-            )?;
+
+            // Collect rows into a Vec to avoid holding MappedRows (which is
+            // parameterised on its closure type) across both branches.
+            let raw_rows: Vec<rusqlite::Result<(String, f64)>> =
+                if let Some(ref kind_str) = kind_filter {
+                    stmt.query_map(
+                        rusqlite::params![query_blob, request.top_k, &namespace, kind_str],
+                        |row| {
+                            let id_str: String = row.get(0)?;
+                            let distance: f64 = row.get(1)?;
+                            Ok((id_str, distance))
+                        },
+                    )?
+                    .collect()
+                } else {
+                    stmt.query_map(
+                        rusqlite::params![query_blob, request.top_k, &namespace],
+                        |row| {
+                            let id_str: String = row.get(0)?;
+                            let distance: f64 = row.get(1)?;
+                            Ok((id_str, distance))
+                        },
+                    )?
+                    .collect()
+                };
 
             let mut hits = Vec::new();
-            for (rank_idx, row) in rows.enumerate() {
+            for (rank_idx, row) in raw_rows.into_iter().enumerate() {
                 let (id_str, distance) = row?;
                 let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -458,9 +487,9 @@ impl SqliteVecStore {
                     .join(", ");
 
                 let sql = format!(
-                    "SELECT e.entity_id, vec_distance_cosine(e.embedding, ?1) as distance \
+                    "SELECT e.subject_id, vec_distance_cosine(e.embedding, ?1) as distance \
                      FROM {} e \
-                     WHERE e.namespace = ?2 AND e.entity_id IN ({})",
+                     WHERE e.namespace = ?2 AND e.subject_id IN ({})",
                     table, placeholders
                 );
 

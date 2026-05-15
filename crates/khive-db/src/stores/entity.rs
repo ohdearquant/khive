@@ -23,23 +23,29 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Entities, op, e)
 }
 
-/// An EntityStore backed by SQLite.
+/// An EntityStore backed by SQLite, scoped to a single namespace.
+///
+/// Reads and deletes are restricted to `self.namespace`. Writes accept
+/// entities whose `namespace` field may differ (cross-namespace writes are
+/// allowed intentionally for bulk import scenarios), but `get_entity` and
+/// `delete_entity` will only see records that belong to this store's namespace.
 pub struct SqlEntityStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
+    namespace: String,
 }
 
 impl SqlEntityStore {
-    /// Create a new store. The `_namespace` parameter is accepted for API
-    /// symmetry but ignored: entities carry their own namespace field.
+    /// Create a new store scoped to `namespace`.
     pub fn new_scoped(
         pool: Arc<ConnectionPool>,
         is_file_backed: bool,
-        _namespace: impl Into<String>,
+        namespace: impl Into<String>,
     ) -> Self {
         Self {
             pool,
             is_file_backed,
+            namespace: namespace.into(),
         }
     }
 
@@ -313,14 +319,15 @@ impl EntityStore for SqlEntityStore {
 
     async fn get_entity(&self, id: Uuid) -> Result<Option<Entity>, StorageError> {
         let id_str = id.to_string();
+        let namespace = self.namespace.clone();
 
         self.with_reader("get_entity", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, name, description, properties, tags, \
                  created_at, updated_at, deleted_at \
-                 FROM entities WHERE id = ?1 AND deleted_at IS NULL",
+                 FROM entities WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL",
             )?;
-            let mut rows = stmt.query(rusqlite::params![id_str])?;
+            let mut rows = stmt.query(rusqlite::params![id_str, namespace])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_entity(row)?)),
                 None => Ok(None),
@@ -331,6 +338,7 @@ impl EntityStore for SqlEntityStore {
 
     async fn delete_entity(&self, id: Uuid, mode: DeleteMode) -> Result<bool, StorageError> {
         let id_str = id.to_string();
+        let namespace = self.namespace.clone();
 
         match mode {
             DeleteMode::Soft => {
@@ -338,8 +346,8 @@ impl EntityStore for SqlEntityStore {
                     let now = chrono::Utc::now().timestamp_micros();
                     let deleted = conn.execute(
                         "UPDATE entities SET deleted_at = ?1 \
-                         WHERE id = ?2 AND deleted_at IS NULL",
-                        rusqlite::params![now, id_str],
+                         WHERE id = ?2 AND namespace = ?3 AND deleted_at IS NULL",
+                        rusqlite::params![now, id_str, namespace],
                     )?;
                     Ok(deleted > 0)
                 })
@@ -348,8 +356,8 @@ impl EntityStore for SqlEntityStore {
             DeleteMode::Hard => {
                 self.with_writer("delete_entity_hard", move |conn| {
                     let deleted = conn.execute(
-                        "DELETE FROM entities WHERE id = ?1",
-                        rusqlite::params![id_str],
+                        "DELETE FROM entities WHERE id = ?1 AND namespace = ?2",
+                        rusqlite::params![id_str, namespace],
                     )?;
                     Ok(deleted > 0)
                 })
@@ -705,6 +713,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page_a.items[0].name, "EntityA");
+    }
+
+    /// A store scoped to "ns_a" must not see or delete entities belonging to "ns_b".
+    #[tokio::test]
+    async fn test_cross_namespace_isolation_get_and_delete() {
+        // Both stores share the same pool so rows are physically in the same DB.
+        let config = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let writer = pool.writer().unwrap();
+            writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+        }
+
+        let store_a = SqlEntityStore::new_scoped(Arc::clone(&pool), false, "ns_a");
+        let store_b = SqlEntityStore::new_scoped(Arc::clone(&pool), false, "ns_b");
+
+        // Write an entity that belongs to ns_b via store_b.
+        let entity_b = make_entity("ns_b", EntityKind::Concept, "SecretB");
+        let id_b = entity_b.id;
+        store_b.upsert_entity(entity_b).await.unwrap();
+
+        // store_a (scoped to ns_a) must not see the ns_b entity.
+        let result = store_a.get_entity(id_b).await.unwrap();
+        assert!(
+            result.is_none(),
+            "store_a must not read an entity from ns_b"
+        );
+
+        // store_a must not be able to soft-delete the ns_b entity.
+        let deleted_soft = store_a.delete_entity(id_b, DeleteMode::Soft).await.unwrap();
+        assert!(
+            !deleted_soft,
+            "store_a must not soft-delete an entity from ns_b"
+        );
+
+        // store_a must not be able to hard-delete the ns_b entity.
+        let deleted_hard = store_a.delete_entity(id_b, DeleteMode::Hard).await.unwrap();
+        assert!(
+            !deleted_hard,
+            "store_a must not hard-delete an entity from ns_b"
+        );
+
+        // The entity must still be visible to store_b.
+        let still_there = store_b.get_entity(id_b).await.unwrap();
+        assert!(
+            still_there.is_some(),
+            "entity must still exist in ns_b after cross-namespace delete attempts"
+        );
     }
 
     #[tokio::test]

@@ -242,10 +242,14 @@ impl StorageBackend {
         }
 
         // Create the vec0 virtual table. Idempotent.
+        // Columns: subject_id (PK), namespace (partition filter), kind (substrate
+        // discriminator), embedding (the float vector). vec0 supports TEXT
+        // auxiliary/partition columns alongside the vector column.
         let ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
-             entity_id TEXT PRIMARY KEY, \
+             subject_id TEXT PRIMARY KEY, \
              namespace TEXT NOT NULL, \
+             kind TEXT NOT NULL, \
              embedding float[{}] distance_metric=cosine\
              )",
             model_key, dimensions

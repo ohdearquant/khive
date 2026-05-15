@@ -161,6 +161,7 @@ fn read_edge(row: &rusqlite::Row<'_>) -> Result<Edge, rusqlite::Error> {
     let relation_str: String = row.get(3)?;
     let weight: f64 = row.get(4)?;
     let created_micros: i64 = row.get(5)?;
+    let metadata_str: Option<String> = row.get(6)?;
 
     let id = parse_uuid(&id_str)?;
     let source_id = parse_uuid(&source_str)?;
@@ -169,6 +170,7 @@ fn read_edge(row: &rusqlite::Row<'_>) -> Result<Edge, rusqlite::Error> {
     let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
     })?;
+    let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
 
     Ok(Edge {
         id: id.into(),
@@ -177,7 +179,7 @@ fn read_edge(row: &rusqlite::Row<'_>) -> Result<Edge, rusqlite::Error> {
         relation,
         weight,
         created_at,
-        metadata: None,
+        metadata,
     })
 }
 
@@ -293,11 +295,15 @@ impl GraphStore for SqlGraphStore {
         let src_str = edge.source_id.to_string();
         let tgt_str = edge.target_id.to_string();
         let relation_str = edge.relation.to_string();
+        let metadata_str = edge
+            .metadata
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
         self.with_writer("upsert_edge", move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO graph_edges \
-                 (namespace, id, source_id, target_id, relation, weight, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (namespace, id, source_id, target_id, relation, weight, created_at, metadata) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     namespace,
                     id_str,
@@ -306,6 +312,7 @@ impl GraphStore for SqlGraphStore {
                     relation_str,
                     edge.weight,
                     edge.created_at.timestamp_micros(),
+                    metadata_str,
                 ],
             )?;
             Ok(())
@@ -328,10 +335,14 @@ impl GraphStore for SqlGraphStore {
                 let src_str = edge.source_id.to_string();
                 let tgt_str = edge.target_id.to_string();
                 let relation_str = edge.relation.to_string();
+                let metadata_str = edge
+                    .metadata
+                    .as_ref()
+                    .map(|v| serde_json::to_string(v).unwrap_or_default());
                 match conn.execute(
                     "INSERT OR REPLACE INTO graph_edges \
-                     (namespace, id, source_id, target_id, relation, weight, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (namespace, id, source_id, target_id, relation, weight, created_at, metadata) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![
                         &namespace,
                         id_str,
@@ -340,6 +351,7 @@ impl GraphStore for SqlGraphStore {
                         relation_str,
                         edge.weight,
                         edge.created_at.timestamp_micros(),
+                        metadata_str,
                     ],
                 ) {
                     Ok(_) => affected += 1,
@@ -372,7 +384,7 @@ impl GraphStore for SqlGraphStore {
 
         self.with_reader("get_edge", move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, source_id, target_id, relation, weight, created_at \
+                "SELECT id, source_id, target_id, relation, weight, created_at, metadata \
                  FROM graph_edges WHERE namespace = ?1 AND id = ?2",
             )?;
             let mut rows = stmt.query(rusqlite::params![namespace, id_str])?;
@@ -441,7 +453,7 @@ impl GraphStore for SqlGraphStore {
             let offset_idx = all_params.len();
 
             let data_sql = format!(
-                "SELECT id, source_id, target_id, relation, weight, created_at \
+                "SELECT id, source_id, target_id, relation, weight, created_at, metadata \
                  FROM graph_edges{}{} LIMIT ?{} OFFSET ?{}",
                 where_clause, order_clause, limit_idx, offset_idx,
             );
@@ -741,6 +753,7 @@ const GRAPH_DDL: &str = "\
         relation TEXT NOT NULL,\
         weight REAL NOT NULL DEFAULT 1.0,\
         created_at INTEGER NOT NULL,\
+        metadata TEXT,\
         PRIMARY KEY (namespace, id)\
     );\
     CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_source ON graph_edges(namespace, source_id);\
@@ -931,6 +944,50 @@ mod tests {
         assert!(node_ids.contains(&b));
         assert!(node_ids.contains(&c));
         assert!(!node_ids.contains(&d));
+    }
+
+    #[tokio::test]
+    async fn test_metadata_roundtrip() {
+        let store = setup_memory_store();
+
+        let src = Uuid::new_v4();
+        let tgt = Uuid::new_v4();
+        let meta = serde_json::json!({"note": "important link", "confidence": 0.95});
+        let edge = Edge {
+            id: Uuid::new_v4().into(),
+            source_id: src,
+            target_id: tgt,
+            relation: EdgeRelation::Implements,
+            weight: 0.9,
+            created_at: Utc::now(),
+            metadata: Some(meta.clone()),
+        };
+        let edge_id = edge.id;
+
+        store.upsert_edge(edge).await.unwrap();
+
+        let fetched = store.get_edge(edge_id).await.unwrap().unwrap();
+        assert_eq!(
+            fetched.metadata.as_ref(),
+            Some(&meta),
+            "metadata must survive a write/read roundtrip via get_edge"
+        );
+
+        // Also verify via query_edges.
+        let page = store
+            .query_edges(EdgeFilter::default(), vec![], PageRequest::default())
+            .await
+            .unwrap();
+        let from_query = page
+            .items
+            .iter()
+            .find(|e| e.id == edge_id)
+            .expect("edge must appear in query_edges result");
+        assert_eq!(
+            from_query.metadata.as_ref(),
+            Some(&meta),
+            "metadata must survive a write/read roundtrip via query_edges"
+        );
     }
 
     #[tokio::test]
