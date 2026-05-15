@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "khive-types",
     "khive-score",
+    "khive-storage",
     # Other crates land in subsequent PRs:
     # "khive-storage",
     # "khive-db",
