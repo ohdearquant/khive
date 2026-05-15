@@ -41,7 +41,10 @@ pub fn sum_scores(scores: &[DeterministicScore]) -> DeterministicScore {
         return DeterministicScore::ZERO;
     }
     let sum: i128 = scores.iter().map(|s| s.to_raw() as i128).sum();
-    DeterministicScore::from_raw(sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+    DeterministicScore::from_raw(sum.clamp(
+        DeterministicScore::NEG_INF.to_raw() as i128,
+        i64::MAX as i128,
+    ) as i64)
 }
 
 #[inline]
@@ -51,7 +54,10 @@ pub fn avg_scores(scores: &[DeterministicScore]) -> DeterministicScore {
     }
     let sum: i128 = scores.iter().map(|s| s.to_raw() as i128).sum();
     let mean = sum / scores.len() as i128;
-    DeterministicScore::from_raw(mean.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+    DeterministicScore::from_raw(mean.clamp(
+        DeterministicScore::NEG_INF.to_raw() as i128,
+        i64::MAX as i128,
+    ) as i64)
 }
 
 #[inline]
@@ -68,8 +74,10 @@ pub fn avg_scores_checked(scores: &[DeterministicScore]) -> (DeterministicScore,
     }
     let mean = sum / scores.len() as i128;
     near_saturation |= mean.abs() > SATURATION_THRESHOLD;
-    let result =
-        DeterministicScore::from_raw(mean.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
+    let result = DeterministicScore::from_raw(mean.clamp(
+        DeterministicScore::NEG_INF.to_raw() as i128,
+        i64::MAX as i128,
+    ) as i64);
     (result, near_saturation)
 }
 
