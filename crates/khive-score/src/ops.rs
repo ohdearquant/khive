@@ -188,4 +188,32 @@ mod tests {
         let err = weighted_sum(&[s(0.1)], &[f64::NAN]).unwrap_err();
         assert!(matches!(err, ScoreError::NonFiniteWeight { index: 0 }));
     }
+
+    #[test]
+    fn sum_negative_saturation_clamps_to_neg_inf() {
+        let big_neg = DeterministicScore::NEG_INF;
+        let result = sum_scores(&[big_neg, big_neg, big_neg]);
+        assert_eq!(result, DeterministicScore::NEG_INF);
+        assert!(result.is_infinite());
+        assert_eq!(result.to_f64(), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn avg_negative_saturation_clamps_to_neg_inf() {
+        let big_neg = DeterministicScore::NEG_INF;
+        let result = avg_scores(&[big_neg, big_neg]);
+        assert_eq!(result, DeterministicScore::NEG_INF);
+    }
+
+    #[test]
+    fn sum_order_independent() {
+        let a = DeterministicScore::from_f64(1e9);
+        let b = DeterministicScore::from_f64(-1e9);
+        let c = DeterministicScore::from_f64(0.5);
+        let r1 = sum_scores(&[a, b, c]);
+        let r2 = sum_scores(&[c, a, b]);
+        let r3 = sum_scores(&[b, c, a]);
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+    }
 }
