@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_types::EdgeRelation;
+use khive_types::{EdgeRelation, SubstrateKind};
 
 use crate::error::StorageError;
 
@@ -111,7 +111,8 @@ pub enum VectorIndexKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorRecord {
     pub subject_id: Uuid,
-    pub kind: String,
+    pub kind: SubstrateKind,
+    pub namespace: String,
     pub embedding: Vec<f32>,
     pub updated_at: DateTime<Utc>,
 }
@@ -120,6 +121,8 @@ pub struct VectorRecord {
 pub struct VectorSearchRequest {
     pub query_embedding: Vec<f32>,
     pub top_k: u32,
+    pub namespace: Option<String>,
+    pub kind: Option<SubstrateKind>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -144,11 +147,11 @@ pub struct VectorStoreInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextDocument {
     pub subject_id: Uuid,
-    pub kind: String,
+    pub kind: SubstrateKind,
+    pub namespace: String,
     pub title: Option<String>,
     pub body: String,
     pub tags: Vec<String>,
-    pub namespace: Option<String>,
     pub metadata: Option<Value>,
     pub updated_at: DateTime<Utc>,
 }
@@ -156,7 +159,7 @@ pub struct TextDocument {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TextFilter {
     pub ids: Vec<Uuid>,
-    pub entity_kinds: Vec<String>,
+    pub kinds: Vec<SubstrateKind>,
     pub namespaces: Vec<String>,
 }
 
@@ -250,8 +253,8 @@ impl fmt::Display for LinkId {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Edge {
     pub id: LinkId,
-    pub source_id: LinkId,
-    pub target_id: LinkId,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
     pub relation: EdgeRelation,
     pub weight: f64,
     pub created_at: DateTime<Utc>,

@@ -3,6 +3,8 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use khive_types::SubstrateKind;
+
 use crate::types::{
     BatchWriteSummary, IndexRebuildScope, StorageResult, VectorRecord, VectorSearchHit,
     VectorSearchRequest, VectorStoreInfo,
@@ -10,7 +12,13 @@ use crate::types::{
 
 #[async_trait]
 pub trait VectorStore: Send + Sync + 'static {
-    async fn insert(&self, subject_id: Uuid, kind: &str, embedding: Vec<f32>) -> StorageResult<()>;
+    async fn insert(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        embedding: Vec<f32>,
+    ) -> StorageResult<()>;
     async fn insert_batch(&self, records: Vec<VectorRecord>) -> StorageResult<BatchWriteSummary>;
     async fn delete(&self, subject_id: Uuid) -> StorageResult<bool>;
     async fn count(&self) -> StorageResult<u64>;
