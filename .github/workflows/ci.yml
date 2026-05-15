@@ -41,4 +41,4 @@ jobs:
         with:
           deno-version: v2.x
       - name: Check markdown formatting
-        run: deno fmt --check docs/
+        run: deno fmt --check

@@ -17,18 +17,18 @@ No Neo4j. No SPARQL endpoint to deploy. SQLite on disk, MCP over stdio, `cargo t
 
 ## What you get
 
-| Capability                  | How                                                                                  |
-| --------------------------- | ------------------------------------------------------------------------------------ |
-| **Typed entities**          | 6 closed kinds: concept, document, dataset, project, person, org                     |
+| Capability                  | How                                                                                                |
+| --------------------------- | -------------------------------------------------------------------------------------------------- |
+| **Typed entities**          | 6 closed kinds: concept, document, dataset, project, person, org                                   |
 | **Typed edges**             | 13 closed relations in 6 categories (structure, derivation, dependency, impl, lateral, annotation) |
-| **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                  |
-| **Hybrid search**           | FTS5 trigram (CJK-safe) + sqlite-vec embeddings + reciprocal rank fusion             |
-| **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path               |
-| **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                    |
-| **Salience-weighted notes** | Notes carry importance scores; search ranks by semantic relevance × salience         |
-| **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                    |
-| **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges            |
-| **Namespace isolation**     | Tenant scoping on every operation — share one DB, isolate many agents                |
+| **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                |
+| **Hybrid search**           | FTS5 trigram (CJK-safe) + sqlite-vec embeddings + reciprocal rank fusion                           |
+| **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                             |
+| **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                                  |
+| **Salience-weighted notes** | Notes carry importance scores; search ranks by semantic relevance × salience                       |
+| **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                                  |
+| **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges                         |
+| **Namespace isolation**     | Tenant scoping on every operation — share one DB, isolate many agents                              |
 
 ---
 
@@ -36,11 +36,11 @@ No Neo4j. No SPARQL endpoint to deploy. SQLite on disk, MCP over stdio, `cargo t
 
 Everything in khive is one of three things ([ADR-004](docs/adr/ADR-004-substrate-observables.md)):
 
-| Substrate  | What it is                              | Mutability            | Example                                            |
-| ---------- | --------------------------------------- | --------------------- | -------------------------------------------------- |
-| **Entity** | A graph node with typed edges           | Mutable + soft-delete | `LoRA` (concept), `arxiv:2106.09685` (document)   |
-| **Note**   | A temporal observation about the world  | Mutable + soft-delete | "FlashAttention gains scale with seq len, not batch" |
-| **Event**  | An audit log entry                      | Immutable             | `create(kind="entity", ...)` was called at T       |
+| Substrate  | What it is                             | Mutability            | Example                                              |
+| ---------- | -------------------------------------- | --------------------- | ---------------------------------------------------- |
+| **Entity** | A graph node with typed edges          | Mutable + soft-delete | `LoRA` (concept), `arxiv:2106.09685` (document)      |
+| **Note**   | A temporal observation about the world | Mutable + soft-delete | "FlashAttention gains scale with seq len, not batch" |
+| **Event**  | An audit log entry                     | Immutable             | `create(kind="entity", ...)` was called at T         |
 
 Entities are _things_. Notes are _what you think about things_. Events are _what happened_.
 
@@ -106,15 +106,15 @@ For the full design: [ADR-003](docs/adr/ADR-003-four-layer-architecture.md) (fou
 
 ## Crates
 
-| Crate            | Purpose                                                   |
-| ---------------- | --------------------------------------------------------- |
-| `khive-types`    | Domain types: Entity, Note, Event, Id128, closed enums    |
-| `khive-score`    | Deterministic i64 fixed-point scoring                     |
-| `khive-storage`  | Trait-only capability surface (zero implementations)      |
-| `khive-db`       | SQLite backend: sqlite-vec, FTS5, graph edges             |
-| `khive-query`    | SPARQL / GQL → SQL compiler                               |
-| `khive-runtime`  | Composable service API, retrieval pipeline, graph ops     |
-| `khive-mcp`      | Stdio MCP binary — the only Rust-facing user surface      |
+| Crate           | Purpose                                                |
+| --------------- | ------------------------------------------------------ |
+| `khive-types`   | Domain types: Entity, Note, Event, Id128, closed enums |
+| `khive-score`   | Deterministic i64 fixed-point scoring                  |
+| `khive-storage` | Trait-only capability surface (zero implementations)   |
+| `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges          |
+| `khive-query`   | SPARQL / GQL → SQL compiler                            |
+| `khive-runtime` | Composable service API, retrieval pipeline, graph ops  |
+| `khive-mcp`     | Stdio MCP binary — the only Rust-facing user surface   |
 
 Dependency direction: `types → score → storage → db → query → runtime → mcp`. Storage is
 trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without touching
@@ -148,16 +148,16 @@ make ci
 khive's architecture is specified in 22 Architecture Decision Records. ADRs are the normative
 contract — code implements what they specify. Schema or interface changes require an ADR first.
 
-| ADR | Title | What it decides |
-| --- | ----- | --------------- |
-| [001](docs/adr/ADR-001-entity-kind-taxonomy.md) | Entity Kind Taxonomy | 6 closed entity kinds |
-| [002](docs/adr/ADR-002-edge-ontology.md) | Edge Ontology | 13 closed relations in 6 categories |
-| [004](docs/adr/ADR-004-substrate-observables.md) | Substrate Observables | Note, Entity, Event — the three primitives |
-| [005](docs/adr/ADR-005-storage-capability-traits.md) | Storage Capability Traits | Trait-only crate, 6 capabilities |
-| [019](docs/adr/ADR-019-note-kind-taxonomy.md) | Note Kind Taxonomy | 5 closed note kinds |
-| [021](docs/adr/ADR-021-edge-relation-enum.md) | Edge Relation Enum | Compiler-enforced relation set |
-| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md) | Verb-Consolidated MCP | 14 tools via `kind=` discriminant |
-| [024](docs/adr/ADR-024-note-search-and-cross-substrate.md) | Note Search + Cross-Substrate | Hybrid retrieval + `annotates` edges |
+| ADR                                                        | Title                         | What it decides                            |
+| ---------------------------------------------------------- | ----------------------------- | ------------------------------------------ |
+| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)            | Entity Kind Taxonomy          | 6 closed entity kinds                      |
+| [002](docs/adr/ADR-002-edge-ontology.md)                   | Edge Ontology                 | 13 closed relations in 6 categories        |
+| [004](docs/adr/ADR-004-substrate-observables.md)           | Substrate Observables         | Note, Entity, Event — the three primitives |
+| [005](docs/adr/ADR-005-storage-capability-traits.md)       | Storage Capability Traits     | Trait-only crate, 6 capabilities           |
+| [019](docs/adr/ADR-019-note-kind-taxonomy.md)              | Note Kind Taxonomy            | 5 closed note kinds                        |
+| [021](docs/adr/ADR-021-edge-relation-enum.md)              | Edge Relation Enum            | Compiler-enforced relation set             |
+| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)   | Verb-Consolidated MCP         | 14 tools via `kind=` discriminant          |
+| [024](docs/adr/ADR-024-note-search-and-cross-substrate.md) | Note Search + Cross-Substrate | Hybrid retrieval + `annotates` edges       |
 
 Full index: [docs/adr/README.md](docs/adr/README.md).
 
