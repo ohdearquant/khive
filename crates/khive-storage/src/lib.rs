@@ -42,4 +42,4 @@ pub use types::{
     VectorSearchRequest, VectorStoreInfo,
 };
 
-pub use khive_types::{EdgeCategory, EdgeRelation, EntityKind, SubstrateKind};
+pub use khive_types::{EdgeCategory, EdgeRelation, EntityKind, EventOutcome, SubstrateKind};

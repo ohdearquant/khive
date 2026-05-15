@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use khive_types::{EventOutcome, SubstrateKind};
+
 use crate::types::{BatchWriteSummary, Page, PageRequest, StorageResult};
 
 /// Storage-level event record. Every verb execution produces one.
@@ -14,9 +16,9 @@ pub struct Event {
     pub id: Uuid,
     pub namespace: String,
     pub verb: String,
-    pub substrate: String,
+    pub substrate: SubstrateKind,
     pub actor: String,
-    pub outcome: String,
+    pub outcome: EventOutcome,
     pub data: Option<Value>,
     pub duration_us: i64,
     pub target_id: Option<Uuid>,
@@ -27,16 +29,16 @@ impl Event {
     pub fn new(
         namespace: impl Into<String>,
         verb: impl Into<String>,
-        substrate: impl Into<String>,
+        substrate: SubstrateKind,
         actor: impl Into<String>,
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
             namespace: namespace.into(),
             verb: verb.into(),
-            substrate: substrate.into(),
+            substrate,
             actor: actor.into(),
-            outcome: "success".into(),
+            outcome: EventOutcome::Success,
             data: None,
             duration_us: 0,
             target_id: None,
@@ -44,8 +46,8 @@ impl Event {
         }
     }
 
-    pub fn with_outcome(mut self, o: impl Into<String>) -> Self {
-        self.outcome = o.into();
+    pub fn with_outcome(mut self, o: EventOutcome) -> Self {
+        self.outcome = o;
         self
     }
 
@@ -70,7 +72,7 @@ impl Event {
 pub struct EventFilter {
     pub ids: Vec<Uuid>,
     pub verbs: Vec<String>,
-    pub substrates: Vec<String>,
+    pub substrates: Vec<SubstrateKind>,
     pub actors: Vec<String>,
     pub namespaces: Vec<String>,
     pub after: Option<i64>,

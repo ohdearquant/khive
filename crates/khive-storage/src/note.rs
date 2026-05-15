@@ -68,10 +68,10 @@ pub trait NoteStore: Send + Sync + 'static {
     async fn query_notes(
         &self,
         namespace: &str,
-        kind: Option<&str>,
+        kind: Option<NoteKind>,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
-    async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
+    async fn count_notes(&self, namespace: &str, kind: Option<NoteKind>) -> StorageResult<u64>;
 
     async fn upsert_note_if_below_quota(&self, note: Note, max_notes: u64) -> StorageResult<bool> {
         let count = self.count_notes(&note.namespace, None).await?;
