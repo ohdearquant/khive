@@ -1,0 +1,29 @@
+[package]
+name = "khive-db"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+khive-storage = { path = "../khive-storage" }
+khive-score = { path = "../khive-score" }
+khive-types = { path = "../khive-types", features = ["serde"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { version = "0.33", features = ["bundled", "column_decltype"] }
+crossbeam-queue = "0.3"
+parking_lot = "0.12"
+tempfile = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
