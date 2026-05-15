@@ -40,6 +40,7 @@ impl StorageBackend {
     /// 1 writer + N readers in WAL mode for concurrent access.
     /// No schema is applied — call `apply_schema()` for each service.
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
+        crate::extension::ensure_extensions_loaded();
         let config = PoolConfig {
             path: Some(path.as_ref().to_path_buf()),
             ..PoolConfig::default()
@@ -57,6 +58,7 @@ impl StorageBackend {
     /// single-connection mode since in-memory databases cannot be shared
     /// across multiple connections.
     pub fn memory() -> Result<Self, SqliteError> {
+        crate::extension::ensure_extensions_loaded();
         let config = PoolConfig {
             path: None,
             ..PoolConfig::default()
@@ -241,10 +243,10 @@ impl StorageBackend {
             ));
         }
 
+        // Ensure sqlite-vec is registered before creating vec0 tables.
+        crate::extension::ensure_extensions_loaded();
+
         // Create the vec0 virtual table. Idempotent.
-        // Columns: subject_id (PK), namespace (partition filter), kind (substrate
-        // discriminator), embedding (the float vector). vec0 supports TEXT
-        // auxiliary/partition columns alongside the vector column.
         let ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
              subject_id TEXT PRIMARY KEY, \
@@ -457,7 +459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires sqlite-vec native extension loaded at test time"]
+    #[cfg(feature = "vectors")]
     async fn vectors_roundtrip_via_public_api() {
         let backend = StorageBackend::memory().unwrap();
         let store = backend.vectors("test_api", 3).unwrap();
@@ -489,7 +491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires sqlite-vec native extension loaded at test time"]
+    #[cfg(feature = "vectors")]
     async fn vectors_creates_table_idempotently() {
         let backend = StorageBackend::memory().unwrap();
 

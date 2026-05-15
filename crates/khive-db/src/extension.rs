@@ -14,9 +14,19 @@ pub fn ensure_extensions_loaded() {
     static INIT: Once = Once::new();
 
     INIT.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+        // sqlite-vec exports sqlite3_vec_init as `extern "C" fn()` for
+        // auto_extension registration. sqlite3_auto_extension expects
+        // the 3-arg xEntryPoint signature, so we transmute the function
+        // pointer — this is the standard pattern for static extensions.
+        type AutoExtFn = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+
+        let f: AutoExtFn =
+            std::mem::transmute::<unsafe extern "C" fn(), AutoExtFn>(sqlite_vec::sqlite3_vec_init);
+        rusqlite::ffi::sqlite3_auto_extension(Some(f));
     });
 }
 

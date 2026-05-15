@@ -193,7 +193,8 @@ fn build_note_where(
 
 #[async_trait]
 impl NoteStore for SqlNoteStore {
-    async fn upsert_note(&self, note: Note) -> Result<(), StorageError> {
+    async fn upsert_note(&self, mut note: Note) -> Result<(), StorageError> {
+        note.namespace.clone_from(&self.namespace);
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();
         let kind_str = note.kind.to_string();
@@ -227,7 +228,10 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
-    async fn upsert_notes(&self, notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
+    async fn upsert_notes(&self, mut notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
+        for n in &mut notes {
+            n.namespace.clone_from(&self.namespace);
+        }
         let attempted = notes.len() as u64;
 
         self.with_writer("upsert_notes", move |conn| {
@@ -409,9 +413,10 @@ impl NoteStore for SqlNoteStore {
 
     async fn upsert_note_if_below_quota(
         &self,
-        note: Note,
+        mut note: Note,
         max_notes: u64,
     ) -> Result<bool, StorageError> {
+        note.namespace.clone_from(&self.namespace);
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();
         let kind_str = note.kind.to_string();
@@ -486,19 +491,25 @@ mod tests {
     use super::*;
     use crate::pool::PoolConfig;
 
-    fn setup_memory_store() -> SqlNoteStore {
+    fn setup_pool() -> Arc<ConnectionPool> {
         let config = PoolConfig {
             path: None,
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
-
         {
             let writer = pool.writer().unwrap();
             writer.conn().execute_batch(NOTES_DDL).unwrap();
         }
+        pool
+    }
 
-        SqlNoteStore::new_scoped(pool, false, "default")
+    fn setup_memory_store() -> SqlNoteStore {
+        SqlNoteStore::new_scoped(setup_pool(), false, "default")
+    }
+
+    fn setup_memory_store_ns(ns: &str) -> SqlNoteStore {
+        SqlNoteStore::new_scoped(setup_pool(), false, ns)
     }
 
     fn make_note(namespace: &str, kind: NoteKind, content: &str) -> Note {
@@ -557,19 +568,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_count_notes() {
-        let store = setup_memory_store();
+        let pool = setup_pool();
+        let store_ns1 = SqlNoteStore::new_scoped(Arc::clone(&pool), false, "ns1");
+        let store_ns2 = SqlNoteStore::new_scoped(Arc::clone(&pool), false, "ns2");
 
         for _ in 0..3 {
-            store
+            store_ns1
                 .upsert_note(make_note("ns1", NoteKind::Observation, "content"))
                 .await
                 .unwrap();
         }
 
-        let count = store.count_notes("ns1", None).await.unwrap();
+        let count = store_ns1.count_notes("ns1", None).await.unwrap();
         assert_eq!(count, 3);
 
-        let count_other = store.count_notes("ns2", None).await.unwrap();
+        let count_other = store_ns2.count_notes("ns2", None).await.unwrap();
         assert_eq!(count_other, 0);
     }
 
@@ -622,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_quota() {
-        let store = setup_memory_store();
+        let store = setup_memory_store_ns("quota_ns");
 
         for _ in 0..3 {
             let inserted = store

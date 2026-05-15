@@ -221,7 +221,8 @@ fn build_entity_where(
 
 #[async_trait]
 impl EntityStore for SqlEntityStore {
-    async fn upsert_entity(&self, entity: Entity) -> Result<(), StorageError> {
+    async fn upsert_entity(&self, mut entity: Entity) -> Result<(), StorageError> {
+        entity.namespace.clone_from(&self.namespace);
         let namespace = entity.namespace.clone();
         let id_str = entity.id.to_string();
         let properties_str = entity
@@ -256,8 +257,11 @@ impl EntityStore for SqlEntityStore {
 
     async fn upsert_entities(
         &self,
-        entities: Vec<Entity>,
+        mut entities: Vec<Entity>,
     ) -> Result<BatchWriteSummary, StorageError> {
+        for e in &mut entities {
+            e.namespace.clone_from(&self.namespace);
+        }
         let attempted = entities.len() as u64;
 
         self.with_writer("upsert_entities", move |conn| {
@@ -468,19 +472,25 @@ mod tests {
     use super::*;
     use crate::pool::PoolConfig;
 
-    fn setup_memory_store() -> SqlEntityStore {
+    fn setup_pool() -> Arc<ConnectionPool> {
         let config = PoolConfig {
             path: None,
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
-
         {
             let writer = pool.writer().unwrap();
             writer.conn().execute_batch(ENTITIES_DDL).unwrap();
         }
+        pool
+    }
 
-        SqlEntityStore::new_scoped(pool, false, "default")
+    fn setup_memory_store() -> SqlEntityStore {
+        SqlEntityStore::new_scoped(setup_pool(), false, "default")
+    }
+
+    fn setup_memory_store_ns(ns: &str) -> SqlEntityStore {
+        SqlEntityStore::new_scoped(setup_pool(), false, ns)
     }
 
     fn make_entity(namespace: &str, kind: EntityKind, name: &str) -> Entity {
@@ -567,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_entities_basic() {
-        let store = setup_memory_store();
+        let store = setup_memory_store_ns("ns1");
 
         for name in &["Alpha", "Beta", "Gamma"] {
             store
@@ -611,7 +621,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_by_name_prefix() {
-        let store = setup_memory_store();
+        let store = setup_memory_store_ns("ns1");
 
         // "Alpha" and "AlphaGo" both start with "Alpha"; "Beta" does not
         for &name in &["Alpha", "AlphaGo", "Beta"] {
@@ -641,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_count_entities() {
-        let store = setup_memory_store();
+        let store = setup_memory_store_ns("ns1");
 
         for _ in 0..5 {
             store
@@ -665,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_upsert() {
-        let store = setup_memory_store();
+        let store = setup_memory_store_ns("batch_ns");
 
         let entities: Vec<Entity> = (0..10)
             .map(|i| make_entity("batch_ns", EntityKind::Concept, &format!("entity_{i}")))
@@ -685,22 +695,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_namespace_isolation() {
-        let store = setup_memory_store();
+        let pool = setup_pool();
+        let store_a = SqlEntityStore::new_scoped(Arc::clone(&pool), false, "ns_a");
+        let store_b = SqlEntityStore::new_scoped(Arc::clone(&pool), false, "ns_b");
 
-        store
+        store_a
             .upsert_entity(make_entity("ns_a", EntityKind::Concept, "EntityA"))
             .await
             .unwrap();
-        store
+        store_b
             .upsert_entity(make_entity("ns_b", EntityKind::Concept, "EntityB"))
             .await
             .unwrap();
 
-        let count_a = store
+        let count_a = store_a
             .count_entities("ns_a", EntityFilter::default())
             .await
             .unwrap();
-        let count_b = store
+        let count_b = store_b
             .count_entities("ns_b", EntityFilter::default())
             .await
             .unwrap();
@@ -708,7 +720,7 @@ mod tests {
         assert_eq!(count_a, 1);
         assert_eq!(count_b, 1);
 
-        let page_a = store
+        let page_a = store_a
             .query_entities("ns_a", EntityFilter::default(), PageRequest::default())
             .await
             .unwrap();
@@ -768,7 +780,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_by_ids() {
-        let store = setup_memory_store();
+        let store = setup_memory_store_ns("ns1");
 
         let e1 = make_entity("ns1", EntityKind::Concept, "E1");
         let e2 = make_entity("ns1", EntityKind::Concept, "E2");
