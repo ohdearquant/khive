@@ -94,7 +94,7 @@ impl StorageBackend {
     ///
     /// Idempotent — safe to call multiple times.
     pub fn entities(&self) -> Result<Arc<dyn khive_storage::EntityStore>, SqliteError> {
-        self.entities_for_namespace("default")
+        self.entities_for_namespace("local")
     }
 
     /// Get an EntityStore. The namespace parameter is validated (non-empty) and
@@ -123,7 +123,7 @@ impl StorageBackend {
     /// Creates the `graph_edges` table (with indexes) if it does not already
     /// exist. Idempotent — safe to call multiple times.
     pub fn graph(&self) -> Result<Arc<dyn khive_storage::GraphStore>, SqliteError> {
-        self.graph_for_namespace("default")
+        self.graph_for_namespace("local")
     }
 
     /// Get a GraphStore scoped to a namespace.
@@ -150,7 +150,7 @@ impl StorageBackend {
     ///
     /// Idempotent — safe to call multiple times.
     pub fn notes(&self) -> Result<Arc<dyn khive_storage::NoteStore>, SqliteError> {
-        self.notes_for_namespace("default")
+        self.notes_for_namespace("local")
     }
 
     /// Get a NoteStore. The namespace parameter is validated (non-empty) and
@@ -179,7 +179,7 @@ impl StorageBackend {
     /// Creates the `events` table (with indexes) if it does not already exist.
     /// Idempotent — safe to call multiple times.
     pub fn events(&self) -> Result<Arc<dyn khive_storage::EventStore>, SqliteError> {
-        self.events_for_namespace("default")
+        self.events_for_namespace("local")
     }
 
     /// Get an EventStore scoped to a namespace.
@@ -211,7 +211,7 @@ impl StorageBackend {
         model_key: &str,
         dimensions: usize,
     ) -> Result<Arc<dyn khive_storage::VectorStore>, SqliteError> {
-        self.vectors_for_namespace(model_key, dimensions, "default")
+        self.vectors_for_namespace(model_key, dimensions, "local")
     }
 
     /// Get a VectorStore for a specific embedding model, scoped to a namespace.
@@ -469,7 +469,7 @@ mod tests {
             .insert(
                 id,
                 khive_types::SubstrateKind::Entity,
-                "default",
+                "local",
                 vec![1.0, 0.0, 0.0],
             )
             .await
@@ -503,7 +503,7 @@ mod tests {
             .insert(
                 id,
                 khive_types::SubstrateKind::Entity,
-                "default",
+                "local",
                 vec![1.0, 0.0, 0.0],
             )
             .await

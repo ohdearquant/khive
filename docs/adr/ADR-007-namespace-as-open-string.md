@@ -9,7 +9,7 @@
 A multi-tenant KG needs namespace isolation — Tenant A's queries don't see Tenant B's data. The
 implementation needs to:
 
-1. Be enforceable at the storage layer (every SQL query carries `WHERE namespace = ?`).
+1. Be filterable at the storage layer (SQL queries can carry `WHERE namespace = ?`).
 2. Be derivable from the request context (auth, project hierarchy, etc.).
 3. Be cheap to compare and pass around.
 
@@ -29,7 +29,9 @@ impl Namespace {
     pub fn local() -> Self { Self("local".to_string()) }
     pub fn as_str(&self) -> &str { &self.0 }
     pub fn is_child_of(&self, parent: &Namespace) -> bool {
-        self.0.starts_with(&format!("{}/", parent.0))
+        self.0.len() > parent.0.len()
+            && self.0.starts_with(parent.as_str())
+            && self.0.as_bytes().get(parent.0.len()) == Some(&b':')
     }
 }
 
@@ -38,8 +40,8 @@ impl Default for Namespace {
 }
 ```
 
-Hierarchical namespaces use `/` as the separator: `"local"`, `"local/project-alpha"`,
-`"local/project-alpha/team-1"`.
+Hierarchical namespaces use `:` as the separator: `"local"`, `"local:project-alpha"`,
+`"local:project-alpha:team-1"`.
 
 ## Rationale
 
@@ -61,21 +63,21 @@ Empty namespace is ambiguous — does it mean "global" or "uninitialized"? `"loc
 "this is local single-user data." If we add a hosted scenario later, namespaces like
 `"tenant-abc123"` are clearly different from local.
 
-### Why hierarchical via `/`?
+### Why hierarchical via `:`?
 
-For research KGs, users naturally want to organize by project: `"local/llm-research"`,
-`"local/optical-flow"`, etc. The `/` convention:
+For research KGs, users naturally want to organize by project: `"local:llm-research"`,
+`"local:optical-flow"`, etc. The `:` convention:
 
 - Allows simple prefix matching for "all projects under X."
-- Is filesystem-like — familiar to users.
-- Doesn't conflict with any existing identifier characters.
+- Is URI-like — familiar to users (`scheme:path`).
+- Doesn't conflict with filesystem path characters or URL separators.
 
 ### Why an opaque String wrapper (not a parsed structure)?
 
 The structure of namespace strings is a _convention_, not a contract. Different deployments may use
 different conventions:
 
-- `"local/project/team"` for hierarchical
+- `"local:project:team"` for hierarchical
 - `"tenant-uuid"` for hosted
 - `"workspace-name"` for single-flat
 
@@ -122,8 +124,8 @@ does not break callers.
 
 ### Neutral
 
-- Migration to typed namespaces (if ever needed) is a transparent change at the storage layer —
-  every SQL query already uses `WHERE namespace = ?` as a string parameter.
+- Migration to typed namespaces (if ever needed) is a transparent change — namespace is already
+  passed as a string parameter throughout the stack.
 
 ## Storage-Layer Design: Namespace as Caller-Supplied Parameter
 
@@ -164,10 +166,10 @@ impl EntityStore {
    (`khive-runtime`) ensures that MCP verbs only access namespaces the authenticated caller owns.
    Storage is a dumb persistence layer that executes what it is told.
 
-5. **Exception — EventStore and GraphStore**: their trait methods don't take per-call namespace
-   (upstream trait constraints). These stores accept a default namespace at construction as a
-   convenience. This is not an enforcement boundary — it is a default that can be overridden via
-   event filter parameters for reads that need to span namespaces.
+5. **Exception — EventStore, GraphStore, and VectorStore**: some trait methods on these stores don't
+   take per-call namespace (e.g., `count`, `delete`, `get_event`). These stores accept a default
+   namespace at construction as a convenience fallback. This is not an enforcement boundary — it is a
+   default that can be overridden via filter parameters for reads that need to span namespaces.
 
 ### Why not store-level scoping (Option A)?
 

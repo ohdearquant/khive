@@ -533,16 +533,6 @@ impl TextSearch for Fts5TextSearch {
     }
 
     async fn search(&self, request: TextSearchRequest) -> Result<Vec<TextSearchHit>, StorageError> {
-        // SECURITY (FP-060): require at least one namespace in the filter to prevent
-        // cross-namespace document probing.
-        let has_namespace_filter = request
-            .filter
-            .as_ref()
-            .is_some_and(|f| !f.namespaces.is_empty());
-        if !has_namespace_filter {
-            return Ok(Vec::new());
-        }
-
         let table = self.table_name.clone();
 
         self.with_reader("fts_search", move |conn| {
@@ -624,16 +614,6 @@ impl TextSearch for Fts5TextSearch {
     }
 
     async fn count(&self, filter: TextFilter) -> Result<u64, StorageError> {
-        // SECURITY (FP-060): namespace required so count() cannot probe cross-namespace
-        // document existence.
-        if filter.namespaces.is_empty() {
-            return Err(StorageError::InvalidInput {
-                capability: StorageCapability::Text,
-                operation: "count".into(),
-                message: "namespace filter required".to_string(),
-            });
-        }
-
         let table = self.table_name.clone();
 
         self.with_reader("fts_count", move |conn| {
