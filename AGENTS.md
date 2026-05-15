@@ -25,8 +25,9 @@ All verbs are available via MCP ([ADR-023](docs/adr/ADR-023-verb-consolidated-mc
 | `update`    | Patch properties, tags, or content                  | Correcting or enriching an existing record               |
 | `delete`    | Soft-delete (or hard-delete) a record               | Removing stale or incorrect data                         |
 | `link`      | Connect two nodes with a typed relation             | When relationships emerge from research                  |
-| `traverse`  | Multi-hop graph query (GQL or SPARQL)               | Structural context — lineages, paths, clusters           |
+| `traverse`  | Multi-hop graph walk with depth/relation filters    | Structural context — lineages, paths, clusters           |
 | `neighbors` | Immediate neighbors of a node                       | "What connects to this entity?"                          |
+| `query`     | GQL/SPARQL query string → SQL                       | Complex pattern matching over the graph                  |
 | `merge`     | Deduplicate two records into one                    | "LoRA" and "Low-Rank Adaptation" are the same concept    |
 | `supersede` | Mark a newer record as replacing an older one       | Revised decision, refined observation                    |
 | `resolve`   | Look up a UUID and return its substrate kind + data | "Is this UUID a note or an entity?"                      |
@@ -195,7 +196,7 @@ MATCH (a:concept) WHERE a.domain = 'attention' AND a.type = 'paper' RETURN a
 MATCH ({name: 'lattice-inference'})-[:implements]->(c:concept) RETURN c
 
 # Multi-hop lineage: from a paper to current implementations
-MATCH (p:concept)<-[:introduced_by]-(c)-[:implements*0..2]->(impl)
+MATCH (p:concept)<-[:introduced_by]-(c)<-[:implements]-(impl)
 WHERE p.name = 'Attention Is All You Need'
 RETURN c, impl
 ```
