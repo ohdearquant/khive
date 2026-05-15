@@ -1,0 +1,11 @@
+{
+  "// note": "Root config for markdown formatting via `deno fmt`. The TypeScript app has its own config at deno/deno.json.",
+  "fmt": {
+    "include": ["docs/", "README.md", "CLAUDE.md", "AGENTS.md"],
+    "exclude": ["docs/adr/_review/findings/"],
+    "lineWidth": 100,
+    "proseWrap": "preserve",
+    "indentWidth": 2,
+    "useTabs": false
+  }
+}
