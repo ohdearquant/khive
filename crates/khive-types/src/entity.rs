@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::str::FromStr;
 
-use crate::{EdgeRelation, Header, Id128};
+use crate::{EdgeRelation, Header, Id128, Timestamp};
 
 /// Taxonomy for entity classification in a research knowledge graph (ADR-001).
 ///
@@ -95,6 +95,7 @@ pub struct Entity {
     pub description: Option<String>,
     pub properties: BTreeMap<String, PropertyValue>,
     pub tags: Vec<String>,
+    pub deleted_at: Option<Timestamp>,
 }
 
 /// A directed, typed edge between two entities (or cross-substrate nodes).
@@ -162,6 +163,7 @@ mod tests {
             description: None,
             properties: props,
             tags: alloc::vec![],
+            deleted_at: None,
         };
         assert_eq!(entity.kind, EntityKind::Person);
         assert_eq!(entity.kind.name(), "person");

@@ -1,6 +1,8 @@
 //! 128-bit identifier — universal ID primitive.
 //!
-//! Wire format: 32 lowercase hex chars (no prefix).
+//! Wire format: canonical hyphenated UUID (8-4-4-4-12).
+//! Parses both hyphenated (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
+//! and simple (`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`) forms.
 //! Hashable, totally ordered, has a nil sentinel.
 
 #![allow(clippy::manual_range_contains)]
@@ -52,12 +54,24 @@ const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
 impl fmt::Display for Id128 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut buf = [0u8; 32];
-        for (i, &byte) in self.0.iter().enumerate() {
-            buf[i * 2] = HEX_CHARS[(byte >> 4) as usize];
-            buf[i * 2 + 1] = HEX_CHARS[(byte & 0x0f) as usize];
+        let b = &self.0;
+        let mut buf = [0u8; 36];
+        let mut pos = 0;
+
+        // Groups: 4 bytes, 2 bytes, 2 bytes, 2 bytes, 6 bytes
+        let groups: &[(usize, usize)] = &[(0, 4), (4, 6), (6, 8), (8, 10), (10, 16)];
+        for (gi, &(start, end)) in groups.iter().enumerate() {
+            if gi > 0 {
+                buf[pos] = b'-';
+                pos += 1;
+            }
+            for i in start..end {
+                buf[pos] = HEX_CHARS[(b[i] >> 4) as usize];
+                buf[pos + 1] = HEX_CHARS[(b[i] & 0x0f) as usize];
+                pos += 2;
+            }
         }
-        f.write_str(core::str::from_utf8(&buf).expect("hex chars are valid utf8"))
+        f.write_str(core::str::from_utf8(&buf[..pos]).expect("hex chars are valid utf8"))
     }
 }
 
@@ -76,8 +90,8 @@ pub enum ParseIdError {
 impl fmt::Display for ParseIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidLength => f.write_str("expected 32 hex characters"),
-            Self::InvalidHex => f.write_str("invalid hex character"),
+            Self::InvalidLength => f.write_str("expected UUID: 32 hex chars or 36 with hyphens"),
+            Self::InvalidHex => f.write_str("invalid hex character in UUID"),
         }
     }
 }
@@ -94,21 +108,41 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
+fn parse_hex_bytes(hex: &[u8]) -> Result<[u8; 16], ParseIdError> {
+    if hex.len() != 32 {
+        return Err(ParseIdError::InvalidLength);
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        let hi = hex_val(hex[i * 2]).ok_or(ParseIdError::InvalidHex)?;
+        let lo = hex_val(hex[i * 2 + 1]).ok_or(ParseIdError::InvalidHex)?;
+        bytes[i] = (hi << 4) | lo;
+    }
+    Ok(bytes)
+}
+
 impl FromStr for Id128 {
     type Err = ParseIdError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.as_bytes();
-        if s.len() != 32 {
-            return Err(ParseIdError::InvalidLength);
+        let b = s.as_bytes();
+        match b.len() {
+            32 => Ok(Self(parse_hex_bytes(b)?)),
+            36 => {
+                // Strip hyphens at positions 8, 13, 18, 23
+                if b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+                    return Err(ParseIdError::InvalidHex);
+                }
+                let mut hex = [0u8; 32];
+                hex[..8].copy_from_slice(&b[..8]);
+                hex[8..12].copy_from_slice(&b[9..13]);
+                hex[12..16].copy_from_slice(&b[14..18]);
+                hex[16..20].copy_from_slice(&b[19..23]);
+                hex[20..32].copy_from_slice(&b[24..36]);
+                Ok(Self(parse_hex_bytes(&hex)?))
+            }
+            _ => Err(ParseIdError::InvalidLength),
         }
-        let mut bytes = [0u8; 16];
-        for i in 0..16 {
-            let hi = hex_val(s[i * 2]).ok_or(ParseIdError::InvalidHex)?;
-            let lo = hex_val(s[i * 2 + 1]).ok_or(ParseIdError::InvalidHex)?;
-            bytes[i] = (hi << 4) | lo;
-        }
-        Ok(Self(bytes))
     }
 }
 
@@ -154,10 +188,29 @@ mod tests {
     }
 
     #[test]
+    fn display_is_hyphenated_uuid() {
+        let id = Id128::from_u128(0xabcdef0123456789abcdef0123456789);
+        let s = format!("{id}");
+        assert_eq!(s.len(), 36);
+        assert_eq!(s, "abcdef01-2345-6789-abcd-ef0123456789");
+    }
+
+    #[test]
+    fn parse_hyphenated() {
+        let id: Id128 = "abcdef01-2345-6789-abcd-ef0123456789".parse().unwrap();
+        assert_eq!(id.to_u128(), 0xabcdef0123456789abcdef0123456789);
+    }
+
+    #[test]
+    fn parse_simple() {
+        let id: Id128 = "abcdef0123456789abcdef0123456789".parse().unwrap();
+        assert_eq!(id.to_u128(), 0xabcdef0123456789abcdef0123456789);
+    }
+
+    #[test]
     fn display_parse_roundtrip() {
         let id = Id128::from_u128(0xabcdef0123456789abcdef0123456789);
         let s = format!("{id}");
-        assert_eq!(s.len(), 32);
         let parsed: Id128 = s.parse().unwrap();
         assert_eq!(parsed, id);
     }
@@ -168,6 +221,11 @@ mod tests {
         assert_eq!(
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".parse::<Id128>(),
             Err(ParseIdError::InvalidHex)
+        );
+        // Wrong hyphen positions
+        assert_eq!(
+            "abcdef01-2345-6789-abcd-ef012345678".parse::<Id128>(),
+            Err(ParseIdError::InvalidLength)
         );
     }
 

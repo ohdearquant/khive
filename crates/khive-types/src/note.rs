@@ -112,6 +112,7 @@ pub struct Note {
     pub salience: f64,
     pub decay_factor: f64,
     pub expires_at: Option<Timestamp>,
+    pub deleted_at: Option<Timestamp>,
 }
 
 #[cfg(test)]
@@ -190,6 +191,7 @@ mod tests {
             salience: 0.8,
             decay_factor: 0.01,
             expires_at: None,
+            deleted_at: None,
         };
         assert_eq!(note.kind, NoteKind::Decision);
         assert_eq!(note.tags.len(), 1);
