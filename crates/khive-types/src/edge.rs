@@ -149,7 +149,13 @@ impl FromStr for EdgeRelation {
         // Normalise: lowercase, replace hyphens with underscores, remove remaining non-alphanumeric.
         let normalised: String = s
             .chars()
-            .map(|c| if c == '-' { '_' } else { c.to_ascii_lowercase() })
+            .map(|c| {
+                if c == '-' {
+                    '_'
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
             .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
 
@@ -192,16 +198,34 @@ mod tests {
 
     #[test]
     fn from_str_case_insensitive() {
-        assert_eq!("Extends".parse::<EdgeRelation>().unwrap(), EdgeRelation::Extends);
-        assert_eq!("extends".parse::<EdgeRelation>().unwrap(), EdgeRelation::Extends);
-        assert_eq!("EXTENDS".parse::<EdgeRelation>().unwrap(), EdgeRelation::Extends);
+        assert_eq!(
+            "Extends".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::Extends
+        );
+        assert_eq!(
+            "extends".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::Extends
+        );
+        assert_eq!(
+            "EXTENDS".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::Extends
+        );
     }
 
     #[test]
     fn from_str_hyphen_tolerant() {
-        assert_eq!("part_of".parse::<EdgeRelation>().unwrap(), EdgeRelation::PartOf);
-        assert_eq!("part-of".parse::<EdgeRelation>().unwrap(), EdgeRelation::PartOf);
-        assert_eq!("partof".parse::<EdgeRelation>().unwrap(), EdgeRelation::PartOf);
+        assert_eq!(
+            "part_of".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::PartOf
+        );
+        assert_eq!(
+            "part-of".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::PartOf
+        );
+        assert_eq!(
+            "partof".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::PartOf
+        );
 
         assert_eq!(
             "introduced_by".parse::<EdgeRelation>().unwrap(),
@@ -217,8 +241,14 @@ mod tests {
     fn from_str_unknown_returns_error_with_list() {
         let err = "related_to".parse::<EdgeRelation>().unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("related_to"), "error should mention the bad input");
-        assert!(msg.contains("contains"), "error should list valid relations");
+        assert!(
+            msg.contains("related_to"),
+            "error should mention the bad input"
+        );
+        assert!(
+            msg.contains("contains"),
+            "error should list valid relations"
+        );
         assert!(msg.contains("annotates"), "error should list all 13");
     }
 
@@ -230,13 +260,22 @@ mod tests {
 
         assert_eq!(EdgeRelation::Extends.category(), EdgeCategory::Derivation);
         assert_eq!(EdgeRelation::VariantOf.category(), EdgeCategory::Derivation);
-        assert_eq!(EdgeRelation::IntroducedBy.category(), EdgeCategory::Derivation);
-        assert_eq!(EdgeRelation::Supersedes.category(), EdgeCategory::Derivation);
+        assert_eq!(
+            EdgeRelation::IntroducedBy.category(),
+            EdgeCategory::Derivation
+        );
+        assert_eq!(
+            EdgeRelation::Supersedes.category(),
+            EdgeCategory::Derivation
+        );
 
         assert_eq!(EdgeRelation::DependsOn.category(), EdgeCategory::Dependency);
         assert_eq!(EdgeRelation::Enables.category(), EdgeCategory::Dependency);
 
-        assert_eq!(EdgeRelation::Implements.category(), EdgeCategory::Implementation);
+        assert_eq!(
+            EdgeRelation::Implements.category(),
+            EdgeCategory::Implementation
+        );
 
         assert_eq!(EdgeRelation::CompetesWith.category(), EdgeCategory::Lateral);
         assert_eq!(EdgeRelation::ComposedWith.category(), EdgeCategory::Lateral);

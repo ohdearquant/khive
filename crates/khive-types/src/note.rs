@@ -13,11 +13,12 @@ use crate::{Header, Timestamp};
 ///
 /// 5 kinds covering the cognitive functions an agent performs while researching.
 /// Closed and exhaustive — adding a sixth requires a new ADR.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum NoteKind {
     /// An empirical capture — what was noticed or measured.
+    #[default]
     Observation,
     /// An analytical or synthetic conclusion drawn from observations.
     Insight,
@@ -46,12 +47,6 @@ impl NoteKind {
             Self::Decision => "decision",
             Self::Reference => "reference",
         }
-    }
-}
-
-impl Default for NoteKind {
-    fn default() -> Self {
-        Self::Observation
     }
 }
 
@@ -157,7 +152,10 @@ mod tests {
     #[test]
     fn note_kind_from_str_case_insensitive() {
         use core::str::FromStr;
-        assert_eq!(NoteKind::from_str("OBSERVATION").unwrap(), NoteKind::Observation);
+        assert_eq!(
+            NoteKind::from_str("OBSERVATION").unwrap(),
+            NoteKind::Observation
+        );
         assert_eq!(NoteKind::from_str("Insight").unwrap(), NoteKind::Insight);
     }
 

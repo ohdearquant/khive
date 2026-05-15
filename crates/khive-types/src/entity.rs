@@ -15,12 +15,13 @@ use crate::{EdgeRelation, Header, Id128};
 /// with unambiguous signals. Finer distinctions (algorithm vs technique,
 /// model vs architecture) live in `properties` — they don't enable useful
 /// queries with the 13-relation edge ontology and cause 20-30% misclassification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum EntityKind {
     /// Algorithms, techniques, architectures, theories, models, research gaps.
     /// The default / residual bucket. Use `properties.type` for finer grain.
+    #[default]
     Concept,
     /// Papers, preprints, technical reports, blog posts, books.
     /// Has: title, authors, year, venue, DOI/URL.
@@ -56,12 +57,6 @@ impl EntityKind {
             Self::Person => "person",
             Self::Org => "org",
         }
-    }
-}
-
-impl Default for EntityKind {
-    fn default() -> Self {
-        Self::Concept
     }
 }
 
@@ -191,7 +186,10 @@ mod tests {
     fn entity_kind_from_str_aliases() {
         assert_eq!(EntityKind::from_str("doc").unwrap(), EntityKind::Document);
         assert_eq!(EntityKind::from_str("paper").unwrap(), EntityKind::Document);
-        assert_eq!(EntityKind::from_str("benchmark").unwrap(), EntityKind::Dataset);
+        assert_eq!(
+            EntityKind::from_str("benchmark").unwrap(),
+            EntityKind::Dataset
+        );
         assert_eq!(EntityKind::from_str("repo").unwrap(), EntityKind::Project);
         assert_eq!(EntityKind::from_str("author").unwrap(), EntityKind::Person);
         assert_eq!(EntityKind::from_str("lab").unwrap(), EntityKind::Org);
@@ -199,7 +197,10 @@ mod tests {
 
     #[test]
     fn entity_kind_from_str_case_insensitive() {
-        assert_eq!(EntityKind::from_str("CONCEPT").unwrap(), EntityKind::Concept);
+        assert_eq!(
+            EntityKind::from_str("CONCEPT").unwrap(),
+            EntityKind::Concept
+        );
         assert_eq!(EntityKind::from_str("Person").unwrap(), EntityKind::Person);
     }
 

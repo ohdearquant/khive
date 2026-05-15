@@ -30,6 +30,6 @@ pub use header::Header;
 pub use id::{Id128, ParseIdError};
 pub use namespace::Namespace;
 pub use note::{Note, NoteKind, NoteStatus};
-pub use substrate::{SUBSTRATE_COUNT, SubstrateError, SubstrateKind};
+pub use substrate::{SubstrateError, SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;
