@@ -19,6 +19,7 @@
 //!    the cap are clamped, not rejected — this matches the cap the compiler
 //!    applies when generating recursive CTEs.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use khive_types::{EdgeRelation, EntityKind};
@@ -35,6 +36,36 @@ pub const MAX_DEPTH: usize = 10;
 /// canonical lowercase form so the compiler can emit literal SQL parameters
 /// that match the values written by `khive-db`.
 pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
+    // Pattern variables are bindings — the same variable name appearing twice
+    // would mean "same node/edge" and require alias-equality predicates in
+    // SQL. Until that is implemented, reject repeated bindings explicitly so
+    // cycles and self-reachability don't silently compile to wrong results.
+    let mut seen_node_vars: HashSet<&str> = HashSet::new();
+    let mut seen_edge_vars: HashSet<&str> = HashSet::new();
+    for element in &query.pattern.elements {
+        match element {
+            PatternElement::Node(node) => {
+                if let Some(var) = node.variable.as_deref() {
+                    if !seen_node_vars.insert(var) {
+                        return Err(QueryError::Unsupported(format!(
+                            "repeated node variable '{var}' (cycle / self-reachability \
+                             requires alias-equality predicates not yet implemented)"
+                        )));
+                    }
+                }
+            }
+            PatternElement::Edge(edge) => {
+                if let Some(var) = edge.variable.as_deref() {
+                    if !seen_edge_vars.insert(var) {
+                        return Err(QueryError::Unsupported(format!(
+                            "repeated edge variable '{var}' not supported"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     for element in &mut query.pattern.elements {
         match element {
             PatternElement::Node(node) => {
@@ -256,6 +287,48 @@ mod tests {
     fn rejects_zero_hop_sparql_explicit_range() {
         use crate::parsers::sparql;
         let mut q = sparql::parse("SELECT ?a ?b WHERE { ?a :extends{0,3} ?b . }").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_node_var_cycle_gql() {
+        let mut q = gql::parse("MATCH (a)-[:extends]->(b)-[:variant_of]->(a) RETURN a").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_node_var_self_reach_variable_length() {
+        let mut q = gql::parse("MATCH (a)-[:extends*1..3]->(a) RETURN a").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_node_var_cycle_sparql() {
+        use crate::parsers::sparql;
+        let mut q =
+            sparql::parse("SELECT ?a WHERE { ?a :extends ?b . ?b :variant_of ?a . }").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_edge_var() {
+        let mut q = gql::parse("MATCH (a)-[e:extends]->(b)-[e:variant_of]->(c) RETURN c").unwrap();
         let err = validate(&mut q).unwrap_err();
         assert!(
             matches!(err, QueryError::Unsupported(_)),
