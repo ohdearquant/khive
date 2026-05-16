@@ -469,6 +469,33 @@ fn triples_to_ast(
         });
     }
 
+    // Collect all variables that appear in the path. Node-only constraints
+    // on variables outside the path (kind filters, property filters) would be
+    // silently dropped — reject instead.
+    let mut path_vars: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (src, tgt, _, _, _) in &ordered_edges {
+        path_vars.insert(src.as_str());
+        path_vars.insert(tgt.as_str());
+    }
+    for var in node_kinds.keys() {
+        if !path_vars.contains(var.as_str()) {
+            return Err(QueryError::Unsupported(format!(
+                "SPARQL variable '?{var}' has constraints (kind/property) but is not \
+                 connected to the edge path; disconnected node constraints are not \
+                 supported"
+            )));
+        }
+    }
+    for var in node_props.keys() {
+        if !path_vars.contains(var.as_str()) {
+            return Err(QueryError::Unsupported(format!(
+                "SPARQL variable '?{var}' has constraints (kind/property) but is not \
+                 connected to the edge path; disconnected node constraints are not \
+                 supported"
+            )));
+        }
+    }
+
     // Build AST pattern: alternating Node-Edge-Node
     let mut elements: Vec<PatternElement> = Vec::new();
 
@@ -580,6 +607,27 @@ mod tests {
         assert!(
             matches!(err, QueryError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn disconnected_kind_constraint_rejected() {
+        // `?c a :concept` constrains a variable not on the edge path — must
+        // not be silently dropped.
+        let err = parse("SELECT ?a WHERE { ?a :extends ?b . ?c a :concept . }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported for disconnected kind constraint, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn disconnected_property_constraint_rejected() {
+        // `?c :name "LoRA"` constrains a variable not on the edge path.
+        let err = parse("SELECT ?a WHERE { ?a :extends ?b . ?c :name 'LoRA' . }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported for disconnected property constraint, got {err:?}"
         );
     }
 }
