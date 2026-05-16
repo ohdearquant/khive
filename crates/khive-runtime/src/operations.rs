@@ -1261,7 +1261,6 @@ mod tests {
     #[tokio::test]
     async fn resolve_prefix_ambiguous_same_namespace() {
         use khive_storage::entity::Entity;
-        use khive_storage::EntityStore;
         use khive_types::EntityKind;
 
         let rt = rt();
