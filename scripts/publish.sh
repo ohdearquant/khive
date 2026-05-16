@@ -37,6 +37,15 @@ DELAY=30  # seconds to wait for crates.io index between publishes
 for crate in "${CRATES[@]}"; do
     echo ""
     echo "--- Publishing $crate ---"
+
+    # Check if this version is already on crates.io — skip if so.
+    VERSION=$(cargo metadata --format-version=1 --no-deps 2>/dev/null \
+        | python3 -c "import sys,json; pkgs=json.load(sys.stdin)['packages']; print(next(p['version'] for p in pkgs if p['name']=='$crate'))" 2>/dev/null || echo "0.1.0")
+    if cargo search "$crate" 2>/dev/null | grep -q "^${crate} = \"${VERSION}\""; then
+        echo "    $crate $VERSION already on crates.io — skipping"
+        continue
+    fi
+
     cargo publish -p "$crate" $DRY_RUN
 
     if [[ -z "$DRY_RUN" ]]; then
