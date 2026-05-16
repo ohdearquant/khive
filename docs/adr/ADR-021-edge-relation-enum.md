@@ -6,8 +6,9 @@
 
 ## Context
 
-ADR-002 defines a closed set of edge relations (13 canonical names in 6 categories — 12
-entity-to-entity relations plus `annotates` for cross-substrate). The natural Rust representation
+ADR-002 defines a closed set of edge relations (13 canonical names in 6 categories — 11
+entity-to-entity relations, `supersedes` for same-substrate (note→note or entity→entity), and
+`annotates` for cross-substrate (note→any substrate)). The natural Rust representation
 stores `Edge.relation` as `String` and validates against the canonical set at write time. This is
 the same shape that entity kinds and note kinds had before ADR-001 and ADR-019:
 

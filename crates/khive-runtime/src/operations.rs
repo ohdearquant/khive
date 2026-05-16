@@ -131,28 +131,24 @@ impl KhiveRuntime {
 
     // ---- Edge operations ----
 
-    /// Create a directed edge between two substrates.
+    /// Validate that `source_id` and `target_id` are legal endpoints for `relation`.
     ///
-    /// Enforces the ADR-002/ADR-019/ADR-024 three-case relation contract:
-    /// - `annotates` (Category 6): source MUST be a note; target may be any substrate
-    ///   (entity, note, event, or edge). This is the only relation that freely crosses substrate kinds.
-    /// - `supersedes` (ADR-019/ADR-024): same-substrate only — both endpoints must resolve to
-    ///   Entity, or both must resolve to Note. Crossing (entity↔note) is invalid. Event and
-    ///   edge endpoints are invalid. Superseded notes are excluded from default search.
-    /// - All other 11 relations (entity→entity): both endpoints MUST resolve to entities.
-    ///   A phantom/cross-namespace endpoint returns `NotFound`; an endpoint that exists but
-    ///   is not an entity (e.g. a note or edge UUID used with `extends`) returns `InvalidInput`.
+    /// Centralises the ADR-002/ADR-019/ADR-024 three-case contract so that both
+    /// `link()` and `update_edge()` share identical enforcement:
     ///
-    /// A record that exists but belongs to a different namespace is treated as not found
-    /// (fail-closed; no cross-namespace existence leak).
-    pub async fn link(
+    /// - `annotates`: source MUST be a note; target may be any substrate.
+    /// - `supersedes`: same-substrate only (note→note or entity→entity).
+    /// - All other 11 relations: both endpoints MUST be entities.
+    ///
+    /// Returns `Ok(())` when valid; otherwise `InvalidInput` or `NotFound` with
+    /// the same messages as the previous inline block (byte-identical behaviour).
+    async fn validate_edge_relation_endpoints(
         &self,
         namespace: Option<&str>,
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,
-        weight: f64,
-    ) -> RuntimeResult<Edge> {
+    ) -> RuntimeResult<()> {
         if relation == EdgeRelation::Annotates {
             // Source must be a note in namespace.
             match self.resolve(namespace, source_id).await? {
@@ -281,6 +277,26 @@ impl KhiveRuntime {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Create a directed edge between two substrates.
+    ///
+    /// Enforces the ADR-002/ADR-019/ADR-024 three-case relation contract via
+    /// `validate_edge_relation_endpoints`. See that method for the full contract.
+    ///
+    /// A record that exists but belongs to a different namespace is treated as not found
+    /// (fail-closed; no cross-namespace existence leak).
+    pub async fn link(
+        &self,
+        namespace: Option<&str>,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+    ) -> RuntimeResult<Edge> {
+        self.validate_edge_relation_endpoints(namespace, source_id, target_id, relation)
+            .await?;
         let edge = Edge {
             id: LinkId::from(Uuid::new_v4()),
             source_id,
@@ -828,6 +844,11 @@ impl KhiveRuntime {
     }
 
     /// Patch-style edge update. Only `Some(_)` fields are applied.
+    ///
+    /// When `relation` is `Some(new_rel)`, validates that the edge's existing endpoints
+    /// are legal for `new_rel` before persisting. Weight-only updates (`relation = None`)
+    /// skip validation. Returns `InvalidInput` if the new relation would violate the
+    /// ADR-002/ADR-019/ADR-024 three-case contract; the edge is NOT mutated on error.
     pub async fn update_edge(
         &self,
         namespace: Option<&str>,
@@ -842,6 +863,9 @@ impl KhiveRuntime {
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
 
         if let Some(r) = relation {
+            // Validate before mutating — use the existing endpoints with the new relation.
+            self.validate_edge_relation_endpoints(namespace, edge.source_id, edge.target_id, r)
+                .await?;
             edge.relation = r;
         }
         if let Some(w) = weight {
@@ -906,6 +930,163 @@ mod tests {
 
     #[tokio::test]
     async fn update_edge_changes_relation() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        let updated = rt
+            .update_edge(None, edge_id, Some(EdgeRelation::VariantOf), None)
+            .await
+            .unwrap();
+        assert_eq!(updated.relation, EdgeRelation::VariantOf);
+    }
+
+    // ---- Round-5 tests: update_edge endpoint validation (ADR-002 bypass fix) ----
+
+    // update_edge: note→entity annotates → set relation=Supersedes → InvalidInput (crossing).
+    // Edge must NOT be mutated in the store.
+    #[tokio::test]
+    async fn update_edge_annotates_note_to_entity_set_supersedes_returns_invalid_input() {
+        let rt = rt();
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "a note",
+                0.5,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let entity = rt
+            .create_entity(None, "concept", "E", None, None, vec![])
+            .await
+            .unwrap();
+        // Create a valid note→entity annotates edge.
+        let edge = rt
+            .link(None, note.id, entity.id, EdgeRelation::Annotates, 1.0)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        // Attempt to change relation to Supersedes (crossing substrates → invalid).
+        let result = rt
+            .update_edge(None, edge_id, Some(EdgeRelation::Supersedes), None)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "update to Supersedes on note→entity edge must return InvalidInput, got {result:?}"
+        );
+
+        // Edge must NOT be mutated — re-fetch and verify relation unchanged.
+        let fetched = rt.get_edge(None, edge_id).await.unwrap().unwrap();
+        assert_eq!(
+            fetched.relation,
+            EdgeRelation::Annotates,
+            "edge relation must be unchanged after failed update"
+        );
+    }
+
+    // update_edge: entity→entity extends → set relation=Annotates → InvalidInput
+    // (annotates source must be a note).
+    #[tokio::test]
+    async fn update_edge_entity_to_entity_set_annotates_returns_invalid_input() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        let result = rt
+            .update_edge(None, edge_id, Some(EdgeRelation::Annotates), None)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "update to Annotates on entity→entity edge must return InvalidInput, got {result:?}"
+        );
+    }
+
+    // update_edge: entity→entity extends → set relation=Supersedes → Ok
+    // (entity→entity is valid for supersedes).
+    #[tokio::test]
+    async fn update_edge_entity_to_entity_set_supersedes_succeeds() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        let updated = rt
+            .update_edge(None, edge_id, Some(EdgeRelation::Supersedes), None)
+            .await
+            .unwrap();
+        assert_eq!(updated.relation, EdgeRelation::Supersedes);
+
+        // Verify persisted.
+        let fetched = rt.get_edge(None, edge_id).await.unwrap().unwrap();
+        assert_eq!(fetched.relation, EdgeRelation::Supersedes);
+    }
+
+    // update_edge: weight-only (relation = None) → Ok, no validation, unchanged relation.
+    #[tokio::test]
+    async fn update_edge_weight_only_skips_validation() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        let updated = rt
+            .update_edge(None, edge_id, None, Some(0.3))
+            .await
+            .unwrap();
+        assert_eq!(updated.relation, EdgeRelation::Extends);
+        assert!((updated.weight - 0.3).abs() < 0.001);
+    }
+
+    // update_edge: entity→entity extends → set relation=VariantOf (same class) → Ok.
+    #[tokio::test]
+    async fn update_edge_same_class_relation_change_succeeds() {
         let rt = rt();
         let a = rt
             .create_entity(None, "concept", "A", None, None, vec![])

@@ -1051,3 +1051,120 @@ async fn create_note_annotating_real_edge_succeeds() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---- Round-5: update_edge relation-endpoint validation via MCP ----
+
+/// Invalid relation update (annotates→supersedes on a note→entity edge) → invalid_params.
+#[tokio::test]
+async fn update_edge_invalid_relation_returns_invalid_params() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create a note and an entity.
+    let note = call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "observation", "content": "mcp update test note"}),
+    )
+    .await?;
+    let note_id = serde_json::from_str::<serde_json::Value>(&first_text(&note)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let entity = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "McpUpdateTarget"}),
+    )
+    .await?;
+    let entity_id = serde_json::from_str::<serde_json::Value>(&first_text(&entity)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Create a valid note→entity annotates edge.
+    let edge = call(
+        &client,
+        "link",
+        json!({"source_id": note_id, "target_id": entity_id, "relation": "annotates", "weight": 1.0}),
+    )
+    .await?;
+    let edge_id = serde_json::from_str::<serde_json::Value>(&first_text(&edge)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Attempt to change relation to supersedes (crossing substrates — invalid).
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("update").with_arguments(
+                json!({"id": edge_id, "relation": "supersedes"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert_invalid_params(
+        result,
+        "update edge: annotates note→entity to supersedes must be invalid_params",
+    );
+    Ok(())
+}
+
+/// Valid relation update (entity→entity extends → supersedes) → ok and persisted.
+#[tokio::test]
+async fn update_edge_valid_relation_change_returns_ok() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let a = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "UpdateRelSrc"}),
+    )
+    .await?;
+    let b = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "UpdateRelTgt"}),
+    )
+    .await?;
+    let a_id = serde_json::from_str::<serde_json::Value>(&first_text(&a)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_id = serde_json::from_str::<serde_json::Value>(&first_text(&b)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let edge = call(
+        &client,
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends", "weight": 0.8}),
+    )
+    .await?;
+    let edge_id = serde_json::from_str::<serde_json::Value>(&first_text(&edge)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Update relation to supersedes (entity→entity: valid).
+    let update = call(
+        &client,
+        "update",
+        json!({"id": edge_id, "relation": "supersedes"}),
+    )
+    .await?;
+    assert!(
+        !update.is_error.unwrap_or(false),
+        "valid relation update must succeed, got: {}",
+        first_text(&update)
+    );
+    let updated: serde_json::Value = serde_json::from_str(&first_text(&update)).unwrap();
+    assert_eq!(
+        updated["relation"], "supersedes",
+        "updated edge must reflect new relation"
+    );
+    Ok(())
+}
