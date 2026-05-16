@@ -132,6 +132,11 @@ impl KhiveRuntime {
     // ---- Edge operations ----
 
     /// Create a directed edge between two entities.
+    ///
+    /// Enforces referential integrity: both endpoints must resolve to a live
+    /// record (entity or note) in the caller's namespace before the edge is
+    /// written.  A record that exists but belongs to a different namespace is
+    /// treated as not found — no cross-namespace existence leak.
     pub async fn link(
         &self,
         namespace: Option<&str>,
@@ -140,6 +145,16 @@ impl KhiveRuntime {
         relation: EdgeRelation,
         weight: f64,
     ) -> RuntimeResult<Edge> {
+        if !self.record_exists_in_ns(namespace, source_id).await? {
+            return Err(RuntimeError::NotFound(format!(
+                "link source {source_id} not found in namespace"
+            )));
+        }
+        if !self.record_exists_in_ns(namespace, target_id).await? {
+            return Err(RuntimeError::NotFound(format!(
+                "link target {target_id} not found in namespace"
+            )));
+        }
         let edge = Edge {
             id: LinkId::from(Uuid::new_v4()),
             source_id,
@@ -151,6 +166,20 @@ impl KhiveRuntime {
         };
         self.graph(namespace)?.upsert_edge(edge.clone()).await?;
         Ok(edge)
+    }
+
+    /// Returns `true` if `id` resolves to a live entity or note in `namespace`.
+    ///
+    /// A record that exists in a different namespace returns `false` (fail-closed).
+    async fn record_exists_in_ns(&self, namespace: Option<&str>, id: Uuid) -> RuntimeResult<bool> {
+        let ns = self.ns(namespace);
+        if let Some(entity) = self.entities(namespace)?.get_entity(id).await? {
+            return Ok(entity.namespace == ns);
+        }
+        if let Some(note) = self.notes(namespace)?.get_note(id).await? {
+            return Ok(note.namespace == ns);
+        }
+        Ok(false)
     }
 
     /// Get immediate neighbors of a node, optionally filtered by relation type.
@@ -1282,5 +1311,172 @@ mod tests {
             result.is_err(),
             "shared 8-char prefix must return Ambiguous error"
         );
+    }
+
+    // ---- Referential integrity tests (fix/link-referential-integrity) ----
+
+    #[tokio::test]
+    async fn link_phantom_source_returns_not_found() {
+        let rt = rt();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let phantom = Uuid::new_v4();
+
+        let result = rt
+            .link(None, phantom, b.id, EdgeRelation::Extends, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::NotFound(msg)) => {
+                assert!(
+                    msg.contains("source"),
+                    "error message must name 'source': {msg}"
+                );
+            }
+            other => panic!("expected NotFound for phantom source, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn link_phantom_target_returns_not_found() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let phantom = Uuid::new_v4();
+
+        let result = rt
+            .link(None, a.id, phantom, EdgeRelation::Extends, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::NotFound(msg)) => {
+                assert!(
+                    msg.contains("target"),
+                    "error message must name 'target': {msg}"
+                );
+            }
+            other => panic!("expected NotFound for phantom target, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn link_real_entities_succeeds() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 0.8)
+            .await
+            .unwrap();
+        assert_eq!(edge.source_id, a.id);
+        assert_eq!(edge.target_id, b.id);
+        assert_eq!(edge.relation, EdgeRelation::Extends);
+    }
+
+    #[tokio::test]
+    async fn create_note_annotates_phantom_returns_not_found() {
+        let rt = rt();
+        let phantom = Uuid::new_v4();
+
+        let result = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "some content",
+                0.5,
+                None,
+                vec![phantom],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::NotFound(_))),
+            "annotates with phantom uuid must return NotFound, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_annotates_real_entity_succeeds() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(None, "concept", "RealTarget", None, None, vec![])
+            .await
+            .unwrap();
+
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "content",
+                0.5,
+                None,
+                vec![entity.id],
+            )
+            .await
+            .unwrap();
+
+        let neighbors = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, entity.id);
+    }
+
+    #[tokio::test]
+    async fn link_target_in_different_namespace_returns_not_found() {
+        let rt = rt();
+        let a = rt
+            .create_entity(Some("ns-a"), "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(Some("ns-b"), "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Linking from ns-a: target b lives in ns-b — must be treated as not found.
+        let result = rt
+            .link(Some("ns-a"), a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::NotFound(_))),
+            "target in different namespace must return NotFound (fail-closed), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_phantom_self_loop_returns_not_found() {
+        let rt = rt();
+        let phantom = Uuid::new_v4();
+
+        let result = rt
+            .link(None, phantom, phantom, EdgeRelation::Extends, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::NotFound(msg)) => {
+                assert!(
+                    msg.contains("source"),
+                    "self-loop must fail on source first: {msg}"
+                );
+            }
+            other => panic!("expected NotFound for phantom self-loop, got {other:?}"),
+        }
     }
 }
