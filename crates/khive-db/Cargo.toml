@@ -8,9 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-khive-storage = { path = "../khive-storage" }
-khive-score = { path = "../khive-score" }
-khive-types = { path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.1.0", path = "../khive-storage" }
+khive-score = { version = "0.1.0", path = "../khive-score" }
+khive-types = { version = "0.1.0", path = "../khive-types", features = ["serde"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }

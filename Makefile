@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci docs-check
+.PHONY: check clippy test fmt fmt-check build clean ci docs-check publish publish-dry
 
 check:
 	cd crates && cargo check --workspace
@@ -27,3 +27,9 @@ docs-check:
 
 ci:
 	./scripts/ci.sh
+
+publish-dry:
+	./scripts/publish.sh
+
+publish:
+	./scripts/publish.sh --live

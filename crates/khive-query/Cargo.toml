@@ -8,8 +8,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-khive-storage = { path = "../khive-storage" }
-khive-types = { path = "../khive-types" }
+khive-storage = { version = "0.1.0", path = "../khive-storage" }
+khive-types = { version = "0.1.0", path = "../khive-types" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

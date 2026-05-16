@@ -8,11 +8,11 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-khive-types = { path = "../khive-types", features = ["serde"] }
-khive-storage = { path = "../khive-storage" }
-khive-score = { path = "../khive-score" }
-khive-db = { path = "../khive-db" }
-khive-query = { path = "../khive-query" }
+khive-types = { version = "0.1.0", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.1.0", path = "../khive-storage" }
+khive-score = { version = "0.1.0", path = "../khive-score" }
+khive-db = { version = "0.1.0", path = "../khive-db" }
+khive-query = { version = "0.1.0", path = "../khive-query" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
