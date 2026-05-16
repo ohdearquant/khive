@@ -89,6 +89,27 @@ For the three verbs that do use `kind`:
 
 Unknown `kind` returns `invalid_params` with the valid options listed.
 
+### Short UUID prefix resolution
+
+All UUID-accepting parameters (`id`, `source_id`, `target_id`, `into_id`, `from_id`, `node_id`,
+`roots[]`, `annotates[]`) accept either a full 36-character UUID or an **8+ hex-character prefix**.
+
+Resolution rules:
+
+- If the input parses as a full UUID → use directly (no DB lookup).
+- If 8+ hex characters → `SELECT id FROM entities UNION notes UNION graph_edges WHERE id LIKE
+  ?1 AND namespace = ?2 LIMIT 2`.
+- **Exactly one match** → resolved. **Zero matches** → `invalid_params` ("no record matches
+  prefix"). **Two+ matches** → `invalid_params` ("ambiguous prefix").
+- **Namespace-scoped**: the lookup filters by the caller's namespace. A prefix unique in
+  namespace A may be ambiguous if it collides in namespace B — but the caller only sees their
+  own namespace. Cross-namespace information leakage is prevented.
+
+Design rationale: agents produce and consume many UUIDs per session. Full 36-char UUIDs are
+noisy in tool output and waste tokens. 8-char prefixes are collision-resistant for graphs under
+~100K records (birthday-paradox threshold: 4 billion with 8 hex chars). If a namespace grows
+large enough for collisions, agents use longer prefixes or full UUIDs.
+
 ### Param-struct shape
 
 Per-verb param structs in `crates/khive-mcp/src/tools/`:
