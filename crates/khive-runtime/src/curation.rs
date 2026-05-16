@@ -156,14 +156,21 @@ impl KhiveRuntime {
         let store = self.entities(namespace)?;
         let graph = self.graph(namespace)?;
 
+        let ns = self.ns(namespace);
         let into_entity = store
             .get_entity(into_id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {into_id}")))?;
+        if into_entity.namespace != ns {
+            return Err(RuntimeError::NotFound(format!("entity {into_id}")));
+        }
         let from_entity = store
             .get_entity(from_id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {from_id}")))?;
+        if from_entity.namespace != ns {
+            return Err(RuntimeError::NotFound(format!("entity {from_id}")));
+        }
 
         // Collect all edges incident to from_id (as source OR target).
         // Use paginated loops so entities with more than PAGE_SIZE edges are fully covered.
@@ -219,31 +226,37 @@ impl KhiveRuntime {
             inbound.extend(page.items);
         }
 
-        // Rewire edges, dropping any that would become self-loops.
-        let mut edges_rewired = 0usize;
-        for edge in outbound {
-            let new_source = into_id;
-            let new_target: Uuid = edge.target_id;
-            if new_source == new_target {
-                graph.delete_edge(edge.id).await?;
-                continue;
+        // Deduplicate incident edges by ID (a self-edge from_id -> from_id
+        // appears in both outbound and inbound lists; process it once).
+        let mut seen_edge_ids: std::collections::HashSet<LinkId> = std::collections::HashSet::new();
+        let mut all_edges: Vec<Edge> = Vec::new();
+        for edge in outbound.into_iter().chain(inbound.into_iter()) {
+            if seen_edge_ids.insert(edge.id) {
+                all_edges.push(edge);
             }
-            let rewired = Edge {
-                source_id: LinkId::from(new_source).into(),
-                ..edge
-            };
-            graph.upsert_edge(rewired).await?;
-            edges_rewired += 1;
         }
-        for edge in inbound {
-            let new_target = into_id;
-            let new_source: Uuid = edge.source_id;
+
+        // Rewire edges in one pass. Replace from_id with into_id on both
+        // endpoints simultaneously, then drop self-loops.
+        let mut edges_rewired = 0usize;
+        for edge in all_edges {
+            let new_source = if edge.source_id == from_id {
+                into_id
+            } else {
+                edge.source_id
+            };
+            let new_target = if edge.target_id == from_id {
+                into_id
+            } else {
+                edge.target_id
+            };
             if new_source == new_target {
                 graph.delete_edge(edge.id).await?;
                 continue;
             }
             let rewired = Edge {
-                target_id: LinkId::from(new_target).into(),
+                source_id: new_source,
+                target_id: new_target,
                 ..edge
             };
             graph.upsert_edge(rewired).await?;

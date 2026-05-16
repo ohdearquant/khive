@@ -340,6 +340,30 @@ impl KhiveRuntime {
             }
         }
 
+        // Drop superseded notes: any note targeted by a `supersedes` edge is
+        // obsolete and excluded from default search (ADR-019, ADR-024).
+        if !alive_notes.is_empty() {
+            let graph = self.graph(namespace)?;
+            let mut superseded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+            for &note_id in alive_notes.keys() {
+                let inbound = graph
+                    .neighbors(
+                        note_id,
+                        NeighborQuery {
+                            direction: Direction::In,
+                            relations: Some(vec![EdgeRelation::Supersedes]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?;
+                if !inbound.is_empty() {
+                    superseded.insert(note_id);
+                }
+            }
+            alive_notes.retain(|id, _| !superseded.contains(id));
+        }
+
         // Apply salience weighting and collect final hits.
         let mut hits: Vec<NoteSearchHit> = buckets
             .into_iter()
@@ -368,15 +392,27 @@ impl KhiveRuntime {
         namespace: Option<&str>,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
-        if let Some(entity) = self.entities(namespace)?.get_entity(id).await? {
+        let ns = self.ns(namespace);
+
+        // Entity: use the namespace-checked getter (returns None on mismatch).
+        if let Some(entity) = self.get_entity(namespace, id).await? {
             return Ok(Some(Resolved::Entity(entity)));
         }
+
+        // Note: storage get_note is ID-only — verify namespace after fetch.
         if let Some(note) = self.notes(namespace)?.get_note(id).await? {
-            return Ok(Some(Resolved::Note(note)));
+            if note.namespace == ns {
+                return Ok(Some(Resolved::Note(note)));
+            }
         }
+
+        // Event: storage get_event is ID-only — verify namespace after fetch.
         if let Some(event) = self.events(namespace)?.get_event(id).await? {
-            return Ok(Some(Resolved::Event(event)));
+            if event.namespace == ns {
+                return Ok(Some(Resolved::Event(event)));
+            }
         }
+
         Ok(None)
     }
 
