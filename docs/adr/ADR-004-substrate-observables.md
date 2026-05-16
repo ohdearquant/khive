@@ -158,7 +158,8 @@ In `khive-db`:
 - Substrates back onto four SQL tables: `entities` and `graph_edges` (Entity substrate), `notes`,
   and `events`.
 - Schema is applied via versioned migrations (see ADR-022).
-- All operations are namespace-scoped.
+- Namespace is a caller-supplied parameter at the storage layer; enforcement happens at the
+  service/runtime layer (see ADR-007).
 
 ## References
 

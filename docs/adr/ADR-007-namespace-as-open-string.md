@@ -9,7 +9,7 @@
 A multi-tenant KG needs namespace isolation — Tenant A's queries don't see Tenant B's data. The
 implementation needs to:
 
-1. Be enforceable at the storage layer (every SQL query carries `WHERE namespace = ?`).
+1. Be filterable at the storage layer (SQL queries can carry `WHERE namespace = ?`).
 2. Be derivable from the request context (auth, project hierarchy, etc.).
 3. Be cheap to compare and pass around.
 
@@ -29,7 +29,9 @@ impl Namespace {
     pub fn local() -> Self { Self("local".to_string()) }
     pub fn as_str(&self) -> &str { &self.0 }
     pub fn is_child_of(&self, parent: &Namespace) -> bool {
-        self.0.starts_with(&format!("{}/", parent.0))
+        self.0.len() > parent.0.len()
+            && self.0.starts_with(parent.as_str())
+            && self.0.as_bytes().get(parent.0.len()) == Some(&b':')
     }
 }
 
@@ -38,8 +40,8 @@ impl Default for Namespace {
 }
 ```
 
-Hierarchical namespaces use `/` as the separator: `"local"`, `"local/project-alpha"`,
-`"local/project-alpha/team-1"`.
+Hierarchical namespaces use `:` as the separator: `"local"`, `"local:project-alpha"`,
+`"local:project-alpha:team-1"`.
 
 ## Rationale
 
@@ -61,21 +63,21 @@ Empty namespace is ambiguous — does it mean "global" or "uninitialized"? `"loc
 "this is local single-user data." If we add a hosted scenario later, namespaces like
 `"tenant-abc123"` are clearly different from local.
 
-### Why hierarchical via `/`?
+### Why hierarchical via `:`?
 
-For research KGs, users naturally want to organize by project: `"local/llm-research"`,
-`"local/optical-flow"`, etc. The `/` convention:
+For research KGs, users naturally want to organize by project: `"local:llm-research"`,
+`"local:optical-flow"`, etc. The `:` convention:
 
 - Allows simple prefix matching for "all projects under X."
-- Is filesystem-like — familiar to users.
-- Doesn't conflict with any existing identifier characters.
+- Is URI-like — familiar to users (`scheme:path`).
+- Doesn't conflict with filesystem path characters or URL separators.
 
 ### Why an opaque String wrapper (not a parsed structure)?
 
 The structure of namespace strings is a _convention_, not a contract. Different deployments may use
 different conventions:
 
-- `"local/project/team"` for hierarchical
+- `"local:project:team"` for hierarchical
 - `"tenant-uuid"` for hosted
 - `"workspace-name"` for single-flat
 
@@ -122,8 +124,64 @@ does not break callers.
 
 ### Neutral
 
-- Migration to typed namespaces (if ever needed) is a transparent change at the storage layer —
-  every SQL query already uses `WHERE namespace = ?` as a string parameter.
+- Migration to typed namespaces (if ever needed) is a transparent change — namespace is already
+  passed as a string parameter throughout the stack.
+
+## Storage-Layer Design: Namespace as Caller-Supplied Parameter
+
+This section records the Option B decision for how namespace is handled in `khive-storage` and
+`khive-db`. It supersedes any earlier wording that implied "stores are namespace-scoped handles."
+
+### Decision
+
+**Stores are unscoped database connections. Namespace is a caller-supplied parameter, not a
+store-level boundary.**
+
+```rust
+// Option A (rejected): namespace baked into the store handle
+struct EntityStore { namespace: Namespace, pool: Pool }
+
+// Option B (chosen): namespace is a call-site parameter
+struct EntityStore { pool: Pool }
+impl EntityStore {
+    async fn query(&self, namespace: &str, ...) -> Vec<Entity> { ... }
+    async fn get(&self, id: Uuid) -> Option<Entity> { ... }  // no namespace: UUID is global
+}
+```
+
+### Rules
+
+1. **Methods that operate on multiple records** (query, count, search, list) take `namespace` as an
+   explicit parameter. The caller decides which namespace to query.
+
+2. **Methods that operate on a single record by ID** (get, delete, upsert) do not take a namespace
+   parameter. UUID v4 is globally unique across all namespaces — there is no ambiguity, and no
+   namespace filter is needed.
+
+3. **Records carry their own namespace.** `Entity.namespace`, `Note.namespace`, `Event.namespace` —
+   the record's namespace field is authoritative. `upsert` writes the namespace stored in the record
+   as-is; it does not override it from a store-level setting.
+
+4. **Isolation is enforced at the service/runtime layer**, not the storage layer. The runtime
+   (`khive-runtime`) ensures that MCP verbs only access namespaces the authenticated caller owns.
+   Storage is a dumb persistence layer that executes what it is told.
+
+5. **Exception — EventStore, GraphStore, and VectorStore**: some trait methods on these stores don't
+   take per-call namespace (e.g., `count`, `delete`, `get_event`). These stores accept a default
+   namespace at construction as a convenience fallback. This is not an enforcement boundary — it is a
+   default that can be overridden via filter parameters for reads that need to span namespaces.
+
+### Why not store-level scoping (Option A)?
+
+| Problem                         | Detail                                                                                                                                                                            |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| False security                  | The store struct has no auth context and cannot make access decisions. Scoping it feels safe but doesn't enforce anything.                                                        |
+| API inconsistency               | Some methods take namespace, others use `self.namespace` — callers have to remember which is which.                                                                               |
+| Parameter-ignoring anti-pattern | When a method signature accepts a namespace parameter but the implementation ignores it in favor of `self.namespace`, implementors are confused and bugs are introduced silently. |
+| Inflexibility                   | A store scoped to namespace X cannot serve a cross-namespace admin query without constructing a second store or bypassing the scope.                                              |
+
+Store-level scoping is the wrong abstraction. Access control belongs to the layer that has the
+authority context — the service/runtime — not the layer that has the database connection.
 
 ## Implementation
 
@@ -140,17 +198,26 @@ pub struct Namespace(String);
 
 In `khive-storage`:
 
-- All store traits accept `&str` for namespace parameters.
-- All SQL queries include `WHERE namespace = ?`.
+- Store traits are unscoped database connections — no `namespace` field on the struct.
+- Methods over multiple records accept `namespace: &str` as an explicit caller-supplied parameter.
+- Methods over a single record by ID (get, delete, upsert) do not take a namespace parameter.
 - No namespace validation at the storage layer.
+
+In `khive-db`:
+
+- SQL queries for multi-record operations include `WHERE namespace = ?` with the caller-supplied
+  value.
+- SQL queries for single-record operations use `WHERE id = ?` only.
 
 In services (when ported):
 
 - Validate namespace format at ingress (e.g., regex, length limits) before passing to storage.
 - Derive namespace from auth context for multi-tenant scenarios.
+- Enforce that the authenticated caller's namespace matches the requested namespace before calling
+  storage.
 
 ## References
 
 - ADR-003: Four-Layer Architecture (namespace flows top-down through layers)
-- ADR-004: Substrate Observables (every observable is namespace-scoped)
+- ADR-004: Substrate Observables (every observable carries a namespace field)
 - `crates/khive-types/src/namespace.rs`: implementation
