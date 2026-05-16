@@ -160,6 +160,12 @@ impl KhiveRuntime {
                     )));
                 }
                 None => {
+                    // Existing edge used as annotates source: wrong kind, not absent.
+                    if self.get_edge(namespace, source_id).await?.is_some() {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "annotates source {source_id} must be a note"
+                        )));
+                    }
                     return Err(RuntimeError::NotFound(format!(
                         "link source {source_id} not found in namespace"
                     )));
@@ -1781,6 +1787,40 @@ mod tests {
             other => {
                 panic!("expected InvalidInput for entity source with Annotates, got {other:?}")
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn link_edge_as_annotates_source_returns_invalid_input() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let edge_uuid: Uuid = edge.id.into();
+
+        // An existing edge used as an annotates source: wrong kind, not absent.
+        let result = rt
+            .link(None, edge_uuid, a.id, EdgeRelation::Annotates, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("source") && msg.contains("note"),
+                    "edge-as-annotates-source must report wrong kind, not NotFound: {msg}"
+                );
+            }
+            other => panic!(
+                "expected InvalidInput for edge source with Annotates, got {other:?}"
+            ),
         }
     }
 
