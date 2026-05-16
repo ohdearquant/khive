@@ -131,7 +131,17 @@ impl KhiveRuntime {
 
     // ---- Edge operations ----
 
-    /// Create a directed edge between two entities.
+    /// Create a directed edge between two substrates.
+    ///
+    /// Enforces the ADR-002 relation-aware endpoint contract:
+    /// - `annotates` (Category 6): source MUST be a note; target may be any substrate
+    ///   (entity, note, event, or edge). This is the only relation that crosses substrate kinds.
+    /// - All other 12 relations (entity→entity): both endpoints MUST resolve to entities.
+    ///   A phantom/cross-namespace endpoint returns `NotFound`; an endpoint that exists but
+    ///   is not an entity (e.g. a note or edge UUID used with `extends`) returns `InvalidInput`.
+    ///
+    /// A record that exists but belongs to a different namespace is treated as not found
+    /// (fail-closed; no cross-namespace existence leak).
     pub async fn link(
         &self,
         namespace: Option<&str>,
@@ -140,6 +150,79 @@ impl KhiveRuntime {
         relation: EdgeRelation,
         weight: f64,
     ) -> RuntimeResult<Edge> {
+        if relation == EdgeRelation::Annotates {
+            // Source must be a note in namespace.
+            match self.resolve(namespace, source_id).await? {
+                Some(Resolved::Note(_)) => {}
+                Some(_) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "annotates source {source_id} must be a note"
+                    )));
+                }
+                None => {
+                    // Existing edge used as annotates source: wrong kind, not absent.
+                    if self.get_edge(namespace, source_id).await?.is_some() {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "annotates source {source_id} must be a note"
+                        )));
+                    }
+                    return Err(RuntimeError::NotFound(format!(
+                        "link source {source_id} not found in namespace"
+                    )));
+                }
+            }
+            // Target may be any substrate (entity, note, event, or edge).
+            if !self.substrate_exists_in_ns(namespace, target_id).await? {
+                return Err(RuntimeError::NotFound(format!(
+                    "link target {target_id} not found in namespace"
+                )));
+            }
+        } else {
+            // All 12 entity→entity relations: both endpoints must be entities.
+            // resolve() covers entity/note/event; get_edge() covers edges (not in resolve).
+            // None from resolve + Some from get_edge → InvalidInput (wrong substrate kind).
+            // None from both → NotFound (phantom / cross-namespace).
+            match self.resolve(namespace, source_id).await? {
+                Some(Resolved::Entity(_)) => {}
+                Some(_) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "link source {source_id} must be an entity for relation {relation:?} \
+                         (ADR-002: only `annotates` crosses substrates)"
+                    )));
+                }
+                None => {
+                    if self.get_edge(namespace, source_id).await?.is_some() {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "link source {source_id} must be an entity for relation {relation:?} \
+                             (ADR-002: only `annotates` crosses substrates)"
+                        )));
+                    }
+                    return Err(RuntimeError::NotFound(format!(
+                        "link source {source_id} not found in namespace"
+                    )));
+                }
+            }
+            match self.resolve(namespace, target_id).await? {
+                Some(Resolved::Entity(_)) => {}
+                Some(_) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "link target {target_id} must be an entity for relation {relation:?} \
+                         (ADR-002: only `annotates` crosses substrates)"
+                    )));
+                }
+                None => {
+                    if self.get_edge(namespace, target_id).await?.is_some() {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "link target {target_id} must be an entity for relation {relation:?} \
+                             (ADR-002: only `annotates` crosses substrates)"
+                        )));
+                    }
+                    return Err(RuntimeError::NotFound(format!(
+                        "link target {target_id} not found in namespace"
+                    )));
+                }
+            }
+        }
         let edge = Edge {
             id: LinkId::from(Uuid::new_v4()),
             source_id,
@@ -151,6 +234,21 @@ impl KhiveRuntime {
         };
         self.graph(namespace)?.upsert_edge(edge.clone()).await?;
         Ok(edge)
+    }
+
+    /// Returns `true` if `id` resolves to a live substrate record in `namespace`.
+    ///
+    /// Covers entity, note, event (via `resolve`) and edge (via `get_edge`).
+    /// A record that exists in a different namespace returns `false` (fail-closed).
+    async fn substrate_exists_in_ns(
+        &self,
+        namespace: Option<&str>,
+        id: Uuid,
+    ) -> RuntimeResult<bool> {
+        if self.resolve(namespace, id).await?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.get_edge(namespace, id).await?.is_some())
     }
 
     /// Get immediate neighbors of a node, optionally filtered by relation type.
@@ -205,6 +303,16 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
         let ns = self.ns(namespace);
+
+        // Validate all annotates targets before any write (ADR-024:295 atomicity).
+        for &target_id in &annotates {
+            if !self.substrate_exists_in_ns(namespace, target_id).await? {
+                return Err(RuntimeError::NotFound(format!(
+                    "create_note annotates target {target_id} not found in namespace"
+                )));
+            }
+        }
+
         let mut note = Note::new(ns, kind, content).with_salience(salience);
         if let Some(n) = name {
             note = note.with_name(n);
@@ -1282,5 +1390,513 @@ mod tests {
             result.is_err(),
             "shared 8-char prefix must return Ambiguous error"
         );
+    }
+
+    // ---- Referential integrity tests (fix/link-referential-integrity) ----
+
+    #[tokio::test]
+    async fn link_phantom_source_returns_not_found() {
+        let rt = rt();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let phantom = Uuid::new_v4();
+
+        let result = rt
+            .link(None, phantom, b.id, EdgeRelation::Extends, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::NotFound(msg)) => {
+                assert!(
+                    msg.contains("source"),
+                    "error message must name 'source': {msg}"
+                );
+            }
+            other => panic!("expected NotFound for phantom source, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn link_phantom_target_returns_not_found() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let phantom = Uuid::new_v4();
+
+        let result = rt
+            .link(None, a.id, phantom, EdgeRelation::Extends, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::NotFound(msg)) => {
+                assert!(
+                    msg.contains("target"),
+                    "error message must name 'target': {msg}"
+                );
+            }
+            other => panic!("expected NotFound for phantom target, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn link_real_entities_succeeds() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 0.8)
+            .await
+            .unwrap();
+        assert_eq!(edge.source_id, a.id);
+        assert_eq!(edge.target_id, b.id);
+        assert_eq!(edge.relation, EdgeRelation::Extends);
+    }
+
+    #[tokio::test]
+    async fn create_note_annotates_phantom_returns_not_found() {
+        let rt = rt();
+        let phantom = Uuid::new_v4();
+
+        let result = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "some content",
+                0.5,
+                None,
+                vec![phantom],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::NotFound(_))),
+            "annotates with phantom uuid must return NotFound, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_annotates_real_entity_succeeds() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(None, "concept", "RealTarget", None, None, vec![])
+            .await
+            .unwrap();
+
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "content",
+                0.5,
+                None,
+                vec![entity.id],
+            )
+            .await
+            .unwrap();
+
+        let neighbors = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, entity.id);
+    }
+
+    #[tokio::test]
+    async fn link_target_in_different_namespace_returns_not_found() {
+        let rt = rt();
+        let a = rt
+            .create_entity(Some("ns-a"), "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(Some("ns-b"), "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Linking from ns-a: target b lives in ns-b — must be treated as not found.
+        let result = rt
+            .link(Some("ns-a"), a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::NotFound(_))),
+            "target in different namespace must return NotFound (fail-closed), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_phantom_self_loop_returns_not_found() {
+        let rt = rt();
+        let phantom = Uuid::new_v4();
+
+        let result = rt
+            .link(None, phantom, phantom, EdgeRelation::Extends, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::NotFound(msg)) => {
+                assert!(
+                    msg.contains("source"),
+                    "self-loop must fail on source first: {msg}"
+                );
+            }
+            other => panic!("expected NotFound for phantom self-loop, got {other:?}"),
+        }
+    }
+
+    // ---- Round-2 tests: edge target coverage + atomicity ----
+
+    #[tokio::test]
+    async fn link_note_to_edge_annotates_succeeds() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        // Create a real edge between a and b, capture its UUID.
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let edge_uuid: Uuid = edge.id.into();
+
+        // Create a note and annotate the edge itself (edge is a valid substrate target per ADR-024).
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "edge note",
+                0.5,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(None, note.id, edge_uuid, EdgeRelation::Annotates, 1.0)
+            .await;
+        assert!(
+            result.is_ok(),
+            "note→edge Annotates must succeed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_annotates_real_edge_succeeds() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let edge_uuid: Uuid = edge.id.into();
+
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "annotating an edge",
+                0.5,
+                None,
+                vec![edge_uuid],
+            )
+            .await
+            .unwrap();
+
+        let neighbors = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, edge_uuid);
+    }
+
+    #[tokio::test]
+    async fn create_note_annotates_phantom_is_atomic_no_note_persisted() {
+        let rt = rt();
+        let phantom = Uuid::new_v4();
+
+        let before_count = rt.list_notes(None, None, 1000).await.unwrap().len();
+
+        let result = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "should not persist",
+                0.5,
+                None,
+                vec![phantom],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::NotFound(_))),
+            "phantom annotates target must return NotFound, got {result:?}"
+        );
+
+        // Atomicity: the note row must NOT have been written.
+        let after_count = rt.list_notes(None, None, 1000).await.unwrap().len();
+        assert_eq!(
+            before_count, after_count,
+            "failed create_note must not persist any note row (atomicity)"
+        );
+
+        // FTS must not contain the content either.
+        let search_hits = rt
+            .search_notes(None, "should not persist", None, 10)
+            .await
+            .unwrap();
+        assert!(
+            search_hits.is_empty(),
+            "failed create_note must not index into FTS (atomicity)"
+        );
+        // Vector-store row: only written when an embedding model is configured; the rt()
+        // harness has none, so no vector assertion is needed here.
+    }
+
+    // ---- Round-3 tests: relation-aware endpoint contract (ADR-002) ----
+
+    // Test #2: entity→entity with non-annotates rejects an edge UUID as target.
+    #[tokio::test]
+    async fn link_entity_to_edge_uuid_non_annotates_returns_invalid_input() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        // Create a real edge; capture its UUID as the bad target.
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let edge_uuid: Uuid = edge.id.into();
+
+        let result = rt
+            .link(None, a.id, edge_uuid, EdgeRelation::Extends, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("target"),
+                    "error message must name 'target': {msg}"
+                );
+            }
+            other => {
+                panic!("expected InvalidInput for edge-uuid target with Extends, got {other:?}")
+            }
+        }
+    }
+
+    // Test #3: non-annotates rejects a note UUID as source.
+    #[tokio::test]
+    async fn link_note_as_source_non_annotates_returns_invalid_input() {
+        let rt = rt();
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "a note",
+                0.5,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let entity = rt
+            .create_entity(None, "concept", "E", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(None, note.id, entity.id, EdgeRelation::DependsOn, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("source"),
+                    "error message must name 'source': {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput for note source with DependsOn, got {other:?}"),
+        }
+    }
+
+    // Test #4: annotates rejects entity as source (source must be a note).
+    #[tokio::test]
+    async fn link_entity_as_annotates_source_returns_invalid_input() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(None, a.id, b.id, EdgeRelation::Annotates, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("source") && msg.contains("note"),
+                    "error must say source must be a note: {msg}"
+                );
+            }
+            other => {
+                panic!("expected InvalidInput for entity source with Annotates, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn link_edge_as_annotates_source_returns_invalid_input() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let edge_uuid: Uuid = edge.id.into();
+
+        // An existing edge used as an annotates source: wrong kind, not absent.
+        let result = rt
+            .link(None, edge_uuid, a.id, EdgeRelation::Annotates, 1.0)
+            .await;
+        match result {
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("source") && msg.contains("note"),
+                    "edge-as-annotates-source must report wrong kind, not NotFound: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput for edge source with Annotates, got {other:?}"),
+        }
+    }
+
+    // Test #5: note→event with annotates succeeds (event is a valid annotates target).
+    #[tokio::test]
+    async fn link_note_to_event_annotates_succeeds() {
+        use khive_storage::Event;
+        use khive_types::SubstrateKind;
+
+        let rt = rt();
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "observing an event",
+                0.6,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Build an event directly via the store (no runtime create_event exists).
+        let ns = rt.ns(None);
+        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event_id = event.id;
+        rt.events(None).unwrap().append_event(event).await.unwrap();
+
+        let result = rt
+            .link(None, note.id, event_id, EdgeRelation::Annotates, 1.0)
+            .await;
+        assert!(
+            result.is_ok(),
+            "note→event Annotates must succeed, got {result:?}"
+        );
+    }
+
+    // Test #6: create_note with event as annotates target succeeds.
+    #[tokio::test]
+    async fn create_note_annotates_event_succeeds() {
+        use khive_storage::Event;
+        use khive_types::SubstrateKind;
+
+        let rt = rt();
+        let ns = rt.ns(None);
+        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event_id = event.id;
+        rt.events(None).unwrap().append_event(event).await.unwrap();
+
+        let result = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                None,
+                "note annotating an event",
+                0.5,
+                None,
+                vec![event_id],
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "create_note with event annotates target must succeed, got {result:?}"
+        );
+        // Verify the annotates edge was created.
+        let note = result.unwrap();
+        let neighbors = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, event_id);
     }
 }
