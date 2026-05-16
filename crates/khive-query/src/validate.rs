@@ -118,26 +118,57 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
         }
     }
 
+    // Build variable → kind map so condition validation is context-aware.
+    // `kind` and `relation` only get taxonomy enforcement on the correct
+    // variable type (node vs edge). On the other type, they're treated as
+    // ordinary JSON property keys.
+    let mut var_kinds: std::collections::HashMap<&str, VarKind> = std::collections::HashMap::new();
+    for element in &query.pattern.elements {
+        match element {
+            PatternElement::Node(n) => {
+                if let Some(v) = n.variable.as_deref() {
+                    var_kinds.insert(v, VarKind::Node);
+                }
+            }
+            PatternElement::Edge(e) => {
+                if let Some(v) = e.variable.as_deref() {
+                    var_kinds.insert(v, VarKind::Edge);
+                }
+            }
+        }
+    }
+
     for cond in query.where_clause.iter_mut() {
-        validate_condition(cond)?;
+        let is_edge = var_kinds
+            .get(cond.variable.as_str())
+            .copied()
+            .unwrap_or(VarKind::Node)
+            == VarKind::Edge;
+        validate_condition(cond, is_edge)?;
     }
 
     Ok(())
 }
 
-fn validate_condition(cond: &mut Condition) -> Result<(), QueryError> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VarKind {
+    Node,
+    Edge,
+}
+
+fn validate_condition(cond: &mut Condition, is_edge: bool) -> Result<(), QueryError> {
     match cond.property.as_str() {
         "namespace" => Err(QueryError::Validation(
             "namespace is set by CompileOptions, not query text".into(),
         )),
-        "kind" => {
+        "kind" if !is_edge => {
             if let ConditionValue::String(ref mut s) = cond.value {
                 let parsed = EntityKind::from_str(s).map_err(QueryError::Validation)?;
                 *s = parsed.name().to_string();
             }
             Ok(())
         }
-        "relation" => {
+        "relation" if is_edge => {
             if let ConditionValue::String(ref mut s) = cond.value {
                 let parsed = EdgeRelation::from_str(s)
                     .map_err(|err| QueryError::Validation(err.to_string()))?;
@@ -380,5 +411,29 @@ mod tests {
         let edge = q.pattern.edges().next().unwrap();
         assert_eq!(edge.min_hops, 2);
         assert_eq!(edge.max_hops, MAX_DEPTH);
+    }
+
+    #[test]
+    fn node_property_named_relation_allowed() {
+        // `relation` on a node variable is a free-form JSON property, not the
+        // edge relation column — taxonomy enforcement should not apply.
+        let mut q =
+            gql::parse("MATCH (a)-[:extends]->(b) WHERE a.relation = 'external' RETURN a").unwrap();
+        validate(&mut q).unwrap();
+        let val = match &q.where_clause[0].value {
+            ConditionValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert_eq!(val, "external");
+    }
+
+    #[test]
+    fn edge_relation_still_validated() {
+        // `relation` on an edge variable must still go through EdgeRelation
+        // taxonomy validation.
+        let mut q = gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'not_real' RETURN a")
+            .unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(err.to_string().contains("not_real"), "msg: {err}");
     }
 }
