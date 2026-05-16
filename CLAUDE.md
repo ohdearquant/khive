@@ -1,133 +1,151 @@
-# khive — Claude Code Working Guide
+# khive — Developer Guide
 
-**What this is**: The research knowledge graph runtime. Build domain-specific KGs that grow with
-your work.
+**What this is**: A research knowledge graph runtime. Typed entities, closed edge ontology,
+hybrid search, GQL/SPARQL queries — all in a single 7.7MB Rust binary over MCP stdio.
 
-**License**: Apache 2.0 (public).
+**v0.1.0** — [crates.io](https://crates.io/crates/khive-mcp) | Apache 2.0
 
 ---
 
-## Architecture
+## Scope and intent
 
-The Rust core owns storage + query (where native code matters). Everything user-facing is TypeScript
-(where iteration speed matters). Agents reach the KG via MCP, the universal interface.
+khive is a **structured persistence layer for AI research agents**. An agent reads papers, forms
+concepts, links ideas, records decisions — khive gives that work a typed, queryable graph that
+persists across sessions.
+
+It is NOT a general-purpose database, a vector DB, or a chat memory system. It has opinions:
+6 entity kinds, 13 edge relations, 5 note kinds — all closed sets. If your data doesn't fit the
+schema, change how you model it, not the schema. Schema changes require an ADR.
+
+---
+
+## Architecture (what ships today)
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  frontend/  — Next.js 15 + React 19 + Tailwind               │
-│  Visual KG explorer, traverse UI, research session frontend  │
-└──────────────────────────────────────────────────────────────┘
-                            ↕ HTTP
-┌──────────────────────────────────────────────────────────────┐
-│  deno/      — Deno 2 + TypeScript (single package)           │
-│  Two entry points:                                            │
-│    • src/server.ts   HTTP gateway + research orchestration   │
-│    • src/cli.ts      `khive` CLI (deno compile → binary)     │
-│  Both talk to the runtime via MCP stdio                       │
-└──────────────────────────────────────────────────────────────┘
-                            ↕ MCP stdio
-┌──────────────────────────────────────────────────────────────┐
-│  crates/khive-mcp    — Rust binary (ONLY user-facing Rust)   │
-│  Stdio MCP server, embeds khive-runtime                       │
+│  khive-mcp     — stdio MCP server (the only binary)          │
+│  11 verb tools: create get list update delete merge          │
+│                 search link neighbors traverse query          │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
-│  crates/             — Rust storage + query core              │
-│  khive-types, khive-score, khive-storage, khive-db,           │
-│  khive-query, khive-runtime                                    │
+│  khive-runtime — composable Service API                      │
+│  khive-query   — GQL/SPARQL → SQL compiler                   │
+│  khive-db      — SQLite + sqlite-vec + FTS5                  │
+│  khive-storage — trait-only capability surface                │
+│  khive-score   — deterministic i64 scoring                   │
+│  khive-types   — domain types + closed enums                 │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-External agents (Claude Code, Python ag2, custom TS, etc.) call into the same `khive-mcp` over
-stdio. There is **no language-specific SDK** — MCP is the universal interface. See
-[ADR-011](docs/adr/ADR-011-deno-mcp-only-server.md).
+Dependency chain: `types → score → storage → db → query → runtime → mcp`.
+
+Future layers (HTTP gateway, CLI, frontend) are planned but not shipped.
 
 ---
 
 ## Directory map
 
-| Path                   | Purpose                                                                           |
-| ---------------------- | --------------------------------------------------------------------------------- |
-| `frontend/`            | Next.js 15 App Router. KG visualization, traverse UI, research session interface. |
-| `deno/`                | Deno + TypeScript. Server + CLI in one package.                                   |
-| `deno/src/server.ts`   | HTTP entry point — `deno task server`                                             |
-| `deno/src/cli.ts`      | CLI entry point — `deno task cli` (compiles to `khive` binary)                    |
-| `deno/src/api/`        | HTTP routes (used by server entry)                                                |
-| `deno/src/commands/`   | CLI command handlers (used by cli entry)                                          |
-| `deno/src/mcp/`        | MCP client wrapper — talks to `khive-mcp`                                         |
-| `deno/src/research/`   | Agent orchestration (research sessions)                                           |
-| `mcp/`                 | Specialized MCP servers (paper extractors etc.) — language per tool               |
-| `crates/khive-types`   | Domain types (Entity, Note, Event, Id128, ...)                                    |
-| `crates/khive-score`   | Deterministic scoring (i64 fixed-point)                                           |
-| `crates/khive-storage` | Trait-only capability surface (SqlAccess, GraphStore, ...)                        |
-| `crates/khive-db`      | SQLite backend implementing the storage traits                                    |
-| `crates/khive-query`   | SPARQL/GQL parsers + SQL compiler                                                 |
-| `crates/khive-runtime` | Composable Service API (used by `khive-mcp`)                                      |
-| `crates/khive-mcp`     | The stdio MCP binary — the only Rust user-facing binary                           |
-| `docs/adr/`            | Architecture Decision Records                                                     |
+| Path                   | Purpose                                                     |
+| ---------------------- | ----------------------------------------------------------- |
+| `crates/khive-types`   | Domain types: Entity, Note, Event, EntityKind, EdgeRelation |
+| `crates/khive-score`   | Deterministic i64 fixed-point scoring + RRF                 |
+| `crates/khive-storage` | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch  |
+| `crates/khive-db`      | SQLite backend + sqlite-vec + FTS5 trigram                  |
+| `crates/khive-query`   | GQL + SPARQL parsers, AST validation, SQL compiler          |
+| `crates/khive-runtime` | Service API: CRUD, hybrid search, graph traversal, curation |
+| `crates/khive-mcp`     | Stdio MCP binary — the only user-facing Rust artifact       |
+| `docs/adr/`            | Architecture Decision Records (the design contract)         |
+| `tests/smoke_test.py`  | End-to-end binary smoke test (all 11 tools)                 |
+| `scripts/publish.sh`   | Publish all crates to crates.io in dependency order         |
 
 ---
 
-## Working conventions
+## Closed taxonomies (DO NOT extend without an ADR)
 
-### Deno (deno/)
+### 6 entity kinds ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md))
 
-- Deno 2.x. **Never** `npm install` for the Deno package — use `deno.json` `imports` map.
-- `deno task cli`, `deno task server` for dev.
-- `deno task fmt`, `deno task lint`, `deno task check`, `deno task test`.
-- Package name on npm/JSR: `khive`.
-- Shared code lives in `deno/src/mcp/`, `deno/src/research/`, `deno/src/types/` — imported by both
-  entry points.
+`concept` | `document` | `dataset` | `project` | `person` | `org`
 
-### Next.js (frontend/)
+### 13 edge relations ([ADR-002](docs/adr/ADR-002-edge-ontology.md))
 
-- Next 15.x, React 19, TypeScript strict, App Router.
-- Tailwind + shadcn/ui.
-- TanStack Query for data fetching.
-- react-flow for KG visualization.
+Structure: `contains` | `part_of` | `instance_of`
+Derivation: `extends` | `variant_of` | `introduced_by` | `supersedes`
+Dependency: `depends_on` | `enables`
+Implementation: `implements`
+Lateral: `competes_with` | `composed_with`
+Annotation: `annotates`
 
-### Rust (crates/)
+### 5 note kinds ([ADR-019](docs/adr/ADR-019-note-kind-taxonomy.md))
 
-- Workspace at `crates/Cargo.toml`.
-- `cargo check --workspace`, `cargo test --workspace`.
-- Apache-2.0 license on all crates.
-- Storage crates are trait-driven (ADR-005). Backend implementations live in their own crates.
-- `cargo clippy --workspace -- -D warnings` must pass before merge.
-- `cargo fmt --all -- --check` must pass before merge.
+`observation` | `insight` | `question` | `decision` | `reference`
 
-### MCP (mcp/)
-
-- Specialized MCP servers — paper extractors, web scrapers, etc.
-- Language per tool — Python for ML-heavy, Deno for orchestration glue.
-- Each MCP server has its own config (`pyproject.toml`, `deno.json`, etc.).
+**These are enforced at compile time** (Rust enums) and at the MCP boundary (parse errors list
+valid values). Ad-hoc kinds/relations are rejected, not silently accepted.
 
 ---
 
-## CI / CD
+## MCP tool surface (11 tools, v0.1)
 
-GitHub Actions runs on every push to `main` and every PR:
+| Tool        | Params                                | What it does                                                  |
+| ----------- | ------------------------------------- | ------------------------------------------------------------- |
+| `create`    | `kind=entity\|note` + fields          | Create an entity or note                                      |
+| `get`       | `id` (UUID)                           | Fetch any record — auto-detects entity/note/edge              |
+| `list`      | `kind=entity\|edge\|note` + filters   | Structured browse with pagination                             |
+| `update`    | `id` + patch fields                   | Patch entity (name/desc/props/tags) or edge (relation/weight) |
+| `delete`    | `id`, `hard?`                         | Soft-delete (default) or hard-delete with edge cascade        |
+| `merge`     | `into_id`, `from_id`                  | Deduplicate two entities (v0.1: entity-only)                  |
+| `search`    | `kind=entity\|note`, `query`          | Hybrid FTS5 + vector search with RRF fusion                   |
+| `link`      | `source_id`, `target_id`, `relation`  | Create a typed directed edge                                  |
+| `neighbors` | `node_id`, `direction?`, `relations?` | Immediate graph neighbors                                     |
+| `traverse`  | `roots`, `max_depth?`, `relations?`   | Multi-hop BFS with filters                                    |
+| `query`     | GQL or SPARQL string                  | Pattern matching compiled to SQL                              |
 
-- **CI job** (ubuntu + macOS matrix): `cargo fmt --check`, `cargo clippy -D warnings`,
-  `cargo test --workspace`, `cargo check --no-default-features`, release build.
-- **Docs lint job**: `deno fmt --check docs/`.
-
-Locally, `make ci` runs the same checks. Individual targets: `make check`, `make clippy`,
-`make test`, `make fmt`, `make docs-check`.
-
-Feature branches + PRs for all changes. Never push directly to main.
-
-Conventional commits with crate scope: `feat(types): add NoteKind taxonomy`.
+`get`/`update`/`delete`/`merge` are UUID-only — no `kind` needed, the handler resolves
+the substrate from the UUID. `create`/`list`/`search` require `kind`.
 
 ---
 
-## ADR-driven development
+## Coding standards
 
-Architecture Decision Records (`docs/adr/`) are the design contract. Code implements what ADRs
-specify. Significant design changes (new entity kinds, new edge relations, new MCP verbs, new
-storage traits) require an ADR **before** code lands. See `docs/adr/README.md` for the full index.
+### Rust
 
-ADR status values: `accepted` (approved design), `planned` (approved but not yet implemented),
-`deprecated` (replaced by a newer ADR).
+- **Workspace**: `crates/Cargo.toml`. Always `cargo check --workspace` after changes.
+- **Clippy**: `cargo clippy --workspace --all-targets -- -D warnings` must pass. No exceptions.
+- **Fmt**: `cargo fmt --all -- --check`. No exceptions.
+- **Tests**: `cargo test --workspace`. Run before every commit.
+- **No comments by default.** Only when the WHY is non-obvious. Never explain WHAT.
+- **No stubs.** If you don't know how to implement, read the source until you do.
+- **No premature abstraction.** Three similar lines > a helper used once.
+- **No backwards-compat shims.** If something is unused, delete it.
+- **Match existing patterns.** Read the file before editing it.
+
+### Schema changes
+
+- **Migrations only.** Schema changes go through `crates/khive-db/src/migrations.rs`.
+  Add a new `VersionedMigration` with `version = <last + 1>`. Never edit V1.
+- **Store DDL** (`NOTES_DDL`, etc.) must include new columns for test convenience,
+  and `run_migrations` must handle the idempotency.
+
+### MCP tool changes
+
+- Tool params live in `crates/khive-mcp/src/tools/<verb>.rs`.
+- Handler logic lives in `crates/khive-mcp/src/server.rs`.
+- Runtime methods live in `crates/khive-runtime/src/operations.rs` (or `curation.rs`,
+  `retrieval.rs`, `graph_traversal.rs`).
+- **Invalid inputs return `McpError::invalid_params`** with the full list of valid values.
+  Never silently coerce.
+
+### Namespace isolation
+
+- **Enforced at the runtime layer.** Every ID-based operation (get, delete, update, merge)
+  must verify `record.namespace == caller_namespace` after fetching by UUID.
+- Storage stores are ID-only. The runtime is the trust boundary.
+
+### Edge cascade
+
+- **Hard entity delete cascades incident edges.** No dangling references.
+- Soft delete leaves edges in place — queries filter by `deleted_at IS NULL`.
 
 ---
 
@@ -137,86 +155,90 @@ ADR status values: `accepted` (approved design), `planned` (approved but not yet
 # Full CI (same as GitHub Actions)
 make ci
 
-# Rust core
-cd crates && cargo test --workspace
+# Individual checks
+make check      # cargo check --workspace
+make clippy     # clippy with -D warnings
+make test       # cargo test --workspace
+make fmt        # cargo fmt + deno fmt docs/
+make fmt-check  # verify without modifying
 
-# Deno (CLI dev mode)
-cd deno && deno task cli --help
+# Build release binary
+make build      # cargo build --workspace --release
 
-# Deno (HTTP server, watch)
-cd deno && deno task server
-
-# Frontend
-cd frontend && pnpm install && pnpm dev
+# Publish to crates.io
+make publish-dry  # dry run — validates all 7 crates
+make publish      # live publish in dependency order
 ```
 
-### Local stack
+### Commits
 
-Both Deno entry points spawn `khive-mcp` as a child process. The `khive-mcp` binary must be on
-`PATH` or specified via `KHIVE_MCP_COMMAND`:
+Feature branches + PRs. Never push directly to main.
 
-```bash
-# Default: spawn `khive-mcp` from PATH
-deno task --cwd deno cli entity list
+Conventional commits with crate scope: `feat(query): add SPARQL property filter`.
 
-# Custom binary location or arguments
-KHIVE_MCP_COMMAND="$(pwd)/target/release/khive-mcp --db /tmp/khive-graph.db" \
-  deno task --cwd deno cli entity list
-```
+### Testing
+
+- **Verify before claiming complete.** Run the test, check the output.
+- **Report outcomes faithfully.** If tests fail, say so.
+- **Integration > unit** for the MCP surface — the value is in the composition.
+- **Smoke test**: `python3 tests/smoke_test.py` exercises all 11 tools end-to-end.
 
 ---
 
-## Code style
+## ADR-driven development
 
-- **Default to writing no comments.** Only when the WHY is non-obvious.
-- **Don't introduce abstractions for future hypothetical use.** Three similar lines beats premature
-  abstraction.
-- **No stubs.** If you don't know how to implement, research until you do.
-- **No backwards-compat shims** unless explicitly necessary.
-- **Match existing patterns in the file.** Don't reinvent style locally.
+Architecture Decision Records (`docs/adr/`) are the normative contract. Code implements what
+ADRs specify. Changing the schema or interface requires an ADR **before** code lands.
 
----
+Key ADRs for contributors:
 
-## Testing discipline
+| ADR                                                      | What it governs                                    |
+| -------------------------------------------------------- | -------------------------------------------------- |
+| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)          | 6 entity kinds — don't add without this            |
+| [002](docs/adr/ADR-002-edge-ontology.md)                 | 13 edge relations — closed set                     |
+| [005](docs/adr/ADR-005-storage-capability-traits.md)     | Storage traits — the abstraction boundary          |
+| [008](docs/adr/ADR-008-query-layer-separation.md)        | Query crate — parser/validator/compiler separation |
+| [019](docs/adr/ADR-019-note-kind-taxonomy.md)            | 5 note kinds                                       |
+| [022](docs/adr/ADR-022-schema-migrations.md)             | Migration system — how to change the DB schema     |
+| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md) | 11 MCP tools — the public contract                 |
 
-- **Verify before claiming complete.** Run the test, check the output. "I believe it works" is not
-  "I confirmed it works."
-- **Report outcomes faithfully.** If tests fail, say so. Never claim "all green" when output shows
-  failures.
-- **Integration > unit** for research pipelines — the value is in the composition.
+Full index: [docs/adr/README.md](docs/adr/README.md).
 
 ---
 
 ## What lives where
 
-| Want to do...                          | Edit this                                                                             |
-| -------------------------------------- | ------------------------------------------------------------------------------------- |
-| Add a new HTTP route                   | `deno/src/api/`                                                                       |
-| Add a new CLI subcommand               | `deno/src/commands/`                                                                  |
-| Add a new MCP tool                     | `crates/khive-mcp/src/tools/`                                                         |
-| Add a research agent role              | `deno/src/research/`                                                                  |
-| Change KG schema                       | `crates/khive-db/src/stores/` + add migration                                         |
-| Add a new entity kind                  | **STOP** — that's an ADR change ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md)) |
-| Add a new edge relation                | **STOP** — that's an ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))        |
-| Add KG visualization                   | `frontend/app/`                                                                       |
-| Add specialized MCP server (extractor) | `mcp/<name>/`                                                                         |
-
----
-
-## Cross-references
-
-- **lattice** (separate repo, public on crates.io): inference engine for embeddings + reranking +
-  LLM serving. `lattice-embed` is consumed directly by `khive-runtime` as a Rust dependency (see
-  ADR-012).
-- **lionag2** (open source, separate repo): ag2 research patterns we drew inspiration from.
+| Want to do...           | Edit this                                                                   |
+| ----------------------- | --------------------------------------------------------------------------- |
+| Add a new MCP tool      | `crates/khive-mcp/src/tools/` + `server.rs`                                 |
+| Add a runtime operation | `crates/khive-runtime/src/operations.rs`                                    |
+| Change DB schema        | `crates/khive-db/src/migrations.rs` (new version) + store DDL               |
+| Add a new entity kind   | **STOP** — ADR change ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md)) |
+| Add a new edge relation | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))        |
+| Add a new note kind     | **STOP** — ADR change ([ADR-019](docs/adr/ADR-019-note-kind-taxonomy.md))   |
+| Fix a query parser bug  | `crates/khive-query/src/parsers/` + add regression test                     |
+| Fix a storage bug       | `crates/khive-db/src/stores/` + test                                        |
 
 ---
 
 ## Anti-patterns
 
-- **Don't add a language SDK.** Agents speak MCP. That's the contract.
-- **Don't write the CLI in Rust.** It's Deno (one TS codebase covers server + CLI).
-- **Don't reimplement KG primitives outside `crates/`.** If you're writing entity CRUD in Deno,
-  you're in the wrong place — add an MCP tool instead.
-- **Don't store research findings only in memory.** They should become entities + edges in the KG.
+- **Don't add a language SDK.** MCP is the universal interface. No Python/TS/Go client library.
+- **Don't reimplement KG primitives outside `crates/`.** If you need entity CRUD in another
+  language, call the MCP server — don't rewrite the storage logic.
+- **Don't silently coerce invalid input.** Invalid entity kinds, note kinds, and edge relations
+  must return errors with the valid values listed. Never `unwrap_or_default()`.
+- **Don't bypass namespace isolation.** Every ID-based runtime method checks namespace.
+  Storage is ID-only by design — the runtime enforces access control.
+- **Don't edit V1 migrations.** Append a new version. V1 is immutable on existing databases.
+- **Don't store research findings only as notes.** Notes are for context; entities + edges
+  are for structure. If a concept is worth naming, it's an entity.
 - **Don't optimize before measuring.** The bottleneck is rarely where you think.
+
+---
+
+## Cross-references
+
+- **[lattice-embed](https://crates.io/crates/lattice-embed)**: Local embedding model inference.
+  Consumed as a Rust dependency by `khive-runtime` (ADR-012).
+- **[AGENTS.md](AGENTS.md)**: Guide for AI agents _using_ khive (not developing it).
