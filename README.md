@@ -4,6 +4,7 @@ A research knowledge graph runtime. Typed substrates, closed taxonomies, and a v
 MCP surface — built for agents that need structure, not just vectors.
 
 [![CI](https://github.com/ohdearquant/khive/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/khive/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 Vector search finds similar text. A knowledge graph finds _structure_ — lineages, dependencies,
@@ -48,19 +49,16 @@ Entities are _things_. Notes are _what you think about things_. Events are _what
 
 ## The MCP verb surface
 
-14 tools, verb-shaped ([ADR-023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)):
+11 tools in v0.1, verb-shaped ([ADR-023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)):
 
 ```
-CRUD:        create  get  list  update  delete
-Curation:    merge  supersede
-Graph:       link  traverse  neighbors  query
-Search:      search
-Batch:       request
-Resolution:  resolve
+CRUD:     create  get  list  update  delete  merge
+Graph:    link  traverse  neighbors  query
+Search:   search
 ```
 
-Multi-domain verbs take `kind=` as a discriminant: `create(kind="entity", ...)` vs
-`create(kind="note", ...)`. No `<kind>_<op>` name explosion.
+`create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
+`get`, `update`, `delete`, `merge` are UUID-only — they auto-detect the record type.
 
 Agents reach khive via MCP stdio — Python, TypeScript, Rust, or any MCP-compatible client.
 No language SDK to learn.
@@ -71,21 +69,8 @@ No language SDK to learn.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  frontend/  — Next.js 15 + React 19 + Tailwind               │
-│  Visual KG explorer, traverse UI, research session frontend  │
-└──────────────────────────────────────────────────────────────┘
-                            ↕ HTTP
-┌──────────────────────────────────────────────────────────────┐
-│  deno/      — Deno 2 + TypeScript (single package)           │
-│  Two entry points:                                            │
-│    • src/server.ts   HTTP gateway + research orchestration   │
-│    • src/cli.ts      `khive` CLI (deno compile → binary)     │
-│  Both talk to the runtime via MCP stdio                       │
-└──────────────────────────────────────────────────────────────┘
-                            ↕ MCP stdio
-┌──────────────────────────────────────────────────────────────┐
-│  crates/khive-mcp    — Rust binary (ONLY user-facing Rust)   │
-│  Stdio MCP server, embeds khive-runtime                       │
+│  crates/khive-mcp    — Rust binary (stdio MCP server)        │
+│  The only binary you need. Embeds khive-runtime.              │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -95,12 +80,10 @@ No language SDK to learn.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The Rust core handles what Rust does well: native sqlite-vec, FTS5 trigram tokenization, concurrent
-connection pooling, memory-local graph traversal. Everything user-facing (HTTP, CLI, agent
-orchestration) is TypeScript via Deno — one codebase, two entry points.
+Native sqlite-vec for vector search, FTS5 trigram tokenization (CJK-safe), concurrent connection
+pooling, memory-local graph traversal. One binary, one DB file, no services to run.
 
-For the full design: [ADR-003](docs/adr/ADR-003-four-layer-architecture.md) (four layers) and
-[ADR-011](docs/adr/ADR-011-deno-mcp-only-server.md) (Deno + MCP-only).
+HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ---
 
@@ -124,22 +107,68 @@ consumers.
 
 ## Quick start
 
+### Install from crates.io
+
 ```bash
-# Clone
+cargo install khive-mcp
+```
+
+### Or build from source
+
+```bash
 git clone https://github.com/ohdearquant/khive.git && cd khive
+cd crates && cargo build --release -p khive-mcp
+# Binary at: crates/target/release/khive-mcp
+```
 
-# Run Rust tests
+### Configure for Claude Code
+
+Add to your project's `.mcp.json` (or `~/.claude/mcp.json` for global):
+
+```json
+{
+  "mcpServers": {
+    "khive": {
+      "command": "khive-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+That's it. Claude Code will auto-discover the 11 tools. Your agent can immediately:
+
+```
+create(kind="entity", entity_kind="concept", name="LoRA", description="Low-Rank Adaptation")
+search(kind="entity", query="parameter efficient fine-tuning")
+link(source_id="<lora-uuid>", target_id="<qlora-uuid>", relation="variant_of")
+```
+
+### Configuration options
+
+```bash
+khive-mcp                                    # Default: ~/.khive/khive-graph.db
+khive-mcp --db /path/to/my.db               # Custom DB path
+khive-mcp --db :memory:                      # Ephemeral (testing)
+khive-mcp --namespace my-project             # Default namespace (default: "local")
+khive-mcp --no-embed                         # Disable local embedding model
+khive-mcp --log debug                        # Log level (default: warn)
+```
+
+Environment variables: `KHIVE_DB`, `KHIVE_NAMESPACE`, `KHIVE_NO_EMBED`, `KHIVE_LOG`.
+
+### Run tests
+
+```bash
 cd crates && cargo test --workspace
-
-# Full CI (same as GitHub Actions — fmt, clippy, test, build)
-make ci
+make ci  # Full CI: fmt, clippy, test, build
 ```
 
 ### Prerequisites
 
 - Rust 1.94+ (via [rustup](https://rustup.rs))
-- Deno 2.x (for TypeScript layers)
-- Node.js 20+ and pnpm (for frontend)
+- Deno 2.x (for TypeScript layers — optional, not needed for MCP server)
+- Node.js 20+ and pnpm (for frontend — optional)
 
 ---
 
@@ -156,7 +185,7 @@ contract — code implements what they specify. Schema or interface changes requ
 | [005](docs/adr/ADR-005-storage-capability-traits.md)       | Storage Capability Traits     | Trait-only crate, 6 capabilities           |
 | [019](docs/adr/ADR-019-note-kind-taxonomy.md)              | Note Kind Taxonomy            | 5 closed note kinds                        |
 | [021](docs/adr/ADR-021-edge-relation-enum.md)              | Edge Relation Enum            | Compiler-enforced relation set             |
-| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)   | Verb-Consolidated MCP         | 14 tools via `kind=` discriminant          |
+| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)   | Verb-Consolidated MCP         | 11 tools, UUID-resolving verbs             |
 | [024](docs/adr/ADR-024-note-search-and-cross-substrate.md) | Note Search + Cross-Substrate | Hybrid retrieval + `annotates` edges       |
 
 Full index: [docs/adr/README.md](docs/adr/README.md).
@@ -175,8 +204,9 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
 
 ## Status
 
-**Pre-alpha.** The type system and ADR corpus are stable. Storage, runtime, and MCP crates are
-landing incrementally. API surface will change before v0.1.
+**v0.1.0 — published on [crates.io](https://crates.io/crates/khive-mcp).** The Rust core is
+complete: 7 crates, 11 MCP tools, hybrid search with local embeddings, GQL/SPARQL queries. Ready
+for use with Claude Code and any MCP-compatible agent.
 
 ## License
 
