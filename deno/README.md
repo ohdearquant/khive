@@ -34,8 +34,8 @@ deno/
 ## Development
 
 ```bash
-# CLI (dev mode)
-deno task cli entity add concept "FlashAttention"
+# CLI (dev mode) — requires khive-mcp binary on PATH (or set KHIVE_MCP_COMMAND)
+deno task cli entity create --kind concept --name "FlashAttention"
 
 # HTTP server (watch mode)
 deno task server
@@ -49,21 +49,21 @@ deno task check
 deno task fmt
 deno task lint
 
-# Tests
+# Tests (unit + integration — integration requires khive-mcp binary)
 deno task test
 ```
 
 ## Publishing
 
-The package is published to npm as `khive` and JSR as `@khive/khive`. The CLI binary is also
-published as a GitHub release artifact via `deno compile`.
+The package is not yet published to npm or JSR. Use `deno task` for local development. Standalone
+binaries are not yet published as GitHub release artifacts.
 
 ## Local stack
 
 Both entry points spawn `khive-mcp` as a child process via stdio. Two ways to configure:
 
 ```bash
-# Default: spawn `khive-mcp` from PATH
+# Default: spawn `khive-mcp` from PATH (build first: cd crates && cargo build --release -p khive-mcp)
 deno task server
 
 # Custom: explicit command (e.g., specific binary, DB path, log level)
@@ -84,7 +84,6 @@ KHIVE_MCP_COMMAND="khive-mcp --db ~/.khive/khive-graph.db --log debug" deno task
 
 - **Server** → Deno Deploy / Cloudflare Workers / any Docker host. Single binary via
   `deno task compile:server`.
-- **CLI** → install via npm (`npm i -g khive`), JSR, or download a release binary.
+- **CLI** → compile locally via `deno task compile:cli`, then place the resulting binary on PATH.
 
-Both deployments need `khive-mcp` (Rust binary) on `PATH`. The Rust binary is published as a GitHub
-release artifact per platform (macOS/Linux/Windows).
+Both deployments need `khive-mcp` (Rust binary) built and on `PATH`.
