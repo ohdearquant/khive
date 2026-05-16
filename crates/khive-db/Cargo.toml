@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "SQLite storage backend: entities, edges, notes, events, FTS5, sqlite-vec vectors."
 
 [dependencies]
 khive-storage = { version = "0.1.0", path = "../khive-storage" }

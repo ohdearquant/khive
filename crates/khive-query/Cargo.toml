@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "GQL and SPARQL parsers with SQL compiler for knowledge graph queries."
 
 [dependencies]
 khive-storage = { version = "0.1.0", path = "../khive-storage" }
