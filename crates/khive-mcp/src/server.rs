@@ -66,9 +66,7 @@ impl KhiveMcpServer {
                         None,
                     ))
                 }
-                Err(e) => {
-                    return Err(McpError::invalid_params(format!("{e}"), None))
-                }
+                Err(e) => return Err(McpError::invalid_params(format!("{e}"), None)),
             }
         }
         Err(McpError::invalid_params(
@@ -534,8 +532,12 @@ Example:
   {"into_id":"<uuid>","from_id":"<uuid>","strategy":"prefer_into"}"#
     )]
     async fn merge(&self, Parameters(p): Parameters<MergeParams>) -> Result<String, McpError> {
-        let into_id = self.resolve_uuid(&p.into_id, p.namespace.as_deref()).await?;
-        let from_id = self.resolve_uuid(&p.from_id, p.namespace.as_deref()).await?;
+        let into_id = self
+            .resolve_uuid(&p.into_id, p.namespace.as_deref())
+            .await?;
+        let from_id = self
+            .resolve_uuid(&p.from_id, p.namespace.as_deref())
+            .await?;
         let strategy = match p.strategy.as_deref().unwrap_or("prefer_into") {
             "prefer_into" => MergeStrategy::PreferInto,
             "prefer_from" => MergeStrategy::PreferFrom,
@@ -665,8 +667,12 @@ Examples:
   {"source_id":"<LoRA-uuid>","target_id":"<QLoRA-uuid>","relation":"variant_of","weight":0.9}
   {"source_id":"<note-uuid>","target_id":"<entity-uuid>","relation":"annotates","weight":1.0}"#)]
     async fn link(&self, Parameters(p): Parameters<LinkParams>) -> Result<String, McpError> {
-        let source = self.resolve_uuid(&p.source_id, p.namespace.as_deref()).await?;
-        let target = self.resolve_uuid(&p.target_id, p.namespace.as_deref()).await?;
+        let source = self
+            .resolve_uuid(&p.source_id, p.namespace.as_deref())
+            .await?;
+        let target = self
+            .resolve_uuid(&p.target_id, p.namespace.as_deref())
+            .await?;
         let weight = p.weight.unwrap_or(1.0).clamp(0.0, 1.0);
         let relation = Self::parse_relation(&p.relation)?;
         let edge = self
@@ -693,7 +699,9 @@ Examples:
         &self,
         Parameters(p): Parameters<NeighborsParams>,
     ) -> Result<String, McpError> {
-        let node_id = self.resolve_uuid(&p.node_id, p.namespace.as_deref()).await?;
+        let node_id = self
+            .resolve_uuid(&p.node_id, p.namespace.as_deref())
+            .await?;
         let direction = Self::parse_direction(p.direction.as_deref());
         let relations: Option<Vec<EdgeRelation>> = p
             .relations

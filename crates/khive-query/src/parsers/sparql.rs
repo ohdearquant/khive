@@ -343,10 +343,8 @@ fn triples_to_ast(
     return_items: Vec<String>,
     limit: Option<usize>,
 ) -> Result<GqlQuery, QueryError> {
-    let return_items: Vec<ReturnItem> = return_items
-        .into_iter()
-        .map(ReturnItem::Variable)
-        .collect();
+    let return_items: Vec<ReturnItem> =
+        return_items.into_iter().map(ReturnItem::Variable).collect();
     let mut node_kinds: HashMap<String, String> = HashMap::new();
     let mut node_props: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut edges: Vec<(String, String, String, usize, usize)> = Vec::new(); // (src, tgt, rel, min, max)
@@ -547,7 +545,10 @@ mod tests {
         let q = parse("SELECT ?a ?b WHERE { ?a a :concept . ?a :extends ?b . } LIMIT 10").unwrap();
         assert_eq!(
             q.return_items,
-            vec![ReturnItem::Variable("a".into()), ReturnItem::Variable("b".into())]
+            vec![
+                ReturnItem::Variable("a".into()),
+                ReturnItem::Variable("b".into())
+            ]
         );
         assert_eq!(q.limit, Some(10));
 

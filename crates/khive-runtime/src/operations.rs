@@ -409,11 +409,7 @@ impl KhiveRuntime {
         let ns = self.ns(namespace).to_string();
         let pattern = format!("{}%", prefix);
 
-        let tables = [
-            ("entities", true),
-            ("notes", true),
-            ("graph_edges", false),
-        ];
+        let tables = [("entities", true), ("notes", true), ("graph_edges", false)];
 
         let mut matches: Vec<String> = Vec::new();
         let mut reader = self.sql().reader().await.map_err(RuntimeError::Storage)?;
@@ -444,7 +440,13 @@ impl KhiveRuntime {
                         }
                     }
                 }
-                Err(_) => continue, // table may not exist in test DBs
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("no such table") {
+                        continue;
+                    }
+                    return Err(RuntimeError::Storage(e));
+                }
             }
             if matches.len() > 1 {
                 break;
@@ -454,9 +456,8 @@ impl KhiveRuntime {
         match matches.len() {
             0 => Ok(None),
             1 => {
-                let uuid = Uuid::from_str(&matches[0]).map_err(|e| {
-                    RuntimeError::Internal(format!("stored UUID is invalid: {e}"))
-                })?;
+                let uuid = Uuid::from_str(&matches[0])
+                    .map_err(|e| RuntimeError::Internal(format!("stored UUID is invalid: {e}")))?;
                 Ok(Some(uuid))
             }
             _ => Err(RuntimeError::Ambiguous(format!(
@@ -1259,37 +1260,28 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_prefix_ambiguous_same_namespace() {
+        use khive_storage::entity::Entity;
+        use khive_storage::EntityStore;
+        use khive_types::EntityKind;
+
         let rt = rt();
-        let a = rt
-            .create_entity(None, "concept", "AmbigA", None, None, vec![])
-            .await
-            .unwrap();
-        let b = rt
-            .create_entity(None, "concept", "AmbigB", None, None, vec![])
-            .await
-            .unwrap();
+        // Two entities with UUIDs sharing the same 8-char prefix "aabbccdd".
+        let id_a = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000001").unwrap();
+        let id_b = Uuid::parse_str("aabbccdd-2222-4000-8000-000000000002").unwrap();
 
-        // Use a 1-char prefix to force ambiguity (both UUIDs share at least
-        // the first character since v4 UUIDs are hex — but let's use a prefix
-        // that we know matches both by querying the common prefix).
-        let a_str = a.id.to_string();
-        let b_str = b.id.to_string();
-        let common_len = a_str
-            .chars()
-            .zip(b_str.chars())
-            .take_while(|(x, y)| x == y)
-            .count();
+        let mut entity_a = Entity::new("local", EntityKind::Concept, "AmbigA");
+        entity_a.id = id_a;
+        let mut entity_b = Entity::new("local", EntityKind::Concept, "AmbigB");
+        entity_b.id = id_b;
 
-        if common_len >= 8 {
-            // Rare but possible — both share an 8-char prefix, so ambiguity error
-            let prefix = &a_str[..8];
-            let result = rt.resolve_prefix(None, prefix).await;
-            assert!(result.is_err(), "should error on ambiguous prefix");
-        }
-        // Otherwise, 8-char prefixes are unique — both resolve independently
-        let ra = rt.resolve_prefix(None, &a_str[..8]).await.unwrap();
-        assert_eq!(ra, Some(a.id));
-        let rb = rt.resolve_prefix(None, &b_str[..8]).await.unwrap();
-        assert_eq!(rb, Some(b.id));
+        let store = rt.entities(None).unwrap();
+        store.upsert_entity(entity_a).await.unwrap();
+        store.upsert_entity(entity_b).await.unwrap();
+
+        let result = rt.resolve_prefix(None, "aabbccdd").await;
+        assert!(
+            result.is_err(),
+            "shared 8-char prefix must return Ambiguous error"
+        );
     }
 }

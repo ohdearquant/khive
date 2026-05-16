@@ -690,7 +690,14 @@ enum VarKind {
 }
 
 const NODE_COLUMNS: &[&str] = &[
-    "id", "name", "kind", "namespace", "description", "properties", "created_at", "updated_at",
+    "id",
+    "name",
+    "kind",
+    "namespace",
+    "description",
+    "properties",
+    "created_at",
+    "updated_at",
 ];
 const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
 
@@ -954,12 +961,25 @@ mod tests {
 
     #[test]
     fn return_property_projection_compiles() {
-        let q = gql::parse("MATCH (a:concept)-[e:extends]->(b:concept) RETURN a.name, b.name LIMIT 5").unwrap();
+        let q =
+            gql::parse("MATCH (a:concept)-[e:extends]->(b:concept) RETURN a.name, b.name LIMIT 5")
+                .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         // Node aliases are n0, n1; the SQL uses `alias.col AS var_prop`
-        assert!(compiled.sql.contains(".name AS a_name"), "sql: {}", compiled.sql);
-        assert!(compiled.sql.contains(".name AS b_name"), "sql: {}", compiled.sql);
-        assert!(!compiled.sql.contains("a_kind"), "should not emit full node columns");
+        assert!(
+            compiled.sql.contains(".name AS a_name"),
+            "sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains(".name AS b_name"),
+            "sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("a_kind"),
+            "should not emit full node columns"
+        );
     }
 
     #[test]
@@ -984,10 +1004,19 @@ mod tests {
 
     #[test]
     fn return_valid_edge_property_compiles() {
-        let q = gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.relation, e.weight LIMIT 5").unwrap();
+        let q =
+            gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.relation, e.weight LIMIT 5").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         // Edge alias is e0; SQL: `e0.relation AS e_relation`
-        assert!(compiled.sql.contains(".relation AS e_relation"), "sql: {}", compiled.sql);
-        assert!(compiled.sql.contains(".weight AS e_weight"), "sql: {}", compiled.sql);
+        assert!(
+            compiled.sql.contains(".relation AS e_relation"),
+            "sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains(".weight AS e_weight"),
+            "sql: {}",
+            compiled.sql
+        );
     }
 }
