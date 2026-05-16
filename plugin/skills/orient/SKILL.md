@@ -20,14 +20,14 @@ concepts = list(kind="entity", entity_kind="concept", limit=50)
 # 2. For each, check neighbors
 for entity in concepts:
     nbrs = neighbors(node_id=entity.id, direction="both")
-    if len(nbrs.edges) == 0:
+    if len(nbrs) == 0:
         print(f"Orphan concept: {entity.name} ({entity.id})")
 
 # Repeat for projects
 projects = list(kind="entity", entity_kind="project", limit=50)
 for entity in projects:
     nbrs = neighbors(node_id=entity.id, direction="both")
-    if len(nbrs.edges) == 0:
+    if len(nbrs) == 0:
         print(f"Orphan project: {entity.name} ({entity.id})")
 ```
 
@@ -40,7 +40,7 @@ Orphans should be zero. If any exist, add `instance_of`/`extends` and `introduce
 concepts = list(kind="entity", entity_kind="concept", limit=50)
 for entity in concepts:
     nbrs = neighbors(node_id=entity.id, direction="both")
-    degree = len(nbrs.edges)
+    degree = len(nbrs)
     if degree < 4:
         print(f"Under-linked: {entity.name} — {degree} edges (need ≥ 4)")
 ```

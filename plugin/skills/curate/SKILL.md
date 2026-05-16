@@ -96,7 +96,7 @@ concepts = list(kind="entity", entity_kind="concept", limit=50)
 # 2. For each entity, check neighbor count
 for entity in concepts:
     result = neighbors(node_id=entity.id, direction="both")
-    if len(result.edges) == 0:
+    if len(result) == 0:
         # Orphan — add minimum edges or hard-delete if stale artifact
         print(f"Orphan: {entity.name} ({entity.id})")
 ```
@@ -125,14 +125,14 @@ all_nodes = list(kind="entity", limit=500)
 concepts = list(kind="entity", entity_kind="concept", limit=50)
 for entity in concepts:
     nbrs = neighbors(node_id=entity.id, direction="both")
-    if len(nbrs.edges) == 0:
+    if len(nbrs) == 0:
         print(f"Orphan: {entity.name}")
 # → should find 0 orphans
 
 # 3. Low-degree check
 for entity in concepts:
     nbrs = neighbors(node_id=entity.id, direction="both")
-    if len(nbrs.edges) < 4:
-        print(f"Under-linked: {entity.name} ({len(nbrs.edges)} edges)")
+    if len(nbrs) < 4:
+        print(f"Under-linked: {entity.name} ({len(nbrs)} edges)")
 # → all concepts should have ≥ 4 edges
 ```

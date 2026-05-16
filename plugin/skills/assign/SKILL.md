@@ -93,10 +93,10 @@ old_targets = neighbors(node_id=old_note_id, direction="out", relations=["annota
 # 2. Create the replacement, attaching to the same entities
 new = create(kind="note", note_kind="decision",
   content="New decision...", salience=0.9,
-  annotates=[edge.target_id for edge in old_targets.edges])
+  annotates=[hit.node_id for hit in old_targets])
 
 # 3. Mark the old as superseded
-link(source_id=new.id, target_id=old.id, relation="supersedes")
+link(source_id=new.id, target_id=old_note_id, relation="supersedes")
 ```
 
 Old note is now excluded from `search(kind="note")` results automatically. It's preserved for history via `get(id=old_note_id)`.

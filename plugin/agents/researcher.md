@@ -105,7 +105,7 @@ Mandatory verification before reporting:
 1. **Orphan check** — every entity you created must have ≥ 1 edge:
    ```python
    nbrs = neighbors(node_id=<created-id>, direction="both")
-   if len(nbrs.edges) == 0:
+   if len(nbrs) == 0:
        # add instance_of at minimum
    ```
 
@@ -113,7 +113,7 @@ Mandatory verification before reporting:
    ```python
    for entity_id in created_ids:
        nbrs = neighbors(node_id=entity_id, direction="both")
-       print(f"{entity_id}: {len(nbrs.edges)} edges")
+       print(f"{entity_id}: {len(nbrs)} edges")
    ```
 
 3. **Update status** if research changed maturity:

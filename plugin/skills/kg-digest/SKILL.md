@@ -119,7 +119,7 @@ After ingesting a batch:
 concepts = list(kind="entity", entity_kind="concept", limit=50)
 for entity in concepts:
     nbrs = neighbors(node_id=entity.id, direction="both")
-    edge_count = len(nbrs.edges)
+    edge_count = len(nbrs)
     if edge_count < 4:
         print(f"Under-linked: {entity.name} ({edge_count} edges) — add edges before reporting done")
 ```
