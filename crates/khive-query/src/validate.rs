@@ -60,6 +60,16 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
                 if edge.min_hops > edge.max_hops {
                     edge.min_hops = edge.max_hops;
                 }
+                // Zero-hop (start == end) results require a depth-0 seed in
+                // the recursive CTE that we haven't implemented yet. Reject
+                // explicitly rather than silently compiling as one-or-more.
+                if edge.min_hops == 0 {
+                    return Err(QueryError::Unsupported(
+                        "zero-hop ranges (min_hops = 0) not yet supported; \
+                         use a minimum of 1 hop"
+                            .into(),
+                    ));
+                }
             }
         }
     }
@@ -217,5 +227,39 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(val, "introduced_by");
+    }
+
+    #[test]
+    fn rejects_zero_hop_range_gql_wide() {
+        let mut q = gql::parse("MATCH (a)-[:extends*0..3]->(b) RETURN b").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_hop_range_gql_narrow() {
+        // *0..1 has max_hops=1 so has_variable_length() is false, but the
+        // fixed-length compiler also can't produce zero-hop rows — reject at
+        // validation regardless of compile path.
+        let mut q = gql::parse("MATCH (a)-[:extends*0..1]->(b) RETURN b").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_hop_sparql_explicit_range() {
+        use crate::parsers::sparql;
+        let mut q = sparql::parse("SELECT ?a ?b WHERE { ?a :extends{0,3} ?b . }").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
     }
 }

@@ -414,14 +414,19 @@ fn triples_to_ast(
         .copied()
         .collect();
 
+    if start_candidates.len() > 1 {
+        return Err(QueryError::Unsupported(
+            "SPARQL WHERE block has multiple disconnected components; \
+             only single-path patterns are supported"
+                .into(),
+        ));
+    }
+
     let start = if start_candidates.len() == 1 {
         start_candidates[0].to_string()
-    } else if start_candidates.is_empty() {
+    } else {
         // Cycle — pick first source
         edges[0].0.clone()
-    } else {
-        // Multiple disconnected starts — pick first
-        start_candidates[0].to_string()
     };
 
     // Walk the chain
@@ -443,6 +448,18 @@ fn triples_to_ast(
         if !found {
             break;
         }
+    }
+
+    // SPARQL triples are conjunctive — every edge must be reachable from the
+    // single start through the path walk. If any edge wasn't consumed, the
+    // pattern is branched or disconnected and we cannot represent it in the
+    // current single-path AST.
+    if used.iter().any(|consumed| !consumed) {
+        return Err(QueryError::Unsupported(
+            "SPARQL WHERE block is branched or disconnected; \
+             only single-path patterns are supported"
+                .into(),
+        ));
     }
 
     if ordered_edges.is_empty() {
@@ -542,5 +559,27 @@ mod tests {
                 .unwrap();
         let nodes: Vec<_> = q.pattern.nodes().collect();
         assert_eq!(nodes[0].properties.get("domain").unwrap(), "attention");
+    }
+
+    #[test]
+    fn disconnected_triples_rejected() {
+        // Two separate edges with no shared variable — silently dropping the
+        // second triple would change query semantics, so reject.
+        let err = parse("SELECT ?a ?d WHERE { ?a :extends ?b . ?c :implements ?d . }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn branched_triples_rejected() {
+        // `?a` has two outbound edges — branching, not a single path.
+        let err =
+            parse("SELECT ?a ?b ?c WHERE { ?a :extends ?b . ?a :implements ?c . }").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
     }
 }
