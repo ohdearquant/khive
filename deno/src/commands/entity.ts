@@ -13,9 +13,9 @@ const USAGE = `khive entity — manage entities in the knowledge graph
 
 Usage:
   khive entity create --kind <K> --name <N> [options]
-  khive entity get <ID> [--namespace <NS>]
-  khive entity list [--kind <K>] [--namespace <NS>] [--limit N]
-  khive entity delete <ID> [--hard] [--namespace <NS>]
+  khive entity get <ID>
+  khive entity list [--kind <K>] [--limit N]
+  khive entity delete <ID> [--hard]
 
 Subcommands:
   create    Create a new entity
@@ -37,7 +37,12 @@ Global options:
   --help, -h          Show this help
 `;
 
-/** Extract text content from an MCP CallToolResult. */
+/** Extract text content from an MCP CallToolResult.
+ *
+ * The MCP SDK returns a CallToolResult with:
+ *   { content: [{ type: "text", text: "<json-string>" }], isError?: boolean }
+ * This helper unwraps the text payload for JSON.parse.
+ */
 function extractText(result: unknown): string {
   const r = result as { content?: Array<{ type: string; text?: string }>; isError?: boolean };
   if (r.isError) {
@@ -69,9 +74,6 @@ export async function runEntity(
         return await runList(client, rest, globals);
       case "delete":
         return await runDelete(client, rest, globals);
-      // Keep legacy "add" alias for backwards compat with any existing scripts
-      case "add":
-        return await runCreate(client, rest, globals);
       default:
         console.error(`Unknown entity subcommand: ${subcommand}\n`);
         console.error(USAGE);
@@ -114,8 +116,13 @@ async function runCreate(
   const namespace = flags.namespace ?? globals.namespace;
   const tags = flags.tags ? flags.tags.split(",").map((t: string) => t.trim()) : undefined;
 
+  // The flat `create` verb requires:
+  //   kind="entity"         — discriminant for the create handler
+  //   entity_kind=<K>       — the user-supplied entity kind (concept|document|...)
+  //   name=<N>              — required for entities
   const toolArgs: Record<string, unknown> = {
-    kind: flags.kind,
+    kind: "entity",
+    entity_kind: flags.kind,
     name: flags.name,
   };
   if (flags.description) toolArgs.description = flags.description;
@@ -123,11 +130,12 @@ async function runCreate(
   if (tags) toolArgs.tags = tags;
 
   try {
-    const result = await client.callTool("entity_create", toolArgs);
+    const result = await client.callTool("create", toolArgs);
     const text = extractText(result);
     if (flags.json) {
       console.log(text);
     } else {
+      // create returns the entity object directly (not wrapped)
       const entity = JSON.parse(text);
       console.log(`Created entity:`);
       console.log(`  id:          ${entity.id ?? entity.full_id}`);
@@ -156,7 +164,7 @@ async function runGet(
   });
 
   if (flags.help) {
-    console.log("Usage: khive entity get <ID> [--namespace <NS>]");
+    console.log("Usage: khive entity get <ID>");
     return 0;
   }
 
@@ -171,12 +179,14 @@ async function runGet(
   if (namespace) toolArgs.namespace = namespace;
 
   try {
-    const result = await client.callTool("entity_get", toolArgs);
+    const result = await client.callTool("get", toolArgs);
     const text = extractText(result);
     if (flags.json) {
       console.log(text);
     } else {
-      const entity = JSON.parse(text);
+      // get returns {"kind": "entity"|"note"|"edge", "data": {...}}
+      const wrapped = JSON.parse(text);
+      const entity = wrapped.data;
       console.log(`Entity:`);
       console.log(`  id:          ${entity.id ?? entity.full_id}`);
       console.log(`  kind:        ${entity.kind}`);
@@ -211,17 +221,22 @@ async function runList(
   });
 
   if (flags.help) {
-    console.log("Usage: khive entity list [--kind <K>] [--namespace <NS>] [--limit N]");
+    console.log("Usage: khive entity list [--kind <K>] [--limit N]");
     return 0;
   }
 
   const namespace = flags.namespace ?? globals.namespace;
-  const toolArgs: Record<string, unknown> = { limit: Number(flags.limit) };
-  if (flags.kind) toolArgs.kind = flags.kind;
+  // The flat `list` verb requires kind="entity" as the discriminant.
+  // The user's --kind flag (entity_kind filter) maps to entity_kind.
+  const toolArgs: Record<string, unknown> = {
+    kind: "entity",
+    limit: Number(flags.limit),
+  };
+  if (flags.kind) toolArgs.entity_kind = flags.kind;
   if (namespace) toolArgs.namespace = namespace;
 
   try {
-    const result = await client.callTool("entity_list", toolArgs);
+    const result = await client.callTool("list", toolArgs);
     const text = extractText(result);
     if (flags.json) {
       console.log(text);
@@ -231,7 +246,6 @@ async function runList(
         console.log("No entities found.");
         return 0;
       }
-      // Column widths
       const idW = 8;
       const kindW = 10;
       const nameW = Math.min(
@@ -272,7 +286,7 @@ async function runDelete(
   });
 
   if (flags.help) {
-    console.log("Usage: khive entity delete <ID> [--hard] [--namespace <NS>]");
+    console.log("Usage: khive entity delete <ID> [--hard]");
     return 0;
   }
 
@@ -283,11 +297,13 @@ async function runDelete(
   }
 
   const namespace = flags.namespace ?? globals.namespace;
-  const toolArgs: Record<string, unknown> = { id: String(id), hard: flags.hard };
+  // delete auto-detects kind from UUID — only id (and optional hard/namespace) needed.
+  const toolArgs: Record<string, unknown> = { id: String(id) };
+  if (flags.hard) toolArgs.hard = true;
   if (namespace) toolArgs.namespace = namespace;
 
   try {
-    const result = await client.callTool("entity_delete", toolArgs);
+    const result = await client.callTool("delete", toolArgs);
     const text = extractText(result);
     if (flags.json) {
       console.log(text);
