@@ -30,6 +30,7 @@ alternatives. New decisions should be added as ADR-NNN-kebab-case-title.md using
 | [022](ADR-022-schema-migrations.md)               | Schema Migrations                        | accepted | Versioned ordered idempotent migrations via `_schema_migrations` table; `run_migrations()` applies V1+ in transaction per version                                             |
 | [023](ADR-023-verb-consolidated-mcp-surface.md)   | Verb-Consolidated MCP Surface            | accepted | 11-tool verb surface with `kind=` discriminant; `merge` is entity-only in v0.1 (note merge deferred); `supersede` deferred                                                    |
 | [024](ADR-024-note-search-and-cross-substrate.md) | Note Search + Cross-Substrate Navigation | accepted | Auto-index notes (FTS5 + vector); hybrid retrieval with salience weight; cross-substrate via `annotates` edges; `get(id)` serves UUID resolution (no separate `resolve` verb) |
+| [025](ADR-025-oss-cloud-extension-model.md)       | OSS Foundation + Cloud Extension Model   | accepted | khive-oss is source of truth; cloud depends on `khive-runtime`/`khive-mcp` as crate deps; unified ~26-verb MCP session; namespace maps to API-key scoping                     |
 
 ## Reading Order
 
