@@ -193,10 +193,12 @@ impl KhiveRuntime {
     ///   `SubstrateKind::Note`.
     /// - For each UUID in `annotates`, creates an `EdgeRelation::Annotates` edge from
     ///   the note to that target.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_note(
         &self,
         namespace: Option<&str>,
         kind: NoteKind,
+        name: Option<&str>,
         content: &str,
         salience: f64,
         properties: Option<serde_json::Value>,
@@ -204,18 +206,26 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Note> {
         let ns = self.ns(namespace);
         let mut note = Note::new(ns, kind, content).with_salience(salience);
+        if let Some(n) = name {
+            note = note.with_name(n);
+        }
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
         self.notes(Some(ns))?.upsert_note(note.clone()).await?;
+
+        let body = match &note.name {
+            Some(n) => format!("{n} {}", note.content),
+            None => note.content.clone(),
+        };
 
         // Index into FTS5.
         self.text_for_notes(Some(ns))?
             .upsert_document(TextDocument {
                 subject_id: note.id,
                 kind: SubstrateKind::Note,
-                title: None,
-                body: note.content.clone(),
+                title: note.name.clone(),
+                body,
                 tags: vec![],
                 namespace: ns.to_string(),
                 metadata: note.properties.clone(),
@@ -416,6 +426,33 @@ impl KhiveRuntime {
         Ok(None)
     }
 
+    /// Delete a note by ID, enforcing namespace isolation.
+    ///
+    /// Returns `false` without deleting if the note does not exist or belongs to
+    /// a different namespace (ADR-007 namespace isolation).
+    pub async fn delete_note(
+        &self,
+        namespace: Option<&str>,
+        id: Uuid,
+        hard: bool,
+    ) -> RuntimeResult<bool> {
+        let ns = self.ns(namespace);
+        let note_store = self.notes(namespace)?;
+        let note = match note_store.get_note(id).await? {
+            Some(n) => n,
+            None => return Ok(false),
+        };
+        if note.namespace != ns {
+            return Ok(false);
+        }
+        let mode = if hard {
+            DeleteMode::Hard
+        } else {
+            DeleteMode::Soft
+        };
+        Ok(note_store.delete_note(id, mode).await?)
+    }
+
     // ---- Query operations ----
 
     /// Execute a GQL or SPARQL query string, returning raw SQL rows.
@@ -446,8 +483,12 @@ impl KhiveRuntime {
 
     /// Delete an entity by ID (soft delete by default).
     ///
-    /// Returns `false` without deleting if the entity exists but belongs to a different namespace.
-    /// This enforces ADR-007 namespace isolation at the runtime layer.
+    /// On hard delete, cascades to remove all incident edges (both inbound and
+    /// outbound) to prevent dangling references. Soft delete leaves edges in
+    /// place — queries already filter by `deleted_at IS NULL`.
+    ///
+    /// Returns `false` without deleting if the entity exists but belongs to a
+    /// different namespace (ADR-007 namespace isolation).
     pub async fn delete_entity(
         &self,
         namespace: Option<&str>,
@@ -466,6 +507,29 @@ impl KhiveRuntime {
         } else {
             DeleteMode::Soft
         };
+
+        // On hard delete, cascade-remove incident edges to prevent dangling refs.
+        if hard {
+            let graph = self.graph(namespace)?;
+            for direction in [Direction::Out, Direction::In] {
+                let hits = graph
+                    .neighbors(
+                        id,
+                        NeighborQuery {
+                            direction,
+                            relations: None,
+                            limit: None,
+                            min_weight: None,
+                        },
+                    )
+                    .await?;
+                for hit in hits {
+                    graph.delete_edge(LinkId::from(hit.edge_id)).await?;
+                }
+            }
+            self.remove_from_indexes(namespace, id).await?;
+        }
+
         Ok(self.entities(namespace)?.delete_entity(id, mode).await?)
     }
 
@@ -819,6 +883,7 @@ mod tests {
             .create_note(
                 None,
                 khive_storage::NoteKind::Observation,
+                None,
                 "FlashAttention reduces memory by using tiling",
                 0.8,
                 None,
@@ -859,6 +924,7 @@ mod tests {
             .create_note(
                 None,
                 khive_storage::NoteKind::Insight,
+                None,
                 "FlashAttention is IO-aware",
                 0.9,
                 Some(props.clone()),
@@ -882,6 +948,7 @@ mod tests {
             .create_note(
                 None,
                 khive_storage::NoteKind::Observation,
+                None,
                 "FlashAttention uses SRAM tiling for memory efficiency",
                 0.9,
                 None,
@@ -994,6 +1061,7 @@ mod tests {
         rt.create_note(
             None,
             khive_storage::NoteKind::Observation,
+            None,
             "GQA reduces KV cache memory for large models",
             0.8,
             None,
@@ -1017,6 +1085,7 @@ mod tests {
             .create_note(
                 None,
                 khive_storage::NoteKind::Observation,
+                None,
                 "RoPE positional encoding rotary embeddings",
                 0.7,
                 None,
@@ -1065,6 +1134,7 @@ mod tests {
             .create_note(
                 None,
                 khive_storage::NoteKind::Observation,
+                None,
                 "LoRA fine-tunes LLMs with low-rank adapters",
                 0.85,
                 None,

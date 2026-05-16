@@ -111,8 +111,9 @@ target is any substrate UUID — entity, edge, event, or another note.
 2. Creates one `annotates` edge per target UUID:
    `link(source=note.id, target=<uuid>, relation=annotates, weight=1.0)`.
 
-No new table. No new field on the Note struct. Edges reference UUIDs that may resolve to any
-observable substrate — the existing edge schema already supports this.
+No new table. The `Note` struct gains only the optional `name` display field (Part 4 below);
+annotation and supersession remain edges in `graph_edges`. Edges reference UUIDs that may resolve
+to any observable substrate — the existing edge schema already supports this.
 
 **Discovery via the existing graph machinery**:
 
@@ -143,27 +144,27 @@ pub enum Resolved {
 Implementation: try the entity store first (fastest, indexed by id), then notes, then events. Cost:
 at most 3 lookups per UUID for negative cases. Cheap enough for v0.1.
 
-**MCP exposure** — uses what's already there:
+**MCP exposure** — the existing `get(id)` verb (per ADR-023) wraps this runtime helper. UUID is
+globally unique; `get` resolves the substrate internally and returns `{ kind, data }`:
 
-| Verb (existing)                                                | Cross-substrate query                                |
-| -------------------------------------------------------------- | ---------------------------------------------------- |
-| `neighbors(node_id, relations=["annotates"], direction="in")`  | "notes annotating this"                              |
-| `neighbors(node_id, relations=["annotates"], direction="out")` | "things this annotates"                              |
-| `traverse(roots, relations=["annotates", ...])`                | mixed expansion                                      |
-| `get(kind="???", id)`                                          | resolve via the new `resolve` helper if kind unknown |
+| Verb (existing)                                                | Cross-substrate query          |
+| -------------------------------------------------------------- | ------------------------------ |
+| `neighbors(node_id, relations=["annotates"], direction="in")`  | "notes annotating this"        |
+| `neighbors(node_id, relations=["annotates"], direction="out")` | "things this annotates"        |
+| `traverse(roots, relations=["annotates", ...])`                | mixed expansion                |
+| `get(id)`                                                      | "what substrate is this UUID?" |
 
-**New verb `resolve(id)`** added to MCP for the "I have a UUID, what is it?" use case — small but
-useful. Returns `{ kind, data }` discriminated.
-
-**Surface impact**: +1 new MCP verb (`resolve`). Cross-substrate questions like "notes about this
-entity" use `neighbors` with `relations=["annotates"]` — no new traversal verb needed. Total MCP
-surface grows from 13 (ADR-023) to 14.
+No new MCP verb is needed. `get(id)` already returns `{ kind, data }` and covers the cross-substrate
+UUID lookup use case without adding to the surface count.
 
 ### Part 4 — `create(kind="note", ...)` ergonomics
 
 The `create(kind="note", ...)` verb (per ADR-023) takes an optional `annotates` parameter listing
-UUIDs the note is about. The handler creates the note, then issues `annotates` edges for each
-target:
+UUIDs the note is about, and an optional `name` field for titled notes (e.g. a design document or
+a named reference entry). `name` has no semantic effect on search ranking or retrieval — it is
+display metadata only. Notes without a `name` are anonymous observations (the common case).
+
+The handler creates the note, then issues `annotates` edges for each target:
 
 ```rust
 pub struct CreateParams {
@@ -205,11 +206,13 @@ annotation is just an edge with relation `annotates`. The inverse-lookup case ("
 entity") becomes a standard `neighbors(node_id, direction="in", relations=["annotates"])` call —
 already indexed, already fast. One mechanism instead of two.
 
-### Why the new `resolve` verb?
+### Why no new `resolve` verb?
 
 `neighbors` and `traverse` return edges whose target is a raw UUID. The caller often needs to know
-"is this UUID a note or an entity or an event?" before fetching it. `resolve(id)` is the
-substrate-typed lookup that closes this gap. It's the only new MCP verb this ADR adds.
+"is this UUID a note or an entity or an event?" before fetching it. This lookup is now handled by
+`get(id)` (per ADR-023), which resolves the substrate internally and returns `{ kind, data }`.
+UUID global uniqueness means no `kind=` discriminant is needed on the caller side. Adding a
+separate `resolve` verb would duplicate what `get` already does.
 
 ## Alternatives Considered
 
@@ -261,14 +264,15 @@ land:
    - `VectorStore::insert(subject_id, kind, embedding)` — extend signature.
    - `VectorStore::search(query_embedding, kind: Option<&str>, top_k)` — extend signature to filter
      by kind.
-   - `Note` struct is unchanged structurally — supersession and annotation are both edges in
-     `graph_edges`, not fields on `Note`.
+   - `Note` struct gains an optional `name` field (display metadata; no semantic effect on search).
+     Supersession and annotation remain edges in `graph_edges`, not fields on `Note`.
 
 3. **Runtime layer**:
    - Auto-index notes on `create(kind="note", ...)` (FTS5 + vector store with `kind="note"`).
    - `search(kind="note", query, limit)` implementation: FTS5 + vector hybrid + salience weight +
      supersede/delete filters.
-   - `resolve(id)` — substrate-typed UUID lookup.
+   - `get(id)` runtime helper: substrate-typed UUID lookup — try entity store, then notes, then
+     events. Returns `{ kind, data }`. Used by the MCP `get` handler for cross-substrate resolution.
    - `create_note(..., annotates: Vec<Uuid>)` creates the note and one
      `link(source=note.id, target=t, relation=annotates, weight=1.0)` per target.
 
@@ -276,7 +280,8 @@ land:
    - `create(kind="note", ..., annotates=[...])` — the handler creates the note plus one `annotates`
      edge per target UUID.
    - `search(kind="note", query, limit)` — hybrid retrieval with salience weighting.
-   - New `resolve(id)` verb — returns `{kind, data}` discriminated record.
+   - `get(id)` — UUID-only lookup; resolves substrate and returns `{kind, data}`. No new verb
+     needed for cross-substrate resolution.
    - Cross-substrate navigation reuses existing
      `neighbors(node_id, relations=["annotates"], direction=...)` and
      `traverse(roots, relations=["annotates", ...])`.
@@ -292,7 +297,7 @@ land:
    - `neighbors(entity_id, direction="in", relations=["annotates"])` returns the annotating note's
      UUID.
    - `neighbors(note_id, direction="out", relations=["annotates"])` returns the targets.
-   - `resolve(note_id)` → `{kind: "note", data: {...}}`. `resolve(entity_id)` →
+   - `get(note_id)` → `{kind: "note", data: {...}}`. `get(entity_id)` →
      `{kind: "entity", data: {...}}`.
 
 ## Open Questions
@@ -318,4 +323,5 @@ land:
 - ADR-019: Note Kind Taxonomy (defines the `supersede` semantics this search filters out by default)
 - ADR-022: Schema Migrations (the V2 migration mechanism)
 - ADR-023: Verb-Consolidated MCP Surface (defines `search`, `list`, `create(kind="note", ...)`,
-  `neighbors`, `traverse`; this ADR adds the `resolve` verb and the `annotates` edge wiring)
+  `get`, `neighbors`, `traverse`; this ADR specifies the `annotates` edge wiring and the
+  cross-substrate behavior of `get(id)` returning `{kind, data}`)

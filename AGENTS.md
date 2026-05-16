@@ -16,22 +16,26 @@ If you're working on khive itself (writing code in this repo), see `CLAUDE.md` i
 
 All verbs are available via MCP ([ADR-023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)).
 
-| Verb        | What it does                                        | When to use                                              |
-| ----------- | --------------------------------------------------- | -------------------------------------------------------- |
-| `create`    | Add an entity or note                               | New concept, paper, observation, decision worth tracking |
-| `get`       | Fetch a record by ID                                | When you have a UUID and need the full record            |
-| `search`    | Text + semantic search over entities or notes       | Finding things by content similarity                     |
-| `list`      | Structured filtering (by kind, tags, etc.)          | Browsing a category or namespace                         |
-| `update`    | Patch properties, tags, or content                  | Correcting or enriching an existing record               |
-| `delete`    | Soft-delete (or hard-delete) a record               | Removing stale or incorrect data                         |
-| `link`      | Connect two nodes with a typed relation             | When relationships emerge from research                  |
-| `traverse`  | Multi-hop graph walk with depth/relation filters    | Structural context — lineages, paths, clusters           |
-| `neighbors` | Immediate neighbors of a node                       | "What connects to this entity?"                          |
-| `query`     | GQL/SPARQL query string → SQL                       | Complex pattern matching over the graph                  |
-| `merge`     | Deduplicate two records into one                    | "LoRA" and "Low-Rank Adaptation" are the same concept    |
-| `supersede` | Mark a newer record as replacing an older one       | Revised decision, refined observation                    |
-| `resolve`   | Look up a UUID and return its substrate kind + data | "Is this UUID a note or an entity?"                      |
-| `request`   | Batch multiple verbs in one call                    | Parallel creates, chained operations                     |
+| Verb        | What it does                                     | When to use                                              |
+| ----------- | ------------------------------------------------ | -------------------------------------------------------- |
+| `create`    | Add an entity or note                            | New concept, paper, observation, decision worth tracking |
+| `get`       | Fetch any record by UUID (auto-detects type)     | When you have a UUID and need the full record            |
+| `search`    | Text + semantic search over entities or notes    | Finding things by content similarity                     |
+| `list`      | Structured filtering (by kind, tags, etc.)       | Browsing a category or namespace                         |
+| `update`    | Patch properties, tags, or content (by UUID)     | Correcting or enriching an existing record               |
+| `delete`    | Soft-delete (or hard-delete) a record (by UUID)  | Removing stale or incorrect data                         |
+| `link`      | Connect two nodes with a typed relation          | When relationships emerge from research                  |
+| `traverse`  | Multi-hop graph walk with depth/relation filters | Structural context — lineages, paths, clusters           |
+| `neighbors` | Immediate neighbors of a node                    | "What connects to this entity?"                          |
+| `query`     | GQL/SPARQL query string → SQL                    | Complex pattern matching over the graph                  |
+| `merge`     | Deduplicate two entities into one (v0.1)         | "LoRA" and "Low-Rank Adaptation" are the same concept    |
+
+**11 tools in v0.1.** `get`, `update`, `delete` are UUID-only — they auto-detect whether the
+record is an entity, note, or edge. `create`, `list`, `search` require `kind=entity|note` (or
+`kind=edge` for `list`).
+
+**Deferred (not available in v0.1):** `supersede` (use `link(..., relation="supersedes")` as a
+workaround), `request` (batch DSL), note merge (only entity merge is implemented).
 
 ### Notes vs entities
 
@@ -114,6 +118,43 @@ When you `link` nodes, use ONLY these relations:
 **Why closed**: a sparse ontology stays queryable. Ad-hoc relations (`uses`, `related_to`,
 `loaded_by`) fragment the graph and make traversal useless. If your relationship doesn't fit, it's
 probably a property on the entity, not an edge.
+
+---
+
+## Tool schemas (required → **bold**, optional → normal)
+
+| Tool        | Fields                                                                                                                                               | Example                                                      |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `create`    | **kind** (entity\|note), **name** + **entity_kind** for entity, **content** + note_kind for note; description, properties, tags, salience, annotates | `{"kind":"entity","entity_kind":"concept","name":"LoRA"}`    |
+| `get`       | **id** (UUID); namespace                                                                                                                             | `{"id":"<uuid>"}`                                            |
+| `list`      | **kind** (entity\|edge\|note); entity_kind, note_kind, source_id, target_id, relations, min_weight, max_weight, limit                                | `{"kind":"entity","entity_kind":"concept","limit":20}`       |
+| `update`    | **id** (UUID); name, description, properties, tags (entity), relation, weight (edge); namespace                                                      | `{"id":"<uuid>","description":"Updated desc"}`               |
+| `delete`    | **id** (UUID); hard (default: false); namespace                                                                                                      | `{"id":"<uuid>","hard":true}`                                |
+| `merge`     | **into_id**, **from_id**; strategy (prefer_into\|prefer_from\|union); namespace                                                                      | `{"into_id":"<uuid>","from_id":"<uuid>"}`                    |
+| `search`    | **kind** (entity\|note), **query** (text); limit; namespace                                                                                          | `{"kind":"entity","query":"attention mechanism"}`            |
+| `link`      | **source_id**, **target_id**, **relation**; weight (0.0–1.0); namespace                                                                              | `{"source_id":"<A>","target_id":"<B>","relation":"extends"}` |
+| `neighbors` | **node_id**; direction (out\|in\|both), relations, limit; namespace                                                                                  | `{"node_id":"<uuid>","direction":"in"}`                      |
+| `traverse`  | **roots** (UUID list); max_depth, direction, relations, include_roots; namespace                                                                     | `{"roots":["<uuid>"],"max_depth":2}`                         |
+| `query`     | **query** (GQL or SPARQL string); namespace                                                                                                          | `{"query":"MATCH (a:concept)-[:extends]->(b) RETURN a"}`     |
+
+### When to use which retrieval verb
+
+- **`get(id)`** — you have a UUID, fetch the record (any type)
+- **`search(kind, query)`** — text similarity: "find things _about_ X"
+- **`list(kind, filters)`** — structured browse: "all concepts" / "edges from node A"
+- **`neighbors(node_id)`** — one-hop graph: "what connects to X?"
+- **`traverse(roots)`** — multi-hop graph: "reachability within N hops"
+- **`query(gql)`** — pattern matching: "concepts that extend something introduced by a paper"
+
+### v0.1 workaround: supersession via edges
+
+Until `supersede` lands, manually create a supersedes edge:
+
+```
+link(source_id=new_note, target_id=old_note, relation="supersedes")
+```
+
+`search(kind="note")` already excludes notes targeted by a `supersedes` edge.
 
 ---
 

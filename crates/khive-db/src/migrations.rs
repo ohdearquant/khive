@@ -159,11 +159,25 @@ const V1_UP: &str = "\
 /// To add a new migration: append a `VersionedMigration` entry with
 /// `version = <last_version + 1>`. The version sequence must be contiguous
 /// (1, 2, 3, ...); `run_migrations` returns an error on gaps.
-pub const MIGRATIONS: &[VersionedMigration] = &[VersionedMigration {
-    version: 1,
-    name: "initial_schema",
-    up: V1_UP,
-}];
+///
+/// V2 note: `NOTES_DDL` in `stores/note.rs` already includes `name TEXT` so that
+/// in-process schema creation (used by tests and `StorageBackend::notes()`) has the
+/// column from the start.  When `run_migrations` is called on a DB that was
+/// bootstrapped via `NOTES_DDL`, the V2 `ALTER TABLE` would fail with "duplicate
+/// column name".  The migration runner handles this by checking column existence
+/// before applying V2 — see `run_migrations`.
+pub const MIGRATIONS: &[VersionedMigration] = &[
+    VersionedMigration {
+        version: 1,
+        name: "initial_schema",
+        up: V1_UP,
+    },
+    VersionedMigration {
+        version: 2,
+        name: "add_name_to_notes",
+        up: "ALTER TABLE notes ADD COLUMN name TEXT;",
+    },
+];
 
 const MIGRATION_TRACKING_TABLE: &str = "\
     CREATE TABLE IF NOT EXISTS _schema_migrations (\
@@ -173,19 +187,6 @@ const MIGRATION_TRACKING_TABLE: &str = "\
     );\
 ";
 
-/// Detect whether this DB was created before `_schema_migrations` was introduced
-/// but already has the V1 schema applied (the `entities` table exists).
-fn is_legacy_v1_db(conn: &Connection) -> bool {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entities'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    count > 0
-}
-
 /// Apply all unapplied migrations from `MIGRATIONS` in order.
 ///
 /// Returns the highest version now applied, or `0` if the DB is empty and no
@@ -194,12 +195,6 @@ fn is_legacy_v1_db(conn: &Connection) -> bool {
 /// # Idempotency
 ///
 /// Safe to call multiple times. Already-applied migrations are skipped.
-///
-/// # Existing DBs
-///
-/// If `_schema_migrations` is absent but the `entities` table exists (indicating
-/// a DB created before ADR-022), V1 is recorded as already applied without
-/// re-running the DDL. This preserves existing data.
 ///
 /// # Atomicity
 ///
@@ -213,7 +208,6 @@ fn is_legacy_v1_db(conn: &Connection) -> bool {
 ///
 /// Returns `SqliteError::Migration { version, error }` if any migration fails.
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
-    // Validate that the MIGRATIONS array is contiguous.
     for (i, m) in MIGRATIONS.iter().enumerate() {
         let expected = (i + 1) as u32;
         if m.version != expected {
@@ -225,29 +219,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
         }
     }
 
-    // Check whether _schema_migrations table already exists.
-    let tracking_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_schema_migrations'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-
-    if !tracking_exists {
-        // Create the tracking table.
-        conn.execute_batch(MIGRATION_TRACKING_TABLE)?;
-
-        // If this looks like a pre-ADR-022 DB, seed V1 as applied.
-        if is_legacy_v1_db(conn) {
-            let now = chrono::Utc::now().timestamp_micros();
-            conn.execute(
-                "INSERT OR IGNORE INTO _schema_migrations (version, name, applied_at) \
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![1u32, "initial_schema", now],
-            )?;
-        }
-    }
+    conn.execute_batch(MIGRATION_TRACKING_TABLE)?;
 
     // Determine the current version (highest applied).
     let current_version: u32 = conn
@@ -263,6 +235,35 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     for migration in MIGRATIONS {
         if migration.version <= current_version {
             continue;
+        }
+
+        // V2 adds `name` to notes.  StorageBackend::notes() bootstraps the schema
+        // via NOTES_DDL (which already includes `name`), so the column may already
+        // exist even though the migration has never been recorded.  Treat "duplicate
+        // column name" from SQLite as idempotent for ALTER TABLE migrations.
+        if migration.version == 2 {
+            let col_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('notes') WHERE name = 'name'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if col_exists {
+                // Column already present — record the migration as applied and skip.
+                let now = chrono::Utc::now().timestamp_micros();
+                conn.execute(
+                    "INSERT OR IGNORE INTO _schema_migrations (version, name, applied_at) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![migration.version, migration.name, now],
+                )
+                .map_err(|e| SqliteError::Migration {
+                    version: migration.version,
+                    error: e.to_string(),
+                })?;
+                applied_version = migration.version;
+                continue;
+            }
         }
 
         let tx = conn.transaction().map_err(|e| SqliteError::Migration {
@@ -310,20 +311,20 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_migrates_to_v1() {
+    fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
 
-        // Verify the tracking table has a row for V1.
+        // Verify the tracking table has rows for V1 and V2.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 1",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -334,6 +335,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tbl_count, 1);
+
+        // Verify V2 added the name column to notes.
+        let col_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('notes') WHERE name = 'name'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(col_count, 1, "V2 must add name column to notes");
     }
 
     #[test]
@@ -341,44 +352,82 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 1);
-        assert_eq!(v2, 1);
+        assert_eq!(v1, 2);
+        assert_eq!(v2, 2);
 
-        // Should still have exactly one row in the tracking table.
+        // Should still have exactly two rows in the tracking table (V1 + V2).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 
     #[test]
     fn failed_migration_rolls_back() {
-        // Build a minimal test-only migration array with a bad V99.
-        let bad_migrations: &[VersionedMigration] = &[
-            VersionedMigration {
-                version: 1,
-                name: "initial_schema",
-                up: V1_UP,
-            },
-            VersionedMigration {
-                version: 2,
-                name: "bad_migration",
-                up: "THIS IS NOT VALID SQL;",
-            },
-        ];
+        let bad_v3 = VersionedMigration {
+            version: 3,
+            name: "bad_migration",
+            up: "THIS IS NOT VALID SQL;",
+        };
 
         let mut conn = open_memory();
 
-        // Apply V1 manually via the real run_migrations so the DB is at V1.
-        run_migrations(&mut conn).expect("V1 should apply cleanly");
+        // Apply all real migrations (V1 + V2) so the DB is at V2.
+        run_migrations(&mut conn).expect("V1+V2 should apply cleanly");
 
-        // Now manually drive the bad V2 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_migrations[1]);
+        // Now manually drive the bad V3 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v3);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V1 — no V2 row in tracking.
+        // DB should still be at V2 — no V3 row in tracking.
+        let v3_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v3_count, 0, "V3 must not be recorded after rollback");
+
+        // V1 and V2 should still be there.
+        let applied_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied_count, 2, "V1 and V2 must still be recorded");
+    }
+
+    #[test]
+    fn store_ddl_then_migrations_is_idempotent() {
+        use crate::stores::note::ensure_notes_schema;
+
+        let mut conn = open_memory();
+
+        // Simulate the StorageBackend path: store DDL creates notes table
+        // WITH the name column (NOTES_DDL includes it for test convenience).
+        ensure_notes_schema(&conn).expect("store DDL should create notes");
+
+        // Verify name column exists from DDL.
+        let has_name: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('notes') WHERE name = 'name'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_name, "NOTES_DDL should include name column");
+
+        // Now run versioned migrations — V2 should detect the existing column
+        // and skip the ALTER TABLE without error.
+        let version = run_migrations(&mut conn).expect("migrations after store DDL");
+        assert_eq!(version, 2);
+
+        // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM _schema_migrations WHERE version = 2",
@@ -386,46 +435,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v2_count, 0, "V2 must not be recorded after rollback");
-
-        // V1 should still be there.
-        let v1_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(v1_count, 1, "V1 must still be recorded");
-    }
-
-    #[test]
-    fn existing_db_without_tracking_table_is_seeded_as_v1() {
-        let mut conn = open_memory();
-
-        // Simulate a pre-ADR-022 DB: create the entities table directly
-        // without _schema_migrations.
-        conn.execute_batch(
-            "CREATE TABLE entities (id TEXT PRIMARY KEY, namespace TEXT NOT NULL, \
-             kind TEXT NOT NULL, name TEXT NOT NULL, description TEXT, \
-             properties TEXT, tags TEXT NOT NULL DEFAULT '[]', \
-             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, \
-             deleted_at INTEGER);",
-        )
-        .expect("setup entities table");
-
-        // run_migrations should detect the existing table and seed V1.
-        let version = run_migrations(&mut conn).expect("should seed existing DB as V1");
-        assert_eq!(version, 1);
-
-        let v1_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(v1_count, 1);
+        assert_eq!(
+            v2_count, 1,
+            "V2 must be recorded even when column pre-exists"
+        );
     }
 
     /// Helper: apply a single migration in a transaction, recording it in the

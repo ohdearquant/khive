@@ -229,6 +229,7 @@ async fn create_note_and_list_notes() {
     rt.create_note(
         None,
         NoteKind::Observation,
+        None,
         "LoRA is a fine-tuning technique",
         0.9,
         None,
@@ -239,6 +240,7 @@ async fn create_note_and_list_notes() {
     rt.create_note(
         None,
         NoteKind::Observation,
+        None,
         "QLoRA uses quantization",
         0.8,
         None,
@@ -249,6 +251,7 @@ async fn create_note_and_list_notes() {
     rt.create_note(
         None,
         NoteKind::Question,
+        None,
         "Review LoRA paper",
         0.7,
         None,
@@ -278,7 +281,7 @@ async fn create_all_note_kinds() {
         NoteKind::Decision,
         NoteKind::Reference,
     ] {
-        rt.create_note(None, kind, "content", 0.5, None, vec![])
+        rt.create_note(None, kind, None, "content", 0.5, None, vec![])
             .await
             .unwrap();
     }
@@ -478,6 +481,7 @@ async fn list_notes_excludes_soft_deleted() {
         .create_note(
             None,
             NoteKind::Observation,
+            None,
             "soft-delete-test",
             0.9,
             None,
