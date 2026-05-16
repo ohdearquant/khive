@@ -1818,9 +1818,7 @@ mod tests {
                     "edge-as-annotates-source must report wrong kind, not NotFound: {msg}"
                 );
             }
-            other => panic!(
-                "expected InvalidInput for edge source with Annotates, got {other:?}"
-            ),
+            other => panic!("expected InvalidInput for edge source with Annotates, got {other:?}"),
         }
     }
 
