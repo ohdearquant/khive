@@ -342,26 +342,23 @@ fn compile_variable_length(
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
         std::collections::HashMap::new();
 
-    // For variable-length, we expect pattern: start_node -[*N..M]-> end_node
-    // Possibly with kind/property filters on each node.
+    // For variable-length, we expect exactly: start_node -[*N..M]-> end_node.
+    // Mixed fixed+variable chains and additional trailing pattern elements are
+    // not yet supported — reject explicitly rather than silently dropping them.
     let nodes: Vec<&NodePattern> = query.pattern.nodes().collect();
     let edges: Vec<&EdgePattern> = query.pattern.edges().collect();
 
-    if nodes.len() < 2 || edges.is_empty() {
-        return Err(QueryError::Compile(
-            "variable-length pattern requires at least two nodes and one edge".into(),
+    if nodes.len() != 2 || edges.len() != 1 || query.pattern.elements.len() != 3 {
+        return Err(QueryError::Unsupported(
+            "variable-length patterns must be a single start_node -[*N..M]-> end_node \
+             (mixed fixed/variable chains are not yet implemented)"
+                .into(),
         ));
     }
 
-    // For now, support single variable-length edge pattern.
-    // Multi-hop chains with mixed fixed/variable can be added later.
     let start = &nodes[0];
     let edge = &edges[0];
-    let end = if nodes.len() > 1 {
-        Some(&nodes[1])
-    } else {
-        None
-    };
+    let end = &nodes[1];
 
     // MAJ-2: depth cap — always parameterized, never injected as literal
     let max_depth = edge.max_hops.min(10);
@@ -438,28 +435,28 @@ fn compile_variable_length(
     params.push(SqlValue::Integer(max_depth as i64));
     let depth_param = params.len();
 
-    // End-node conditions (applied in outer WHERE)
+    // End-node conditions (applied in outer WHERE). `r` is always joined
+    // unconditionally below so these references resolve regardless of whether
+    // the end variable is projected.
     let mut end_conditions: Vec<String> = vec!["r.deleted_at IS NULL".to_string()];
     let r_ns_filter = namespace_filter("r", opts, &mut params);
     if !r_ns_filter.is_empty() {
         end_conditions.push(r_ns_filter.trim_start_matches(" AND ").to_string());
     }
-    if let Some(end_node) = end {
-        if let Some(ref kind) = end_node.kind {
-            params.push(SqlValue::Text(kind.clone()));
-            end_conditions.push(format!("r.kind = ?{}", params.len()));
-        }
-        for (key, val) in &end_node.properties {
-            params.push(SqlValue::Text(val.clone()));
-            if key == "name" {
-                end_conditions.push(format!("r.name = ?{} COLLATE NOCASE", params.len()));
-            } else {
-                end_conditions.push(format!(
-                    "json_extract(r.properties, '$.{}') = ?{} COLLATE NOCASE",
-                    key.replace('\'', "''"),
-                    params.len()
-                ));
-            }
+    if let Some(ref kind) = end.kind {
+        params.push(SqlValue::Text(kind.clone()));
+        end_conditions.push(format!("r.kind = ?{}", params.len()));
+    }
+    for (key, val) in &end.properties {
+        params.push(SqlValue::Text(val.clone()));
+        if key == "name" {
+            end_conditions.push(format!("r.name = ?{} COLLATE NOCASE", params.len()));
+        } else {
+            end_conditions.push(format!(
+                "json_extract(r.properties, '$.{}') = ?{} COLLATE NOCASE",
+                key.replace('\'', "''"),
+                params.len()
+            ));
         }
     }
 
@@ -468,7 +465,7 @@ fn compile_variable_length(
         // Map variables to appropriate aliases
         let col_alias = if start.variable.as_deref() == Some(&cond.variable) {
             "s"
-        } else if end.and_then(|e| e.variable.as_deref()) == Some(&cond.variable) {
+        } else if end.variable.as_deref() == Some(&cond.variable) {
             "r"
         } else {
             return Err(QueryError::Compile(format!(
@@ -544,10 +541,8 @@ fn compile_variable_length(
     if let Some(ref var) = start.variable {
         var_to_alias.insert(var.clone(), ("s".to_string(), VarKind::Node));
     }
-    if let Some(end_node) = end {
-        if let Some(ref var) = end_node.variable {
-            var_to_alias.insert(var.clone(), ("r".to_string(), VarKind::Node));
-        }
+    if let Some(ref var) = end.variable {
+        var_to_alias.insert(var.clone(), ("r".to_string(), VarKind::Node));
     }
     if let Some(ref var) = edge.variable {
         var_to_alias.insert(var.clone(), ("e".to_string(), VarKind::Edge));
@@ -556,7 +551,6 @@ fn compile_variable_length(
     // Build SELECT based on RETURN items
     let mut select_parts: Vec<String> = Vec::new();
     let mut has_start = false;
-    let mut has_end = false;
 
     for var in &query.return_items {
         if let Some((_, kind)) = var_to_alias.get(var) {
@@ -572,7 +566,6 @@ fn compile_variable_length(
                              s.updated_at AS {var}_updated_at"
                         ));
                     } else {
-                        has_end = true;
                         select_parts.push(format!(
                             "r.id AS {var}_id, r.namespace AS {var}_namespace, \
                              r.kind AS {var}_kind, r.name AS {var}_name, \
@@ -600,17 +593,16 @@ fn compile_variable_length(
     select_parts.push("t.depth AS _depth".to_string());
     select_parts.push("t.total_weight AS _total_weight".to_string());
 
-    // Build the CTE
+    // `s` is optional (only joined if the start variable is projected); `r` is
+    // always joined because the outer WHERE always references `r.deleted_at`,
+    // `r.namespace` (and possibly r.kind / r.properties) regardless of whether
+    // it appears in RETURN.
     let join_start = if has_start {
         "JOIN entities s ON s.id = t.start_id"
     } else {
         ""
     };
-    let join_end = if has_end {
-        "JOIN entities r ON r.id = t.current_id"
-    } else {
-        ""
-    };
+    let join_end = "JOIN entities r ON r.id = t.current_id";
 
     let sql = format!(
         "WITH RECURSIVE traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight) AS (\
@@ -816,5 +808,81 @@ mod tests {
             !has_paper,
             "raw alias 'paper' must not leak into SQL params"
         );
+    }
+
+    #[test]
+    fn compile_rejects_namespace_in_where() {
+        let q =
+            gql::parse("MATCH (a:concept)-[:extends]->(b) WHERE a.namespace = 'other' RETURN a")
+                .unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(err.to_string().contains("namespace"), "msg: {err}");
+    }
+
+    #[test]
+    fn compile_rejects_unknown_relation_in_where() {
+        let q = gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'related_to' RETURN a")
+            .unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(err.to_string().contains("related_to"), "msg: {err}");
+    }
+
+    #[test]
+    fn compile_normalises_kind_alias_in_where_param() {
+        let q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'paper' RETURN a").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        let has_document = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, SqlValue::Text(s) if s == "document"));
+        let has_paper = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, SqlValue::Text(s) if s == "paper"));
+        assert!(
+            has_document,
+            "WHERE a.kind = 'paper' must normalise to 'document'"
+        );
+        assert!(!has_paper, "raw 'paper' must not leak into SQL params");
+    }
+
+    #[test]
+    fn variable_length_return_start_only_joins_end_entity() {
+        // Even when only the start variable is projected, the outer query
+        // references `r.deleted_at` / `r.namespace`, so entities r must be
+        // joined unconditionally.
+        let q = gql::parse("MATCH (a:concept)-[:extends*1..3]->(b) RETURN a LIMIT 10").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("JOIN entities r"),
+            "entities r must always be joined when r.* conditions are emitted; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn variable_length_trailing_pattern_unsupported() {
+        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b)-[:implements]->(c) RETURN b").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn variable_length_mixed_chain_unsupported() {
+        // Mixed fixed + variable in one chain — has_variable_length() triggers
+        // the variable-length path, which must reject because edges.len() > 1.
+        let q = gql::parse("MATCH (a)-[:extends]->(b)-[:implements*1..2]->(c) RETURN c").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn sparql_star_rejected_as_unsupported() {
+        use crate::parsers::sparql;
+        let err = sparql::parse("SELECT ?a ?b WHERE { ?a :extends* ?b . }").unwrap_err();
+        assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
     }
 }

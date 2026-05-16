@@ -208,8 +208,15 @@ impl SparqlParser {
                 (1, 5)
             }
             Some('*') => {
-                self.advance();
-                (0, 5)
+                // SPARQL `*` means zero-or-more, but our recursive CTE seed
+                // starts at depth 1 and cannot emit a depth-0 row that maps
+                // the start node to itself. Reject explicitly until depth-0
+                // is implemented — silently treating `*` as `+` would drop
+                // valid matches.
+                return Err(QueryError::Unsupported(
+                    "SPARQL '*' (zero-or-more hops) not yet supported; use '+' or '{min,max}'"
+                        .into(),
+                ));
             }
             Some('{') => {
                 self.advance();

@@ -1,15 +1,21 @@
 //! AST validation per ADR-008 §Validation Rules.
 //!
 //! `validate` normalises an AST in place and rejects queries that violate the
-//! closed taxonomies:
+//! closed taxonomies or attempt to subvert namespace scoping:
 //!
 //! 1. **Edge relations** must parse to one of the 13 canonical [`EdgeRelation`]
 //!    variants (ADR-002). Aliases and case differences are normalised to the
-//!    canonical snake_case form stored in the database.
+//!    canonical snake_case form stored in the database. Applies to edge
+//!    patterns *and* `WHERE e.relation = '…'` constraints.
 //! 2. **Node kinds** must parse to one of the 6 [`EntityKind`] variants
 //!    (ADR-001). Common aliases (`paper` → `document`, `benchmark` → `dataset`)
-//!    are normalised.
-//! 3. **Traversal depth** is capped at [`MAX_DEPTH`] (10 hops). Requests above
+//!    are normalised. Applies to node labels *and* `WHERE a.kind = '…'`
+//!    constraints.
+//! 3. **Namespace scoping is a trusted parameter only.** Queries must not name
+//!    `namespace` in node property maps or `WHERE` conditions — the only valid
+//!    source of namespace filtering is `CompileOptions::scopes`. This matches
+//!    ADR-008 §Validation: "never trust query strings to set namespaces."
+//! 4. **Traversal depth** is capped at [`MAX_DEPTH`] (10 hops). Requests above
 //!    the cap are clamped, not rejected — this matches the cap the compiler
 //!    applies when generating recursive CTEs.
 
@@ -17,7 +23,7 @@ use std::str::FromStr;
 
 use khive_types::{EdgeRelation, EntityKind};
 
-use crate::ast::{GqlQuery, PatternElement};
+use crate::ast::{Condition, ConditionValue, GqlQuery, PatternElement};
 use crate::error::QueryError;
 
 /// Maximum traversal depth allowed by the query layer (ADR-008 §Validation).
@@ -36,6 +42,11 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
                     let parsed = EntityKind::from_str(kind).map_err(QueryError::Validation)?;
                     *kind = parsed.name().to_string();
                 }
+                if node.properties.contains_key("namespace") {
+                    return Err(QueryError::Validation(
+                        "namespace is set by CompileOptions, not query text".into(),
+                    ));
+                }
             }
             PatternElement::Edge(edge) => {
                 for relation in edge.relations.iter_mut() {
@@ -52,7 +63,36 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
             }
         }
     }
+
+    for cond in query.where_clause.iter_mut() {
+        validate_condition(cond)?;
+    }
+
     Ok(())
+}
+
+fn validate_condition(cond: &mut Condition) -> Result<(), QueryError> {
+    match cond.property.as_str() {
+        "namespace" => Err(QueryError::Validation(
+            "namespace is set by CompileOptions, not query text".into(),
+        )),
+        "kind" => {
+            if let ConditionValue::String(ref mut s) = cond.value {
+                let parsed = EntityKind::from_str(s).map_err(QueryError::Validation)?;
+                *s = parsed.name().to_string();
+            }
+            Ok(())
+        }
+        "relation" => {
+            if let ConditionValue::String(ref mut s) = cond.value {
+                let parsed = EdgeRelation::from_str(s)
+                    .map_err(|err| QueryError::Validation(err.to_string()))?;
+                *s = parsed.as_str().to_string();
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -118,5 +158,64 @@ mod tests {
             edge.relations,
             vec!["extends".to_string(), "variant_of".to_string()]
         );
+    }
+
+    #[test]
+    fn rejects_namespace_in_where() {
+        let mut q =
+            gql::parse("MATCH (a:concept)-[:extends]->(b) WHERE a.namespace = 'other' RETURN a")
+                .unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(err.to_string().contains("namespace"), "msg: {err}");
+    }
+
+    #[test]
+    fn rejects_namespace_in_node_properties() {
+        let mut q =
+            gql::parse("MATCH (a:concept {namespace: 'other'})-[:extends]->(b) RETURN a").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(err.to_string().contains("namespace"), "msg: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_relation_in_where() {
+        let mut q =
+            gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'related_to' RETURN a")
+                .unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(err.to_string().contains("related_to"), "msg: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_kind_in_where() {
+        let mut q =
+            gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'gizmo' RETURN a").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(err.to_string().contains("gizmo"), "msg: {err}");
+    }
+
+    #[test]
+    fn normalises_kind_alias_in_where() {
+        let mut q =
+            gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'paper' RETURN a").unwrap();
+        validate(&mut q).unwrap();
+        let val = match &q.where_clause[0].value {
+            ConditionValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert_eq!(val, "document");
+    }
+
+    #[test]
+    fn normalises_relation_alias_in_where() {
+        let mut q =
+            gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'Introduced_By' RETURN a")
+                .unwrap();
+        validate(&mut q).unwrap();
+        let val = match &q.where_clause[0].value {
+            ConditionValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert_eq!(val, "introduced_by");
     }
 }
