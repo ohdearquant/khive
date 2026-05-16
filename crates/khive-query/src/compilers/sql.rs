@@ -18,7 +18,7 @@ use khive_storage::types::SqlValue;
 pub struct CompiledQuery {
     pub sql: String,
     pub params: Vec<SqlValue>,
-    pub return_vars: Vec<String>,
+    pub return_vars: Vec<ReturnItem>,
 }
 
 pub struct CompileOptions {
@@ -284,26 +284,33 @@ fn compile_fixed_length(
     }
 
     // SELECT clause
-    for var in &query.return_items {
+    for item in &query.return_items {
+        let var = item.variable();
         if let Some((alias, kind)) = var_to_alias.get(var) {
-            match kind {
-                VarKind::Node => {
-                    select_parts.push(format!(
-                        "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                         {alias}.kind AS {var}_kind, {alias}.name AS {var}_name, \
-                         {alias}.properties AS {var}_properties, \
-                         {alias}.created_at AS {var}_created_at, \
-                         {alias}.updated_at AS {var}_updated_at"
-                    ));
+            match item {
+                ReturnItem::Property(_, prop) => {
+                    let col = property_to_column(prop, kind);
+                    select_parts.push(format!("{alias}.{col} AS {var}_{prop}"));
                 }
-                VarKind::Edge => {
-                    select_parts.push(format!(
-                        "{alias}.id AS {var}_id, {alias}.source_id AS {var}_source, \
-                         {alias}.target_id AS {var}_target, \
-                         {alias}.relation AS {var}_relation, \
-                         {alias}.weight AS {var}_weight"
-                    ));
-                }
+                ReturnItem::Variable(_) => match kind {
+                    VarKind::Node => {
+                        select_parts.push(format!(
+                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
+                             {alias}.kind AS {var}_kind, {alias}.name AS {var}_name, \
+                             {alias}.properties AS {var}_properties, \
+                             {alias}.created_at AS {var}_created_at, \
+                             {alias}.updated_at AS {var}_updated_at"
+                        ));
+                    }
+                    VarKind::Edge => {
+                        select_parts.push(format!(
+                            "{alias}.id AS {var}_id, {alias}.source_id AS {var}_source, \
+                             {alias}.target_id AS {var}_target, \
+                             {alias}.relation AS {var}_relation, \
+                             {alias}.weight AS {var}_weight"
+                        ));
+                    }
+                },
             }
         } else {
             return Err(QueryError::Compile(format!(
@@ -552,35 +559,56 @@ fn compile_variable_length(
     let mut select_parts: Vec<String> = Vec::new();
     let mut has_start = false;
 
-    for var in &query.return_items {
+    for item in &query.return_items {
+        let var = item.variable();
         if let Some((_, kind)) = var_to_alias.get(var) {
-            match kind {
-                VarKind::Node => {
-                    if start.variable.as_deref() == Some(var.as_str()) {
-                        has_start = true;
-                        select_parts.push(format!(
-                            "s.id AS {var}_id, s.namespace AS {var}_namespace, \
-                             s.kind AS {var}_kind, s.name AS {var}_name, \
-                             s.properties AS {var}_properties, \
-                             s.created_at AS {var}_created_at, \
-                             s.updated_at AS {var}_updated_at"
-                        ));
+            match item {
+                ReturnItem::Property(_, prop) => {
+                    let is_start = start.variable.as_deref() == Some(var);
+                    if *kind == VarKind::Node {
+                        let tbl = if is_start { "s" } else { "r" };
+                        if is_start {
+                            has_start = true;
+                        }
+                        let col = property_to_column(prop, kind);
+                        select_parts.push(format!("{tbl}.{col} AS {var}_{prop}"));
                     } else {
-                        select_parts.push(format!(
-                            "r.id AS {var}_id, r.namespace AS {var}_namespace, \
-                             r.kind AS {var}_kind, r.name AS {var}_name, \
-                             r.properties AS {var}_properties, \
-                             r.created_at AS {var}_created_at, \
-                             r.updated_at AS {var}_updated_at"
-                        ));
+                        let col = match prop.as_str() {
+                            "relation" => "via_relation",
+                            "weight" => "via_weight",
+                            _ => "via_edge",
+                        };
+                        select_parts.push(format!("t.{col} AS {var}_{prop}"));
                     }
                 }
-                VarKind::Edge => {
-                    select_parts.push(format!(
-                        "t.via_edge AS {var}_id, t.via_relation AS {var}_relation, \
-                         t.via_weight AS {var}_weight"
-                    ));
-                }
+                ReturnItem::Variable(_) => match kind {
+                    VarKind::Node => {
+                        if start.variable.as_deref() == Some(var) {
+                            has_start = true;
+                            select_parts.push(format!(
+                                "s.id AS {var}_id, s.namespace AS {var}_namespace, \
+                                 s.kind AS {var}_kind, s.name AS {var}_name, \
+                                 s.properties AS {var}_properties, \
+                                 s.created_at AS {var}_created_at, \
+                                 s.updated_at AS {var}_updated_at"
+                            ));
+                        } else {
+                            select_parts.push(format!(
+                                "r.id AS {var}_id, r.namespace AS {var}_namespace, \
+                                 r.kind AS {var}_kind, r.name AS {var}_name, \
+                                 r.properties AS {var}_properties, \
+                                 r.created_at AS {var}_created_at, \
+                                 r.updated_at AS {var}_updated_at"
+                            ));
+                        }
+                    }
+                    VarKind::Edge => {
+                        select_parts.push(format!(
+                            "t.via_edge AS {var}_id, t.via_relation AS {var}_relation, \
+                             t.via_weight AS {var}_weight"
+                        ));
+                    }
+                },
             }
         } else {
             return Err(QueryError::Compile(format!(
@@ -649,10 +677,30 @@ fn compile_variable_length(
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum VarKind {
     Node,
     Edge,
+}
+
+fn property_to_column(prop: &str, kind: &VarKind) -> &'static str {
+    match (kind, prop) {
+        (VarKind::Node, "id") => "id",
+        (VarKind::Node, "name") => "name",
+        (VarKind::Node, "kind") => "kind",
+        (VarKind::Node, "namespace") => "namespace",
+        (VarKind::Node, "description") => "description",
+        (VarKind::Node, "properties") => "properties",
+        (VarKind::Node, "created_at") => "created_at",
+        (VarKind::Node, "updated_at") => "updated_at",
+        (VarKind::Edge, "id") => "id",
+        (VarKind::Edge, "source_id") => "source_id",
+        (VarKind::Edge, "target_id") => "target_id",
+        (VarKind::Edge, "relation") => "relation",
+        (VarKind::Edge, "weight") => "weight",
+        // Fallback: use prop name directly (will fail at SQL level if invalid)
+        _ => "name",
+    }
 }
 
 #[cfg(test)]
@@ -679,7 +727,14 @@ mod tests {
         let compiled = compile(&q, &opts()).unwrap();
         assert!(compiled.sql.contains("JOIN graph_edges"));
         assert!(compiled.sql.contains("LIMIT"));
-        assert_eq!(compiled.return_vars, vec!["a", "e", "b"]);
+        assert_eq!(
+            compiled.return_vars,
+            vec![
+                ReturnItem::Variable("a".into()),
+                ReturnItem::Variable("e".into()),
+                ReturnItem::Variable("b".into()),
+            ]
+        );
         // No recursive CTE for fixed-length
         assert!(!compiled.sql.contains("WITH RECURSIVE"));
     }

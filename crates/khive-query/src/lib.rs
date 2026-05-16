@@ -23,7 +23,7 @@ pub mod error;
 pub mod parsers;
 pub mod validate;
 
-pub use ast::GqlQuery;
+pub use ast::{GqlQuery, ReturnItem};
 pub use compilers::sql::{compile, CompileOptions, CompiledQuery};
 pub use error::QueryError;
 pub use validate::{validate, MAX_DEPTH};

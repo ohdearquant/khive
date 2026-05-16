@@ -10,7 +10,8 @@
 //!   props     = '{' key ':' value (',' key ':' value)* '}'
 //!   conditions = condition ('AND' condition)*
 //!   condition  = var '.' prop op value
-//!   items     = var (',' var)*
+//!   items     = item (',' item)*
+//!   item      = var | var '.' prop
 
 use crate::ast::*;
 use crate::error::QueryError;
@@ -426,19 +427,30 @@ impl Parser {
         Ok(conditions)
     }
 
-    fn parse_return_items(&mut self) -> Result<Vec<String>, QueryError> {
+    fn parse_return_items(&mut self) -> Result<Vec<ReturnItem>, QueryError> {
         let mut items = Vec::new();
-        items.push(self.parse_ident()?);
+        items.push(self.parse_return_item()?);
         loop {
             self.skip_whitespace();
             if self.peek() == Some(',') {
                 self.advance();
-                items.push(self.parse_ident()?);
+                items.push(self.parse_return_item()?);
             } else {
                 break;
             }
         }
         Ok(items)
+    }
+
+    fn parse_return_item(&mut self) -> Result<ReturnItem, QueryError> {
+        let ident = self.parse_ident()?;
+        if self.peek() == Some('.') {
+            self.advance();
+            let prop = self.parse_ident()?;
+            Ok(ReturnItem::Property(ident, prop))
+        } else {
+            Ok(ReturnItem::Variable(ident))
+        }
     }
 
     fn parse_query(&mut self) -> Result<GqlQuery, QueryError> {
@@ -490,7 +502,14 @@ mod tests {
     fn simple_two_node_pattern() {
         let q = parse("MATCH (a:concept)-[e:introduced_by]->(b:paper) RETURN a, e, b").unwrap();
         assert_eq!(q.pattern.elements.len(), 3);
-        assert_eq!(q.return_items, vec!["a", "e", "b"]);
+        assert_eq!(
+            q.return_items,
+            vec![
+                ReturnItem::Variable("a".into()),
+                ReturnItem::Variable("e".into()),
+                ReturnItem::Variable("b".into()),
+            ]
+        );
 
         let nodes: Vec<_> = q.pattern.nodes().collect();
         assert_eq!(nodes[0].kind.as_deref(), Some("concept"));

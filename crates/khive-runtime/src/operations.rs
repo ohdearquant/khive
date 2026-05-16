@@ -393,6 +393,52 @@ impl KhiveRuntime {
         Ok(hits)
     }
 
+    /// Resolve a short UUID prefix (8+ hex chars) to a full UUID.
+    ///
+    /// Searches entities, notes, and edges tables for a UUID starting with the
+    /// given prefix. Returns `Ok(Some(uuid))` if exactly one match is found,
+    /// `Ok(None)` if no matches, or an error if ambiguous (multiple matches).
+    pub async fn resolve_prefix(&self, prefix: &str) -> RuntimeResult<Option<Uuid>> {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let pattern = format!("{}%", prefix);
+        let sql = SqlStatement {
+            sql: "SELECT id FROM entities WHERE id LIKE ?1 AND deleted_at IS NULL \
+                  UNION SELECT id FROM notes WHERE id LIKE ?1 AND deleted_at IS NULL \
+                  UNION SELECT id FROM graph_edges WHERE id LIKE ?1 \
+                  LIMIT 2"
+                .to_string(),
+            params: vec![SqlValue::Text(pattern)],
+            label: Some("resolve_prefix".into()),
+        };
+
+        let mut reader = self.sql().reader().await.map_err(RuntimeError::Storage)?;
+        let rows = reader.query_all(sql).await.map_err(RuntimeError::Storage)?;
+
+        match rows.len() {
+            0 => Ok(None),
+            1 => {
+                let id_str = rows[0]
+                    .columns
+                    .first()
+                    .and_then(|c| match &c.value {
+                        SqlValue::Text(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        RuntimeError::Internal("prefix resolve returned non-text id".into())
+                    })?;
+                let uuid = Uuid::from_str(id_str).map_err(|e| {
+                    RuntimeError::Internal(format!("stored UUID is invalid: {e}"))
+                })?;
+                Ok(Some(uuid))
+            }
+            _ => Err(RuntimeError::Ambiguous(format!(
+                "prefix '{prefix}' matches multiple UUIDs"
+            ))),
+        }
+    }
+
     /// Resolve a UUID to its substrate kind by trying entity, then note, then event stores.
     ///
     /// Returns `None` if the UUID is not found in any substrate.

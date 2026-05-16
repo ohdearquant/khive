@@ -6,8 +6,22 @@ use std::collections::HashMap;
 pub struct GqlQuery {
     pub pattern: MatchPattern,
     pub where_clause: Vec<Condition>,
-    pub return_items: Vec<String>,
+    pub return_items: Vec<ReturnItem>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnItem {
+    Variable(String),
+    Property(String, String),
+}
+
+impl ReturnItem {
+    pub fn variable(&self) -> &str {
+        match self {
+            Self::Variable(v) | Self::Property(v, _) => v,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
