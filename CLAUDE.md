@@ -19,6 +19,24 @@ schema, change how you model it, not the schema. Schema changes require an ADR.
 
 ---
 
+## Data vs. view — the principle most violated here
+
+Data is **history-preserving**: it records what happened and marks state. The query/view layer
+decides **what is shown**. Different layers — never conflate them.
+
+"Don't show outdated / invalid / superseded info" is **always a view problem — never a reason to
+delete, mutate, copy, or transfer data.** If you want removal, the verb is `delete`. `supersedes`
+means *precisely*: keep the old record, mark it superseded; what a query returns is a separate
+view-layer decision (filter superseded — do **not** rewrite or transfer its edges).
+
+**Tell:** if you are mutating / copying / transferring stored relationships to make a *query
+result* look right, stop — wrong layer.
+
+Corollary: the rule for any typed relation lives in its ADR (and consumer ADRs). If your intended
+behavior isn't written there, it is an unspecified design decision → escalate, do not invent.
+
+---
+
 ## Architecture (what ships today)
 
 ```
