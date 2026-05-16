@@ -82,11 +82,12 @@ MATCH (a:concept) RETURN a.name, a.id LIMIT 50
 ```sparql
 SELECT ?name WHERE {
   ?a a :concept .
-  ?a :domain ?domain .
+  ?a :domain 'attention' .
   ?a :name ?name .
-  FILTER(?domain = 'attention')
 } LIMIT 20
 ```
+
+Note: `FILTER()` is not supported. Express property filters as triple patterns (e.g., `?a :domain 'attention'` instead of `FILTER(?domain = 'attention')`).
 
 SPARQL and GQL compile to the same SQL. Use whichever syntax is natural — GQL for imperative traversal patterns, SPARQL for triple-pattern matching.
 

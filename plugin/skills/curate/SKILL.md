@@ -17,12 +17,11 @@ search(kind="entity", query="low rank fine tuning")
 ```
 If multiple results describe the same concept, merge them.
 
-### By structural query
-```gql
--- Find entities with identical or very similar names
-MATCH (a:concept), (b:concept)
-WHERE a.name = b.name AND a.id != b.id
-RETURN a.name, a.id, b.id
+### By listing and grouping
+```python
+# Multi-pattern GQL is not yet supported — use list + client-side grouping
+concepts = list(kind="entity", entity_kind="concept", limit=500)
+# Group by normalized name; inspect same-name groups with get/neighbors before merge
 ```
 
 ### After parallel batch ingestion

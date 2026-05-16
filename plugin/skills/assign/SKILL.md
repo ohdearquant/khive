@@ -87,14 +87,13 @@ Always use `annotates` unless the note is genuinely freestanding.
 When a decision changes, don't delete the old note — supersede it:
 
 ```python
-# 1. Fetch the old note to find its annotates targets
-old = get(id=old_note_id)
-# old.annotates contains the entity IDs this note was attached to
+# 1. Discover what the old note annotates (annotation targets are edges, not fields)
+old_targets = neighbors(node_id=old_note_id, direction="out", relations=["annotates"])
 
 # 2. Create the replacement, attaching to the same entities
 new = create(kind="note", note_kind="decision",
   content="New decision...", salience=0.9,
-  annotates=old.annotates)
+  annotates=[edge.target_id for edge in old_targets.edges])
 
 # 3. Mark the old as superseded
 link(source_id=new.id, target_id=old.id, relation="supersedes")
