@@ -48,21 +48,22 @@ merge(into_id=<canonical>, from_id=<duplicate>,
 
 ## Supersession Pattern (notes and concepts)
 
-When a record is replaced by a better version, don't delete — supersede:
+When a note is replaced by a better version, don't delete — supersede:
 
 ```python
-# Create the replacement, attaching to the same entities as the old note
+# Single call: inherits annotation targets + creates supersedes edge
 new_note = create(kind="note", note_kind="decision",
   content="Updated decision with new evidence...", salience=0.9,
-  annotates=["<entity-id>"])
-
-# Wire supersession
-link(source_id=new_note.id, target_id=old_note_id, relation="supersedes")
+  supersedes="<old-note-id>")
 ```
 
 **Effect**: `search(kind="note")` automatically excludes notes targeted by `supersedes` edges. The old note remains accessible via `get(id=old_note_id)` for history.
 
-For concepts: `link(source_id=new_concept_id, target_id=old_concept_id, relation="supersedes")` marks the old as obsolete.
+For concepts (no auto-supersede — use manual link):
+```python
+link(source_id=new_concept_id, target_id=old_concept_id, relation="supersedes")
+```
+Note: concept supersession is structural only — search does NOT auto-hide superseded entities.
 
 ## Edge Cascade on Hard Delete
 
