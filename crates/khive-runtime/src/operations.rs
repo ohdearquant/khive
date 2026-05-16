@@ -396,19 +396,25 @@ impl KhiveRuntime {
     /// Resolve a short UUID prefix (8+ hex chars) to a full UUID.
     ///
     /// Searches entities, notes, and edges tables for a UUID starting with the
-    /// given prefix. Returns `Ok(Some(uuid))` if exactly one match is found,
-    /// `Ok(None)` if no matches, or an error if ambiguous (multiple matches).
-    pub async fn resolve_prefix(&self, prefix: &str) -> RuntimeResult<Option<Uuid>> {
+    /// given prefix, scoped to the caller's namespace. Returns `Ok(Some(uuid))`
+    /// if exactly one match is found, `Ok(None)` if no matches, or an error if
+    /// ambiguous (multiple matches).
+    pub async fn resolve_prefix(
+        &self,
+        namespace: Option<&str>,
+        prefix: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
         use khive_storage::types::{SqlStatement, SqlValue};
 
+        let ns = self.ns(namespace).to_string();
         let pattern = format!("{}%", prefix);
         let sql = SqlStatement {
-            sql: "SELECT id FROM entities WHERE id LIKE ?1 AND deleted_at IS NULL \
-                  UNION SELECT id FROM notes WHERE id LIKE ?1 AND deleted_at IS NULL \
-                  UNION SELECT id FROM graph_edges WHERE id LIKE ?1 \
+            sql: "SELECT id FROM entities WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL \
+                  UNION SELECT id FROM notes WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL \
+                  UNION SELECT id FROM graph_edges WHERE id LIKE ?1 AND namespace = ?2 \
                   LIMIT 2"
                 .to_string(),
-            params: vec![SqlValue::Text(pattern)],
+            params: vec![SqlValue::Text(pattern), SqlValue::Text(ns)],
             label: Some("resolve_prefix".into()),
         };
 

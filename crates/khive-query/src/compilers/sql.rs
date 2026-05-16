@@ -289,7 +289,7 @@ fn compile_fixed_length(
         if let Some((alias, kind)) = var_to_alias.get(var) {
             match item {
                 ReturnItem::Property(_, prop) => {
-                    let col = property_to_column(prop, kind);
+                    let col = property_to_column(prop, kind)?;
                     select_parts.push(format!("{alias}.{col} AS {var}_{prop}"));
                 }
                 ReturnItem::Variable(_) => match kind {
@@ -570,13 +570,19 @@ fn compile_variable_length(
                         if is_start {
                             has_start = true;
                         }
-                        let col = property_to_column(prop, kind);
+                        let col = property_to_column(prop, kind)?;
                         select_parts.push(format!("{tbl}.{col} AS {var}_{prop}"));
                     } else {
                         let col = match prop.as_str() {
+                            "id" => "via_edge",
                             "relation" => "via_relation",
                             "weight" => "via_weight",
-                            _ => "via_edge",
+                            _ => {
+                                return Err(QueryError::Compile(format!(
+                                    "unknown edge property '{prop}' in RETURN projection. \
+                                     Valid: id, source_id, target_id, relation, weight"
+                                )));
+                            }
                         };
                         select_parts.push(format!("t.{col} AS {var}_{prop}"));
                     }
@@ -683,23 +689,28 @@ enum VarKind {
     Edge,
 }
 
-fn property_to_column(prop: &str, kind: &VarKind) -> &'static str {
-    match (kind, prop) {
-        (VarKind::Node, "id") => "id",
-        (VarKind::Node, "name") => "name",
-        (VarKind::Node, "kind") => "kind",
-        (VarKind::Node, "namespace") => "namespace",
-        (VarKind::Node, "description") => "description",
-        (VarKind::Node, "properties") => "properties",
-        (VarKind::Node, "created_at") => "created_at",
-        (VarKind::Node, "updated_at") => "updated_at",
-        (VarKind::Edge, "id") => "id",
-        (VarKind::Edge, "source_id") => "source_id",
-        (VarKind::Edge, "target_id") => "target_id",
-        (VarKind::Edge, "relation") => "relation",
-        (VarKind::Edge, "weight") => "weight",
-        // Fallback: use prop name directly (will fail at SQL level if invalid)
-        _ => "name",
+const NODE_COLUMNS: &[&str] = &[
+    "id", "name", "kind", "namespace", "description", "properties", "created_at", "updated_at",
+];
+const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
+
+fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
+    let valid = match kind {
+        VarKind::Node => NODE_COLUMNS,
+        VarKind::Edge => EDGE_COLUMNS,
+    };
+    if valid.contains(&prop) {
+        Ok(prop)
+    } else {
+        let kind_name = match kind {
+            VarKind::Node => "node",
+            VarKind::Edge => "edge",
+        };
+        Err(QueryError::Compile(format!(
+            "unknown {kind_name} property '{prop}' in RETURN projection. \
+             Valid: {}",
+            valid.join(", ")
+        )))
     }
 }
 
