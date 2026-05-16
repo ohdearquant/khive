@@ -75,8 +75,9 @@ fn validate_model_key(model_key: &str) -> Result<(), SqliteError> {
 
 /// A VectorStore backed by sqlite-vec's vec0 virtual tables.
 ///
-/// Each instance manages one table `vec_{model_key}`. All operations are
-/// scoped to the store's `namespace` for tenant isolation.
+/// Each instance manages one table `vec_{model_key}`. The `namespace` field
+/// is a default for trait methods that lack a per-call namespace parameter
+/// (count, delete, info). Access control is enforced at the runtime layer.
 pub struct SqliteVecStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,

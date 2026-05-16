@@ -214,10 +214,11 @@ impl StorageBackend {
         self.vectors_for_namespace(model_key, dimensions, "local")
     }
 
-    /// Get a VectorStore for a specific embedding model, scoped to a namespace.
+    /// Get a VectorStore for a specific embedding model with a default namespace.
     ///
-    /// Creates the vec0 virtual table if it does not already exist. All operations
-    /// are filtered to entries that match `namespace` for tenant isolation.
+    /// Creates the vec0 virtual table if it does not already exist. The `namespace`
+    /// is a default for trait methods that lack a per-call namespace parameter
+    /// (count, delete, info). Access control is enforced at the runtime layer.
     ///
     /// The `model_key` must contain only ASCII alphanumeric/underscore characters.
     pub fn vectors_for_namespace(
