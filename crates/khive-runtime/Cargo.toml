@@ -1,0 +1,30 @@
+[package]
+name = "khive-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+khive-types = { path = "../khive-types", features = ["serde"] }
+khive-storage = { path = "../khive-storage" }
+khive-score = { path = "../khive-score" }
+khive-db = { path = "../khive-db" }
+khive-query = { path = "../khive-query" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+lattice-embed = { workspace = true }
+tempfile = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"

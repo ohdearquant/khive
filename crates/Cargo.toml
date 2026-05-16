@@ -6,8 +6,8 @@ members = [
     "khive-storage",
     "khive-db",
     "khive-query",
+    "khive-runtime",
     # Other crates land in subsequent PRs:
-    # "khive-runtime",
     # "khive-mcp",
 ]
 
