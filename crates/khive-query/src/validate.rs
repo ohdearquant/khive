@@ -1,0 +1,122 @@
+//! AST validation per ADR-008 §Validation Rules.
+//!
+//! `validate` normalises an AST in place and rejects queries that violate the
+//! closed taxonomies:
+//!
+//! 1. **Edge relations** must parse to one of the 13 canonical [`EdgeRelation`]
+//!    variants (ADR-002). Aliases and case differences are normalised to the
+//!    canonical snake_case form stored in the database.
+//! 2. **Node kinds** must parse to one of the 6 [`EntityKind`] variants
+//!    (ADR-001). Common aliases (`paper` → `document`, `benchmark` → `dataset`)
+//!    are normalised.
+//! 3. **Traversal depth** is capped at [`MAX_DEPTH`] (10 hops). Requests above
+//!    the cap are clamped, not rejected — this matches the cap the compiler
+//!    applies when generating recursive CTEs.
+
+use std::str::FromStr;
+
+use khive_types::{EdgeRelation, EntityKind};
+
+use crate::ast::{GqlQuery, PatternElement};
+use crate::error::QueryError;
+
+/// Maximum traversal depth allowed by the query layer (ADR-008 §Validation).
+pub const MAX_DEPTH: usize = 10;
+
+/// Validate and normalise an AST in place.
+///
+/// On success, every kind / relation string in the AST is replaced with its
+/// canonical lowercase form so the compiler can emit literal SQL parameters
+/// that match the values written by `khive-db`.
+pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
+    for element in &mut query.pattern.elements {
+        match element {
+            PatternElement::Node(node) => {
+                if let Some(kind) = node.kind.as_mut() {
+                    let parsed = EntityKind::from_str(kind).map_err(QueryError::Validation)?;
+                    *kind = parsed.name().to_string();
+                }
+            }
+            PatternElement::Edge(edge) => {
+                for relation in edge.relations.iter_mut() {
+                    let parsed = EdgeRelation::from_str(relation)
+                        .map_err(|err| QueryError::Validation(err.to_string()))?;
+                    *relation = parsed.as_str().to_string();
+                }
+                if edge.max_hops > MAX_DEPTH {
+                    edge.max_hops = MAX_DEPTH;
+                }
+                if edge.min_hops > edge.max_hops {
+                    edge.min_hops = edge.max_hops;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parsers::gql;
+
+    #[test]
+    fn normalises_entity_kind_aliases() {
+        let mut q = gql::parse("MATCH (a:paper)-[:introduced_by]->(b:concept) RETURN a").unwrap();
+        validate(&mut q).unwrap();
+        let kinds: Vec<_> = q
+            .pattern
+            .nodes()
+            .map(|n| n.kind.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(kinds, vec!["document", "concept"]);
+    }
+
+    #[test]
+    fn normalises_relation_case_and_hyphens() {
+        let mut q = gql::parse("MATCH (a)-[:Introduced_By]->(b) RETURN a").unwrap();
+        validate(&mut q).unwrap();
+        let rels: Vec<_> = q
+            .pattern
+            .edges()
+            .flat_map(|e| e.relations.iter().cloned())
+            .collect();
+        assert_eq!(rels, vec!["introduced_by".to_string()]);
+    }
+
+    #[test]
+    fn rejects_unknown_relation() {
+        let mut q = gql::parse("MATCH (a)-[:not_a_relation]->(b) RETURN a").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not_a_relation"), "msg: {msg}");
+    }
+
+    #[test]
+    fn rejects_unknown_kind() {
+        let mut q = gql::parse("MATCH (a:gizmo)-[:extends]->(b) RETURN a").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gizmo"), "msg: {msg}");
+    }
+
+    #[test]
+    fn clamps_depth_above_max() {
+        let mut q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
+        validate(&mut q).unwrap();
+        let edge = q.pattern.edges().next().unwrap();
+        assert_eq!(edge.max_hops, MAX_DEPTH);
+        assert!(edge.min_hops <= edge.max_hops);
+    }
+
+    #[test]
+    fn multi_relation_all_normalised() {
+        let mut q = gql::parse("MATCH (a)-[:Extends|VARIANT_OF]->(b) RETURN a").unwrap();
+        validate(&mut q).unwrap();
+        let edge = q.pattern.edges().next().unwrap();
+        assert_eq!(
+            edge.relations,
+            vec!["extends".to_string(), "variant_of".to_string()]
+        );
+    }
+}

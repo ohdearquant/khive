@@ -1,0 +1,15 @@
+[package]
+name = "khive-query"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+khive-storage = { path = "../khive-storage" }
+khive-types = { path = "../khive-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
