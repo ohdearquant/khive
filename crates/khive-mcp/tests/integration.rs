@@ -8,8 +8,8 @@
 use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use rmcp::{
-    model::{CallToolRequestParams, ClientInfo},
-    ClientHandler, ServerHandler, ServiceExt,
+    model::{CallToolRequestParams, ClientInfo, ErrorCode},
+    ClientHandler, ServerHandler, ServiceError, ServiceExt,
 };
 use serde_json::json;
 
@@ -884,5 +884,170 @@ async fn unknown_kind_returns_error() -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+// ---- MCP error-kind boundary tests (ADR-024, CLAUDE.md:136) ----
+
+/// Assert that a call_tool result is a JSON-RPC invalid_params error (code -32602),
+/// not an internal_error. This verifies the MCP boundary maps validation failures correctly.
+fn assert_invalid_params(result: Result<rmcp::model::CallToolResult, ServiceError>, ctx: &str) {
+    match result {
+        Err(ServiceError::McpError(e)) => {
+            assert_eq!(
+                e.code,
+                ErrorCode::INVALID_PARAMS,
+                "{ctx}: expected invalid_params (-32602) but got {:?}",
+                e.code
+            );
+        }
+        Err(other) => panic!("{ctx}: unexpected service error: {other}"),
+        Ok(r) => panic!(
+            "{ctx}: expected an error but got success (is_error={:?})",
+            r.is_error
+        ),
+    }
+}
+
+#[tokio::test]
+async fn link_phantom_target_returns_invalid_params() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let src = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "PhantomSrc"}),
+    )
+    .await?;
+    let src_id = serde_json::from_str::<serde_json::Value>(&first_text(&src)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let phantom = "00000000-0000-0000-0000-000000000099";
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("link").with_arguments(
+                json!({"source_id": src_id, "target_id": phantom, "relation": "extends"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert_invalid_params(result, "link with phantom target UUID");
+    Ok(())
+}
+
+#[tokio::test]
+async fn link_wrong_substrate_returns_invalid_params() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create a note — notes are not valid as source for non-annotates relations.
+    let note = call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "observation", "content": "substrate test"}),
+    )
+    .await?;
+    let note_id = serde_json::from_str::<serde_json::Value>(&first_text(&note)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let entity = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "SubstrateTarget"}),
+    )
+    .await?;
+    let entity_id = serde_json::from_str::<serde_json::Value>(&first_text(&entity)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // note UUID as source with a non-annotates relation — wrong substrate.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("link").with_arguments(
+                json!({"source_id": note_id, "target_id": entity_id, "relation": "extends"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert_invalid_params(result, "link note→entity with non-annotates relation");
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_note_with_phantom_annotates_returns_invalid_params() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let phantom = "00000000-0000-0000-0000-000000000099";
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("create").with_arguments(
+                json!({"kind": "note", "note_kind": "observation", "content": "phantom annotates", "annotates": [phantom]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert_invalid_params(result, "create note with phantom annotates UUID");
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_note_annotating_real_edge_succeeds() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create two entities and link them to get a real edge UUID.
+    let a = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "EdgeAnnotateSrc"}),
+    )
+    .await?;
+    let b = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "EdgeAnnotateTgt"}),
+    )
+    .await?;
+    let a_id = serde_json::from_str::<serde_json::Value>(&first_text(&a)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_id = serde_json::from_str::<serde_json::Value>(&first_text(&b)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let edge = call(
+        &client,
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends", "weight": 0.8}),
+    )
+    .await?;
+    let edge_id = serde_json::from_str::<serde_json::Value>(&first_text(&edge)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A note annotating a real edge UUID must succeed (ADR-024: target = any substrate).
+    let result = call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "observation", "content": "annotating an edge", "annotates": [edge_id]}),
+    )
+    .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "annotating a real edge UUID must succeed, got: {}",
+        first_text(&result)
+    );
     Ok(())
 }

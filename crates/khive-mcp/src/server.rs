@@ -103,6 +103,17 @@ impl KhiveMcpServer {
         serde_json::to_string_pretty(v)
             .map_err(|e| McpError::internal_error(format!("serialize error: {e}"), None))
     }
+
+    /// Map a RuntimeError to the correct MCP error kind.
+    /// InvalidInput and NotFound are caller-correctable — invalid_params.
+    /// Everything else is internal_error.
+    fn validation_err(e: khive_runtime::RuntimeError) -> McpError {
+        match e {
+            khive_runtime::RuntimeError::InvalidInput(m)
+            | khive_runtime::RuntimeError::NotFound(m) => McpError::invalid_params(m, None),
+            other => McpError::internal_error(other.to_string(), None),
+        }
+    }
 }
 
 // ---- Tool implementations ----
@@ -195,7 +206,7 @@ Examples:
                         annotates,
                     )
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    .map_err(Self::validation_err)?;
                 Self::to_json(&note)
             }
             other => Err(McpError::invalid_params(
@@ -660,7 +671,7 @@ Canonical relations (13 total — use ONLY these):
 
 Weight guide: 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible, <0.4=speculative
 
-annotates edges connect notes to entities/notes (cross-substrate navigation per ADR-024).
+annotates edges: source must be a note; target may be an entity, note, edge, or event (cross-substrate navigation per ADR-024).
 
 Examples:
   {"source_id":"<uuid>","target_id":"<uuid>","relation":"introduced_by","weight":1.0}
@@ -679,7 +690,7 @@ Examples:
             .runtime
             .link(p.namespace.as_deref(), source, target, relation, weight)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(Self::validation_err)?;
         Self::to_json(&edge)
     }
 

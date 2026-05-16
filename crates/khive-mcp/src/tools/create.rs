@@ -50,7 +50,7 @@ pub struct CreateParams {
     /// Salience score between 0.0 (forgettable) and 1.0 (critical). Defaults to 0.5.
     pub salience: Option<f64>,
 
-    /// UUIDs of entities or notes this note annotates (creates annotates edges). Note only.
+    /// UUIDs of any substrate (entity, note, edge, or event) this note annotates (creates annotates edges).
     pub annotates: Option<Vec<String>>,
 
     // ---- shared fields ----
