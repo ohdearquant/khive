@@ -1,4 +1,5 @@
 ---
+name: kg-digest
 description: Ingest research material into the knowledge graph — papers, concepts, implementations. Check→Create→Link→Note→Report.
 ---
 
@@ -71,26 +72,29 @@ properties = {
 Paper: "LoRA: Low-Rank Adaptation of Large Language Models"
 
 Step 1: Create paper entity
-  create(kind="entity", entity_kind="document", name="LoRA",
+  paper = create(kind="entity", entity_kind="document", name="LoRA paper",
     properties={type:"paper", title:"LoRA: Low-Rank...", authors:"Hu et al.", year:"2021", source:"arxiv:2106.09685", domain:"fine-tuning"})
 
 Step 2: Create technique entity
-  search → create(kind="entity", entity_kind="concept", name="LoRA",
+  search → technique = create(kind="entity", entity_kind="concept", name="LoRA",
     properties={type:"technique", domain:"fine-tuning", status:"implemented"})
 
-Step 3: Wire edges
-  link(source=technique_id, target=paper_id, relation="introduced_by")   ← concept → paper
-  link(source="QLoRA", target=technique_id, relation="variant_of")       ← if QLoRA already exists
-  link(source=technique_id, target="PEFT", relation="instance_of")       ← parent category
-  link(source=technique_id, target="full fine-tuning", relation="competes_with")
+Step 3: Wire edges (always use IDs from prior responses, never entity names as strings)
+  link(source_id=technique.id, target_id=paper.id, relation="introduced_by")  ← concept → paper
+  link(source_id=qlora.id, target_id=technique.id, relation="variant_of")      ← if QLoRA already exists
+  link(source_id=technique.id, target_id=peft.id, relation="instance_of")      ← parent category
+  link(source_id=technique.id, target_id=full_finetune.id, relation="competes_with")
 
 Step 4: Author entity
-  search → create person → link(source=paper_id, target=person_id, relation="introduced_by")
+  person = search or create person entity
+  # introduced_by goes FROM concept TO paper or person — NOT from paper to person
+  # Paper authorship is recorded in properties.authors, not as introduced_by edges
+  link(source_id=technique.id, target_id=person.id, relation="introduced_by")
 
 Step 5: Insight note
   create(kind="note", note_kind="insight",
     content="LoRA achieves 99% of full fine-tuning quality at 0.1% parameter count by decomposing weight delta into two low-rank matrices",
-    salience=0.85, annotates=[technique_id])
+    salience=0.85, annotates=[technique.id])
 ```
 
 ## Dedup Workflow
@@ -110,7 +114,14 @@ Found duplicate: merge(into_id=<canonical>, from_id=<duplicate>)
 ## Verification Checklist
 
 After ingesting a batch:
+```python
+# List all concepts ingested, then check each
+concepts = list(kind="entity", entity_kind="concept", limit=50)
+for entity in concepts:
+    nbrs = neighbors(node_id=entity.id, direction="both")
+    edge_count = len(nbrs.edges)
+    if edge_count < 4:
+        print(f"Under-linked: {entity.name} ({edge_count} edges) — add edges before reporting done")
 ```
-query("MATCH (a:concept) RETURN a.name, a.id")
-```
-For each entity ID: `neighbors(node_id=<id>)` — count edges. Any with < min for kind → add edges before reporting done.
+
+Any with < min for kind → add edges before reporting done.

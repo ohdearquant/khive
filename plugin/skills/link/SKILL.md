@@ -1,4 +1,5 @@
 ---
+name: link
 description: Wire edges in the knowledge graph using the 13 canonical relations. Full ontology reference with examples and weight guidelines.
 ---
 
@@ -27,7 +28,13 @@ Edges are the value of the graph. An entity with no edges is a note in a noteboo
 | `introduced_by` | concept → paper/person | First described in | `LoRA` → `Hu et al. 2021 paper` |
 | `supersedes` | new → old | Entirely replaces | `FlashAttention-3` → `Flash Attention original` |
 
-**`introduced_by` direction is concept → paper, not paper → concept.** A common mistake: reversing this makes traversal from "find what a paper introduced" require `direction="in"` instead of the intuitive "out".
+**`introduced_by` direction is concept → paper or concept → person, never paper → person.**
+
+- Correct: `link(source_id=lora_concept.id, target_id=lora_paper.id, relation="introduced_by")` — LoRA (concept) was introduced by the LoRA paper
+- Correct: `link(source_id=lora_concept.id, target_id=hu_person.id, relation="introduced_by")` — LoRA was introduced by Hu
+- Wrong: `link(source_id=paper.id, target_id=person.id, relation="introduced_by")` — papers are NOT "introduced by" persons; record authorship in `properties.authors`
+
+To find what a paper introduced: `neighbors(node_id=paper_id, direction="in", relations=["introduced_by"])`
 
 `supersedes` is for complete replacement. `extends` is for "builds on but doesn't obsolete."
 
@@ -79,21 +86,28 @@ Default weight if omitted: 1.0. Use lower weights for hypothetical or uncertain 
 ## Link Examples
 
 ```python
+# Always use IDs from prior create/search responses — never entity names as strings
+lora = search(kind="entity", query="LoRA")[0]
+qlora = search(kind="entity", query="QLoRA")[0]
+lora_paper = search(kind="entity", query="LoRA paper")[0]
+peft = search(kind="entity", query="parameter-efficient fine-tuning")[0]
+full_finetune = search(kind="entity", query="full fine-tuning")[0]
+
 # Core derivation chain
-link(source_id=qlora_id, target_id=lora_id, relation="variant_of", weight=1.0)
-link(source_id=lora_id, target_id=paper_id, relation="introduced_by", weight=1.0)
-link(source_id=lora_id, target_id=peft_id, relation="instance_of", weight=0.9)
-link(source_id=lora_id, target_id=full_finetune_id, relation="competes_with", weight=0.8)
+link(source_id=qlora.id, target_id=lora.id, relation="variant_of", weight=1.0)
+link(source_id=lora.id, target_id=lora_paper.id, relation="introduced_by", weight=1.0)
+link(source_id=lora.id, target_id=peft.id, relation="instance_of", weight=0.9)
+link(source_id=lora.id, target_id=full_finetune.id, relation="competes_with", weight=0.8)
 
 # Implementation wiring
-link(source_id=codebase_id, target_id=lora_id, relation="implements", weight=1.0)
-link(source_id=codebase_id, target_id=parent_id, relation="part_of", weight=1.0)
+link(source_id=codebase.id, target_id=lora.id, relation="implements", weight=1.0)
+link(source_id=codebase.id, target_id=parent.id, relation="part_of", weight=1.0)
 
 # Dependency
-link(source_id=app_id, target_id=library_id, relation="depends_on", weight=1.0)
+link(source_id=app.id, target_id=library.id, relation="depends_on", weight=1.0)
 
 # Cross-system composition
-link(source_id=gdn_id, target_id=gqa_id, relation="composed_with", weight=0.8)
+link(source_id=gdn.id, target_id=gqa.id, relation="composed_with", weight=0.8)
 ```
 
 ## What Is NOT a Relation

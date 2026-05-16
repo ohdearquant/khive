@@ -7,7 +7,7 @@
     "url": "https://github.com/ohdearquant"
   },
   "homepage": "https://github.com/ohdearquant/khive",
-  "repository": "https://github.com/ohdearquant/khive-plugin",
+  "repository": "https://github.com/ohdearquant/khive",
   "license": "Apache-2.0",
   "mcpServers": {
     "khive": {

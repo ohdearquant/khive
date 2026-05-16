@@ -7,8 +7,8 @@ hybrid search, GQL/SPARQL queries — all via MCP.
 
 ```bash
 # Option 1: Plugin (includes skills)
-/plugin marketplace add https://github.com/ohdearquant/khive-plugin
-/plugin install khive@khive-plugin
+/plugin marketplace add https://github.com/ohdearquant/khive
+/plugin install khive
 
 # Option 2: Direct MCP (server only, no skills)
 claude mcp add --transport stdio khive -- khive-mcp
@@ -36,15 +36,17 @@ claude mcp add --transport stdio khive -- khive-mcp
 | `traverse` | Multi-hop BFS |
 | `query` | GQL/SPARQL pattern matching |
 
-### 5 Skills (slash commands)
+### 7 Skills (slash commands)
 
 | Skill | Command | Purpose |
 |-------|---------|---------|
 | kg-digest | `/khive:kg-digest` | Ingest research into the graph |
-| recall | `/khive:recall` | Search entities and notes |
-| orient | `/khive:orient` | Explore graph structure |
+| retrieve | `/khive:retrieve` | Choose the right retrieval verb |
+| orient | `/khive:orient` | Explore graph structure + health |
 | assign | `/khive:assign` | Create typed notes |
 | search | `/khive:search` | Hybrid semantic search |
+| curate | `/khive:curate` | Merge, dedup, supersede, delete |
+| link | `/khive:link` | Edge ontology reference |
 
 ### 1 Agent
 

@@ -1,8 +1,9 @@
 ---
+name: retrieve
 description: Retrieve from the knowledge graph — choose between search, query, traverse, and neighbors based on what you're looking for.
 ---
 
-# Recall
+# Retrieve
 
 Six retrieval verbs serve different questions. Picking the wrong one wastes tokens and misses results.
 
@@ -38,9 +39,11 @@ neighbors(node_id="b70dd157", direction="out", relations=["implements", "depends
 neighbors(node_id="b70dd157", direction="in", relations=["introduced_by"])
 ```
 
-Use `direction="in"` to find things that point TO a concept (e.g., who cites this paper).
+Use `direction="in"` to find things that point TO a concept (e.g., who cites this paper, or what concepts were introduced by a paper).
 Use `direction="out"` to find things this concept points to (e.g., what it extends).
 Use `direction="both"` for full local context before deciding where to traverse.
+
+**Finding what a paper introduced**: `introduced_by` goes FROM concept TO paper, so use `direction="in"` on the paper ID to find all concepts that were introduced by it.
 
 ## Traverse: Multi-Hop Lineage
 
@@ -56,24 +59,30 @@ Multiple `roots` lets you find the shared frontier of two concepts.
 
 ## Query: Pattern Matching
 
+GQL supports these constructs:
+
 ```gql
--- Who derives from LoRA? (up to 3 hops)
-MATCH (a)-[:extends|variant_of*1..3]->(b {name: 'LoRA'}) RETURN a.name, b.name
+-- Who derives from LoRA? (up to 3 hops, explicit min required)
+MATCH (a)-[:extends|variant_of*1..3]->(b) WHERE b.name = 'LoRA' RETURN a.name, b.name LIMIT 10
 
--- All papers in the attention domain
-MATCH (a:concept) WHERE a.domain = 'attention' AND a.type = 'paper' RETURN a.name
+-- Concepts with a property value (use a.domain for json_extract WHERE, not RETURN)
+MATCH (a:concept) WHERE a.domain = 'attention' RETURN a.name, a.id LIMIT 20
 
--- Concept → paper → person chain
-MATCH (p:concept)<-[:introduced_by]-(c)<-[:implements]-(impl)
-WHERE p.name = 'Attention Is All You Need' RETURN c.name, impl.name
+-- Concept → paper chain (introduced_by goes concept → paper)
+MATCH (c:concept)-[:introduced_by]->(p:document) RETURN c.name, p.name LIMIT 20
 
--- Concepts without any edges (orphans)
-MATCH (a:concept) WHERE NOT (a)-[]-() RETURN a.name
-
--- Low-degree nodes needing enrichment
-MATCH (a:concept) RETURN a.name, COUNT {(a)-[]-()} as degree
-ORDER BY degree ASC LIMIT 10
+-- Find all implementations of a concept
+MATCH (p:project)-[:implements]->(c:concept) WHERE c.name = 'FlashAttention' RETURN p.name, c.name LIMIT 20
 ```
+
+**GQL constraints** — the following are NOT supported, do not use them:
+- `WHERE NOT (a)-[]-()` — not implemented
+- `COUNT(...)` or `COUNT { ... }` — no aggregates
+- `ORDER BY` — not implemented
+- `RETURN a.domain` or `RETURN a.status` — these are JSON properties; use `RETURN a.properties` or filter with `WHERE a.domain = 'x'`
+- `[*..2]` — must be `[*1..2]` (explicit min required)
+
+For orphan detection and degree counting, use the multi-step Python procedures in the `orient` skill instead of GQL.
 
 SPARQL syntax works for the same queries:
 ```sparql

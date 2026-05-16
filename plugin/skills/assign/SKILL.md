@@ -1,4 +1,5 @@
 ---
+name: assign
 description: Create typed notes — decisions, insights, observations, questions, references — and attach them to entities for cross-substrate navigation.
 ---
 
@@ -86,14 +87,20 @@ Always use `annotates` unless the note is genuinely freestanding.
 When a decision changes, don't delete the old note — supersede it:
 
 ```python
-# Create the new note
-new = create(kind="note", note_kind="decision", content="New decision...", salience=0.9)
+# 1. Fetch the old note to find its annotates targets
+old = get(id=old_note_id)
+# old.annotates contains the entity IDs this note was attached to
 
-# Mark the old as superseded
-link(source_id=new.id, target_id=old_id, relation="supersedes")
+# 2. Create the replacement, attaching to the same entities
+new = create(kind="note", note_kind="decision",
+  content="New decision...", salience=0.9,
+  annotates=old.annotates)
+
+# 3. Mark the old as superseded
+link(source_id=new.id, target_id=old.id, relation="supersedes")
 ```
 
-Old note is now excluded from `search(kind="note")` results automatically. It's preserved for history via `get(id=old_id)`.
+Old note is now excluded from `search(kind="note")` results automatically. It's preserved for history via `get(id=old_note_id)`.
 
 ## Before Creating a Note
 

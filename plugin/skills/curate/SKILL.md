@@ -1,4 +1,5 @@
 ---
+name: curate
 description: Curate the knowledge graph — merge duplicates, supersede stale notes, clean up orphans, verify edge cascades.
 ---
 
@@ -20,7 +21,7 @@ If multiple results describe the same concept, merge them.
 ```gql
 -- Find entities with identical or very similar names
 MATCH (a:concept), (b:concept)
-WHERE a.name = b.name AND a.id <> b.id
+WHERE a.name = b.name AND a.id != b.id
 RETURN a.name, a.id, b.id
 ```
 
@@ -51,7 +52,7 @@ merge(into_id=<canonical>, from_id=<duplicate>,
 When a record is replaced by a better version, don't delete — supersede:
 
 ```python
-# Create the replacement
+# Create the replacement, attaching to the same entities as the old note
 new_note = create(kind="note", note_kind="decision",
   content="Updated decision with new evidence...", salience=0.9,
   annotates=["<entity-id>"])
@@ -62,7 +63,7 @@ link(source_id=new_note.id, target_id=old_note_id, relation="supersedes")
 
 **Effect**: `search(kind="note")` automatically excludes notes targeted by `supersedes` edges. The old note remains accessible via `get(id=old_note_id)` for history.
 
-For concepts: `link(source=new_concept, target=old_concept, relation="supersedes")` marks the old as obsolete.
+For concepts: `link(source_id=new_concept_id, target_id=old_concept_id, relation="supersedes")` marks the old as obsolete.
 
 ## Edge Cascade on Hard Delete
 
@@ -87,14 +88,21 @@ delete(id="<entity-uuid>")          # soft = default
 
 ## Orphan Cleanup
 
-After any merge or delete, check for orphans:
+After any merge or delete, check for orphans using a multi-step procedure (GQL does not support `WHERE NOT`):
 
-```gql
-MATCH (a:concept) WHERE NOT (a)-[]-() RETURN a.name, a.id
-MATCH (a:project) WHERE NOT (a)-[]-() RETURN a.name, a.id
+```python
+# 1. List all concept entities
+concepts = list(kind="entity", entity_kind="concept", limit=50)
+
+# 2. For each entity, check neighbor count
+for entity in concepts:
+    result = neighbors(node_id=entity.id, direction="both")
+    if len(result.edges) == 0:
+        # Orphan — add minimum edges or hard-delete if stale artifact
+        print(f"Orphan: {entity.name} ({entity.id})")
 ```
 
-For each orphan: either add minimum edges or hard-delete if it was a stale artifact.
+Repeat for `entity_kind="project"`. For each orphan: either add minimum edges or hard-delete if it was a stale artifact.
 
 ## Edge Quality Pass
 
@@ -109,16 +117,23 @@ For each low-weight edge: `get(id=<edge-id>)` → decide: update weight (if you 
 ## Post-Curate Verification
 
 ```python
-# 1. Density check
-query("MATCH ()-[e]-() RETURN COUNT(e) as edges")
-query("MATCH (n) RETURN COUNT(n) as nodes")
-# → edges/nodes should be ≥ 5
+# 1. Density check (multi-step: aggregate queries are not supported in GQL)
+all_edges = list(kind="edge", limit=500)
+all_nodes = list(kind="entity", limit=500)
+# → len(all_edges) / len(all_nodes) should be ≥ 5
 
 # 2. Orphan check
-query("MATCH (a:concept) WHERE NOT (a)-[]-() RETURN a.name")
-# → should return 0 rows
+concepts = list(kind="entity", entity_kind="concept", limit=50)
+for entity in concepts:
+    nbrs = neighbors(node_id=entity.id, direction="both")
+    if len(nbrs.edges) == 0:
+        print(f"Orphan: {entity.name}")
+# → should find 0 orphans
 
 # 3. Low-degree check
-query("MATCH (a:concept) RETURN a.name, COUNT {(a)-[]-()} as d ORDER BY d ASC LIMIT 10")
-# → all concepts should have d ≥ 4
+for entity in concepts:
+    nbrs = neighbors(node_id=entity.id, direction="both")
+    if len(nbrs.edges) < 4:
+        print(f"Under-linked: {entity.name} ({len(nbrs.edges)} edges)")
+# → all concepts should have ≥ 4 edges
 ```

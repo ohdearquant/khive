@@ -49,6 +49,13 @@ Use only these 13 relations (no others — the parser rejects unknown relations)
 - Lateral: `competes_with`, `composed_with`
 - Annotation: `annotates`
 
+**`introduced_by` direction**: concept → paper or concept → person. Never paper → person.
+- Correct: `link(source_id=concept.id, target_id=paper.id, relation="introduced_by")` — concept was introduced by the paper
+- Correct: `link(source_id=concept.id, target_id=person.id, relation="introduced_by")` — concept was introduced by the person
+- Wrong: `link(source_id=paper.id, target_id=person.id, relation="introduced_by")` — authorship belongs in `properties.authors`
+
+**Always use IDs from prior responses.** Never pass entity names as strings to `source_id` or `target_id`.
+
 **Every concept you create needs at minimum**: one `instance_of` or `extends` (parent), one `introduced_by` (paper or person if known), and one lateral edge if alternatives exist.
 
 ### Note creation rules
@@ -59,17 +66,17 @@ Record findings as notes annotating the relevant entity:
 # Observation during research
 create(kind="note", note_kind="observation",
   content="FlashAttention-3 on H100 achieves 1.5-2.0× speedup over FA-2 using TMA and async softmax pipeline",
-  salience=0.75, annotates=["<FlashAttention-3-id>"])
+  salience=0.75, annotates=[flash3.id])
 
 # Synthetic conclusion
 create(kind="note", note_kind="insight",
   content="IO-awareness in attention kernels consistently yields 2-4× speedup regardless of architecture — the bottleneck is memory bandwidth, not compute",
-  salience=0.85, annotates=["<FlashAttention-id>", "<IO-aware-attention-id>"])
+  salience=0.85, annotates=[flash.id, io_aware.id])
 
 # Open question for follow-up
 create(kind="note", note_kind="question",
   content="Does FlashAttention-3's TMA approach work on AMD MI300X, or is it CUDA-only?",
-  salience=0.6, annotates=["<FlashAttention-3-id>"])
+  salience=0.6, annotates=[flash3.id])
 ```
 
 Never store findings ONLY as notes. If a concept is worth naming, it's an entity with edges.
@@ -83,9 +90,9 @@ Never store findings ONLY as notes. If a concept is worth naming, it's an entity
 "What does entity X connect to?"     → neighbors(node_id=X, direction="both")
 "What builds on X? (lineage)"        → traverse(roots=[X], direction="in", relations=["extends","variant_of"])
 "What does X depend on?"             → traverse(roots=[X], direction="out", relations=["depends_on"])
-"All concepts in domain Y"           → query("MATCH (a:concept) WHERE a.domain='Y' RETURN a.name")
-"Implementations of concept X"       → query("MATCH (p:project)-[:implements]->(c) WHERE c.name='X' RETURN p.name")
-"Papers introducing X"               → neighbors(node_id=X, direction="out", relations=["introduced_by"])
+"All concepts in domain Y"           → query("MATCH (a:concept) WHERE a.domain='Y' RETURN a.name, a.id LIMIT 50")
+"Implementations of concept X"       → query("MATCH (p:project)-[:implements]->(c:concept) WHERE c.name='X' RETURN p.name, c.name LIMIT 20")
+"What concepts did paper P introduce?"→ neighbors(node_id=paper_id, direction="in", relations=["introduced_by"])
 "Previously observed/decided on X"   → search(kind="note", query=X)
 ```
 
@@ -97,11 +104,17 @@ Mandatory verification before reporting:
 
 1. **Orphan check** — every entity you created must have ≥ 1 edge:
    ```python
-   neighbors(node_id=<created-id>)
+   nbrs = neighbors(node_id=<created-id>, direction="both")
+   if len(nbrs.edges) == 0:
+       # add instance_of at minimum
    ```
-   If 0 edges: add `instance_of` at minimum.
 
-2. **Density check** — concepts should have ≥ 4 edges, projects ≥ 3, documents ≥ 2.
+2. **Density check** — concepts should have ≥ 4 edges, projects ≥ 3, documents ≥ 2:
+   ```python
+   for entity_id in created_ids:
+       nbrs = neighbors(node_id=entity_id, direction="both")
+       print(f"{entity_id}: {len(nbrs.edges)} edges")
+   ```
 
 3. **Update status** if research changed maturity:
    ```python
@@ -112,7 +125,7 @@ Mandatory verification before reporting:
    ```python
    create(kind="note", note_kind="decision",
      content="Chose X over Y because Z. Alternatives considered: [list]",
-     salience=0.9, annotates=["<entity-id>"])
+     salience=0.9, annotates=[entity.id])
    ```
 
 ---
@@ -130,7 +143,7 @@ Return findings to the caller with:
 Example:
 ```
 Ingested: FlashAttention-3 (concept, id: a3f9c2b1)
-Edges: extends→FlashAttention-2, introduced_by→Dao et al. 2024, competes_with→Mamba attention
+Edges: extends→FlashAttention-2, introduced_by→Dao et al. 2024 paper, competes_with→Mamba attention
 Notes: 1 observation (salience 0.75), 1 question (salience 0.6)
 Gap: TMA support on AMD — filed as question note
 Density: 47 edges / 11 entities = 4.3 (was 3.8 before)
@@ -143,6 +156,8 @@ Density: 47 edges / 11 entities = 4.3 (was 3.8 before)
 - Do not search externally for things already in the graph — check the graph first
 - Do not create entities without edges — orphans degrade graph quality immediately
 - Do not use ad-hoc edge relations (`uses`, `related_to`, `references`) — map to the 13 or don't link
-- Do not reverse `introduced_by` — direction is concept → paper, not paper → concept
+- Do not reverse `introduced_by` — direction is concept → paper/person, never paper → person
+- Do not use entity names as strings in `source_id`/`target_id` — always use IDs from prior responses
 - Do not use `traverse` when `neighbors` suffices — use the cheapest retrieval that answers the question
 - Do not leave notes unattached to entities — always use `annotates`
+- Do not use unsupported GQL constructs (`WHERE NOT`, `COUNT`, `ORDER BY`, `[*..N]` without min)

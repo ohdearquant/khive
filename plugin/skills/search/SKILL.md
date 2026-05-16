@@ -1,4 +1,5 @@
 ---
+name: search
 description: Search mechanics — hybrid FTS5+vector for similarity, GQL/SPARQL for patterns, list for structured filtering.
 ---
 
@@ -41,7 +42,7 @@ list(kind="entity", entity_kind="concept", limit=50)
 list(kind="entity", entity_kind="project")
 list(kind="edge", source_id="<uuid>")
 list(kind="edge", target_id="<uuid>", relations=["implements"])
-list(kind="edge", relations=["introduces_by"], min_weight=0.7)
+list(kind="edge", relations=["introduced_by"], min_weight=0.7)
 list(kind="note", note_kind="decision", limit=20)
 ```
 
@@ -52,26 +53,34 @@ list(kind="note", note_kind="decision", limit=20)
 GQL queries compile to SQL. Use when `search` would return too much noise or when you need structural patterns across the graph.
 
 ```gql
--- Entities with specific property values
-MATCH (a:concept) WHERE a.domain = 'attention' AND a.status = 'implemented' RETURN a.name
+-- Entities with specific property values (json_extract works in WHERE)
+MATCH (a:concept) WHERE a.domain = 'attention' RETURN a.name, a.id LIMIT 20
 
 -- Chain through multiple edge types
-MATCH (c:concept)<-[:introduced_by]-(d:document) WHERE d.year = '2022' RETURN c.name, d.name
+MATCH (c:concept)-[:introduced_by]->(d:document) WHERE d.year = '2022' RETURN c.name, d.name LIMIT 20
 
--- Property projection in RETURN
-MATCH (a:concept)-[:competes_with]->(b:concept) RETURN a.name, b.name, a.domain
+-- Property projection in RETURN (only: id, name, kind, namespace, description, properties, created_at, updated_at)
+MATCH (a:concept)-[:competes_with]->(b:concept) RETURN a.name, b.name LIMIT 20
 
 -- Find all implementations of a concept
-MATCH (p:project)-[:implements]->(c:concept) WHERE c.name = 'FlashAttention' RETURN p.name
+MATCH (p:project)-[:implements]->(c:concept) WHERE c.name = 'FlashAttention' RETURN p.name, c.name LIMIT 20
 
--- Concepts with no parent (potential orphaned entries needing instance_of)
-MATCH (a:concept) WHERE NOT (a)-[:instance_of|extends]->() RETURN a.name
+-- Concepts without a parent category (potential entries needing instance_of)
+MATCH (a:concept) RETURN a.name, a.id LIMIT 50
+-- Then check each via: neighbors(node_id=<id>, direction="out", relations=["instance_of", "extends"])
 ```
+
+**GQL constraints** — the following are NOT supported:
+- `WHERE NOT` — not implemented; use multi-step Python procedures instead
+- `COUNT(...)` or `COUNT { ... }` — no aggregates; count in Python after fetching
+- `ORDER BY` — not implemented
+- `RETURN a.domain` or `RETURN a.status` — these are JSON inside `properties`; use `RETURN a.properties` to get the full JSON, or `WHERE a.domain = 'x'` to filter
+- `[*..2]` — must be `[*1..2]` (explicit min required in variable-length patterns)
 
 ## SPARQL Alternative
 
 ```sparql
-SELECT ?name ?domain WHERE {
+SELECT ?name WHERE {
   ?a a :concept .
   ?a :domain ?domain .
   ?a :name ?name .
@@ -106,4 +115,5 @@ Is the query an exact property value match?    → query (WHERE a.domain = 'atte
 Do you need multi-hop structural patterns?     → query (MATCH path)
 Do you need ranked results by relevance?       → search
 Do you need all edges of a specific type?      → list(kind="edge", relations=[...])
+Do you need aggregate counts or sorting?       → fetch with list/neighbors, count in Python
 ```
