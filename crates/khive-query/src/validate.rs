@@ -85,21 +85,34 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
                         .map_err(|err| QueryError::Validation(err.to_string()))?;
                     *relation = parsed.as_str().to_string();
                 }
-                if edge.max_hops > MAX_DEPTH {
-                    edge.max_hops = MAX_DEPTH;
-                }
-                if edge.min_hops > edge.max_hops {
-                    edge.min_hops = edge.max_hops;
-                }
-                // Zero-hop (start == end) results require a depth-0 seed in
-                // the recursive CTE that we haven't implemented yet. Reject
-                // explicitly rather than silently compiling as one-or-more.
                 if edge.min_hops == 0 {
                     return Err(QueryError::Unsupported(
                         "zero-hop ranges (min_hops = 0) not yet supported; \
                          use a minimum of 1 hop"
                             .into(),
                     ));
+                }
+                // Reject inverted ranges before any clamping — silently
+                // rewriting *3..1 to *1..1 changes query semantics.
+                if edge.min_hops > edge.max_hops {
+                    return Err(QueryError::Validation(format!(
+                        "invalid hop range: min {} > max {}",
+                        edge.min_hops, edge.max_hops
+                    )));
+                }
+                // If the minimum already exceeds our depth cap, the query
+                // can never produce results — reject rather than silently
+                // returning an empty set from a clamped range.
+                if edge.min_hops > MAX_DEPTH {
+                    return Err(QueryError::Unsupported(format!(
+                        "minimum hop count {} exceeds depth cap {}",
+                        edge.min_hops, MAX_DEPTH
+                    )));
+                }
+                // Clamp max_hops to the depth cap — the lower bound is
+                // still satisfiable, so this only narrows the search.
+                if edge.max_hops > MAX_DEPTH {
+                    edge.max_hops = MAX_DEPTH;
                 }
             }
         }
@@ -334,5 +347,38 @@ mod tests {
             matches!(err, QueryError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
         );
+    }
+
+    #[test]
+    fn rejects_inverted_range() {
+        // *3..1 is an inverted range — must error, not silently rewrite to *1..1.
+        let mut q = gql::parse("MATCH (a)-[:extends*3..1]->(b) RETURN b").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Validation(_)),
+            "expected Validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_min_hops_above_depth_cap() {
+        // min=50, max=100 — the lower bound exceeds MAX_DEPTH so the query
+        // can never produce results within our cap.
+        let mut q = gql::parse("MATCH (a)-[:extends*50..100]->(b) RETURN b").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clamps_max_but_keeps_satisfiable_min() {
+        // *2..50 — min 2 is satisfiable, max gets clamped to MAX_DEPTH.
+        let mut q = gql::parse("MATCH (a)-[:extends*2..50]->(b) RETURN b").unwrap();
+        validate(&mut q).unwrap();
+        let edge = q.pattern.edges().next().unwrap();
+        assert_eq!(edge.min_hops, 2);
+        assert_eq!(edge.max_hops, MAX_DEPTH);
     }
 }
