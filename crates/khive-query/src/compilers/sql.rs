@@ -951,4 +951,43 @@ mod tests {
         let err = sparql::parse("SELECT ?a ?b WHERE { ?a :extends* ?b . }").unwrap_err();
         assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
     }
+
+    #[test]
+    fn return_property_projection_compiles() {
+        let q = gql::parse("MATCH (a:concept)-[e:extends]->(b:concept) RETURN a.name, b.name LIMIT 5").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // Node aliases are n0, n1; the SQL uses `alias.col AS var_prop`
+        assert!(compiled.sql.contains(".name AS a_name"), "sql: {}", compiled.sql);
+        assert!(compiled.sql.contains(".name AS b_name"), "sql: {}", compiled.sql);
+        assert!(!compiled.sql.contains("a_kind"), "should not emit full node columns");
+    }
+
+    #[test]
+    fn return_unknown_node_property_rejected() {
+        let q = gql::parse("MATCH (a:concept)-[:extends]->(b) RETURN a.domain LIMIT 5").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(ref msg) if msg.contains("unknown node property 'domain'")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn return_unknown_edge_property_rejected() {
+        let q = gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.label LIMIT 5").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(ref msg) if msg.contains("unknown edge property 'label'")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn return_valid_edge_property_compiles() {
+        let q = gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.relation, e.weight LIMIT 5").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // Edge alias is e0; SQL: `e0.relation AS e_relation`
+        assert!(compiled.sql.contains(".relation AS e_relation"), "sql: {}", compiled.sql);
+        assert!(compiled.sql.contains(".weight AS e_weight"), "sql: {}", compiled.sql);
+    }
 }

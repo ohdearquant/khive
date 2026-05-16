@@ -106,9 +106,10 @@ Resolution rules:
   own namespace. Cross-namespace information leakage is prevented.
 
 Design rationale: agents produce and consume many UUIDs per session. Full 36-char UUIDs are
-noisy in tool output and waste tokens. 8-char prefixes are collision-resistant for graphs under
-~100K records (birthday-paradox threshold: 4 billion with 8 hex chars). If a namespace grows
-large enough for collisions, agents use longer prefixes or full UUIDs.
+noisy in tool output and waste tokens. 8 hex chars gives a 2^32 keyspace (~4.3B possible
+prefixes); the birthday-paradox collision threshold is ~sqrt(2^32) ≈ 65K records, so
+ambiguity errors become plausible around tens of thousands of IDs per namespace. Ambiguity
+is handled gracefully (explicit error), and agents extend the prefix when needed.
 
 ### Param-struct shape
 
