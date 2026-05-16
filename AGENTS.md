@@ -121,6 +121,43 @@ probably a property on the entity, not an edge.
 
 ---
 
+## Tool schemas (required → **bold**, optional → normal)
+
+| Tool        | Fields                                                                                                                                               | Example                                                      |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `create`    | **kind** (entity\|note), **name** + **entity_kind** for entity, **content** + note_kind for note; description, properties, tags, salience, annotates | `{"kind":"entity","entity_kind":"concept","name":"LoRA"}`    |
+| `get`       | **id** (UUID); namespace                                                                                                                             | `{"id":"<uuid>"}`                                            |
+| `list`      | **kind** (entity\|edge\|note); entity_kind, note_kind, source_id, target_id, relations, min_weight, max_weight, limit                                | `{"kind":"entity","entity_kind":"concept","limit":20}`       |
+| `update`    | **id** (UUID); name, description, properties, tags (entity), relation, weight (edge); namespace                                                      | `{"id":"<uuid>","description":"Updated desc"}`               |
+| `delete`    | **id** (UUID); hard (default: false); namespace                                                                                                      | `{"id":"<uuid>","hard":true}`                                |
+| `merge`     | **into_id**, **from_id**; strategy (prefer_into\|prefer_from\|union); namespace                                                                      | `{"into_id":"<uuid>","from_id":"<uuid>"}`                    |
+| `search`    | **kind** (entity\|note), **query** (text); limit; namespace                                                                                          | `{"kind":"entity","query":"attention mechanism"}`            |
+| `link`      | **source_id**, **target_id**, **relation**; weight (0.0–1.0); namespace                                                                              | `{"source_id":"<A>","target_id":"<B>","relation":"extends"}` |
+| `neighbors` | **node_id**; direction (out\|in\|both), relations, limit; namespace                                                                                  | `{"node_id":"<uuid>","direction":"in"}`                      |
+| `traverse`  | **roots** (UUID list); max_depth, direction, relations, include_roots; namespace                                                                     | `{"roots":["<uuid>"],"max_depth":2}`                         |
+| `query`     | **query** (GQL or SPARQL string); namespace                                                                                                          | `{"query":"MATCH (a:concept)-[:extends]->(b) RETURN a"}`     |
+
+### When to use which retrieval verb
+
+- **`get(id)`** — you have a UUID, fetch the record (any type)
+- **`search(kind, query)`** — text similarity: "find things _about_ X"
+- **`list(kind, filters)`** — structured browse: "all concepts" / "edges from node A"
+- **`neighbors(node_id)`** — one-hop graph: "what connects to X?"
+- **`traverse(roots)`** — multi-hop graph: "reachability within N hops"
+- **`query(gql)`** — pattern matching: "concepts that extend something introduced by a paper"
+
+### v0.1 workaround: supersession via edges
+
+Until `supersede` lands, manually create a supersedes edge:
+
+```
+link(source_id=new_note, target_id=old_note, relation="supersedes")
+```
+
+`search(kind="note")` already excludes notes targeted by a `supersedes` edge.
+
+---
+
 ## Research workflow pattern
 
 ```
