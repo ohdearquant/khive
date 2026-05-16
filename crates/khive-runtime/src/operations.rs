@@ -1,19 +1,37 @@
 //! High-level operations composing storage capabilities into user-facing verbs.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use uuid::Uuid;
 
+use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::note::{Note, NoteKind};
 use khive_storage::types::{
     DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery,
-    PageRequest, SortOrder, SqlStatement, TextDocument, TraversalRequest,
+    PageRequest, SortOrder, SqlStatement, TextDocument, TextFilter, TextQueryMode,
+    TextSearchRequest, TraversalRequest, VectorSearchRequest,
 };
-use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter};
+use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event};
 use khive_types::{EntityKind, SubstrateKind};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::KhiveRuntime;
+
+/// A note search result with UUID and salience-weighted RRF score.
+#[derive(Clone, Debug)]
+pub struct NoteSearchHit {
+    pub note_id: Uuid,
+    pub score: DeterministicScore,
+}
+
+/// Result of resolving a UUID to its substrate kind.
+#[derive(Clone, Debug)]
+pub enum Resolved {
+    Entity(Entity),
+    Note(Note),
+    Event(Event),
+}
 
 impl KhiveRuntime {
     // ---- Entity operations ----
@@ -72,12 +90,22 @@ impl KhiveRuntime {
     }
 
     /// Retrieve an entity by ID.
+    ///
+    /// Returns `None` if the entity does not exist or belongs to a different namespace.
+    /// This enforces ADR-007 namespace isolation at the runtime layer.
     pub async fn get_entity(
         &self,
         namespace: Option<&str>,
         id: Uuid,
     ) -> RuntimeResult<Option<Entity>> {
-        Ok(self.entities(namespace)?.get_entity(id).await?)
+        let entity = match self.entities(namespace)?.get_entity(id).await? {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        if entity.namespace != self.ns(namespace) {
+            return Ok(None);
+        }
+        Ok(Some(entity))
     }
 
     /// List entities in a namespace, optionally filtered by kind.
@@ -88,9 +116,10 @@ impl KhiveRuntime {
         limit: u32,
     ) -> RuntimeResult<Vec<Entity>> {
         let filter = EntityFilter {
-            kinds: kind
-                .map(|k| vec![EntityKind::from_str(k).unwrap_or_default()])
-                .unwrap_or_default(),
+            kinds: match kind {
+                Some(k) => vec![EntityKind::from_str(k).map_err(RuntimeError::InvalidInput)?],
+                None => vec![],
+            },
             ..Default::default()
         };
         let page = self
@@ -124,17 +153,21 @@ impl KhiveRuntime {
         Ok(edge)
     }
 
-    /// Get immediate neighbors of a node.
+    /// Get immediate neighbors of a node, optionally filtered by relation type.
+    ///
+    /// Pass `relations: Some(vec![EdgeRelation::Annotates])` to retrieve only
+    /// annotation edges, enabling cross-substrate navigation as described in ADR-024.
     pub async fn neighbors(
         &self,
         namespace: Option<&str>,
         node_id: Uuid,
         direction: Direction,
         limit: Option<u32>,
+        relations: Option<Vec<EdgeRelation>>,
     ) -> RuntimeResult<Vec<NeighborHit>> {
         let query = NeighborQuery {
             direction,
-            relations: None,
+            relations,
             limit,
             min_weight: None,
         };
@@ -152,16 +185,58 @@ impl KhiveRuntime {
 
     // ---- Note operations ----
 
-    /// Create and persist a note.
+    /// Create and persist a note, optionally with properties and annotation targets.
+    ///
+    /// After creating the note:
+    /// - Always indexes into FTS5 at the `notes_<namespace>` key.
+    /// - If an embedding model is configured, indexes into the vector store with
+    ///   `SubstrateKind::Note`.
+    /// - For each UUID in `annotates`, creates an `EdgeRelation::Annotates` edge from
+    ///   the note to that target.
     pub async fn create_note(
         &self,
         namespace: Option<&str>,
         kind: NoteKind,
         content: &str,
         salience: f64,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        let note = Note::new(self.ns(namespace), kind, content).with_salience(salience);
-        self.notes(namespace)?.upsert_note(note.clone()).await?;
+        let ns = self.ns(namespace);
+        let mut note = Note::new(ns, kind, content).with_salience(salience);
+        if let Some(p) = properties {
+            note = note.with_properties(p);
+        }
+        self.notes(Some(ns))?.upsert_note(note.clone()).await?;
+
+        // Index into FTS5.
+        self.text_for_notes(Some(ns))?
+            .upsert_document(TextDocument {
+                subject_id: note.id,
+                kind: SubstrateKind::Note,
+                title: None,
+                body: note.content.clone(),
+                tags: vec![],
+                namespace: ns.to_string(),
+                metadata: note.properties.clone(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await?;
+
+        // Index into vector store if model is configured.
+        if self.config().embedding_model.is_some() {
+            let vector = self.embed(&note.content).await?;
+            self.vectors(Some(ns))?
+                .insert(note.id, SubstrateKind::Note, ns, vector)
+                .await?;
+        }
+
+        // Create annotates edges.
+        for target_id in annotates {
+            self.link(Some(ns), note.id, target_id, EdgeRelation::Annotates, 1.0)
+                .await?;
+        }
+
         Ok(note)
     }
 
@@ -172,15 +247,137 @@ impl KhiveRuntime {
         kind: Option<&str>,
         limit: u32,
     ) -> RuntimeResult<Vec<Note>> {
+        let note_kind = match kind {
+            Some(k) => Some(NoteKind::from_str(k).map_err(RuntimeError::InvalidInput)?),
+            None => None,
+        };
         let page = self
             .notes(namespace)?
             .query_notes(
                 self.ns(namespace),
-                kind.and_then(|k| NoteKind::from_str(k).ok()),
+                note_kind,
                 PageRequest { offset: 0, limit },
             )
             .await?;
         Ok(page.items)
+    }
+
+    /// Search notes using a hybrid FTS5 + vector pipeline with salience weighting.
+    ///
+    /// Pipeline (per ADR-024):
+    /// 1. FTS5 query against `notes_<namespace>`.
+    /// 2. If embedding model is configured: vector search filtered to `kind="note"`.
+    /// 3. RRF fusion (k=60).
+    /// 4. Salience-weighted rerank: `score *= (0.5 + 0.5 * note.salience)`.
+    /// 5. Filter soft-deleted notes (`deleted_at IS NOT NULL`).
+    /// 6. Truncate to `limit`.
+    pub async fn search_notes(
+        &self,
+        namespace: Option<&str>,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: u32,
+    ) -> RuntimeResult<Vec<NoteSearchHit>> {
+        const RRF_K: usize = 60;
+        let candidates = limit.saturating_mul(4).max(limit);
+        let ns = self.ns(namespace).to_string();
+
+        // FTS5 over the notes index.
+        let text_hits = self
+            .text_for_notes(namespace)?
+            .search(TextSearchRequest {
+                query: query_text.to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(TextFilter {
+                    namespaces: vec![ns.clone()],
+                    ..TextFilter::default()
+                }),
+                top_k: candidates,
+                snippet_chars: 200,
+            })
+            .await?;
+
+        // Vector search filtered to notes.
+        let vector_hits = if let Some(vec) = query_vector {
+            self.vectors(namespace)?
+                .search(VectorSearchRequest {
+                    query_embedding: vec,
+                    top_k: candidates,
+                    namespace: Some(ns.clone()),
+                    kind: Some(SubstrateKind::Note),
+                })
+                .await?
+        } else {
+            vec![]
+        };
+
+        // RRF fusion.
+        let mut buckets: HashMap<Uuid, DeterministicScore> = HashMap::new();
+        for (i, hit) in text_hits.into_iter().enumerate() {
+            let rank = i + 1;
+            let entry = buckets.entry(hit.subject_id).or_default();
+            *entry = *entry + rrf_score(rank, RRF_K);
+        }
+        for (i, hit) in vector_hits.into_iter().enumerate() {
+            let rank = i + 1;
+            let entry = buckets.entry(hit.subject_id).or_default();
+            *entry = *entry + rrf_score(rank, RRF_K);
+        }
+
+        let candidate_ids: Vec<Uuid> = buckets.keys().copied().collect();
+        if candidate_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Fetch each candidate note individually to get salience and apply soft-delete filter.
+        let note_store = self.notes(namespace)?;
+        let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
+        for id in &candidate_ids {
+            if let Some(note) = note_store.get_note(*id).await? {
+                if note.deleted_at.is_none() {
+                    alive_notes.insert(*id, note);
+                }
+            }
+        }
+
+        // Apply salience weighting and collect final hits.
+        let mut hits: Vec<NoteSearchHit> = buckets
+            .into_iter()
+            .filter_map(|(id, rrf)| {
+                let note = alive_notes.get(&id)?;
+                let weight = 0.5 + 0.5 * note.salience;
+                let weighted = DeterministicScore::from_f64(rrf.to_f64() * weight);
+                Some(NoteSearchHit {
+                    note_id: id,
+                    score: weighted,
+                })
+            })
+            .collect();
+
+        hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
+        hits.truncate(limit as usize);
+        Ok(hits)
+    }
+
+    /// Resolve a UUID to its substrate kind by trying entity, then note, then event stores.
+    ///
+    /// Returns `None` if the UUID is not found in any substrate.
+    /// Cost: at most 3 store lookups per call (cheap for v0.1).
+    pub async fn resolve(
+        &self,
+        namespace: Option<&str>,
+        id: Uuid,
+    ) -> RuntimeResult<Option<Resolved>> {
+        if let Some(entity) = self.entities(namespace)?.get_entity(id).await? {
+            return Ok(Some(Resolved::Entity(entity)));
+        }
+        if let Some(note) = self.notes(namespace)?.get_note(id).await? {
+            return Ok(Some(Resolved::Note(note)));
+        }
+        if let Some(event) = self.events(namespace)?.get_event(id).await? {
+            return Ok(Some(Resolved::Event(event)));
+        }
+        Ok(None)
     }
 
     // ---- Query operations ----
@@ -212,12 +409,22 @@ impl KhiveRuntime {
     }
 
     /// Delete an entity by ID (soft delete by default).
+    ///
+    /// Returns `false` without deleting if the entity exists but belongs to a different namespace.
+    /// This enforces ADR-007 namespace isolation at the runtime layer.
     pub async fn delete_entity(
         &self,
         namespace: Option<&str>,
         id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
+        let entity = match self.entities(namespace)?.get_entity(id).await? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        if entity.namespace != self.ns(namespace) {
+            return Ok(false);
+        }
         let mode = if hard {
             DeleteMode::Hard
         } else {
@@ -233,9 +440,10 @@ impl KhiveRuntime {
         kind: Option<&str>,
     ) -> RuntimeResult<u64> {
         let filter = EntityFilter {
-            kinds: kind
-                .map(|k| vec![EntityKind::from_str(k).unwrap_or_default()])
-                .unwrap_or_default(),
+            kinds: match kind {
+                Some(k) => vec![EntityKind::from_str(k).map_err(RuntimeError::InvalidInput)?],
+                None => vec![],
+            },
             ..Default::default()
         };
         Ok(self
@@ -514,5 +722,333 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(just_extends, 1);
+    }
+
+    #[tokio::test]
+    async fn get_entity_namespace_isolation() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(Some("ns-a"), "concept", "Alpha", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Same namespace: visible.
+        let found = rt.get_entity(Some("ns-a"), entity.id).await.unwrap();
+        assert!(found.is_some(), "should be visible in its own namespace");
+
+        // Different namespace: invisible.
+        let not_found = rt.get_entity(Some("ns-b"), entity.id).await.unwrap();
+        assert!(
+            not_found.is_none(),
+            "should not be visible across namespaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_entity_namespace_isolation() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(Some("ns-a"), "concept", "Beta", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Delete from wrong namespace: no-op, returns false.
+        let deleted = rt
+            .delete_entity(Some("ns-b"), entity.id, true)
+            .await
+            .unwrap();
+        assert!(!deleted, "cross-namespace delete must return false");
+
+        // Entity still present in its own namespace.
+        let still_there = rt.get_entity(Some("ns-a"), entity.id).await.unwrap();
+        assert!(
+            still_there.is_some(),
+            "entity must survive cross-ns delete attempt"
+        );
+
+        // Delete from correct namespace: succeeds.
+        let deleted_ok = rt
+            .delete_entity(Some("ns-a"), entity.id, true)
+            .await
+            .unwrap();
+        assert!(deleted_ok, "same-namespace delete must succeed");
+    }
+
+    // ---- Note ADR-024 tests ----
+
+    #[tokio::test]
+    async fn create_note_indexes_into_fts5() {
+        let rt = rt();
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                "FlashAttention reduces memory by using tiling",
+                0.8,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // FTS5 should have indexed the note content.
+        let ns = rt.ns(None).to_string();
+        let hits = rt
+            .text_for_notes(None)
+            .unwrap()
+            .search(khive_storage::types::TextSearchRequest {
+                query: "FlashAttention".to_string(),
+                mode: khive_storage::types::TextQueryMode::Plain,
+                filter: Some(khive_storage::types::TextFilter {
+                    namespaces: vec![ns],
+                    ..Default::default()
+                }),
+                top_k: 10,
+                snippet_chars: 100,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            hits.iter().any(|h| h.subject_id == note.id),
+            "note should be indexed in FTS5 after create"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_with_properties() {
+        let rt = rt();
+        let props = serde_json::json!({"source": "arxiv:2205.14135"});
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Insight,
+                "FlashAttention is IO-aware",
+                0.9,
+                Some(props.clone()),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(note.properties.as_ref().unwrap(), &props);
+    }
+
+    #[tokio::test]
+    async fn create_note_creates_annotates_edges() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(None, "concept", "FlashAttention", None, None, vec![])
+            .await
+            .unwrap();
+
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                "FlashAttention uses SRAM tiling for memory efficiency",
+                0.9,
+                None,
+                vec![entity.id],
+            )
+            .await
+            .unwrap();
+
+        // The note should have an outbound `annotates` edge to the entity.
+        let out_neighbors = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out_neighbors.len(), 1);
+        assert_eq!(out_neighbors[0].node_id, entity.id);
+        assert_eq!(out_neighbors[0].relation, EdgeRelation::Annotates);
+
+        // The entity should have an inbound `annotates` edge from the note.
+        let in_neighbors = rt
+            .neighbors(
+                None,
+                entity.id,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(in_neighbors.len(), 1);
+        assert_eq!(in_neighbors[0].node_id, note.id);
+    }
+
+    #[tokio::test]
+    async fn neighbors_without_relation_filter_returns_all() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let c = rt
+            .create_entity(None, "concept", "C", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+            .await
+            .unwrap();
+
+        let all = rt
+            .neighbors(None, a.id, Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn neighbors_with_relation_filter_returns_subset() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let c = rt
+            .create_entity(None, "concept", "C", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+            .await
+            .unwrap();
+
+        let filtered = rt
+            .neighbors(
+                None,
+                a.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Extends]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].node_id, b.id);
+        assert_eq!(filtered[0].relation, EdgeRelation::Extends);
+    }
+
+    #[tokio::test]
+    async fn search_notes_returns_relevant_note() {
+        let rt = rt();
+        rt.create_note(
+            None,
+            khive_storage::NoteKind::Observation,
+            "GQA reduces KV cache memory for large models",
+            0.8,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let results = rt
+            .search_notes(None, "GQA KV cache", None, 10)
+            .await
+            .unwrap();
+
+        assert!(!results.is_empty(), "search should return the indexed note");
+    }
+
+    #[tokio::test]
+    async fn search_notes_excludes_soft_deleted() {
+        let rt = rt();
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                "RoPE positional encoding rotary embeddings",
+                0.7,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Soft-delete the note.
+        rt.notes(None)
+            .unwrap()
+            .delete_note(note.id, DeleteMode::Soft)
+            .await
+            .unwrap();
+
+        let results = rt
+            .search_notes(None, "RoPE rotary positional", None, 10)
+            .await
+            .unwrap();
+
+        assert!(
+            results.iter().all(|h| h.note_id != note.id),
+            "soft-deleted note should be excluded from search"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_entity() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(None, "concept", "LoRA", None, None, vec![])
+            .await
+            .unwrap();
+
+        let resolved = rt.resolve(None, entity.id).await.unwrap();
+        match resolved {
+            Some(Resolved::Entity(e)) => assert_eq!(e.id, entity.id),
+            other => panic!("expected Resolved::Entity, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_note() {
+        let rt = rt();
+        let note = rt
+            .create_note(
+                None,
+                khive_storage::NoteKind::Observation,
+                "LoRA fine-tunes LLMs with low-rank adapters",
+                0.85,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let resolved = rt.resolve(None, note.id).await.unwrap();
+        match resolved {
+            Some(Resolved::Note(n)) => assert_eq!(n.id, note.id),
+            other => panic!("expected Resolved::Note, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_none_for_unknown_uuid() {
+        let rt = rt();
+        let unknown = Uuid::new_v4();
+        let resolved = rt.resolve(None, unknown).await.unwrap();
+        assert!(resolved.is_none(), "unknown UUID should resolve to None");
     }
 }

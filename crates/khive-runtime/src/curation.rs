@@ -93,6 +93,9 @@ impl KhiveRuntime {
     ///
     /// Only fields set to `Some(_)` are changed. Re-indexes FTS5 (and vectors if configured)
     /// when `name` or `description` changes; skips re-indexing for property/tag-only patches.
+    ///
+    /// Returns `RuntimeError::NotFound` if the entity does not exist or belongs to a different
+    /// namespace. This enforces ADR-007 namespace isolation at the runtime layer.
     pub async fn update_entity(
         &self,
         namespace: Option<&str>,
@@ -104,6 +107,10 @@ impl KhiveRuntime {
             .get_entity(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
+
+        if entity.namespace != self.ns(namespace) {
+            return Err(RuntimeError::NotFound(format!("entity {id}")));
+        }
 
         let mut text_changed = false;
 
@@ -159,43 +166,58 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {from_id}")))?;
 
         // Collect all edges incident to from_id (as source OR target).
-        let incident_filter = EdgeFilter {
-            source_ids: vec![from_id],
-            ..Default::default()
-        };
-        let outbound = graph
-            .query_edges(
-                incident_filter,
-                vec![SortOrder {
-                    field: EdgeSortField::CreatedAt,
-                    direction: khive_storage::types::SortDirection::Asc,
-                }],
-                PageRequest {
-                    offset: 0,
-                    limit: 10_000,
-                },
-            )
-            .await?
-            .items;
+        // Use paginated loops so entities with more than PAGE_SIZE edges are fully covered.
+        const PAGE_SIZE: u32 = 1_000;
+        let sort = vec![SortOrder {
+            field: EdgeSortField::CreatedAt,
+            direction: khive_storage::types::SortDirection::Asc,
+        }];
 
-        let inbound_filter = EdgeFilter {
-            target_ids: vec![from_id],
-            ..Default::default()
-        };
-        let inbound = graph
-            .query_edges(
-                inbound_filter,
-                vec![SortOrder {
-                    field: EdgeSortField::CreatedAt,
-                    direction: khive_storage::types::SortDirection::Asc,
-                }],
-                PageRequest {
-                    offset: 0,
-                    limit: 10_000,
-                },
-            )
-            .await?
-            .items;
+        let mut outbound: Vec<Edge> = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let page = graph
+                .query_edges(
+                    EdgeFilter {
+                        source_ids: vec![from_id],
+                        ..Default::default()
+                    },
+                    sort.clone(),
+                    PageRequest {
+                        offset,
+                        limit: PAGE_SIZE,
+                    },
+                )
+                .await?;
+            if page.items.is_empty() {
+                break;
+            }
+            offset += page.items.len() as u64;
+            outbound.extend(page.items);
+        }
+
+        let mut inbound: Vec<Edge> = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let page = graph
+                .query_edges(
+                    EdgeFilter {
+                        target_ids: vec![from_id],
+                        ..Default::default()
+                    },
+                    sort.clone(),
+                    PageRequest {
+                        offset,
+                        limit: PAGE_SIZE,
+                    },
+                )
+                .await?;
+            if page.items.is_empty() {
+                break;
+            }
+            offset += page.items.len() as u64;
+            inbound.extend(page.items);
+        }
 
         // Rewire edges, dropping any that would become self-loops.
         let mut edges_rewired = 0usize;
@@ -266,6 +288,10 @@ impl KhiveRuntime {
     // ---- Internal helpers ----
 
     /// Re-upsert FTS5 document (and vector if model configured) for the entity.
+    ///
+    /// Uses `entity.namespace` — the authoritative namespace stored on the record — rather
+    /// than the caller-supplied `namespace` parameter. This prevents a cross-namespace
+    /// reindex from writing the search document into the wrong namespace's FTS index.
     pub(crate) async fn reindex_entity(
         &self,
         namespace: Option<&str>,
@@ -275,7 +301,8 @@ impl KhiveRuntime {
             Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
             _ => entity.name.clone(),
         };
-        let ns = self.ns(namespace).to_string();
+        // Use entity.namespace (authoritative) rather than self.ns(namespace) (caller claim).
+        let ns = entity.namespace.clone();
         self.text(namespace)?
             .upsert_document(TextDocument {
                 subject_id: entity.id,
@@ -642,14 +669,14 @@ mod tests {
 
         // Verify edges now point to D.
         let a_neighbors = rt
-            .neighbors(None, a.id, Direction::Out, None)
+            .neighbors(None, a.id, Direction::Out, None, None)
             .await
             .unwrap();
         assert_eq!(a_neighbors.len(), 1);
         assert_eq!(a_neighbors[0].node_id, d.id);
 
         let c_neighbors = rt
-            .neighbors(None, c.id, Direction::Out, None)
+            .neighbors(None, c.id, Direction::Out, None, None)
             .await
             .unwrap();
         assert_eq!(c_neighbors.len(), 1);
@@ -831,7 +858,7 @@ mod tests {
         );
 
         let a_out = rt
-            .neighbors(None, a.id, Direction::Out, None)
+            .neighbors(None, a.id, Direction::Out, None, None)
             .await
             .unwrap();
         assert!(a_out.is_empty(), "no self-loop should remain");

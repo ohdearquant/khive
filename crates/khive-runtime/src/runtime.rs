@@ -148,6 +148,15 @@ impl KhiveRuntime {
         Ok(self.backend.text(&key)?)
     }
 
+    /// Get a TextSearch index for the namespace's notes corpus.
+    pub fn text_for_notes(
+        &self,
+        namespace: Option<&str>,
+    ) -> RuntimeResult<Arc<dyn khive_storage::TextSearch>> {
+        let key = format!("notes_{}", sanitize_key(self.ns(namespace)));
+        Ok(self.backend.text(&key)?)
+    }
+
     /// Get the lazily-initialized embedding service.
     ///
     /// Returns a `CachedEmbeddingService` wrapping a `NativeEmbeddingService`.

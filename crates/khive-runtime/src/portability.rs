@@ -213,7 +213,12 @@ impl KhiveRuntime {
             let entity = khive_storage::entity::Entity {
                 id: ee.id,
                 namespace: ns.clone(),
-                kind: EntityKind::from_str(&ee.kind).unwrap_or_default(),
+                kind: EntityKind::from_str(&ee.kind).map_err(|e| {
+                    RuntimeError::InvalidInput(format!(
+                        "invalid entity kind {:?} in archive: {}",
+                        ee.kind, e
+                    ))
+                })?,
                 name: ee.name.clone(),
                 description: ee.description.clone(),
                 properties: ee.properties.clone(),
@@ -222,7 +227,10 @@ impl KhiveRuntime {
                 updated_at: updated_micros,
                 deleted_at: None,
             };
-            store.upsert_entity(entity).await?;
+            store.upsert_entity(entity.clone()).await?;
+            // Index into FTS5 (and vector store if a model is configured) so that
+            // imported entities are visible to hybrid_search immediately.
+            self.reindex_entity(Some(&ns), &entity).await?;
             entities_imported += 1;
         }
 

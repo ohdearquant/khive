@@ -163,7 +163,7 @@ async fn link_and_neighbors() {
         .unwrap();
 
     let hits = rt
-        .neighbors(None, qlora.id, Direction::Out, None)
+        .neighbors(None, qlora.id, Direction::Out, None, None)
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
@@ -231,15 +231,31 @@ async fn create_note_and_list_notes() {
         NoteKind::Observation,
         "LoRA is a fine-tuning technique",
         0.9,
+        None,
+        vec![],
     )
     .await
     .unwrap();
-    rt.create_note(None, NoteKind::Observation, "QLoRA uses quantization", 0.8)
-        .await
-        .unwrap();
-    rt.create_note(None, NoteKind::Question, "Review LoRA paper", 0.7)
-        .await
-        .unwrap();
+    rt.create_note(
+        None,
+        NoteKind::Observation,
+        "QLoRA uses quantization",
+        0.8,
+        None,
+        vec![],
+    )
+    .await
+    .unwrap();
+    rt.create_note(
+        None,
+        NoteKind::Question,
+        "Review LoRA paper",
+        0.7,
+        None,
+        vec![],
+    )
+    .await
+    .unwrap();
 
     let observations = rt.list_notes(None, Some("observation"), 50).await.unwrap();
     assert_eq!(observations.len(), 2);
@@ -262,7 +278,9 @@ async fn create_all_note_kinds() {
         NoteKind::Decision,
         NoteKind::Reference,
     ] {
-        rt.create_note(None, kind, "content", 0.5).await.unwrap();
+        rt.create_note(None, kind, "content", 0.5, None, vec![])
+            .await
+            .unwrap();
     }
     let all = rt.list_notes(None, None, 50).await.unwrap();
     assert_eq!(all.len(), 5);
@@ -457,7 +475,14 @@ async fn list_notes_excludes_soft_deleted() {
 
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let note = rt
-        .create_note(None, NoteKind::Observation, "soft-delete-test", 0.9)
+        .create_note(
+            None,
+            NoteKind::Observation,
+            "soft-delete-test",
+            0.9,
+            None,
+            vec![],
+        )
         .await
         .unwrap();
 

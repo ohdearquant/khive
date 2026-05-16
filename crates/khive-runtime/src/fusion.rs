@@ -1,14 +1,17 @@
 //! Fusion strategies for combining ranked result lists.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::types::{
-    TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit, VectorSearchRequest,
+    PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
+    VectorSearchRequest,
 };
+use khive_storage::EntityFilter;
+use khive_types::SubstrateKind;
 
 use crate::error::RuntimeResult;
 use crate::retrieval::{SearchHit, SearchSource};
@@ -66,12 +69,16 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
+        let ns = self.ns(namespace).to_string();
         let text_hits = self
             .text(namespace)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
                 mode: TextQueryMode::Plain,
-                filter: None,
+                filter: Some(TextFilter {
+                    namespaces: vec![ns.clone()],
+                    ..TextFilter::default()
+                }),
                 top_k: candidates,
                 snippet_chars: 200,
             })
@@ -82,20 +89,39 @@ impl KhiveRuntime {
                 .search(VectorSearchRequest {
                     query_embedding: vec,
                     top_k: candidates,
-                    namespace: None,
-                    kind: None,
+                    namespace: Some(ns.clone()),
+                    kind: Some(SubstrateKind::Entity),
                 })
                 .await?
         } else {
             Vec::new()
         };
 
-        Ok(fuse_with_strategy(
-            text_hits,
-            vector_hits,
-            &strategy,
-            limit as usize,
-        ))
+        let mut fused = fuse_with_strategy(text_hits, vector_hits, &strategy, limit as usize);
+
+        // Filter out soft-deleted entities. A single query fetches all alive IDs from the
+        // fused set; any ID absent from the result has been soft-deleted (deleted_at IS NOT NULL).
+        if !fused.is_empty() {
+            let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
+            let alive_page = self
+                .entities(namespace)?
+                .query_entities(
+                    self.ns(namespace),
+                    EntityFilter {
+                        ids: candidate_ids,
+                        ..EntityFilter::default()
+                    },
+                    PageRequest {
+                        offset: 0,
+                        limit: fused.len() as u32,
+                    },
+                )
+                .await?;
+            let alive: HashSet<Uuid> = alive_page.items.into_iter().map(|e| e.id).collect();
+            fused.retain(|h| alive.contains(&h.entity_id));
+        }
+
+        Ok(fused)
     }
 }
 
