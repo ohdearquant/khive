@@ -11,7 +11,7 @@ homepage.workspace = true
 khive-types = { path = "../khive-types", features = ["serde"] }
 khive-storage = { path = "../khive-storage" }
 khive-score = { path = "../khive-score" }
-khive-db = { path = "../khive-db" }
+khive-db = { path = "../khive-db", features = ["vectors"] }
 khive-query = { path = "../khive-query" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
