@@ -9,9 +9,9 @@ homepage.workspace = true
 description = "khive stdio MCP server — the only user-facing Rust binary"
 
 [dependencies]
-khive-runtime = { version = "0.1.0", path = "../khive-runtime" }
-khive-storage = { version = "0.1.0", path = "../khive-storage" }
-khive-types = { version = "0.1.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.1.1", path = "../khive-runtime" }
+khive-storage = { version = "0.1.1", path = "../khive-storage" }
+khive-types = { version = "0.1.1", path = "../khive-types", features = ["serde"] }
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 tokio = { workspace = true }
 serde = { workspace = true }
