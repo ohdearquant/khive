@@ -154,11 +154,12 @@ Until `supersede` lands, manually create a supersedes edge:
 link(source_id=new_note, target_id=old_note, relation="supersedes")
 ```
 
-`search(kind="note")` already excludes notes targeted by a `supersedes` edge — that exclusion is
-a **view-layer filter**, not a data change. Superseding **keeps** the old note and its edges and
-marks it superseded; it never deletes, copies, or transfers anything. "Show only current" is a
-query concern. See CLAUDE.md §"Data vs. view — the principle most violated here" before
-implementing any supersede/annotate/currency behavior.
+ADR-024 specifies that note `search` excludes notes targeted by a `supersedes` edge — but that
+exclusion is **not yet implemented** (issue #36: supersession is currently write-only). When it
+lands it must be a **view-layer filter**, not a data change: superseding **keeps** the old note
+and its edges and marks it superseded; it never deletes, copies, or transfers anything. "Show
+only current" is a query concern. See CLAUDE.md §"Data vs. view — the principle most violated
+here" before implementing any supersede / annotate / currency behavior.
 
 ---
 
