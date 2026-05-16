@@ -16,22 +16,26 @@ If you're working on khive itself (writing code in this repo), see `CLAUDE.md` i
 
 All verbs are available via MCP ([ADR-023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)).
 
-| Verb        | What it does                                        | When to use                                              |
-| ----------- | --------------------------------------------------- | -------------------------------------------------------- |
-| `create`    | Add an entity or note                               | New concept, paper, observation, decision worth tracking |
-| `get`       | Fetch a record by ID                                | When you have a UUID and need the full record            |
-| `search`    | Text + semantic search over entities or notes       | Finding things by content similarity                     |
-| `list`      | Structured filtering (by kind, tags, etc.)          | Browsing a category or namespace                         |
-| `update`    | Patch properties, tags, or content                  | Correcting or enriching an existing record               |
-| `delete`    | Soft-delete (or hard-delete) a record               | Removing stale or incorrect data                         |
-| `link`      | Connect two nodes with a typed relation             | When relationships emerge from research                  |
-| `traverse`  | Multi-hop graph walk with depth/relation filters    | Structural context — lineages, paths, clusters           |
-| `neighbors` | Immediate neighbors of a node                       | "What connects to this entity?"                          |
-| `query`     | GQL/SPARQL query string → SQL                       | Complex pattern matching over the graph                  |
-| `merge`     | Deduplicate two records into one                    | "LoRA" and "Low-Rank Adaptation" are the same concept    |
-| `supersede` | Mark a newer record as replacing an older one       | Revised decision, refined observation                    |
-| `resolve`   | Look up a UUID and return its substrate kind + data | "Is this UUID a note or an entity?"                      |
-| `request`   | Batch multiple verbs in one call                    | Parallel creates, chained operations                     |
+| Verb        | What it does                                     | When to use                                              |
+| ----------- | ------------------------------------------------ | -------------------------------------------------------- |
+| `create`    | Add an entity or note                            | New concept, paper, observation, decision worth tracking |
+| `get`       | Fetch any record by UUID (auto-detects type)     | When you have a UUID and need the full record            |
+| `search`    | Text + semantic search over entities or notes    | Finding things by content similarity                     |
+| `list`      | Structured filtering (by kind, tags, etc.)       | Browsing a category or namespace                         |
+| `update`    | Patch properties, tags, or content (by UUID)     | Correcting or enriching an existing record               |
+| `delete`    | Soft-delete (or hard-delete) a record (by UUID)  | Removing stale or incorrect data                         |
+| `link`      | Connect two nodes with a typed relation          | When relationships emerge from research                  |
+| `traverse`  | Multi-hop graph walk with depth/relation filters | Structural context — lineages, paths, clusters           |
+| `neighbors` | Immediate neighbors of a node                    | "What connects to this entity?"                          |
+| `query`     | GQL/SPARQL query string → SQL                    | Complex pattern matching over the graph                  |
+| `merge`     | Deduplicate two entities into one (v0.1)         | "LoRA" and "Low-Rank Adaptation" are the same concept    |
+
+**11 tools in v0.1.** `get`, `update`, `delete` are UUID-only — they auto-detect whether the
+record is an entity, note, or edge. `create`, `list`, `search` require `kind=entity|note` (or
+`kind=edge` for `list`).
+
+**Deferred (not available in v0.1):** `supersede` (use `link(..., relation="supersedes")` as a
+workaround), `request` (batch DSL), note merge (only entity merge is implemented).
 
 ### Notes vs entities
 

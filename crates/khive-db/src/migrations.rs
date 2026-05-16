@@ -402,6 +402,45 @@ mod tests {
         assert_eq!(applied_count, 2, "V1 and V2 must still be recorded");
     }
 
+    #[test]
+    fn store_ddl_then_migrations_is_idempotent() {
+        use crate::stores::note::ensure_notes_schema;
+
+        let mut conn = open_memory();
+
+        // Simulate the StorageBackend path: store DDL creates notes table
+        // WITH the name column (NOTES_DDL includes it for test convenience).
+        ensure_notes_schema(&conn).expect("store DDL should create notes");
+
+        // Verify name column exists from DDL.
+        let has_name: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('notes') WHERE name = 'name'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_name, "NOTES_DDL should include name column");
+
+        // Now run versioned migrations — V2 should detect the existing column
+        // and skip the ALTER TABLE without error.
+        let version = run_migrations(&mut conn).expect("migrations after store DDL");
+        assert_eq!(version, 2);
+
+        // V2 should be recorded as applied (skipped but tracked).
+        let v2_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v2_count, 1,
+            "V2 must be recorded even when column pre-exists"
+        );
+    }
+
     /// Helper: apply a single migration in a transaction, recording it in the
     /// tracking table. Extracted here for use in the rollback test only.
     fn apply_single_migration(
