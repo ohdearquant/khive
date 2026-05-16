@@ -193,7 +193,9 @@ impl KhiveRuntime {
 
                     if let Some(&(bwd_depth, _, _)) = bwd.get(&hit.node_id) {
                         let total = new_depth + bwd_depth;
-                        if meeting.as_ref().is_none_or(|&(_, best)| total < best) {
+                        if total <= max_depth
+                            && meeting.as_ref().is_none_or(|&(_, best)| total < best)
+                        {
                             meeting = Some((hit.node_id, total));
                         }
                     }
@@ -227,14 +229,14 @@ impl KhiveRuntime {
                         continue;
                     }
                     let new_depth = bwd_depth + 1;
-                    // For incoming direction: hit.node_id is the source; `node` is the child
-                    // in the forward direction (i.e., the next hop toward `to`).
                     bwd.insert(hit.node_id, (new_depth, Some(node), Some(hit.edge_id)));
                     bwd_q.push_back(hit.node_id);
 
                     if let Some(&(fwd_depth, _, _)) = fwd.get(&hit.node_id) {
                         let total = fwd_depth + new_depth;
-                        if meeting.as_ref().is_none_or(|&(_, best)| total < best) {
+                        if total <= max_depth
+                            && meeting.as_ref().is_none_or(|&(_, best)| total < best)
+                        {
                             meeting = Some((hit.node_id, total));
                         }
                     }
@@ -552,5 +554,64 @@ mod tests {
         assert_eq!(path.len(), 1);
         assert_eq!(path[0].entity_id, a.id);
         assert!(path[0].via_edge.is_none());
+    }
+
+    #[tokio::test]
+    async fn shortest_path_max_depth_zero_adjacent() {
+        let rt = rt().await;
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+
+        // max_depth=0 means only the trivial from==to case succeeds.
+        let path = rt.shortest_path(None, a.id, b.id, 0).await.unwrap();
+        assert!(
+            path.is_none(),
+            "1-hop path should not be returned at max_depth=0"
+        );
+    }
+
+    #[tokio::test]
+    async fn shortest_path_max_depth_one_two_hop_chain() {
+        let rt = rt().await;
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let c = rt
+            .create_entity(None, "concept", "C", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+
+        // max_depth=1 should find A->B but not A->B->C.
+        let one_hop = rt.shortest_path(None, a.id, b.id, 1).await.unwrap();
+        assert!(
+            one_hop.is_some(),
+            "1-hop path should be found at max_depth=1"
+        );
+
+        let two_hop = rt.shortest_path(None, a.id, c.id, 1).await.unwrap();
+        assert!(
+            two_hop.is_none(),
+            "2-hop path should not be returned at max_depth=1"
+        );
     }
 }
