@@ -129,13 +129,15 @@ kind="note" — create a lightweight text note.
   note_kind: observation (default) | insight | question | decision | reference
   Aliases: obs, finding, q, choice, ref, citation
   Optional: salience (0.0–1.0, default 0.5), annotates (UUIDs → creates annotates edges),
+            supersedes (UUID of old note → creates supersedes edge + inherits annotation targets),
             properties (JSON)
 
 Examples:
   Add algorithm:  {"kind":"entity","entity_kind":"concept","name":"FlashAttention","properties":{"domain":"attention"}}
   Add paper:      {"kind":"entity","entity_kind":"document","name":"Attention Is All You Need","properties":{"year":2017}}
   Add decision:   {"kind":"note","note_kind":"decision","content":"Use FlashAttention-2 for attention","salience":0.9}
-  Annotating:     {"kind":"note","content":"Reduces memory by tiling","annotates":["<entity-uuid>"]}"#)]
+  Annotating:     {"kind":"note","content":"Reduces memory by tiling","annotates":["<entity-uuid>"]}
+  Superseding:    {"kind":"note","note_kind":"decision","content":"New decision...","supersedes":"<old-note-uuid>"}"#)]
     async fn create(&self, Parameters(p): Parameters<CreateParams>) -> Result<String, McpError> {
         match p.kind.as_str() {
             "entity" => {
@@ -183,6 +185,32 @@ Examples:
                 for s in p.annotates.unwrap_or_default() {
                     annotates.push(self.resolve_uuid(&s, p.namespace.as_deref()).await?);
                 }
+
+                // If superseding an old note, inherit its annotation targets.
+                let supersedes_id = match p.supersedes.as_deref() {
+                    Some(s) => {
+                        let old_id = self.resolve_uuid(s, p.namespace.as_deref()).await?;
+                        let old_neighbors = self
+                            .runtime
+                            .neighbors(
+                                p.namespace.as_deref(),
+                                old_id,
+                                Direction::Out,
+                                None,
+                                Some(vec![EdgeRelation::Annotates]),
+                            )
+                            .await
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                        for hit in &old_neighbors {
+                            if !annotates.contains(&hit.node_id) {
+                                annotates.push(hit.node_id);
+                            }
+                        }
+                        Some(old_id)
+                    }
+                    None => None,
+                };
+
                 let note = self
                     .runtime
                     .create_note(
@@ -196,6 +224,21 @@ Examples:
                     )
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                // Create supersedes edge from new note → old note.
+                if let Some(old_id) = supersedes_id {
+                    self.runtime
+                        .link(
+                            p.namespace.as_deref(),
+                            note.id,
+                            old_id,
+                            EdgeRelation::Supersedes,
+                            1.0,
+                        )
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                }
+
                 Self::to_json(&note)
             }
             other => Err(McpError::invalid_params(

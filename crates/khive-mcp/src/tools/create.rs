@@ -53,6 +53,11 @@ pub struct CreateParams {
     /// UUIDs of entities or notes this note annotates (creates annotates edges). Note only.
     pub annotates: Option<Vec<String>>,
 
+    /// UUID of an existing note this note supersedes. Note only.
+    /// Creates a `supersedes` edge from the new note to the old one, and copies
+    /// annotation targets from the old note (so the new note annotates the same entities).
+    pub supersedes: Option<String>,
+
     // ---- shared fields ----
     /// Freeform JSON properties.
     pub properties: Option<serde_json::Value>,
