@@ -51,10 +51,28 @@ impl KhiveMcpServer {
         Ok(())
     }
 
-    /// Parse a UUID from a string, returning an MCP error on failure.
-    fn parse_uuid(s: &str) -> Result<Uuid, McpError> {
-        Uuid::from_str(s)
-            .map_err(|_| McpError::invalid_params(format!("invalid UUID: {s:?}"), None))
+    /// Resolve a UUID from either a full string or a short 8+ hex-char prefix.
+    /// Namespace-scoped: only matches records in the caller's namespace.
+    async fn resolve_uuid(&self, s: &str, namespace: Option<&str>) -> Result<Uuid, McpError> {
+        if let Ok(uuid) = Uuid::from_str(s) {
+            return Ok(uuid);
+        }
+        if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            match self.runtime.resolve_prefix(namespace, s).await {
+                Ok(Some(uuid)) => return Ok(uuid),
+                Ok(None) => {
+                    return Err(McpError::invalid_params(
+                        format!("no record matches prefix: {s:?}"),
+                        None,
+                    ))
+                }
+                Err(e) => return Err(McpError::invalid_params(format!("{e}"), None)),
+            }
+        }
+        Err(McpError::invalid_params(
+            format!("invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"),
+            None,
+        ))
     }
 
     /// Map a direction string to the storage Direction enum.
@@ -161,12 +179,10 @@ Examples:
                     })?,
                 };
                 let salience = p.salience.unwrap_or(0.5);
-                let annotates = p
-                    .annotates
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|s| Self::parse_uuid(s))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut annotates = Vec::new();
+                for s in p.annotates.unwrap_or_default() {
+                    annotates.push(self.resolve_uuid(&s, p.namespace.as_deref()).await?);
+                }
                 let note = self
                     .runtime
                     .create_note(
@@ -202,7 +218,7 @@ Examples:
   {"id":"<uuid>","namespace":"my-project"}"#
     )]
     async fn get(&self, Parameters(p): Parameters<GetParams>) -> Result<String, McpError> {
-        let id = Self::parse_uuid(&p.id)?;
+        let id = self.resolve_uuid(&p.id, p.namespace.as_deref()).await?;
         let ns = p.namespace.as_deref();
 
         // Try entity first.
@@ -271,8 +287,14 @@ Examples:
                 Self::to_json(&entities)
             }
             "edge" => {
-                let source_id = p.source_id.as_deref().map(Self::parse_uuid).transpose()?;
-                let target_id = p.target_id.as_deref().map(Self::parse_uuid).transpose()?;
+                let source_id = match p.source_id.as_deref() {
+                    Some(s) => Some(self.resolve_uuid(s, p.namespace.as_deref()).await?),
+                    None => None,
+                };
+                let target_id = match p.target_id.as_deref() {
+                    Some(s) => Some(self.resolve_uuid(s, p.namespace.as_deref()).await?),
+                    None => None,
+                };
                 let relations: Vec<EdgeRelation> = p
                     .relations
                     .unwrap_or_default()
@@ -344,7 +366,7 @@ Examples:
   Adjust weight:     {"id":"<uuid>","weight":0.7}"#
     )]
     async fn update(&self, Parameters(p): Parameters<UpdateParams>) -> Result<String, McpError> {
-        let id = Self::parse_uuid(&p.id)?;
+        let id = self.resolve_uuid(&p.id, p.namespace.as_deref()).await?;
         let ns = p.namespace.as_deref();
 
         // Try entity first.
@@ -435,7 +457,7 @@ Examples:
   Hard-delete:  {"id":"<uuid>","hard":true}"#
     )]
     async fn delete(&self, Parameters(p): Parameters<DeleteParams>) -> Result<String, McpError> {
-        let id = Self::parse_uuid(&p.id)?;
+        let id = self.resolve_uuid(&p.id, p.namespace.as_deref()).await?;
         let ns = p.namespace.as_deref();
 
         // Try entity first.
@@ -510,8 +532,12 @@ Example:
   {"into_id":"<uuid>","from_id":"<uuid>","strategy":"prefer_into"}"#
     )]
     async fn merge(&self, Parameters(p): Parameters<MergeParams>) -> Result<String, McpError> {
-        let into_id = Self::parse_uuid(&p.into_id)?;
-        let from_id = Self::parse_uuid(&p.from_id)?;
+        let into_id = self
+            .resolve_uuid(&p.into_id, p.namespace.as_deref())
+            .await?;
+        let from_id = self
+            .resolve_uuid(&p.from_id, p.namespace.as_deref())
+            .await?;
         let strategy = match p.strategy.as_deref().unwrap_or("prefer_into") {
             "prefer_into" => MergeStrategy::PreferInto,
             "prefer_from" => MergeStrategy::PreferFrom,
@@ -641,8 +667,12 @@ Examples:
   {"source_id":"<LoRA-uuid>","target_id":"<QLoRA-uuid>","relation":"variant_of","weight":0.9}
   {"source_id":"<note-uuid>","target_id":"<entity-uuid>","relation":"annotates","weight":1.0}"#)]
     async fn link(&self, Parameters(p): Parameters<LinkParams>) -> Result<String, McpError> {
-        let source = Self::parse_uuid(&p.source_id)?;
-        let target = Self::parse_uuid(&p.target_id)?;
+        let source = self
+            .resolve_uuid(&p.source_id, p.namespace.as_deref())
+            .await?;
+        let target = self
+            .resolve_uuid(&p.target_id, p.namespace.as_deref())
+            .await?;
         let weight = p.weight.unwrap_or(1.0).clamp(0.0, 1.0);
         let relation = Self::parse_relation(&p.relation)?;
         let edge = self
@@ -669,7 +699,9 @@ Examples:
         &self,
         Parameters(p): Parameters<NeighborsParams>,
     ) -> Result<String, McpError> {
-        let node_id = Self::parse_uuid(&p.node_id)?;
+        let node_id = self
+            .resolve_uuid(&p.node_id, p.namespace.as_deref())
+            .await?;
         let direction = Self::parse_direction(p.direction.as_deref());
         let relations: Option<Vec<EdgeRelation>> = p
             .relations
@@ -708,11 +740,10 @@ Example — expand annotation graph from an entity:
         &self,
         Parameters(p): Parameters<TraverseParams>,
     ) -> Result<String, McpError> {
-        let roots = p
-            .roots
-            .iter()
-            .map(|s| Self::parse_uuid(s))
-            .collect::<Result<Vec<Uuid>, _>>()?;
+        let mut roots = Vec::with_capacity(p.roots.len());
+        for s in &p.roots {
+            roots.push(self.resolve_uuid(s, p.namespace.as_deref()).await?);
+        }
         let direction = Self::parse_direction(p.direction.as_deref());
         let relations: Option<Vec<EdgeRelation>> = p
             .relations

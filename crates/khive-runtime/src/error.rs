@@ -26,4 +26,10 @@ pub enum RuntimeError {
 
     #[error("embedding: {0}")]
     Embedding(#[from] lattice_embed::EmbedError),
+
+    #[error("ambiguous: {0}")]
+    Ambiguous(String),
+
+    #[error("internal: {0}")]
+    Internal(String),
 }

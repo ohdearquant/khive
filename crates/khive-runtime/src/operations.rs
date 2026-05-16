@@ -393,6 +393,79 @@ impl KhiveRuntime {
         Ok(hits)
     }
 
+    /// Resolve a short UUID prefix (8+ hex chars) to a full UUID.
+    ///
+    /// Searches entities, notes, and edges tables for a UUID starting with the
+    /// given prefix, scoped to the caller's namespace. Returns `Ok(Some(uuid))`
+    /// if exactly one match is found, `Ok(None)` if no matches, or an error if
+    /// ambiguous (multiple matches).
+    pub async fn resolve_prefix(
+        &self,
+        namespace: Option<&str>,
+        prefix: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let ns = self.ns(namespace).to_string();
+        let pattern = format!("{}%", prefix);
+
+        let tables = [("entities", true), ("notes", true), ("graph_edges", false)];
+
+        let mut matches: Vec<String> = Vec::new();
+        let mut reader = self.sql().reader().await.map_err(RuntimeError::Storage)?;
+
+        for (table, has_deleted_at) in tables {
+            let deleted_filter = if has_deleted_at {
+                " AND deleted_at IS NULL"
+            } else {
+                ""
+            };
+            let sql = SqlStatement {
+                sql: format!(
+                    "SELECT id FROM {table} WHERE id LIKE ?1 AND namespace = ?2{deleted_filter} LIMIT 2"
+                ),
+                params: vec![
+                    SqlValue::Text(pattern.clone()),
+                    SqlValue::Text(ns.clone()),
+                ],
+                label: Some("resolve_prefix".into()),
+            };
+            match reader.query_all(sql).await {
+                Ok(rows) => {
+                    for row in rows {
+                        if let Some(col) = row.columns.first() {
+                            if let SqlValue::Text(s) = &col.value {
+                                matches.push(s.clone());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("no such table") {
+                        continue;
+                    }
+                    return Err(RuntimeError::Storage(e));
+                }
+            }
+            if matches.len() > 1 {
+                break;
+            }
+        }
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => {
+                let uuid = Uuid::from_str(&matches[0])
+                    .map_err(|e| RuntimeError::Internal(format!("stored UUID is invalid: {e}")))?;
+                Ok(Some(uuid))
+            }
+            _ => Err(RuntimeError::Ambiguous(format!(
+                "prefix '{prefix}' matches multiple UUIDs"
+            ))),
+        }
+    }
+
     /// Resolve a UUID to its substrate kind by trying entity, then note, then event stores.
     ///
     /// Returns `None` if the UUID is not found in any substrate.
@@ -1156,5 +1229,58 @@ mod tests {
         let unknown = Uuid::new_v4();
         let resolved = rt.resolve(None, unknown).await.unwrap();
         assert!(resolved.is_none(), "unknown UUID should resolve to None");
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_finds_entity_in_own_namespace() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(None, "concept", "PrefixTest", None, None, vec![])
+            .await
+            .unwrap();
+        let prefix = &entity.id.to_string()[..8];
+
+        let resolved = rt.resolve_prefix(None, prefix).await.unwrap();
+        assert_eq!(resolved, Some(entity.id));
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_invisible_across_namespaces() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(Some("ns_a"), "concept", "Invisible", None, None, vec![])
+            .await
+            .unwrap();
+        let prefix = &entity.id.to_string()[..8];
+
+        // From ns_b, the entity in ns_a should not be visible.
+        let resolved = rt.resolve_prefix(Some("ns_b"), prefix).await.unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_ambiguous_same_namespace() {
+        use khive_storage::entity::Entity;
+        use khive_types::EntityKind;
+
+        let rt = rt();
+        // Two entities with UUIDs sharing the same 8-char prefix "aabbccdd".
+        let id_a = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000001").unwrap();
+        let id_b = Uuid::parse_str("aabbccdd-2222-4000-8000-000000000002").unwrap();
+
+        let mut entity_a = Entity::new("local", EntityKind::Concept, "AmbigA");
+        entity_a.id = id_a;
+        let mut entity_b = Entity::new("local", EntityKind::Concept, "AmbigB");
+        entity_b.id = id_b;
+
+        let store = rt.entities(None).unwrap();
+        store.upsert_entity(entity_a).await.unwrap();
+        store.upsert_entity(entity_b).await.unwrap();
+
+        let result = rt.resolve_prefix(None, "aabbccdd").await;
+        assert!(
+            result.is_err(),
+            "shared 8-char prefix must return Ambiguous error"
+        );
     }
 }

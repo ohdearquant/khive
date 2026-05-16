@@ -18,7 +18,7 @@ use khive_storage::types::SqlValue;
 pub struct CompiledQuery {
     pub sql: String,
     pub params: Vec<SqlValue>,
-    pub return_vars: Vec<String>,
+    pub return_vars: Vec<ReturnItem>,
 }
 
 pub struct CompileOptions {
@@ -284,26 +284,33 @@ fn compile_fixed_length(
     }
 
     // SELECT clause
-    for var in &query.return_items {
+    for item in &query.return_items {
+        let var = item.variable();
         if let Some((alias, kind)) = var_to_alias.get(var) {
-            match kind {
-                VarKind::Node => {
-                    select_parts.push(format!(
-                        "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                         {alias}.kind AS {var}_kind, {alias}.name AS {var}_name, \
-                         {alias}.properties AS {var}_properties, \
-                         {alias}.created_at AS {var}_created_at, \
-                         {alias}.updated_at AS {var}_updated_at"
-                    ));
+            match item {
+                ReturnItem::Property(_, prop) => {
+                    let col = property_to_column(prop, kind)?;
+                    select_parts.push(format!("{alias}.{col} AS {var}_{prop}"));
                 }
-                VarKind::Edge => {
-                    select_parts.push(format!(
-                        "{alias}.id AS {var}_id, {alias}.source_id AS {var}_source, \
-                         {alias}.target_id AS {var}_target, \
-                         {alias}.relation AS {var}_relation, \
-                         {alias}.weight AS {var}_weight"
-                    ));
-                }
+                ReturnItem::Variable(_) => match kind {
+                    VarKind::Node => {
+                        select_parts.push(format!(
+                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
+                             {alias}.kind AS {var}_kind, {alias}.name AS {var}_name, \
+                             {alias}.properties AS {var}_properties, \
+                             {alias}.created_at AS {var}_created_at, \
+                             {alias}.updated_at AS {var}_updated_at"
+                        ));
+                    }
+                    VarKind::Edge => {
+                        select_parts.push(format!(
+                            "{alias}.id AS {var}_id, {alias}.source_id AS {var}_source, \
+                             {alias}.target_id AS {var}_target, \
+                             {alias}.relation AS {var}_relation, \
+                             {alias}.weight AS {var}_weight"
+                        ));
+                    }
+                },
             }
         } else {
             return Err(QueryError::Compile(format!(
@@ -552,35 +559,62 @@ fn compile_variable_length(
     let mut select_parts: Vec<String> = Vec::new();
     let mut has_start = false;
 
-    for var in &query.return_items {
+    for item in &query.return_items {
+        let var = item.variable();
         if let Some((_, kind)) = var_to_alias.get(var) {
-            match kind {
-                VarKind::Node => {
-                    if start.variable.as_deref() == Some(var.as_str()) {
-                        has_start = true;
-                        select_parts.push(format!(
-                            "s.id AS {var}_id, s.namespace AS {var}_namespace, \
-                             s.kind AS {var}_kind, s.name AS {var}_name, \
-                             s.properties AS {var}_properties, \
-                             s.created_at AS {var}_created_at, \
-                             s.updated_at AS {var}_updated_at"
-                        ));
+            match item {
+                ReturnItem::Property(_, prop) => {
+                    let is_start = start.variable.as_deref() == Some(var);
+                    if *kind == VarKind::Node {
+                        let tbl = if is_start { "s" } else { "r" };
+                        if is_start {
+                            has_start = true;
+                        }
+                        let col = property_to_column(prop, kind)?;
+                        select_parts.push(format!("{tbl}.{col} AS {var}_{prop}"));
                     } else {
-                        select_parts.push(format!(
-                            "r.id AS {var}_id, r.namespace AS {var}_namespace, \
-                             r.kind AS {var}_kind, r.name AS {var}_name, \
-                             r.properties AS {var}_properties, \
-                             r.created_at AS {var}_created_at, \
-                             r.updated_at AS {var}_updated_at"
-                        ));
+                        let col = match prop.as_str() {
+                            "id" => "via_edge",
+                            "relation" => "via_relation",
+                            "weight" => "via_weight",
+                            _ => {
+                                return Err(QueryError::Compile(format!(
+                                    "unknown edge property '{prop}' in RETURN projection. \
+                                     Valid: id, source_id, target_id, relation, weight"
+                                )));
+                            }
+                        };
+                        select_parts.push(format!("t.{col} AS {var}_{prop}"));
                     }
                 }
-                VarKind::Edge => {
-                    select_parts.push(format!(
-                        "t.via_edge AS {var}_id, t.via_relation AS {var}_relation, \
-                         t.via_weight AS {var}_weight"
-                    ));
-                }
+                ReturnItem::Variable(_) => match kind {
+                    VarKind::Node => {
+                        if start.variable.as_deref() == Some(var) {
+                            has_start = true;
+                            select_parts.push(format!(
+                                "s.id AS {var}_id, s.namespace AS {var}_namespace, \
+                                 s.kind AS {var}_kind, s.name AS {var}_name, \
+                                 s.properties AS {var}_properties, \
+                                 s.created_at AS {var}_created_at, \
+                                 s.updated_at AS {var}_updated_at"
+                            ));
+                        } else {
+                            select_parts.push(format!(
+                                "r.id AS {var}_id, r.namespace AS {var}_namespace, \
+                                 r.kind AS {var}_kind, r.name AS {var}_name, \
+                                 r.properties AS {var}_properties, \
+                                 r.created_at AS {var}_created_at, \
+                                 r.updated_at AS {var}_updated_at"
+                            ));
+                        }
+                    }
+                    VarKind::Edge => {
+                        select_parts.push(format!(
+                            "t.via_edge AS {var}_id, t.via_relation AS {var}_relation, \
+                             t.via_weight AS {var}_weight"
+                        ));
+                    }
+                },
             }
         } else {
             return Err(QueryError::Compile(format!(
@@ -649,10 +683,42 @@ fn compile_variable_length(
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum VarKind {
     Node,
     Edge,
+}
+
+const NODE_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "kind",
+    "namespace",
+    "description",
+    "properties",
+    "created_at",
+    "updated_at",
+];
+const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
+
+fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
+    let valid = match kind {
+        VarKind::Node => NODE_COLUMNS,
+        VarKind::Edge => EDGE_COLUMNS,
+    };
+    if valid.contains(&prop) {
+        Ok(prop)
+    } else {
+        let kind_name = match kind {
+            VarKind::Node => "node",
+            VarKind::Edge => "edge",
+        };
+        Err(QueryError::Compile(format!(
+            "unknown {kind_name} property '{prop}' in RETURN projection. \
+             Valid: {}",
+            valid.join(", ")
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -679,7 +745,14 @@ mod tests {
         let compiled = compile(&q, &opts()).unwrap();
         assert!(compiled.sql.contains("JOIN graph_edges"));
         assert!(compiled.sql.contains("LIMIT"));
-        assert_eq!(compiled.return_vars, vec!["a", "e", "b"]);
+        assert_eq!(
+            compiled.return_vars,
+            vec![
+                ReturnItem::Variable("a".into()),
+                ReturnItem::Variable("e".into()),
+                ReturnItem::Variable("b".into()),
+            ]
+        );
         // No recursive CTE for fixed-length
         assert!(!compiled.sql.contains("WITH RECURSIVE"));
     }
@@ -884,5 +957,66 @@ mod tests {
         use crate::parsers::sparql;
         let err = sparql::parse("SELECT ?a ?b WHERE { ?a :extends* ?b . }").unwrap_err();
         assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn return_property_projection_compiles() {
+        let q =
+            gql::parse("MATCH (a:concept)-[e:extends]->(b:concept) RETURN a.name, b.name LIMIT 5")
+                .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // Node aliases are n0, n1; the SQL uses `alias.col AS var_prop`
+        assert!(
+            compiled.sql.contains(".name AS a_name"),
+            "sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains(".name AS b_name"),
+            "sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("a_kind"),
+            "should not emit full node columns"
+        );
+    }
+
+    #[test]
+    fn return_unknown_node_property_rejected() {
+        let q = gql::parse("MATCH (a:concept)-[:extends]->(b) RETURN a.domain LIMIT 5").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(ref msg) if msg.contains("unknown node property 'domain'")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn return_unknown_edge_property_rejected() {
+        let q = gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.label LIMIT 5").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(ref msg) if msg.contains("unknown edge property 'label'")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn return_valid_edge_property_compiles() {
+        let q =
+            gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.relation, e.weight LIMIT 5").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // Edge alias is e0; SQL: `e0.relation AS e_relation`
+        assert!(
+            compiled.sql.contains(".relation AS e_relation"),
+            "sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains(".weight AS e_weight"),
+            "sql: {}",
+            compiled.sql
+        );
     }
 }
