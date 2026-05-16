@@ -36,7 +36,15 @@ canonical bucket.
 | `extends`       | child → parent            | Builds on, generalizes (FlashAttention-2 → FlashAttention) |
 | `variant_of`    | variant → original        | Modified version (QLoRA → LoRA)                            |
 | `introduced_by` | concept → document/person | First described in (LoRA → Hu et al. 2021)                 |
-| `supersedes`    | new → old                 | Replaces entirely (rare)                                   |
+| `supersedes`    | new → old                 | Replaces entirely; same-substrate (rare)                   |
+
+`supersedes` is the **same-substrate** replacement relation: a note supersedes a note, or an
+entity supersedes an entity — it never crosses substrate kinds (so it does not contradict
+"`annotates` is the only relation that crosses substrate kinds", stated below). Note supersession
+(ADR-019) and entity supersession use the identical `supersedes` edge and mechanism
+(`new --supersedes--> old`). Both endpoints must resolve to the **same** substrate kind in the
+caller's namespace; `note→entity` and `entity→note` are rejected, as is any endpoint that is not a
+note or entity (event, edge).
 
 ### Category 3: Dependency (runtime/build needs)
 
