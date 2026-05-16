@@ -110,29 +110,49 @@ def _tool(proc: subprocess.Popen, name: str, args: dict) -> Any:
     return json.loads(text) if text else None
 
 
-def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
-    """Call a tool; assert it errors (either RPC-level or tool-level isError).
+def _expect_rpc_error(proc: subprocess.Popen, name: str, args: dict) -> str:
+    """Call a tool; assert it returns a JSON-RPC-level error (code -32xxx).
 
-    Returns the error message text so callers can assert on its content.
+    khive-mcp returns McpError::invalid_params (or invalid_request) uniformly
+    for all validation failures — invalid kinds, unknown properties, malformed
+    IDs, and not-found lookups all surface as RPC-level errors, never as tool-
+    level isError responses.  This helper enforces that contract precisely so
+    that a future regression (e.g. switching to isError) is caught immediately.
+
+    Returns the RPC error message string so callers can assert on its content.
     """
     result = _tool_raw(proc, name, args)
 
-    # Case 1: JSON-RPC protocol-level error (code -32xxx)
     if "_rpc_error" in result:
         err = result["_rpc_error"]
         return err.get("message", str(err))
 
-    # Case 2: Tool result with isError=true
+    # If we got a tool-level isError, that is a contract deviation — fail hard.
     if result.get("isError"):
         content = result.get("content", [])
-        return content[0]["text"] if content else ""
+        text = content[0]["text"] if content else ""
+        raise AssertionError(
+            f"Tool '{name}' returned tool-level isError instead of the expected "
+            f"RPC-level error (McpError::invalid_params).  This is a contract "
+            f"deviation — khive-mcp should surface validation errors as JSON-RPC "
+            f"errors, not as isError tool results.  Text: {text!r}"
+        )
 
-    # Not an error — fail the test
+    # Success — also a failure
     content = result.get("content", [])
     text = content[0]["text"] if content else ""
     raise AssertionError(
-        f"Expected tool '{name}' to return an error but got success:\n{text}"
+        f"Expected tool '{name}' to return an RPC-level error but got success:\n{text}"
     )
+
+
+def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
+    """Alias retained for call-sites that need channel-agnostic behaviour.
+
+    For new call-sites, prefer _expect_rpc_error() which asserts the specific
+    channel (RPC-level) that khive-mcp uses for all validation failures.
+    """
+    return _expect_rpc_error(proc, name, args)
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +235,8 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
     full_id = entity["id"]
     short_prefix = full_id[:8]
 
-    # ---- get from ns-beta must not find it ----
-    err_text = _tool_expect_error(proc, "get", {"id": full_id, "namespace": "ns-beta"})
+    # ---- get from ns-beta must not find it (RPC-level error) ----
+    err_text = _expect_rpc_error(proc, "get", {"id": full_id, "namespace": "ns-beta"})
     assert "not found" in err_text.lower(), (
         f"Expected 'not found' error from ns-beta get, got: {err_text!r}"
     )
@@ -248,8 +268,8 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
     assert fetched["kind"] == "entity", f"Expected kind=entity, got {fetched['kind']}"
     assert fetched["data"]["name"] == "AlphaEntity"
 
-    # ---- short prefix from ns-beta must not resolve to the entity ----
-    err_prefix = _tool_expect_error(proc, "get", {"id": short_prefix, "namespace": "ns-beta"})
+    # ---- short prefix from ns-beta must not resolve to the entity (RPC-level error) ----
+    err_prefix = _expect_rpc_error(proc, "get", {"id": short_prefix, "namespace": "ns-beta"})
     # The error should say "no record matches" rather than returning the entity from ns-alpha
     assert ("no record" in err_prefix.lower() or "not found" in err_prefix.lower()), (
         f"Expected prefix-not-found from ns-beta, got: {err_prefix!r}"
@@ -279,13 +299,13 @@ def test_short_uuid_prefix_resolution(proc: subprocess.Popen) -> None:
         f"8-char prefix did not resolve to PrefixTarget: {fetched}"
     )
 
-    # ---- 7-char prefix returns an error ----
-    err_7 = _tool_expect_error(proc, "get", {"id": prefix7})
+    # ---- 7-char prefix returns an RPC-level error ----
+    err_7 = _expect_rpc_error(proc, "get", {"id": prefix7})
     assert err_7, f"Expected an error for 7-char prefix, got empty string"
-    # Should not return a wrong record — confirmed by isError=True above.
+    # Should not return a wrong record — confirmed by RPC error above.
 
-    # ---- non-hex 8-char string returns an error ----
-    err_bad = _tool_expect_error(proc, "get", {"id": prefix_bad})
+    # ---- non-hex 8-char string returns an RPC-level error ----
+    err_bad = _expect_rpc_error(proc, "get", {"id": prefix_bad})
     assert err_bad, f"Expected an error for non-hex prefix, got empty string"
 
 
@@ -332,18 +352,22 @@ def test_gql_property_projection(proc: subprocess.Popen) -> None:
     )
 
     # ---- RETURN a.bogus — must return a compile error listing valid columns ----
-    err_text = _tool_expect_error(proc, "query", {
+    # khive-query surfaces this as a RPC-level error (McpError::invalid_request,
+    # code -32603) with the message format:
+    #   "query: compile error: unknown node property '<token>' in RETURN projection.
+    #    Valid: id, name, kind, namespace, description, properties, created_at, updated_at"
+    err_text = _expect_rpc_error(proc, "query", {
         "query": "MATCH (a:concept)-[e:extends]->(b:concept) RETURN a.bogus LIMIT 5",
     })
-    # Error must mention the unknown property AND list valid alternatives.
-    assert "bogus" in err_text, (
-        f"Error text should name the offending property 'bogus': {err_text!r}"
+    # Error must quote the offending token in single-quotes exactly as the compiler emits.
+    assert "'bogus'" in err_text, (
+        f"Error text should name the offending property as \"'bogus'\": {err_text!r}"
     )
-    # Valid node columns are id, name, kind, namespace, description, properties, created_at, updated_at
-    for expected_col in ("name", "id", "kind"):
-        assert expected_col in err_text, (
-            f"Valid column '{expected_col}' not mentioned in compile error: {err_text!r}"
-        )
+    # Error must contain the compiler's fixed-format valid-column list.  If the
+    # columns change, this assertion will catch the drift.
+    assert "Valid: id, name, kind, namespace, description, properties, created_at, updated_at" in err_text, (
+        f"Error text must contain the full valid-column list emitted by the compiler: {err_text!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -381,14 +405,32 @@ def test_edge_cascade_hard_delete(proc: subprocess.Popen) -> None:
     del_result = _tool(proc, "delete", {"id": hub["id"], "hard": True})
     assert del_result["deleted"] is True, f"Hard delete should return deleted=true: {del_result}"
 
-    # Both incident edges must be gone
-    err_e1 = _tool_expect_error(proc, "get", {"id": e1_id})
+    # Both incident edges must be gone — assert via get() AND via list() so the
+    # proof is symmetric with the pre-delete list assertion above.
+    err_e1 = _expect_rpc_error(proc, "get", {"id": e1_id})
     assert "not found" in err_e1.lower(), (
         f"Outbound edge should be deleted after hard-delete of source: {err_e1!r}"
     )
-    err_e2 = _tool_expect_error(proc, "get", {"id": e2_id})
+    err_e2 = _expect_rpc_error(proc, "get", {"id": e2_id})
     assert "not found" in err_e2.lower(), (
         f"Inbound edge should be deleted after hard-delete of target: {err_e2!r}"
+    )
+
+    # Symmetric list proof: list by source_id and target_id must both return empty
+    # (mirrors the pre-delete list assertion — completes the cascade proof).
+    edges_after_src = _tool(proc, "list", {"kind": "edge", "source_id": hub["id"]})
+    assert edges_after_src == [] or not any(
+        e["id"] in (e1_id, e2_id) for e in edges_after_src
+    ), (
+        f"list(source_id=hub) should return no incident edges after hard-delete, "
+        f"got: {[e['id'] for e in edges_after_src]}"
+    )
+    edges_after_tgt = _tool(proc, "list", {"kind": "edge", "target_id": hub["id"]})
+    assert edges_after_tgt == [] or not any(
+        e["id"] in (e1_id, e2_id) for e in edges_after_tgt
+    ), (
+        f"list(target_id=hub) should return no incident edges after hard-delete, "
+        f"got: {[e['id'] for e in edges_after_tgt]}"
     )
 
     # ---- Soft delete: edges must remain ----
@@ -445,16 +487,25 @@ def test_note_supersession(proc: subprocess.Popen) -> None:
         "weight": 1.0,
     })
 
-    # ---- search(kind=note) must exclude the superseded old note ----
+    # ---- search(kind=note) must exclude the superseded old note AND include the new note ----
+    # Both notes share the token "unique_token_abc".  A bug that dropped ALL notes
+    # sharing the token would make old_id absent (correct) but also new_id absent
+    # (false green).  Asserting new_id IS present closes that gap.
     hits = _tool(proc, "search", {
         "kind": "note",
         "query": "unique_token_abc",
         "limit": 20,
     })
     hit_note_ids = [h.get("note_id", "") for h in hits]
+
     assert old_id not in hit_note_ids, (
         f"Superseded note (old_id={old_id}) should be excluded from search, "
         f"but appeared in hits: {hit_note_ids}"
+    )
+    assert new_id in hit_note_ids, (
+        f"New note (new_id={new_id}) MUST appear in search results — the unique "
+        f"token 'unique_token_abc' is shared by both notes, so a correct "
+        f"implementation must return the non-superseded note.  hits: {hit_note_ids}"
     )
 
     # ---- get(old_id) must still succeed — superseded is not deleted ----
@@ -466,12 +517,11 @@ def test_note_supersession(proc: subprocess.Popen) -> None:
         f"Superseded note content incorrect: {fetched_old}"
     )
 
-    # ---- the new note may appear in search results ----
-    new_in_hits = new_id in hit_note_ids
-    # Not a strict requirement (depends on FTS ranking), but it should at least
-    # be gettable.
+    # ---- get(new_id) must also succeed (recoverability check) ----
     fetched_new = _tool(proc, "get", {"id": new_id})
-    assert fetched_new["kind"] == "note"
+    assert fetched_new["kind"] == "note", (
+        f"New note must be gettable via get(): {fetched_new}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +531,7 @@ def test_note_supersession(proc: subprocess.Popen) -> None:
 def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     """Invalid entity_kind / edge relation / note_kind error with valid values listed."""
     # ---- Invalid entity_kind ----
-    err_ek = _tool_expect_error(proc, "create", {
+    err_ek = _expect_rpc_error(proc, "create", {
         "kind": "entity",
         "entity_kind": "galaxy",   # not in the 6-element closed set
         "name": "StarSystem",
@@ -503,7 +553,7 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     # Need two entities first
     src = _tool(proc, "create", {"kind": "entity", "entity_kind": "concept", "name": "TaxSrc"})
     tgt = _tool(proc, "create", {"kind": "entity", "entity_kind": "concept", "name": "TaxTgt"})
-    err_rel = _tool_expect_error(proc, "link", {
+    err_rel = _expect_rpc_error(proc, "link", {
         "source_id": src["id"],
         "target_id": tgt["id"],
         "relation": "invented_by",  # not in the 13-relation closed set
@@ -518,7 +568,7 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     )
 
     # ---- Invalid note_kind ----
-    err_nk = _tool_expect_error(proc, "create", {
+    err_nk = _expect_rpc_error(proc, "create", {
         "kind": "note",
         "note_kind": "scribble",   # not in the 5-element closed set
         "content": "some content",
@@ -533,7 +583,7 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     )
 
     # ---- Invalid top-level kind ----
-    err_kind = _tool_expect_error(proc, "create", {
+    err_kind = _expect_rpc_error(proc, "create", {
         "kind": "blob",
         "name": "Whatever",
     })
@@ -605,8 +655,8 @@ def test_merge_semantics(proc: subprocess.Popen) -> None:
         f"removed_id mismatch: expected {gone['id']}, got {summary['removed_id']}"
     )
 
-    # ---- from_id is gone ----
-    err_gone = _tool_expect_error(proc, "get", {"id": gone["id"]})
+    # ---- from_id is gone (RPC-level not-found) ----
+    err_gone = _expect_rpc_error(proc, "get", {"id": gone["id"]})
     assert ("not found" in err_gone.lower()), (
         f"Merged-away entity should not be gettable: {err_gone!r}"
     )
