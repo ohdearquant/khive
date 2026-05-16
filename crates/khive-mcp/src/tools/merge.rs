@@ -1,15 +1,19 @@
 //! Parameter types for the `merge` verb (ADR-023).
+//!
+//! v0.1 scope: entity-only. Note merge is deferred.
 
 use rmcp::schemars;
 use serde::Deserialize;
 
 /// Input for `merge` — deduplicate two entity records into one (ADR-014).
 ///
+/// **v0.1: entity-only.** Both IDs must refer to entities (note merge is deferred).
+///
 /// Rewires all edges from `from_id` to `into_id`, merges properties by strategy,
-/// unions tags, then hard-deletes `from_id`. Both IDs must refer to entities.
+/// unions tags, then hard-deletes `from_id`.
 ///
 /// Use when you discover two records describe the same thing (deduplication).
-/// Compare with `supersede` which preserves the old record as history.
+/// Compare with `supersede` which preserves the old record as history (deferred past v0.1).
 ///
 /// strategy options:
 ///   prefer_into (default): into's values win on conflict; from fills in missing keys

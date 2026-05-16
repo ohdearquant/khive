@@ -490,10 +490,12 @@ Examples:
     // ---- merge ----
 
     #[tool(
-        description = r#"Merge two entities: rewire all edges from `from_id` to `into_id`, merge properties, hard-delete `from_id`.
+        description = r#"Merge two entity records: rewire all edges from `from_id` to `into_id`, merge properties, hard-delete `from_id`.
+
+v0.1: entity-only. Note merge is deferred past v0.1.
 
 Use when you discover two entity records describe the same thing (deduplication).
-Compare with `supersede` (not yet available) which preserves the old record as history.
+Compare with `supersede` (deferred past v0.1) which preserves the old record as history.
 
 strategy: prefer_into (default) | prefer_from | union
   prefer_into: into's values win on conflict; from fills in missing keys

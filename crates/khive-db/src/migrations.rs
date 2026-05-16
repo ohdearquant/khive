@@ -159,6 +159,13 @@ const V1_UP: &str = "\
 /// To add a new migration: append a `VersionedMigration` entry with
 /// `version = <last_version + 1>`. The version sequence must be contiguous
 /// (1, 2, 3, ...); `run_migrations` returns an error on gaps.
+///
+/// V2 note: `NOTES_DDL` in `stores/note.rs` already includes `name TEXT` so that
+/// in-process schema creation (used by tests and `StorageBackend::notes()`) has the
+/// column from the start.  When `run_migrations` is called on a DB that was
+/// bootstrapped via `NOTES_DDL`, the V2 `ALTER TABLE` would fail with "duplicate
+/// column name".  The migration runner handles this by checking column existence
+/// before applying V2 — see `run_migrations`.
 pub const MIGRATIONS: &[VersionedMigration] = &[
     VersionedMigration {
         version: 1,
@@ -228,6 +235,35 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     for migration in MIGRATIONS {
         if migration.version <= current_version {
             continue;
+        }
+
+        // V2 adds `name` to notes.  StorageBackend::notes() bootstraps the schema
+        // via NOTES_DDL (which already includes `name`), so the column may already
+        // exist even though the migration has never been recorded.  Treat "duplicate
+        // column name" from SQLite as idempotent for ALTER TABLE migrations.
+        if migration.version == 2 {
+            let col_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('notes') WHERE name = 'name'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if col_exists {
+                // Column already present — record the migration as applied and skip.
+                let now = chrono::Utc::now().timestamp_micros();
+                conn.execute(
+                    "INSERT OR IGNORE INTO _schema_migrations (version, name, applied_at) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![migration.version, migration.name, now],
+                )
+                .map_err(|e| SqliteError::Migration {
+                    version: migration.version,
+                    error: e.to_string(),
+                })?;
+                applied_version = migration.version;
+                continue;
+            }
         }
 
         let tx = conn.transaction().map_err(|e| SqliteError::Migration {

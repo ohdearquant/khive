@@ -29,12 +29,12 @@ kinds take a `kind=<observable>` discriminant.
 
 | Tool        | Notes                                                                                                                                |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `create`    | `kind=entity\|note`. Entity needs `entity_kind`; note needs `note_kind`. Note supports an optional `name` field for titled notes.   |
-| `get`       | UUID-only. Resolves substrate automatically (entity, note, edge). Returns `{kind, data}`.                                           |
+| `create`    | `kind=entity\|note`. Entity needs `entity_kind`; note needs `note_kind`. Note supports an optional `name` field for titled notes.    |
+| `get`       | UUID-only. Resolves substrate automatically (entity, note, edge). Returns `{kind, data}`.                                            |
 | `list`      | `kind=entity\|edge\|note`. Structured filter per kind.                                                                               |
 | `update`    | UUID-only. Resolves substrate, applies entity or edge patch.                                                                         |
 | `delete`    | UUID-only. Resolves substrate. Hard entity delete cascades edges.                                                                    |
-| `merge`     | UUID-only (`into_id`, `from_id`). Verifies both are same substrate.                                                                  |
+| `merge`     | UUID-only (`into_id`, `from_id`). **Entity-only in v0.1** — note merge is deferred past v0.1. Verifies both IDs resolve to entities. |
 | `search`    | `kind=entity\|note`. Hybrid FTS5+vector.                                                                                             |
 | `link`      | Create directed edge. Args: `source_id`, `target_id`, `relation`, `weight`.                                                          |
 | `traverse`  | Multi-hop graph traversal.                                                                                                           |
@@ -46,17 +46,22 @@ kinds take a `kind=<observable>` discriminant.
 `supersede` and `request` are planned but deferred past v0.1. `get(id)` serves the cross-substrate
 UUID lookup use case (returning `{kind, data}`) without a separate `resolve` verb.
 
-### `merge` — dedupe semantics
+### `merge` — dedupe semantics (entity-only in v0.1)
 
 **`merge(into_id, from_id)`** — "these two records describe the same thing; dedupe them." Used
-when the agent realizes "LoRA" and "Low-Rank Adaptation" are duplicate concept entities, or two
-`observation` notes about the same fact. Properties combine per strategy; tags union;
-edges/references rewire to the kept record; the `from` record is removed. Both UUIDs must resolve
-to the same substrate kind; the handler verifies this before merging.
+when the agent realizes "LoRA" and "Low-Rank Adaptation" are duplicate concept entities.
+Properties combine per strategy; tags union; edges/references rewire to the kept record; the
+`from` record is removed. Both UUIDs must resolve to entities; the handler verifies this before
+merging.
+
+**Note merge is deferred past v0.1.** In v0.1, `merge` is entity-only. Deduplicating two notes
+that record the same observation is not yet supported — add a `supersedes` edge manually via
+`link(source=new_note_id, target=old_note_id, relation="supersedes")` as a workaround until
+note merge lands.
 
 Supersession (history-preserving replacement via a `supersedes` edge) is a planned operation
-deferred past v0.1. For now, agents that need to mark a record obsolete can add a `supersedes`
-edge manually via `link(source=new_id, target=old_id, relation="supersedes")`.
+deferred past v0.1. Agents that need to mark any record obsolete can add a `supersedes` edge
+manually via `link(source=new_id, target=old_id, relation="supersedes")`.
 
 ### Versioning tools (when ADR-015 ships)
 

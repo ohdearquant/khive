@@ -1,6 +1,6 @@
 # ADR-020: Request DSL — Batch Operations via Function-Call Syntax
 
-**Status**: accepted\
+**Status**: planned\
 **Date**: 2026-05-15\
 **Authors**: Ocean, lambda:khive
 

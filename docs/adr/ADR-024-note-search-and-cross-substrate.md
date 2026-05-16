@@ -111,8 +111,9 @@ target is any substrate UUID — entity, edge, event, or another note.
 2. Creates one `annotates` edge per target UUID:
    `link(source=note.id, target=<uuid>, relation=annotates, weight=1.0)`.
 
-No new table. No new field on the Note struct. Edges reference UUIDs that may resolve to any
-observable substrate — the existing edge schema already supports this.
+No new table. The `Note` struct gains only the optional `name` display field (Part 4 below);
+annotation and supersession remain edges in `graph_edges`. Edges reference UUIDs that may resolve
+to any observable substrate — the existing edge schema already supports this.
 
 **Discovery via the existing graph machinery**:
 
@@ -146,12 +147,12 @@ at most 3 lookups per UUID for negative cases. Cheap enough for v0.1.
 **MCP exposure** — the existing `get(id)` verb (per ADR-023) wraps this runtime helper. UUID is
 globally unique; `get` resolves the substrate internally and returns `{ kind, data }`:
 
-| Verb (existing)                                                | Cross-substrate query           |
-| -------------------------------------------------------------- | ------------------------------- |
-| `neighbors(node_id, relations=["annotates"], direction="in")`  | "notes annotating this"         |
-| `neighbors(node_id, relations=["annotates"], direction="out")` | "things this annotates"         |
-| `traverse(roots, relations=["annotates", ...])`                | mixed expansion                 |
-| `get(id)`                                                      | "what substrate is this UUID?"  |
+| Verb (existing)                                                | Cross-substrate query          |
+| -------------------------------------------------------------- | ------------------------------ |
+| `neighbors(node_id, relations=["annotates"], direction="in")`  | "notes annotating this"        |
+| `neighbors(node_id, relations=["annotates"], direction="out")` | "things this annotates"        |
+| `traverse(roots, relations=["annotates", ...])`                | mixed expansion                |
+| `get(id)`                                                      | "what substrate is this UUID?" |
 
 No new MCP verb is needed. `get(id)` already returns `{ kind, data }` and covers the cross-substrate
 UUID lookup use case without adding to the surface count.
@@ -263,8 +264,8 @@ land:
    - `VectorStore::insert(subject_id, kind, embedding)` — extend signature.
    - `VectorStore::search(query_embedding, kind: Option<&str>, top_k)` — extend signature to filter
      by kind.
-   - `Note` struct is unchanged structurally — supersession and annotation are both edges in
-     `graph_edges`, not fields on `Note`.
+   - `Note` struct gains an optional `name` field (display metadata; no semantic effect on search).
+     Supersession and annotation remain edges in `graph_edges`, not fields on `Note`.
 
 3. **Runtime layer**:
    - Auto-index notes on `create(kind="note", ...)` (FTS5 + vector store with `kind="note"`).
