@@ -116,14 +116,15 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
     let id_str: String = row.get(0)?;
     let namespace: String = row.get(1)?;
     let kind_str: String = row.get(2)?;
-    let content: String = row.get(3)?;
-    let salience: f64 = row.get(4)?;
-    let decay_factor: f64 = row.get(5)?;
-    let expires_at: Option<i64> = row.get(6)?;
-    let properties_str: Option<String> = row.get(7)?;
-    let created_at: i64 = row.get(8)?;
-    let updated_at: i64 = row.get(9)?;
-    let deleted_at: Option<i64> = row.get(10)?;
+    let name: Option<String> = row.get(3)?;
+    let content: String = row.get(4)?;
+    let salience: f64 = row.get(5)?;
+    let decay_factor: f64 = row.get(6)?;
+    let expires_at: Option<i64> = row.get(7)?;
+    let properties_str: Option<String> = row.get(8)?;
+    let created_at: i64 = row.get(9)?;
+    let updated_at: i64 = row.get(10)?;
+    let deleted_at: Option<i64> = row.get(11)?;
 
     let id = parse_uuid(&id_str)?;
     let kind = parse_note_kind(&kind_str, 2)?;
@@ -132,7 +133,7 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
         .map(|s| {
             serde_json::from_str(&s).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    7,
+                    8,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -144,6 +145,7 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
         id,
         namespace,
         kind,
+        name,
         content,
         salience,
         decay_factor,
@@ -198,13 +200,14 @@ impl NoteStore for SqlNoteStore {
         self.with_writer("upsert_note", move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO notes \
-                 (id, namespace, kind, content, salience, decay_factor, expires_at, \
+                 (id, namespace, kind, name, content, salience, decay_factor, expires_at, \
                   properties, created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     id_str,
                     namespace,
                     kind_str,
+                    note.name,
                     note.content,
                     note.salience,
                     note.decay_factor,
@@ -246,6 +249,7 @@ impl NoteStore for SqlNoteStore {
                         id_str,
                         &note.namespace,
                         kind_str,
+                        &note.name,
                         note.content,
                         note.salience,
                         note.decay_factor,
@@ -285,7 +289,7 @@ impl NoteStore for SqlNoteStore {
 
         self.with_reader("get_note", move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, namespace, kind, content, salience, decay_factor, expires_at, \
+                "SELECT id, namespace, kind, name, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
                  FROM notes WHERE id = ?1 AND deleted_at IS NULL",
             )?;
@@ -352,7 +356,7 @@ impl NoteStore for SqlNoteStore {
             let offset_idx = data_params.len();
 
             let data_sql = format!(
-                "SELECT id, namespace, kind, content, salience, decay_factor, expires_at, \
+                "SELECT id, namespace, kind, name, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
                  FROM notes{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
@@ -420,13 +424,14 @@ impl NoteStore for SqlNoteStore {
             }
             conn.execute(
                 "INSERT OR REPLACE INTO notes \
-                 (id, namespace, kind, content, salience, decay_factor, expires_at, \
+                 (id, namespace, kind, name, content, salience, decay_factor, expires_at, \
                   properties, created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     id_str,
                     namespace,
                     kind_str,
+                    note.name,
                     note.content,
                     note.salience,
                     note.decay_factor,
@@ -452,6 +457,7 @@ const NOTES_DDL: &str = "\
         id TEXT PRIMARY KEY,\
         namespace TEXT NOT NULL,\
         kind TEXT NOT NULL,\
+        name TEXT,\
         content TEXT NOT NULL DEFAULT '',\
         salience REAL NOT NULL DEFAULT 0.5,\
         decay_factor REAL NOT NULL DEFAULT 0.0,\

@@ -124,6 +124,7 @@ const V1_UP: &str = "\
         id TEXT PRIMARY KEY,\
         namespace TEXT NOT NULL,\
         kind TEXT NOT NULL,\
+        name TEXT,\
         content TEXT NOT NULL DEFAULT '',\
         salience REAL NOT NULL DEFAULT 0.5,\
         decay_factor REAL NOT NULL DEFAULT 0.0,\

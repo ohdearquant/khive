@@ -15,6 +15,7 @@ pub struct Note {
     pub id: Uuid,
     pub namespace: String,
     pub kind: NoteKind,
+    pub name: Option<String>,
     pub content: String,
     pub salience: f64,
     pub decay_factor: f64,
@@ -32,6 +33,7 @@ impl Note {
             id: Uuid::new_v4(),
             namespace: namespace.into(),
             kind,
+            name: None,
             content: content.into(),
             salience: 0.5,
             decay_factor: 0.0,
@@ -41,6 +43,11 @@ impl Note {
             updated_at: now,
             deleted_at: None,
         }
+    }
+
+    pub fn with_name(mut self, n: impl Into<String>) -> Self {
+        self.name = Some(n.into());
+        self
     }
 
     pub fn with_salience(mut self, s: f64) -> Self {

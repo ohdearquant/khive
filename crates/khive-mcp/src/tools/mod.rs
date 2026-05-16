@@ -1,6 +1,9 @@
-pub mod edge;
-pub mod entity;
-pub mod entity_curation;
+pub mod create;
+pub mod delete;
+pub mod get;
 pub mod graph;
-pub mod note;
+pub mod list;
+pub mod merge;
 pub mod query;
+pub mod search;
+pub mod update;

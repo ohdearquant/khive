@@ -1,6 +1,9 @@
 //! Integration tests for khive-mcp.
 //!
 //! Uses rmcp's duplex transport to test the full JSON-RPC path end-to-end.
+//! Tests use the verb-consolidated surface from ADR-023 + ADR-024:
+//! 11 tools — create, get, list, update, delete, merge, search,
+//! link, neighbors, traverse, query.
 
 use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
@@ -64,7 +67,7 @@ async fn call(
     Ok(client.call_tool(params).await?)
 }
 
-// ---- Tests ----
+// ---- Server info ----
 
 #[tokio::test]
 async fn server_info_contains_name_and_tools_capability() {
@@ -77,15 +80,18 @@ async fn server_info_contains_name_and_tools_capability() {
     );
 }
 
+// ---- Tool list ----
+
 #[tokio::test]
-async fn list_tools_returns_sixteen_tools() -> anyhow::Result<()> {
+async fn list_tools_returns_eleven_tools() -> anyhow::Result<()> {
     let client = connect().await?;
     let result = client.list_tools(None).await?;
     assert_eq!(
         result.tools.len(),
-        16,
-        "expected 16 tools, got {}",
-        result.tools.len()
+        11,
+        "expected 11 tools (ADR-023 + ADR-024), got {}: {:?}",
+        result.tools.len(),
+        result.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
     Ok(())
 }
@@ -97,36 +103,38 @@ async fn tool_names_are_correct() -> anyhow::Result<()> {
     let names: std::collections::HashSet<String> =
         result.tools.iter().map(|t| t.name.to_string()).collect();
     for expected in [
-        "entity_create",
-        "entity_get",
-        "entity_list",
-        "entity_delete",
-        "entity_update",
-        "entity_merge",
+        "create",
+        "get",
+        "list",
+        "update",
+        "delete",
+        "merge",
+        "search",
         "link",
         "neighbors",
         "traverse",
-        "edge_get",
-        "edge_list",
-        "edge_update",
-        "edge_delete",
-        "note_create",
-        "note_list",
         "query",
     ] {
         assert!(names.contains(expected), "missing tool: {expected}");
     }
+    assert!(
+        !names.contains("resolve"),
+        "resolve tool must not be present (absorbed into get)"
+    );
     Ok(())
 }
+
+// ---- create / get / list / delete (entity) ----
 
 #[tokio::test]
 async fn entity_create_roundtrip() -> anyhow::Result<()> {
     let client = connect().await?;
     let result = call(
         &client,
-        "entity_create",
+        "create",
         json!({
-            "kind": "concept",
+            "kind": "entity",
+            "entity_kind": "concept",
             "name": "FlashAttention",
             "description": "Memory-efficient exact attention",
             "properties": {"type": "algorithm", "domain": "attention"}
@@ -148,16 +156,41 @@ async fn entity_get_returns_existing() -> anyhow::Result<()> {
 
     let create = call(
         &client,
-        "entity_create",
-        json!({"kind": "document", "name": "Attention Is All You Need"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "document", "name": "Attention Is All You Need"}),
     )
     .await?;
     let created: serde_json::Value = serde_json::from_str(&first_text(&create)).unwrap();
     let id = created["id"].as_str().unwrap().to_string();
 
-    let get = call(&client, "entity_get", json!({"id": id})).await?;
-    let fetched: serde_json::Value = serde_json::from_str(&first_text(&get)).unwrap();
-    assert_eq!(fetched["name"], "Attention Is All You Need");
+    // get auto-detects kind from UUID; returns {"kind": "entity", "data": {...}}
+    let get = call(&client, "get", json!({"id": id})).await?;
+    let wrapped: serde_json::Value = serde_json::from_str(&first_text(&get)).unwrap();
+    assert_eq!(wrapped["kind"], "entity");
+    assert_eq!(wrapped["data"]["name"], "Attention Is All You Need");
+    Ok(())
+}
+
+#[tokio::test]
+async fn entity_get_with_entity_uuid_returns_kind_entity() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let create = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "GetKindTest"}),
+    )
+    .await?;
+    let created: serde_json::Value = serde_json::from_str(&first_text(&create)).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let get = call(&client, "get", json!({"id": id})).await?;
+    let wrapped: serde_json::Value = serde_json::from_str(&first_text(&get)).unwrap();
+    assert_eq!(
+        wrapped["kind"], "entity",
+        "entity UUID must return kind=entity"
+    );
+    assert!(wrapped["data"].is_object(), "data must be an object");
     Ok(())
 }
 
@@ -166,7 +199,7 @@ async fn entity_get_missing_returns_error() -> anyhow::Result<()> {
     let client = connect().await?;
     let result = client
         .call_tool(
-            CallToolRequestParams::new("entity_get").with_arguments(
+            CallToolRequestParams::new("get").with_arguments(
                 json!({"id": "00000000-0000-0000-0000-000000000000"})
                     .as_object()
                     .unwrap()
@@ -178,7 +211,6 @@ async fn entity_get_missing_returns_error() -> anyhow::Result<()> {
     match result {
         Err(_) => {}
         Ok(r) => {
-            // Error may be encoded as isError=true in content
             assert!(
                 r.is_error.unwrap_or(false),
                 "missing entity should be flagged as error"
@@ -194,15 +226,41 @@ async fn entity_list_returns_all_created() -> anyhow::Result<()> {
     for name in ["LoRA", "QLoRA", "DoRA"] {
         call(
             &client,
-            "entity_create",
-            json!({"kind": "concept", "name": name}),
+            "create",
+            json!({"kind": "entity", "entity_kind": "concept", "name": name}),
         )
         .await?;
     }
 
-    let result = call(&client, "entity_list", json!({"kind": "concept"})).await?;
+    let result = call(
+        &client,
+        "list",
+        json!({"kind": "entity", "entity_kind": "concept"}),
+    )
+    .await?;
     let entities: Vec<serde_json::Value> = serde_json::from_str(&first_text(&result)).unwrap();
     assert_eq!(entities.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn entity_list_limit_is_respected() -> anyhow::Result<()> {
+    let client = connect().await?;
+    for i in 0..10 {
+        call(
+            &client,
+            "create",
+            json!({"kind": "entity", "entity_kind": "concept", "name": format!("Entity{i}")}),
+        )
+        .await?;
+    }
+    let result = call(&client, "list", json!({"kind": "entity", "limit": 3})).await?;
+    let items: Vec<serde_json::Value> = serde_json::from_str(&first_text(&result)).unwrap();
+    assert!(
+        items.len() <= 3,
+        "result should respect limit, got {}",
+        items.len()
+    );
     Ok(())
 }
 
@@ -212,18 +270,87 @@ async fn entity_delete_succeeds() -> anyhow::Result<()> {
 
     let create = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "ToDelete"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "ToDelete"}),
     )
     .await?;
     let created: serde_json::Value = serde_json::from_str(&first_text(&create)).unwrap();
     let id = created["id"].as_str().unwrap().to_string();
 
-    let del = call(&client, "entity_delete", json!({"id": id})).await?;
+    // delete auto-detects kind from UUID
+    let del = call(&client, "delete", json!({"id": id})).await?;
     let result: serde_json::Value = serde_json::from_str(&first_text(&del)).unwrap();
     assert_eq!(result["deleted"], true);
     Ok(())
 }
+
+// ---- update (entity + edge) ----
+
+#[tokio::test]
+async fn entity_update_patches_name() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let create = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "OldName", "description": "keep this"}),
+    )
+    .await?;
+    let created: serde_json::Value = serde_json::from_str(&first_text(&create)).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // update auto-detects kind from UUID; only patch name — description must be unchanged.
+    let update = call(&client, "update", json!({"id": id, "name": "NewName"})).await?;
+    let updated: serde_json::Value = serde_json::from_str(&first_text(&update)).unwrap();
+    assert_eq!(updated["name"], "NewName");
+    assert_eq!(updated["description"], "keep this");
+    Ok(())
+}
+
+// ---- merge ----
+
+#[tokio::test]
+async fn entity_merge_returns_summary() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let a = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "MergeInto"}),
+    )
+    .await?;
+    let b = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "MergeFrom"}),
+    )
+    .await?;
+    let a_id = serde_json::from_str::<serde_json::Value>(&first_text(&a)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_id = serde_json::from_str::<serde_json::Value>(&first_text(&b)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // merge auto-detects kind; both IDs must be entities
+    let merge = call(
+        &client,
+        "merge",
+        json!({"into_id": a_id, "from_id": b_id, "strategy": "prefer_into"}),
+    )
+    .await?;
+    let summary: serde_json::Value = serde_json::from_str(&first_text(&merge)).unwrap();
+    assert_eq!(summary["kept_id"].as_str().unwrap(), a_id);
+    assert_eq!(summary["removed_id"].as_str().unwrap(), b_id);
+    assert!(summary["edges_rewired"].is_number());
+    assert!(summary["properties_merged"].is_number());
+    assert!(summary["tags_unioned"].is_number());
+    Ok(())
+}
+
+// ---- link / neighbors / traverse ----
 
 #[tokio::test]
 async fn link_creates_edge() -> anyhow::Result<()> {
@@ -231,14 +358,14 @@ async fn link_creates_edge() -> anyhow::Result<()> {
 
     let a = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "A"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "A"}),
     )
     .await?;
     let b = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "B"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "B"}),
     )
     .await?;
 
@@ -264,19 +391,60 @@ async fn link_creates_edge() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn get_with_edge_uuid_returns_kind_edge() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let a = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "EdgeSrcGet"}),
+    )
+    .await?;
+    let b = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "EdgeTgtGet"}),
+    )
+    .await?;
+    let a_id = serde_json::from_str::<serde_json::Value>(&first_text(&a)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_id = serde_json::from_str::<serde_json::Value>(&first_text(&b)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let link = call(
+        &client,
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends", "weight": 0.8}),
+    )
+    .await?;
+    let edge: serde_json::Value = serde_json::from_str(&first_text(&link)).unwrap();
+    let edge_id = edge["id"].as_str().unwrap().to_string();
+
+    let get = call(&client, "get", json!({"id": edge_id})).await?;
+    let wrapped: serde_json::Value = serde_json::from_str(&first_text(&get)).unwrap();
+    assert_eq!(wrapped["kind"], "edge", "edge UUID must return kind=edge");
+    assert!(wrapped["data"].is_object(), "data must be an object");
+    Ok(())
+}
+
+#[tokio::test]
 async fn neighbors_returns_linked_nodes() -> anyhow::Result<()> {
     let client = connect().await?;
 
     let a = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "Root"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "Root"}),
     )
     .await?;
     let b = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "Child"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "Child"}),
     )
     .await?;
 
@@ -314,20 +482,20 @@ async fn traverse_reaches_multi_hop_nodes() -> anyhow::Result<()> {
 
     let a = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "A"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "A"}),
     )
     .await?;
     let b = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "B"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "B"}),
     )
     .await?;
     let c = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "C"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "C"}),
     )
     .await?;
 
@@ -374,225 +542,22 @@ async fn traverse_reaches_multi_hop_nodes() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn note_create_and_list_roundtrip() -> anyhow::Result<()> {
-    let client = connect().await?;
-
-    call(
-        &client,
-        "note_create",
-        json!({"kind": "decision", "content": "Use FlashAttention-2 for attention", "salience": 0.9}),
-    )
-    .await?;
-
-    let notes = call(&client, "note_list", json!({"kind": "decision"})).await?;
-    let items: Vec<serde_json::Value> = serde_json::from_str(&first_text(&notes)).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["content"], "Use FlashAttention-2 for attention");
-    Ok(())
-}
+// ---- edge list / update via list + update verbs ----
 
 #[tokio::test]
-async fn note_create_with_canonical_kind() -> anyhow::Result<()> {
-    let client = connect().await?;
-    let result = call(
-        &client,
-        "note_create",
-        json!({"kind": "observation", "content": "FlashAttention is fast"}),
-    )
-    .await?;
-    assert!(
-        !result.is_error.unwrap_or(false),
-        "canonical kind 'observation' should succeed"
-    );
-    let note: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
-    assert_eq!(note["kind"], "observation");
-    Ok(())
-}
-
-#[tokio::test]
-async fn note_create_with_alias_obs() -> anyhow::Result<()> {
-    let client = connect().await?;
-    let result = call(
-        &client,
-        "note_create",
-        json!({"kind": "obs", "content": "GQA reduces KV cache memory"}),
-    )
-    .await?;
-    assert!(
-        !result.is_error.unwrap_or(false),
-        "alias 'obs' should map to observation"
-    );
-    let note: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
-    assert_eq!(note["kind"], "observation");
-    Ok(())
-}
-
-#[tokio::test]
-async fn note_create_unknown_kind_returns_error() -> anyhow::Result<()> {
-    let client = connect().await?;
-    let result = client
-        .call_tool(
-            CallToolRequestParams::new("note_create").with_arguments(
-                json!({"kind": "garbage", "content": "should fail"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        )
-        .await;
-    match result {
-        Err(_) => {}
-        Ok(r) => {
-            assert!(
-                r.is_error.unwrap_or(false),
-                "unknown kind 'garbage' should produce an error response"
-            );
-            let text = first_text(&r);
-            assert!(
-                text.contains("observation") || text.contains("invalid"),
-                "error message should mention valid kinds, got: {text}"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn note_list_empty_returns_empty_array() -> anyhow::Result<()> {
-    let client = connect().await?;
-    let result = call(&client, "note_list", json!({})).await?;
-    let items: Vec<serde_json::Value> = serde_json::from_str(&first_text(&result)).unwrap();
-    assert!(items.is_empty(), "fresh namespace should have no notes");
-    Ok(())
-}
-
-#[tokio::test]
-async fn invalid_uuid_returns_error() -> anyhow::Result<()> {
-    let client = connect().await?;
-    let result = client
-        .call_tool(
-            CallToolRequestParams::new("entity_get")
-                .with_arguments(json!({"id": "not-a-uuid"}).as_object().unwrap().clone()),
-        )
-        .await;
-    match result {
-        Err(_) => {}
-        Ok(r) => {
-            assert!(
-                r.is_error.unwrap_or(false),
-                "invalid UUID should produce error response"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn entity_list_limit_is_respected() -> anyhow::Result<()> {
-    let client = connect().await?;
-    for i in 0..10 {
-        call(
-            &client,
-            "entity_create",
-            json!({"kind": "concept", "name": format!("Entity{i}")}),
-        )
-        .await?;
-    }
-    let result = call(&client, "entity_list", json!({"limit": 3})).await?;
-    let items: Vec<serde_json::Value> = serde_json::from_str(&first_text(&result)).unwrap();
-    assert!(
-        items.len() <= 3,
-        "result should respect limit, got {}",
-        items.len()
-    );
-    Ok(())
-}
-
-// =============================================================================
-// ADR-014 curation tools
-// =============================================================================
-
-#[tokio::test]
-async fn entity_update_tool_patches_name() -> anyhow::Result<()> {
-    let client = connect().await?;
-
-    let create = call(
-        &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "OldName", "description": "keep this"}),
-    )
-    .await?;
-    let created: serde_json::Value = serde_json::from_str(&first_text(&create)).unwrap();
-    let id = created["id"].as_str().unwrap().to_string();
-
-    // Only patch name — description must be unchanged.
-    let update = call(
-        &client,
-        "entity_update",
-        json!({"id": id, "name": "NewName"}),
-    )
-    .await?;
-    let updated: serde_json::Value = serde_json::from_str(&first_text(&update)).unwrap();
-    assert_eq!(updated["name"], "NewName");
-    assert_eq!(updated["description"], "keep this");
-    Ok(())
-}
-
-#[tokio::test]
-async fn entity_merge_tool_returns_summary() -> anyhow::Result<()> {
+async fn edge_list_returns_edges() -> anyhow::Result<()> {
     let client = connect().await?;
 
     let a = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "MergeInto"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "EdgeSrc"}),
     )
     .await?;
     let b = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "MergeFrom"}),
-    )
-    .await?;
-    let a_id = serde_json::from_str::<serde_json::Value>(&first_text(&a)).unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let b_id = serde_json::from_str::<serde_json::Value>(&first_text(&b)).unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let merge = call(
-        &client,
-        "entity_merge",
-        json!({"into_id": a_id, "from_id": b_id, "strategy": "prefer_into"}),
-    )
-    .await?;
-    let summary: serde_json::Value = serde_json::from_str(&first_text(&merge)).unwrap();
-    assert_eq!(summary["kept_id"].as_str().unwrap(), a_id);
-    assert_eq!(summary["removed_id"].as_str().unwrap(), b_id);
-    assert!(summary["edges_rewired"].is_number());
-    assert!(summary["properties_merged"].is_number());
-    assert!(summary["tags_unioned"].is_number());
-    Ok(())
-}
-
-#[tokio::test]
-async fn edge_list_tool_returns_edges() -> anyhow::Result<()> {
-    let client = connect().await?;
-
-    let a = call(
-        &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "EdgeSrc"}),
-    )
-    .await?;
-    let b = call(
-        &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "EdgeTgt"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "EdgeTgt"}),
     )
     .await?;
     let a_id = serde_json::from_str::<serde_json::Value>(&first_text(&a)).unwrap()["id"]
@@ -611,7 +576,7 @@ async fn edge_list_tool_returns_edges() -> anyhow::Result<()> {
     )
     .await?;
 
-    let list = call(&client, "edge_list", json!({"source_id": a_id})).await?;
+    let list = call(&client, "list", json!({"kind": "edge", "source_id": a_id})).await?;
     let edges: Vec<serde_json::Value> = serde_json::from_str(&first_text(&list)).unwrap();
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0]["relation"], "extends");
@@ -619,19 +584,19 @@ async fn edge_list_tool_returns_edges() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn edge_update_tool_validates_relation() -> anyhow::Result<()> {
+async fn edge_update_validates_relation() -> anyhow::Result<()> {
     let client = connect().await?;
 
     let a = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "A"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "A"}),
     )
     .await?;
     let b = call(
         &client,
-        "entity_create",
-        json!({"kind": "concept", "name": "B"}),
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "B"}),
     )
     .await?;
     let a_id = serde_json::from_str::<serde_json::Value>(&first_text(&a)).unwrap()["id"]
@@ -652,10 +617,10 @@ async fn edge_update_tool_validates_relation() -> anyhow::Result<()> {
     let edge_data: serde_json::Value = serde_json::from_str(&first_text(&edge)).unwrap();
     let edge_id = edge_data["id"].as_str().unwrap().to_string();
 
-    // Valid relation update succeeds.
+    // Valid relation update succeeds — update auto-detects kind from UUID.
     let ok = call(
         &client,
-        "edge_update",
+        "update",
         json!({"id": edge_id, "relation": "depends_on"}),
     )
     .await?;
@@ -665,7 +630,7 @@ async fn edge_update_tool_validates_relation() -> anyhow::Result<()> {
     // Invalid relation returns an error.
     let bad = client
         .call_tool(
-            CallToolRequestParams::new("edge_update").with_arguments(
+            CallToolRequestParams::new("update").with_arguments(
                 json!({"id": edge_id, "relation": "related_to"})
                     .as_object()
                     .unwrap()
@@ -679,6 +644,243 @@ async fn edge_update_tool_validates_relation() -> anyhow::Result<()> {
             assert!(
                 r.is_error.unwrap_or(false),
                 "unknown relation should produce an error"
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---- notes via create / list verbs ----
+
+#[tokio::test]
+async fn note_create_and_list_roundtrip() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "decision", "content": "Use FlashAttention-2 for attention", "salience": 0.9}),
+    )
+    .await?;
+
+    let notes = call(
+        &client,
+        "list",
+        json!({"kind": "note", "note_kind": "decision"}),
+    )
+    .await?;
+    let items: Vec<serde_json::Value> = serde_json::from_str(&first_text(&notes)).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["content"], "Use FlashAttention-2 for attention");
+    Ok(())
+}
+
+#[tokio::test]
+async fn note_create_with_canonical_kind() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let result = call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "observation", "content": "FlashAttention is fast"}),
+    )
+    .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "canonical note_kind 'observation' should succeed"
+    );
+    let note: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
+    assert_eq!(note["kind"], "observation");
+    Ok(())
+}
+
+#[tokio::test]
+async fn note_create_with_alias_obs() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let result = call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "obs", "content": "GQA reduces KV cache memory"}),
+    )
+    .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "alias 'obs' should map to observation"
+    );
+    let note: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
+    assert_eq!(note["kind"], "observation");
+    Ok(())
+}
+
+#[tokio::test]
+async fn note_create_unknown_kind_returns_error() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("create").with_arguments(
+                json!({"kind": "note", "note_kind": "garbage", "content": "should fail"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    match result {
+        Err(_) => {}
+        Ok(r) => {
+            assert!(
+                r.is_error.unwrap_or(false),
+                "unknown note_kind 'garbage' should produce an error response"
+            );
+            let text = first_text(&r);
+            assert!(
+                text.contains("observation") || text.contains("invalid"),
+                "error message should mention valid kinds, got: {text}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn note_list_empty_returns_empty_array() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let result = call(&client, "list", json!({"kind": "note"})).await?;
+    let items: Vec<serde_json::Value> = serde_json::from_str(&first_text(&result)).unwrap();
+    assert!(items.is_empty(), "fresh namespace should have no notes");
+    Ok(())
+}
+
+// ---- search ----
+
+#[tokio::test]
+async fn search_entity_returns_results() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "FlashAttention", "description": "Memory-efficient attention mechanism"}),
+    )
+    .await?;
+
+    let result = call(
+        &client,
+        "search",
+        json!({"kind": "entity", "query": "FlashAttention", "limit": 5}),
+    )
+    .await?;
+    assert!(!result.is_error.unwrap_or(false), "search should succeed");
+    let hits: Vec<serde_json::Value> = serde_json::from_str(&first_text(&result)).unwrap();
+    assert!(!hits.is_empty(), "search should return at least one hit");
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_note_returns_results() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "observation", "content": "LoRA reduces trainable parameters by 10000x", "salience": 0.8}),
+    )
+    .await?;
+
+    let result = call(
+        &client,
+        "search",
+        json!({"kind": "note", "query": "LoRA parameter efficiency", "limit": 5}),
+    )
+    .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "note search should succeed"
+    );
+    Ok(())
+}
+
+// ---- cross-substrate: annotates edges (ADR-024) ----
+
+#[tokio::test]
+async fn note_with_annotates_creates_edge() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let entity = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "AnnotationTarget"}),
+    )
+    .await?;
+    let entity_id = serde_json::from_str::<serde_json::Value>(&first_text(&entity)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let note = call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "observation", "content": "This entity is important", "annotates": [entity_id]}),
+    )
+    .await?;
+    assert!(
+        !note.is_error.unwrap_or(false),
+        "annotated note create should succeed"
+    );
+
+    // The annotates edge should be discoverable via neighbors.
+    let nbrs = call(
+        &client,
+        "neighbors",
+        json!({"node_id": entity_id, "direction": "in", "relations": ["annotates"]}),
+    )
+    .await?;
+    let hits: Vec<serde_json::Value> = serde_json::from_str(&first_text(&nbrs)).unwrap();
+    assert_eq!(hits.len(), 1, "one note should annotate the entity");
+    Ok(())
+}
+
+// ---- invalid inputs ----
+
+#[tokio::test]
+async fn invalid_uuid_returns_error() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("get")
+                .with_arguments(json!({"id": "not-a-uuid"}).as_object().unwrap().clone()),
+        )
+        .await;
+    match result {
+        Err(_) => {}
+        Ok(r) => {
+            assert!(
+                r.is_error.unwrap_or(false),
+                "invalid UUID should produce error response"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_kind_returns_error() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("create").with_arguments(
+                json!({"kind": "badkind", "name": "X"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    match result {
+        Err(_) => {}
+        Ok(r) => {
+            assert!(
+                r.is_error.unwrap_or(false),
+                "unknown kind should produce error response"
             );
         }
     }

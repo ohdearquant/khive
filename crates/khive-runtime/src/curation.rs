@@ -340,7 +340,11 @@ impl KhiveRuntime {
     }
 
     /// Remove an entity from FTS5 and (if configured) vector indexes.
-    async fn remove_from_indexes(&self, namespace: Option<&str>, id: Uuid) -> RuntimeResult<()> {
+    pub(crate) async fn remove_from_indexes(
+        &self,
+        namespace: Option<&str>,
+        id: Uuid,
+    ) -> RuntimeResult<()> {
         let ns = self.ns(namespace).to_string();
         self.text(namespace)?.delete_document(&ns, id).await?;
         if self.config().embedding_model.is_some() {
