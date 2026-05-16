@@ -1168,3 +1168,134 @@ async fn update_edge_valid_relation_change_returns_ok() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---- create(kind=note, supersedes=...) — note supersession (split from #23) ----
+
+fn id_of(r: &rmcp::model::CallToolResult) -> String {
+    serde_json::from_str::<serde_json::Value>(&first_text(r)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Valid note→note supersede succeeds, creates the supersedes edge, and does
+/// NOT inherit the old note's annotations (annotations are per-note explicit).
+#[tokio::test]
+async fn create_note_supersedes_real_note_no_inherit_succeeds() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let ent = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "SupersedeAnnTarget"}),
+    )
+    .await?;
+    let ent_id = id_of(&ent);
+
+    let old = call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "observation", "content": "old note", "annotates": [ent_id]}),
+    )
+    .await?;
+    let old_id = id_of(&old);
+
+    let new = call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "observation", "content": "new note", "supersedes": old_id}),
+    )
+    .await?;
+    assert!(
+        !new.is_error.unwrap_or(false),
+        "note→note supersede must succeed, got: {}",
+        first_text(&new)
+    );
+    let new_id = id_of(&new);
+
+    // supersedes edge new --supersedes--> old exists
+    let sup = call(
+        &client,
+        "list",
+        json!({"kind": "edge", "source_id": new_id, "relations": ["supersedes"]}),
+    )
+    .await?;
+    let sup_edges: serde_json::Value = serde_json::from_str(&first_text(&sup)).unwrap();
+    assert_eq!(
+        sup_edges.as_array().map(|a| a.len()).unwrap_or(0),
+        1,
+        "exactly one supersedes edge from the new note expected"
+    );
+    assert_eq!(sup_edges[0]["target_id"], old_id);
+
+    // NOT inherited: the new note has no annotates edges (old's annotation not copied)
+    let ann = call(
+        &client,
+        "list",
+        json!({"kind": "edge", "source_id": new_id, "relations": ["annotates"]}),
+    )
+    .await?;
+    let ann_edges: serde_json::Value = serde_json::from_str(&first_text(&ann)).unwrap();
+    assert_eq!(
+        ann_edges.as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "supersession must NOT inherit the old note's annotations"
+    );
+    Ok(())
+}
+
+/// Phantom supersedes target → invalid_params AND nothing persisted (atomicity).
+#[tokio::test]
+async fn create_note_supersedes_phantom_invalid_params_not_persisted() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let phantom = "00000000-0000-0000-0000-0000000000ab";
+    let marker = "supersede-phantom-MUSTNOTPERSIST";
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("create").with_arguments(
+                json!({"kind": "note", "note_kind": "observation", "content": marker, "supersedes": phantom})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert_invalid_params(result, "create note with phantom supersedes UUID");
+
+    // Atomicity: the note must not have been persisted.
+    let search = call(&client, "search", json!({"kind": "note", "query": marker})).await?;
+    let hits: serde_json::Value = serde_json::from_str(&first_text(&search)).unwrap();
+    assert_eq!(
+        hits.as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "failed supersede-create must persist no note (atomicity)"
+    );
+    Ok(())
+}
+
+/// supersedes target that is an entity (not a note) → invalid_params.
+#[tokio::test]
+async fn create_note_supersedes_entity_returns_invalid_params() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let ent = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "NotANote"}),
+    )
+    .await?;
+    let ent_id = id_of(&ent);
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("create").with_arguments(
+                json!({"kind": "note", "note_kind": "observation", "content": "x", "supersedes": ent_id})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    assert_invalid_params(result, "create note superseding an entity (must be a note)");
+    Ok(())
+}

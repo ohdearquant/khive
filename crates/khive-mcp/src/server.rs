@@ -140,7 +140,7 @@ kind="note" — create a lightweight text note.
   note_kind: observation (default) | insight | question | decision | reference
   Aliases: obs, finding, q, choice, ref, citation
   Optional: salience (0.0–1.0, default 0.5), annotates (UUIDs → creates annotates edges),
-            supersedes (UUID of old note → creates supersedes edge + inherits annotation targets),
+            supersedes (UUID of old note → creates a supersedes edge; annotations are NOT inherited — declare them explicitly),
             properties (JSON)
 
 Examples:
@@ -197,25 +197,26 @@ Examples:
                     annotates.push(self.resolve_uuid(&s, p.namespace.as_deref()).await?);
                 }
 
-                // If superseding an old note, inherit its annotation targets.
+                // Supersession is note-level. Validate the old note exists (a live note in
+                // this namespace) BEFORE any write, so a bad target persists nothing
+                // (atomicity). Annotations are NOT inherited — they are per-note explicit
+                // (ADR-019); "show only current" is a separate view-layer concern (#36),
+                // never a data transfer. See CLAUDE.md §"Data vs. view".
                 let supersedes_id = match p.supersedes.as_deref() {
                     Some(s) => {
                         let old_id = self.resolve_uuid(s, p.namespace.as_deref()).await?;
-                        let old_neighbors = self
+                        let resolved = self
                             .runtime
-                            .neighbors(
-                                p.namespace.as_deref(),
-                                old_id,
-                                Direction::Out,
-                                None,
-                                Some(vec![EdgeRelation::Annotates]),
-                            )
+                            .resolve(p.namespace.as_deref(), old_id)
                             .await
                             .map_err(Self::validation_err)?;
-                        for hit in &old_neighbors {
-                            if !annotates.contains(&hit.node_id) {
-                                annotates.push(hit.node_id);
-                            }
+                        if !matches!(resolved, Some(khive_runtime::operations::Resolved::Note(_))) {
+                            return Err(McpError::invalid_params(
+                                format!(
+                                    "supersedes target {old_id} must be a note in this namespace"
+                                ),
+                                None,
+                            ));
                         }
                         Some(old_id)
                     }

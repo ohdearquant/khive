@@ -53,9 +53,9 @@ pub struct CreateParams {
     /// UUIDs of any substrate (entity, note, edge, or event) this note annotates (creates annotates edges).
     pub annotates: Option<Vec<String>>,
 
-    /// UUID of an existing note this note supersedes. Note only.
-    /// Creates a `supersedes` edge from the new note to the old one, and copies
-    /// annotation targets from the old note (so the new note annotates the same entities).
+    /// UUID of an existing note this note supersedes (must be a note in the same
+    /// namespace). Creates a `supersedes` edge from the new note to the old one.
+    /// Annotations are NOT inherited — they are per-note explicit (ADR-019).
     pub supersedes: Option<String>,
 
     // ---- shared fields ----

@@ -185,7 +185,13 @@ Note with optional graph edges).
 A note can be superseded by a later note when the agent's understanding evolves: an earlier
 `observation` is refined into a more accurate one, an earlier `decision` is revised, etc.
 Supersession is **history-preserving** — the original note stays in the store, and a later note is
-marked as its successor. Search excludes superseded notes by default.
+marked as its successor. Search excludes superseded notes by default: that exclusion is a
+**view-layer filter**, not a data change (tracked in issue #36; currently unimplemented).
+
+**Supersession does not transfer annotations.** Annotations are per-note and explicit: a
+superseding note annotates only what its own `annotates` declares; the old note's `annotates`
+edges are never copied or inherited. "Show only current" is a query/view concern, never a reason
+to mutate or transfer data (see CLAUDE.md §"Data vs. view — the principle most violated here").
 
 **Supersession is an edge, not a field.** Notes are first-class graph nodes (ADR-024); the
 `supersedes` relation in the closed edge ontology (ADR-002) already expresses "new replaces old".
