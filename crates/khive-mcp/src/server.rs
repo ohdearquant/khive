@@ -557,9 +557,19 @@ Examples:
         let limit = p.limit.unwrap_or(10).min(100);
         match p.kind.as_str() {
             "entity" => {
+                let query_vector = if self.runtime.config().embedding_model.is_some() {
+                    Some(
+                        self.runtime
+                            .embed(&p.query)
+                            .await
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                    )
+                } else {
+                    None
+                };
                 let hits = self
                     .runtime
-                    .hybrid_search(p.namespace.as_deref(), &p.query, None, limit)
+                    .hybrid_search(p.namespace.as_deref(), &p.query, query_vector, limit)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 let result: Vec<serde_json::Value> = hits
@@ -576,9 +586,19 @@ Examples:
                 Self::to_json(&result)
             }
             "note" => {
+                let query_vector = if self.runtime.config().embedding_model.is_some() {
+                    Some(
+                        self.runtime
+                            .embed(&p.query)
+                            .await
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                    )
+                } else {
+                    None
+                };
                 let hits = self
                     .runtime
-                    .search_notes(p.namespace.as_deref(), &p.query, None, limit)
+                    .search_notes(p.namespace.as_deref(), &p.query, query_vector, limit)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 // Return note_ids and scores as JSON.
