@@ -19,6 +19,10 @@ struct Args {
     #[arg(long, env = "KHIVE_NAMESPACE", default_value = "local")]
     namespace: String,
 
+    /// Disable local embedding model (skips vector indexing on create/update).
+    #[arg(long, env = "KHIVE_NO_EMBED")]
+    no_embed: bool,
+
     /// Log level for stderr output (stdout is reserved for the MCP protocol).
     #[arg(long, env = "KHIVE_LOG", default_value = "warn")]
     log: String,
@@ -44,10 +48,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let embedding_model = if args.no_embed {
+        None
+    } else {
+        RuntimeConfig::default().embedding_model
+    };
+
     let config = RuntimeConfig {
         db_path,
         default_namespace: args.namespace,
-        ..RuntimeConfig::default()
+        embedding_model,
     };
 
     let runtime = KhiveRuntime::new(config)?;
