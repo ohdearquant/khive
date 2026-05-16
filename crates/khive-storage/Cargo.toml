@@ -10,8 +10,8 @@ repository.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
-khive-score = { version = "0.1.0", path = "../khive-score" }
-khive-types = { version = "0.1.0", path = "../khive-types", features = ["serde"] }
+khive-score = { version = "0.1.1", path = "../khive-score" }
+khive-types = { version = "0.1.1", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
