@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci docs-check publish publish-dry
+.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry
 
 check:
 	cd crates && cargo check --workspace
@@ -8,6 +8,10 @@ clippy:
 
 test:
 	cd crates && cargo test --workspace
+
+contract-test:
+	cd crates && cargo build --release -p khive-mcp
+	python3 tests/contract_test.py
 
 fmt:
 	cd crates && cargo fmt --all
