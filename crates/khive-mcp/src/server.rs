@@ -435,7 +435,6 @@ Examples:
   Hard-delete:  {"id":"<uuid>","hard":true}"#
     )]
     async fn delete(&self, Parameters(p): Parameters<DeleteParams>) -> Result<String, McpError> {
-        use khive_storage::types::DeleteMode;
         let id = Self::parse_uuid(&p.id)?;
         let ns = p.namespace.as_deref();
 
@@ -471,27 +470,15 @@ Examples:
             return Self::to_json(&serde_json::json!({ "deleted": deleted, "id": p.id }));
         }
 
-        // Try note.
-        let note_store = self
+        // Try note — delete_note enforces namespace isolation and returns false
+        // for both "not found" and "wrong namespace" (both surface as not-found).
+        let deleted_note = self
             .runtime
-            .notes(ns)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        if note_store
-            .get_note(id)
+            .delete_note(ns, id, p.hard.unwrap_or(false))
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .is_some()
-        {
-            let mode = if p.hard.unwrap_or(false) {
-                DeleteMode::Hard
-            } else {
-                DeleteMode::Soft
-            };
-            let deleted = note_store
-                .delete_note(id, mode)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            return Self::to_json(&serde_json::json!({ "deleted": deleted, "id": p.id }));
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if deleted_note {
+            return Self::to_json(&serde_json::json!({ "deleted": true, "id": p.id }));
         }
 
         Err(McpError::invalid_params(

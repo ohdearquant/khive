@@ -426,6 +426,33 @@ impl KhiveRuntime {
         Ok(None)
     }
 
+    /// Delete a note by ID, enforcing namespace isolation.
+    ///
+    /// Returns `false` without deleting if the note does not exist or belongs to
+    /// a different namespace (ADR-007 namespace isolation).
+    pub async fn delete_note(
+        &self,
+        namespace: Option<&str>,
+        id: Uuid,
+        hard: bool,
+    ) -> RuntimeResult<bool> {
+        let ns = self.ns(namespace);
+        let note_store = self.notes(namespace)?;
+        let note = match note_store.get_note(id).await? {
+            Some(n) => n,
+            None => return Ok(false),
+        };
+        if note.namespace != ns {
+            return Ok(false);
+        }
+        let mode = if hard {
+            DeleteMode::Hard
+        } else {
+            DeleteMode::Soft
+        };
+        Ok(note_store.delete_note(id, mode).await?)
+    }
+
     // ---- Query operations ----
 
     /// Execute a GQL or SPARQL query string, returning raw SQL rows.

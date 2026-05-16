@@ -242,9 +242,9 @@ impl NoteStore for SqlNoteStore {
 
                 match conn.execute(
                     "INSERT OR REPLACE INTO notes \
-                     (id, namespace, kind, content, salience, decay_factor, expires_at, \
+                     (id, namespace, kind, name, content, salience, decay_factor, expires_at, \
                       properties, created_at, updated_at, deleted_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         id_str,
                         &note.namespace,

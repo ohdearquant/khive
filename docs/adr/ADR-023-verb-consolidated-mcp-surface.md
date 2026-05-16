@@ -27,41 +27,36 @@ kinds take a `kind=<observable>` discriminant.
 
 ### Final tool list (v0.1)
 
-| Tool        | Kinds it covers    | Notes                                                                                                                                                                                                                  |
-| ----------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `create`    | entity, note       | Discriminated by `kind`. Entity needs `entity_kind` field for EntityKind (concept/document/...); note needs `note_kind` for NoteKind                                                                                   |
-| `get`       | entity, edge, note | Discriminated by `kind`. Returns `null` if not found                                                                                                                                                                   |
-| `list`      | entity, edge, note | Structured filter per kind                                                                                                                                                                                             |
-| `update`    | entity, edge, note | Patch semantics per ADR-014                                                                                                                                                                                            |
-| `delete`    | entity, edge, note | `hard` flag for entity/note; edges always hard                                                                                                                                                                         |
-| `merge`     | entity, note       | Dedupe two records into one. Per ADR-014 for entities; for notes, content/properties merge by strategy, tags union, edges/references rewired                                                                           |
-| `supersede` | entity, note       | Mark a record as obsoleted by a newer one. History-preserving (the old record stays). Creates a `supersedes` edge `new --supersedes--> old` for both kinds (notes and entities are both first-class nodes per ADR-024) |
-| `link`      | (edges only)       | Kind-agnostic — making an edge is always one verb. Args: source_id, target_id, relation, weight                                                                                                                        |
-| `traverse`  | (graph)            | Multi-hop traversal from roots                                                                                                                                                                                         |
-| `neighbors` | (graph)            | Immediate neighbors of a node                                                                                                                                                                                          |
-| `query`     | (graph query)      | GQL/SPARQL query string                                                                                                                                                                                                |
-| `search`    | entity, note       | Semantic search (was `recall` for notes; extends to entity hybrid_search). `kind=` selects target.                                                                                                                     |
-| `request`   | (batch dispatcher) | Per ADR-020 — composes any of the above                                                                                                                                                                                |
+| Tool        | Notes                                                                                                                                |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `create`    | `kind=entity\|note`. Entity needs `entity_kind`; note needs `note_kind`. Note supports an optional `name` field for titled notes.   |
+| `get`       | UUID-only. Resolves substrate automatically (entity, note, edge). Returns `{kind, data}`.                                           |
+| `list`      | `kind=entity\|edge\|note`. Structured filter per kind.                                                                               |
+| `update`    | UUID-only. Resolves substrate, applies entity or edge patch.                                                                         |
+| `delete`    | UUID-only. Resolves substrate. Hard entity delete cascades edges.                                                                    |
+| `merge`     | UUID-only (`into_id`, `from_id`). Verifies both are same substrate.                                                                  |
+| `search`    | `kind=entity\|note`. Hybrid FTS5+vector.                                                                                             |
+| `link`      | Create directed edge. Args: `source_id`, `target_id`, `relation`, `weight`.                                                          |
+| `traverse`  | Multi-hop graph traversal.                                                                                                           |
+| `neighbors` | Immediate neighbors with optional relation filter.                                                                                   |
+| `query`     | GQL/SPARQL query string.                                                                                                             |
 
-**13 tools.** Compact enough to scan in one screen, even when commits/branches ship. ADR-024 adds
-one more (`resolve`) for cross-substrate UUID lookup, bringing the v0.1 total to 14.
+**11 tools in v0.1.** Compact enough to scan in one screen, even when commits/branches ship.
 
-### `merge` and `supersede` — semantic distinction
+`supersede` and `request` are planned but deferred past v0.1. `get(id)` serves the cross-substrate
+UUID lookup use case (returning `{kind, data}`) without a separate `resolve` verb.
 
-The two are **not interchangeable**:
+### `merge` — dedupe semantics
 
-- **`merge(kind, into, from)`** — "these two records describe the same thing; dedupe them." Used
-  when the agent realizes "LoRA" and "Low-Rank Adaptation" are duplicate concept entities, or two
-  `observation` notes about the same fact. Properties combine per strategy; tags union;
-  edges/references rewire to the kept record; the `from` record is removed.
+**`merge(into_id, from_id)`** — "these two records describe the same thing; dedupe them." Used
+when the agent realizes "LoRA" and "Low-Rank Adaptation" are duplicate concept entities, or two
+`observation` notes about the same fact. Properties combine per strategy; tags union;
+edges/references rewire to the kept record; the `from` record is removed. Both UUIDs must resolve
+to the same substrate kind; the handler verifies this before merging.
 
-- **`supersede(kind, new_id, old_id)`** — "this newer record corrects or replaces an older one."
-  Used when an agent's understanding evolves: an earlier `decision` is revised, an `observation` is
-  refined. The old record stays in storage as history (filtered from default `search` results), with
-  a `supersedes` edge from the new record to the old one. The new record is the active truth.
-
-Merging destroys distinct-record history; supersession preserves it. Both are common agent
-operations.
+Supersession (history-preserving replacement via a `supersedes` edge) is a planned operation
+deferred past v0.1. For now, agents that need to mark a record obsolete can add a `supersedes`
+edge manually via `link(source=new_id, target=old_id, relation="supersedes")`.
 
 ### Versioning tools (when ADR-015 ships)
 
@@ -74,13 +69,18 @@ without growing.
 
 ### `kind` parameter spec
 
-Each multi-domain verb takes a `kind` parameter as a snake_case string discriminator:
+Only three verbs take a `kind` discriminant: `create`, `list`, and `search`. The remaining CRUD
+verbs (`get`, `update`, `delete`, `merge`) are UUID-only — the handler resolves the substrate
+internally and no `kind` is required.
+
+For the three verbs that do use `kind`:
 
 - `kind="entity"` → routes to entity store. Additional required field `entity_kind` for `create`
   (concept|document|dataset|project|person|org per ADR-001).
-- `kind="edge"` → routes to graph store. Used by `get`, `list`, `update`, `delete`.
+- `kind="edge"` → routes to graph store. Used by `list` only.
 - `kind="note"` → routes to note store. Additional required field `note_kind` for `create`
   (observation|insight|question|decision|reference per ADR-019; defaults to `observation`).
+  Notes also accept an optional `name` field for titled notes (analogous to entity `name`).
 
 Unknown `kind` returns `invalid_params` with the valid options listed.
 
@@ -92,7 +92,7 @@ Per-verb param structs in `crates/khive-mcp/src/tools/`:
 pub struct CreateParams {
     pub kind: String,                // "entity" | "note"
     pub namespace: Option<String>,
-    pub name: Option<String>,        // entity only
+    pub name: Option<String>,        // entity: display name; note: optional title for titled notes
     pub entity_kind: Option<String>, // entity only — EntityKind value
     pub description: Option<String>, // entity only
     pub content: Option<String>,     // note only
@@ -103,15 +103,11 @@ pub struct CreateParams {
 }
 
 pub struct GetParams {
-    pub kind: String,        // "entity" | "edge" | "note"
-    pub namespace: Option<String>,
-    pub id: String,          // UUID
+    pub id: String,          // UUID — substrate resolved internally; returns {kind, data}
 }
 
 pub struct UpdateParams {
-    pub kind: String,                // "entity" | "edge" | "note"
-    pub namespace: Option<String>,
-    pub id: String,
+    pub id: String,          // UUID — substrate resolved internally
     // Entity patch fields:
     pub name: Option<String>,
     pub description: Option<Option<String>>,
@@ -127,14 +123,12 @@ pub struct UpdateParams {
 }
 
 pub struct DeleteParams {
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub id: String,
+    pub id: String,          // UUID — substrate resolved internally
     pub hard: Option<bool>,  // entity/note; edges always hard
 }
 
 pub struct ListParams {
-    pub kind: String,
+    pub kind: String,        // "entity" | "edge" | "note"
     pub namespace: Option<String>,
     pub limit: Option<u32>,
     // Entity-specific filter:
@@ -157,18 +151,9 @@ pub struct SearchParams {
 }
 
 pub struct MergeParams {
-    pub kind: String,        // "entity" | "note"
-    pub namespace: Option<String>,
-    pub into_id: String,
+    pub into_id: String,     // UUID — substrate resolved internally; both must be same kind
     pub from_id: String,
     pub strategy: Option<String>,  // "prefer_into" | "prefer_from" | "union"
-}
-
-pub struct SupersedeParams {
-    pub kind: String,        // "entity" | "note"
-    pub namespace: Option<String>,
-    pub new_id: String,      // the current/correct version
-    pub old_id: String,      // the version being superseded
 }
 ```
 
@@ -189,10 +174,11 @@ calls in their own application logic.
 
 ### What about `request` (ADR-020)?
 
-`request` is a meta-tool: it batches the verbs above. Its DSL syntax stays exactly as ADR-020
-specified — e.g.,
+`request` is a planned meta-tool that batches the verbs above. It is deferred past v0.1. Once it
+ships, its DSL syntax will follow ADR-020 exactly — e.g.,
 `[create(kind="entity", entity_kind="concept", name="A"), create(kind="entity", entity_kind="concept", name="B")]`.
-The verb consolidation makes the DSL more uniform — every batched op is `verb(kind=..., args)`.
+The verb consolidation makes the DSL uniform — every batched op is `verb(kind=..., args)` or
+`verb(id=..., args)` for UUID-resolved operations.
 
 ## Rationale
 
@@ -243,7 +229,8 @@ create(kind="entity", entity_kind="concept", name="QLoRA")
 create(kind="note", note_kind="insight", content="LoRA is a parameter-efficient fine-tuning method")
 ```
 
-Both are equally readable. The new form makes the dispatch explicit. Batched via `request`:
+Both are equally readable. The new form makes the dispatch explicit. Once `request` ships (planned
+post-v0.1), the same calls batch via:
 
 ```
 request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\"), create(kind=\"entity\", entity_kind=\"concept\", name=\"QLoRA\")]")
@@ -262,20 +249,19 @@ request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\"), c
 
 ### Positive
 
-- 13 MCP tools in v0.1 (14 once ADR-024's `resolve` lands) instead of ~15 namespaced per-kind names
-  — and growing more slowly as we add kinds.
+- 11 MCP tools in v0.1 instead of ~15 namespaced per-kind names — and growing more slowly as we
+  add kinds. `supersede` and `request` are deferred; `resolve` is absorbed into `get`.
 - Every CRUD-style operation is one verb. New observable kinds (commits, events) just become new
   `kind=` values.
 - Discriminated dispatch makes the implementation testable in isolation (per-kind routing logic is a
   small switch).
-- `request` DSL becomes more uniform — every batched op is `verb(kind=..., args)`.
+- When `request` ships, its DSL will be uniform — every batched op is `verb(kind=..., args)` or
+  `verb(id=..., args)`.
 
 ### Negative
 
 - Wider param structs (all kinds' fields share one struct, most optional). The handler validates
   required-fields-by-kind. This is slightly less type-safe than per-kind structs.
-- Param structs become wider (all kinds' fields in one struct, most optional). The handler validates
-  required-fields-by-kind. This is mildly less type-safe than per-kind structs.
 - Per-kind JSON schemas are harder to express; clients see "any of these fields, depending on kind".
 
 ### Neutral
@@ -292,13 +278,13 @@ request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\"), c
    - Verb-shaped param structs (`CreateParams`, `GetParams`, etc.) — one per verb, with optional
      kind-specific fields.
    - One handler per verb that dispatches on `kind`.
-   - Keep `link`, `traverse`, `neighbors`, `query`, `request` as their own verbs (domain-specific).
+   - Keep `link`, `traverse`, `neighbors`, `query` as their own verbs (domain-specific).
 2. **Integration tests** in `crates/khive-mcp/tests/integration.rs` assert the verb count and
    per-kind dispatch.
 3. **Tool descriptions** spell out verb semantics + valid `kind` values + per-kind required fields.
 4. **`crates/khive-mcp/src/tools/`** module structure: one file per verb (`create.rs`, `get.rs`,
    `list.rs`, `update.rs`, `delete.rs`, `search.rs`, `merge.rs`, `link.rs`, `traverse.rs`,
-   `neighbors.rs`, `query.rs`, `request.rs`, `supersede.rs`).
+   `neighbors.rs`, `query.rs`). `supersede.rs` and `request.rs` are deferred.
 5. **Documentation sweep** (CLAUDE.md, AGENTS.md, README.md) reflects the verb surface.
 
 ## Open Questions
@@ -319,5 +305,6 @@ request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\"), c
 - ADR-019: Note Kind Taxonomy (provides `NoteKind` for the `note_kind` field)
 - ADR-020: Request DSL (composes the verb surface)
 - ADR-021: EdgeRelation Enum (provides the relation values for edge operations)
-- ADR-024: Note Search + Cross-Substrate Navigation (adds the `resolve` verb and the
-  `annotates`-edge wiring for `create(kind="note", ...)`)
+- ADR-024: Note Search + Cross-Substrate Navigation (defines the hybrid search pipeline for notes
+  and the `annotates`-edge wiring for `create(kind="note", ...)`; `get(id)` serves the
+  cross-substrate UUID lookup use case that was originally proposed as a separate `resolve` verb)
