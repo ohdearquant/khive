@@ -1,0 +1,32 @@
+[package]
+name = "khive-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "khive stdio MCP server — the only user-facing Rust binary"
+
+[dependencies]
+khive-runtime = { path = "../khive-runtime" }
+khive-storage = { path = "../khive-storage" }
+khive-types = { path = "../khive-types", features = ["serde"] }
+rmcp = { version = "1.7", features = ["server", "transport-io"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+rmcp = { version = "1.7", features = ["server", "transport-io", "client"] }
+
+[[bin]]
+name = "khive-mcp"
+path = "src/main.rs"
