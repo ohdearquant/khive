@@ -769,3 +769,39 @@ async fn delete_nonexistent_id_returns_not_found() {
         "delete on nonexistent id must be NotFound"
     );
 }
+
+// ---- ADR-025 contract: KG pack rejects non-KG kinds (single-pack architecture) ----
+// Step 5 adds kind-discriminated routing so a second pack's kinds dispatch correctly.
+// Until then, the KG pack validates only its own vocabulary — this is documented behavior.
+
+#[tokio::test]
+async fn create_entity_non_kg_kind_rejected_by_pack_validation() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Router", "entity_kind": "device"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "non-KG entity_kind must be rejected in single-pack mode"
+    );
+}
+
+#[tokio::test]
+async fn create_note_non_kg_kind_rejected_by_pack_validation() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "content": "Task content", "note_kind": "task"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "non-KG note_kind must be rejected in single-pack mode"
+    );
+}
