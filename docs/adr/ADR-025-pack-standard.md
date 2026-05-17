@@ -103,11 +103,11 @@ KG, Lambda, or Leo. Packs cannot add edge relations.
 
 ### Built-in packs
 
-| Pack   | Note kinds                                | Entity kinds                                     | Location                    |
-| ------ | ----------------------------------------- | ------------------------------------------------ | --------------------------- |
+| Pack   | Note kinds                                          | Entity kinds                                     | Location                               |
+| ------ | --------------------------------------------------- | ------------------------------------------------ | -------------------------------------- |
 | kg     | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | khive-runtime (default, always loaded) |
-| lambda | memory, task, message                     | actor                                            | khive-cloud-pack-lambda     |
-| leo    | wave                                      | device, location                                 | khive-cloud-pack-leo        |
+| lambda | memory, task, message                               | actor                                            | khive-cloud-pack-lambda                |
+| leo    | wave                                                | device, location                                 | khive-cloud-pack-leo                   |
 
 The `kg` pack is the only pack shipped in `khive-runtime`. Lambda and Leo packs live in separate
 crates in the `khive-cloud-*` family and are not part of the OSS repo.
@@ -146,13 +146,13 @@ binary, not loaded at runtime. Dynamic loading is a separate concern and is expl
 
 ## Alternatives Considered
 
-| Alternative                        | Pros                             | Cons                                                                      | Why rejected                                                   |
-| ---------------------------------- | -------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| Feature-gated enums                | Compile-time exhaustiveness      | Requires rebuild per pack set; no runtime composition                     | Too inflexible for multi-tier deployment                       |
-| No validation (any string accepted) | Zero friction for new kinds      | Vocabulary drift; agents can't discover valid kinds; inconsistent storage | Same failure mode ADR-001 and ADR-019 fixed                    |
-| Trait objects with dynamic dispatch | True runtime extensibility       | Heap allocation required; not no_std compatible                           | Const items are sufficient; reserve dyn for future if needed   |
-| Dynamic library loading            | Truly separate plugin artifacts  | Security surface; version skew; linking complexity                        | Deferred; compile-time composition covers all known use cases  |
-| Single shared enum across all tiers | Compile-time exhaustiveness      | Pollutes KG taxonomy; breaks ADR-001/ADR-019 invariants                   | Mixing domain concerns breaks classification discipline        |
+| Alternative                         | Pros                            | Cons                                                                      | Why rejected                                                  |
+| ----------------------------------- | ------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| Feature-gated enums                 | Compile-time exhaustiveness     | Requires rebuild per pack set; no runtime composition                     | Too inflexible for multi-tier deployment                      |
+| No validation (any string accepted) | Zero friction for new kinds     | Vocabulary drift; agents can't discover valid kinds; inconsistent storage | Same failure mode ADR-001 and ADR-019 fixed                   |
+| Trait objects with dynamic dispatch | True runtime extensibility      | Heap allocation required; not no_std compatible                           | Const items are sufficient; reserve dyn for future if needed  |
+| Dynamic library loading             | Truly separate plugin artifacts | Security surface; version skew; linking complexity                        | Deferred; compile-time composition covers all known use cases |
+| Single shared enum across all tiers | Compile-time exhaustiveness     | Pollutes KG taxonomy; breaks ADR-001/ADR-019 invariants                   | Mixing domain concerns breaks classification discipline       |
 
 ## Consequences
 
@@ -183,13 +183,13 @@ binary, not loaded at runtime. Dynamic loading is a separate concern and is expl
 
 This ADR is implemented incrementally across multiple PRs:
 
-| Step | Description | Status |
-| ---- | ----------- | ------ |
-| 1. Pack trait + VerbDef in `khive-types` | Declarative metadata (this PR) | done |
-| 2. PackRuntime trait + VerbRegistry in `khive-runtime` | Async dispatch layer | pending |
-| 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic | pending |
-| 4. `khive-pack-kg` crate with vocabulary and verb handlers | First concrete pack | pending |
-| 5. Rewrite `khive-mcp` to route through VerbRegistry | Single `request` tool surface | pending |
+| Step                                                                     | Description                    | Status  |
+| ------------------------------------------------------------------------ | ------------------------------ | ------- |
+| 1. Pack trait + VerbDef in `khive-types`                                 | Declarative metadata (this PR) | done    |
+| 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | pending |
+| 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic     | pending |
+| 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | pending |
+| 5. Rewrite `khive-mcp` to route through VerbRegistry                     | Single `request` tool surface  | pending |
 
 Until step 3 is complete, the runtime still enforces the fixed 6/5 kind enums from `khive-types`.
 The Pack trait exists as the declared interface; runtime vocabulary merging activates when the

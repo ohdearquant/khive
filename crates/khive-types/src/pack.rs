@@ -1,12 +1,11 @@
-//! Pack trait — the composition unit for khive's verb-pack architecture.
+//! Pack trait — the declarative composition unit for khive (ADR-025).
 //!
-//! A pack declares vocabulary (note kinds, entity kinds) and verbs that it
-//! contributes to the runtime. The runtime collects all pack vocabularies at
-//! init and validates kind strings against the merged set; verbs are dispatched
-//! through the registry.
+//! A pack declares vocabulary (note kinds, entity kinds) and verbs. This is
+//! purely static metadata — no I/O, no async. Runtime dispatch lives in
+//! `khive-runtime` (PackRuntime trait, not yet implemented).
 //!
-//! This trait lives in khive-types (no_std, zero deps) so anything that needs
-//! to validate kinds can depend only on types, not the full runtime.
+//! This trait lives in khive-types (no_std, zero deps) so downstream crates
+//! can reference pack metadata without pulling in the full runtime.
 
 /// Verb metadata for discovery and documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
