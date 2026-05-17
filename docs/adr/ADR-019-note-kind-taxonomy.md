@@ -185,7 +185,13 @@ Note with optional graph edges).
 A note can be superseded by a later note when the agent's understanding evolves: an earlier
 `observation` is refined into a more accurate one, an earlier `decision` is revised, etc.
 Supersession is **history-preserving** — the original note stays in the store, and a later note is
-marked as its successor. Search excludes superseded notes by default.
+marked as its successor. Search excludes superseded notes by default (implemented in
+`khive_runtime::operations::search_notes`, per ADR-024 §"Filter superseded notes").
+
+**Supersession does not transfer annotations.** Annotations are per-note and explicit: a
+superseding note annotates only what its own `annotates` declares; the old note's `annotates`
+edges are never copied or inherited. "Show only current" is a query/view concern, never a
+reason to mutate or transfer data.
 
 **Supersession is an edge, not a field.** Notes are first-class graph nodes (ADR-024); the
 `supersedes` relation in the closed edge ontology (ADR-002) already expresses "new replaces old".
