@@ -67,7 +67,11 @@ impl FromStr for SubstrateKind {
             "note" | "Note" => Ok(Self::Note),
             "entity" | "Entity" => Ok(Self::Entity),
             "event" | "Event" => Ok(Self::Event),
-            other => Err(crate::error::UnknownVariant::new("substrate_kind", other, SUBSTRATE_KIND_VALID)),
+            other => Err(crate::error::UnknownVariant::new(
+                "substrate_kind",
+                other,
+                SUBSTRATE_KIND_VALID,
+            )),
         }
     }
 }

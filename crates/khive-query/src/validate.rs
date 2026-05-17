@@ -70,7 +70,8 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
         match element {
             PatternElement::Node(node) => {
                 if let Some(kind) = node.kind.as_mut() {
-                    let parsed = EntityKind::from_str(kind).map_err(|e| QueryError::Validation(e.to_string()))?;
+                    let parsed = EntityKind::from_str(kind)
+                        .map_err(|e| QueryError::Validation(e.to_string()))?;
                     *kind = parsed.name().to_string();
                 }
                 if node.properties.contains_key("namespace") {
@@ -163,7 +164,8 @@ fn validate_condition(cond: &mut Condition, is_edge: bool) -> Result<(), QueryEr
         )),
         "kind" if !is_edge => {
             if let ConditionValue::String(ref mut s) = cond.value {
-                let parsed = EntityKind::from_str(s).map_err(|e| QueryError::Validation(e.to_string()))?;
+                let parsed =
+                    EntityKind::from_str(s).map_err(|e| QueryError::Validation(e.to_string()))?;
                 *s = parsed.name().to_string();
             }
             Ok(())
