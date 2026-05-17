@@ -14,6 +14,7 @@ extern crate std;
 
 pub mod edge;
 pub mod entity;
+pub mod error;
 pub mod event;
 pub mod header;
 pub mod id;
@@ -23,13 +24,14 @@ pub mod substrate;
 pub mod timestamp;
 pub mod vector;
 
-pub use edge::{EdgeCategory, EdgeRelation, UnknownRelation};
+pub use edge::{EdgeCategory, EdgeRelation};
 pub use entity::{Entity, EntityKind, Link, PropertyValue};
+pub use error::{TypeError, UnknownVariant};
 pub use event::{Event, EventBuilder, EventOutcome};
 pub use header::Header;
 pub use id::{Id128, ParseIdError};
 pub use namespace::Namespace;
 pub use note::{Note, NoteKind, NoteStatus};
-pub use substrate::{SubstrateError, SubstrateKind, SUBSTRATE_COUNT};
+pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;

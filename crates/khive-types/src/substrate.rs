@@ -57,34 +57,24 @@ impl fmt::Display for SubstrateKind {
     }
 }
 
+const SUBSTRATE_KIND_VALID: &[&str] = &["note", "entity", "event"];
+
 impl FromStr for SubstrateKind {
-    type Err = SubstrateError;
+    type Err = crate::error::UnknownVariant;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "note" | "Note" => Ok(Self::Note),
             "entity" | "Entity" => Ok(Self::Entity),
             "event" | "Event" => Ok(Self::Event),
-            _ => Err(SubstrateError::UnknownKind),
+            other => Err(crate::error::UnknownVariant::new(
+                "substrate_kind",
+                other,
+                SUBSTRATE_KIND_VALID,
+            )),
         }
     }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubstrateError {
-    UnknownKind,
-}
-
-impl fmt::Display for SubstrateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownKind => f.write_str("unknown substrate kind"),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for SubstrateError {}
 
 #[cfg(test)]
 mod tests {

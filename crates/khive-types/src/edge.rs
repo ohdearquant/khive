@@ -1,7 +1,7 @@
 //! Edge relation types for the closed ontology defined in ADR-002 / ADR-021.
 
 extern crate alloc;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use core::fmt;
 use core::str::FromStr;
 
@@ -116,37 +116,26 @@ impl fmt::Display for EdgeRelation {
     }
 }
 
-/// Parse error returned when a string does not match any canonical relation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnknownRelation(pub String);
-
-impl fmt::Display for UnknownRelation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "unknown edge relation {:?}; valid relations: {}",
-            self.0,
-            EdgeRelation::ALL
-                .iter()
-                .map(|r| r.as_str())
-                .collect::<alloc::vec::Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for UnknownRelation {}
+const EDGE_RELATION_VALID: &[&str] = &[
+    "contains",
+    "part_of",
+    "instance_of",
+    "extends",
+    "variant_of",
+    "introduced_by",
+    "supersedes",
+    "depends_on",
+    "enables",
+    "implements",
+    "competes_with",
+    "composed_with",
+    "annotates",
+];
 
 impl FromStr for EdgeRelation {
-    type Err = UnknownRelation;
+    type Err = crate::error::UnknownVariant;
 
-    /// Case-insensitive, hyphen-tolerant parser.
-    ///
-    /// `part_of`, `part-of`, and `partof` all parse to `PartOf`.
-    /// `Extends`, `extends`, `EXTENDS` all parse to `Extends`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Normalise: lowercase, replace hyphens with underscores, remove remaining non-alphanumeric.
         let normalised: String = s
             .chars()
             .map(|c| {
@@ -173,7 +162,11 @@ impl FromStr for EdgeRelation {
             "competes_with" | "competeswith" => Ok(Self::CompetesWith),
             "composed_with" | "composedwith" => Ok(Self::ComposedWith),
             "annotates" => Ok(Self::Annotates),
-            _ => Err(UnknownRelation(s.to_string())),
+            _ => Err(crate::error::UnknownVariant::new(
+                "edge_relation",
+                s,
+                EDGE_RELATION_VALID,
+            )),
         }
     }
 }
@@ -181,6 +174,7 @@ impl FromStr for EdgeRelation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     #[test]
     fn all_has_thirteen_variants() {

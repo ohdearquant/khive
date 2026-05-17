@@ -56,8 +56,16 @@ impl fmt::Display for NoteKind {
     }
 }
 
+const NOTE_KIND_VALID: &[&str] = &[
+    "observation",
+    "insight",
+    "question",
+    "decision",
+    "reference",
+];
+
 impl core::str::FromStr for NoteKind {
-    type Err = alloc::string::String;
+    type Err = crate::error::UnknownVariant;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -66,8 +74,10 @@ impl core::str::FromStr for NoteKind {
             "question" | "q" => Ok(Self::Question),
             "decision" | "choice" => Ok(Self::Decision),
             "reference" | "ref" | "citation" => Ok(Self::Reference),
-            other => Err(alloc::format!(
-                "unknown note kind: {other:?}. Valid: observation | insight | question | decision | reference"
+            other => Err(crate::error::UnknownVariant::new(
+                "note_kind",
+                other,
+                NOTE_KIND_VALID,
             )),
         }
     }
@@ -175,8 +185,9 @@ mod tests {
     fn note_kind_from_str_unknown_errors() {
         use core::str::FromStr;
         let err = NoteKind::from_str("garbage").unwrap_err();
-        assert!(err.contains("unknown note kind"));
-        assert!(err.contains("observation"));
+        assert_eq!(err.domain, "note_kind");
+        assert_eq!(err.value, "garbage");
+        assert!(err.valid.contains(&"observation"));
     }
 
     #[test]

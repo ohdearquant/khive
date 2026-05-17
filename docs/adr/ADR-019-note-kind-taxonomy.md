@@ -70,7 +70,7 @@ impl std::fmt::Display for NoteKind {
 }
 
 impl std::str::FromStr for NoteKind {
-    type Err = String;
+    type Err = UnknownVariant;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "observation" | "obs" => Ok(Self::Observation),
@@ -78,9 +78,7 @@ impl std::str::FromStr for NoteKind {
             "question" | "q" => Ok(Self::Question),
             "decision" | "choice" => Ok(Self::Decision),
             "reference" | "ref" | "citation" => Ok(Self::Reference),
-            other => Err(format!(
-                "unknown note kind: {other:?}. Valid: observation | insight | question | decision | reference"
-            )),
+            other => Err(UnknownVariant::new("note_kind", other, NOTE_KIND_VALID)),
         }
     }
 }
@@ -236,8 +234,9 @@ entity nodes — one verb, one relation, one mechanism, two substrate kinds.
 5. **MCP `create` handler (note branch)**: the `note_kind: Option<String>` wire field is parsed
    through `NoteKind::from_str` at the boundary; invalid values return `invalid_params` with the 5
    valid kinds enumerated. Update tool description accordingly. ~20 LOC.
-6. **MCP `list` and `search` handlers (note branch)**: same — `note_kind: Option<String>` parsed and
-   validated.
+6. **MCP `list` handler (note branch)**: same — `note_kind: Option<String>` parsed and
+   validated. Note: `search(kind="note")` does not filter by note kind in v0.1 (ADR-023
+   defines only `kind`, `query`, `limit` for search).
 7. **Tests**: 1 unit test per kind (parse + display roundtrip + default), 1 integration test for the
    MCP error path with an unknown kind.
 

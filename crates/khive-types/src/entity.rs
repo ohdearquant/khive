@@ -66,8 +66,10 @@ impl fmt::Display for EntityKind {
     }
 }
 
+const ENTITY_KIND_VALID: &[&str] = &["concept", "document", "dataset", "project", "person", "org"];
+
 impl FromStr for EntityKind {
-    type Err = String;
+    type Err = crate::error::UnknownVariant;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -77,8 +79,10 @@ impl FromStr for EntityKind {
             "project" | "repo" | "crate" | "library" | "lib" => Ok(Self::Project),
             "person" | "author" | "researcher" => Ok(Self::Person),
             "org" | "organization" | "organisation" | "lab" | "company" => Ok(Self::Org),
-            other => Err(alloc::format!(
-                "unknown entity kind: {other:?}. Valid: concept | document | dataset | project | person | org"
+            other => Err(crate::error::UnknownVariant::new(
+                "entity_kind",
+                other,
+                ENTITY_KIND_VALID,
             )),
         }
     }
@@ -209,7 +213,9 @@ mod tests {
     #[test]
     fn entity_kind_from_str_unknown_errors() {
         let err = EntityKind::from_str("gadget").unwrap_err();
-        assert!(err.contains("unknown entity kind"));
+        assert_eq!(err.domain, "entity_kind");
+        assert_eq!(err.value, "gadget");
+        assert!(err.valid.contains(&"concept"));
     }
 
     #[test]
