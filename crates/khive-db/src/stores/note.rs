@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
-use khive_storage::note::{Note, NoteKind};
+use khive_storage::note::Note;
 use khive_storage::types::{BatchWriteSummary, DeleteMode, Page, PageRequest};
 use khive_storage::NoteStore;
 use khive_storage::StorageCapability;
@@ -106,16 +106,10 @@ impl SqlNoteStore {
 // Helpers
 // =============================================================================
 
-fn parse_note_kind(s: &str, col: usize) -> Result<NoteKind, rusqlite::Error> {
-    s.parse::<NoteKind>().map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, e.into())
-    })
-}
-
 fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
     let id_str: String = row.get(0)?;
     let namespace: String = row.get(1)?;
-    let kind_str: String = row.get(2)?;
+    let kind: String = row.get(2)?;
     let name: Option<String> = row.get(3)?;
     let content: String = row.get(4)?;
     let salience: f64 = row.get(5)?;
@@ -127,7 +121,6 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
     let deleted_at: Option<i64> = row.get(11)?;
 
     let id = parse_uuid(&id_str)?;
-    let kind = parse_note_kind(&kind_str, 2)?;
 
     let properties = properties_str
         .map(|s| {
@@ -332,7 +325,7 @@ impl NoteStore for SqlNoteStore {
     async fn query_notes(
         &self,
         namespace: &str,
-        kind: Option<NoteKind>,
+        kind: Option<&str>,
         page: PageRequest,
     ) -> Result<Page<Note>, StorageError> {
         let namespace = namespace.to_string();
@@ -380,11 +373,7 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
-    async fn count_notes(
-        &self,
-        namespace: &str,
-        kind: Option<NoteKind>,
-    ) -> Result<u64, StorageError> {
+    async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> Result<u64, StorageError> {
         let namespace = namespace.to_string();
         let kind = kind.map(|k| k.to_string());
 
@@ -498,7 +487,7 @@ mod tests {
         SqlNoteStore::new(setup_pool(), false)
     }
 
-    fn make_note(namespace: &str, kind: NoteKind, content: &str) -> Note {
+    fn make_note(namespace: &str, kind: &str, content: &str) -> Note {
         Note::new(namespace, kind, content)
     }
 
@@ -506,7 +495,7 @@ mod tests {
     async fn test_upsert_and_get_note() {
         let store = setup_memory_store();
 
-        let note = make_note("default", NoteKind::Observation, "Hello world");
+        let note = make_note("default", "observation", "Hello world");
         let id = note.id;
 
         store.upsert_note(note).await.unwrap();
@@ -516,18 +505,18 @@ mod tests {
         let fetched = fetched.unwrap();
         assert_eq!(fetched.id, id);
         assert_eq!(fetched.content, "Hello world");
-        assert_eq!(fetched.kind, NoteKind::Observation);
+        assert_eq!(fetched.kind, "observation");
     }
 
     #[tokio::test]
     async fn test_kind_roundtrip_all_variants() {
         let store = setup_memory_store();
         for kind in [
-            NoteKind::Observation,
-            NoteKind::Insight,
-            NoteKind::Question,
-            NoteKind::Decision,
-            NoteKind::Reference,
+            "observation",
+            "insight",
+            "question",
+            "decision",
+            "reference",
         ] {
             let note = make_note("default", kind, "content");
             let id = note.id;
@@ -541,7 +530,7 @@ mod tests {
     async fn test_soft_delete() {
         let store = setup_memory_store();
 
-        let note = make_note("default", NoteKind::Observation, "to be deleted");
+        let note = make_note("default", "observation", "to be deleted");
         let id = note.id;
         store.upsert_note(note).await.unwrap();
 
@@ -556,7 +545,7 @@ mod tests {
     async fn test_hard_delete() {
         let store = setup_memory_store();
 
-        let note = make_note("default", NoteKind::Observation, "to be hard deleted");
+        let note = make_note("default", "observation", "to be hard deleted");
         let id = note.id;
         store.upsert_note(note).await.unwrap();
 
@@ -575,12 +564,12 @@ mod tests {
 
         for _ in 0..3 {
             store
-                .upsert_note(make_note("ns1", NoteKind::Observation, "content"))
+                .upsert_note(make_note("ns1", "observation", "content"))
                 .await
                 .unwrap();
         }
         store
-            .upsert_note(make_note("ns2", NoteKind::Observation, "other"))
+            .upsert_note(make_note("ns2", "observation", "other"))
             .await
             .unwrap();
 
@@ -598,14 +587,14 @@ mod tests {
 
         for _ in 0..3 {
             let inserted = store
-                .upsert_note_if_below_quota(make_note("quota_ns", NoteKind::Observation, "x"), 3)
+                .upsert_note_if_below_quota(make_note("quota_ns", "observation", "x"), 3)
                 .await
                 .unwrap();
             assert!(inserted);
         }
 
         let inserted = store
-            .upsert_note_if_below_quota(make_note("quota_ns", NoteKind::Observation, "x"), 3)
+            .upsert_note_if_below_quota(make_note("quota_ns", "observation", "x"), 3)
             .await
             .unwrap();
         assert!(!inserted);
@@ -618,11 +607,11 @@ mod tests {
         let store = SqlNoteStore::new(Arc::clone(&pool), false);
 
         store
-            .upsert_note(make_note("ns_a", NoteKind::Observation, "A"))
+            .upsert_note(make_note("ns_a", "observation", "A"))
             .await
             .unwrap();
         store
-            .upsert_note(make_note("ns_b", NoteKind::Insight, "B"))
+            .upsert_note(make_note("ns_b", "insight", "B"))
             .await
             .unwrap();
 

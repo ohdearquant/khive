@@ -6,7 +6,6 @@
 
 use std::str::FromStr;
 
-use khive_runtime::NoteKind;
 use khive_storage::EdgeRelation;
 
 use rmcp::{
@@ -179,15 +178,8 @@ Examples:
                     McpError::invalid_params("kind=note requires 'content'", None)
                 })?;
                 let kind = match p.note_kind.as_deref() {
-                    None | Some("") => NoteKind::Observation,
-                    Some(s) => NoteKind::from_str(s).map_err(|_| {
-                        McpError::invalid_params(
-                            format!(
-                                "invalid note_kind {s:?}. Valid: observation | insight | question | decision | reference (aliases: obs, finding, q, choice, ref, citation)"
-                            ),
-                            None,
-                        )
-                    })?,
+                    None | Some("") => "observation",
+                    Some(s) => s,
                 };
                 let salience = p.salience.unwrap_or(0.5);
                 let mut annotates = Vec::new();
@@ -330,22 +322,12 @@ Examples:
             "note" => {
                 let kind_str = match p.note_kind.as_deref() {
                     None | Some("") => None,
-                    Some(s) => {
-                        let k = NoteKind::from_str(s).map_err(|_| {
-                            McpError::invalid_params(
-                                format!(
-                                    "invalid note_kind {s:?}. Valid: observation | insight | question | decision | reference"
-                                ),
-                                None,
-                            )
-                        })?;
-                        Some(k.to_string())
-                    }
+                    Some(s) => Some(s),
                 };
                 let limit = p.limit.unwrap_or(20).min(200);
                 let notes = self
                     .runtime
-                    .list_notes(p.namespace.as_deref(), kind_str.as_deref(), limit)
+                    .list_notes(p.namespace.as_deref(), kind_str, limit)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Self::to_json(&notes)

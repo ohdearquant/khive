@@ -3,7 +3,7 @@
 //! Tests cover entity CRUD, graph operations, note memory, GQL query,
 //! and namespace isolation using an in-memory runtime.
 
-use khive_runtime::{KhiveRuntime, NoteKind, RuntimeConfig};
+use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
 use khive_storage::EdgeRelation;
 use uuid::Uuid;
@@ -37,7 +37,7 @@ async fn entity_create_and_get_roundtrip() {
     let fetched = fetched.unwrap();
     assert_eq!(fetched.id, entity.id);
     assert_eq!(fetched.name, "LoRA");
-    assert_eq!(fetched.kind, khive_types::EntityKind::Concept);
+    assert_eq!(fetched.kind, "concept");
     assert_eq!(fetched.description.as_deref(), Some("Low-Rank Adaptation"));
 }
 
@@ -228,7 +228,7 @@ async fn create_note_and_list_notes() {
 
     rt.create_note(
         None,
-        NoteKind::Observation,
+        "observation",
         None,
         "LoRA is a fine-tuning technique",
         0.9,
@@ -239,7 +239,7 @@ async fn create_note_and_list_notes() {
     .unwrap();
     rt.create_note(
         None,
-        NoteKind::Observation,
+        "observation",
         None,
         "QLoRA uses quantization",
         0.8,
@@ -250,7 +250,7 @@ async fn create_note_and_list_notes() {
     .unwrap();
     rt.create_note(
         None,
-        NoteKind::Question,
+        "question",
         None,
         "Review LoRA paper",
         0.7,
@@ -275,11 +275,11 @@ async fn create_note_and_list_notes() {
 async fn create_all_note_kinds() {
     let rt = rt();
     for kind in [
-        NoteKind::Observation,
-        NoteKind::Insight,
-        NoteKind::Question,
-        NoteKind::Decision,
-        NoteKind::Reference,
+        "observation",
+        "insight",
+        "question",
+        "decision",
+        "reference",
     ] {
         rt.create_note(None, kind, None, "content", 0.5, None, vec![])
             .await
@@ -480,7 +480,7 @@ async fn list_notes_excludes_soft_deleted() {
     let note = rt
         .create_note(
             None,
-            NoteKind::Observation,
+            "observation",
             None,
             "soft-delete-test",
             0.9,

@@ -20,11 +20,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use std::str::FromStr;
-
 use khive_storage::types::{EdgeFilter, LinkId, PageRequest};
 use khive_storage::{EdgeRelation, EntityFilter};
-use khive_types::EntityKind;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::KhiveRuntime;
@@ -213,12 +210,7 @@ impl KhiveRuntime {
             let entity = khive_storage::entity::Entity {
                 id: ee.id,
                 namespace: ns.clone(),
-                kind: EntityKind::from_str(&ee.kind).map_err(|e| {
-                    RuntimeError::InvalidInput(format!(
-                        "invalid entity kind {:?} in archive: {}",
-                        ee.kind, e
-                    ))
-                })?,
+                kind: ee.kind.clone(),
                 name: ee.name.clone(),
                 description: ee.description.clone(),
                 properties: ee.properties.clone(),

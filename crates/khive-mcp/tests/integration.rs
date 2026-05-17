@@ -695,6 +695,8 @@ async fn note_create_with_canonical_kind() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn note_create_with_alias_obs() -> anyhow::Result<()> {
+    // Pack-agnostic: the runtime/mcp layer accepts any string for note_kind.
+    // "obs" passes through as-is — alias normalization is a pack-handler concern.
     let client = connect().await?;
     let result = call(
         &client,
@@ -704,40 +706,31 @@ async fn note_create_with_alias_obs() -> anyhow::Result<()> {
     .await?;
     assert!(
         !result.is_error.unwrap_or(false),
-        "alias 'obs' should map to observation"
+        "pack-agnostic runtime must accept any string for note_kind"
     );
     let note: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
-    assert_eq!(note["kind"], "observation");
+    // kind passes through unchanged — pack handlers do normalization, not the runtime/mcp layer
+    assert_eq!(note["kind"], "obs");
     Ok(())
 }
 
 #[tokio::test]
-async fn note_create_unknown_kind_returns_error() -> anyhow::Result<()> {
+async fn note_create_unknown_kind_passes_through() -> anyhow::Result<()> {
+    // Pack-agnostic: the mcp/runtime layer no longer validates note_kind.
+    // Any string is accepted. Pack handlers do kind validation at a higher layer.
     let client = connect().await?;
-    let result = client
-        .call_tool(
-            CallToolRequestParams::new("create").with_arguments(
-                json!({"kind": "note", "note_kind": "garbage", "content": "should fail"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        )
-        .await;
-    match result {
-        Err(_) => {}
-        Ok(r) => {
-            assert!(
-                r.is_error.unwrap_or(false),
-                "unknown note_kind 'garbage' should produce an error response"
-            );
-            let text = first_text(&r);
-            assert!(
-                text.contains("observation") || text.contains("invalid"),
-                "error message should mention valid kinds, got: {text}"
-            );
-        }
-    }
+    let result = call(
+        &client,
+        "create",
+        json!({"kind": "note", "note_kind": "garbage", "content": "pack-agnostic test"}),
+    )
+    .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "pack-agnostic runtime must accept any string for note_kind (got error)"
+    );
+    let note: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
+    assert_eq!(note["kind"], "garbage");
     Ok(())
 }
 

@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_types::EntityKind;
-
 use crate::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, StorageResult};
 
 /// Storage-level entity record. Flat SQL-friendly representation.
@@ -15,7 +13,7 @@ use crate::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, StorageResu
 pub struct Entity {
     pub id: Uuid,
     pub namespace: String,
-    pub kind: EntityKind,
+    pub kind: String,
     pub name: String,
     pub description: Option<String>,
     pub properties: Option<Value>,
@@ -26,12 +24,16 @@ pub struct Entity {
 }
 
 impl Entity {
-    pub fn new(namespace: impl Into<String>, kind: EntityKind, name: impl Into<String>) -> Self {
+    pub fn new(
+        namespace: impl Into<String>,
+        kind: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
         let now = chrono::Utc::now().timestamp_micros();
         Self {
             id: Uuid::new_v4(),
             namespace: namespace.into(),
-            kind,
+            kind: kind.into(),
             name: name.into(),
             description: None,
             properties: None,
@@ -62,7 +64,7 @@ impl Entity {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EntityFilter {
     pub ids: Vec<Uuid>,
-    pub kinds: Vec<EntityKind>,
+    pub kinds: Vec<String>,
     pub name_prefix: Option<String>,
     pub tags_any: Vec<String>,
 }

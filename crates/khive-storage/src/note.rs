@@ -7,14 +7,12 @@ use uuid::Uuid;
 
 use crate::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, StorageResult};
 
-pub use khive_types::NoteKind;
-
 /// A storage-level note record. Flat, SQL-friendly representation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Note {
     pub id: Uuid,
     pub namespace: String,
-    pub kind: NoteKind,
+    pub kind: String,
     pub name: Option<String>,
     pub content: String,
     pub salience: f64,
@@ -27,12 +25,16 @@ pub struct Note {
 }
 
 impl Note {
-    pub fn new(namespace: impl Into<String>, kind: NoteKind, content: impl Into<String>) -> Self {
+    pub fn new(
+        namespace: impl Into<String>,
+        kind: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         let now = chrono::Utc::now().timestamp_micros();
         Self {
             id: Uuid::new_v4(),
             namespace: namespace.into(),
-            kind,
+            kind: kind.into(),
             name: None,
             content: content.into(),
             salience: 0.5,
@@ -75,10 +77,10 @@ pub trait NoteStore: Send + Sync + 'static {
     async fn query_notes(
         &self,
         namespace: &str,
-        kind: Option<NoteKind>,
+        kind: Option<&str>,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
-    async fn count_notes(&self, namespace: &str, kind: Option<NoteKind>) -> StorageResult<u64>;
+    async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
 
     async fn upsert_note_if_below_quota(&self, note: Note, max_notes: u64) -> StorageResult<bool> {
         let count = self.count_notes(&note.namespace, None).await?;

@@ -854,32 +854,35 @@ mod tests {
     }
 
     #[test]
-    fn compile_rejects_unknown_kind() {
+    fn compile_unknown_kind_passes_through() {
+        // Pack-agnostic: any string is accepted as an entity kind at the query layer.
+        // Validation is a pack-handler concern.
         let q = gql::parse("MATCH (a:gizmo)-[:extends]->(b) RETURN a").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("gizmo"), "msg: {msg}");
+        let compiled = compile(&q, &opts()).unwrap();
+        let has_gizmo = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, SqlValue::Text(s) if s == "gizmo"));
+        assert!(
+            has_gizmo,
+            "pack-agnostic: unknown kind must pass through into SQL params"
+        );
     }
 
     #[test]
-    fn compile_normalises_kind_aliases_to_canonical() {
-        // `paper` is an alias for the canonical `document` kind; the SQL must
-        // bind `document` so it matches what `khive-db` stores.
+    fn compile_kind_passes_through_unchanged() {
+        // Pack-agnostic: 'paper' is no longer normalized to 'document' at the query layer.
+        // The string passes through as-is.
         let q =
             gql::parse("MATCH (a:paper)-[:introduced_by]->(b:concept) RETURN a LIMIT 1").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        let has_document = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, SqlValue::Text(s) if s == "document"));
         let has_paper = compiled
             .params
             .iter()
             .any(|p| matches!(p, SqlValue::Text(s) if s == "paper"));
-        assert!(has_document, "expected canonical 'document' in params");
         assert!(
-            !has_paper,
-            "raw alias 'paper' must not leak into SQL params"
+            has_paper,
+            "kind 'paper' must pass through unchanged into SQL params"
         );
     }
 
@@ -901,22 +904,18 @@ mod tests {
     }
 
     #[test]
-    fn compile_normalises_kind_alias_in_where_param() {
+    fn compile_kind_in_where_passes_through_unchanged() {
+        // Pack-agnostic: kind strings in WHERE conditions pass through as-is.
         let q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'paper' RETURN a").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        let has_document = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, SqlValue::Text(s) if s == "document"));
         let has_paper = compiled
             .params
             .iter()
             .any(|p| matches!(p, SqlValue::Text(s) if s == "paper"));
         assert!(
-            has_document,
-            "WHERE a.kind = 'paper' must normalise to 'document'"
+            has_paper,
+            "kind 'paper' must pass through unchanged into SQL params"
         );
-        assert!(!has_paper, "raw 'paper' must not leak into SQL params");
     }
 
     #[test]

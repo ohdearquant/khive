@@ -27,7 +27,7 @@ pub use error::StorageError;
 
 pub use event::{Event, EventFilter, EventStore};
 pub use graph::GraphStore;
-pub use note::{Note, NoteKind, NoteStore};
+pub use note::{Note, NoteStore};
 pub use sql::{SqlAccess, SqlReader, SqlTransaction, SqlWriter};
 pub use text::TextSearch;
 pub use types::StorageResult;
@@ -42,4 +42,4 @@ pub use types::{
     VectorSearchRequest, VectorStoreInfo,
 };
 
-pub use khive_types::{EdgeCategory, EdgeRelation, EntityKind, EventOutcome, SubstrateKind};
+pub use khive_types::{EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind};
