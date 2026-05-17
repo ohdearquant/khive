@@ -3,7 +3,7 @@
 //! v0.1 scope: entity-only. Note merge is deferred.
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Input for `merge` — deduplicate two entity records into one (ADR-014).
 ///
@@ -23,7 +23,7 @@ use serde::Deserialize;
 /// Returns a summary: kept_id, removed_id, edges_rewired, properties_merged, tags_unioned.
 ///
 /// Warning: not atomic in v0.1 — re-run with the same args to recover from mid-way failures.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MergeParams {
     /// Namespace (omit for server default).
     pub namespace: Option<String>,

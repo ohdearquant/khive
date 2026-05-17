@@ -218,12 +218,13 @@ This ADR is implemented incrementally across multiple PRs:
 | 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | done    |
 | 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic     | done    |
 | 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | done    |
-| 5. Rewrite `khive-mcp` to route through VerbRegistry                     | Single `request` tool surface  | pending |
+| 5. Rewrite `khive-mcp` to route through VerbRegistry                     | Registry-based dispatch         | done    |
 
-Steps 1-4 establish the single-pack architecture: the `kg` pack is the only pack loaded, so
-verb-name dispatch is sufficient. Step 5 adds kind-discriminated routing to the MCP layer,
-enabling multi-pack deployment where shared CRUD verbs dispatch based on the kind parameter
-rather than just the verb name.
+All steps complete. The MCP server is a thin translation layer: typed params → JSON Value →
+VerbRegistry dispatch → pretty-printed response. Business logic lives entirely in packs.
+Multi-pack deployment (kind-discriminated routing for shared CRUD verbs) is supported by the
+`VerbRegistry::all_note_kinds()` / `all_entity_kinds()` infrastructure but not yet exercised
+because only the `kg` pack is registered.
 
 ## References
 

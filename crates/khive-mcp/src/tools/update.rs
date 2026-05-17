@@ -1,7 +1,7 @@
 //! Parameter types for the `update` verb (ADR-023).
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Input for `update` — patch-style modification of an entity or edge.
 ///
@@ -22,7 +22,7 @@ use serde::Deserialize;
 ///   Clear description:  {"id":"<uuid>","description":null}
 ///   Adjust edge weight: {"id":"<uuid>","weight":0.7}
 ///   Fix edge relation:  {"id":"<uuid>","relation":"extends"}
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UpdateParams {
     /// Namespace (omit for server default).
     pub namespace: Option<String>,

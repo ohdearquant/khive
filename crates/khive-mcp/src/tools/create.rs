@@ -1,13 +1,13 @@
 //! Parameter types for the `create` verb (ADR-023).
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Input for `create` — create an entity or note.
 ///
 /// kind="entity": requires `name` and `entity_kind`.
 /// kind="note": requires `content`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CreateParams {
     /// Discriminant. One of: entity | note
     #[schemars(description = "entity | note")]
