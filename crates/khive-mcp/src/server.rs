@@ -140,15 +140,13 @@ kind="note" — create a lightweight text note.
   note_kind: observation (default) | insight | question | decision | reference
   Aliases: obs, finding, q, choice, ref, citation
   Optional: salience (0.0–1.0, default 0.5), annotates (UUIDs → creates annotates edges),
-            supersedes (UUID of old note → creates a supersedes edge; annotations are NOT inherited — declare them explicitly),
             properties (JSON)
 
 Examples:
   Add algorithm:  {"kind":"entity","entity_kind":"concept","name":"FlashAttention","properties":{"domain":"attention"}}
   Add paper:      {"kind":"entity","entity_kind":"document","name":"Attention Is All You Need","properties":{"year":2017}}
   Add decision:   {"kind":"note","note_kind":"decision","content":"Use FlashAttention-2 for attention","salience":0.9}
-  Annotating:     {"kind":"note","content":"Reduces memory by tiling","annotates":["<entity-uuid>"]}
-  Superseding:    {"kind":"note","note_kind":"decision","content":"New decision...","supersedes":"<old-note-uuid>"}"#)]
+  Annotating:     {"kind":"note","content":"Reduces memory by tiling","annotates":["<entity-uuid>"]}"#)]
     async fn create(&self, Parameters(p): Parameters<CreateParams>) -> Result<String, McpError> {
         match p.kind.as_str() {
             "entity" => {
@@ -196,33 +194,6 @@ Examples:
                 for s in p.annotates.unwrap_or_default() {
                     annotates.push(self.resolve_uuid(&s, p.namespace.as_deref()).await?);
                 }
-
-                // Supersession is note-level. Validate the old note exists (a live note in
-                // this namespace) BEFORE any write, so a bad target persists nothing
-                // (atomicity). Annotations are NOT inherited — they are per-note explicit
-                // (ADR-019); "show only current" is a separate view-layer concern (#36),
-                // never a data transfer. See CLAUDE.md §"Data vs. view".
-                let supersedes_id = match p.supersedes.as_deref() {
-                    Some(s) => {
-                        let old_id = self.resolve_uuid(s, p.namespace.as_deref()).await?;
-                        let resolved = self
-                            .runtime
-                            .resolve(p.namespace.as_deref(), old_id)
-                            .await
-                            .map_err(Self::validation_err)?;
-                        if !matches!(resolved, Some(khive_runtime::operations::Resolved::Note(_))) {
-                            return Err(McpError::invalid_params(
-                                format!(
-                                    "supersedes target {old_id} must be a note in this namespace"
-                                ),
-                                None,
-                            ));
-                        }
-                        Some(old_id)
-                    }
-                    None => None,
-                };
-
                 let note = self
                     .runtime
                     .create_note(
@@ -236,21 +207,6 @@ Examples:
                     )
                     .await
                     .map_err(Self::validation_err)?;
-
-                // Create supersedes edge from new note → old note.
-                if let Some(old_id) = supersedes_id {
-                    self.runtime
-                        .link(
-                            p.namespace.as_deref(),
-                            note.id,
-                            old_id,
-                            EdgeRelation::Supersedes,
-                            1.0,
-                        )
-                        .await
-                        .map_err(Self::validation_err)?;
-                }
-
                 Self::to_json(&note)
             }
             other => Err(McpError::invalid_params(
