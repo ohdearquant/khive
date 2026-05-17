@@ -98,22 +98,16 @@ set. Any `create` or `update` call with an unregistered kind returns an error li
 values from all loaded packs. The merge is additive — packs can overlap (two packs declaring the
 same kind string is not an error; it is idempotent in the merged set).
 
-### Verb routing: name-based vs kind-discriminated
+### Verb routing
 
-Verbs fall into two categories:
+The `VerbRegistry` dispatches by verb name: the first registered pack whose `verbs()` contains
+the requested verb handles the call. This is sufficient for the current single-pack deployment.
 
-1. **Pack-specific verbs** — verbs unique to one pack (e.g. a hypothetical `reindex` or
-   `schedule`). Routed by verb name alone: the registry dispatches to the pack that declares it.
-
-2. **Shared CRUD verbs** — verbs like `create`, `list`, `search`, `get`, `update`, `delete` that
-   multiple packs handle. These require **kind-discriminated routing**: the registry inspects the
-   `kind` / `entity_kind` / `note_kind` parameter to determine which pack owns that vocabulary
-   entry, then dispatches to that pack.
-
-Kind-discriminated routing is implemented in step 5 (MCP rewrite). Until then, only one pack is
-loaded (the `kg` pack) and the distinction is moot — verb-name dispatch is sufficient for the
-single-pack case. The `VerbRegistry` already provides `all_note_kinds()` and `all_entity_kinds()`
-which are the building blocks for kind-discriminated dispatch.
+When multiple packs need to share CRUD verbs (`create`, `list`, `search`, etc.), the registry
+will need **kind-discriminated routing** — inspecting `entity_kind` or `note_kind` to determine
+which pack owns that vocabulary entry. This is deferred as future work beyond the initial
+5-step implementation. The `VerbRegistry::all_note_kinds()` and `all_entity_kinds()` methods
+provide the building blocks for such routing when needed.
 
 ### Wire types
 
@@ -222,9 +216,11 @@ This ADR is implemented incrementally across multiple PRs:
 
 All steps complete. The MCP server is a thin translation layer: typed params → JSON Value →
 VerbRegistry dispatch → pretty-printed response. Business logic lives entirely in packs.
-Multi-pack deployment (kind-discriminated routing for shared CRUD verbs) is supported by the
-`VerbRegistry::all_note_kinds()` / `all_entity_kinds()` infrastructure but not yet exercised
-because only the `kg` pack is registered.
+
+**Limitation**: the current registry uses verb-name dispatch (first registered pack wins).
+Multi-pack deployment with shared CRUD verbs requires kind-discriminated routing — a future
+enhancement beyond this 5-step plan. The infrastructure (`all_note_kinds()`, `all_entity_kinds()`)
+exists but routing logic is not yet implemented.
 
 ## References
 
