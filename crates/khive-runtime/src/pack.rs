@@ -1,7 +1,7 @@
-//! Pack runtime trait and verb registry.
+//! Pack runtime trait and verb registry (ADR-025 step 2).
 //!
-//! Packs register verbs into the runtime. The MCP server exposes a single
-//! `request` tool that dispatches to the appropriate pack handler.
+//! Packs register verbs into the runtime. The registry routes verb calls
+//! to the pack that declares them.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -10,16 +10,27 @@ pub use khive_types::VerbDef;
 
 use crate::error::RuntimeError;
 
-/// Async trait for packs that handle verb dispatch.
+/// Async dispatch trait for packs (ADR-025).
 ///
-/// Each pack owns a clone of KhiveRuntime (cheap — Arc internally) and
-/// handles a set of verbs. The registry routes verb calls to the correct pack.
+/// This is the behavioral counterpart to `khive_types::Pack`. The `Pack` trait
+/// provides static metadata via const items (not object-safe); this trait
+/// mirrors that metadata as methods and adds async dispatch.
+///
+/// Implementors must also implement `Pack` on the same struct — the `name()`
+/// and `verbs()` methods here should return the same values as `Pack::NAME`
+/// and `Pack::VERBS`.
 #[async_trait]
 pub trait PackRuntime: Send + Sync {
-    /// Pack name (matches Pack::NAME from khive-types).
+    /// Pack name — must match `Pack::NAME` on the implementing struct.
     fn name(&self) -> &str;
 
-    /// Verbs this pack handles.
+    /// Note kinds this pack owns — must match `Pack::NOTE_KINDS`.
+    fn note_kinds(&self) -> &'static [&'static str];
+
+    /// Entity kinds this pack owns — must match `Pack::ENTITY_KINDS`.
+    fn entity_kinds(&self) -> &'static [&'static str];
+
+    /// Verbs this pack handles — must match `Pack::VERBS`.
     fn verbs(&self) -> &'static [VerbDef];
 
     /// Dispatch a verb call. Returns serialized JSON response.
@@ -68,6 +79,22 @@ impl VerbRegistry {
     /// All verb definitions across all registered packs.
     pub fn all_verbs(&self) -> Vec<&VerbDef> {
         self.packs.iter().flat_map(|p| p.verbs().iter()).collect()
+    }
+
+    /// All note kinds across all registered packs (merged set).
+    pub fn all_note_kinds(&self) -> Vec<&'static str> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.note_kinds().iter().copied())
+            .collect()
+    }
+
+    /// All entity kinds across all registered packs (merged set).
+    pub fn all_entity_kinds(&self) -> Vec<&'static str> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.entity_kinds().iter().copied())
+            .collect()
     }
 }
 
