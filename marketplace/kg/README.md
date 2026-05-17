@@ -35,17 +35,14 @@ claude mcp add --transport stdio kg -- khive-mcp
 | `traverse` | Multi-hop BFS |
 | `query` | GQL/SPARQL pattern matching |
 
-### 7 Skills (slash commands)
+### 4 Skills (workflow-shaped, not verb docs)
 
-| Skill | Command | Purpose |
-|-------|---------|---------|
-| kg-digest | `/kg:kg-digest` | Ingest research into the graph |
-| retrieve | `/kg:retrieve` | Choose the right retrieval verb |
-| orient | `/kg:orient` | Explore graph structure + health |
-| assign | `/kg:assign` | Create typed notes |
-| search | `/kg:search` | Hybrid semantic search |
-| curate | `/kg:curate` | Merge, dedup, supersede, delete |
-| link | `/kg:link` | Edge ontology reference |
+| Skill | Command | What it does |
+|-------|---------|--------------|
+| digest | `/kg:digest` | Ingest material into the graph — extract entities, link them, verify density |
+| explore | `/kg:explore` | Discover what the graph knows about a topic — traverse, narrate, surface gaps |
+| connect | `/kg:connect` | Wire a new concept into existing knowledge — find relations, reach density |
+| polish | `/kg:polish` | Audit and fix — orphans, low-degree nodes, duplicates, stale edges |
 
 ### 1 Agent
 
