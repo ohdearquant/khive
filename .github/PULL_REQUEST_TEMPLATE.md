@@ -24,6 +24,7 @@
 - [ ] Every claim in this PR description matches the actual diff
 - [ ] Any agent-authored comment / PR body starts with an attribution line
 - [ ] `cargo test` output included for behavior-changing code
+- [ ] Behavior touching a typed relation (edges, entity/note kinds, `supersedes`/`annotates`, namespace) cites its governing ADR line — or flags it as an **unspecified design decision**, not a code invention (CLAUDE.md §"Data vs. view")
 
 ## Out of scope
 
