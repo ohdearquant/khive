@@ -10,18 +10,15 @@ description = "khive stdio MCP server — the only user-facing Rust binary"
 
 [dependencies]
 khive-runtime = { version = "0.1.1", path = "../khive-runtime" }
-khive-storage = { version = "0.1.1", path = "../khive-storage" }
-khive-types = { version = "0.1.1", path = "../khive-types", features = ["serde"] }
+khive-pack-kg = { version = "0.1.1", path = "../khive-pack-kg" }
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-async-trait = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
-uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

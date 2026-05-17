@@ -1,7 +1,7 @@
 //! Parameter types for the `search` verb (ADR-023, ADR-024).
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Input for `search` — semantic/hybrid search across entities or notes.
 ///
@@ -17,7 +17,7 @@ use serde::Deserialize;
 /// Examples:
 ///   Find entities: {"kind":"entity","query":"FlashAttention memory efficient attention"}
 ///   Find notes:    {"kind":"note","query":"LoRA fine-tuning parameter efficiency","limit":5}
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
     /// Discriminant. One of: entity | note
     #[schemars(description = "entity | note")]

@@ -771,8 +771,8 @@ async fn delete_nonexistent_id_returns_not_found() {
 }
 
 // ---- ADR-025 contract: KG pack rejects non-KG kinds (single-pack architecture) ----
-// Step 5 adds kind-discriminated routing so a second pack's kinds dispatch correctly.
-// Until then, the KG pack validates only its own vocabulary — this is documented behavior.
+// The KG pack validates only its own vocabulary. Multi-pack kind-discriminated routing
+// is future work beyond the current 5-step plan (see ADR-025 §Limitation).
 
 #[tokio::test]
 async fn create_entity_non_kg_kind_rejected_by_pack_validation() {

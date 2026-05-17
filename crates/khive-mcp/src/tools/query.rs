@@ -1,10 +1,10 @@
 //! MCP tool parameter types for graph query operations.
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Input for `query` — run a GQL or SPARQL query against the knowledge graph.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct QueryParams {
     /// Namespace (omit for server default).
     pub namespace: Option<String>,

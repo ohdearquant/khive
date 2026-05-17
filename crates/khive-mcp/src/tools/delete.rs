@@ -1,7 +1,7 @@
 //! Parameter types for the `delete` verb (ADR-023).
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Input for `delete` — remove a record by UUID.
 ///
@@ -10,7 +10,7 @@ use serde::Deserialize;
 /// Edge: always hard-deleted (edges have no soft-delete state).
 ///
 /// Returns {"deleted": true, "id": "<uuid>"} on success.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DeleteParams {
     /// Namespace (omit for server default).
     pub namespace: Option<String>,

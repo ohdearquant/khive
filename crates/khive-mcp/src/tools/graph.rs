@@ -1,10 +1,10 @@
 //! MCP tool parameter types for graph (edge) operations.
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Input for `link` — create a directed edge between two entities.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LinkParams {
     /// Namespace (omit for server default).
     pub namespace: Option<String>,
@@ -35,7 +35,7 @@ pub struct LinkParams {
 }
 
 /// Input for `neighbors` — get immediate neighbors of a node.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NeighborsParams {
     /// Namespace (omit for server default).
     pub namespace: Option<String>,
@@ -55,7 +55,7 @@ pub struct NeighborsParams {
 }
 
 /// Input for `traverse` — multi-hop graph traversal.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraverseParams {
     /// Namespace (omit for server default).
     pub namespace: Option<String>,

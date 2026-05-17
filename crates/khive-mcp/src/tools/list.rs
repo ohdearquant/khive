@@ -1,14 +1,14 @@
 //! Parameter types for the `list` verb (ADR-023).
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Input for `list` — list records with optional filtering.
 ///
 /// kind="entity": returns entities, optionally filtered by entity_kind.
 /// kind="edge": returns edges, optionally filtered by source/target/relations/weight.
 /// kind="note": returns notes, optionally filtered by note_kind.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ListParams {
     /// Discriminant. One of: entity | edge | note
     #[schemars(description = "entity | edge | note")]
