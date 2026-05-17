@@ -1,5 +1,6 @@
 {
   "name": "khive",
+  "description": "Knowledge graph, agent runtime, and personal AI tools by Ocean.",
   "owner": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"
@@ -7,7 +8,7 @@
   "plugins": [
     {
       "name": "kg",
-      "source": "marketplace/kg",
+      "source": "./marketplace/kg",
       "description": "Persistent knowledge graph for AI agents"
     }
   ]

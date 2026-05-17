@@ -17,6 +17,5 @@
       "installHint": "cargo install khive-mcp"
     }
   },
-  "keywords": ["knowledge-graph", "research", "entities", "mcp"],
-  "categories": ["knowledge-management", "developer-tools"]
+  "keywords": ["knowledge-graph", "research", "entities", "mcp", "knowledge-management"]
 }
