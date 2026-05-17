@@ -130,12 +130,13 @@ pack the endpoints belong to. Packs cannot add edge relations.
 
 ### Built-in pack
 
-| Pack | Note kinds                                          | Entity kinds                                     | Location                               |
-| ---- | --------------------------------------------------- | ------------------------------------------------ | -------------------------------------- |
-| kg   | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | khive-runtime (default, always loaded) |
+| Pack | Note kinds                                          | Entity kinds                                     | Location          |
+| ---- | --------------------------------------------------- | ------------------------------------------------ | ----------------- |
+| kg   | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | `khive-pack-kg`   |
 
-The `kg` pack is the only pack shipped in the OSS distribution. Extension packs are separate crates
-that implement the `Pack` trait and register with the runtime at init.
+The `kg` pack is the only pack shipped in the OSS distribution. It is registered into the
+`VerbRegistry` by the transport layer (step 5). Extension packs are separate crates that implement
+the `Pack` + `PackRuntime` traits and register alongside `kg` at init.
 
 ## Rationale
 
