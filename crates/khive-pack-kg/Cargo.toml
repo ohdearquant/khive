@@ -1,0 +1,26 @@
+[package]
+name = "khive-pack-kg"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "KG verb pack — entity/note CRUD, graph traversal, hybrid search for research knowledge graphs"
+
+[dependencies]
+khive-types = { version = "0.1.1", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.1.1", path = "../khive-runtime" }
+khive-storage = { version = "0.1.1", path = "../khive-storage" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

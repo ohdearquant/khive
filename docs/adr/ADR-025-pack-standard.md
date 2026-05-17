@@ -199,7 +199,7 @@ This ADR is implemented incrementally across multiple PRs:
 | 1. Pack trait + VerbDef in `khive-types`                                 | Declarative metadata (this PR) | done    |
 | 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | done    |
 | 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic     | done    |
-| 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | pending |
+| 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | done    |
 | 5. Rewrite `khive-mcp` to route through VerbRegistry                     | Single `request` tool surface  | pending |
 
 Until step 3 is complete, the runtime still enforces the fixed 6/5 kind enums from `khive-types`.
