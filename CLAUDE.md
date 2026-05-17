@@ -233,7 +233,7 @@ Key ADRs for contributors:
 | [019](docs/adr/ADR-019-note-kind-taxonomy.md)            | 5 note kinds                                       |
 | [022](docs/adr/ADR-022-schema-migrations.md)             | Migration system — how to change the DB schema     |
 | [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md) | 11 MCP tools — the public contract                 |
-| [025](docs/adr/ADR-025-pack-standard.md)                 | Pack trait — composable vocabulary extension        |
+| [025](docs/adr/ADR-025-pack-standard.md)                 | Pack trait — composable vocabulary extension       |
 
 Full index: [docs/adr/README.md](docs/adr/README.md).
 
@@ -241,18 +241,18 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
 
 ## What lives where
 
-| Want to do...           | Edit this                                                                   |
-| ----------------------- | --------------------------------------------------------------------------- |
-| Add a new MCP tool      | `crates/khive-mcp/src/tools/` (params) + pack handler                       |
-| Add a verb handler      | `crates/khive-pack-kg/src/handlers.rs`                                      |
-| Add a runtime operation | `crates/khive-runtime/src/operations.rs`                                    |
-| Change DB schema        | `crates/khive-db/src/migrations.rs` (new version) + store DDL               |
-| Add a new entity kind   | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                     |
-| Add a new edge relation | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))        |
-| Add a new note kind     | `crates/khive-pack-kg/src/vocab.rs` + ADR-019 amendment                     |
+| Want to do...           | Edit this                                                                                    |
+| ----------------------- | -------------------------------------------------------------------------------------------- |
+| Add a new MCP tool      | `crates/khive-mcp/src/tools/` (params) + pack handler                                        |
+| Add a verb handler      | `crates/khive-pack-kg/src/handlers.rs`                                                       |
+| Add a runtime operation | `crates/khive-runtime/src/operations.rs`                                                     |
+| Change DB schema        | `crates/khive-db/src/migrations.rs` (new version) + store DDL                                |
+| Add a new entity kind   | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                      |
+| Add a new edge relation | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                         |
+| Add a new note kind     | `crates/khive-pack-kg/src/vocab.rs` + ADR-019 amendment                                      |
 | Add a new pack          | New crate implementing `Pack` + `PackRuntime` ([ADR-025](docs/adr/ADR-025-pack-standard.md)) |
-| Fix a query parser bug  | `crates/khive-query/src/parsers/` + add regression test                     |
-| Fix a storage bug       | `crates/khive-db/src/stores/` + test                                        |
+| Fix a query parser bug  | `crates/khive-query/src/parsers/` + add regression test                                      |
+| Fix a storage bug       | `crates/khive-db/src/stores/` + test                                                         |
 
 ---
 

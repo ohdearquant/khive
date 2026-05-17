@@ -92,16 +92,16 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ## Crates
 
-| Crate            | Purpose                                               |
-| ---------------- | ----------------------------------------------------- |
-| `khive-types`    | Domain types, Pack trait, closed enums                 |
-| `khive-score`    | Deterministic i64 fixed-point scoring                 |
-| `khive-storage`  | Trait-only capability surface (zero implementations)  |
-| `khive-db`       | SQLite backend: sqlite-vec, FTS5, graph edges         |
-| `khive-query`    | SPARQL / GQL → SQL compiler                           |
-| `khive-runtime`  | Service API + VerbRegistry + PackRuntime trait         |
-| `khive-pack-kg`  | KG pack: vocabulary, verb handlers, kind validation   |
-| `khive-mcp`      | Stdio MCP binary — thin dispatch over VerbRegistry    |
+| Crate           | Purpose                                              |
+| --------------- | ---------------------------------------------------- |
+| `khive-types`   | Domain types, Pack trait, closed enums               |
+| `khive-score`   | Deterministic i64 fixed-point scoring                |
+| `khive-storage` | Trait-only capability surface (zero implementations) |
+| `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges        |
+| `khive-query`   | SPARQL / GQL → SQL compiler                          |
+| `khive-runtime` | Service API + VerbRegistry + PackRuntime trait       |
+| `khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation  |
+| `khive-mcp`     | Stdio MCP binary — thin dispatch over VerbRegistry   |
 
 Dependency direction: `types → score → storage → db → query → runtime → pack-kg → mcp`.
 Storage is trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without
