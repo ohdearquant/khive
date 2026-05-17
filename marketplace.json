@@ -1,0 +1,14 @@
+{
+  "name": "khive",
+  "owner": {
+    "name": "Ocean (HaiyangLi)",
+    "url": "https://github.com/ohdearquant"
+  },
+  "plugins": [
+    {
+      "name": "kg",
+      "source": "marketplace/kg",
+      "description": "Persistent knowledge graph for AI agents"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "kg",
+  "description": "Persistent knowledge graph for AI agents — typed entities, closed edge ontology, hybrid search, GQL queries.",
+  "version": "0.1.1",
+  "author": {
+    "name": "Ocean (HaiyangLi)",
+    "url": "https://github.com/ohdearquant"
+  },
+  "homepage": "https://github.com/ohdearquant/khive",
+  "repository": "https://github.com/ohdearquant/khive",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "kg": {
+      "type": "stdio",
+      "command": "khive-mcp",
+      "args": [],
+      "installHint": "cargo install khive-mcp"
+    }
+  },
+  "keywords": ["knowledge-graph", "research", "entities", "mcp"],
+  "categories": ["knowledge-management", "developer-tools"]
+}
