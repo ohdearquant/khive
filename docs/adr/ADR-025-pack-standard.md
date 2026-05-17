@@ -98,6 +98,23 @@ set. Any `create` or `update` call with an unregistered kind returns an error li
 values from all loaded packs. The merge is additive — packs can overlap (two packs declaring the
 same kind string is not an error; it is idempotent in the merged set).
 
+### Verb routing: name-based vs kind-discriminated
+
+Verbs fall into two categories:
+
+1. **Pack-specific verbs** — verbs unique to one pack (e.g. a hypothetical `reindex` or
+   `schedule`). Routed by verb name alone: the registry dispatches to the pack that declares it.
+
+2. **Shared CRUD verbs** — verbs like `create`, `list`, `search`, `get`, `update`, `delete` that
+   multiple packs handle. These require **kind-discriminated routing**: the registry inspects the
+   `kind` / `entity_kind` / `note_kind` parameter to determine which pack owns that vocabulary
+   entry, then dispatches to that pack.
+
+Kind-discriminated routing is implemented in step 5 (MCP rewrite). Until then, only one pack is
+loaded (the `kg` pack) and the distinction is moot — verb-name dispatch is sufficient for the
+single-pack case. The `VerbRegistry` already provides `all_note_kinds()` and `all_entity_kinds()`
+which are the building blocks for kind-discriminated dispatch.
+
 ### Wire types
 
 Entity and note kinds on the wire stay `String`. Validation is runtime, not compile-time. This is a
@@ -113,12 +130,13 @@ pack the endpoints belong to. Packs cannot add edge relations.
 
 ### Built-in pack
 
-| Pack | Note kinds                                          | Entity kinds                                     | Location                               |
-| ---- | --------------------------------------------------- | ------------------------------------------------ | -------------------------------------- |
-| kg   | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | khive-runtime (default, always loaded) |
+| Pack | Note kinds                                          | Entity kinds                                     | Location          |
+| ---- | --------------------------------------------------- | ------------------------------------------------ | ----------------- |
+| kg   | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | `khive-pack-kg`   |
 
-The `kg` pack is the only pack shipped in the OSS distribution. Extension packs are separate crates
-that implement the `Pack` trait and register with the runtime at init.
+The `kg` pack is the only pack shipped in the OSS distribution. It is registered into the
+`VerbRegistry` by the transport layer (step 5). Extension packs are separate crates that implement
+the `Pack` + `PackRuntime` traits and register alongside `kg` at init.
 
 ## Rationale
 
@@ -199,12 +217,13 @@ This ADR is implemented incrementally across multiple PRs:
 | 1. Pack trait + VerbDef in `khive-types`                                 | Declarative metadata (this PR) | done    |
 | 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | done    |
 | 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic     | done    |
-| 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | pending |
+| 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | done    |
 | 5. Rewrite `khive-mcp` to route through VerbRegistry                     | Single `request` tool surface  | pending |
 
-Until step 3 is complete, the runtime still enforces the fixed 6/5 kind enums from `khive-types`.
-The Pack trait exists as the declared interface; runtime vocabulary merging activates when the
-validation is moved from `khive-runtime` to individual pack handlers (step 3-4).
+Steps 1-4 establish the single-pack architecture: the `kg` pack is the only pack loaded, so
+verb-name dispatch is sufficient. Step 5 adds kind-discriminated routing to the MCP layer,
+enabling multi-pack deployment where shared CRUD verbs dispatch based on the kind parameter
+rather than just the verb name.
 
 ## References
 
