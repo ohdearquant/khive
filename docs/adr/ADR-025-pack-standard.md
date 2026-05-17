@@ -38,6 +38,11 @@ runtime.
 
 ```rust
 // crates/khive-types/src/pack.rs
+pub struct VerbDef {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
 pub trait Pack {
     /// Short identifier for this pack (e.g. "kg", "lambda", "leo").
     const NAME: &'static str;
@@ -52,6 +57,10 @@ pub trait Pack {
     ///
     /// Same validation semantics as note kinds.
     const ENTITY_KINDS: &'static [&'static str];
+
+    /// Verbs this pack handles. The runtime routes verb calls to the pack
+    /// that declares them.
+    const VERBS: &'static [VerbDef];
 }
 ```
 
@@ -169,6 +178,22 @@ binary, not loaded at runtime. Dynamic loading is a separate concern and is expl
 - Validation happens at the service boundary, not at the call site. Invalid kinds surface as
   runtime errors rather than compile errors. Acceptable: the pack set is not knowable at compile
   time.
+
+## Implementation Status
+
+This ADR is implemented incrementally across multiple PRs:
+
+| Step | Description | Status |
+| ---- | ----------- | ------ |
+| 1. Pack trait + VerbDef in `khive-types` | Declarative metadata (this PR) | done |
+| 2. PackRuntime trait + VerbRegistry in `khive-runtime` | Async dispatch layer | pending |
+| 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic | pending |
+| 4. `khive-pack-kg` crate with vocabulary and verb handlers | First concrete pack | pending |
+| 5. Rewrite `khive-mcp` to route through VerbRegistry | Single `request` tool surface | pending |
+
+Until step 3 is complete, the runtime still enforces the fixed 6/5 kind enums from `khive-types`.
+The Pack trait exists as the declared interface; runtime vocabulary merging activates when the
+validation is moved from `khive-runtime` to individual pack handlers (step 3-4).
 
 ## References
 
