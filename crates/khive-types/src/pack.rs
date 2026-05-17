@@ -22,7 +22,7 @@ pub struct VerbDef {
 ///
 /// Edge relations remain a closed enum (ADR-021) and are NOT pack-extensible.
 pub trait Pack {
-    /// Short identifier for this pack (e.g. "kg", "lambda", "leo").
+    /// Short identifier for this pack (e.g. "kg", "tasks").
     const NAME: &'static str;
 
     /// Note kinds this pack contributes to the runtime vocabulary.
