@@ -154,7 +154,12 @@ Until `supersede` lands, manually create a supersedes edge:
 link(source_id=new_note, target_id=old_note, relation="supersedes")
 ```
 
-`search(kind="note")` already excludes notes targeted by a `supersedes` edge.
+`search(kind="note")` already excludes notes targeted by a `supersedes` edge (implemented in
+`khive_runtime::operations::search_notes`, per ADR-024 §"Filter superseded notes" step 5). That
+exclusion is a **view-layer filter**: superseding **keeps** the old note and its edges and
+marks it superseded; it never deletes, copies, or transfers anything. "Show only current" is a
+query concern. See CLAUDE.md §"Data vs. view — the principle most violated here" before
+implementing any supersede / annotate / currency behavior.
 
 ---
 
