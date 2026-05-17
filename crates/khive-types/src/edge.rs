@@ -117,8 +117,18 @@ impl fmt::Display for EdgeRelation {
 }
 
 const EDGE_RELATION_VALID: &[&str] = &[
-    "contains", "part_of", "instance_of", "extends", "variant_of", "introduced_by",
-    "supersedes", "depends_on", "enables", "implements", "competes_with", "composed_with",
+    "contains",
+    "part_of",
+    "instance_of",
+    "extends",
+    "variant_of",
+    "introduced_by",
+    "supersedes",
+    "depends_on",
+    "enables",
+    "implements",
+    "competes_with",
+    "composed_with",
     "annotates",
 ];
 
@@ -152,7 +162,11 @@ impl FromStr for EdgeRelation {
             "competes_with" | "competeswith" => Ok(Self::CompetesWith),
             "composed_with" | "composedwith" => Ok(Self::ComposedWith),
             "annotates" => Ok(Self::Annotates),
-            _ => Err(crate::error::UnknownVariant::new("edge_relation", s, EDGE_RELATION_VALID)),
+            _ => Err(crate::error::UnknownVariant::new(
+                "edge_relation",
+                s,
+                EDGE_RELATION_VALID,
+            )),
         }
     }
 }

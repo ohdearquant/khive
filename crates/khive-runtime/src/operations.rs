@@ -47,8 +47,8 @@ impl KhiveRuntime {
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
         let ns = self.ns(namespace);
-        let entity_kind = EntityKind::from_str(kind)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let entity_kind =
+            EntityKind::from_str(kind).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
         let mut entity = Entity::new(ns, entity_kind, name);
         if let Some(d) = description {
             entity = entity.with_description(d);
@@ -118,7 +118,8 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<Entity>> {
         let filter = EntityFilter {
             kinds: match kind {
-                Some(k) => vec![EntityKind::from_str(k).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?],
+                Some(k) => vec![EntityKind::from_str(k)
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?],
                 None => vec![],
             },
             ..Default::default()
@@ -441,7 +442,9 @@ impl KhiveRuntime {
         limit: u32,
     ) -> RuntimeResult<Vec<Note>> {
         let note_kind = match kind {
-            Some(k) => Some(NoteKind::from_str(k).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?),
+            Some(k) => {
+                Some(NoteKind::from_str(k).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?)
+            }
             None => None,
         };
         let page = self
@@ -797,7 +800,8 @@ impl KhiveRuntime {
     ) -> RuntimeResult<u64> {
         let filter = EntityFilter {
             kinds: match kind {
-                Some(k) => vec![EntityKind::from_str(k).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?],
+                Some(k) => vec![EntityKind::from_str(k)
+                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?],
                 None => vec![],
             },
             ..Default::default()

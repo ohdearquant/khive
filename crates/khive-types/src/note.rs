@@ -56,7 +56,13 @@ impl fmt::Display for NoteKind {
     }
 }
 
-const NOTE_KIND_VALID: &[&str] = &["observation", "insight", "question", "decision", "reference"];
+const NOTE_KIND_VALID: &[&str] = &[
+    "observation",
+    "insight",
+    "question",
+    "decision",
+    "reference",
+];
 
 impl core::str::FromStr for NoteKind {
     type Err = crate::error::UnknownVariant;
@@ -68,7 +74,11 @@ impl core::str::FromStr for NoteKind {
             "question" | "q" => Ok(Self::Question),
             "decision" | "choice" => Ok(Self::Decision),
             "reference" | "ref" | "citation" => Ok(Self::Reference),
-            other => Err(crate::error::UnknownVariant::new("note_kind", other, NOTE_KIND_VALID)),
+            other => Err(crate::error::UnknownVariant::new(
+                "note_kind",
+                other,
+                NOTE_KIND_VALID,
+            )),
         }
     }
 }

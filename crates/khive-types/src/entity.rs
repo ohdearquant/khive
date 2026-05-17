@@ -79,7 +79,11 @@ impl FromStr for EntityKind {
             "project" | "repo" | "crate" | "library" | "lib" => Ok(Self::Project),
             "person" | "author" | "researcher" => Ok(Self::Person),
             "org" | "organization" | "organisation" | "lab" | "company" => Ok(Self::Org),
-            other => Err(crate::error::UnknownVariant::new("entity_kind", other, ENTITY_KIND_VALID)),
+            other => Err(crate::error::UnknownVariant::new(
+                "entity_kind",
+                other,
+                ENTITY_KIND_VALID,
+            )),
         }
     }
 }
