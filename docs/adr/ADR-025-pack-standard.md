@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-17\
-**Authors**: Ocean, lambda:khive
+**Authors**: Ocean
 
 ## Context
 
@@ -10,17 +10,16 @@ khive's closed taxonomies — 6 entity kinds (ADR-001), 5 note kinds (ADR-019), 
 (ADR-021) — serve the KG use case well. The closed sets prevent vocabulary drift and give agents
 unambiguous classification targets.
 
-However, the system needs to support multiple product tiers (Lambda, Leo) and marketplace plugins
-that introduce their own kinds. A Lambda-tier deployment needs `memory`, `task`, and `message` note
-kinds and an `actor` entity kind. A Leo-tier deployment needs `wave` note kinds and `device` /
-`location` entity kinds. These are not KG concerns — adding them to ADR-001/ADR-019 would pollute
-the KG taxonomy and break the classification invariants those ADRs establish.
+However, downstream deployments and third-party plugins may need additional kinds beyond the base
+KG set. For example, a task-management plugin might need `task` and `message` note kinds; a
+hardware-inventory plugin might need `device` entity kinds. These are not KG concerns — adding them
+to ADR-001/ADR-019 would pollute the KG taxonomy and break the classification invariants those ADRs
+establish.
 
 The current compile-time enums in `khive-types` prevent extension without forking:
 
 1. Any new kind requires an ADR amendment and a code change to the enum.
-2. There is no mechanism for a plugin or product tier to introduce kinds without modifying core
-   types.
+2. There is no mechanism for a plugin to introduce kinds without modifying core types.
 3. The closed-set discipline is the right approach for edge relations (graph semantics are universal)
    but is too rigid for note kinds and entity kinds, which are domain-classification concerns.
 
@@ -44,7 +43,7 @@ pub struct VerbDef {
 }
 
 pub trait Pack {
-    /// Short identifier for this pack (e.g. "kg", "lambda", "leo").
+    /// Short identifier for this pack (e.g. "kg", "tasks", "inventory").
     const NAME: &'static str;
 
     /// Note kinds this pack contributes to the runtime vocabulary.
@@ -67,19 +66,30 @@ pub trait Pack {
 Const associated items (`&'static str` and `&'static [&'static str]`) require no heap allocation
 and are compatible with `#![no_std]`.
 
-### PackRuntime supertrait
+### PackRuntime — object-safe dispatch trait
 
-A `PackRuntime` supertrait in `khive-runtime` extends `Pack` with behavior. It does NOT live in
-`khive-types` — behavior (tools, migrations, init) requires the full runtime context.
+A `PackRuntime` trait in `khive-runtime` provides async verb dispatch. It does NOT live in
+`khive-types` — behavior requires the full runtime context.
+
+`Pack` uses const associated items (`const NAME`, `const VERBS`, etc.) which are not object-safe
+in Rust — you cannot use `dyn Pack` or `Box<dyn Pack>`. Since the registry needs to store
+heterogeneous packs, `PackRuntime` mirrors the `Pack` metadata as methods and adds dispatch:
 
 ```rust
-// crates/khive-runtime/src/pack.rs  (not in khive-types)
-pub trait PackRuntime: Pack + Send + Sync {
-    fn tools(&self) -> &[ToolDescriptor];
-    fn migrations(&self) -> &[Migration];
-    async fn init(&self, ctx: &RuntimeContext) -> Result<()>;
+// crates/khive-runtime/src/pack.rs
+#[async_trait]
+pub trait PackRuntime: Send + Sync {
+    fn name(&self) -> &str;
+    fn note_kinds(&self) -> &'static [&'static str];
+    fn entity_kinds(&self) -> &'static [&'static str];
+    fn verbs(&self) -> &'static [VerbDef];
+    async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError>;
 }
 ```
+
+Implementors must also implement `Pack` on the same struct — the methods must return the same
+values as the corresponding consts. This is enforced by convention and tests, not the type system,
+because Rust's object safety rules prohibit const items in trait objects.
 
 ### Runtime vocabulary merging
 
@@ -91,34 +101,36 @@ same kind string is not an error; it is idempotent in the merged set).
 ### Wire types
 
 Entity and note kinds on the wire stay `String`. Validation is runtime, not compile-time. This is a
-deliberate relaxation from the compile-time enum approach used in the KG tier — the enum approach
-works when the closed set is fixed at compile time; it does not work when the valid set is determined
-by which packs are loaded.
+deliberate relaxation from the compile-time enum approach — the enum approach works when the closed
+set is fixed at compile time; it does not work when the valid set is determined by which packs are
+loaded.
 
 ### Edge relations stay closed
 
 `EdgeRelation` remains a closed enum (ADR-021). Edge relations define graph semantics — their
-meaning is universal across all packs. A `contains` edge means the same thing whether the pack is
-KG, Lambda, or Leo. Packs cannot add edge relations.
+meaning is universal across all packs. A `contains` edge means the same thing regardless of which
+pack the endpoints belong to. Packs cannot add edge relations.
 
-### Built-in packs
+### Built-in pack
 
-| Pack   | Note kinds                                          | Entity kinds                                     | Location                               |
-| ------ | --------------------------------------------------- | ------------------------------------------------ | -------------------------------------- |
-| kg     | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | khive-runtime (default, always loaded) |
-| lambda | memory, task, message                               | actor                                            | khive-cloud-pack-lambda                |
-| leo    | wave                                                | device, location                                 | khive-cloud-pack-leo                   |
+| Pack | Note kinds                                          | Entity kinds                                     | Location                               |
+| ---- | --------------------------------------------------- | ------------------------------------------------ | -------------------------------------- |
+| kg   | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | khive-runtime (default, always loaded) |
 
-The `kg` pack is the only pack shipped in `khive-runtime`. Lambda and Leo packs live in separate
-crates in the `khive-cloud-*` family and are not part of the OSS repo.
+The `kg` pack is the only pack shipped in the OSS distribution. Extension packs are separate crates
+that implement the `Pack` trait and register with the runtime at init.
 
 ## Rationale
 
-### Why const associated items instead of methods?
+### Why const associated items for `Pack` (in khive-types)?
 
-Methods would require vtable dispatch and heap allocation to collect from multiple packs. Const
-items are zero-cost and enable static initialization of the merged vocabulary table at startup.
-They also prevent accidental state: vocabulary is a static declaration, not a runtime computation.
+For the declarative metadata layer, methods would require vtable dispatch and heap allocation.
+Const items are zero-cost and enable static initialization. They also prevent accidental state:
+vocabulary is a static declaration, not a runtime computation.
+
+The runtime dispatch layer (`PackRuntime` in khive-runtime) intentionally uses object-safe methods
+because it needs heterogeneous storage (`Box<dyn PackRuntime>`). The `Pack` consts remain the
+source of truth; `PackRuntime` methods mirror them for object-safety.
 
 ### Why `&'static [&'static str]` instead of a vocabulary enum?
 
@@ -130,7 +142,7 @@ pack own its vocabulary without a shared discriminant type.
 
 Feature gates would require consumers to know which packs are loaded at compile time and rebuild
 when the pack set changes. Runtime composition is strictly more flexible — a single binary can
-serve the KG, Lambda, and Leo tiers with different pack sets per tenant.
+serve multiple pack configurations without recompilation.
 
 ### Why not "any string, no validation"?
 
@@ -148,21 +160,20 @@ binary, not loaded at runtime. Dynamic loading is a separate concern and is expl
 
 | Alternative                         | Pros                            | Cons                                                                      | Why rejected                                                  |
 | ----------------------------------- | ------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| Feature-gated enums                 | Compile-time exhaustiveness     | Requires rebuild per pack set; no runtime composition                     | Too inflexible for multi-tier deployment                      |
+| Feature-gated enums                 | Compile-time exhaustiveness     | Requires rebuild per pack set; no runtime composition                     | Too inflexible for multi-configuration deployment             |
 | No validation (any string accepted) | Zero friction for new kinds     | Vocabulary drift; agents can't discover valid kinds; inconsistent storage | Same failure mode ADR-001 and ADR-019 fixed                   |
-| Trait objects with dynamic dispatch | True runtime extensibility      | Heap allocation required; not no_std compatible                           | Const items are sufficient; reserve dyn for future if needed  |
+| Trait objects for `Pack` metadata   | True runtime extensibility      | Heap allocation required; not no_std compatible in types layer            | Rejected for types layer; accepted for runtime dispatch layer |
 | Dynamic library loading             | Truly separate plugin artifacts | Security surface; version skew; linking complexity                        | Deferred; compile-time composition covers all known use cases |
-| Single shared enum across all tiers | Compile-time exhaustiveness     | Pollutes KG taxonomy; breaks ADR-001/ADR-019 invariants                   | Mixing domain concerns breaks classification discipline       |
+| Single shared enum across all packs | Compile-time exhaustiveness     | Pollutes KG taxonomy; breaks ADR-001/ADR-019 invariants                   | Mixing domain concerns breaks classification discipline       |
 
 ## Consequences
 
 ### Positive
 
-- `khive-types` stays stable: the OSS public API surface does not change with each product tier
-  or marketplace plugin.
+- `khive-types` stays stable: the OSS public API surface does not change with each extension pack.
 - Packs are self-contained: a pack declares its vocabulary in one place, with no changes to any
   shared enum.
-- The same composition mechanism covers all tiers (KG, Lambda, Leo) and marketplace plugins.
+- The same composition mechanism covers all use cases (KG, task management, custom domains).
 - The `kg` pack is the default — the OSS runtime behavior is unchanged for users who load no
   additional packs.
 - `no_std` compatibility is preserved in `khive-types`.
@@ -186,7 +197,7 @@ This ADR is implemented incrementally across multiple PRs:
 | Step                                                                     | Description                    | Status  |
 | ------------------------------------------------------------------------ | ------------------------------ | ------- |
 | 1. Pack trait + VerbDef in `khive-types`                                 | Declarative metadata (this PR) | done    |
-| 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | pending |
+| 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | done    |
 | 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic     | pending |
 | 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | pending |
 | 5. Rewrite `khive-mcp` to route through VerbRegistry                     | Single `request` tool surface  | pending |
@@ -200,5 +211,3 @@ validation is moved from `khive-runtime` to individual pack handlers (step 3-4).
 - ADR-001: Entity Kind Taxonomy (6 KG entity kinds; `kg` pack encodes these)
 - ADR-019: Note Kind Taxonomy (5 KG note kinds; `kg` pack encodes these)
 - ADR-021: EdgeRelation Enum (edge relations stay a closed enum — Pack does not extend them)
-- khive-cloud ADR-009: Type Taxonomy Extension (the motivation for extending beyond 6/5 kinds for
-  Lambda and Leo tiers)
