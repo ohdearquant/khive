@@ -19,4 +19,7 @@ cargo check --workspace --no-default-features
 echo "=== Build (release) ==="
 cargo build --workspace --release
 
+echo "=== Contract Tests ==="
+python3 "$SCRIPT_DIR/../tests/contract_test.py"
+
 echo "=== CI Passed ==="

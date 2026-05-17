@@ -275,6 +275,34 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
         f"Expected prefix-not-found from ns-beta, got: {err_prefix!r}"
     )
 
+    # ---- link from ns-beta using ns-alpha entity UUID must fail ----
+    # The write path (link) must enforce namespace isolation, not just the read paths.
+    beta_entity = _tool(proc, "create", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "name": "BetaEntity",
+        "namespace": "ns-beta",
+    })
+    err_link = _expect_rpc_error(proc, "link", {
+        "source_id": beta_entity["id"],
+        "target_id": full_id,  # ns-alpha entity
+        "relation": "depends_on",
+        "namespace": "ns-beta",
+    })
+    assert "not found" in err_link.lower(), (
+        f"Cross-namespace link (beta→alpha) must fail with not-found, got: {err_link!r}"
+    )
+    # Reverse direction: ns-alpha source linked from ns-beta caller
+    err_link_rev = _expect_rpc_error(proc, "link", {
+        "source_id": full_id,  # ns-alpha entity
+        "target_id": beta_entity["id"],
+        "relation": "extends",
+        "namespace": "ns-beta",
+    })
+    assert "not found" in err_link_rev.lower(), (
+        f"Cross-namespace link (alpha→beta from beta caller) must fail, got: {err_link_rev!r}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Contract 2 — Short-UUID prefix resolution
@@ -537,17 +565,14 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
         "name": "StarSystem",
     })
     assert err_ek, "Expected non-empty error for invalid entity_kind"
-    # The error should mention at least some valid kinds so the agent can self-correct.
-    # The message may come from the runtime layer as "invalid input: ..." so we
-    # check the overall text (case-insensitive) for at least the unknown kind and
-    # evidence of valid values.
     assert "galaxy" in err_ek.lower() or "galaxy" in err_ek, (
         f"Error should name the offending kind 'galaxy': {err_ek!r}"
     )
-    valid_kind_mentioned = any(v in err_ek for v in ("concept", "document", "project", "dataset", "person", "org"))
-    assert valid_kind_mentioned, (
-        f"At least one valid entity_kind must be listed in error: {err_ek!r}"
-    )
+    # The full closed set must be listed so agents can self-correct.
+    for kind in ("concept", "document", "project", "dataset", "person", "org"):
+        assert kind in err_ek, (
+            f"Valid entity_kind '{kind}' missing from error message: {err_ek!r}"
+        )
 
     # ---- Invalid edge relation ----
     # Need two entities first
@@ -562,10 +587,13 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     assert "invented_by" in err_rel, (
         f"Error should name the offending relation 'invented_by': {err_rel!r}"
     )
-    valid_rel_mentioned = any(v in err_rel for v in ("extends", "variant_of", "annotates", "introduced_by"))
-    assert valid_rel_mentioned, (
-        f"At least one valid edge relation must be listed in error: {err_rel!r}"
-    )
+    # All 13 canonical relations must be listed.
+    for rel in ("contains", "part_of", "instance_of", "extends", "variant_of",
+                "introduced_by", "supersedes", "depends_on", "enables",
+                "implements", "competes_with", "composed_with", "annotates"):
+        assert rel in err_rel, (
+            f"Valid edge relation '{rel}' missing from error message: {err_rel!r}"
+        )
 
     # ---- Invalid note_kind ----
     err_nk = _expect_rpc_error(proc, "create", {
@@ -577,10 +605,11 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     assert "scribble" in err_nk, (
         f"Error should name the offending note_kind 'scribble': {err_nk!r}"
     )
-    valid_nk_mentioned = any(v in err_nk for v in ("observation", "insight", "decision", "question", "reference"))
-    assert valid_nk_mentioned, (
-        f"At least one valid note_kind must be listed in error: {err_nk!r}"
-    )
+    # All 5 note kinds must be listed.
+    for nk in ("observation", "insight", "decision", "question", "reference"):
+        assert nk in err_nk, (
+            f"Valid note_kind '{nk}' missing from error message: {err_nk!r}"
+        )
 
     # ---- Invalid top-level kind ----
     err_kind = _expect_rpc_error(proc, "create", {
@@ -591,10 +620,11 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     assert "blob" in err_kind, (
         f"Error should name the offending kind 'blob': {err_kind!r}"
     )
-    valid_top_mentioned = any(v in err_kind for v in ("entity", "note"))
-    assert valid_top_mentioned, (
-        f"Valid top-level kinds (entity, note) must appear in error: {err_kind!r}"
-    )
+    # Both valid top-level kinds must appear.
+    for tk in ("entity", "note"):
+        assert tk in err_kind, (
+            f"Valid top-level kind '{tk}' missing from error message: {err_kind!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -684,15 +714,20 @@ def test_merge_semantics(proc: subprocess.Popen) -> None:
 
     # ---- Self-loop (gone→kept, both become kept) must be dropped ----
     # The edge between kept and kept-as-from would be a self-loop and should be dropped.
-    # Verify that kept entity has no self-loop outbound edge (the only outbound edge from
-    # kept→itself via e_self_loop should have been dropped during merge).
-    kept_outbound = _tool(proc, "list", {
-        "kind": "edge",
-        "source_id": kept["id"],
-    })
-    self_loop_ids = [e["id"] for e in kept_outbound if e["source_id"] == e["target_id"]]
-    assert len(self_loop_ids) == 0, (
-        f"Self-loop edges should be dropped after merge, found: {self_loop_ids}"
+    # Assert via direct get that the specific edge is gone (not just absent from list).
+    err_self_loop = _expect_rpc_error(proc, "get", {"id": e_self_loop_id})
+    assert "not found" in err_self_loop.lower(), (
+        f"Self-loop edge should be deleted after merge, got: {err_self_loop!r}"
+    )
+
+    # Also verify no edges remain referencing the removed entity at all.
+    gone_outbound = _tool(proc, "list", {"kind": "edge", "source_id": gone["id"]})
+    assert gone_outbound == [], (
+        f"No edges should have source_id=gone after merge, got: {gone_outbound}"
+    )
+    gone_inbound = _tool(proc, "list", {"kind": "edge", "target_id": gone["id"]})
+    assert gone_inbound == [], (
+        f"No edges should have target_id=gone after merge, got: {gone_inbound}"
     )
 
 
