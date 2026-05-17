@@ -66,19 +66,30 @@ pub trait Pack {
 Const associated items (`&'static str` and `&'static [&'static str]`) require no heap allocation
 and are compatible with `#![no_std]`.
 
-### PackRuntime supertrait
+### PackRuntime — object-safe dispatch trait
 
-A `PackRuntime` supertrait in `khive-runtime` extends `Pack` with behavior. It does NOT live in
-`khive-types` — behavior (tools, migrations, init) requires the full runtime context.
+A `PackRuntime` trait in `khive-runtime` provides async verb dispatch. It does NOT live in
+`khive-types` — behavior requires the full runtime context.
+
+`Pack` uses const associated items (`const NAME`, `const VERBS`, etc.) which are not object-safe
+in Rust — you cannot use `dyn Pack` or `Box<dyn Pack>`. Since the registry needs to store
+heterogeneous packs, `PackRuntime` mirrors the `Pack` metadata as methods and adds dispatch:
 
 ```rust
-// crates/khive-runtime/src/pack.rs  (not in khive-types)
-pub trait PackRuntime: Pack + Send + Sync {
-    fn tools(&self) -> &[ToolDescriptor];
-    fn migrations(&self) -> &[Migration];
-    async fn init(&self, ctx: &RuntimeContext) -> Result<()>;
+// crates/khive-runtime/src/pack.rs
+#[async_trait]
+pub trait PackRuntime: Send + Sync {
+    fn name(&self) -> &str;
+    fn note_kinds(&self) -> &'static [&'static str];
+    fn entity_kinds(&self) -> &'static [&'static str];
+    fn verbs(&self) -> &'static [VerbDef];
+    async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError>;
 }
 ```
+
+Implementors must also implement `Pack` on the same struct — the methods must return the same
+values as the corresponding consts. This is enforced by convention and tests, not the type system,
+because Rust's object safety rules prohibit const items in trait objects.
 
 ### Runtime vocabulary merging
 
@@ -182,7 +193,7 @@ This ADR is implemented incrementally across multiple PRs:
 | Step                                                                     | Description                    | Status  |
 | ------------------------------------------------------------------------ | ------------------------------ | ------- |
 | 1. Pack trait + VerbDef in `khive-types`                                 | Declarative metadata (this PR) | done    |
-| 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | pending |
+| 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | done    |
 | 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic     | pending |
 | 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | pending |
 | 5. Rewrite `khive-mcp` to route through VerbRegistry                     | Single `request` tool surface  | pending |

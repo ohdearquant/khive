@@ -2,7 +2,7 @@
 //!
 //! A pack declares vocabulary (note kinds, entity kinds) and verbs. This is
 //! purely static metadata — no I/O, no async. Runtime dispatch lives in
-//! `khive-runtime` (PackRuntime trait, not yet implemented).
+//! `khive-runtime` (`PackRuntime` trait + `VerbRegistry`).
 //!
 //! This trait lives in khive-types (no_std, zero deps) so downstream crates
 //! can reference pack metadata without pulling in the full runtime.
