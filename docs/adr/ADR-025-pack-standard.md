@@ -124,9 +124,9 @@ pack the endpoints belong to. Packs cannot add edge relations.
 
 ### Built-in pack
 
-| Pack | Note kinds                                          | Entity kinds                                     | Location          |
-| ---- | --------------------------------------------------- | ------------------------------------------------ | ----------------- |
-| kg   | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | `khive-pack-kg`   |
+| Pack | Note kinds                                          | Entity kinds                                     | Location        |
+| ---- | --------------------------------------------------- | ------------------------------------------------ | --------------- |
+| kg   | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | `khive-pack-kg` |
 
 The `kg` pack is the only pack shipped in the OSS distribution. It is registered into the
 `VerbRegistry` by the transport layer (step 5). Extension packs are separate crates that implement
@@ -206,13 +206,13 @@ binary, not loaded at runtime. Dynamic loading is a separate concern and is expl
 
 This ADR is implemented incrementally across multiple PRs:
 
-| Step                                                                     | Description                    | Status  |
-| ------------------------------------------------------------------------ | ------------------------------ | ------- |
-| 1. Pack trait + VerbDef in `khive-types`                                 | Declarative metadata (this PR) | done    |
-| 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | done    |
-| 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic     | done    |
-| 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | done    |
-| 5. Rewrite `khive-mcp` to route through VerbRegistry                     | Registry-based dispatch         | done    |
+| Step                                                                     | Description                    | Status |
+| ------------------------------------------------------------------------ | ------------------------------ | ------ |
+| 1. Pack trait + VerbDef in `khive-types`                                 | Declarative metadata (this PR) | done   |
+| 2. PackRuntime trait + VerbRegistry in `khive-runtime`                   | Async dispatch layer           | done   |
+| 3. Strip fixed `EntityKind`/`NoteKind` validation from runtime and query | Make runtime pack-agnostic     | done   |
+| 4. `khive-pack-kg` crate with vocabulary and verb handlers               | First concrete pack            | done   |
+| 5. Rewrite `khive-mcp` to route through VerbRegistry                     | Registry-based dispatch        | done   |
 
 All steps complete. The MCP server is a thin translation layer: typed params → JSON Value →
 VerbRegistry dispatch → pretty-printed response. Business logic lives entirely in packs.

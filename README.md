@@ -35,7 +35,7 @@ No Neo4j. No SPARQL endpoint to deploy. SQLite on disk, MCP over stdio, `cargo t
 
 ## The three substrates
 
-Everything in khive is one of three things ([ADR-004](docs/adr/ADR-004-substrate-observables.md)):
+Everything in khive is one of three things:
 
 | Substrate  | What it is                             | Mutability            | Example                                              |
 | ---------- | -------------------------------------- | --------------------- | ---------------------------------------------------- |
@@ -49,7 +49,7 @@ Entities are _things_. Notes are _what you think about things_. Events are _what
 
 ## The MCP verb surface
 
-11 tools in v0.1, verb-shaped ([ADR-023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)):
+11 tools in v0.1, verb-shaped:
 
 ```
 CRUD:     create  get  list  update  delete  merge
@@ -69,14 +69,17 @@ No language SDK to learn.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  crates/khive-mcp    — Rust binary (stdio MCP server)        │
-│  The only binary you need. Embeds khive-runtime.              │
+│  khive-mcp       — Rust binary (stdio MCP server)            │
+│  Thin dispatch shell — routes verbs to packs via registry.   │
+└──────────────────────────────────────────────────────────────┘
+                            ↕ VerbRegistry dispatch
+┌──────────────────────────────────────────────────────────────┐
+│  khive-pack-kg   — KG vocabulary + 11 verb handlers          │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
-│  crates/             — Rust storage + query core              │
-│  khive-types, khive-score, khive-storage, khive-db,           │
-│  khive-query, khive-runtime                                    │
+│  khive-runtime, khive-query, khive-db, khive-storage,        │
+│  khive-score, khive-types                                    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -89,19 +92,20 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ## Crates
 
-| Crate           | Purpose                                                |
-| --------------- | ------------------------------------------------------ |
-| `khive-types`   | Domain types: Entity, Note, Event, Id128, closed enums |
-| `khive-score`   | Deterministic i64 fixed-point scoring                  |
-| `khive-storage` | Trait-only capability surface (zero implementations)   |
-| `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges          |
-| `khive-query`   | SPARQL / GQL → SQL compiler                            |
-| `khive-runtime` | Composable service API, retrieval pipeline, graph ops  |
-| `khive-mcp`     | Stdio MCP binary — the only Rust-facing user surface   |
+| Crate           | Purpose                                              |
+| --------------- | ---------------------------------------------------- |
+| `khive-types`   | Domain types, Pack trait, closed enums               |
+| `khive-score`   | Deterministic i64 fixed-point scoring                |
+| `khive-storage` | Trait-only capability surface (zero implementations) |
+| `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges        |
+| `khive-query`   | SPARQL / GQL → SQL compiler                          |
+| `khive-runtime` | Service API + VerbRegistry + PackRuntime trait       |
+| `khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation  |
+| `khive-mcp`     | Stdio MCP binary — thin dispatch over VerbRegistry   |
 
-Dependency direction: `types → score → storage → db → query → runtime → mcp`. Storage is
-trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without touching
-consumers.
+Dependency direction: `types → score → storage → db → query → runtime → pack-kg → mcp`.
+Storage is trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without
+touching consumers.
 
 ---
 
@@ -172,41 +176,21 @@ make ci  # Full CI: fmt, clippy, test, build
 
 ---
 
-## Design decisions (ADRs)
-
-khive's architecture is specified in 22 Architecture Decision Records. ADRs are the normative
-contract — code implements what they specify. Schema or interface changes require an ADR first.
-
-| ADR                                                        | Title                         | What it decides                            |
-| ---------------------------------------------------------- | ----------------------------- | ------------------------------------------ |
-| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)            | Entity Kind Taxonomy          | 6 closed entity kinds                      |
-| [002](docs/adr/ADR-002-edge-ontology.md)                   | Edge Ontology                 | 13 closed relations in 6 categories        |
-| [004](docs/adr/ADR-004-substrate-observables.md)           | Substrate Observables         | Note, Entity, Event — the three primitives |
-| [005](docs/adr/ADR-005-storage-capability-traits.md)       | Storage Capability Traits     | Trait-only crate, 6 capabilities           |
-| [019](docs/adr/ADR-019-note-kind-taxonomy.md)              | Note Kind Taxonomy            | 5 closed note kinds                        |
-| [021](docs/adr/ADR-021-edge-relation-enum.md)              | Edge Relation Enum            | Compiler-enforced relation set             |
-| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)   | Verb-Consolidated MCP         | 11 tools, UUID-resolving verbs             |
-| [024](docs/adr/ADR-024-note-search-and-cross-substrate.md) | Note Search + Cross-Substrate | Hybrid retrieval + `annotates` edges       |
-
-Full index: [docs/adr/README.md](docs/adr/README.md).
-
----
-
 ## Contributing
 
 - Feature branches + PRs. Never push directly to main.
 - `make ci` must pass (fmt, clippy, test, no-default-features check, release build).
 - Conventional commits: `feat(types): add NoteKind taxonomy`.
-- Schema/interface changes require an ADR — propose in the PR or as an issue.
+- Schema/interface changes need a design doc — propose in the PR or as an issue.
 - See [CLAUDE.md](CLAUDE.md) for the developer guide, [AGENTS.md](AGENTS.md) for agent usage.
 
 ---
 
 ## Status
 
-**v0.1.0 — published on [crates.io](https://crates.io/crates/khive-mcp).** The Rust core is
-complete: 7 crates, 11 MCP tools, hybrid search with local embeddings, GQL/SPARQL queries. Ready
-for use with Claude Code and any MCP-compatible agent.
+**v0.1.2 — published on [crates.io](https://crates.io/crates/khive-mcp).** 8 crates, 11 MCP tools,
+pack-based verb dispatch, hybrid search with local embeddings, GQL/SPARQL queries. Ready for use
+with Claude Code and any MCP-compatible agent.
 
 ## License
 

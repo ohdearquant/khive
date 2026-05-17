@@ -9,11 +9,11 @@ homepage.workspace = true
 description = "Composable Service API: entity/note CRUD, graph traversal, hybrid search, curation."
 
 [dependencies]
-khive-types = { version = "0.1.1", path = "../khive-types", features = ["serde"] }
-khive-storage = { version = "0.1.1", path = "../khive-storage" }
-khive-score = { version = "0.1.1", path = "../khive-score" }
-khive-db = { version = "0.1.1", path = "../khive-db", features = ["vectors"] }
-khive-query = { version = "0.1.1", path = "../khive-query" }
+khive-types = { version = "0.1.2", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.1.2", path = "../khive-storage" }
+khive-score = { version = "0.1.2", path = "../khive-score" }
+khive-db = { version = "0.1.2", path = "../khive-db", features = ["vectors"] }
+khive-query = { version = "0.1.2", path = "../khive-query" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
