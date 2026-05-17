@@ -234,8 +234,9 @@ entity nodes — one verb, one relation, one mechanism, two substrate kinds.
 5. **MCP `create` handler (note branch)**: the `note_kind: Option<String>` wire field is parsed
    through `NoteKind::from_str` at the boundary; invalid values return `invalid_params` with the 5
    valid kinds enumerated. Update tool description accordingly. ~20 LOC.
-6. **MCP `list` and `search` handlers (note branch)**: same — `note_kind: Option<String>` parsed and
-   validated.
+6. **MCP `list` handler (note branch)**: same — `note_kind: Option<String>` parsed and
+   validated. Note: `search(kind="note")` does not filter by note kind in v0.1 (ADR-023
+   defines only `kind`, `query`, `limit` for search).
 7. **Tests**: 1 unit test per kind (parse + display roundtrip + default), 1 integration test for the
    MCP error path with an unknown kind.
 
