@@ -1,16 +1,15 @@
 //! AST validation per ADR-008 §Validation Rules.
 //!
 //! `validate` normalises an AST in place and rejects queries that violate the
-//! closed taxonomies or attempt to subvert namespace scoping:
+//! closed edge ontology or attempt to subvert namespace scoping:
 //!
 //! 1. **Edge relations** must parse to one of the 13 canonical [`EdgeRelation`]
 //!    variants (ADR-002). Aliases and case differences are normalised to the
 //!    canonical snake_case form stored in the database. Applies to edge
 //!    patterns *and* `WHERE e.relation = '…'` constraints.
-//! 2. **Node kinds** must parse to one of the 6 [`EntityKind`] variants
-//!    (ADR-001). Common aliases (`paper` → `document`, `benchmark` → `dataset`)
-//!    are normalised. Applies to node labels *and* `WHERE a.kind = '…'`
-//!    constraints.
+//! 2. **Node kinds** pass through unchanged — the query layer is pack-agnostic
+//!    (ADR-025). Kind validation is the responsibility of the service boundary,
+//!    not the query compiler.
 //! 3. **Namespace scoping is a trusted parameter only.** Queries must not name
 //!    `namespace` in node property maps or `WHERE` conditions — the only valid
 //!    source of namespace filtering is `CompileOptions::scopes`. This matches

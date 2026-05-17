@@ -320,9 +320,13 @@ Examples:
         match p.kind.as_str() {
             "entity" => {
                 let limit = p.limit.unwrap_or(50).min(500);
+                let kind_filter = match p.entity_kind.as_deref() {
+                    None | Some("") => None,
+                    Some(s) => Some(Self::validate_entity_kind(s)?),
+                };
                 let entities = self
                     .runtime
-                    .list_entities(p.namespace.as_deref(), p.entity_kind.as_deref(), limit)
+                    .list_entities(p.namespace.as_deref(), kind_filter, limit)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Self::to_json(&entities)
