@@ -29,6 +29,7 @@ CRATES=(
     khive-db
     khive-query
     khive-runtime
+    khive-pack-kg
     khive-mcp
 )
 
