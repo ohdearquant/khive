@@ -46,7 +46,7 @@ pub struct KgArchive {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExportedEntity {
     pub id: Uuid,
-    /// EntityKind serialized as snake_case string (e.g. `"concept"`, `"person"`).
+    /// Pack-owned kind string (e.g. `"concept"`, `"person"`).
     pub kind: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]

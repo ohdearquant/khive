@@ -31,9 +31,8 @@ pub const MAX_DEPTH: usize = 10;
 
 /// Validate and normalise an AST in place.
 ///
-/// On success, every kind / relation string in the AST is replaced with its
-/// canonical lowercase form so the compiler can emit literal SQL parameters
-/// that match the values written by `khive-db`.
+/// Canonicalizes edge relation strings to their snake_case form (closed set).
+/// Node kind strings pass through unchanged (pack-agnostic).
 pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
     // Pattern variables are bindings — the same variable name appearing twice
     // would mean "same node/edge" and require alias-equality predicates in

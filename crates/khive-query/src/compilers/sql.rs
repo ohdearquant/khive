@@ -42,7 +42,7 @@ pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery,
         return Err(QueryError::Compile("empty pattern".into()));
     }
 
-    // Validate + normalise into canonical taxonomies before emitting SQL.
+    // Validate edge relations + structural rules before emitting SQL.
     let mut query = query.clone();
     validate(&mut query)?;
 
