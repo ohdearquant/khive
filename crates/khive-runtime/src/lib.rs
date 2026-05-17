@@ -35,7 +35,7 @@ pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::{PathNode, TraversalOptions};
 pub use khive_storage::NoteKind;
-pub use pack::{PackRuntime, VerbRegistry};
+pub use pack::{PackRuntime, VerbRegistry, VerbRegistryBuilder};
 pub use portability::{ImportSummary, KgArchive};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{KhiveRuntime, RuntimeConfig};

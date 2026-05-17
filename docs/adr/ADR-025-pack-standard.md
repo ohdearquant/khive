@@ -122,11 +122,15 @@ that implement the `Pack` trait and register with the runtime at init.
 
 ## Rationale
 
-### Why const associated items instead of methods?
+### Why const associated items for `Pack` (in khive-types)?
 
-Methods would require vtable dispatch and heap allocation to collect from multiple packs. Const
-items are zero-cost and enable static initialization of the merged vocabulary table at startup.
-They also prevent accidental state: vocabulary is a static declaration, not a runtime computation.
+For the declarative metadata layer, methods would require vtable dispatch and heap allocation.
+Const items are zero-cost and enable static initialization. They also prevent accidental state:
+vocabulary is a static declaration, not a runtime computation.
+
+The runtime dispatch layer (`PackRuntime` in khive-runtime) intentionally uses object-safe methods
+because it needs heterogeneous storage (`Box<dyn PackRuntime>`). The `Pack` consts remain the
+source of truth; `PackRuntime` methods mirror them for object-safety.
 
 ### Why `&'static [&'static str]` instead of a vocabulary enum?
 
@@ -158,7 +162,7 @@ binary, not loaded at runtime. Dynamic loading is a separate concern and is expl
 | ----------------------------------- | ------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------- |
 | Feature-gated enums                 | Compile-time exhaustiveness     | Requires rebuild per pack set; no runtime composition                     | Too inflexible for multi-configuration deployment             |
 | No validation (any string accepted) | Zero friction for new kinds     | Vocabulary drift; agents can't discover valid kinds; inconsistent storage | Same failure mode ADR-001 and ADR-019 fixed                   |
-| Trait objects with dynamic dispatch | True runtime extensibility      | Heap allocation required; not no_std compatible                           | Const items are sufficient; reserve dyn for future if needed  |
+| Trait objects for `Pack` metadata   | True runtime extensibility      | Heap allocation required; not no_std compatible in types layer            | Rejected for types layer; accepted for runtime dispatch layer |
 | Dynamic library loading             | Truly separate plugin artifacts | Security surface; version skew; linking complexity                        | Deferred; compile-time composition covers all known use cases |
 | Single shared enum across all packs | Compile-time exhaustiveness     | Pollutes KG taxonomy; breaks ADR-001/ADR-019 invariants                   | Mixing domain concerns breaks classification discipline       |
 

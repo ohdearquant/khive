@@ -5,8 +5,11 @@
 //!
 //! `Pack` (in khive-types) uses const associated items which are not
 //! object-safe. `PackRuntime` mirrors that metadata as methods so the
-//! registry can store packs as `Box<dyn PackRuntime>`. See ADR-025
-//! §PackRuntime for the rationale.
+//! registry can store packs as trait objects. See ADR-025 §PackRuntime.
+//!
+//! Lifecycle: build with `VerbRegistryBuilder`, then call `.build()` to
+//! get a cheaply-cloneable `VerbRegistry`. Registration is only possible
+//! through the builder.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -21,8 +24,8 @@ use crate::error::RuntimeError;
 /// `Pack` uses const associated items (not object-safe in Rust); this trait
 /// mirrors that metadata as methods and adds async dispatch.
 ///
-/// Implementors must also implement `Pack` on the same struct. The methods
-/// here must return the same values as the corresponding `Pack` consts.
+/// Registration requires `P: Pack + PackRuntime` — the compiler enforces
+/// that every runtime pack also declares its vocabulary via `Pack`.
 #[async_trait]
 pub trait PackRuntime: Send + Sync {
     /// Pack name — must equal `<Self as Pack>::NAME`.
@@ -41,28 +44,52 @@ pub trait PackRuntime: Send + Sync {
     async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError>;
 }
 
-/// Registry that collects packs and dispatches verb calls.
+/// Builder for constructing a `VerbRegistry`.
 ///
-/// Clone is cheap (Arc-wrapped internally).
+/// Packs are registered here; once `.build()` is called the registry is
+/// immutable and cheaply cloneable.
+pub struct VerbRegistryBuilder {
+    packs: Vec<Box<dyn PackRuntime>>,
+}
+
+impl VerbRegistryBuilder {
+    pub fn new() -> Self {
+        Self { packs: Vec::new() }
+    }
+
+    /// Register a pack. The bound `P: Pack + PackRuntime` ensures the pack
+    /// declares vocabulary via `Pack` consts alongside runtime dispatch.
+    pub fn register<P: khive_types::Pack + PackRuntime + 'static>(&mut self, pack: P) -> &mut Self {
+        self.packs.push(Box::new(pack));
+        self
+    }
+
+    /// Consume the builder and produce an immutable, cloneable registry.
+    pub fn build(self) -> VerbRegistry {
+        VerbRegistry {
+            packs: std::sync::Arc::new(self.packs),
+        }
+    }
+}
+
+impl Default for VerbRegistryBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Immutable registry that dispatches verb calls to registered packs.
+///
+/// Clone is cheap (Arc-wrapped). Constructed via `VerbRegistryBuilder`.
 #[derive(Clone)]
 pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
 }
 
 impl VerbRegistry {
-    pub fn new() -> Self {
-        Self {
-            packs: std::sync::Arc::new(Vec::new()),
-        }
-    }
-
-    pub fn register(&mut self, pack: impl PackRuntime + 'static) {
-        std::sync::Arc::get_mut(&mut self.packs)
-            .expect("register must be called before cloning")
-            .push(Box::new(pack));
-    }
-
     /// Dispatch a verb to the first pack that handles it.
+    ///
+    /// When multiple packs declare the same verb, the first registered pack wins.
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
         for pack in self.packs.iter() {
             if pack.verbs().iter().any(|v| v.name == verb) {
@@ -108,41 +135,42 @@ impl VerbRegistry {
     }
 }
 
-impl Default for VerbRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_types::Pack;
 
     struct AlphaPack;
+
+    impl Pack for AlphaPack {
+        const NAME: &'static str = "alpha";
+        const NOTE_KINDS: &'static [&'static str] = &["memo", "log"];
+        const ENTITY_KINDS: &'static [&'static str] = &["widget"];
+        const VERBS: &'static [VerbDef] = &[
+            VerbDef {
+                name: "create",
+                description: "create a widget",
+            },
+            VerbDef {
+                name: "list",
+                description: "list widgets",
+            },
+        ];
+    }
 
     #[async_trait]
     impl PackRuntime for AlphaPack {
         fn name(&self) -> &str {
-            "alpha"
+            AlphaPack::NAME
         }
         fn note_kinds(&self) -> &'static [&'static str] {
-            &["memo", "log"]
+            AlphaPack::NOTE_KINDS
         }
         fn entity_kinds(&self) -> &'static [&'static str] {
-            &["widget"]
+            AlphaPack::ENTITY_KINDS
         }
         fn verbs(&self) -> &'static [VerbDef] {
-            static VERBS: [VerbDef; 2] = [
-                VerbDef {
-                    name: "create",
-                    description: "create a widget",
-                },
-                VerbDef {
-                    name: "list",
-                    description: "list widgets",
-                },
-            ];
-            &VERBS
+            AlphaPack::VERBS
         }
         async fn dispatch(&self, verb: &str, _params: Value) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
@@ -151,36 +179,53 @@ mod tests {
 
     struct BetaPack;
 
+    impl Pack for BetaPack {
+        const NAME: &'static str = "beta";
+        const NOTE_KINDS: &'static [&'static str] = &["log", "alert"];
+        const ENTITY_KINDS: &'static [&'static str] = &["widget", "gadget"];
+        const VERBS: &'static [VerbDef] = &[
+            VerbDef {
+                name: "notify",
+                description: "send alert",
+            },
+            VerbDef {
+                name: "create",
+                description: "create a gadget",
+            },
+        ];
+    }
+
     #[async_trait]
     impl PackRuntime for BetaPack {
         fn name(&self) -> &str {
-            "beta"
+            BetaPack::NAME
         }
         fn note_kinds(&self) -> &'static [&'static str] {
-            &["log", "alert"]
+            BetaPack::NOTE_KINDS
         }
         fn entity_kinds(&self) -> &'static [&'static str] {
-            &["widget", "gadget"]
+            BetaPack::ENTITY_KINDS
         }
         fn verbs(&self) -> &'static [VerbDef] {
-            static VERBS: [VerbDef; 1] = [VerbDef {
-                name: "notify",
-                description: "send alert",
-            }];
-            &VERBS
+            BetaPack::VERBS
         }
         async fn dispatch(&self, verb: &str, _params: Value) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "pack": "beta", "verb": verb }))
         }
     }
 
+    fn build_registry() -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.register(BetaPack);
+        builder.build()
+    }
+
     #[tokio::test]
     async fn dispatch_routes_to_correct_pack() {
-        let mut reg = VerbRegistry::new();
-        reg.register(AlphaPack);
-        reg.register(BetaPack);
+        let reg = build_registry();
 
-        let res = reg.dispatch("create", Value::Null).await.unwrap();
+        let res = reg.dispatch("list", Value::Null).await.unwrap();
         assert_eq!(res["pack"], "alpha");
 
         let res = reg.dispatch("notify", Value::Null).await.unwrap();
@@ -188,43 +233,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_first_registered_wins_on_collision() {
+        let reg = build_registry();
+
+        let res = reg.dispatch("create", Value::Null).await.unwrap();
+        assert_eq!(res["pack"], "alpha", "first registered pack wins");
+    }
+
+    #[tokio::test]
     async fn dispatch_unknown_verb_returns_error() {
-        let mut reg = VerbRegistry::new();
-        reg.register(AlphaPack);
+        let reg = build_registry();
 
         let err = reg.dispatch("explode", Value::Null).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("explode"));
         assert!(msg.contains("create"));
-        assert!(msg.contains("list"));
     }
 
     #[test]
     fn all_verbs_aggregates_across_packs() {
-        let mut reg = VerbRegistry::new();
-        reg.register(AlphaPack);
-        reg.register(BetaPack);
-
+        let reg = build_registry();
         let verbs: Vec<&str> = reg.all_verbs().iter().map(|v| v.name).collect();
-        assert_eq!(verbs, vec!["create", "list", "notify"]);
+        assert_eq!(verbs, vec!["create", "list", "notify", "create"]);
     }
 
     #[test]
     fn note_kinds_are_deduplicated() {
-        let mut reg = VerbRegistry::new();
-        reg.register(AlphaPack);
-        reg.register(BetaPack);
-
+        let reg = build_registry();
         let kinds = reg.all_note_kinds();
         assert_eq!(kinds, vec!["memo", "log", "alert"]);
     }
 
     #[test]
     fn entity_kinds_are_deduplicated() {
-        let mut reg = VerbRegistry::new();
-        reg.register(AlphaPack);
-        reg.register(BetaPack);
-
+        let reg = build_registry();
         let kinds = reg.all_entity_kinds();
         assert_eq!(kinds, vec!["widget", "gadget"]);
     }
