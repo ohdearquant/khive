@@ -24,13 +24,19 @@ schema, change how you model it, not the schema. Schema changes require an ADR.
 Data is **history-preserving**: it records what happened and marks state. The query/view layer
 decides **what is shown**. Different layers — never conflate them.
 
-"Don't show outdated / invalid / superseded info" is **always a view problem — never a reason to
-delete, mutate, copy, or transfer data.** If you want removal, the verb is `delete`. `supersedes`
-means *precisely*: keep the old record, mark it superseded; what a query returns is a separate
-view-layer decision (filter superseded — do **not** rewrite or transfer its edges).
+"Don't show stale / superseded / non-current info" is **always a view problem — never a reason
+to delete, mutate, copy, or transfer data to "fix" what a query returns.** That's the currency
+rule.
 
-**Tell:** if you are mutating / copying / transferring stored relationships to make a *query
-result* look right, stop — wrong layer.
+(Distinct from correctness. If a stored record is actually _wrong_, use the curation verbs —
+`update` / `delete` / `merge` per [ADR-014](docs/adr/ADR-014-curation-operations.md). Curation
+modifies data deliberately; the view-layer rule doesn't apply to deliberate correction.)
+
+`supersedes` means _precisely_: keep the old record, mark it superseded; what a query returns is
+a separate view-layer decision (filter superseded — do **not** rewrite or transfer its edges).
+
+**Tell:** if you are mutating / copying / transferring stored relationships to make a _query
+result_ look right, stop — wrong layer.
 
 Corollary: the rule for any typed relation lives in its ADR (and consumer ADRs). If your intended
 behavior isn't written there, it is an unspecified design decision → escalate, do not invent.
