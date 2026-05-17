@@ -148,6 +148,24 @@ search(kind="entity", query="parameter efficient fine-tuning")
 link(source_id="<lora-uuid>", target_id="<qlora-uuid>", relation="variant_of")
 ```
 
+### Claude Code plugin (skills + agent)
+
+For guided research workflows, install the marketplace plugin:
+
+```
+/plugin marketplace add ohdearquant/khive
+/plugin install kg
+```
+
+This adds 4 workflow skills and a researcher agent:
+
+| Skill         | What it does                                                    |
+| ------------- | --------------------------------------------------------------- |
+| `/kg:digest`  | Ingest material into the graph — extract entities, link, verify |
+| `/kg:explore` | Discover what the graph knows — traverse, narrate, surface gaps |
+| `/kg:connect` | Wire a new concept into existing knowledge — find relations     |
+| `/kg:polish`  | Audit and fix — orphans, low-degree nodes, duplicates           |
+
 ### Configuration options
 
 ```bash
