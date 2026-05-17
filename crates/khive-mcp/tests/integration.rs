@@ -695,8 +695,6 @@ async fn note_create_with_canonical_kind() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn note_create_with_alias_obs() -> anyhow::Result<()> {
-    // Pack-agnostic: the runtime/mcp layer accepts any string for note_kind.
-    // "obs" passes through as-is — alias normalization is a pack-handler concern.
     let client = connect().await?;
     let result = call(
         &client,
@@ -706,31 +704,41 @@ async fn note_create_with_alias_obs() -> anyhow::Result<()> {
     .await?;
     assert!(
         !result.is_error.unwrap_or(false),
-        "pack-agnostic runtime must accept any string for note_kind"
+        "obs alias must be accepted and canonicalized"
     );
     let note: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
-    // kind passes through unchanged — pack handlers do normalization, not the runtime/mcp layer
-    assert_eq!(note["kind"], "obs");
+    assert_eq!(
+        note["kind"], "observation",
+        "obs alias canonicalizes to observation"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn note_create_unknown_kind_passes_through() -> anyhow::Result<()> {
-    // Pack-agnostic: the mcp/runtime layer no longer validates note_kind.
-    // Any string is accepted. Pack handlers do kind validation at a higher layer.
+async fn note_create_unknown_kind_returns_error() -> anyhow::Result<()> {
     let client = connect().await?;
-    let result = call(
-        &client,
-        "create",
-        json!({"kind": "note", "note_kind": "garbage", "content": "pack-agnostic test"}),
-    )
-    .await?;
-    assert!(
-        !result.is_error.unwrap_or(false),
-        "pack-agnostic runtime must accept any string for note_kind (got error)"
+    let params = CallToolRequestParams::new("create").with_arguments(
+        json!({"kind": "note", "note_kind": "garbage", "content": "should be rejected"})
+            .as_object()
+            .unwrap()
+            .clone(),
     );
-    let note: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
-    assert_eq!(note["kind"], "garbage");
+    let result = client.call_tool(params).await;
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("observation"),
+                "error should list valid kinds: {msg}"
+            );
+        }
+        Ok(r) => {
+            assert!(
+                r.is_error.unwrap_or(false),
+                "unknown note_kind must be rejected at the MCP boundary"
+            );
+        }
+    }
     Ok(())
 }
 
