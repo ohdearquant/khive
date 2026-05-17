@@ -6,7 +6,6 @@
 
 use std::str::FromStr;
 
-use khive_runtime::NoteKind;
 use khive_storage::EdgeRelation;
 
 use rmcp::{
@@ -114,6 +113,43 @@ impl KhiveMcpServer {
             other => McpError::internal_error(other.to_string(), None),
         }
     }
+
+    /// Validate and canonicalize an entity kind at the MCP boundary.
+    /// Accepts canonical names and common aliases; returns the canonical form.
+    fn validate_entity_kind(raw: &str) -> Result<&'static str, McpError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "concept" => Ok("concept"),
+            "document" | "doc" | "paper" => Ok("document"),
+            "dataset" | "data" | "benchmark" => Ok("dataset"),
+            "project" | "repo" | "crate" | "library" | "lib" => Ok("project"),
+            "person" | "author" | "researcher" => Ok("person"),
+            "org" | "organization" | "organisation" | "lab" | "company" => Ok("org"),
+            _ => Err(McpError::invalid_params(
+                format!(
+                    "invalid entity_kind {raw:?}. Valid: concept | document | dataset | project | person | org"
+                ),
+                None,
+            )),
+        }
+    }
+
+    /// Validate and canonicalize a note kind at the MCP boundary.
+    /// Accepts canonical names and common aliases; returns the canonical form.
+    fn validate_note_kind(raw: &str) -> Result<&'static str, McpError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "observation" | "obs" => Ok("observation"),
+            "insight" | "finding" => Ok("insight"),
+            "question" | "q" => Ok("question"),
+            "decision" | "choice" => Ok("decision"),
+            "reference" | "ref" | "citation" => Ok("reference"),
+            _ => Err(McpError::invalid_params(
+                format!(
+                    "invalid note_kind {raw:?}. Valid: observation | insight | question | decision | reference (aliases: obs, finding, q, choice, ref, citation)"
+                ),
+                None,
+            )),
+        }
+    }
 }
 
 // ---- Tool implementations ----
@@ -153,18 +189,19 @@ Examples:
                 let name = p
                     .name
                     .ok_or_else(|| McpError::invalid_params("kind=entity requires 'name'", None))?;
-                let entity_kind = p.entity_kind.ok_or_else(|| {
+                let raw_kind = p.entity_kind.ok_or_else(|| {
                     McpError::invalid_params(
                         "kind=entity requires 'entity_kind' (concept | document | dataset | project | person | org)",
                         None,
                     )
                 })?;
+                let entity_kind = Self::validate_entity_kind(&raw_kind)?;
                 let tags = p.tags.unwrap_or_default();
                 let entity = self
                     .runtime
                     .create_entity(
                         p.namespace.as_deref(),
-                        &entity_kind,
+                        entity_kind,
                         &name,
                         p.description.as_deref(),
                         p.properties,
@@ -179,15 +216,8 @@ Examples:
                     McpError::invalid_params("kind=note requires 'content'", None)
                 })?;
                 let kind = match p.note_kind.as_deref() {
-                    None | Some("") => NoteKind::Observation,
-                    Some(s) => NoteKind::from_str(s).map_err(|_| {
-                        McpError::invalid_params(
-                            format!(
-                                "invalid note_kind {s:?}. Valid: observation | insight | question | decision | reference (aliases: obs, finding, q, choice, ref, citation)"
-                            ),
-                            None,
-                        )
-                    })?,
+                    None | Some("") => "observation",
+                    Some(s) => Self::validate_note_kind(s)?,
                 };
                 let salience = p.salience.unwrap_or(0.5);
                 let mut annotates = Vec::new();
@@ -290,9 +320,13 @@ Examples:
         match p.kind.as_str() {
             "entity" => {
                 let limit = p.limit.unwrap_or(50).min(500);
+                let kind_filter = match p.entity_kind.as_deref() {
+                    None | Some("") => None,
+                    Some(s) => Some(Self::validate_entity_kind(s)?),
+                };
                 let entities = self
                     .runtime
-                    .list_entities(p.namespace.as_deref(), p.entity_kind.as_deref(), limit)
+                    .list_entities(p.namespace.as_deref(), kind_filter, limit)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Self::to_json(&entities)
@@ -330,22 +364,12 @@ Examples:
             "note" => {
                 let kind_str = match p.note_kind.as_deref() {
                     None | Some("") => None,
-                    Some(s) => {
-                        let k = NoteKind::from_str(s).map_err(|_| {
-                            McpError::invalid_params(
-                                format!(
-                                    "invalid note_kind {s:?}. Valid: observation | insight | question | decision | reference"
-                                ),
-                                None,
-                            )
-                        })?;
-                        Some(k.to_string())
-                    }
+                    Some(s) => Some(Self::validate_note_kind(s)?),
                 };
                 let limit = p.limit.unwrap_or(20).min(200);
                 let notes = self
                     .runtime
-                    .list_notes(p.namespace.as_deref(), kind_str.as_deref(), limit)
+                    .list_notes(p.namespace.as_deref(), kind_str, limit)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Self::to_json(&notes)

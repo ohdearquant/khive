@@ -6,14 +6,14 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use khive_score::{rrf_score, DeterministicScore};
-use khive_storage::note::{Note, NoteKind};
+use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery,
     PageRequest, SortOrder, SqlStatement, TextDocument, TextFilter, TextQueryMode,
     TextSearchRequest, TraversalRequest, VectorSearchRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event};
-use khive_types::{EntityKind, SubstrateKind};
+use khive_types::SubstrateKind;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::KhiveRuntime;
@@ -47,9 +47,7 @@ impl KhiveRuntime {
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
         let ns = self.ns(namespace);
-        let entity_kind =
-            EntityKind::from_str(kind).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        let mut entity = Entity::new(ns, entity_kind, name);
+        let mut entity = Entity::new(ns, kind, name);
         if let Some(d) = description {
             entity = entity.with_description(d);
         }
@@ -118,8 +116,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<Entity>> {
         let filter = EntityFilter {
             kinds: match kind {
-                Some(k) => vec![EntityKind::from_str(k)
-                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?],
+                Some(k) => vec![k.to_string()],
                 None => vec![],
             },
             ..Default::default()
@@ -371,7 +368,7 @@ impl KhiveRuntime {
     pub async fn create_note(
         &self,
         namespace: Option<&str>,
-        kind: NoteKind,
+        kind: &str,
         name: Option<&str>,
         content: &str,
         salience: f64,
@@ -441,19 +438,9 @@ impl KhiveRuntime {
         kind: Option<&str>,
         limit: u32,
     ) -> RuntimeResult<Vec<Note>> {
-        let note_kind = match kind {
-            Some(k) => {
-                Some(NoteKind::from_str(k).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?)
-            }
-            None => None,
-        };
         let page = self
             .notes(namespace)?
-            .query_notes(
-                self.ns(namespace),
-                note_kind,
-                PageRequest { offset: 0, limit },
-            )
+            .query_notes(self.ns(namespace), kind, PageRequest { offset: 0, limit })
             .await?;
         Ok(page.items)
     }
@@ -800,8 +787,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<u64> {
         let filter = EntityFilter {
             kinds: match kind {
-                Some(k) => vec![EntityKind::from_str(k)
-                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?],
+                Some(k) => vec![k.to_string()],
                 None => vec![],
             },
             ..Default::default()
@@ -965,15 +951,7 @@ mod tests {
     async fn update_edge_annotates_note_to_entity_set_supersedes_returns_invalid_input() {
         let rt = rt();
         let note = rt
-            .create_note(
-                None,
-                khive_storage::NoteKind::Observation,
-                None,
-                "a note",
-                0.5,
-                None,
-                vec![],
-            )
+            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
             .await
             .unwrap();
         let entity = rt
@@ -1307,7 +1285,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "FlashAttention reduces memory by using tiling",
                 0.8,
@@ -1348,7 +1326,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Insight,
+                "insight",
                 None,
                 "FlashAttention is IO-aware",
                 0.9,
@@ -1372,7 +1350,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "FlashAttention uses SRAM tiling for memory efficiency",
                 0.9,
@@ -1485,7 +1463,7 @@ mod tests {
         let rt = rt();
         rt.create_note(
             None,
-            khive_storage::NoteKind::Observation,
+            "observation",
             None,
             "GQA reduces KV cache memory for large models",
             0.8,
@@ -1509,7 +1487,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "RoPE positional encoding rotary embeddings",
                 0.7,
@@ -1558,7 +1536,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "LoRA fine-tunes LLMs with low-rank adapters",
                 0.85,
@@ -1613,16 +1591,15 @@ mod tests {
     #[tokio::test]
     async fn resolve_prefix_ambiguous_same_namespace() {
         use khive_storage::entity::Entity;
-        use khive_types::EntityKind;
 
         let rt = rt();
         // Two entities with UUIDs sharing the same 8-char prefix "aabbccdd".
         let id_a = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000001").unwrap();
         let id_b = Uuid::parse_str("aabbccdd-2222-4000-8000-000000000002").unwrap();
 
-        let mut entity_a = Entity::new("local", EntityKind::Concept, "AmbigA");
+        let mut entity_a = Entity::new("local", "concept", "AmbigA");
         entity_a.id = id_a;
-        let mut entity_b = Entity::new("local", EntityKind::Concept, "AmbigB");
+        let mut entity_b = Entity::new("local", "concept", "AmbigB");
         entity_b.id = id_b;
 
         let store = rt.entities(None).unwrap();
@@ -1713,7 +1690,7 @@ mod tests {
         let result = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "some content",
                 0.5,
@@ -1738,7 +1715,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "content",
                 0.5,
@@ -1825,15 +1802,7 @@ mod tests {
 
         // Create a note and annotate the edge itself (edge is a valid substrate target per ADR-024).
         let note = rt
-            .create_note(
-                None,
-                khive_storage::NoteKind::Observation,
-                None,
-                "edge note",
-                0.5,
-                None,
-                vec![],
-            )
+            .create_note(None, "observation", None, "edge note", 0.5, None, vec![])
             .await
             .unwrap();
 
@@ -1866,7 +1835,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "annotating an edge",
                 0.5,
@@ -1900,7 +1869,7 @@ mod tests {
         let result = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "should not persist",
                 0.5,
@@ -1975,15 +1944,7 @@ mod tests {
     async fn link_note_as_source_non_annotates_returns_invalid_input() {
         let rt = rt();
         let note = rt
-            .create_note(
-                None,
-                khive_storage::NoteKind::Observation,
-                None,
-                "a note",
-                0.5,
-                None,
-                vec![],
-            )
+            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
             .await
             .unwrap();
         let entity = rt
@@ -2076,7 +2037,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "observing an event",
                 0.6,
@@ -2116,7 +2077,7 @@ mod tests {
         let result = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "note annotating an event",
                 0.5,
@@ -2153,7 +2114,7 @@ mod tests {
         let old_note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "old observation",
                 0.7,
@@ -2165,7 +2126,7 @@ mod tests {
         let new_note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "revised observation superseding the old one",
                 0.9,
@@ -2221,15 +2182,7 @@ mod tests {
     async fn link_supersedes_note_to_entity_returns_invalid_input() {
         let rt = rt();
         let note = rt
-            .create_note(
-                None,
-                khive_storage::NoteKind::Observation,
-                None,
-                "a note",
-                0.5,
-                None,
-                vec![],
-            )
+            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
             .await
             .unwrap();
         let entity = rt
@@ -2261,15 +2214,7 @@ mod tests {
             .await
             .unwrap();
         let note = rt
-            .create_note(
-                None,
-                khive_storage::NoteKind::Observation,
-                None,
-                "a note",
-                0.5,
-                None,
-                vec![],
-            )
+            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
             .await
             .unwrap();
 
@@ -2413,7 +2358,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "existing note",
                 0.5,
@@ -2441,7 +2386,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "existing note",
                 0.5,
@@ -2469,7 +2414,7 @@ mod tests {
         let note_a = rt
             .create_note(
                 Some("ns-a"),
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "note in ns-a",
                 0.5,
@@ -2481,7 +2426,7 @@ mod tests {
         let note_b = rt
             .create_note(
                 Some("ns-b"),
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "note in ns-b",
                 0.5,
@@ -2514,7 +2459,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "a note that cannot be an extends source",
                 0.5,
@@ -2558,7 +2503,7 @@ mod tests {
         let note = rt
             .create_note(
                 None,
-                khive_storage::NoteKind::Observation,
+                "observation",
                 None,
                 "annotating an edge",
                 0.5,

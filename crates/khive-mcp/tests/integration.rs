@@ -244,6 +244,109 @@ async fn entity_list_returns_all_created() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn entity_create_alias_paper_canonicalizes_to_document() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let result = call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "paper", "name": "Attention Is All You Need"}),
+    )
+    .await?;
+    let entity: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
+    assert_eq!(
+        entity["kind"], "document",
+        "paper alias canonicalizes to document"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn entity_create_invalid_kind_returns_error() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let params = CallToolRequestParams::new("create").with_arguments(
+        json!({"kind": "entity", "entity_kind": "garbage", "name": "Bad"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let result = client.call_tool(params).await;
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("concept"),
+                "error should list valid kinds: {msg}"
+            );
+        }
+        Ok(r) => {
+            assert!(
+                r.is_error.unwrap_or(false),
+                "invalid entity_kind must be rejected"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn entity_list_alias_paper_filters_document() -> anyhow::Result<()> {
+    let client = connect().await?;
+    call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "document", "name": "DocEntity"}),
+    )
+    .await?;
+    call(
+        &client,
+        "create",
+        json!({"kind": "entity", "entity_kind": "concept", "name": "ConceptEntity"}),
+    )
+    .await?;
+    let result = call(
+        &client,
+        "list",
+        json!({"kind": "entity", "entity_kind": "paper"}),
+    )
+    .await?;
+    let entities: Vec<serde_json::Value> = serde_json::from_str(&first_text(&result)).unwrap();
+    assert!(
+        entities.iter().all(|e| e["kind"] == "document"),
+        "paper alias must filter to document entities"
+    );
+    assert!(!entities.is_empty(), "should find the document entity");
+    Ok(())
+}
+
+#[tokio::test]
+async fn entity_list_invalid_kind_returns_error() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let params = CallToolRequestParams::new("list").with_arguments(
+        json!({"kind": "entity", "entity_kind": "garbage"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let result = client.call_tool(params).await;
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("concept"),
+                "error should list valid kinds: {msg}"
+            );
+        }
+        Ok(r) => {
+            assert!(
+                r.is_error.unwrap_or(false),
+                "invalid entity_kind must be rejected"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn entity_list_limit_is_respected() -> anyhow::Result<()> {
     let client = connect().await?;
     for i in 0..10 {
@@ -704,37 +807,38 @@ async fn note_create_with_alias_obs() -> anyhow::Result<()> {
     .await?;
     assert!(
         !result.is_error.unwrap_or(false),
-        "alias 'obs' should map to observation"
+        "obs alias must be accepted and canonicalized"
     );
     let note: serde_json::Value = serde_json::from_str(&first_text(&result)).unwrap();
-    assert_eq!(note["kind"], "observation");
+    assert_eq!(
+        note["kind"], "observation",
+        "obs alias canonicalizes to observation"
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn note_create_unknown_kind_returns_error() -> anyhow::Result<()> {
     let client = connect().await?;
-    let result = client
-        .call_tool(
-            CallToolRequestParams::new("create").with_arguments(
-                json!({"kind": "note", "note_kind": "garbage", "content": "should fail"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        )
-        .await;
+    let params = CallToolRequestParams::new("create").with_arguments(
+        json!({"kind": "note", "note_kind": "garbage", "content": "should be rejected"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let result = client.call_tool(params).await;
     match result {
-        Err(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("observation"),
+                "error should list valid kinds: {msg}"
+            );
+        }
         Ok(r) => {
             assert!(
                 r.is_error.unwrap_or(false),
-                "unknown note_kind 'garbage' should produce an error response"
-            );
-            let text = first_text(&r);
-            assert!(
-                text.contains("observation") || text.contains("invalid"),
-                "error message should mention valid kinds, got: {text}"
+                "unknown note_kind must be rejected at the MCP boundary"
             );
         }
     }

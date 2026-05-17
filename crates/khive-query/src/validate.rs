@@ -1,16 +1,15 @@
 //! AST validation per ADR-008 §Validation Rules.
 //!
 //! `validate` normalises an AST in place and rejects queries that violate the
-//! closed taxonomies or attempt to subvert namespace scoping:
+//! closed edge ontology or attempt to subvert namespace scoping:
 //!
 //! 1. **Edge relations** must parse to one of the 13 canonical [`EdgeRelation`]
 //!    variants (ADR-002). Aliases and case differences are normalised to the
 //!    canonical snake_case form stored in the database. Applies to edge
 //!    patterns *and* `WHERE e.relation = '…'` constraints.
-//! 2. **Node kinds** must parse to one of the 6 [`EntityKind`] variants
-//!    (ADR-001). Common aliases (`paper` → `document`, `benchmark` → `dataset`)
-//!    are normalised. Applies to node labels *and* `WHERE a.kind = '…'`
-//!    constraints.
+//! 2. **Node kinds** pass through unchanged — the query layer is pack-agnostic
+//!    (ADR-025). Kind validation is the responsibility of the service boundary,
+//!    not the query compiler.
 //! 3. **Namespace scoping is a trusted parameter only.** Queries must not name
 //!    `namespace` in node property maps or `WHERE` conditions — the only valid
 //!    source of namespace filtering is `CompileOptions::scopes`. This matches
@@ -22,7 +21,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use khive_types::{EdgeRelation, EntityKind};
+use khive_types::EdgeRelation;
 
 use crate::ast::{Condition, ConditionValue, GqlQuery, PatternElement};
 use crate::error::QueryError;
@@ -32,9 +31,8 @@ pub const MAX_DEPTH: usize = 10;
 
 /// Validate and normalise an AST in place.
 ///
-/// On success, every kind / relation string in the AST is replaced with its
-/// canonical lowercase form so the compiler can emit literal SQL parameters
-/// that match the values written by `khive-db`.
+/// Canonicalizes edge relation strings to their snake_case form (closed set).
+/// Node kind strings pass through unchanged (pack-agnostic).
 pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
     // Pattern variables are bindings — the same variable name appearing twice
     // would mean "same node/edge" and require alias-equality predicates in
@@ -69,11 +67,6 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
     for element in &mut query.pattern.elements {
         match element {
             PatternElement::Node(node) => {
-                if let Some(kind) = node.kind.as_mut() {
-                    let parsed = EntityKind::from_str(kind)
-                        .map_err(|e| QueryError::Validation(e.to_string()))?;
-                    *kind = parsed.name().to_string();
-                }
                 if node.properties.contains_key("namespace") {
                     return Err(QueryError::Validation(
                         "namespace is set by CompileOptions, not query text".into(),
@@ -162,14 +155,7 @@ fn validate_condition(cond: &mut Condition, is_edge: bool) -> Result<(), QueryEr
         "namespace" => Err(QueryError::Validation(
             "namespace is set by CompileOptions, not query text".into(),
         )),
-        "kind" if !is_edge => {
-            if let ConditionValue::String(ref mut s) = cond.value {
-                let parsed =
-                    EntityKind::from_str(s).map_err(|e| QueryError::Validation(e.to_string()))?;
-                *s = parsed.name().to_string();
-            }
-            Ok(())
-        }
+        "kind" if !is_edge => Ok(()),
         "relation" if is_edge => {
             if let ConditionValue::String(ref mut s) = cond.value {
                 let parsed = EdgeRelation::from_str(s)
@@ -188,7 +174,8 @@ mod tests {
     use crate::parsers::gql;
 
     #[test]
-    fn normalises_entity_kind_aliases() {
+    fn node_kind_passes_through_unchanged() {
+        // Entity kinds are pack-agnostic strings — no normalization at the query layer.
         let mut q = gql::parse("MATCH (a:paper)-[:introduced_by]->(b:concept) RETURN a").unwrap();
         validate(&mut q).unwrap();
         let kinds: Vec<_> = q
@@ -196,7 +183,7 @@ mod tests {
             .nodes()
             .map(|n| n.kind.as_deref().unwrap_or(""))
             .collect();
-        assert_eq!(kinds, vec!["document", "concept"]);
+        assert_eq!(kinds, vec!["paper", "concept"]);
     }
 
     #[test]
@@ -220,11 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_kind() {
+    fn unknown_kind_passes_through() {
+        // Entity kinds are pack-agnostic strings — any string is accepted at the query layer.
         let mut q = gql::parse("MATCH (a:gizmo)-[:extends]->(b) RETURN a").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("gizmo"), "msg: {msg}");
+        validate(&mut q).unwrap();
     }
 
     #[test]
@@ -274,15 +260,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_kind_in_where() {
+    fn unknown_kind_in_where_passes_through() {
+        // Entity kinds are pack-agnostic strings — any kind string is accepted.
         let mut q =
             gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'gizmo' RETURN a").unwrap();
-        let err = validate(&mut q).unwrap_err();
-        assert!(err.to_string().contains("gizmo"), "msg: {err}");
+        validate(&mut q).unwrap();
+        let val = match &q.where_clause[0].value {
+            ConditionValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert_eq!(val, "gizmo");
     }
 
     #[test]
-    fn normalises_kind_alias_in_where() {
+    fn kind_in_where_passes_through_unchanged() {
+        // Pack-agnostic: 'paper' is not normalized to 'document'; strings pass through as-is.
         let mut q =
             gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'paper' RETURN a").unwrap();
         validate(&mut q).unwrap();
@@ -290,7 +282,7 @@ mod tests {
             ConditionValue::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
-        assert_eq!(val, "document");
+        assert_eq!(val, "paper");
     }
 
     #[test]

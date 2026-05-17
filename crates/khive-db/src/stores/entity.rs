@@ -10,7 +10,6 @@ use khive_storage::error::StorageError;
 use khive_storage::types::{BatchWriteSummary, DeleteMode, Page, PageRequest};
 use khive_storage::EntityStore;
 use khive_storage::StorageCapability;
-use khive_types::EntityKind;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
@@ -120,14 +119,6 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
 
     let id = parse_uuid(&id_str)?;
 
-    let parsed_kind = kind.parse::<EntityKind>().map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            2,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
-
     let properties = properties_str
         .map(|s| {
             serde_json::from_str(&s).map_err(|e| {
@@ -147,7 +138,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
     Ok(Entity {
         id,
         namespace,
-        kind: parsed_kind,
+        kind,
         name,
         description,
         properties,
@@ -191,7 +182,7 @@ fn build_entity_where(
             .kinds
             .iter()
             .map(|k| {
-                params.push(Box::new(k.to_string()));
+                params.push(Box::new(k.clone()));
                 format!("?{}", params.len())
             })
             .collect();
@@ -246,7 +237,7 @@ impl EntityStore for SqlEntityStore {
                 rusqlite::params![
                     id_str,
                     namespace,
-                    entity.kind.to_string(),
+                    entity.kind,
                     entity.name,
                     entity.description,
                     properties_str,
@@ -290,7 +281,7 @@ impl EntityStore for SqlEntityStore {
                     rusqlite::params![
                         id_str,
                         &entity.namespace,
-                        entity.kind.to_string(),
+                        entity.kind,
                         entity.name,
                         entity.description,
                         properties_str,
@@ -494,12 +485,12 @@ mod tests {
         SqlEntityStore::new(setup_pool(), false)
     }
 
-    fn make_entity(namespace: &str, kind: EntityKind, name: &str) -> Entity {
+    fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
         let now = chrono::Utc::now().timestamp_micros();
         Entity {
             id: Uuid::new_v4(),
             namespace: namespace.to_string(),
-            kind,
+            kind: kind.to_string(),
             name: name.to_string(),
             description: None,
             properties: None,
@@ -514,7 +505,7 @@ mod tests {
     async fn test_upsert_and_get_entity() {
         let store = setup_memory_store();
 
-        let entity = make_entity("default", EntityKind::Concept, "LoRA");
+        let entity = make_entity("default", "concept", "LoRA");
         let id = entity.id;
 
         store.upsert_entity(entity).await.unwrap();
@@ -524,7 +515,7 @@ mod tests {
         let fetched = fetched.unwrap();
         assert_eq!(fetched.id, id);
         assert_eq!(fetched.name, "LoRA");
-        assert_eq!(fetched.kind, EntityKind::Concept);
+        assert_eq!(fetched.kind, "concept");
     }
 
     #[tokio::test]
@@ -532,7 +523,7 @@ mod tests {
         let store = setup_memory_store();
 
         let props = serde_json::json!({"domain": "fine-tuning", "type": "technique"});
-        let entity = Entity::new("default", EntityKind::Concept, "QLoRA")
+        let entity = Entity::new("default", "concept", "QLoRA")
             .with_description("Quantized LoRA")
             .with_properties(props.clone())
             .with_tags(vec!["fine-tuning".to_string(), "quantization".to_string()]);
@@ -550,7 +541,7 @@ mod tests {
     async fn test_soft_delete() {
         let store = setup_memory_store();
 
-        let entity = make_entity("default", EntityKind::Concept, "to-delete");
+        let entity = make_entity("default", "concept", "to-delete");
         let id = entity.id;
         store.upsert_entity(entity).await.unwrap();
 
@@ -565,7 +556,7 @@ mod tests {
     async fn test_hard_delete() {
         let store = setup_memory_store();
 
-        let entity = make_entity("default", EntityKind::Concept, "to-hard-delete");
+        let entity = make_entity("default", "concept", "to-hard-delete");
         let id = entity.id;
         store.upsert_entity(entity).await.unwrap();
 
@@ -582,12 +573,12 @@ mod tests {
 
         for name in &["Alpha", "Beta", "Gamma"] {
             store
-                .upsert_entity(make_entity("ns1", EntityKind::Concept, name))
+                .upsert_entity(make_entity("ns1", "concept", name))
                 .await
                 .unwrap();
         }
         store
-            .upsert_entity(make_entity("ns1", EntityKind::Document, "Paper1"))
+            .upsert_entity(make_entity("ns1", "document", "Paper1"))
             .await
             .unwrap();
 
@@ -610,7 +601,7 @@ mod tests {
             .query_entities(
                 "ns1",
                 EntityFilter {
-                    kinds: vec![EntityKind::Concept],
+                    kinds: vec!["concept".to_string()],
                     ..Default::default()
                 },
                 PageRequest::default(),
@@ -627,7 +618,7 @@ mod tests {
         // "Alpha" and "AlphaGo" both start with "Alpha"; "Beta" does not
         for &name in &["Alpha", "AlphaGo", "Beta"] {
             store
-                .upsert_entity(make_entity("ns1", EntityKind::Concept, name))
+                .upsert_entity(make_entity("ns1", "concept", name))
                 .await
                 .unwrap();
         }
@@ -656,7 +647,7 @@ mod tests {
 
         for _ in 0..5 {
             store
-                .upsert_entity(make_entity("ns1", EntityKind::Concept, "X"))
+                .upsert_entity(make_entity("ns1", "concept", "X"))
                 .await
                 .unwrap();
         }
@@ -681,7 +672,7 @@ mod tests {
         let store = setup_memory_store_ns("batch_ns");
 
         let entities: Vec<Entity> = (0..10)
-            .map(|i| make_entity("batch_ns", EntityKind::Concept, &format!("entity_{i}")))
+            .map(|i| make_entity("batch_ns", "concept", &format!("entity_{i}")))
             .collect();
 
         let summary = store.upsert_entities(entities).await.unwrap();
@@ -703,11 +694,11 @@ mod tests {
         let store = SqlEntityStore::new(Arc::clone(&pool), false);
 
         store
-            .upsert_entity(make_entity("ns_a", EntityKind::Concept, "EntityA"))
+            .upsert_entity(make_entity("ns_a", "concept", "EntityA"))
             .await
             .unwrap();
         store
-            .upsert_entity(make_entity("ns_b", EntityKind::Concept, "EntityB"))
+            .upsert_entity(make_entity("ns_b", "concept", "EntityB"))
             .await
             .unwrap();
 
@@ -741,11 +732,11 @@ mod tests {
     async fn test_query_by_tags() {
         let store = setup_memory_store_ns("tags_ns");
 
-        let mut e1 = make_entity("tags_ns", EntityKind::Concept, "Tagged1");
+        let mut e1 = make_entity("tags_ns", "concept", "Tagged1");
         e1.tags = vec!["rust".to_string(), "systems".to_string()];
-        let mut e2 = make_entity("tags_ns", EntityKind::Concept, "Tagged2");
+        let mut e2 = make_entity("tags_ns", "concept", "Tagged2");
         e2.tags = vec!["python".to_string(), "ml".to_string()];
-        let mut e3 = make_entity("tags_ns", EntityKind::Concept, "Tagged3");
+        let mut e3 = make_entity("tags_ns", "concept", "Tagged3");
         e3.tags = vec!["rust".to_string(), "ml".to_string()];
 
         store.upsert_entity(e1).await.unwrap();
@@ -803,9 +794,9 @@ mod tests {
     async fn test_query_by_ids() {
         let store = setup_memory_store_ns("ns1");
 
-        let e1 = make_entity("ns1", EntityKind::Concept, "E1");
-        let e2 = make_entity("ns1", EntityKind::Concept, "E2");
-        let e3 = make_entity("ns1", EntityKind::Concept, "E3");
+        let e1 = make_entity("ns1", "concept", "E1");
+        let e2 = make_entity("ns1", "concept", "E2");
+        let e3 = make_entity("ns1", "concept", "E3");
         let ids = vec![e1.id, e3.id];
 
         store.upsert_entity(e1).await.unwrap();
@@ -844,7 +835,7 @@ mod tests {
         let entity_a = Entity {
             id: shared_id,
             namespace: "ns_a".to_string(),
-            kind: EntityKind::Concept,
+            kind: "concept".to_string(),
             name: "SharedInA".to_string(),
             description: None,
             properties: None,
@@ -864,7 +855,7 @@ mod tests {
         let entity_b = Entity {
             id: shared_id,
             namespace: "ns_b".to_string(),
-            kind: EntityKind::Concept,
+            kind: "concept".to_string(),
             name: "SharedInB".to_string(),
             description: None,
             properties: None,
