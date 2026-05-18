@@ -78,7 +78,7 @@ No language SDK to learn.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-mcp       — Rust binary (stdio MCP server)            │
-│  Thin dispatch shell — routes verbs to packs via registry.   │
+│  1 tool: `request` (ADR-020) — parses DSL, dispatches ops    │
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
@@ -86,8 +86,8 @@ No language SDK to learn.
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-runtime, khive-query, khive-db, khive-storage,        │
-│  khive-score, khive-types                                    │
+│  khive-runtime, khive-request, khive-query, khive-db,        │
+│  khive-storage, khive-score, khive-types                     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -100,18 +100,19 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ## Crates
 
-| Crate           | Purpose                                              |
-| --------------- | ---------------------------------------------------- |
-| `khive-types`   | Domain types, Pack trait, closed enums               |
-| `khive-score`   | Deterministic i64 fixed-point scoring                |
-| `khive-storage` | Trait-only capability surface (zero implementations) |
-| `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges        |
-| `khive-query`   | SPARQL / GQL → SQL compiler                          |
-| `khive-runtime` | Service API + VerbRegistry + PackRuntime trait       |
-| `khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation  |
-| `khive-mcp`     | Stdio MCP binary — thin dispatch over VerbRegistry   |
+| Crate           | Purpose                                                   |
+| --------------- | --------------------------------------------------------- |
+| `khive-types`   | Domain types, Pack trait, closed enums                    |
+| `khive-score`   | Deterministic i64 fixed-point scoring                     |
+| `khive-storage` | Trait-only capability surface (zero implementations)      |
+| `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges             |
+| `khive-query`   | SPARQL / GQL → SQL compiler                               |
+| `khive-runtime` | Service API + VerbRegistry + PackRuntime trait            |
+| `khive-request` | Request DSL parser (function-call + JSON forms)           |
+| `khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation       |
+| `khive-mcp`     | Stdio MCP binary — exposes one `request` tool             |
 
-Dependency direction: `types → score → storage → db → query → runtime → pack-kg → mcp`.
+Dependency direction: `types → score → storage → db → query → runtime → request → pack-kg → mcp`.
 Storage is trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without
 touching consumers.
 
@@ -215,9 +216,10 @@ make ci  # Full CI: fmt, clippy, test, build
 
 ## Status
 
-**v0.1.2 — published on [crates.io](https://crates.io/crates/khive-mcp).** 8 crates, 11 MCP tools,
-pack-based verb dispatch, hybrid search with local embeddings, GQL/SPARQL queries. Ready for use
-with Claude Code and any MCP-compatible agent.
+**v0.1.2 — published on [crates.io](https://crates.io/crates/khive-mcp).** 9 crates, one
+`request` MCP tool dispatching 11 KG verbs through a DSL, pack-based verb dispatch, hybrid
+search with local embeddings, GQL/SPARQL queries. Ready for use with Claude Code and any
+MCP-compatible agent.
 
 ## License
 
