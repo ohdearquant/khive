@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         db_path,
         default_namespace: args.namespace,
         embedding_model,
+        ..RuntimeConfig::default()
     };
 
     let runtime = KhiveRuntime::new(config)?;

@@ -523,6 +523,7 @@ async fn file_backed_runtime_persists() {
             db_path: Some(path.clone()),
             default_namespace: "local".to_string(),
             embedding_model: None,
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
         };
         let rt = KhiveRuntime::new(config).unwrap();
         rt.create_entity(None, "concept", "Persistent", None, None, vec![])
@@ -536,6 +537,7 @@ async fn file_backed_runtime_persists() {
             db_path: Some(path.clone()),
             default_namespace: "local".to_string(),
             embedding_model: None,
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let entities = rt.list_entities(None, None, 50).await.unwrap();

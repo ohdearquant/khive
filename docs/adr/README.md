@@ -33,6 +33,7 @@ alternatives. New decisions should be added as ADR-NNN-kebab-case-title.md using
 | [025](ADR-025-pack-standard.md)                   | Pack Standard                            | accepted                                                           | Pack trait in khive-types; composable vocabulary extension; edge relations stay closed; runtime vocabulary merging                                                            |
 | [027](ADR-027-single-tool-mcp-surface.md)         | Single Tool MCP Surface                  | accepted                                                           | MCP server exposes exactly one tool (`request`); pack verbs reached via DSL; dynamic verb catalog from `VerbRegistry`                                                         |
 | [028](ADR-028-request-parser-crate.md)            | Request Parser as a Standalone Crate     | accepted                                                           | DSL parser extracted to `khive-request` crate (Apache-2.0); transport-agnostic; forward-compat hook for LNDL and future HTTP/CLI/FFI transports                              |
+| [029](ADR-029-authorization-gate.md)              | Authorization Gate                       | accepted                                                           | `khive-gate` trait + `AllowAllGate` default; `RuntimeConfig.gate`; advisory consultation at the single dispatch site (ADR-027); enforcement deferred to v0.3                  |
 
 ## Reading Order
 

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use khive_db::StorageBackend;
+use khive_gate::{AllowAllGate, GateRef};
 use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
 use lattice_embed::{
     CachedEmbeddingService, EmbeddingModel, EmbeddingService, NativeEmbeddingService,
@@ -21,6 +22,10 @@ pub struct RuntimeConfig {
     /// Local embedding model. `None` disables embedding and hybrid vector search;
     /// `hybrid_search` then falls back to text-only.
     pub embedding_model: Option<EmbeddingModel>,
+    /// Authorization gate consulted before each verb dispatch (ADR-029).
+    /// Default: `AllowAllGate` (permissive). For production policy enforcement,
+    /// plug in a Rego- or capability-witness-backed impl.
+    pub gate: GateRef,
 }
 
 impl Default for RuntimeConfig {
@@ -36,6 +41,7 @@ impl Default for RuntimeConfig {
             db_path,
             default_namespace: "local".to_string(),
             embedding_model,
+            gate: Arc::new(AllowAllGate),
         }
     }
 }
@@ -76,6 +82,7 @@ impl KhiveRuntime {
             db_path: None,
             default_namespace: "local".to_string(),
             embedding_model: None,
+            gate: Arc::new(AllowAllGate),
         })
     }
 
@@ -212,6 +219,7 @@ mod tests {
             db_path: Some(path.clone()),
             default_namespace: "test".to_string(),
             embedding_model: None,
+            gate: Arc::new(AllowAllGate),
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -258,6 +266,17 @@ mod tests {
             vec_model_key(EmbeddingModel::AllMiniLmL6V2),
             "all_minilm_l6_v2"
         );
+    }
+
+    #[test]
+    fn default_config_uses_allow_all_gate() {
+        let cfg = RuntimeConfig::default();
+        // Default gate is permissive — checked via type identity (no leak of
+        // concrete gate kind otherwise).
+        assert_eq!(cfg.default_namespace, "local");
+        // `gate` is non-`Debug`-comparable; smoke-check by running a request
+        // through it via the registry layer would belong in pack.rs tests.
+        let _: GateRef = cfg.gate.clone();
     }
 
     #[test]

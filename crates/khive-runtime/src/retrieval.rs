@@ -383,6 +383,7 @@ mod tests {
             db_path: None,
             default_namespace: "test".to_string(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            gate: std::sync::Arc::new(khive_gate::AllowAllGate),
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let texts: Vec<String> = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
@@ -401,6 +402,7 @@ mod tests {
             db_path: None,
             default_namespace: "test".to_string(),
             embedding_model: Some(model),
+            gate: std::sync::Arc::new(khive_gate::AllowAllGate),
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let texts = vec!["hello world".to_string()];
