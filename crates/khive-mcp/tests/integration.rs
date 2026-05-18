@@ -15,6 +15,7 @@ fn make_server() -> KhiveMcpServer {
         db_path: None,
         default_namespace: "test".to_string(),
         embedding_model: None,
+        ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
     KhiveMcpServer::new(runtime)

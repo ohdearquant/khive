@@ -40,10 +40,13 @@ pub struct KhiveMcpServer {
 impl KhiveMcpServer {
     /// Build a server registering the kg pack against the given runtime.
     ///
-    /// Future PRs introduce a multi-pack constructor that reads
-    /// `runtime.config().packs` to select which packs to register.
+    /// The authorization gate from `runtime.config().gate` is threaded into the
+    /// registry (advisory in v0.2 per ADR-029). Future PRs introduce a
+    /// multi-pack constructor that selects which packs to register.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        let gate = runtime.config().gate.clone();
         let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(gate);
         builder.register(KgPack::new(runtime));
         Self {
             registry: builder.build(),

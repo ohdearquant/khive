@@ -14,6 +14,7 @@ khive-storage = { version = "0.1.2", path = "../khive-storage" }
 khive-score = { version = "0.1.2", path = "../khive-score" }
 khive-db = { version = "0.1.2", path = "../khive-db", features = ["vectors"] }
 khive-query = { version = "0.1.2", path = "../khive-query" }
+khive-gate = { version = "0.1.2", path = "../khive-gate" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

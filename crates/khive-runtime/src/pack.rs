@@ -12,6 +12,8 @@
 //! through the builder.
 
 use async_trait::async_trait;
+use khive_gate::{ActorRef, AllowAllGate, GateDecision, GateRef, GateRequest};
+use khive_types::Namespace;
 use serde_json::Value;
 
 pub use khive_types::VerbDef;
@@ -50,11 +52,15 @@ pub trait PackRuntime: Send + Sync {
 /// immutable and cheaply cloneable.
 pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
+    gate: GateRef,
 }
 
 impl VerbRegistryBuilder {
     pub fn new() -> Self {
-        Self { packs: Vec::new() }
+        Self {
+            packs: Vec::new(),
+            gate: std::sync::Arc::new(AllowAllGate),
+        }
     }
 
     /// Register a pack. The bound `P: Pack + PackRuntime` ensures the pack
@@ -64,10 +70,20 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Set the authorization gate consulted on every dispatch (ADR-029).
+    ///
+    /// Defaults to `AllowAllGate` if not set. In v0.2 the gate is **advisory** —
+    /// deny decisions are logged via `tracing::warn!` but do not block dispatch.
+    pub fn with_gate(&mut self, gate: GateRef) -> &mut Self {
+        self.gate = gate;
+        self
+    }
+
     /// Consume the builder and produce an immutable, cloneable registry.
     pub fn build(self) -> VerbRegistry {
         VerbRegistry {
             packs: std::sync::Arc::new(self.packs),
+            gate: self.gate,
         }
     }
 }
@@ -84,13 +100,44 @@ impl Default for VerbRegistryBuilder {
 #[derive(Clone)]
 pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
+    gate: GateRef,
 }
 
 impl VerbRegistry {
     /// Dispatch a verb to the first pack that handles it.
     ///
     /// When multiple packs declare the same verb, the first registered pack wins.
+    ///
+    /// The configured [`Gate`](khive_gate::Gate) is consulted before dispatch
+    /// (ADR-029). In v0.2 the check is **advisory** — `Deny` decisions are
+    /// logged via `tracing::warn!` but do not abort the call. v0.3 will make
+    /// deny authoritative.
+    ///
+    /// The synthesized `GateRequest` carries `ActorRef::anonymous()` and the
+    /// default namespace. Transports that have richer caller context (auth
+    /// headers, session info) will gain a sibling dispatch path in a follow-up.
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
+        let gate_req = GateRequest::new(
+            ActorRef::anonymous(),
+            Namespace::default_ns(),
+            verb,
+            params.clone(),
+        );
+        match self.gate.check(&gate_req) {
+            Ok(GateDecision::Allow { .. }) => {}
+            Ok(GateDecision::Deny { reason }) => {
+                tracing::warn!(
+                    verb,
+                    reason = %reason,
+                    "gate deny (advisory in v0.2; not enforced)"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(verb, error = %err, "gate check failed (advisory)");
+            }
+        }
+        // TODO(ADR-032): emit `EventKind::GateCheck` event for deny / audit-obligation cases.
+
         for pack in self.packs.iter() {
             if pack.verbs().iter().any(|v| v.name == verb) {
                 return pack.dispatch(verb, params).await;
@@ -269,5 +316,70 @@ mod tests {
         let reg = build_registry();
         let kinds = reg.all_entity_kinds();
         assert_eq!(kinds, vec!["widget", "gadget"]);
+    }
+
+    // ---- Gate wiring (ADR-029) ----
+
+    use khive_gate::{Gate, GateError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default, Debug)]
+    struct CountingGate {
+        calls: AtomicUsize,
+        deny_verb: Option<&'static str>,
+    }
+
+    impl Gate for CountingGate {
+        fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if Some(req.verb.as_str()) == self.deny_verb {
+                Ok(GateDecision::deny(format!("test deny for {}", req.verb)))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_consults_the_gate() {
+        let gate = Arc::new(CountingGate::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build();
+
+        reg.dispatch("list", Value::Null).await.unwrap();
+        reg.dispatch("create", Value::Null).await.unwrap();
+        assert_eq!(
+            gate.calls.load(Ordering::SeqCst),
+            2,
+            "gate should be consulted once per dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_proceeds_on_deny_advisory_in_v02() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build();
+
+        // Gate denies — but dispatch proceeds because the gate is advisory.
+        let res = reg.dispatch("create", Value::Null).await.unwrap();
+        assert_eq!(res["pack"], "alpha");
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_uses_allow_all_gate_by_default() {
+        // No `with_gate` call — builder should use `AllowAllGate` so dispatch works.
+        let reg = build_registry();
+        let res = reg.dispatch("list", Value::Null).await.unwrap();
+        assert_eq!(res["pack"], "alpha");
     }
 }

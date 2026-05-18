@@ -6,6 +6,7 @@ members = [
     "khive-storage",
     "khive-db",
     "khive-query",
+    "khive-gate",
     "khive-runtime",
     "khive-request",
     "khive-pack-kg",
