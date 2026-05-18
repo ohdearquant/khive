@@ -78,20 +78,20 @@ shipped in this surface change.
 
 ## Directory map
 
-| Path                   | Purpose                                                     |
-| ---------------------- | ----------------------------------------------------------- |
-| `crates/khive-types`   | Domain types: Entity, Note, Event, EntityKind, EdgeRelation |
-| `crates/khive-score`   | Deterministic i64 fixed-point scoring + RRF                 |
-| `crates/khive-storage` | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch  |
-| `crates/khive-db`      | SQLite backend + sqlite-vec + FTS5 trigram                  |
-| `crates/khive-query`   | GQL + SPARQL parsers, AST validation, SQL compiler          |
-| `crates/khive-runtime` | Service API + VerbRegistry + PackRuntime trait              |
-| `crates/khive-request` | Request DSL parser (function-call + JSON forms)             |
-| `crates/khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation         |
+| Path                   | Purpose                                                         |
+| ---------------------- | --------------------------------------------------------------- |
+| `crates/khive-types`   | Domain types: Entity, Note, Event, EntityKind, EdgeRelation     |
+| `crates/khive-score`   | Deterministic i64 fixed-point scoring + RRF                     |
+| `crates/khive-storage` | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch      |
+| `crates/khive-db`      | SQLite backend + sqlite-vec + FTS5 trigram                      |
+| `crates/khive-query`   | GQL + SPARQL parsers, AST validation, SQL compiler              |
+| `crates/khive-runtime` | Service API + VerbRegistry + PackRuntime trait                  |
+| `crates/khive-request` | Request DSL parser (function-call + JSON forms)                 |
+| `crates/khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation             |
 | `crates/khive-mcp`     | Stdio MCP binary — exposes one `request` tool over VerbRegistry |
-| `docs/adr/`            | Architecture Decision Records (the design contract)         |
-| `tests/smoke_test.py`  | End-to-end binary smoke test (drives every verb via `request`) |
-| `scripts/publish.sh`   | Publish all crates to crates.io in dependency order         |
+| `docs/adr/`            | Architecture Decision Records (the design contract)             |
+| `tests/smoke_test.py`  | End-to-end binary smoke test (drives every verb via `request`)  |
+| `scripts/publish.sh`   | Publish all crates to crates.io in dependency order             |
 
 ---
 

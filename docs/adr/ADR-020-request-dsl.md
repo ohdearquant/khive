@@ -220,7 +220,7 @@ existing convention in other MCP systems.
 - ~~The parser lives in `khive-mcp` as a private module~~ — superseded 2026-05-18: the parser
   lives in its **own crate**, `khive-request`. Two rationales: (1) every transport (MCP, future
   HTTP gateway, FFI, CLI) parses the same shape, so it doesn't belong to any one of them; (2) the
-  *parse → compile → dispatch → execute → return* pipeline is shared between this DSL and LNDL
+  _parse → compile → dispatch → execute → return_ pipeline is shared between this DSL and LNDL
   (Lion Natural Directive Language). Keeping the parser in its own crate makes adding pipe chains,
   LNDL frontends, or bash-style conventions a pure-parser change with zero impact on runtime
   layering.
@@ -229,16 +229,16 @@ existing convention in other MCP systems.
 
 ## Implementation Status (shipped 2026-05-18)
 
-| Step                                                                  | Where                                                              | Status |
-| --------------------------------------------------------------------- | ------------------------------------------------------------------ | ------ |
-| Standalone crate: parser + AST                                        | `crates/khive-request/`                                            | done   |
-| Parser (hand-written recursive descent; JSON form via `serde_json`)   | `crates/khive-request/src/lib.rs`                                  | done   |
-| MCP tool: single `#[tool] request`, parallel dispatch via `join_all`  | `crates/khive-mcp/src/server.rs`                                   | done   |
-| Tool param struct                                                     | `crates/khive-mcp/src/tools/request.rs`                            | done   |
-| 17 parser unit tests + 13 MCP integration tests                       | `crates/khive-request/src/lib.rs`, `khive-mcp/tests/`              | done   |
+| Step                                                                 | Where                                                 | Status |
+| -------------------------------------------------------------------- | ----------------------------------------------------- | ------ |
+| Standalone crate: parser + AST                                       | `crates/khive-request/`                               | done   |
+| Parser (hand-written recursive descent; JSON form via `serde_json`)  | `crates/khive-request/src/lib.rs`                     | done   |
+| MCP tool: single `#[tool] request`, parallel dispatch via `join_all` | `crates/khive-mcp/src/server.rs`                      | done   |
+| Tool param struct                                                    | `crates/khive-mcp/src/tools/request.rs`               | done   |
+| 17 parser unit tests + 13 MCP integration tests                      | `crates/khive-request/src/lib.rs`, `khive-mcp/tests/` | done   |
 
 The flat verb tools previously listed in ADR-023 (`create`, `get`, `list`, `update`, `delete`,
-`merge`, `search`, `link`, `neighbors`, `traverse`, `query`) are now reached *through* `request`
+`merge`, `search`, `link`, `neighbors`, `traverse`, `query`) are now reached _through_ `request`
 — their verb names and per-pack semantics are unchanged; only the wire shape moved.
 
 ## Open Questions

@@ -100,17 +100,17 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ## Crates
 
-| Crate           | Purpose                                                   |
-| --------------- | --------------------------------------------------------- |
-| `khive-types`   | Domain types, Pack trait, closed enums                    |
-| `khive-score`   | Deterministic i64 fixed-point scoring                     |
-| `khive-storage` | Trait-only capability surface (zero implementations)      |
-| `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges             |
-| `khive-query`   | SPARQL / GQL → SQL compiler                               |
-| `khive-runtime` | Service API + VerbRegistry + PackRuntime trait            |
-| `khive-request` | Request DSL parser (function-call + JSON forms)           |
-| `khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation       |
-| `khive-mcp`     | Stdio MCP binary — exposes one `request` tool             |
+| Crate           | Purpose                                              |
+| --------------- | ---------------------------------------------------- |
+| `khive-types`   | Domain types, Pack trait, closed enums               |
+| `khive-score`   | Deterministic i64 fixed-point scoring                |
+| `khive-storage` | Trait-only capability surface (zero implementations) |
+| `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges        |
+| `khive-query`   | SPARQL / GQL → SQL compiler                          |
+| `khive-runtime` | Service API + VerbRegistry + PackRuntime trait       |
+| `khive-request` | Request DSL parser (function-call + JSON forms)      |
+| `khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation  |
+| `khive-mcp`     | Stdio MCP binary — exposes one `request` tool        |
 
 Dependency direction (storage stack): `types → score → storage → db → query → runtime → pack-kg → mcp`.
 Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
