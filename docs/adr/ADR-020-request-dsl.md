@@ -1,7 +1,7 @@
 # ADR-020: Request DSL — Batch Operations via Function-Call Syntax
 
-**Status**: planned\
-**Date**: 2026-05-15\
+**Status**: accepted (v0.2 — supersedes the verb-flat MCP surface from ADR-023)\
+**Date**: 2026-05-15 (planned); 2026-05-18 (accepted)\
 **Authors**: Ocean, lambda:khive
 
 ## Context
@@ -217,39 +217,29 @@ existing convention in other MCP systems.
 
 ### Neutral
 
-- The parser lives in `khive-mcp` as a private module — not exposed to other crates. Could move to
-  its own crate in v0.2 if other surfaces (HTTP gateway, FFI) need it.
+- ~~The parser lives in `khive-mcp` as a private module~~ — superseded 2026-05-18: the parser
+  lives in its **own crate**, `khive-request`. Two rationales: (1) every transport (MCP, future
+  HTTP gateway, FFI, CLI) parses the same shape, so it doesn't belong to any one of them; (2) the
+  *parse → compile → dispatch → execute → return* pipeline is shared between this DSL and LNDL
+  (Lion Natural Directive Language). Keeping the parser in its own crate makes adding pipe chains,
+  LNDL frontends, or bash-style conventions a pure-parser change with zero impact on runtime
+  layering.
 
-## Implementation Plan
+  Public types: `parse_request`, `ParsedRequest`, `ParsedOp`, `DslError`, `MAX_OPS`.
 
-1. **Parser** in `crates/khive-mcp/src/request_dsl.rs` (new file). Pure Rust, no external
-   parser-generator dependencies. Hand-written recursive-descent for:
-   - Top-level: single op OR `[op, op, ...]` OR JSON form
-   - Op: `name(arg=value, arg=value)`
-   - Value: string / number / boolean / null / array / object (JSON literals)
-   - Public types: `ParsedRequest { ops: Vec<ParsedOp> }`,
-     `ParsedOp { tool: String, args: serde_json::Map<String, Value> }`.
+## Implementation Status (shipped 2026-05-18)
 
-2. **Dispatcher** in `crates/khive-mcp/src/server.rs`. New `#[tool]` named `request` accepting
-   `RequestParams { ops: String }`. The handler:
-   - Parses the input.
-   - Validates each op's `tool` name against the registered tool list (reject unknown tools early).
-   - Uses `tokio::join_all` (or `try_join_all` if all-or-nothing) to dispatch in parallel.
-   - Collects results into the response shape above.
+| Step                                                                  | Where                                                              | Status |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------ | ------ |
+| Standalone crate: parser + AST                                        | `crates/khive-request/`                                            | done   |
+| Parser (hand-written recursive descent; JSON form via `serde_json`)   | `crates/khive-request/src/lib.rs`                                  | done   |
+| MCP tool: single `#[tool] request`, parallel dispatch via `join_all`  | `crates/khive-mcp/src/server.rs`                                   | done   |
+| Tool param struct                                                     | `crates/khive-mcp/src/tools/request.rs`                            | done   |
+| 17 parser unit tests + 13 MCP integration tests                       | `crates/khive-request/src/lib.rs`, `khive-mcp/tests/`              | done   |
 
-3. **MCP tool param struct** in `crates/khive-mcp/src/tools/request.rs` (new file). Wire
-   `pub mod request;` in `tools/mod.rs`.
-
-4. **Tests** in `tests/integration.rs`:
-   - Parse a single op, dispatch, verify result.
-   - Parse a batch of 3 mixed ops (e.g., `create(kind="entity", ...)`, `link(...)`,
-     `get(kind="entity", ...)`), verify all succeed.
-   - One op in batch fails → others succeed, response has `ok: false` for the failed one.
-   - Reject batch of 101 ops.
-   - Parse JSON form, equivalent dispatch.
-   - Malformed input → invalid_params error before any dispatch.
-
-5. **Update tool count tests** to include the new `request` tool.
+The flat verb tools previously listed in ADR-023 (`create`, `get`, `list`, `update`, `delete`,
+`merge`, `search`, `link`, `neighbors`, `traverse`, `query`) are now reached *through* `request`
+— their verb names and per-pack semantics are unchanged; only the wire shape moved.
 
 ## Open Questions
 
