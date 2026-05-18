@@ -80,7 +80,7 @@ logs deny reasons but does not yet block. v0.3 makes the gate authoritative (den
 | Impl                                                         | Crate              | License    | Status                                        |
 | ------------------------------------------------------------ | ------------------ | ---------- | --------------------------------------------- |
 | `AllowAllGate`                                               | `khive-gate`       | Apache-2.0 | shipped (this ADR)                            |
-| `RegoGate` (regorus-backed)                                  | `khive-gate-rego`  | Apache-2.0 | planned (sibling crate; follow-up ADR)        |
+| `RegoGate` (regorus-backed)                                  | `khive-gate-rego`  | Apache-2.0 | shipped ([ADR-031](ADR-031-rego-gate.md))     |
 | `LionGate<G: Gate>` (capability witnesses, wraps any `Gate`) | `khive-cloud-gate` | BUSL-1.1   | exists in khive-cloud; migrates to this trait |
 
 Each impl ships as a sibling crate so consumers opt in by adding the dep rather than toggling a
@@ -187,7 +187,7 @@ today is the wrong default.
 | `RuntimeConfig::gate` field + `Default::default`   | `crates/khive-runtime/src/runtime.rs`         | done                                   |
 | Re-export gate types from `khive-runtime`          | `crates/khive-runtime/src/lib.rs`             | done                                   |
 | Dispatch-site gate consultation (advisory)         | `crates/khive-runtime/src/pack.rs` (registry) | done                                   |
-| `khive-gate-rego` crate (`RegoGate`)               | `crates/khive-gate-rego/`                     | planned (follow-up ADR)                |
+| `khive-gate-rego` crate (`RegoGate`)               | `crates/khive-gate-rego/`                     | done ([ADR-031](ADR-031-rego-gate.md)) |
 | `LionGate<G>` migration in khive-cloud             | `khive-cloud/crates/gate/`                    | planned (cloud-side)                   |
 | Audit envelope (`EventKind::GateCheck`)            | TBD                                           | planned (ADR-032)                      |
 | Hard enforcement (deny → dispatch error)           | `crates/khive-runtime/src/pack.rs`            | deferred to v0.3                       |

@@ -34,6 +34,7 @@ alternatives. New decisions should be added as ADR-NNN-kebab-case-title.md using
 | [027](ADR-027-single-tool-mcp-surface.md)         | Single Tool MCP Surface                  | accepted                                                           | MCP server exposes exactly one tool (`request`); pack verbs reached via DSL; dynamic verb catalog from `VerbRegistry`                                                         |
 | [028](ADR-028-request-parser-crate.md)            | Request Parser as a Standalone Crate     | accepted                                                           | DSL parser extracted to `khive-request` crate (Apache-2.0); transport-agnostic; forward-compat hook for LNDL and future HTTP/CLI/FFI transports                              |
 | [029](ADR-029-authorization-gate.md)              | Authorization Gate                       | accepted                                                           | `khive-gate` trait + `AllowAllGate` default; `RuntimeConfig.gate`; advisory consultation at the single dispatch site (ADR-027); enforcement deferred to v0.3                  |
+| [031](ADR-031-rego-gate.md)                       | Rego Policy Backend                      | accepted                                                           | `khive-gate-rego` sibling crate (Apache-2.0) — `RegoGate` powered by `regorus`; policy contract (default entrypoint `data.khive.gate.decision`, `GateDecision` JSON output)   |
 
 ## Reading Order
 
