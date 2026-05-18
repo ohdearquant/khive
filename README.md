@@ -112,7 +112,9 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 | `khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation       |
 | `khive-mcp`     | Stdio MCP binary — exposes one `request` tool             |
 
-Dependency direction: `types → score → storage → db → query → runtime → request → pack-kg → mcp`.
+Dependency direction (storage stack): `types → score → storage → db → query → runtime → pack-kg → mcp`.
+Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
+packs do not depend on it).
 Storage is trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without
 touching consumers.
 
