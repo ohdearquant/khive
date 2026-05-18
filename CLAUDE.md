@@ -278,19 +278,19 @@ ADRs specify. Changing the schema or interface requires an ADR **before** code l
 
 Key ADRs for contributors:
 
-| ADR                                                      | What it governs                                    |
-| -------------------------------------------------------- | -------------------------------------------------- |
-| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)          | 6 entity kinds — don't add without this            |
-| [002](docs/adr/ADR-002-edge-ontology.md)                 | 13 edge relations — closed set                     |
-| [005](docs/adr/ADR-005-storage-capability-traits.md)     | Storage traits — the abstraction boundary          |
-| [008](docs/adr/ADR-008-query-layer-separation.md)        | Query crate — parser/validator/compiler separation |
-| [019](docs/adr/ADR-019-note-kind-taxonomy.md)            | 5 note kinds                                       |
-| [020](docs/adr/ADR-020-request-dsl.md)                   | Request DSL — verb-dispatch syntax for `request`   |
-| [022](docs/adr/ADR-022-schema-migrations.md)             | Migration system — how to change the DB schema     |
-| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md) | Verb taxonomy (wire shape now via `request`)       |
-| [025](docs/adr/ADR-025-pack-standard.md)                 | Pack trait — composable vocabulary extension       |
+| ADR                                                      | What it governs                                      |
+| -------------------------------------------------------- | ---------------------------------------------------- |
+| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)          | 6 entity kinds — don't add without this              |
+| [002](docs/adr/ADR-002-edge-ontology.md)                 | 13 edge relations — closed set                       |
+| [005](docs/adr/ADR-005-storage-capability-traits.md)     | Storage traits — the abstraction boundary            |
+| [008](docs/adr/ADR-008-query-layer-separation.md)        | Query crate — parser/validator/compiler separation   |
+| [019](docs/adr/ADR-019-note-kind-taxonomy.md)            | 5 note kinds                                         |
+| [020](docs/adr/ADR-020-request-dsl.md)                   | Request DSL — verb-dispatch syntax for `request`     |
+| [022](docs/adr/ADR-022-schema-migrations.md)             | Migration system — how to change the DB schema       |
+| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md) | Verb taxonomy (wire shape now via `request`)         |
+| [025](docs/adr/ADR-025-pack-standard.md)                 | Pack trait — composable vocabulary extension         |
 | [027](docs/adr/ADR-027-single-tool-mcp-surface.md)       | Single-tool MCP surface — `request` is the only tool |
-| [028](docs/adr/ADR-028-request-parser-crate.md)          | Parser crate split — `khive-request`               |
+| [028](docs/adr/ADR-028-request-parser-crate.md)          | Parser crate split — `khive-request`                 |
 
 Full index: [docs/adr/README.md](docs/adr/README.md).
 
@@ -298,19 +298,19 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
 
 ## What lives where
 
-| Want to do...               | Edit this                                                                                    |
-| --------------------------- | -------------------------------------------------------------------------------------------- |
-| Add a new verb              | Pack handler in `crates/khive-pack-kg/src/handlers.rs` (or your pack); the MCP surface is `request` — no per-verb tool file to author |
-| Change DSL syntax           | `crates/khive-request/src/lib.rs` + unit tests (ADR-020, ADR-028)                            |
-| Change MCP surface shape    | `crates/khive-mcp/src/server.rs` (ADR-027 — `request` is the only tool)                      |
-| Add a runtime operation     | `crates/khive-runtime/src/operations.rs`                                                     |
-| Change DB schema            | `crates/khive-db/src/migrations.rs` (new version) + store DDL                                |
-| Add a new entity kind       | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                      |
-| Add a new edge relation     | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                         |
-| Add a new note kind         | `crates/khive-pack-kg/src/vocab.rs` + ADR-019 amendment                                      |
-| Add a new pack              | New crate implementing `Pack` + `PackRuntime` ([ADR-025](docs/adr/ADR-025-pack-standard.md)) |
-| Fix a query parser bug      | `crates/khive-query/src/parsers/` + add regression test                                      |
-| Fix a storage bug           | `crates/khive-db/src/stores/` + test                                                         |
+| Want to do...            | Edit this                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Add a new verb           | Pack handler in `crates/khive-pack-kg/src/handlers.rs` (or your pack); the MCP surface is `request` — no per-verb tool file to author |
+| Change DSL syntax        | `crates/khive-request/src/lib.rs` + unit tests (ADR-020, ADR-028)                                                                     |
+| Change MCP surface shape | `crates/khive-mcp/src/server.rs` (ADR-027 — `request` is the only tool)                                                               |
+| Add a runtime operation  | `crates/khive-runtime/src/operations.rs`                                                                                              |
+| Change DB schema         | `crates/khive-db/src/migrations.rs` (new version) + store DDL                                                                         |
+| Add a new entity kind    | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                                                               |
+| Add a new edge relation  | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                                                                  |
+| Add a new note kind      | `crates/khive-pack-kg/src/vocab.rs` + ADR-019 amendment                                                                               |
+| Add a new pack           | New crate implementing `Pack` + `PackRuntime` ([ADR-025](docs/adr/ADR-025-pack-standard.md))                                          |
+| Fix a query parser bug   | `crates/khive-query/src/parsers/` + add regression test                                                                               |
+| Fix a storage bug        | `crates/khive-db/src/stores/` + test                                                                                                  |
 
 ---
 
