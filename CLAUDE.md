@@ -68,7 +68,9 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Dependency chain: `types → score → storage → db → query → runtime → request → pack-kg / pack-gtd → mcp`.
+Dependency chain (storage stack): `types → score → storage → db → query → runtime → pack-kg / pack-gtd → mcp`.
+Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
+packs do not depend on it).
 
 Future layers (HTTP gateway, CLI, frontend, LNDL frontend in `khive-request`) are planned but
 not shipped.
@@ -247,7 +249,7 @@ make fmt-check  # verify without modifying
 make build      # cargo build --workspace --release
 
 # Publish to crates.io
-make publish-dry  # dry run — validates all 7 crates
+make publish-dry  # dry run — validates all workspace crates
 make publish      # live publish in dependency order
 ```
 

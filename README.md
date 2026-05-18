@@ -112,7 +112,9 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 | `khive-pack-gtd` | GTD pack: task lifecycle over the notes substrate (loaded via `KHIVE_PACKS`)           |
 | `khive-mcp`      | Stdio MCP binary — single `request` tool dispatching through the VerbRegistry          |
 
-Dependency direction: `types → score → storage → db → query → runtime → request → pack-kg / pack-gtd → mcp`.
+Dependency direction (storage stack): `types → score → storage → db → query → runtime → pack-kg / pack-gtd → mcp`.
+Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
+packs do not depend on it).
 Storage is trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without
 touching consumers.
 
