@@ -11,12 +11,15 @@
 //! get a cheaply-cloneable `VerbRegistry`. Registration is only possible
 //! through the builder.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::Value;
 
 pub use khive_types::VerbDef;
 
 use crate::error::RuntimeError;
+use crate::KhiveRuntime;
 
 /// Async dispatch trait for packs (ADR-025).
 ///
@@ -40,8 +43,69 @@ pub trait PackRuntime: Send + Sync {
     /// Verbs this pack handles — must equal `<Self as Pack>::VERBS`.
     fn verbs(&self) -> &'static [VerbDef];
 
+    /// Optional per-kind hook for shared CRUD specialization (ADR-030).
+    ///
+    /// When a kind is owned by this pack (declared in `note_kinds()` or
+    /// `entity_kinds()`), returning `Some(hook)` opts that kind into
+    /// pack-specific behavior — defaults, derived properties, side-effect
+    /// edges — through the shared `create` path. Returning `None` keeps
+    /// the kind as plain storage with no specialization.
+    fn kind_hook(&self, _kind: &str) -> Option<Arc<dyn KindHook>> {
+        None
+    }
+
     /// Dispatch a verb call. Returns serialized JSON response.
-    async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError>;
+    ///
+    /// The `registry` parameter gives the handler access to the merged
+    /// vocabulary and kind hooks across all loaded packs (ADR-030).
+    async fn dispatch(
+        &self,
+        verb: &str,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError>;
+}
+
+/// Per-kind specialization for shared CRUD (ADR-030).
+///
+/// Packs implement `KindHook` for kinds they own that need:
+/// - **Defaults** filled into create args (e.g. `status="inbox"` for tasks)
+/// - **Derived properties** computed from args (e.g. salience from priority)
+/// - **Side-effect writes** after the storage commit (e.g. `depends_on` edges)
+///
+/// Hooks are stateless from the framework's perspective — they receive the
+/// runtime as a method parameter and operate on the args `Value` directly.
+/// The pack registers them via [`PackRuntime::kind_hook`].
+///
+/// Lifecycle verbs (e.g. gtd's `complete`, `transition`) remain pack-owned
+/// verbs and do not flow through this trait — only the create path does.
+#[async_trait]
+pub trait KindHook: Send + Sync + std::fmt::Debug {
+    /// Mutate args before the storage write. Fill defaults, normalize values,
+    /// rearrange user-facing fields into the storage shape expected by the
+    /// shared CRUD handler.
+    ///
+    /// Returning an error aborts the create call (no storage write happens).
+    async fn prepare_create(
+        &self,
+        runtime: &KhiveRuntime,
+        args: &mut Value,
+    ) -> Result<(), RuntimeError>;
+
+    /// Fire side effects after a successful storage write — graph edges,
+    /// derived observations, etc. The newly created record's UUID is passed
+    /// so the hook can attach metadata referencing it.
+    ///
+    /// Errors here are **logged but not propagated** — the storage write has
+    /// already succeeded; failing the call would mislead the caller.
+    /// Implementations should `tracing::warn!` and return `Ok(())` for
+    /// best-effort side effects.
+    async fn after_create(
+        &self,
+        runtime: &KhiveRuntime,
+        id: uuid::Uuid,
+        args: &Value,
+    ) -> Result<(), RuntimeError>;
 }
 
 /// Builder for constructing a `VerbRegistry`.
@@ -93,7 +157,7 @@ impl VerbRegistry {
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
         for pack in self.packs.iter() {
             if pack.verbs().iter().any(|v| v.name == verb) {
-                return pack.dispatch(verb, params).await;
+                return pack.dispatch(verb, params, self).await;
             }
         }
         let available: Vec<&str> = self
@@ -107,8 +171,30 @@ impl VerbRegistry {
         )))
     }
 
+    /// Find a kind hook (ADR-030) among the registered packs.
+    ///
+    /// Walks packs in registration order; the first pack that both owns the
+    /// kind (declares it in `note_kinds()` or `entity_kinds()`) and returns
+    /// a hook from `kind_hook(kind)` wins. Returns `None` if the kind is
+    /// unknown to all packs or no owning pack registered a hook.
+    pub fn find_kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
+        for pack in self.packs.iter() {
+            let owns = pack.note_kinds().contains(&kind) || pack.entity_kinds().contains(&kind);
+            if owns {
+                if let Some(hook) = pack.kind_hook(kind) {
+                    return Some(hook);
+                }
+            }
+        }
+        None
+    }
+
     /// All verb definitions across all registered packs.
-    pub fn all_verbs(&self) -> Vec<&VerbDef> {
+    ///
+    /// Returned with `'static` lifetime since pack verbs are `&'static [VerbDef]`
+    /// constants — callers can keep the slice references beyond the registry's
+    /// borrow.
+    pub fn all_verbs(&self) -> Vec<&'static VerbDef> {
         self.packs.iter().flat_map(|p| p.verbs().iter()).collect()
     }
 
@@ -172,7 +258,12 @@ mod tests {
         fn verbs(&self) -> &'static [VerbDef] {
             AlphaPack::VERBS
         }
-        async fn dispatch(&self, verb: &str, _params: Value) -> Result<Value, RuntimeError> {
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+        ) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
         }
     }
@@ -209,7 +300,12 @@ mod tests {
         fn verbs(&self) -> &'static [VerbDef] {
             BetaPack::VERBS
         }
-        async fn dispatch(&self, verb: &str, _params: Value) -> Result<Value, RuntimeError> {
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+        ) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "pack": "beta", "verb": verb }))
         }
     }

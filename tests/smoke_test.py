@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """Smoke test for khive-mcp binary over stdio MCP.
 
-Spawns the binary with an in-memory DB, sends JSON-RPC MCP requests,
-and verifies the full verb-consolidated tool surface (ADR-023 + ADR-024)
-works end-to-end.
-
-11 tools: create, get, list, update, delete, merge, search,
-          link, neighbors, traverse, query.
-
-get/update/delete/merge auto-detect record kind from UUID — no kind= needed.
-get returns {"kind": "entity"|"note"|"edge", "data": {...}}.
+As of v0.2 the MCP surface is a single `request` tool (ADR-020) that dispatches
+verbs through the runtime VerbRegistry. The verb taxonomy from ADR-023 + ADR-024
+is unchanged — only the wire shape moved. The 11 kg verbs (create, get, list,
+update, delete, merge, search, link, neighbors, traverse, query) are reached as
+ops inside `request(ops="...")`.
 
 Usage:
     uv run python tests/smoke_test.py
@@ -51,19 +47,46 @@ def recv(proc):
     return json.loads(line)
 
 
-def call_tool(proc, name, args):
-    send(proc, "tools/call", {"name": name, "arguments": args})
+def _to_dsl_value(v):
+    # JSON literals are valid DSL value syntax.
+    return json.dumps(v, ensure_ascii=False)
+
+
+def _format_op(verb, args):
+    parts = [f"{k}={_to_dsl_value(v)}" for k, v in args.items()]
+    return f"{verb}({', '.join(parts)})"
+
+
+def _send_request(proc, ops_str):
+    send(proc, "tools/call", {"name": "request", "arguments": {"ops": ops_str}})
     resp = recv(proc)
     if "error" in resp:
-        raise RuntimeError(f"MCP error calling {name}: {resp['error']}")
+        raise RuntimeError(f"MCP error on request: {resp['error']}")
     result = resp.get("result", {})
     if result.get("isError"):
         content = result.get("content", [])
         text = content[0]["text"] if content else "(no text)"
-        raise RuntimeError(f"Tool {name} returned error: {text}")
+        raise RuntimeError(f"request returned error: {text}")
     content = result.get("content", [])
     text = content[0]["text"] if content else ""
     return json.loads(text) if text else None
+
+
+def call_tool(proc, verb, args):
+    """Run a single op through the request DSL and unwrap the result.
+
+    Maintains backward-compatible call sites — every prior `call_tool(proc, "create", {...})`
+    becomes `request(ops="create(...)")` under the hood. Raises on per-op failure.
+    """
+    op = _format_op(verb, args)
+    body = _send_request(proc, op)
+    results = body.get("results", [])
+    if not results:
+        raise RuntimeError(f"empty results for {verb}: {body}")
+    first = results[0]
+    if not first.get("ok"):
+        raise RuntimeError(f"verb {verb} failed: {first.get('error')}")
+    return first.get("result")
 
 
 def main():
@@ -93,19 +116,14 @@ def main():
         proc.stdin.write((json.dumps(notify) + "\n").encode())
         proc.stdin.flush()
 
-        # 2. List tools — expect exactly 11 verb tools (ADR-023 + ADR-024)
+        # 2. List tools — expect a single `request` tool (ADR-020)
         send(proc, "tools/list", {})
         tools_resp = recv(proc)
         tool_names = [t["name"] for t in tools_resp["result"]["tools"]]
         print(f"  [ok] tools/list — {len(tool_names)} tools: {', '.join(sorted(tool_names))}")
-        expected_tools = {
-            "create", "get", "list", "update", "delete", "merge",
-            "search", "link", "neighbors", "traverse", "query",
-        }
-        missing = expected_tools - set(tool_names)
-        assert not missing, f"Missing tools: {missing}"
-        assert "resolve" not in tool_names, "resolve must not exist (absorbed into get)"
-        assert len(tool_names) == 11, f"Expected 11 tools, got {len(tool_names)}: {tool_names}"
+        assert tool_names == ["request"], (
+            f"Expected ['request'], got {tool_names}"
+        )
 
         # 3. Create entities via create(kind="entity")
         lora = call_tool(proc, "create", {
@@ -300,7 +318,25 @@ def main():
         assert c["id"] in all_node_ids, "C must be reachable at depth 2"
         print(f"  [ok] traverse — depth-2 multi-hop")
 
-        print(f"\n  ALL 11 VERB TOOLS SMOKE TESTS PASSED")
+        # 23. Bonus: batch dispatch via request — two parallel ops in one MCP call.
+        batch_body = _send_request(
+            proc,
+            r'[create(kind="entity", entity_kind="concept", name="BatchA"), '
+            r'create(kind="entity", entity_kind="concept", name="BatchB")]',
+        )
+        assert batch_body["summary"]["succeeded"] == 2, f"batch failed: {batch_body}"
+        print(f"  [ok] request batch — 2 parallel ops succeeded")
+
+        # 24. Malformed DSL must surface as invalid_params, not silent success.
+        try:
+            _send_request(proc, "create(")
+            print("  [FAIL] malformed DSL was accepted")
+            return 1
+        except RuntimeError as e:
+            assert "expected" in str(e) or "invalid" in str(e), f"unexpected error: {e}"
+            print(f"  [ok] malformed DSL rejected at MCP boundary")
+
+        print(f"\n  ALL VERB-VIA-REQUEST SMOKE TESTS PASSED")
 
     finally:
         proc.stdin.close()
@@ -309,5 +345,63 @@ def main():
     return 0
 
 
+def gtd_smoke():
+    """Optional smoke test for the gtd pack — only runs if KHIVE_PACKS=...,gtd."""
+    proc = subprocess.Popen(
+        [
+            BINARY, "--db", ":memory:", "--no-embed", "--log", "error",
+            "--pack", "kg", "--pack", "gtd",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        send(proc, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "gtd-smoke", "version": "0.1.0"},
+        })
+        recv(proc)
+        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        proc.stdin.write((json.dumps(notify) + "\n").encode())
+        proc.stdin.flush()
+
+        # assign → next → complete round-trip
+        assigned = call_tool(proc, "assign", {
+            "title": "ship pack-gtd",
+            "status": "next",
+            "priority": "p0",
+        })
+        assert assigned["kind"] == "task"
+        assert assigned["status"] == "next"
+        print(f"  [gtd] assign — {assigned['title']!r} ({assigned['id']})")
+
+        ready = call_tool(proc, "next", {})
+        assert any(t["full_id"] == assigned["full_id"] for t in ready), (
+            f"assigned task not in next(): {ready}"
+        )
+        print(f"  [gtd] next — {len(ready)} actionable")
+
+        done = call_tool(proc, "complete", {
+            "id": assigned["full_id"],
+            "result": "smoke-test pass",
+        })
+        assert done["to"] == "done"
+        print(f"  [gtd] complete — transitioned to done")
+
+        print(f"\n  GTD PACK SMOKE TESTS PASSED")
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    if code == 0 and os.environ.get("KHIVE_SMOKE_GTD", "1") != "0":
+        try:
+            gtd_smoke()
+        except Exception as e:
+            print(f"  [gtd FAIL] {e}")
+            code = 2
+    sys.exit(code)

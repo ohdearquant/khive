@@ -49,13 +49,18 @@ Entities are _things_. Notes are _what you think about things_. Events are _what
 
 ## The MCP verb surface
 
-11 tools in v0.1, verb-shaped:
+One MCP tool: `request` (ADR-020). Every verb is a parsed op inside it.
 
 ```
-CRUD:     create  get  list  update  delete  merge
-Graph:    link  traverse  neighbors  query
-Search:   search
+request(ops="verb(arg=value, arg=value)")              # single op
+request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100)
+request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
+
+Default pack: **kg** (11 verbs — `create`, `get`, `list`, `update`, `delete`, `merge`, `search`,
+`link`, `neighbors`, `traverse`, `query`). Load the **gtd** pack alongside for task lifecycle
+(`KHIVE_PACKS=kg,gtd` or `--pack kg --pack gtd`) and get 5 more verbs: `assign`, `next`,
+`complete`, `tasks`, `transition`.
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only — they auto-detect the record type.
@@ -70,16 +75,17 @@ No language SDK to learn.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-mcp       — Rust binary (stdio MCP server)            │
-│  Thin dispatch shell — routes verbs to packs via registry.   │
+│  Single `request` tool → parses DSL → dispatches each op.    │
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-pack-kg   — KG vocabulary + 11 verb handlers          │
+│  khive-pack-gtd  — task lifecycle (5 verbs, optional)        │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-runtime, khive-query, khive-db, khive-storage,        │
-│  khive-score, khive-types                                    │
+│  khive-runtime, khive-request, khive-query, khive-db,        │
+│  khive-storage, khive-score, khive-types                     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -92,18 +98,20 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ## Crates
 
-| Crate           | Purpose                                              |
-| --------------- | ---------------------------------------------------- |
-| `khive-types`   | Domain types, Pack trait, closed enums               |
-| `khive-score`   | Deterministic i64 fixed-point scoring                |
-| `khive-storage` | Trait-only capability surface (zero implementations) |
-| `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges        |
-| `khive-query`   | SPARQL / GQL → SQL compiler                          |
-| `khive-runtime` | Service API + VerbRegistry + PackRuntime trait       |
-| `khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation  |
-| `khive-mcp`     | Stdio MCP binary — thin dispatch over VerbRegistry   |
+| Crate             | Purpose                                                                                 |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| `khive-types`     | Domain types, Pack trait, closed enums                                                  |
+| `khive-score`    | Deterministic i64 fixed-point scoring                                                   |
+| `khive-storage`   | Trait-only capability surface (zero implementations)                                    |
+| `khive-db`        | SQLite backend: sqlite-vec, FTS5, graph edges                                           |
+| `khive-query`     | SPARQL / GQL → SQL compiler                                                             |
+| `khive-runtime`   | Service API + VerbRegistry + PackRuntime trait                                          |
+| `khive-request`   | Request DSL parser (function-call, JSON; pipe / LNDL planned). Transport-agnostic AST.  |
+| `khive-pack-kg`   | KG pack: vocabulary, verb handlers, kind validation                                     |
+| `khive-pack-gtd`  | GTD pack: task lifecycle over the notes substrate (loaded via `KHIVE_PACKS`)            |
+| `khive-mcp`       | Stdio MCP binary — single `request` tool dispatching through the VerbRegistry           |
 
-Dependency direction: `types → score → storage → db → query → runtime → pack-kg → mcp`.
+Dependency direction: `types → score → storage → db → query → runtime → request → pack-kg / pack-gtd → mcp`.
 Storage is trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without
 touching consumers.
 
@@ -140,12 +148,15 @@ Add to your project's `.mcp.json` (or `~/.claude/mcp.json` for global):
 }
 ```
 
-That's it. Claude Code will auto-discover the 11 tools. Your agent can immediately:
+That's it. Claude Code auto-discovers the single `request` tool; the agent expresses verbs as DSL ops:
 
 ```
-create(kind="entity", entity_kind="concept", name="LoRA", description="Low-Rank Adaptation")
-search(kind="entity", query="parameter efficient fine-tuning")
-link(source_id="<lora-uuid>", target_id="<qlora-uuid>", relation="variant_of")
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
+request(ops="search(kind=\"entity\", query=\"parameter efficient fine-tuning\")")
+request(ops="link(source_id=\"<lora-uuid>\", target_id=\"<qlora-uuid>\", relation=\"variant_of\")")
+
+# Or batched in one call:
+request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"A\"), create(kind=\"entity\", entity_kind=\"concept\", name=\"B\")]")
 ```
 
 ### Claude Code plugin (skills + agent)

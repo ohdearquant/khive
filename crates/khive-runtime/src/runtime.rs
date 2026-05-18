@@ -21,6 +21,23 @@ pub struct RuntimeConfig {
     /// Local embedding model. `None` disables embedding and hybrid vector search;
     /// `hybrid_search` then falls back to text-only.
     pub embedding_model: Option<EmbeddingModel>,
+    /// Names of packs the transport layer should register into the VerbRegistry.
+    /// The transport layer (e.g. `khive-mcp`) reads this list and instantiates
+    /// the matching concrete pack types. Unknown names are reported as errors
+    /// by the transport, not silently ignored.
+    /// Default: `["kg"]`.
+    pub packs: Vec<String>,
+}
+
+/// Parse a comma- or whitespace-separated pack list from a single string.
+///
+/// Empty entries are dropped, surrounding whitespace is trimmed.
+pub fn parse_pack_list(s: &str) -> Vec<String> {
+    s.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 impl Default for RuntimeConfig {
@@ -32,10 +49,16 @@ impl Default for RuntimeConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .or(Some(EmbeddingModel::AllMiniLmL6V2));
+        let packs = std::env::var("KHIVE_PACKS")
+            .ok()
+            .map(|s| parse_pack_list(&s))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["kg".to_string()]);
         Self {
             db_path,
             default_namespace: "local".to_string(),
             embedding_model,
+            packs,
         }
     }
 }
@@ -76,6 +99,7 @@ impl KhiveRuntime {
             db_path: None,
             default_namespace: "local".to_string(),
             embedding_model: None,
+            packs: vec!["kg".to_string()],
         })
     }
 
@@ -212,6 +236,7 @@ mod tests {
             db_path: Some(path.clone()),
             default_namespace: "test".to_string(),
             embedding_model: None,
+            packs: vec!["kg".to_string()],
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -258,6 +283,40 @@ mod tests {
             vec_model_key(EmbeddingModel::AllMiniLmL6V2),
             "all_minilm_l6_v2"
         );
+    }
+
+    #[test]
+    fn parse_pack_list_handles_comma_and_whitespace() {
+        assert_eq!(parse_pack_list("kg"), vec!["kg".to_string()]);
+        assert_eq!(
+            parse_pack_list("kg,gtd"),
+            vec!["kg".to_string(), "gtd".to_string()]
+        );
+        assert_eq!(
+            parse_pack_list("  kg ,  gtd  "),
+            vec!["kg".to_string(), "gtd".to_string()]
+        );
+        assert_eq!(
+            parse_pack_list("kg gtd"),
+            vec!["kg".to_string(), "gtd".to_string()]
+        );
+        assert_eq!(parse_pack_list(",,"), Vec::<String>::new());
+        assert_eq!(parse_pack_list(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn default_config_packs_falls_back_to_kg() {
+        let prior = std::env::var("KHIVE_PACKS").ok();
+        unsafe {
+            std::env::remove_var("KHIVE_PACKS");
+        }
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.packs, vec!["kg".to_string()]);
+        if let Some(v) = prior {
+            unsafe {
+                std::env::set_var("KHIVE_PACKS", v);
+            }
+        }
     }
 
     #[test]

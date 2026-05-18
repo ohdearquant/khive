@@ -9,6 +9,7 @@ members = [
     "khive-runtime",
     "khive-request",
     "khive-pack-kg",
+    "khive-pack-gtd",
     "khive-mcp",
 ]
 

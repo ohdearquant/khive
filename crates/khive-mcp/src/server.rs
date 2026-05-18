@@ -2,7 +2,8 @@
 //!
 //! The MCP surface is intentionally minimal: one tool (`request`) that accepts
 //! a function-call DSL or JSON form (ADR-020) and dispatches each parsed
-//! operation through the [`VerbRegistry`] built from the loaded packs.
+//! operation through the [`VerbRegistry`] built from the packs declared in
+//! [`khive_runtime::RuntimeConfig::packs`].
 //!
 //! ## Why a single tool
 //!
@@ -12,7 +13,7 @@
 //! - the `request` tool's description (terse list, per-pack);
 //! - each pack's marketplace plugin SKILL.md files (rich usage guides).
 //!
-//! Tool discovery happens once per session anyway, so collapsing N flat tools
+//! Tool discovery happens once per session anyway, so collapsing 16+ flat tools
 //! into one keeps tool-list latency low and frees agent context budget while
 //! preserving expressiveness through the DSL.
 
@@ -25,6 +26,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 
+use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
 use khive_request::{parse_request, DslError, ParsedOp};
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
@@ -37,17 +39,87 @@ pub struct KhiveMcpServer {
     registry: VerbRegistry,
 }
 
+/// Returned by [`KhiveMcpServer::with_packs`] when a name in the requested pack
+/// list doesn't map to a known built-in pack. The original runtime is returned
+/// so the caller can recover (e.g. retry with a smaller list).
+pub struct PackRegError {
+    pub unknown: String,
+    pub runtime: KhiveRuntime,
+}
+
+impl std::fmt::Debug for PackRegError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackRegError")
+            .field("unknown", &self.unknown)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for PackRegError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown pack name {:?} — built-in packs: kg, gtd",
+            self.unknown
+        )
+    }
+}
+
+impl std::error::Error for PackRegError {}
+
+/// Built-in pack names known to this binary. Kept in sync with
+/// [`KhiveMcpServer::with_packs`] so error messages and CLI help stay accurate.
+pub const BUILTIN_PACKS: &[&str] = &["kg", "gtd"];
+
 impl KhiveMcpServer {
-    /// Build a server registering the kg pack against the given runtime.
+    /// Build a server using the pack list from `runtime.config().packs`.
     ///
-    /// Future PRs introduce a multi-pack constructor that reads
-    /// `runtime.config().packs` to select which packs to register.
+    /// Always returns a server. Unknown pack names are logged via `tracing::warn!`
+    /// rather than rejected — startup must remain robust if a future binary drops
+    /// a pack that an older config still names. Use [`Self::with_packs`] for
+    /// strict validation in tests / programmatic callers.
     pub fn new(runtime: KhiveRuntime) -> Self {
+        let packs: Vec<String> = runtime.config().packs.clone();
+        Self::with_packs(runtime, &packs).unwrap_or_else(|err| {
+            tracing::warn!("pack registration: {err}; falling back to kg only");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(err.runtime));
+            Self {
+                registry: builder.build(),
+            }
+        })
+    }
+
+    /// Build a server with an explicit pack list (strict — fails on unknown names).
+    // The error variant intentionally carries the runtime by value so callers
+    // can recover and retry. Boxing would force every recovery path through a
+    // deref for no real benefit.
+    #[allow(clippy::result_large_err)]
+    pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
         let mut builder = VerbRegistryBuilder::new();
-        builder.register(KgPack::new(runtime));
-        Self {
-            registry: builder.build(),
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for name in packs {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            match name.as_str() {
+                "kg" => {
+                    builder.register(KgPack::new(runtime.clone()));
+                }
+                "gtd" => {
+                    builder.register(GtdPack::new(runtime.clone()));
+                }
+                other => {
+                    return Err(PackRegError {
+                        unknown: other.to_string(),
+                        runtime,
+                    });
+                }
+            }
         }
+        Ok(Self {
+            registry: builder.build(),
+        })
     }
 
     /// Serve over stdio (blocks until the connection closes).
@@ -132,9 +204,9 @@ Response shape:
 
 A failed op does NOT abort the batch. Each entry has its own ok / error.
 
-Verb discovery: install the `kg` plugin for usage skills. The verbs currently
-registered on this server (pack-derived) are listed below. Argument schemas
-live in each pack's docs and SKILL.md files.
+Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
+currently registered on this server (pack-derived) are listed below. Argument
+schemas live in each pack's docs and SKILL.md files.
 
 Tip: for one-shot calls, the single-op form is the densest. Use batch when
 several independent ops can run together (e.g. bulk create + link)."#)]
@@ -156,7 +228,8 @@ impl ServerHandler for KhiveMcpServer {
         let catalog = self.verb_catalog();
         let instructions = format!(
             "khive — request-only MCP surface (ADR-020 + ADR-025). One tool, `request`, \
-             dispatches verbs through the loaded pack registry. Verbs registered on this \
+             dispatches verbs through the loaded pack registry. Configure packs via \
+             KHIVE_PACKS or --pack (built-ins: kg, gtd). Verbs registered on this \
              server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
              plugin's SKILL.md files."
         );
