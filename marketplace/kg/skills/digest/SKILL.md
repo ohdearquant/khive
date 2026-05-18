@@ -7,6 +7,15 @@ description: Ingest research material into the knowledge graph — papers, conce
 You have material to add to the knowledge graph. This skill walks you through a complete
 ingestion: extract → create → link → annotate → verify.
 
+The MCP server exposes one tool — `request` — that takes the verb call as a string:
+
+```text
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
+request(ops="[create(...), create(...), link(...)]")   # parallel batch
+```
+
+The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
+
 ## Workflow
 
 ### 1. Check what already exists

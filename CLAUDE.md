@@ -48,8 +48,8 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-mcp     — stdio MCP server (the only binary)          │
-│  11 verb tools: create get list update delete merge          │
-│                 search link neighbors traverse query         │
+│  1 tool: `request` (ADR-020 + ADR-027) — parses DSL,         │
+│  dispatches verb ops through the VerbRegistry                │
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
@@ -58,6 +58,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-runtime — composable Service API + VerbRegistry       │
+│  khive-request — DSL parser (function-call + JSON forms)     │
 │  khive-query   — GQL/SPARQL → SQL compiler                   │
 │  khive-db      — SQLite + sqlite-vec + FTS5                  │
 │  khive-storage — trait-only capability surface               │
@@ -66,27 +67,31 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Dependency chain: `types → score → storage → db → query → runtime → pack-kg → mcp`.
+Dependency chain (storage stack): `types → score → storage → db → query → runtime → pack-kg → mcp`.
+Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
+packs do not depend on it).
 
-Future layers (HTTP gateway, CLI, frontend) are planned but not shipped.
+Future layers (HTTP gateway, CLI, frontend, and a second `gtd` pack) are planned but not
+shipped in this surface change.
 
 ---
 
 ## Directory map
 
-| Path                   | Purpose                                                     |
-| ---------------------- | ----------------------------------------------------------- |
-| `crates/khive-types`   | Domain types: Entity, Note, Event, EntityKind, EdgeRelation |
-| `crates/khive-score`   | Deterministic i64 fixed-point scoring + RRF                 |
-| `crates/khive-storage` | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch  |
-| `crates/khive-db`      | SQLite backend + sqlite-vec + FTS5 trigram                  |
-| `crates/khive-query`   | GQL + SPARQL parsers, AST validation, SQL compiler          |
-| `crates/khive-runtime` | Service API + VerbRegistry + PackRuntime trait              |
-| `crates/khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation         |
-| `crates/khive-mcp`     | Stdio MCP binary — thin dispatch shell over VerbRegistry    |
-| `docs/adr/`            | Architecture Decision Records (the design contract)         |
-| `tests/smoke_test.py`  | End-to-end binary smoke test (all 11 tools)                 |
-| `scripts/publish.sh`   | Publish all crates to crates.io in dependency order         |
+| Path                   | Purpose                                                         |
+| ---------------------- | --------------------------------------------------------------- |
+| `crates/khive-types`   | Domain types: Entity, Note, Event, EntityKind, EdgeRelation     |
+| `crates/khive-score`   | Deterministic i64 fixed-point scoring + RRF                     |
+| `crates/khive-storage` | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch      |
+| `crates/khive-db`      | SQLite backend + sqlite-vec + FTS5 trigram                      |
+| `crates/khive-query`   | GQL + SPARQL parsers, AST validation, SQL compiler              |
+| `crates/khive-runtime` | Service API + VerbRegistry + PackRuntime trait                  |
+| `crates/khive-request` | Request DSL parser (function-call + JSON forms)                 |
+| `crates/khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation             |
+| `crates/khive-mcp`     | Stdio MCP binary — exposes one `request` tool over VerbRegistry |
+| `docs/adr/`            | Architecture Decision Records (the design contract)             |
+| `tests/smoke_test.py`  | End-to-end binary smoke test (drives every verb via `request`)  |
+| `scripts/publish.sh`   | Publish all crates to crates.io in dependency order             |
 
 ---
 
@@ -116,9 +121,26 @@ not silently accepted.
 
 ---
 
-## MCP tool surface (11 tools, v0.1)
+## MCP tool surface (one tool: `request`, v0.2 — ADR-020 + ADR-027)
 
-| Tool        | Params                                | What it does                                                  |
+The MCP server exposes a single tool named `request` that accepts a verb-dispatch DSL string
+and routes each parsed op through the loaded packs. Verb taxonomy and semantics are unchanged
+from ADR-023 — only the wire shape moved.
+
+```
+# Single op
+request(ops="verb(arg=value, arg=value)")
+
+# Parallel batch (max 100, no inter-op ordering)
+request(ops="[v1(...), v2(...), v3(...)]")
+
+# JSON form (equivalent)
+request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
+```
+
+### KG pack verbs (11 — ADR-023 + ADR-024)
+
+| Verb        | Args                                  | What it does                                                  |
 | ----------- | ------------------------------------- | ------------------------------------------------------------- |
 | `create`    | `kind=entity\|note` + fields          | Create an entity or note                                      |
 | `get`       | `id` (UUID)                           | Fetch any record — auto-detects entity/note/edge              |
@@ -134,6 +156,10 @@ not silently accepted.
 
 `get`/`update`/`delete`/`merge` are UUID-only — no `kind` needed, the handler resolves
 the substrate from the UUID. `create`/`list`/`search` require `kind`.
+
+Each op returns `{ok: true, tool, result}` or `{ok: false, tool, error}`. A failed op does
+NOT abort the batch — each entry has its own ok/error. The aggregate response also carries
+`summary: {total, succeeded, failed}`.
 
 ---
 
@@ -160,13 +186,20 @@ the substrate from the UUID. `create`/`list`/`search` require `kind`.
 
 ### MCP tool changes
 
-- Tool params live in `crates/khive-mcp/src/tools/<verb>.rs` (schema only — `Serialize + Deserialize + JsonSchema`).
-- MCP server (`crates/khive-mcp/src/server.rs`) is a thin dispatch shell — no business logic.
+- The MCP server exposes exactly one tool: `request` (ADR-027). There are no per-verb tool
+  files — the only schema in `crates/khive-mcp/src/tools/` is `request.rs` (the `RequestParams`
+  struct).
+- DSL parsing lives in the `khive-request` crate (ADR-028). Edits to the parser go there,
+  not in `khive-mcp`.
+- MCP server (`crates/khive-mcp/src/server.rs`) is a thin dispatch shell — calls
+  `khive_request::parse_request`, then routes each parsed op through the registry. No
+  business logic.
 - **Verb handler logic lives in the pack** (`crates/khive-pack-kg/src/handlers.rs`).
 - Runtime methods live in `crates/khive-runtime/src/operations.rs` (or `curation.rs`,
   `retrieval.rs`, `graph_traversal.rs`).
-- **Invalid inputs return `McpError::invalid_params`** with the full list of valid values.
-  Never silently coerce.
+- **Invalid DSL** (parse/lex failure) returns RPC-level `McpError::invalid_params` from
+  `request`. **Per-verb validation failure** (unknown kind, bad UUID, etc.) returns a per-op
+  `{ok: false, error: "..."}` entry — the batch does not abort.
 
 ### Namespace isolation
 
@@ -198,7 +231,7 @@ make fmt-check  # verify without modifying
 make build      # cargo build --workspace --release
 
 # Publish to crates.io
-make publish-dry  # dry run — validates all 7 crates
+make publish-dry  # dry run — validates all workspace crates
 make publish      # live publish in dependency order
 ```
 
@@ -213,7 +246,9 @@ Conventional commits with crate scope: `feat(query): add SPARQL property filter`
 - **Verify before claiming complete.** Run the test, check the output.
 - **Report outcomes faithfully.** If tests fail, say so.
 - **Integration > unit** for the MCP surface — the value is in the composition.
-- **Smoke test**: `python3 tests/smoke_test.py` exercises all 11 tools end-to-end.
+- **Smoke test**: `python3 tests/smoke_test.py` exercises every KG verb end-to-end through the
+  `request` tool — asserts `tools/list` returns only `request` and that its description carries
+  the full verb catalog.
 
 ---
 
@@ -224,16 +259,19 @@ ADRs specify. Changing the schema or interface requires an ADR **before** code l
 
 Key ADRs for contributors:
 
-| ADR                                                      | What it governs                                    |
-| -------------------------------------------------------- | -------------------------------------------------- |
-| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)          | 6 entity kinds — don't add without this            |
-| [002](docs/adr/ADR-002-edge-ontology.md)                 | 13 edge relations — closed set                     |
-| [005](docs/adr/ADR-005-storage-capability-traits.md)     | Storage traits — the abstraction boundary          |
-| [008](docs/adr/ADR-008-query-layer-separation.md)        | Query crate — parser/validator/compiler separation |
-| [019](docs/adr/ADR-019-note-kind-taxonomy.md)            | 5 note kinds                                       |
-| [022](docs/adr/ADR-022-schema-migrations.md)             | Migration system — how to change the DB schema     |
-| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md) | 11 MCP tools — the public contract                 |
-| [025](docs/adr/ADR-025-pack-standard.md)                 | Pack trait — composable vocabulary extension       |
+| ADR                                                      | What it governs                                      |
+| -------------------------------------------------------- | ---------------------------------------------------- |
+| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)          | 6 entity kinds — don't add without this              |
+| [002](docs/adr/ADR-002-edge-ontology.md)                 | 13 edge relations — closed set                       |
+| [005](docs/adr/ADR-005-storage-capability-traits.md)     | Storage traits — the abstraction boundary            |
+| [008](docs/adr/ADR-008-query-layer-separation.md)        | Query crate — parser/validator/compiler separation   |
+| [019](docs/adr/ADR-019-note-kind-taxonomy.md)            | 5 note kinds                                         |
+| [020](docs/adr/ADR-020-request-dsl.md)                   | Request DSL — verb-dispatch syntax for `request`     |
+| [022](docs/adr/ADR-022-schema-migrations.md)             | Migration system — how to change the DB schema       |
+| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md) | Verb taxonomy (wire shape now via `request`)         |
+| [025](docs/adr/ADR-025-pack-standard.md)                 | Pack trait — composable vocabulary extension         |
+| [027](docs/adr/ADR-027-single-tool-mcp-surface.md)       | Single-tool MCP surface — `request` is the only tool |
+| [028](docs/adr/ADR-028-request-parser-crate.md)          | Parser crate split — `khive-request`                 |
 
 Full index: [docs/adr/README.md](docs/adr/README.md).
 
@@ -241,18 +279,19 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
 
 ## What lives where
 
-| Want to do...           | Edit this                                                                                    |
-| ----------------------- | -------------------------------------------------------------------------------------------- |
-| Add a new MCP tool      | `crates/khive-mcp/src/tools/` (params) + pack handler                                        |
-| Add a verb handler      | `crates/khive-pack-kg/src/handlers.rs`                                                       |
-| Add a runtime operation | `crates/khive-runtime/src/operations.rs`                                                     |
-| Change DB schema        | `crates/khive-db/src/migrations.rs` (new version) + store DDL                                |
-| Add a new entity kind   | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                      |
-| Add a new edge relation | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                         |
-| Add a new note kind     | `crates/khive-pack-kg/src/vocab.rs` + ADR-019 amendment                                      |
-| Add a new pack          | New crate implementing `Pack` + `PackRuntime` ([ADR-025](docs/adr/ADR-025-pack-standard.md)) |
-| Fix a query parser bug  | `crates/khive-query/src/parsers/` + add regression test                                      |
-| Fix a storage bug       | `crates/khive-db/src/stores/` + test                                                         |
+| Want to do...            | Edit this                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Add a new verb           | Pack handler in `crates/khive-pack-kg/src/handlers.rs` (or your pack); the MCP surface is `request` — no per-verb tool file to author |
+| Change DSL syntax        | `crates/khive-request/src/lib.rs` + unit tests (ADR-020, ADR-028)                                                                     |
+| Change MCP surface shape | `crates/khive-mcp/src/server.rs` (ADR-027 — `request` is the only tool)                                                               |
+| Add a runtime operation  | `crates/khive-runtime/src/operations.rs`                                                                                              |
+| Change DB schema         | `crates/khive-db/src/migrations.rs` (new version) + store DDL                                                                         |
+| Add a new entity kind    | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                                                               |
+| Add a new edge relation  | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                                                                  |
+| Add a new note kind      | `crates/khive-pack-kg/src/vocab.rs` + ADR-019 amendment                                                                               |
+| Add a new pack           | New crate implementing `Pack` + `PackRuntime` ([ADR-025](docs/adr/ADR-025-pack-standard.md))                                          |
+| Fix a query parser bug   | `crates/khive-query/src/parsers/` + add regression test                                                                               |
+| Fix a storage bug        | `crates/khive-db/src/stores/` + test                                                                                                  |
 
 ---
 

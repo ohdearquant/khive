@@ -49,12 +49,20 @@ Entities are _things_. Notes are _what you think about things_. Events are _what
 
 ## The MCP verb surface
 
-11 tools in v0.1, verb-shaped:
+One MCP tool (`request`), 11 verbs inside it:
 
 ```
 CRUD:     create  get  list  update  delete  merge
 Graph:    link  traverse  neighbors  query
 Search:   search
+```
+
+Verbs are dispatched through a single tool that accepts a function-call DSL or JSON form
+(ADR-020 + ADR-027):
+
+```text
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
+request(ops="[create(...), create(...), link(...)]")   # parallel batch
 ```
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
@@ -70,7 +78,7 @@ No language SDK to learn.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-mcp       — Rust binary (stdio MCP server)            │
-│  Thin dispatch shell — routes verbs to packs via registry.   │
+│  1 tool: `request` (ADR-020) — parses DSL, dispatches ops    │
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
@@ -78,8 +86,8 @@ No language SDK to learn.
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-runtime, khive-query, khive-db, khive-storage,        │
-│  khive-score, khive-types                                    │
+│  khive-runtime, khive-request, khive-query, khive-db,        │
+│  khive-storage, khive-score, khive-types                     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -100,10 +108,13 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 | `khive-db`      | SQLite backend: sqlite-vec, FTS5, graph edges        |
 | `khive-query`   | SPARQL / GQL → SQL compiler                          |
 | `khive-runtime` | Service API + VerbRegistry + PackRuntime trait       |
+| `khive-request` | Request DSL parser (function-call + JSON forms)      |
 | `khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation  |
-| `khive-mcp`     | Stdio MCP binary — thin dispatch over VerbRegistry   |
+| `khive-mcp`     | Stdio MCP binary — exposes one `request` tool        |
 
-Dependency direction: `types → score → storage → db → query → runtime → pack-kg → mcp`.
+Dependency direction (storage stack): `types → score → storage → db → query → runtime → pack-kg → mcp`.
+Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
+packs do not depend on it).
 Storage is trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without
 touching consumers.
 
@@ -140,12 +151,13 @@ Add to your project's `.mcp.json` (or `~/.claude/mcp.json` for global):
 }
 ```
 
-That's it. Claude Code will auto-discover the 11 tools. Your agent can immediately:
+That's it. Claude Code will auto-discover the `request` tool (the verb catalog is rendered in its
+description). Your agent can immediately:
 
-```
-create(kind="entity", entity_kind="concept", name="LoRA", description="Low-Rank Adaptation")
-search(kind="entity", query="parameter efficient fine-tuning")
-link(source_id="<lora-uuid>", target_id="<qlora-uuid>", relation="variant_of")
+```text
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\", description=\"Low-Rank Adaptation\")")
+request(ops="search(kind=\"entity\", query=\"parameter efficient fine-tuning\")")
+request(ops="link(source_id=\"<lora-uuid>\", target_id=\"<qlora-uuid>\", relation=\"variant_of\")")
 ```
 
 ### Claude Code plugin (skills + agent)
@@ -206,9 +218,10 @@ make ci  # Full CI: fmt, clippy, test, build
 
 ## Status
 
-**v0.1.2 — published on [crates.io](https://crates.io/crates/khive-mcp).** 8 crates, 11 MCP tools,
-pack-based verb dispatch, hybrid search with local embeddings, GQL/SPARQL queries. Ready for use
-with Claude Code and any MCP-compatible agent.
+**v0.1.2 — published on [crates.io](https://crates.io/crates/khive-mcp).** 9 crates, one
+`request` MCP tool dispatching 11 KG verbs through a DSL, pack-based verb dispatch, hybrid
+search with local embeddings, GQL/SPARQL queries. Ready for use with Claude Code and any
+MCP-compatible agent.
 
 ## License
 

@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Smoke test for khive-mcp binary over stdio MCP.
 
-Spawns the binary with an in-memory DB, sends JSON-RPC MCP requests,
-and verifies the full verb-consolidated tool surface (ADR-023 + ADR-024)
-works end-to-end.
+Spawns the binary with an in-memory DB, sends JSON-RPC MCP requests, and
+verifies the full verb-consolidated surface works end-to-end. As of v0.2 the
+MCP server exposes a single tool, `request`, that accepts a function-call DSL
+or JSON-form batch; every verb is reached through it.
 
-11 tools: create, get, list, update, delete, merge, search,
-          link, neighbors, traverse, query.
-
-get/update/delete/merge auto-detect record kind from UUID — no kind= needed.
-get returns {"kind": "entity"|"note"|"edge", "data": {...}}.
+Verb semantics (unchanged from v0.1): create, get, list, update, delete, merge,
+search, link, neighbors, traverse, query. get/update/delete/merge auto-detect
+record kind from UUID — no kind= needed. get returns {"kind": "entity"|"note"|"edge", "data": {...}}.
 
 Usage:
     uv run python tests/smoke_test.py
@@ -51,19 +50,39 @@ def recv(proc):
     return json.loads(line)
 
 
-def call_tool(proc, name, args):
-    send(proc, "tools/call", {"name": name, "arguments": args})
+def _call_request_raw(proc, ops_string):
+    """Send `request(ops=<ops_string>)`. Return the parsed response body."""
+    send(proc, "tools/call", {"name": "request", "arguments": {"ops": ops_string}})
     resp = recv(proc)
     if "error" in resp:
-        raise RuntimeError(f"MCP error calling {name}: {resp['error']}")
+        raise RuntimeError(f"MCP error calling request: {resp['error']}")
     result = resp.get("result", {})
     if result.get("isError"):
         content = result.get("content", [])
         text = content[0]["text"] if content else "(no text)"
-        raise RuntimeError(f"Tool {name} returned error: {text}")
+        raise RuntimeError(f"request returned protocol error: {text}")
     content = result.get("content", [])
     text = content[0]["text"] if content else ""
     return json.loads(text) if text else None
+
+
+def call_verb(proc, name, args):
+    """Call a single verb through `request`. Return that verb's result, or raise on per-op error.
+
+    The wire shape is the single `request` MCP tool (ADR-027). Tests express
+    intent in terms of verbs; this helper handles the encoding/unwrapping.
+    """
+    ops = json.dumps([{"tool": name, "args": args}])
+    body = _call_request_raw(proc, ops)
+    if body is None:
+        raise RuntimeError(f"request returned empty body for verb {name}")
+    results = body.get("results") or []
+    if not results:
+        raise RuntimeError(f"request returned no results for verb {name}: {body}")
+    first = results[0]
+    if not first.get("ok", False):
+        raise RuntimeError(f"verb {name} failed: {first.get('error', '<no error string>')}")
+    return first.get("result")
 
 
 def main():
@@ -93,22 +112,28 @@ def main():
         proc.stdin.write((json.dumps(notify) + "\n").encode())
         proc.stdin.flush()
 
-        # 2. List tools — expect exactly 11 verb tools (ADR-023 + ADR-024)
+        # 2. List tools — must be exactly `request` (ADR-027 single-tool surface).
+        #    The request tool's description must include each KG verb so MCP
+        #    clients can discover them via `tools/list`.
         send(proc, "tools/list", {})
         tools_resp = recv(proc)
-        tool_names = [t["name"] for t in tools_resp["result"]["tools"]]
-        print(f"  [ok] tools/list — {len(tool_names)} tools: {', '.join(sorted(tool_names))}")
-        expected_tools = {
+        tools = tools_resp["result"]["tools"]
+        tool_names = [t["name"] for t in tools]
+        assert tool_names == ["request"], (
+            f"expected exactly [request], got {tool_names}"
+        )
+        request_desc = tools[0].get("description") or ""
+        for verb in (
             "create", "get", "list", "update", "delete", "merge",
             "search", "link", "neighbors", "traverse", "query",
-        }
-        missing = expected_tools - set(tool_names)
-        assert not missing, f"Missing tools: {missing}"
-        assert "resolve" not in tool_names, "resolve must not exist (absorbed into get)"
-        assert len(tool_names) == 11, f"Expected 11 tools, got {len(tool_names)}: {tool_names}"
+        ):
+            assert verb in request_desc, (
+                f"request description missing verb {verb!r}; got:\n{request_desc}"
+            )
+        print(f"  [ok] tools/list — single `request` tool; description lists 11 verbs")
 
-        # 3. Create entities via create(kind="entity")
-        lora = call_tool(proc, "create", {
+        # 3. Create entities
+        lora = call_verb(proc, "create", {
             "kind": "entity",
             "entity_kind": "concept",
             "name": "LoRA",
@@ -119,7 +144,7 @@ def main():
         lora_id = lora["id"]
         print(f"  [ok] create entity — LoRA ({lora_id[:8]}...)")
 
-        qlora = call_tool(proc, "create", {
+        qlora = call_verb(proc, "create", {
             "kind": "entity",
             "entity_kind": "concept",
             "name": "QLoRA",
@@ -128,7 +153,7 @@ def main():
         qlora_id = qlora["id"]
         print(f"  [ok] create entity — QLoRA ({qlora_id[:8]}...)")
 
-        paper = call_tool(proc, "create", {
+        paper = call_verb(proc, "create", {
             "kind": "entity",
             "entity_kind": "document",
             "name": "LoRA: Low-Rank Adaptation of Large Language Models",
@@ -138,18 +163,18 @@ def main():
         print(f"  [ok] create entity — paper ({paper_id[:8]}...)")
 
         # 4. Get entity via get (auto-detects kind; returns {"kind": "entity", "data": {...}})
-        fetched = call_tool(proc, "get", {"id": lora_id})
+        fetched = call_verb(proc, "get", {"id": lora_id})
         assert fetched["kind"] == "entity", f"expected kind=entity, got: {fetched}"
         assert fetched["data"]["name"] == "LoRA", f"unexpected: {fetched}"
         print(f"  [ok] get entity — wrapped response kind={fetched['kind']}")
 
-        # 5. List entities via list(kind="entity")
-        entities = call_tool(proc, "list", {"kind": "entity", "entity_kind": "concept"})
+        # 5. List entities
+        entities = call_verb(proc, "list", {"kind": "entity", "entity_kind": "concept"})
         assert len(entities) == 2, f"expected 2 concepts, got {len(entities)}"
         print(f"  [ok] list entities — {len(entities)} concepts")
 
         # 6. Create edges via link
-        edge1 = call_tool(proc, "link", {
+        edge1 = call_verb(proc, "link", {
             "source_id": qlora_id,
             "target_id": lora_id,
             "relation": "variant_of",
@@ -158,7 +183,7 @@ def main():
         assert edge1["relation"] == "variant_of"
         print(f"  [ok] link — QLoRA variant_of LoRA")
 
-        edge2 = call_tool(proc, "link", {
+        call_verb(proc, "link", {
             "source_id": paper_id,
             "target_id": lora_id,
             "relation": "introduced_by",
@@ -166,40 +191,40 @@ def main():
         })
         print(f"  [ok] link — paper introduced_by LoRA")
 
-        # 7. Get edge via get (auto-detects kind; returns {"kind": "edge", "data": {...}})
+        # 7. Get edge via get (auto-detects kind)
         edge_id = edge1["id"]
-        fetched_edge = call_tool(proc, "get", {"id": edge_id})
+        fetched_edge = call_verb(proc, "get", {"id": edge_id})
         assert fetched_edge["kind"] == "edge", f"expected kind=edge, got: {fetched_edge}"
         print(f"  [ok] get edge — wrapped response kind={fetched_edge['kind']}")
 
-        # 8. Neighbors via neighbors
-        nbrs = call_tool(proc, "neighbors", {
+        # 8. Neighbors
+        nbrs = call_verb(proc, "neighbors", {
             "node_id": lora_id,
             "direction": "in",
         })
         assert len(nbrs) == 2, f"expected 2 inbound neighbors, got {len(nbrs)}"
         print(f"  [ok] neighbors — {len(nbrs)} inbound to LoRA")
 
-        # 9. Edge list via list(kind="edge")
-        edges = call_tool(proc, "list", {"kind": "edge", "source_id": qlora_id})
+        # 9. Edge list
+        edges = call_verb(proc, "list", {"kind": "edge", "source_id": qlora_id})
         assert len(edges) == 1
         print(f"  [ok] list edges")
 
-        # 10. Edge update via update (auto-detects kind from UUID)
-        updated_edge = call_tool(proc, "update", {"id": edge_id, "weight": 0.95})
+        # 10. Edge update (auto-detects kind from UUID)
+        updated_edge = call_verb(proc, "update", {"id": edge_id, "weight": 0.95})
         assert abs(updated_edge["weight"] - 0.95) < 0.01
         print(f"  [ok] update edge weight")
 
-        # 11. Entity update via update (auto-detects kind from UUID)
-        patched = call_tool(proc, "update", {
+        # 11. Entity update (auto-detects kind from UUID)
+        patched = call_verb(proc, "update", {
             "id": lora_id,
             "description": "Low-Rank Adaptation of LLMs",
         })
         assert patched["description"] == "Low-Rank Adaptation of LLMs"
         print(f"  [ok] update entity")
 
-        # 12. Create note via create(kind="note")
-        note = call_tool(proc, "create", {
+        # 12. Create note
+        note = call_verb(proc, "create", {
             "kind": "note",
             "note_kind": "observation",
             "content": "LoRA reduces trainable parameters by 10000x",
@@ -209,13 +234,13 @@ def main():
         note_id = note["id"]
         print(f"  [ok] create note — observation ({note_id[:8]}...)")
 
-        # 13. List notes via list(kind="note")
-        notes = call_tool(proc, "list", {"kind": "note", "note_kind": "observation"})
+        # 13. List notes
+        notes = call_verb(proc, "list", {"kind": "note", "note_kind": "observation"})
         assert len(notes) == 1
         print(f"  [ok] list notes — {len(notes)} observation")
 
-        # 14. Search entities via search(kind="entity")
-        search_hits = call_tool(proc, "search", {
+        # 14. Search entities
+        search_hits = call_verb(proc, "search", {
             "kind": "entity",
             "query": "LoRA parameter efficient fine-tuning",
             "limit": 5,
@@ -223,8 +248,8 @@ def main():
         assert isinstance(search_hits, list), f"expected list, got: {search_hits}"
         print(f"  [ok] search entities — {len(search_hits)} hit(s)")
 
-        # 15. Search notes via search(kind="note")
-        note_hits = call_tool(proc, "search", {
+        # 15. Search notes
+        note_hits = call_verb(proc, "search", {
             "kind": "note",
             "query": "LoRA parameters",
             "limit": 5,
@@ -232,15 +257,14 @@ def main():
         assert isinstance(note_hits, list), f"expected list, got: {note_hits}"
         print(f"  [ok] search notes — {len(note_hits)} hit(s)")
 
-        # 16. Cross-substrate: create annotated note (ADR-024)
-        annotated_note = call_tool(proc, "create", {
+        # 16. Cross-substrate: annotated note (ADR-024)
+        call_verb(proc, "create", {
             "kind": "note",
             "note_kind": "insight",
             "content": "LoRA is parameter-efficient",
             "annotates": [lora_id],
         })
-        annotated_note_id = annotated_note["id"]
-        nbrs_in = call_tool(proc, "neighbors", {
+        nbrs_in = call_verb(proc, "neighbors", {
             "node_id": lora_id,
             "direction": "in",
             "relations": ["annotates"],
@@ -249,19 +273,19 @@ def main():
         print(f"  [ok] create annotated note + neighbors(annotates)")
 
         # 17. GQL query
-        rows = call_tool(proc, "query", {
+        rows = call_verb(proc, "query", {
             "query": "MATCH (a:concept)-[e:variant_of]->(b:concept) RETURN a, b LIMIT 10",
         })
         assert len(rows) >= 1, f"expected at least 1 row, got {len(rows)}"
         print(f"  [ok] query (GQL) — {len(rows)} row(s)")
 
-        # 18. Entity merge via merge (auto-detects kind; both IDs must be entities)
-        dupe = call_tool(proc, "create", {
+        # 18. Entity merge
+        dupe = call_verb(proc, "create", {
             "kind": "entity",
             "entity_kind": "concept",
             "name": "LoRA duplicate",
         })
-        summary = call_tool(proc, "merge", {
+        summary = call_verb(proc, "merge", {
             "into_id": lora_id,
             "from_id": dupe["id"],
             "strategy": "prefer_into",
@@ -269,28 +293,28 @@ def main():
         assert summary["kept_id"] == lora_id
         print(f"  [ok] merge entity")
 
-        # 19. Entity delete via delete (auto-detects kind from UUID)
-        del_result = call_tool(proc, "delete", {"id": qlora_id})
+        # 19. Entity delete
+        del_result = call_verb(proc, "delete", {"id": qlora_id})
         assert del_result["deleted"] is True
         print(f"  [ok] delete entity")
 
-        # 20. Edge delete via delete (auto-detects kind from UUID)
-        del_edge = call_tool(proc, "delete", {"id": edge_id})
+        # 20. Edge delete
+        del_edge = call_verb(proc, "delete", {"id": edge_id})
         assert del_edge["deleted"] is True
         print(f"  [ok] delete edge")
 
-        # 21. Note delete via delete (auto-detects kind from UUID)
-        del_note = call_tool(proc, "delete", {"id": note_id})
+        # 21. Note delete
+        del_note = call_verb(proc, "delete", {"id": note_id})
         assert del_note["deleted"] is True
         print(f"  [ok] delete note")
 
         # 22. Traverse
-        a = call_tool(proc, "create", {"kind": "entity", "entity_kind": "concept", "name": "TraverseA"})
-        b = call_tool(proc, "create", {"kind": "entity", "entity_kind": "concept", "name": "TraverseB"})
-        c = call_tool(proc, "create", {"kind": "entity", "entity_kind": "concept", "name": "TraverseC"})
-        call_tool(proc, "link", {"source_id": a["id"], "target_id": b["id"], "relation": "extends"})
-        call_tool(proc, "link", {"source_id": b["id"], "target_id": c["id"], "relation": "extends"})
-        paths = call_tool(proc, "traverse", {
+        a = call_verb(proc, "create", {"kind": "entity", "entity_kind": "concept", "name": "TraverseA"})
+        b = call_verb(proc, "create", {"kind": "entity", "entity_kind": "concept", "name": "TraverseB"})
+        c = call_verb(proc, "create", {"kind": "entity", "entity_kind": "concept", "name": "TraverseC"})
+        call_verb(proc, "link", {"source_id": a["id"], "target_id": b["id"], "relation": "extends"})
+        call_verb(proc, "link", {"source_id": b["id"], "target_id": c["id"], "relation": "extends"})
+        paths = call_verb(proc, "traverse", {
             "roots": [a["id"]],
             "max_depth": 2,
             "include_roots": False,
@@ -300,7 +324,20 @@ def main():
         assert c["id"] in all_node_ids, "C must be reachable at depth 2"
         print(f"  [ok] traverse — depth-2 multi-hop")
 
-        print(f"\n  ALL 11 VERB TOOLS SMOKE TESTS PASSED")
+        # 23. Parallel batch — independent ops must all succeed in one request call.
+        bulk_ops = json.dumps([
+            {"tool": "create", "args": {"kind": "entity", "entity_kind": "concept", "name": "BulkA"}},
+            {"tool": "create", "args": {"kind": "entity", "entity_kind": "concept", "name": "BulkB"}},
+            {"tool": "create", "args": {"kind": "entity", "entity_kind": "concept", "name": "BulkC"}},
+        ])
+        bulk = _call_request_raw(proc, bulk_ops)
+        summary = bulk.get("summary", {})
+        assert summary.get("total") == 3 and summary.get("failed") == 0, (
+            f"expected 3/0 summary, got {summary}"
+        )
+        print(f"  [ok] parallel batch — 3 independent creates in one request call")
+
+        print(f"\n  ALL VERB SMOKE TESTS PASSED (single-tool surface)")
 
     finally:
         proc.stdin.close()

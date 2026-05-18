@@ -69,13 +69,13 @@ cargo install khive-mcp@{VERSION}
 - [ ] All workspace tests pass: `make ci`
 - [ ] Smoke test passes: `python3 tests/smoke_test.py`
 - [ ] No secrets in crate source: grep for tokens, keys, internal URLs
-- [ ] Crate descriptions present on all 7 crates
+- [ ] Crate descriptions present on all workspace crates
 - [ ] Inter-crate deps have `version = "{VERSION}"` alongside `path`
 - [ ] `CHANGELOG.md` updated (if maintained)
 - [ ] README status section updated
 - [ ] Git tag created: `git tag v{VERSION} && git push origin v{VERSION}`
 - [ ] `make publish-dry` succeeds
-- [ ] `make publish` completes (all 7 crates on crates.io)
+- [ ] `make publish` completes (all workspace crates on crates.io)
 - [ ] GitHub release created from tag with this document as body
 
 ## Known issues

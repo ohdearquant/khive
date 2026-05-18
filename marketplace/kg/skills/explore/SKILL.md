@@ -7,6 +7,15 @@ description: Discover what the knowledge graph knows about a topic. Traverse, na
 You want to know what the graph contains about a topic. This skill retrieves, traverses,
 and narrates — giving you a grounded picture of existing knowledge and where the gaps are.
 
+The MCP server exposes one tool — `request` — that takes the verb call as a string:
+
+```text
+request(ops="search(kind=\"entity\", query=\"<topic>\")")
+request(ops="[search(kind=\"entity\", query=\"X\"), search(kind=\"note\", query=\"X\")]")  # parallel batch
+```
+
+The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
+
 ## Workflow
 
 ### 1. Search for entry points
