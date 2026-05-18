@@ -132,10 +132,17 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
         return Err(DslError::Empty);
     }
 
-    // JSON form: `[{...}, ...]` or `{...}`.
+    // JSON form: `[{...}, ...]` or `{...}`. After `[`, JSON whitespace is legal
+    // before the first element — common when pretty-printers emit `[ {...} ]`.
     let first = trimmed.as_bytes()[0];
-    let looks_like_json =
-        first == b'{' || (first == b'[' && trimmed.as_bytes().get(1).is_some_and(|b| *b == b'{'));
+    let looks_like_json = first == b'{'
+        || (first == b'['
+            && trimmed
+                .as_bytes()
+                .iter()
+                .skip(1)
+                .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                .is_some_and(|b| *b == b'{'));
     if looks_like_json {
         return parse_json_form(trimmed);
     }
@@ -560,6 +567,20 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[1].tool, "complete");
         assert_eq!(v[1].args["id"], json!("abc"));
+    }
+
+    #[test]
+    fn json_form_with_leading_whitespace_inside_array_parses() {
+        // Pretty-printers commonly emit `[ {...} ]` with spaces or newlines after `[`.
+        // The whitespace is legal JSON, so the parser must route this to the JSON
+        // path rather than the function-call batch parser.
+        let v = ops(r#"[  {"tool":"next","args":{}} ]"#);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].tool, "next");
+
+        let v = ops("[\n  {\"tool\":\"next\",\"args\":{}},\n  {\"tool\":\"complete\",\"args\":{\"id\":\"x\"}}\n]");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1].tool, "complete");
     }
 
     #[test]

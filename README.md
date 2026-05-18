@@ -49,7 +49,7 @@ Entities are _things_. Notes are _what you think about things_. Events are _what
 
 ## The MCP verb surface
 
-One MCP tool: `request` (ADR-020). Every verb is a parsed op inside it.
+One MCP tool: `request` (ADR-020 + ADR-027). Every verb is a parsed op inside it.
 
 ```
 request(ops="verb(arg=value, arg=value)")              # single op
@@ -148,10 +148,11 @@ Add to your project's `.mcp.json` (or `~/.claude/mcp.json` for global):
 }
 ```
 
-That's it. Claude Code auto-discovers the single `request` tool; the agent expresses verbs as DSL ops:
+That's it. Claude Code auto-discovers the single `request` tool (the verb catalog is rendered in
+its description); the agent expresses verbs as DSL ops:
 
-```
-request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
+```text
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\", description=\"Low-Rank Adaptation\")")
 request(ops="search(kind=\"entity\", query=\"parameter efficient fine-tuning\")")
 request(ops="link(source_id=\"<lora-uuid>\", target_id=\"<qlora-uuid>\", relation=\"variant_of\")")
 

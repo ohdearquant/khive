@@ -8,9 +8,9 @@
 
 [ADR-023](ADR-023-verb-consolidated-mcp-surface.md) enumerated 11 verb tools as the v0.1 MCP
 surface (`create`, `get`, `list`, `update`, `delete`, `merge`, `search`, `link`, `neighbors`,
-`traverse`, `query`). Each was a separate `#[tool]` handler in `khive-mcp`. With ADR-025 packs
-and the GTD pack ([ADR-026](ADR-026-gtd-pack.md)) this would have grown to 16+ tools — and any
-third-party pack would add more.
+`traverse`, `query`). Each was a separate `#[tool]` handler in `khive-mcp`. With ADR-025 packs,
+any third-party pack would add more — and the next first-party pack (GTD, planned in a follow-up
+ADR) would push the surface past 16 tools.
 
 Two costs dominate at that scale:
 
@@ -28,8 +28,8 @@ tools. This ADR makes the consolidation explicit.
 ## Decision
 
 The khive-mcp server exposes **exactly one MCP tool**: `request`. All pack verbs (kg's `create`,
-`get`, …; gtd's `assign`, `next`, …) are reached through `request(ops="…")` per ADR-020. No flat
-verb tools are advertised.
+`get`, …, and verbs from any additional packs registered into the `VerbRegistry`) are reached
+through `request(ops="…")` per ADR-020. No flat verb tools are advertised.
 
 ### Tool discovery
 
@@ -43,23 +43,24 @@ ops syntax:
   Batch       : [verb(...), verb(...)]                — parallel, max 100
   JSON form   : [{"tool":"verb","args":{...}}, ...]   — equivalent
 
-Available verbs (built from loaded packs):
+Verbs registered on this server:
   create — Create an entity or note ...
   get    — Fetch any record ...
   ...
-  assign — Create a task ...           (gtd, when KHIVE_PACKS=...,gtd)
 ```
 
-The catalog is **dynamic** — `KhiveMcpServer` walks the runtime's `VerbRegistry::all_verbs()` and
-renders the lines. A pack loaded via `KHIVE_PACKS` appears in the catalog with no code change in
-the server.
+The catalog is **dynamic** — `KhiveMcpServer::list_tools` walks the runtime's
+`VerbRegistry::all_verbs()` and appends the lines to the `request` tool's description. The same
+catalog is also surfaced in the server's `instructions` for clients that read it there. Any pack
+registered into the `VerbRegistry` appears in the catalog with no code change in the server.
 
-### Plugin scoping
+### Plugin scoping (forward-looking)
 
-The marketplace plugin model leans on this. Each plugin's `plugin.json` sets
-`mcpServers.<name>.env.KHIVE_PACKS=<pack-list>`, so installing the `gtd` plugin gives an agent a
-catalog scoped to GTD without exposing KG. Pack composition (`KHIVE_PACKS=kg,gtd`) yields the
-union. The MCP surface contract — "one tool, the verbs are data" — is what makes this clean.
+The single-tool surface is the substrate for plugin scoping. The mechanism — `KHIVE_PACKS` env var
+selecting which packs to register into the registry — lands together with the second built-in
+pack in a follow-up PR. v0.2 of this ADR ships the surface; v0.2 of the runtime currently
+registers `kg` only, and the catalog reflects exactly what's registered. Multi-pack composition
+(`KHIVE_PACKS=kg,gtd`) is the same machinery once a second pack ships.
 
 ## Rationale
 
@@ -83,15 +84,15 @@ flat tools alive. Tool-list parsimony is a one-shot benefit worth taking immedia
 ### Why a dynamic catalog (vs. hard-coded description)
 
 The pack system (ADR-025) is the substrate for third-party verbs. A hard-coded catalog would
-lock the description to the kg + gtd built-ins; dynamic generation makes the server agnostic
-about which packs are loaded.
+lock the description to the kg built-in; dynamic generation from `VerbRegistry::all_verbs()`
+makes the server agnostic about which packs are loaded.
 
 ## Alternatives Considered
 
 | Alternative                                  | Pros                             | Cons                                                 | Why rejected                                   |
 | -------------------------------------------- | -------------------------------- | ---------------------------------------------------- | ---------------------------------------------- |
 | Keep flat tools alongside `request`          | Familiar for non-batching agents | Doubles the surface; ambiguity over which to use     | Surface bloat with no usability win            |
-| One tool per pack (e.g. `kg`, `gtd`)         | Pack-scoped discovery            | Per-pack tools duplicate the DSL description         | `request` already scopes via `KHIVE_PACKS`     |
+| One tool per pack (e.g. `kg`, `gtd`)         | Pack-scoped discovery            | Per-pack tools duplicate the DSL description         | `request` scopes via the loaded pack set       |
 | `request` for batch, flat tools for solo ops | "Right tool for the job"         | Two mental models; flat tools still bloat the list   | `request` handles solo ops natively            |
 | Hard-coded verb catalog in `request` desc    | Simpler server                   | Description rots when packs change; blocks 3rd-party | Dynamic generation is one read of the registry |
 
@@ -122,19 +123,20 @@ about which packs are loaded.
 
 ## Implementation Status
 
-| Step                                                     | Where                                                     | Status |
-| -------------------------------------------------------- | --------------------------------------------------------- | ------ |
-| Single `#[tool] request` handler                         | `crates/khive-mcp/src/server.rs`                          | done   |
-| Dynamic verb catalog from `VerbRegistry`                 | `KhiveMcpServer::verb_catalog()`                          | done   |
-| Removed per-verb tool param files                        | `crates/khive-mcp/src/tools/` (only `request.rs` remains) | done   |
-| Plugin authoring via `KHIVE_PACKS` env                   | `marketplace/{kg,gtd}/plugin.json`                        | done   |
-| Integration tests: `list_tools` returns `[request]` only | `crates/khive-mcp/tests/integration.rs`                   | done   |
+| Step                                                                     | Where                                                     | Status                        |
+| ------------------------------------------------------------------------ | --------------------------------------------------------- | ----------------------------- |
+| Single `#[tool] request` handler                                         | `crates/khive-mcp/src/server.rs`                          | done                          |
+| Dynamic verb catalog from `VerbRegistry`                                 | `KhiveMcpServer::verb_catalog()`                          | done                          |
+| Catalog reaches `tools/list` description (not only `instructions`)       | `KhiveMcpServer::list_tools` override                     | done                          |
+| Removed per-verb tool param files                                        | `crates/khive-mcp/src/tools/` (only `request.rs` remains) | done                          |
+| Built-in pack registration                                               | `crates/khive-mcp/src/server.rs`                          | kg only in v0.2 of this ADR   |
+| `KHIVE_PACKS` env / `--pack` CLI + multi-pack registration               | `crates/khive-mcp/src/server.rs`, `main.rs`               | planned (lands with gtd pack) |
+| Plugin authoring via `KHIVE_PACKS` env                                   | `marketplace/<pack>/plugin.json`                          | planned (lands with gtd pack) |
+| Integration tests: `list_tools` returns `[request]` with dynamic catalog | `crates/khive-mcp/tests/integration.rs`                   | done                          |
 
 ## References
 
 - [ADR-020](ADR-020-request-dsl.md): Request DSL (the syntax + parser this tool wraps)
 - [ADR-023](ADR-023-verb-consolidated-mcp-surface.md): Verb taxonomy (semantics still authoritative)
 - [ADR-025](ADR-025-pack-standard.md): Pack standard (vocabulary mechanism)
-- [ADR-026](ADR-026-gtd-pack.md): GTD pack (concrete pack composition)
 - [ADR-028](ADR-028-request-parser-crate.md): Why the parser lives in its own crate
-- [ADR-029](ADR-029-authorization-gate.md): The gate consulted at this single dispatch site

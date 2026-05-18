@@ -7,6 +7,15 @@ description: Wire a new concept into existing knowledge. Find what it relates to
 You just encountered something new and want to integrate it into your existing graph.
 This skill finds what it relates to and wires the edges.
 
+The MCP server exposes one tool — `request` — that takes the verb call as a string:
+
+```text
+request(ops="search(kind=\"entity\", query=\"LoRA\")")
+request(ops="[search(kind=\"entity\", query=\"A\"), search(kind=\"entity\", query=\"B\")]")  # parallel batch
+```
+
+The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
+
 ## Workflow
 
 ### 1. Check if it already exists

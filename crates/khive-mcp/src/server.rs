@@ -227,7 +227,7 @@ impl ServerHandler for KhiveMcpServer {
     fn get_info(&self) -> ServerInfo {
         let catalog = self.verb_catalog();
         let instructions = format!(
-            "khive — request-only MCP surface (ADR-020 + ADR-025). One tool, `request`, \
+            "khive — request-only MCP surface (ADR-020 + ADR-027). One tool, `request`, \
              dispatches verbs through the loaded pack registry. Configure packs via \
              KHIVE_PACKS or --pack (built-ins: kg, gtd). Verbs registered on this \
              server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
@@ -239,5 +239,31 @@ impl ServerHandler for KhiveMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(instructions)
+    }
+
+    /// Override the macro-generated `list_tools` so the `request` tool's
+    /// description carries the dynamic verb catalog built from the loaded
+    /// pack registry. Many MCP clients only surface `tools/list` descriptions
+    /// (not server instructions) — ADR-027 requires discovery to work there.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        let mut tools = Self::tool_router().list_all();
+        let catalog = self.verb_catalog();
+        for t in &mut tools {
+            if t.name == "request" {
+                let base = t.description.as_deref().unwrap_or("");
+                t.description = Some(std::borrow::Cow::Owned(format!(
+                    "{base}\n\nVerbs registered on this server:\n{catalog}"
+                )));
+            }
+        }
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
     }
 }

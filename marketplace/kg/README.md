@@ -19,9 +19,16 @@ claude mcp add --transport stdio kg -- khive-mcp
 
 ## What You Get
 
-### 11 MCP Tools
+### 1 MCP tool (`request`), 11 verbs inside it
 
-| Tool | What it does |
+The MCP server exposes a single tool, `request`, that takes the verb call as a string:
+
+```text
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
+request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\")]")  # parallel batch
+```
+
+| Verb | What it does |
 |------|-------------|
 | `create` | Create entities or notes |
 | `get` | Fetch any record by UUID (or 8-char prefix) |
