@@ -49,12 +49,20 @@ Entities are _things_. Notes are _what you think about things_. Events are _what
 
 ## The MCP verb surface
 
-11 tools in v0.1, verb-shaped:
+One MCP tool (`request`), 11 verbs inside it:
 
 ```
 CRUD:     create  get  list  update  delete  merge
 Graph:    link  traverse  neighbors  query
 Search:   search
+```
+
+Verbs are dispatched through a single tool that accepts a function-call DSL or JSON form
+(ADR-020 + ADR-027):
+
+```text
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
+request(ops="[create(...), create(...), link(...)]")   # parallel batch
 ```
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
@@ -140,12 +148,13 @@ Add to your project's `.mcp.json` (or `~/.claude/mcp.json` for global):
 }
 ```
 
-That's it. Claude Code will auto-discover the 11 tools. Your agent can immediately:
+That's it. Claude Code will auto-discover the `request` tool (the verb catalog is rendered in its
+description). Your agent can immediately:
 
-```
-create(kind="entity", entity_kind="concept", name="LoRA", description="Low-Rank Adaptation")
-search(kind="entity", query="parameter efficient fine-tuning")
-link(source_id="<lora-uuid>", target_id="<qlora-uuid>", relation="variant_of")
+```text
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\", description=\"Low-Rank Adaptation\")")
+request(ops="search(kind=\"entity\", query=\"parameter efficient fine-tuning\")")
+request(ops="link(source_id=\"<lora-uuid>\", target_id=\"<qlora-uuid>\", relation=\"variant_of\")")
 ```
 
 ### Claude Code plugin (skills + agent)

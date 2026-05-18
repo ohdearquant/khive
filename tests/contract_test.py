@@ -81,45 +81,74 @@ def _recv(proc: subprocess.Popen) -> dict:
     return json.loads(line)
 
 
-def _tool_raw(proc: subprocess.Popen, name: str, args: dict) -> dict:
-    """Call a tool and return the raw response dict.
+def _request_raw(proc: subprocess.Popen, ops_string: str) -> dict:
+    """Call the single `request` MCP tool and return the parsed response body.
 
     Returns {"_rpc_error": {...}} if the server replied with a JSON-RPC error
-    (code -32xxx) rather than a tool result.  Callers that want to inspect RPC
-    errors without raising can check for "_rpc_error" in the return value.
+    (i.e. the DSL itself was rejected — malformed input).
     """
-    _send(proc, "tools/call", {"name": name, "arguments": args})
+    _send(proc, "tools/call", {"name": "request", "arguments": {"ops": ops_string}})
     resp = _recv(proc)
     if "error" in resp:
-        # Surface as a sentinel dict so callers can inspect the message.
         return {"_rpc_error": resp["error"]}
-    return resp.get("result", {})
+    result = resp.get("result", {})
+    if result.get("isError"):
+        content = result.get("content", [])
+        text = content[0]["text"] if content else ""
+        return {"_rpc_error": {"message": text, "code": -32603}}
+    content = result.get("content", [])
+    text = content[0]["text"] if content else ""
+    return json.loads(text) if text else {}
+
+
+def _tool_raw(proc: subprocess.Popen, name: str, args: dict) -> dict:
+    """Call a verb through `request`. Return a sentinel-keyed dict.
+
+    The MCP server exposes a single tool (`request`) per ADR-027; tests still
+    talk in verbs, so this helper packs the verb into a one-op JSON-form batch,
+    dispatches it, and returns:
+
+      - On success         : {"_ok": <verb's result object>}
+      - On per-op failure  : {"_op_error": "<message>"}
+      - On RPC-level fail  : {"_rpc_error": {...}}
+
+    Validation errors that v0.1 surfaced as RPC-level McpError::invalid_params
+    are now per-op errors inside the batch response — see ADR-020 §dispatch
+    (`{ok, error}` per op).  Callers asserting failure should use
+    `_expect_rpc_error()` which accepts either channel.
+    """
+    ops = json.dumps([{"tool": name, "args": args}])
+    body = _request_raw(proc, ops)
+    if "_rpc_error" in body:
+        return body
+    results = body.get("results") or []
+    if not results:
+        return {"_rpc_error": {"message": f"empty results for verb {name}: {body}"}}
+    first = results[0]
+    if not first.get("ok", False):
+        return {"_op_error": first.get("error", "<no error string>")}
+    return {"_ok": first.get("result")}
 
 
 def _tool(proc: subprocess.Popen, name: str, args: dict) -> Any:
-    """Call a tool; raise on any error; parse and return JSON payload."""
+    """Call a verb through `request`; raise on any error; return its result."""
     result = _tool_raw(proc, name, args)
     if "_rpc_error" in result:
         raise RuntimeError(f"MCP-level error calling {name}: {result['_rpc_error']}")
-    if result.get("isError"):
-        content = result.get("content", [])
-        text = content[0]["text"] if content else "(no text)"
-        raise RuntimeError(f"Tool '{name}' returned error: {text}")
-    content = result.get("content", [])
-    text = content[0]["text"] if content else ""
-    return json.loads(text) if text else None
+    if "_op_error" in result:
+        raise RuntimeError(f"Verb '{name}' returned error: {result['_op_error']}")
+    return result.get("_ok")
 
 
 def _expect_rpc_error(proc: subprocess.Popen, name: str, args: dict) -> str:
-    """Call a tool; assert it returns a JSON-RPC-level error (code -32xxx).
+    """Assert the verb call fails. Return the error message string.
 
-    khive-mcp returns McpError::invalid_params (or invalid_request) uniformly
-    for all validation failures — invalid kinds, unknown properties, malformed
-    IDs, and not-found lookups all surface as RPC-level errors, never as tool-
-    level isError responses.  This helper enforces that contract precisely so
-    that a future regression (e.g. switching to isError) is caught immediately.
-
-    Returns the RPC error message string so callers can assert on its content.
+    Pre-ADR-027 (v0.1) khive-mcp surfaced every validation failure as an
+    RPC-level `McpError::invalid_params`.  Post-ADR-027 the single `request`
+    tool returns per-op `{ok: false, error: "..."}` for verb-level failures
+    and reserves RPC-level errors for DSL/parse failures.  Both are
+    "this call did not succeed" from the caller's point of view, so this
+    helper accepts either channel and returns the error message string.
     """
     result = _tool_raw(proc, name, args)
 
@@ -127,31 +156,16 @@ def _expect_rpc_error(proc: subprocess.Popen, name: str, args: dict) -> str:
         err = result["_rpc_error"]
         return err.get("message", str(err))
 
-    # If we got a tool-level isError, that is a contract deviation — fail hard.
-    if result.get("isError"):
-        content = result.get("content", [])
-        text = content[0]["text"] if content else ""
-        raise AssertionError(
-            f"Tool '{name}' returned tool-level isError instead of the expected "
-            f"RPC-level error (McpError::invalid_params).  This is a contract "
-            f"deviation — khive-mcp should surface validation errors as JSON-RPC "
-            f"errors, not as isError tool results.  Text: {text!r}"
-        )
+    if "_op_error" in result:
+        return result["_op_error"]
 
-    # Success — also a failure
-    content = result.get("content", [])
-    text = content[0]["text"] if content else ""
     raise AssertionError(
-        f"Expected tool '{name}' to return an RPC-level error but got success:\n{text}"
+        f"Expected verb '{name}' to fail but got success:\n{result.get('_ok')!r}"
     )
 
 
 def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
-    """Alias retained for call-sites that need channel-agnostic behaviour.
-
-    For new call-sites, prefer _expect_rpc_error() which asserts the specific
-    channel (RPC-level) that khive-mcp uses for all validation failures.
-    """
+    """Alias retained for call-sites — prefer `_expect_rpc_error()`."""
     return _expect_rpc_error(proc, name, args)
 
 

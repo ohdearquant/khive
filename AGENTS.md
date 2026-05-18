@@ -14,7 +14,10 @@ If you're working on khive itself (writing code in this repo), see `CLAUDE.md` i
 
 ## Core verbs
 
-All verbs are available via MCP ([ADR-023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)).
+All verbs are dispatched through a single MCP tool, `request`, which accepts a function-call DSL
+or JSON form ([ADR-020](docs/adr/ADR-020-request-dsl.md),
+[ADR-027](docs/adr/ADR-027-single-tool-mcp-surface.md)). Verb semantics are unchanged from
+[ADR-023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md); only the wire shape moved.
 
 | Verb        | What it does                                     | When to use                                              |
 | ----------- | ------------------------------------------------ | -------------------------------------------------------- |
@@ -30,12 +33,37 @@ All verbs are available via MCP ([ADR-023](docs/adr/ADR-023-verb-consolidated-mc
 | `query`     | GQL/SPARQL query string → SQL                    | Complex pattern matching over the graph                  |
 | `merge`     | Deduplicate two entities into one (v0.1)         | "LoRA" and "Low-Rank Adaptation" are the same concept    |
 
-**11 tools in v0.1.** `get`, `update`, `delete` are UUID-only — they auto-detect whether the
-record is an entity, note, or edge. `create`, `list`, `search` require `kind=entity|note` (or
-`kind=edge` for `list`).
+**One MCP tool (`request`), 11 verbs inside it.** `get`, `update`, `delete` are UUID-only — they
+auto-detect whether the record is an entity, note, or edge. `create`, `list`, `search` require
+`kind=entity|note` (or `kind=edge` for `list`).
 
-**Deferred (not available in v0.1):** `supersede` (use `link(..., relation="supersedes")` as a
-workaround), `request` (batch DSL), note merge (only entity merge is implemented).
+### How to call a verb
+
+Wrap the verb call in `request(ops="…")`:
+
+```text
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
+request(ops="search(kind=\"entity\", query=\"memory efficient attention\")")
+request(ops="link(source_id=\"<u>\", target_id=\"<v>\", relation=\"extends\", weight=0.9)")
+```
+
+Run several ops in parallel by passing a batch:
+
+```text
+request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"A\"), create(kind=\"entity\", entity_kind=\"concept\", name=\"B\")]")
+```
+
+JSON form is equivalent (use this when the DSL string would be hard to escape):
+
+```text
+request(ops="[{\"tool\":\"create\",\"args\":{\"kind\":\"entity\",\"entity_kind\":\"concept\",\"name\":\"LoRA\"}}]")
+```
+
+Ops in a batch run in parallel and have no ordering guarantee. If op B depends on op A's output
+(e.g. create-then-link), use two `request` calls.
+
+**Deferred (not available in v0.1 semantics):** `supersede` (use `link(..., relation="supersedes")`
+as a workaround), note merge (only entity merge is implemented).
 
 ### Notes vs entities
 
@@ -151,7 +179,7 @@ probably a property on the entity, not an edge.
 Until `supersede` lands, manually create a supersedes edge:
 
 ```
-link(source_id=new_note, target_id=old_note, relation="supersedes")
+request(ops="link(source_id=\"<new_note>\", target_id=\"<old_note>\", relation=\"supersedes\")")
 ```
 
 `search(kind="note")` already excludes notes targeted by a `supersedes` edge (implemented in
@@ -165,6 +193,9 @@ implementing any supersede / annotate / currency behavior.
 
 ## Research workflow pattern
 
+Each step below is run as `request(ops="<verb_call>")`. The inner verb syntax is shown for
+brevity — wrap it in `request(...)` when calling MCP.
+
 ```
 1. search(kind="note", query="topic I'm investigating")
    → see what you already know
@@ -176,13 +207,19 @@ implementing any supersede / annotate / currency behavior.
    create(kind="entity", entity_kind="concept", name="...", properties={...})
 
 4. For relationships:
-   link(source=A, target=B, relation="extends")
+   link(source_id="<A>", target_id="<B>", relation="extends")
 
 5. For observations/insights:
-   create(kind="note", note_kind="observation", content="...", annotates=[entity_id])
+   create(kind="note", note_kind="observation", content="...", annotates=["<entity_id>"])
 
 6. For structural queries:
-   traverse(roots=[entity_id], max_depth=3, relations=["extends", "variant_of"])
+   traverse(roots=["<entity_id>"], max_depth=3, relations=["extends", "variant_of"])
+```
+
+Independent ops can be batched in one call:
+
+```
+request(ops="[search(kind=\"entity\", query=\"LoRA\"), search(kind=\"note\", query=\"LoRA\")]")
 ```
 
 ---

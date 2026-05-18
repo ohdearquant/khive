@@ -105,6 +105,40 @@ async fn list_tools_returns_only_request() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn request_tool_description_contains_dynamic_verb_catalog() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let listed = client.list_tools(None).await?;
+    let request = listed
+        .tools
+        .iter()
+        .find(|t| t.name == "request")
+        .expect("request tool must be present");
+    let desc = request.description.as_deref().unwrap_or("");
+
+    // The dynamic catalog must reach `tools/list` consumers (ADR-027). Each
+    // verb the kg pack registers should appear by name in the description.
+    for verb in [
+        "create",
+        "get",
+        "list",
+        "update",
+        "delete",
+        "merge",
+        "search",
+        "link",
+        "neighbors",
+        "traverse",
+        "query",
+    ] {
+        assert!(
+            desc.contains(verb),
+            "request description missing verb {verb:?}: {desc}"
+        );
+    }
+    Ok(())
+}
+
 // ── kg verbs through the DSL ─────────────────────────────────────────────────
 
 #[tokio::test]
@@ -120,13 +154,17 @@ async fn create_entity_via_dsl() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn create_then_list_in_one_batch() -> anyhow::Result<()> {
+async fn parallel_batch_of_independent_creates_all_succeed() -> anyhow::Result<()> {
+    // Ops inside `[...]` are dispatched in parallel (ADR-020 §dispatch).
+    // This test exercises that contract with independent ops only —
+    // dependent ops (e.g. create-then-list) must split across two `request`
+    // calls because the list won't see the creates inside the same batch.
     let client = connect().await?;
     let result = call(
         &client,
         "request",
         json!({
-            "ops": r#"[create(kind="entity", entity_kind="concept", name="A"), create(kind="entity", entity_kind="concept", name="B"), list(kind="entity")]"#
+            "ops": r#"[create(kind="entity", entity_kind="concept", name="A"), create(kind="entity", entity_kind="concept", name="B"), create(kind="entity", entity_kind="concept", name="C")]"#
         }),
     )
     .await?;
@@ -136,8 +174,28 @@ async fn create_then_list_in_one_batch() -> anyhow::Result<()> {
     for r in results {
         assert_eq!(r["ok"], json!(true), "op should succeed: {r}");
     }
-    // Last op listed entities — handler returns a JSON array directly.
-    let entities = results[2]["result"]
+    assert_eq!(body["summary"]["succeeded"], json!(3));
+    assert_eq!(body["summary"]["failed"], json!(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_then_list_across_separate_request_calls() -> anyhow::Result<()> {
+    // Create-then-read requires two `request` calls because operations inside
+    // a single batch run in parallel and have no ordering guarantee
+    // (ADR-020 §dispatch).
+    let client = connect().await?;
+    call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"[create(kind="entity", entity_kind="concept", name="A"), create(kind="entity", entity_kind="concept", name="B")]"#
+        }),
+    )
+    .await?;
+
+    let listed = ok_one(&client, r#"list(kind="entity")"#).await?;
+    let entities = listed
         .as_array()
         .expect("entities array (list returns array directly)");
     let names: Vec<&str> = entities.iter().filter_map(|e| e["name"].as_str()).collect();

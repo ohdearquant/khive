@@ -6,6 +6,15 @@ description: Audit graph health and fix issues — orphans, low-degree nodes, du
 
 Your graph needs maintenance. This skill audits health, identifies issues, and fixes them.
 
+The MCP server exposes one tool — `request` — that takes the verb call as a string:
+
+```text
+request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=50)")
+request(ops="[list(kind=\"edge\", source_id=\"<u>\"), list(kind=\"edge\", target_id=\"<u>\")]")  # parallel batch
+```
+
+The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
+
 ## Workflow
 
 ### 1. Get the lay of the land
