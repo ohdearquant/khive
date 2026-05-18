@@ -1,0 +1,24 @@
+{
+  "name": "gtd",
+  "description": "GTD-style task lifecycle for AI agents — assign, next, complete, transition. Tasks live alongside your knowledge graph; recall surfaces them like any other note.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Ocean (HaiyangLi)",
+    "url": "https://github.com/ohdearquant"
+  },
+  "homepage": "https://github.com/ohdearquant/khive",
+  "repository": "https://github.com/ohdearquant/khive",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "gtd": {
+      "type": "stdio",
+      "command": "khive-mcp",
+      "args": [],
+      "env": {
+        "KHIVE_PACKS": "gtd"
+      },
+      "installHint": "cargo install khive-mcp"
+    }
+  },
+  "keywords": ["gtd", "tasks", "productivity", "lifecycle", "mcp", "todo"]
+}

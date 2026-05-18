@@ -1,0 +1,23 @@
+[package]
+name = "khive-pack-gtd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "GTD verb pack — task lifecycle (assign/next/complete/transition) over the notes substrate"
+
+[dependencies]
+khive-types = { version = "0.1.2", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.1.2", path = "../khive-runtime" }
+khive-storage = { version = "0.1.2", path = "../khive-storage" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

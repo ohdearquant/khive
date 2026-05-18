@@ -47,17 +47,18 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-mcp     — stdio MCP server (the only binary)          │
-│  11 verb tools: create get list update delete merge          │
-│                 search link neighbors traverse query         │
+│  khive-mcp      — stdio MCP server (the only binary)         │
+│  1 tool: `request` (ADR-020) — parses DSL, dispatches ops    │
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg — KG vocabulary + 11 verb handlers (ADR-025)  │
+│  khive-pack-kg  — KG vocabulary + 11 verb handlers (ADR-025) │
+│  khive-pack-gtd — GTD lifecycle, 5 verbs (ADR-026, optional) │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-runtime — composable Service API + VerbRegistry       │
+│  khive-request — DSL parser (function-call + JSON forms)     │
 │  khive-query   — GQL/SPARQL → SQL compiler                   │
 │  khive-db      — SQLite + sqlite-vec + FTS5                  │
 │  khive-storage — trait-only capability surface               │
@@ -66,27 +67,31 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Dependency chain: `types → score → storage → db → query → runtime → pack-kg → mcp`.
+Dependency chain: `types → score → storage → db → query → runtime → request → pack-kg / pack-gtd → mcp`.
 
-Future layers (HTTP gateway, CLI, frontend) are planned but not shipped.
+Future layers (HTTP gateway, CLI, frontend, LNDL frontend in `khive-request`) are planned but
+not shipped.
 
 ---
 
 ## Directory map
 
-| Path                   | Purpose                                                     |
-| ---------------------- | ----------------------------------------------------------- |
-| `crates/khive-types`   | Domain types: Entity, Note, Event, EntityKind, EdgeRelation |
-| `crates/khive-score`   | Deterministic i64 fixed-point scoring + RRF                 |
-| `crates/khive-storage` | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch  |
-| `crates/khive-db`      | SQLite backend + sqlite-vec + FTS5 trigram                  |
-| `crates/khive-query`   | GQL + SPARQL parsers, AST validation, SQL compiler          |
-| `crates/khive-runtime` | Service API + VerbRegistry + PackRuntime trait              |
-| `crates/khive-pack-kg` | KG pack: vocabulary, verb handlers, kind validation         |
-| `crates/khive-mcp`     | Stdio MCP binary — thin dispatch shell over VerbRegistry    |
-| `docs/adr/`            | Architecture Decision Records (the design contract)         |
-| `tests/smoke_test.py`  | End-to-end binary smoke test (all 11 tools)                 |
-| `scripts/publish.sh`   | Publish all crates to crates.io in dependency order         |
+| Path                    | Purpose                                                                   |
+| ----------------------- | ------------------------------------------------------------------------- |
+| `crates/khive-types`    | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait   |
+| `crates/khive-score`    | Deterministic i64 fixed-point scoring + RRF                               |
+| `crates/khive-storage`  | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                |
+| `crates/khive-db`       | SQLite backend + sqlite-vec + FTS5 trigram                                |
+| `crates/khive-query`    | GQL + SPARQL parsers, AST validation, SQL compiler                        |
+| `crates/khive-runtime`  | Service API + VerbRegistry + PackRuntime trait                            |
+| `crates/khive-request`  | Request DSL parser (function-call + JSON; pipe/LNDL planned)              |
+| `crates/khive-pack-kg`  | KG pack: vocabulary, 11 verb handlers, kind validation                    |
+| `crates/khive-pack-gtd` | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition) |
+| `crates/khive-mcp`      | Stdio MCP binary — single `request` tool over VerbRegistry                |
+| `docs/adr/`             | Architecture Decision Records (the design contract)                       |
+| `marketplace/`          | Claude Code plugins (`kg`, `gtd`) — install via `/plugin install`         |
+| `tests/smoke_test.py`   | End-to-end binary smoke test (drives all verbs via the `request` DSL)     |
+| `scripts/publish.sh`    | Publish all crates to crates.io in dependency order                       |
 
 ---
 
@@ -116,9 +121,28 @@ not silently accepted.
 
 ---
 
-## MCP tool surface (11 tools, v0.1)
+## MCP tool surface (one tool: `request`, v0.2 — ADR-020)
 
-| Tool        | Params                                | What it does                                                  |
+The MCP surface is intentionally minimal: one tool named `request` that accepts a verb-dispatch
+DSL string and routes each parsed op through the loaded packs.
+
+```
+# Single op
+request(ops="verb(arg=value, arg=value)")
+
+# Parallel batch (max 100)
+request(ops="[v1(...), v2(...), v3(...)]")
+
+# JSON form (equivalent)
+request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
+```
+
+Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default is
+`kg` only.
+
+### KG pack verbs (11 — ADR-023 + ADR-024)
+
+| Verb        | Args                                  | What it does                                                  |
 | ----------- | ------------------------------------- | ------------------------------------------------------------- |
 | `create`    | `kind=entity\|note` + fields          | Create an entity or note                                      |
 | `get`       | `id` (UUID)                           | Fetch any record — auto-detects entity/note/edge              |
@@ -131,6 +155,18 @@ not silently accepted.
 | `neighbors` | `node_id`, `direction?`, `relations?` | Immediate graph neighbors                                     |
 | `traverse`  | `roots`, `max_depth?`, `relations?`   | Multi-hop BFS with filters                                    |
 | `query`     | GQL or SPARQL string                  | Pattern matching compiled to SQL                              |
+
+### GTD pack verbs (5 — ADR-026, optional)
+
+Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
+
+| Verb         | Args                                                                         | What it does                                                |
+| ------------ | ---------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `assign`     | `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?` | Create a task (defaults: status=inbox, priority=p2)         |
+| `next`       | `limit?`, `assignee?`                                                        | List actionable tasks (status ∈ next/active), priority-sort |
+| `complete`   | `id`, `result?`                                                              | Validate transition → done, record `completed_at`           |
+| `tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                       |
+| `transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation  |
 
 `get`/`update`/`delete`/`merge` are UUID-only — no `kind` needed, the handler resolves
 the substrate from the UUID. `create`/`list`/`search` require `kind`.
@@ -213,7 +249,7 @@ Conventional commits with crate scope: `feat(query): add SPARQL property filter`
 - **Verify before claiming complete.** Run the test, check the output.
 - **Report outcomes faithfully.** If tests fail, say so.
 - **Integration > unit** for the MCP surface — the value is in the composition.
-- **Smoke test**: `python3 tests/smoke_test.py` exercises all 11 tools end-to-end.
+- **Smoke test**: `python3 tests/smoke_test.py` drives every verb through the `request` tool end-to-end (KG verbs in the default run; GTD verbs in the post-pass when both packs are loaded).
 
 ---
 

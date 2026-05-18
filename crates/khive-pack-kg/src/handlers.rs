@@ -8,12 +8,54 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError};
+use khive_runtime::{
+    EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
+};
 use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
 use khive_storage::EdgeRelation;
 
 use crate::vocab::{EntityKind, NoteKind};
 use crate::KgPack;
+
+// ---- Kind canonicalization (ADR-030) ----
+//
+// kg's vocab (EntityKind / NoteKind) provides alias normalization for kg-owned
+// kinds ("paper" → "document", "obs" → "observation", etc.). Other packs
+// (gtd, future) register kinds with no aliases — those are matched against the
+// merged registry vocabulary literally. The hybrid resolver tries kg's enum
+// first, then falls back to registry membership.
+
+fn canonical_entity_kind(raw: &str, registry: &VerbRegistry) -> Result<String, RuntimeError> {
+    if let Ok(k) = EntityKind::from_str(raw) {
+        return Ok(k.name().to_string());
+    }
+    let normalized = raw.trim().to_ascii_lowercase();
+    if registry.all_entity_kinds().contains(&normalized.as_str()) {
+        return Ok(normalized);
+    }
+    let mut all: Vec<&'static str> = registry.all_entity_kinds();
+    all.sort_unstable();
+    Err(RuntimeError::InvalidInput(format!(
+        "unknown entity_kind {raw:?}; valid: {}",
+        all.join(" | ")
+    )))
+}
+
+fn canonical_note_kind(raw: &str, registry: &VerbRegistry) -> Result<String, RuntimeError> {
+    if let Ok(k) = NoteKind::from_str(raw) {
+        return Ok(k.name().to_string());
+    }
+    let normalized = raw.trim().to_ascii_lowercase();
+    if registry.all_note_kinds().contains(&normalized.as_str()) {
+        return Ok(normalized);
+    }
+    let mut all: Vec<&'static str> = registry.all_note_kinds();
+    all.sort_unstable();
+    Err(RuntimeError::InvalidInput(format!(
+        "unknown note_kind {raw:?}; valid: {}",
+        all.join(" | ")
+    )))
+}
 
 // ---- Param structs (serde-only, no rmcp dependency) ----
 
@@ -22,10 +64,8 @@ struct CreateParams {
     kind: String,
     namespace: Option<String>,
     name: Option<String>,
-    entity_kind: Option<String>,
     description: Option<String>,
     content: Option<String>,
-    note_kind: Option<String>,
     salience: Option<f64>,
     annotates: Option<Vec<String>>,
     properties: Option<Value>,
@@ -177,46 +217,89 @@ fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeErro
 // ---- Handler implementations ----
 
 impl KgPack {
-    pub(crate) async fn handle_create(&self, params: Value) -> Result<Value, RuntimeError> {
-        let p: CreateParams = deser(params)?;
-        match p.kind.as_str() {
+    pub(crate) async fn handle_create(
+        &self,
+        mut params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
+        // Read the discriminator pair without consuming params (the hook may mutate).
+        let kind = params
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RuntimeError::InvalidInput("create requires 'kind'".into()))?
+            .to_string();
+
+        // Canonicalize the sub-discriminator (entity_kind / note_kind) and look up
+        // an optional hook for it (ADR-030). Returns the canonical kind string +
+        // hook. For entities the hook is rarely used today; for notes it's how
+        // gtd's `task` kind layers defaults + edges over the shared CRUD path.
+        let (sub_kind, hook) = match kind.as_str() {
             "entity" => {
+                let raw = params
+                    .get("entity_kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match raw {
+                    Some(s) => {
+                        let canonical = canonical_entity_kind(&s, registry)?;
+                        let hook = registry.find_kind_hook(&canonical);
+                        (Some(canonical), hook)
+                    }
+                    None => {
+                        return Err(RuntimeError::InvalidInput(
+                            "kind=entity requires 'entity_kind' (concept | document | dataset | project | person | org)".into(),
+                        ));
+                    }
+                }
+            }
+            "note" => {
+                let raw = params
+                    .get("note_kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "observation".to_string());
+                let canonical = canonical_note_kind(&raw, registry)?;
+                let hook = registry.find_kind_hook(&canonical);
+                (Some(canonical), hook)
+            }
+            _ => (None, None),
+        };
+
+        if let Some(ref h) = hook {
+            h.prepare_create(&self.runtime, &mut params).await?;
+        }
+
+        let p: CreateParams = deser(params.clone())?;
+
+        let (response, new_id) = match p.kind.as_str() {
+            "entity" => {
+                let canonical = sub_kind.clone().expect("entity_kind canonicalized above");
                 let name = p.name.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=entity requires 'name'".into())
                 })?;
-                let raw_kind = p.entity_kind.ok_or_else(|| {
-                    RuntimeError::InvalidInput(
-                        "kind=entity requires 'entity_kind' (concept | document | dataset | project | person | org)".into(),
-                    )
-                })?;
-                let validated = EntityKind::from_str(&raw_kind)
-                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
                 let tags = p.tags.unwrap_or_default();
                 let entity = self
                     .runtime
                     .create_entity(
                         p.namespace.as_deref(),
-                        validated.name(),
+                        &canonical,
                         &name,
                         p.description.as_deref(),
                         p.properties,
                         tags,
                     )
                     .await?;
-                to_json(&entity)
+                let id = entity.id;
+                (to_json(&entity)?, id)
             }
             "note" => {
+                let canonical = sub_kind
+                    .clone()
+                    .unwrap_or_else(|| "observation".to_string());
                 let content = p.content.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=note requires 'content'".into())
                 })?;
-                let kind_str = match p.note_kind.as_deref() {
-                    None | Some("") => "observation".to_string(),
-                    Some(s) => {
-                        let validated = NoteKind::from_str(s)
-                            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-                        validated.name().to_string()
-                    }
-                };
                 let salience = p.salience.unwrap_or(0.5);
                 let mut annotates = Vec::new();
                 for s in p.annotates.unwrap_or_default() {
@@ -227,7 +310,7 @@ impl KgPack {
                     .runtime
                     .create_note(
                         p.namespace.as_deref(),
-                        &kind_str,
+                        &canonical,
                         p.name.as_deref(),
                         &content,
                         salience,
@@ -235,12 +318,28 @@ impl KgPack {
                         annotates,
                     )
                     .await?;
-                to_json(&note)
+                let id = note.id;
+                (to_json(&note)?, id)
             }
-            other => Err(RuntimeError::InvalidInput(format!(
-                "unknown kind {other:?}; valid: entity | note"
-            ))),
+            other => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "unknown kind {other:?}; valid: entity | note"
+                )))
+            }
+        };
+
+        if let Some(ref h) = hook {
+            if let Err(e) = h.after_create(&self.runtime, new_id, &params).await {
+                tracing::warn!(
+                    kind = %sub_kind.as_deref().unwrap_or(""),
+                    id = %new_id,
+                    error = %e,
+                    "kind hook after_create failed (storage write already committed)"
+                );
+            }
         }
+
+        Ok(response)
     }
 
     pub(crate) async fn handle_get(&self, params: Value) -> Result<Value, RuntimeError> {
@@ -271,16 +370,16 @@ impl KgPack {
         Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
     }
 
-    pub(crate) async fn handle_list(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_list(
+        &self,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
         let p: ListParams = deser(params)?;
         match p.kind.as_str() {
             "entity" => {
                 let kind_filter = match p.entity_kind.as_deref() {
-                    Some(k) => {
-                        let v = EntityKind::from_str(k)
-                            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-                        Some(v.name().to_string())
-                    }
+                    Some(k) => Some(canonical_entity_kind(k, registry)?),
                     None => None,
                 };
                 let limit = p.limit.unwrap_or(50).min(500);
@@ -326,11 +425,7 @@ impl KgPack {
             "note" => {
                 let kind_filter = match p.note_kind.as_deref() {
                     None | Some("") => None,
-                    Some(s) => {
-                        let v = NoteKind::from_str(s)
-                            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-                        Some(v.name().to_string())
-                    }
+                    Some(s) => Some(canonical_note_kind(s, registry)?),
                 };
                 let limit = p.limit.unwrap_or(20).min(200);
                 let notes = self
@@ -430,7 +525,11 @@ impl KgPack {
         to_json(&summary)
     }
 
-    pub(crate) async fn handle_search(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_search(
+        &self,
+        params: Value,
+        _registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
         let p: SearchParams = deser(params)?;
         let limit = p.limit.unwrap_or(10).min(100);
         match p.kind.as_str() {

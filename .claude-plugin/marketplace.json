@@ -10,6 +10,11 @@
       "name": "kg",
       "source": "./marketplace/kg",
       "description": "Persistent knowledge graph for AI agents"
+    },
+    {
+      "name": "gtd",
+      "source": "./marketplace/gtd",
+      "description": "GTD-style task lifecycle (assign/next/complete/transition) over the notes substrate"
     }
   ]
 }
