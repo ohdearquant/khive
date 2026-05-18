@@ -1,8 +1,18 @@
 # ADR-023: Verb-Consolidated MCP Surface
 
-**Status**: accepted\
+**Status**: accepted (verb names + semantics); superseded by [ADR-020](ADR-020-request-dsl.md) for
+the *MCP wire shape* — as of v0.2 these verbs are dispatched through a single `request` tool, not
+exposed as separate MCP tools.\
 **Date**: 2026-05-15\
 **Authors**: Ocean, lambda:khive
+
+> **2026-05-18 update.** This ADR's *verb taxonomy* (11 verbs with `kind=` discriminant) is still
+> authoritative — packs declare these verbs and the runtime [`VerbRegistry`] dispatches them. What
+> changed is the MCP transport: instead of 11 (or more, with extra packs) separate `#[tool]`
+> handlers, khive-mcp v0.2 advertises one tool — `request` — and parses the DSL from
+> [ADR-020](ADR-020-request-dsl.md). Examples below stay valid as the *verb-name portion* of a
+> request op; e.g. a flat call `{"kind":"entity","entity_kind":"concept","name":"LoRA"}` becomes
+> `request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")`.
 
 ## Context
 

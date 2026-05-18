@@ -1,9 +1,6 @@
-pub mod create;
-pub mod delete;
-pub mod get;
-pub mod graph;
-pub mod list;
-pub mod merge;
-pub mod query;
-pub mod search;
-pub mod update;
+//! MCP tool parameter types.
+//!
+//! After v0.2 (ADR-020) the MCP surface collapses to a single `request` tool —
+//! verb-specific param schemas live in the packs themselves, not here.
+
+pub mod request;
