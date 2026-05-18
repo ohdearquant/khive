@@ -1,0 +1,19 @@
+[package]
+name = "khive-gate-rego"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Rego (Open Policy Agent) backend for khive-gate, powered by regorus."
+
+[dependencies]
+khive-gate = { version = "0.1.2", path = "../khive-gate" }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+regorus = "0.10"
+
+[dev-dependencies]
+khive-types = { version = "0.1.2", path = "../khive-types", features = ["serde"] }
