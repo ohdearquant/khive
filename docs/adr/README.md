@@ -37,6 +37,7 @@ alternatives. New decisions should be added as ADR-NNN-kebab-case-title.md using
 | [029](ADR-029-authorization-gate.md)              | Authorization Gate                       | accepted                                                           | `khive-gate` trait + `AllowAllGate` default; `RuntimeConfig.gate`; advisory consultation at the single dispatch site (ADR-027); enforcement deferred to v0.3                  |
 | [030](ADR-030-kind-hooks.md)                      | Kind Hooks                               | accepted                                                           | Shared CRUD + per-kind specialization: packs register `KindHook` impls (`prepare_create` + `after_create`); kg's `create` consults registry vocabulary                        |
 | [031](ADR-031-pack-extensible-edge-endpoints.md)  | Pack-Extensible Edge Endpoints           | accepted                                                           | `Pack::EDGE_RULES` adds substrate-aware endpoint pairs to existing relations; closed 13-relation taxonomy preserved; enables task→task `depends_on` from the GTD pack         |
+| [032](ADR-032-rego-gate.md)                       | Rego Policy Backend                      | accepted                                                           | `khive-gate-rego` sibling crate (Apache-2.0) — `RegoGate` powered by `regorus`; policy contract (default entrypoint `data.khive.gate.decision`, `GateDecision` JSON output)   |
 
 ## Reading Order
 

@@ -188,13 +188,14 @@ pub enum GateError {
 ///
 /// Implementations live downstream:
 /// - `AllowAllGate` (this crate) — permissive default
-/// - `RegoGate` (planned, behind a feature flag) — regorus-backed Rego eval
+/// - `RegoGate` (Apache-2.0 sibling crate `khive-gate-rego`, ADR-032) —
+///   regorus-backed Rego eval
 /// - `LionGate<G>` (khive-cloud, BUSL) — wraps any `Gate` with lion-core
 ///   capability witnesses for verifiable enforcement.
 pub trait Gate: Send + Sync + std::fmt::Debug {
     fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError>;
 
-    /// Short name of this backend — surfaced in audit events (ADR-032 planned)
+    /// Short name of this backend — surfaced in audit events (ADR-033 planned)
     /// so downstream tooling can tell `RegoGate` results apart from
     /// `LionGate<RegoGate>` results without parsing the type.
     fn impl_name(&self) -> &'static str {

@@ -231,7 +231,7 @@ impl VerbRegistry {
                 tracing::warn!(verb, error = %err, "gate check failed (advisory)");
             }
         }
-        // TODO(ADR-032): emit `EventKind::GateCheck` event for deny / audit-obligation cases.
+        // TODO(ADR-033): emit `EventKind::GateCheck` event for deny / audit-obligation cases.
 
         for pack in self.packs.iter() {
             if pack.verbs().iter().any(|v| v.name == verb) {

@@ -48,6 +48,7 @@ CRATES=(
     khive-db
     khive-query
     khive-gate
+    khive-gate-rego
     khive-runtime
     khive-request
     khive-pack-kg
