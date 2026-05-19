@@ -26,10 +26,10 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 
-use khive_pack_gtd::GtdPack;
-use khive_pack_kg::KgPack;
 use khive_request::{parse_request, DslError, ParsedOp};
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
+
+use crate::pack::{DialectRegistrar, KgDialect};
 
 use crate::tools::request::RequestParams;
 
@@ -59,17 +59,20 @@ impl std::fmt::Display for PackRegError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unknown pack name {:?} — built-in packs: kg, gtd",
-            self.unknown
+            "unknown pack name {:?} — built-in packs: {}",
+            self.unknown,
+            BUILTIN_PACKS.join(", ")
         )
     }
 }
 
 impl std::error::Error for PackRegError {}
 
-/// Built-in pack names known to this binary. Kept in sync with
-/// [`KhiveMcpServer::with_packs`] so error messages and CLI help stay accurate.
-pub const BUILTIN_PACKS: &[&str] = &["kg", "gtd"];
+/// Built-in pack names known to this binary.
+///
+/// Sourced from the `KgDialect` registrar so this constant and the error
+/// messages in `with_packs` stay in sync without any manual bookkeeping.
+pub const BUILTIN_PACKS: &[&str] = KgDialect::pack_names();
 
 impl KhiveMcpServer {
     /// Build a server using the pack list from `runtime.config().packs`.
@@ -91,7 +94,10 @@ impl KhiveMcpServer {
             let mut builder = VerbRegistryBuilder::new();
             builder.with_gate(gate);
             builder.with_default_namespace(default_namespace);
-            builder.register(KgPack::new(recovered_runtime.clone()));
+            // Fallback: register the kg pack through the dialect registrar so
+            // this code path stays free of direct pack-type imports.
+            KgDialect::register("kg", recovered_runtime.clone(), &mut builder)
+                .expect("kg is a known pack name");
             let registry = builder.build();
             recovered_runtime.install_edge_rules(registry.all_edge_rules());
             Self { registry }
@@ -114,19 +120,8 @@ impl KhiveMcpServer {
             if !seen.insert(name.as_str()) {
                 continue;
             }
-            match name.as_str() {
-                "kg" => {
-                    builder.register(KgPack::new(runtime.clone()));
-                }
-                "gtd" => {
-                    builder.register(GtdPack::new(runtime.clone()));
-                }
-                other => {
-                    return Err(PackRegError {
-                        unknown: other.to_string(),
-                        runtime,
-                    });
-                }
+            if let Err(unknown) = KgDialect::register(name, runtime.clone(), &mut builder) {
+                return Err(PackRegError { unknown, runtime });
             }
         }
         let registry = builder.build();

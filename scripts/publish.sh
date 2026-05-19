@@ -53,6 +53,7 @@ CRATES=(
     khive-request
     khive-pack-kg
     khive-pack-gtd
+    khive-dialect-kg
     khive-mcp
 )
 
