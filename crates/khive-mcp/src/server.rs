@@ -27,7 +27,7 @@ use rmcp::{
 use serde_json::{json, Value};
 
 use khive_request::{parse_request, DslError, ParsedOp};
-use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 
 use crate::pack::{DialectRegistrar, KgDialect};
 
@@ -131,6 +131,16 @@ impl KhiveMcpServer {
         Ok(Self { registry })
     }
 
+    /// Build a server directly from a pre-configured registry.
+    ///
+    /// Intended for tests that need to inject mock packs (e.g. packs that
+    /// return `RuntimeError::Khive` to exercise structured error serialization).
+    /// Production code should use [`Self::new`] or [`Self::with_packs`].
+    #[doc(hidden)]
+    pub fn from_registry(registry: VerbRegistry) -> Self {
+        Self { registry }
+    }
+
     /// Serve over stdio (blocks until the connection closes).
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
         use rmcp::transport::stdio;
@@ -171,6 +181,15 @@ impl KhiveMcpServer {
                 let args_value = Value::Object(args);
                 match registry.dispatch(&tool, args_value).await {
                     Ok(result) => json!({ "ok": true, "tool": tool, "result": result }),
+                    Err(RuntimeError::Khive(k)) => {
+                        // Preserve the full structured KhiveError on the wire.
+                        // Non-Khive variants fall through to the flat-string form
+                        // below to keep backward compatibility.
+                        let error_payload = serde_json::to_value(&k).unwrap_or_else(
+                            |_| json!({ "kind": "internal", "message": k.to_string() }),
+                        );
+                        json!({ "ok": false, "tool": tool, "error": error_payload })
+                    }
                     Err(e) => json!({ "ok": false, "tool": tool, "error": e.to_string() }),
                 }
             }

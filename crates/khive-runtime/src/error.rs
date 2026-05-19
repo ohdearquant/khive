@@ -32,4 +32,16 @@ pub enum RuntimeError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    /// A structured [`khive_types::KhiveError`] converted into the runtime
+    /// layer. The full structured error is preserved so callers can inspect
+    /// `kind`, `code`, `details`, and `retry_hint` without information loss.
+    #[error("{0}")]
+    Khive(khive_types::KhiveError),
+}
+
+impl From<khive_types::KhiveError> for RuntimeError {
+    fn from(e: khive_types::KhiveError) -> Self {
+        Self::Khive(e)
+    }
 }

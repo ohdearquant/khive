@@ -2,8 +2,12 @@
 //!
 //! Validates the single-tool composition: every verb is reached via `request(ops="…")`.
 
+use async_trait::async_trait;
 use khive_mcp::server::KhiveMcpServer;
-use khive_runtime::{KhiveRuntime, RuntimeConfig};
+use khive_runtime::{
+    KhiveRuntime, PackRuntime, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+};
+use khive_types::{Details, ErrorCode as KhiveErrorCode, ErrorDomain, KhiveError, Pack, VerbDef};
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult, ClientInfo, ErrorCode},
     ClientHandler, ServerHandler, ServiceError, ServiceExt,
@@ -891,5 +895,148 @@ async fn search_kind_filter_surfaces_right_kind_when_wrong_kind_outranks() -> an
             "search(kind=\"concept\") must only return concepts: {got}"
         );
     }
+    Ok(())
+}
+
+// ── Structured KhiveError preservation through the MCP boundary ──────────────
+
+/// A minimal mock pack whose single verb always returns a `RuntimeError::Khive`
+/// with code + details + retry_hint set. Used to verify that the MCP per-op
+/// serializer emits a structured JSON error object (not a flat string).
+struct ErrorInjectPack;
+
+impl khive_types::Pack for ErrorInjectPack {
+    const NAME: &'static str = "error-inject";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const VERBS: &'static [VerbDef] = &[VerbDef {
+        name: "always_fail",
+        description: "always returns a KhiveError::unavailable with code + details",
+    }];
+}
+
+#[async_trait]
+impl PackRuntime for ErrorInjectPack {
+    fn name(&self) -> &str {
+        "error-inject"
+    }
+
+    fn note_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn verbs(&self) -> &'static [VerbDef] {
+        ErrorInjectPack::VERBS
+    }
+
+    async fn dispatch(
+        &self,
+        _verb: &str,
+        _params: serde_json::Value,
+        _registry: &VerbRegistry,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let err = KhiveError::unavailable("downstream service offline")
+            .with_code(KhiveErrorCode::new(ErrorDomain::Runtime, 10))
+            .with_details(Details::new([
+                ("service", "embed"),
+                ("region", "us-east-1"),
+            ]));
+        Err(RuntimeError::Khive(err))
+    }
+}
+
+/// Build a server backed only by the `ErrorInjectPack` (no DB, no embedding).
+fn make_error_inject_server() -> KhiveMcpServer {
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(ErrorInjectPack);
+    let registry = builder.build();
+    KhiveMcpServer::from_registry(registry)
+}
+
+async fn connect_error_inject(
+) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = make_error_inject_server();
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    Ok(client)
+}
+
+/// `RuntimeError::Khive` must survive the MCP per-op boundary as a structured
+/// JSON object — not collapsed to a flat string via `Display`.
+///
+/// Verifies:
+/// - `error` is a JSON object (not a string)
+/// - `error.kind` is present (snake_case string)
+/// - `error.message` is present
+/// - `error.code` is present as a wire string (e.g. "runtime:10")
+/// - `error.details` is a non-null JSON object
+/// - Non-Khive errors still produce a flat string (backward-compat check via
+///   the existing `unknown_verb_returns_per_op_failure_not_invalid_params` test)
+#[tokio::test]
+async fn runtime_khive_error_serializes_as_structured_object() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "always_fail()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    // The op failed.
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+
+    // `error` must be an object, not a string.
+    let error = &first["error"];
+    assert!(
+        error.is_object(),
+        "error must be a JSON object (not a string); got: {error}"
+    );
+
+    // Required fields must be present.
+    assert!(
+        error["kind"].is_string(),
+        "error.kind must be a string; got: {error}"
+    );
+    assert!(
+        error["message"].is_string(),
+        "error.message must be a string; got: {error}"
+    );
+    assert!(
+        error["code"].is_string(),
+        "error.code must be a wire string (e.g. 'runtime:10'); got: {error}"
+    );
+    assert!(
+        error["details"].is_object(),
+        "error.details must be a JSON object; got: {error}"
+    );
+
+    // Spot-check values.
+    assert_eq!(
+        error["kind"].as_str().unwrap(),
+        "unavailable",
+        "KhiveError::unavailable should map to kind='unavailable'"
+    );
+    assert_eq!(
+        error["code"].as_str().unwrap(),
+        "runtime:10",
+        "ErrorCode(Runtime, 10) should serialize as 'runtime:10'"
+    );
+    assert_eq!(
+        error["details"]["service"].as_str().unwrap(),
+        "embed",
+        "details key 'service' should be preserved"
+    );
+
     Ok(())
 }
