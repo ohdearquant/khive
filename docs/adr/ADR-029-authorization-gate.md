@@ -1,6 +1,6 @@
 # ADR-029: Authorization Gate — Pluggable Policy Trait
 
-**Status**: accepted (trait + default only; enforcement deferred to v0.3)\
+**Status**: accepted (enforcement now hard, per ADR-035)\
 **Date**: 2026-05-18\
 **Authors**: Ocean, lambda:khive
 
@@ -204,7 +204,7 @@ today is the wrong default.
 | `khive-gate-rego` crate (`RegoGate`)               | `crates/khive-gate-rego/`                     | done (ADR-032)       |
 | `LionGate<G>` migration in khive-cloud             | `khive-cloud/crates/gate/`                    | planned (cloud-side) |
 | Audit envelope (`AuditEvent` via tracing)          | `crates/khive-gate/src/lib.rs` (type)         | accepted (ADR-033)   |
-| Hard enforcement (deny → dispatch error)           | `crates/khive-runtime/src/pack.rs`            | deferred to v0.3     |
+| Hard enforcement (deny → dispatch error)           | `crates/khive-runtime/src/pack.rs`            | accepted (ADR-035)   |
 
 ## Open Questions
 
@@ -212,8 +212,10 @@ today is the wrong default.
    transport-agnostic) or in `khive-mcp`'s request handler (one site, transport-specific).
    Dispatch-site keeps non-MCP transports gated for free; transport-site keeps the registry
    transport-agnostic. Lean: dispatch-site. Resolve in the wiring PR.
-2. **Audit envelope schema.** Once enforcement lands, audit obligations need a sink. Likely an
-   `EventStore` write with `EventKind::Audit`; shape TBD in the audit subsystem ADR.
+2. **Audit envelope schema.** ~~Resolved by ADR-033 (AuditEvent type) and ADR-035 (storage
+   shape: `SubstrateKind::Event` with the full `AuditEvent` serialized into `Event.data`).~~
+   *Resolved: ADR-033 defines `AuditEvent`; ADR-035 specifies persistence as
+   `SubstrateKind::Event` with the full `AuditEvent` JSON in `Event.data`.*
 3. **Multi-gate composition.** Should `LionGate<G>` chain — wrap another gate, both consulted?
    Or is single wrapping enough? Defer until a real second stack emerges.
 4. **Anonymous actor semantics.** `AllowAllGate` accepts `ActorRef::anonymous()`. A real

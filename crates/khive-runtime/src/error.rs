@@ -33,6 +33,14 @@ pub enum RuntimeError {
     #[error("internal: {0}")]
     Internal(String),
 
+    /// Gate denied this verb invocation (ADR-035).
+    ///
+    /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns
+    /// `GateDecision::Deny`. The pack is never invoked. The `reason` field
+    /// carries the deny message produced by the gate implementation.
+    #[error("permission denied for verb {verb:?}: {reason}")]
+    PermissionDenied { verb: String, reason: String },
+
     /// A structured [`khive_types::KhiveError`] converted into the runtime
     /// layer. The full structured error is preserved so callers can inspect
     /// `kind`, `code`, `details`, and `retry_hint` without information loss.

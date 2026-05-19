@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use khive_gate::{ActorRef, AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
-use khive_types::Namespace;
+use khive_storage::{Event, EventStore, SubstrateKind};
+use khive_types::{EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{EdgeEndpointRule, EndpointKind, VerbDef};
@@ -125,6 +126,13 @@ pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
     gate: GateRef,
     default_namespace: String,
+    /// Optional audit event sink (ADR-035).
+    ///
+    /// When set, every gate check writes a storage `Event` in addition to the
+    /// `tracing::info!` emission. The store is `Arc<dyn EventStore>` so the
+    /// registry does not depend on the full `KhiveRuntime` surface — only the
+    /// audit-persistence capability is needed here.
+    event_store: Option<Arc<dyn EventStore>>,
 }
 
 impl VerbRegistryBuilder {
@@ -133,6 +141,7 @@ impl VerbRegistryBuilder {
             packs: Vec::new(),
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::default_ns().as_str().to_string(),
+            event_store: None,
         }
     }
 
@@ -161,12 +170,26 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Set the `EventStore` used to persist audit events (ADR-035).
+    ///
+    /// When configured, every gate check appends one `Event` (substrate =
+    /// `Event`, outcome = `Success` on allow, `Denied` on deny) in addition to
+    /// the `tracing::info!` emission that was already present in v0.2.
+    ///
+    /// Callers that do not set this field continue to use tracing-only emission
+    /// (the v0.2 default). There is no behavior change for them.
+    pub fn with_event_store(&mut self, store: Arc<dyn EventStore>) -> &mut Self {
+        self.event_store = Some(store);
+        self
+    }
+
     /// Consume the builder and produce an immutable, cloneable registry.
     pub fn build(self) -> VerbRegistry {
         VerbRegistry {
             packs: std::sync::Arc::new(self.packs),
             gate: self.gate,
             default_namespace: self.default_namespace,
+            event_store: self.event_store,
         }
     }
 }
@@ -185,6 +208,8 @@ pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
     gate: GateRef,
     default_namespace: String,
+    /// Audit event sink — `None` means tracing-only (v0.2 default) (ADR-035).
+    event_store: Option<Arc<dyn EventStore>>,
 }
 
 impl VerbRegistry {
@@ -193,9 +218,20 @@ impl VerbRegistry {
     /// When multiple packs declare the same verb, the first registered pack wins.
     ///
     /// The configured [`Gate`](khive_gate::Gate) is consulted before dispatch
-    /// (ADR-029). In v0.2 the check is **advisory** — `Deny` decisions are
-    /// logged via `tracing::warn!` but do not abort the call. v0.3 will make
-    /// deny authoritative.
+    /// (ADR-029, ADR-035). `Deny` decisions return
+    /// [`RuntimeError::PermissionDenied`] immediately — the pack is never
+    /// invoked. `Allow` decisions proceed to pack dispatch as before.
+    ///
+    /// Every gate consultation emits one `tracing::info!(... "gate.check")` event
+    /// with a structured `audit_event` field (ADR-033). When a [`EventStore`]
+    /// is configured via [`VerbRegistryBuilder::with_event_store`], an `Event`
+    /// is also persisted to the substrate (ADR-035). Storage errors are logged
+    /// via `tracing::warn!` and never propagated.
+    ///
+    /// When `gate.check` itself returns an error (gate infrastructure failure),
+    /// the error is logged via `tracing::warn!` and dispatch proceeds (fail-open,
+    /// consistent with ADR-029 §Rationale "Why advisory in v0.2"). No audit event
+    /// is persisted for an errored gate check — no decision was produced.
     ///
     /// The synthesized `GateRequest` carries `ActorRef::anonymous()` and the
     /// operation's namespace — pulled from `params["namespace"]` when present
@@ -218,30 +254,76 @@ impl VerbRegistry {
             verb,
             params.clone(),
         );
-        // Consult the gate and emit a structured audit event (ADR-033).
-        // In v0.2 the gate is advisory — Deny is logged but does not block.
-        // The audit event is emitted via tracing::info! as structured JSON.
-        // Storage-backed emission (EventStore::append_event) is deferred to v0.3
-        // when VerbRegistry gains a runtime handle; see ADR-033 §"Implementation Status".
-        match self.gate.check(&gate_req) {
+
+        // Consult the gate (ADR-029, ADR-035).
+        //
+        // - Ok(Allow) → proceed to pack dispatch (tracing + optional EventStore).
+        // - Ok(Deny) → emit audit, persist if store configured, return PermissionDenied.
+        // - Err(_) → warn via tracing, fail-open (no audit persisted).
+        let gate_blocked = match self.gate.check(&gate_req) {
             Ok(decision) => {
-                if matches!(decision, GateDecision::Deny { .. }) {
-                    tracing::warn!(
-                        verb,
-                        reason = %match &decision { GateDecision::Deny { reason } => reason.as_str(), _ => "" },
-                        "gate deny (advisory in v0.2; not enforced)"
-                    );
-                }
+                let is_deny = matches!(decision, GateDecision::Deny { .. });
+
+                // Emit audit event via tracing (ADR-033 — preserved path).
                 let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
                 tracing::info!(
                     audit_event = %serde_json::to_string(&audit)
                         .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
                     "gate.check"
                 );
+
+                // Persist to EventStore when configured (ADR-035).
+                if let Some(store) = &self.event_store {
+                    let outcome = if is_deny {
+                        EventOutcome::Denied
+                    } else {
+                        EventOutcome::Success
+                    };
+                    let audit_data = serde_json::to_value(&audit).unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "failed to serialize AuditEvent for EventStore");
+                        serde_json::Value::Null
+                    });
+                    let storage_event = Event::new(
+                        gate_req.namespace.as_str(),
+                        verb,
+                        SubstrateKind::Event,
+                        format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
+                    )
+                    .with_outcome(outcome)
+                    .with_data(audit_data);
+                    if let Err(store_err) = store.append_event(storage_event).await {
+                        tracing::warn!(
+                            verb,
+                            error = %store_err,
+                            "audit event store write failed (non-fatal)"
+                        );
+                    }
+                }
+
+                if is_deny {
+                    let reason = match decision {
+                        GateDecision::Deny { reason } => reason,
+                        _ => String::new(),
+                    };
+                    Some(reason)
+                } else {
+                    None
+                }
             }
             Err(err) => {
-                tracing::warn!(verb, error = %err, "gate check failed (advisory)");
+                // Gate infrastructure failure — fail-open (ADR-029 §Rationale).
+                // No decision was produced; no audit event is persisted.
+                tracing::warn!(verb, error = %err, "gate check failed (fail-open)");
+                None
             }
+        };
+
+        // Hard enforcement (ADR-035): Deny is now authoritative.
+        if let Some(reason) = gate_blocked {
+            return Err(RuntimeError::PermissionDenied {
+                verb: verb.to_string(),
+                reason,
+            });
         }
 
         for pack in self.packs.iter() {
@@ -509,7 +591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_proceeds_on_deny_advisory_in_v02() {
+    async fn dispatch_returns_permission_denied_on_deny_v03() {
         let gate = Arc::new(CountingGate {
             calls: AtomicUsize::new(0),
             deny_verb: Some("create"),
@@ -519,10 +601,38 @@ mod tests {
         builder.with_gate(gate.clone());
         let reg = builder.build();
 
-        // Gate denies — but dispatch proceeds because the gate is advisory.
-        let res = reg.dispatch("create", Value::Null).await.unwrap();
-        assert_eq!(res["pack"], "alpha");
+        // Gate denies — dispatch now returns PermissionDenied (hard enforcement, ADR-035).
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::PermissionDenied { ref verb, .. } if verb == "create"),
+            "expected PermissionDenied, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("create"),
+            "error message must name the verb: {msg}"
+        );
+        assert!(
+            msg.contains("test deny for create"),
+            "error message must carry the deny reason: {msg}"
+        );
         assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_allow_verb_succeeds_even_with_deny_gate_for_other_verb() {
+        // Deny only "create" — "list" must still work.
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build();
+
+        let res = reg.dispatch("list", Value::Null).await.unwrap();
+        assert_eq!(res["pack"], "alpha");
     }
 
     #[tokio::test]
@@ -667,9 +777,10 @@ mod tests {
         builder.with_gate(gate.clone());
         let reg = builder.build();
 
-        // Gate denies but dispatch still succeeds (advisory v0.2).
-        let res = reg.dispatch("create", Value::Null).await.unwrap();
-        assert_eq!(res["pack"], "alpha");
+        // Gate denies — dispatch returns PermissionDenied (hard enforcement, ADR-035).
+        // The audit event is still recorded (captured inside the gate impl).
+        let err = reg.dispatch("create", Value::Null).await.unwrap_err();
+        assert!(matches!(err, RuntimeError::PermissionDenied { .. }));
 
         let evs = gate.events.lock().unwrap();
         let ev = &evs[0];
@@ -834,6 +945,271 @@ mod tests {
         );
     }
 
+    // ---- Hard enforcement + EventStore persistence (ADR-035) ----
+
+    use async_trait::async_trait;
+    use khive_storage::{
+        BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, SubstrateKind,
+    };
+    use khive_types::EventOutcome;
+
+    /// In-memory EventStore for unit tests — avoids file-backed SQLite.
+    #[derive(Default, Debug)]
+    struct MemoryEventStore {
+        events: std::sync::Mutex<Vec<Event>>,
+    }
+
+    #[async_trait]
+    impl EventStore for MemoryEventStore {
+        async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+        async fn append_events(
+            &self,
+            events: Vec<Event>,
+        ) -> khive_storage::StorageResult<BatchWriteSummary> {
+            let attempted = events.len() as u64;
+            let affected = attempted;
+            self.events.lock().unwrap().extend(events);
+            Ok(BatchWriteSummary {
+                attempted,
+                affected,
+                failed: 0,
+                first_error: String::new(),
+            })
+        }
+        async fn get_event(&self, id: uuid::Uuid) -> khive_storage::StorageResult<Option<Event>> {
+            Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.id == id)
+                .cloned())
+        }
+        async fn query_events(
+            &self,
+            _filter: EventFilter,
+            _page: PageRequest,
+        ) -> khive_storage::StorageResult<Page<Event>> {
+            let items = self.events.lock().unwrap().clone();
+            let total = items.len() as u64;
+            Ok(Page {
+                items,
+                total: Some(total),
+            })
+        }
+        async fn count_events(&self, _filter: EventFilter) -> khive_storage::StorageResult<u64> {
+            Ok(self.events.lock().unwrap().len() as u64)
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_all_gate_default_remains_backward_compatible() {
+        // No gate set — AllowAllGate is the default. Dispatch must succeed.
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        let reg = builder.build();
+
+        let res = reg.dispatch("list", Value::Null).await.unwrap();
+        assert_eq!(
+            res["pack"], "alpha",
+            "AllowAllGate must allow every verb — backward compat guarantee"
+        );
+        let res = reg.dispatch("create", Value::Null).await.unwrap();
+        assert_eq!(res["pack"], "alpha");
+    }
+
+    #[tokio::test]
+    async fn deny_gate_returns_permission_denied_pack_never_invoked() {
+        #[derive(Debug)]
+        struct AlwaysDenyGate;
+        impl Gate for AlwaysDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::deny("test: always deny"))
+            }
+        }
+
+        // Track whether dispatch was ever invoked on the pack.
+        #[derive(Debug)]
+        struct TrackedPack {
+            invoked: Arc<AtomicUsize>,
+        }
+
+        impl khive_types::Pack for TrackedPack {
+            const NAME: &'static str = "tracked";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const VERBS: &'static [VerbDef] = &[VerbDef {
+                name: "guarded",
+                description: "a guarded verb",
+            }];
+        }
+
+        #[async_trait]
+        impl PackRuntime for TrackedPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn verbs(&self) -> &'static [VerbDef] {
+                Self::VERBS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+            ) -> Result<Value, RuntimeError> {
+                self.invoked.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"invoked": true}))
+            }
+        }
+
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(TrackedPack {
+            invoked: invoked.clone(),
+        });
+        builder.with_gate(Arc::new(AlwaysDenyGate));
+        let reg = builder.build();
+
+        let err = reg.dispatch("guarded", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason } if verb == "guarded" && reason.contains("always deny")),
+            "expected PermissionDenied with verb=guarded and reason, got: {err:?}"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "pack dispatch MUST NOT be invoked when gate denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_event_persists_to_event_store_on_allow() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build();
+
+        reg.dispatch("list", serde_json::json!({"namespace": "test-ns"}))
+            .await
+            .unwrap();
+
+        let count = store.count_events(EventFilter::default()).await.unwrap();
+        assert_eq!(count, 1, "one audit event persisted to EventStore on allow");
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let ev = &page.items[0];
+        assert_eq!(ev.verb, "list");
+        assert_eq!(ev.namespace, "test-ns");
+        assert_eq!(ev.substrate, SubstrateKind::Event);
+        assert_eq!(ev.outcome, EventOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn audit_event_persists_to_event_store_on_deny() {
+        #[derive(Debug)]
+        struct AlwaysDenyGate;
+        impl Gate for AlwaysDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::deny("denied by test"))
+            }
+        }
+
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(AlwaysDenyGate));
+        builder.with_event_store(store.clone());
+        let reg = builder.build();
+
+        // Hard enforce → PermissionDenied returned.
+        let err = reg
+            .dispatch("list", serde_json::json!({"namespace": "test-ns"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::PermissionDenied { .. }));
+
+        let count = store.count_events(EventFilter::default()).await.unwrap();
+        assert_eq!(count, 1, "one audit event persisted to EventStore on deny");
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let ev = &page.items[0];
+        assert_eq!(ev.verb, "list");
+        assert_eq!(ev.outcome, EventOutcome::Denied);
+    }
+
+    #[tokio::test]
+    async fn gate_error_does_not_persist_to_event_store() {
+        #[derive(Debug)]
+        struct FailingGate;
+        impl Gate for FailingGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, khive_gate::GateError> {
+                Err(khive_gate::GateError::Internal("gate broken".into()))
+            }
+        }
+
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(FailingGate));
+        builder.with_event_store(store.clone());
+        let reg = builder.build();
+
+        // Gate Err → fail-open, dispatch proceeds.
+        let res = reg.dispatch("list", Value::Null).await.unwrap();
+        assert_eq!(
+            res["pack"], "alpha",
+            "gate error must fail-open, not block dispatch"
+        );
+
+        let count = store.count_events(EventFilter::default()).await.unwrap();
+        assert_eq!(
+            count, 0,
+            "gate infrastructure error must NOT produce an audit event in EventStore"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_event_store_configured_tracing_only() {
+        // When no event_store is configured, dispatch must succeed without error.
+        // (The tracing path is exercised in the tracing tests above; here we just
+        // verify the absence of event_store does not break dispatch.)
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        let reg = builder.build();
+
+        let res = reg.dispatch("list", Value::Null).await.unwrap();
+        assert_eq!(res["pack"], "alpha");
+    }
+
     #[test]
     fn dispatch_tracing_emits_gate_check_event_with_deny_payload() {
         #[derive(Debug)]
@@ -852,10 +1228,9 @@ mod tests {
             builder.register(AlphaPack);
             builder.with_gate(Arc::new(AlwaysDenyGate));
             let reg = builder.build();
-            // Advisory in v0.2 — dispatch succeeds even when the gate denies.
-            reg.dispatch("create", serde_json::Value::Null)
-                .await
-                .unwrap();
+            // Hard enforcement (ADR-035) — dispatch returns PermissionDenied on Deny.
+            // The tracing audit event is still emitted before the error is returned.
+            let _ = reg.dispatch("create", serde_json::Value::Null).await;
         });
 
         let gate_events = gate_check_events(&events);
@@ -883,5 +1258,359 @@ mod tests {
             serde_json::Value::Array(Vec::new()),
             "obligations must be `[]` on Deny on the tracing payload, not omitted"
         );
+    }
+
+    // ---- EventStore audit envelope round-trip (ADR-033 / ADR-035) ----
+    //
+    // Codex review finding (Major #1): EventStore was persisting a summary
+    // Event without the full AuditEvent fields (deny_reason, gate_impl,
+    // obligations). This test verifies the complete envelope survives
+    // append_event → query_events.
+
+    #[tokio::test]
+    async fn audit_envelope_round_trips_deny_reason_and_gate_impl_through_event_store() {
+        #[derive(Debug)]
+        struct DenyGateWithName;
+        impl Gate for DenyGateWithName {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::deny("policy: write forbidden for anon"))
+            }
+            fn impl_name(&self) -> &'static str {
+                "DenyGateWithName"
+            }
+        }
+
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(DenyGateWithName));
+        builder.with_event_store(store.clone());
+        let reg = builder.build();
+
+        // Dispatch is denied — PermissionDenied returned.
+        let err = reg
+            .dispatch("list", serde_json::json!({"namespace": "test-ns"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+
+        // Exactly one event in the store.
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "one audit event must be persisted on deny"
+        );
+
+        let ev = &page.items[0];
+        assert_eq!(ev.outcome, EventOutcome::Denied);
+
+        // The data field must hold the full AuditEvent envelope (ADR-033 contract).
+        let data = ev
+            .data
+            .as_ref()
+            .expect("Event.data must be Some — full AuditEvent envelope must be persisted");
+
+        let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
+            .expect("Event.data must deserialize to AuditEvent");
+
+        assert_eq!(
+            audit.deny_reason.as_deref(),
+            Some("policy: write forbidden for anon"),
+            "deny_reason must be preserved through EventStore"
+        );
+        assert_eq!(
+            audit.gate_impl, "DenyGateWithName",
+            "gate_impl must be preserved through EventStore"
+        );
+        assert_eq!(
+            audit.decision,
+            khive_gate::AuditDecision::Deny,
+            "decision field must be preserved through EventStore"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_envelope_round_trips_obligations_through_event_store() {
+        use khive_gate::Obligation;
+
+        #[derive(Debug)]
+        struct ObligationGate;
+        impl Gate for ObligationGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::allow_with(vec![Obligation::Audit {
+                    tag: "billing.meter".into(),
+                }]))
+            }
+            fn impl_name(&self) -> &'static str {
+                "ObligationGate"
+            }
+        }
+
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(ObligationGate));
+        builder.with_event_store(store.clone());
+        let reg = builder.build();
+
+        reg.dispatch("list", serde_json::json!({"namespace": "test-ns"}))
+            .await
+            .unwrap();
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+
+        let ev = &page.items[0];
+        assert_eq!(ev.outcome, EventOutcome::Success);
+
+        let data = ev
+            .data
+            .as_ref()
+            .expect("Event.data must be Some — AuditEvent envelope must be persisted on allow");
+
+        let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
+            .expect("Event.data must deserialize to AuditEvent");
+
+        assert_eq!(audit.gate_impl, "ObligationGate");
+        assert_eq!(
+            audit.obligations.len(),
+            1,
+            "obligations must be preserved through EventStore"
+        );
+        match &audit.obligations[0] {
+            Obligation::Audit { tag } => assert_eq!(tag, "billing.meter"),
+            other => panic!("expected Audit obligation, got {other:?}"),
+        }
+    }
+
+    // ---- SQL-backed audit envelope round-trip (ADR-033 / ADR-035, codex r2) ----
+    //
+    // The two tests above use MemoryEventStore (no serialization). This test
+    // wires the production SqlEventStore via KhiveRuntime::memory() to verify
+    // that the full AuditEvent envelope survives the SQL text→parse round-trip
+    // (Event.data is stored as TEXT and parsed back on read).
+
+    #[tokio::test]
+    async fn sql_backed_audit_envelope_round_trips_deny_reason_gate_impl_and_obligations() {
+        #[derive(Debug)]
+        struct SqlTestDenyGate;
+        impl Gate for SqlTestDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::deny("sql-path: write denied"))
+            }
+            fn impl_name(&self) -> &'static str {
+                "SqlTestDenyGate"
+            }
+        }
+
+        // KhiveRuntime::memory() creates an in-memory SQLite pool (is_file_backed=false).
+        // events_for_namespace ensures the events schema and returns a SqlEventStore
+        // scoped to "test-ns". The pool is shared so reads and writes see the same data.
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let sql_store = rt
+            .events(Some("test-ns"))
+            .expect("events_for_namespace must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(SqlTestDenyGate));
+        builder.with_event_store(sql_store.clone());
+        let reg = builder.build();
+
+        // Dispatch is denied — PermissionDenied returned.
+        let err = reg
+            .dispatch("list", serde_json::json!({"namespace": "test-ns"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+
+        // Query via the same SqlEventStore — this is the SQL read path.
+        let page = sql_store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "one audit event must be persisted on deny through SqlEventStore"
+        );
+
+        let ev = &page.items[0];
+        assert_eq!(ev.outcome, EventOutcome::Denied);
+
+        // Event.data must hold the full AuditEvent serialized as JSON text and
+        // parsed back. If the SQL path was lossy, this deserialization would fail
+        // or the field assertions below would fail.
+        let data = ev
+            .data
+            .as_ref()
+            .expect("Event.data must be Some — SqlEventStore must persist AuditEvent envelope");
+
+        let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
+            .expect("Event.data must deserialize to AuditEvent after SQL round-trip");
+
+        assert_eq!(
+            audit.deny_reason.as_deref(),
+            Some("sql-path: write denied"),
+            "deny_reason must survive the SQL text round-trip"
+        );
+        assert_eq!(
+            audit.gate_impl, "SqlTestDenyGate",
+            "gate_impl must survive the SQL text round-trip"
+        );
+        assert_eq!(
+            audit.decision,
+            khive_gate::AuditDecision::Deny,
+            "decision field must survive the SQL text round-trip"
+        );
+        // obligations is [] on a Deny gate (no obligations returned).
+        // Verify the field is present and empty after SQL round-trip.
+        assert!(
+            audit.obligations.is_empty(),
+            "obligations must be preserved as empty [] through SQL round-trip"
+        );
+    }
+
+    // ---- SQL-backed audit envelope: non-empty obligations survive round-trip ----
+    //
+    // Codex r3 identified a blind spot: the deny-path SQL test above only
+    // asserts obligations == [], which passes even if the SQL path drops the
+    // field entirely (AuditEvent.obligations has #[serde(default)]).
+    //
+    // This test installs an allow-path gate that returns a non-empty obligations
+    // vec. After dispatch, the same SqlEventStore is queried and both layers are
+    // checked:
+    //   1. Raw Event.data["obligations"] is a non-empty JSON array.
+    //   2. Deserialized AuditEvent.obligations[0] matches the expected variant.
+    #[tokio::test]
+    async fn sql_backed_audit_envelope_round_trips_non_empty_obligations() {
+        use khive_gate::Obligation;
+
+        #[derive(Debug)]
+        struct SqlTestAllowWithObligationGate;
+        impl Gate for SqlTestAllowWithObligationGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::allow_with(vec![Obligation::Audit {
+                    tag: "sql-path-billing.meter".into(),
+                }]))
+            }
+            fn impl_name(&self) -> &'static str {
+                "SqlTestAllowWithObligationGate"
+            }
+        }
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let sql_store = rt
+            .events(Some("test-ns"))
+            .expect("events_for_namespace must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(SqlTestAllowWithObligationGate));
+        builder.with_event_store(sql_store.clone());
+        let reg = builder.build();
+
+        // Dispatch succeeds — the gate allows with obligations.
+        reg.dispatch("list", serde_json::json!({"namespace": "test-ns"}))
+            .await
+            .expect("dispatch must succeed when gate allows");
+
+        // Query via the same SqlEventStore — this is the SQL read path.
+        let page = sql_store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "one audit event must be persisted on allow through SqlEventStore"
+        );
+
+        let ev = &page.items[0];
+        assert_eq!(ev.outcome, EventOutcome::Success);
+
+        let data = ev
+            .data
+            .as_ref()
+            .expect("Event.data must be Some — SqlEventStore must persist AuditEvent envelope");
+
+        // Layer 1: raw JSON check — obligations must be a non-empty array in
+        // the persisted TEXT. If the SQL path dropped the field, the default
+        // #[serde(default)] would silently deserialize it to [], so we verify
+        // the raw JSON before deserializing.
+        let obligations_raw = data
+            .get("obligations")
+            .expect("Event.data JSON must contain 'obligations' key");
+        let obligations_arr = obligations_raw
+            .as_array()
+            .expect("'obligations' must be a JSON array");
+        assert!(
+            !obligations_arr.is_empty(),
+            "raw Event.data['obligations'] must be non-empty after SQL round-trip"
+        );
+
+        // Layer 2: deserialized AuditEvent check — the obligation variant and
+        // payload must survive the text round-trip faithfully.
+        let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
+            .expect("Event.data must deserialize to AuditEvent after SQL round-trip");
+
+        assert_eq!(
+            audit.gate_impl, "SqlTestAllowWithObligationGate",
+            "gate_impl must survive the SQL text round-trip"
+        );
+        assert_eq!(
+            audit.decision,
+            khive_gate::AuditDecision::Allow,
+            "decision field must survive the SQL text round-trip"
+        );
+        assert_eq!(
+            audit.obligations.len(),
+            1,
+            "obligations must be non-empty after SQL round-trip (not silently defaulted to [])"
+        );
+        match &audit.obligations[0] {
+            Obligation::Audit { tag } => assert_eq!(
+                tag, "sql-path-billing.meter",
+                "Audit obligation tag must survive the SQL text round-trip"
+            ),
+            other => panic!("expected Audit obligation, got {other:?}"),
+        }
     }
 }

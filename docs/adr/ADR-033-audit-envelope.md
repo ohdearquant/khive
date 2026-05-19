@@ -199,17 +199,17 @@ intended. Closing the observation loop now means:
 
 ## Implementation Status
 
-| Step                                                   | Where                                           | Status           |
-| ------------------------------------------------------ | ----------------------------------------------- | ---------------- |
-| `AuditEvent` + `AuditDecision` types + `from_check`    | `crates/khive-gate/src/lib.rs`                  | done (this ADR)  |
-| `Gate::impl_name()` docstring updated (→ ADR-033)      | `crates/khive-gate/src/lib.rs`                  | done (this ADR)  |
-| Emission via `tracing::info!` at dispatch site         | `crates/khive-runtime/src/pack.rs`              | done (this ADR)  |
-| Re-export `AuditEvent` + `AuditDecision` from runtime  | `crates/khive-runtime/src/lib.rs`               | done (this ADR)  |
-| Tests: serde round-trip, allow/deny/obligations fields | `crates/khive-gate/src/lib.rs` (unit tests)     | done (this ADR)  |
-| Tests: one event per dispatch, field alignment         | `crates/khive-runtime/src/pack.rs` (unit tests) | done (this ADR)  |
-| `EventStore::append_event` wiring                      | `crates/khive-runtime/src/pack.rs`              | deferred to v0.3 |
-| Query surface (`EventFilter` by `verb`, `actor`, etc.) | `crates/khive-runtime/src/operations.rs`        | deferred to v0.3 |
-| Alert / SLO consumption of deny counts                 | TBD (v0.3+)                                     | deferred         |
+| Step                                                   | Where                                           | Status             |
+| ------------------------------------------------------ | ----------------------------------------------- | ------------------ |
+| `AuditEvent` + `AuditDecision` types + `from_check`    | `crates/khive-gate/src/lib.rs`                  | done (this ADR)    |
+| `Gate::impl_name()` docstring updated (→ ADR-033)      | `crates/khive-gate/src/lib.rs`                  | done (this ADR)    |
+| Emission via `tracing::info!` at dispatch site         | `crates/khive-runtime/src/pack.rs`              | done (this ADR)    |
+| Re-export `AuditEvent` + `AuditDecision` from runtime  | `crates/khive-runtime/src/lib.rs`               | done (this ADR)    |
+| Tests: serde round-trip, allow/deny/obligations fields | `crates/khive-gate/src/lib.rs` (unit tests)     | done (this ADR)    |
+| Tests: one event per dispatch, field alignment         | `crates/khive-runtime/src/pack.rs` (unit tests) | done (this ADR)    |
+| `EventStore::append_event` wiring                      | `crates/khive-runtime/src/pack.rs`              | accepted (ADR-035) |
+| Query surface (`EventFilter` by `verb`, `actor`, etc.) | `crates/khive-runtime/src/operations.rs`        | deferred to v0.3   |
+| Alert / SLO consumption of deny counts                 | TBD (v0.3+)                                     | deferred           |
 
 ## References
 

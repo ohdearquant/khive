@@ -78,7 +78,8 @@ impl KhiveMcpServer {
     /// Build a server using the pack list from `runtime.config().packs`.
     ///
     /// The authorization gate from `runtime.config().gate` is threaded into the
-    /// registry (advisory in v0.2 per ADR-029).
+    /// registry. Gate decisions are **hard-enforcing** in v0.3 — a `Deny`
+    /// result blocks pack dispatch and returns `PermissionDenied` (ADR-035).
     ///
     /// Always returns a server. Unknown pack names are logged via `tracing::warn!`
     /// rather than rejected — startup must remain robust if a future binary drops
@@ -94,6 +95,10 @@ impl KhiveMcpServer {
             let mut builder = VerbRegistryBuilder::new();
             builder.with_gate(gate);
             builder.with_default_namespace(default_namespace);
+            // ADR-035: wire the EventStore for the fallback path too.
+            if let Ok(event_store) = recovered_runtime.events(None) {
+                builder.with_event_store(event_store);
+            }
             // Fallback: register the kg pack through the dialect registrar so
             // this code path stays free of direct pack-type imports.
             KgDialect::register("kg", recovered_runtime.clone(), &mut builder)
@@ -115,6 +120,10 @@ impl KhiveMcpServer {
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace);
+        // ADR-035: wire the EventStore into the registry for audit persistence.
+        if let Ok(event_store) = runtime.events(None) {
+            builder.with_event_store(event_store);
+        }
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for name in packs {
             if !seen.insert(name.as_str()) {
