@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry};
 use khive_types::{Pack, VerbDef};
 
 pub use vocab::{EntityKind, NoteKind};
@@ -106,15 +106,20 @@ impl PackRuntime for KgPack {
         &KG_VERBS
     }
 
-    async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
+    async fn dispatch(
+        &self,
+        verb: &str,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
         match verb {
-            "create" => self.handle_create(params).await,
+            "create" => self.handle_create(params, registry).await,
             "get" => self.handle_get(params).await,
-            "list" => self.handle_list(params).await,
+            "list" => self.handle_list(params, registry).await,
             "update" => self.handle_update(params).await,
             "delete" => self.handle_delete(params).await,
             "merge" => self.handle_merge(params).await,
-            "search" => self.handle_search(params).await,
+            "search" => self.handle_search(params, registry).await,
             "link" => self.handle_link(params).await,
             "neighbors" => self.handle_neighbors(params).await,
             "traverse" => self.handle_traverse(params).await,

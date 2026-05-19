@@ -33,7 +33,7 @@ pub use header::Header;
 pub use id::{Id128, ParseIdError};
 pub use namespace::Namespace;
 pub use note::{Note, NoteKind, NoteStatus};
-pub use pack::{Pack, VerbDef};
+pub use pack::{EdgeEndpointRule, EndpointKind, Pack, VerbDef};
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;

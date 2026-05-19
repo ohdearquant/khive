@@ -34,6 +34,7 @@ search(kind="note", query="<topic>")         # what was previously observed/deci
 ```
 
 Then:
+
 ```python
 neighbors(node_id=<found-id>, direction="both")  # immediate context
 traverse(roots=[<found-id>], max_depth=2)         # broader neighborhood
@@ -55,6 +56,7 @@ Do not begin external research until you've exhausted what's already in the grap
 ### Edge creation rules
 
 Use only these 13 relations (no others — the parser rejects unknown relations):
+
 - Structure: `contains`, `part_of`, `instance_of`
 - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
 - Dependency: `depends_on`, `enables`
@@ -63,6 +65,7 @@ Use only these 13 relations (no others — the parser rejects unknown relations)
 - Annotation: `annotates`
 
 **`introduced_by` direction**: concept → paper or concept → person. Never paper → person.
+
 - Correct: `link(source_id=concept.id, target_id=paper.id, relation="introduced_by")` — concept was introduced by the paper
 - Correct: `link(source_id=concept.id, target_id=person.id, relation="introduced_by")` — concept was introduced by the person
 - Wrong: `link(source_id=paper.id, target_id=person.id, relation="introduced_by")` — authorship belongs in `properties.authors`
@@ -154,6 +157,7 @@ Return findings to the caller with:
 5. **Graph density before/after** (edges/nodes ratio)
 
 Example:
+
 ```
 Ingested: FlashAttention-3 (concept, id: a3f9c2b1)
 Edges: extends→FlashAttention-2, introduced_by→Dao et al. 2024 paper, competes_with→Mamba attention

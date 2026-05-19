@@ -1,9 +1,10 @@
 //! KhiveRuntime — composable handle to all storage capabilities.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use khive_db::StorageBackend;
 use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
+use khive_types::EdgeEndpointRule;
 use lattice_embed::{
     CachedEmbeddingService, EmbeddingModel, EmbeddingService, NativeEmbeddingService,
 };
@@ -21,6 +22,23 @@ pub struct RuntimeConfig {
     /// Local embedding model. `None` disables embedding and hybrid vector search;
     /// `hybrid_search` then falls back to text-only.
     pub embedding_model: Option<EmbeddingModel>,
+    /// Names of packs the transport layer should register into the VerbRegistry.
+    /// The transport layer (e.g. `khive-mcp`) reads this list and instantiates
+    /// the matching concrete pack types. Unknown names are reported as errors
+    /// by the transport, not silently ignored.
+    /// Default: `["kg"]`.
+    pub packs: Vec<String>,
+}
+
+/// Parse a comma- or whitespace-separated pack list from a single string.
+///
+/// Empty entries are dropped, surrounding whitespace is trimmed.
+pub fn parse_pack_list(s: &str) -> Vec<String> {
+    s.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 impl Default for RuntimeConfig {
@@ -32,10 +50,16 @@ impl Default for RuntimeConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .or(Some(EmbeddingModel::AllMiniLmL6V2));
+        let packs = std::env::var("KHIVE_PACKS")
+            .ok()
+            .map(|s| parse_pack_list(&s))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["kg".to_string()]);
         Self {
             db_path,
             default_namespace: "local".to_string(),
             embedding_model,
+            packs,
         }
     }
 }
@@ -49,6 +73,11 @@ pub struct KhiveRuntime {
     backend: Arc<StorageBackend>,
     config: RuntimeConfig,
     embedder: Arc<OnceCell<Arc<dyn EmbeddingService>>>,
+    /// Pack-extensible edge endpoint rules (ADR-031). Shared across clones
+    /// via `Arc<RwLock<_>>`; installed once by the transport after the
+    /// `VerbRegistry` is built. Empty until installed — base rules
+    /// (ADR-002) still apply on their own.
+    edge_rules: Arc<RwLock<Vec<EdgeEndpointRule>>>,
 }
 
 impl KhiveRuntime {
@@ -67,6 +96,7 @@ impl KhiveRuntime {
             backend: Arc::new(backend),
             config,
             embedder: Arc::new(OnceCell::new()),
+            edge_rules: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -76,6 +106,7 @@ impl KhiveRuntime {
             db_path: None,
             default_namespace: "local".to_string(),
             embedding_model: None,
+            packs: vec!["kg".to_string()],
         })
     }
 
@@ -157,6 +188,26 @@ impl KhiveRuntime {
         Ok(self.backend.text(&key)?)
     }
 
+    /// Install the pack-aggregated edge endpoint rules (ADR-031).
+    ///
+    /// Called by the transport layer after the `VerbRegistry` is built so
+    /// that runtime-layer edge validation (in `validate_edge_relation_endpoints`)
+    /// can consult pack rules in addition to the ADR-002 base contract. Idempotent:
+    /// later calls overwrite the previous rule set.
+    pub fn install_edge_rules(&self, rules: Vec<EdgeEndpointRule>) {
+        if let Ok(mut guard) = self.edge_rules.write() {
+            *guard = rules;
+        }
+    }
+
+    /// Snapshot of currently-installed pack edge rules.
+    pub(crate) fn pack_edge_rules(&self) -> Vec<EdgeEndpointRule> {
+        self.edge_rules
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
     /// Get the lazily-initialized embedding service.
     ///
     /// Returns a `CachedEmbeddingService` wrapping a `NativeEmbeddingService`.
@@ -212,6 +263,7 @@ mod tests {
             db_path: Some(path.clone()),
             default_namespace: "test".to_string(),
             embedding_model: None,
+            packs: vec!["kg".to_string()],
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
@@ -258,6 +310,40 @@ mod tests {
             vec_model_key(EmbeddingModel::AllMiniLmL6V2),
             "all_minilm_l6_v2"
         );
+    }
+
+    #[test]
+    fn parse_pack_list_handles_comma_and_whitespace() {
+        assert_eq!(parse_pack_list("kg"), vec!["kg".to_string()]);
+        assert_eq!(
+            parse_pack_list("kg,gtd"),
+            vec!["kg".to_string(), "gtd".to_string()]
+        );
+        assert_eq!(
+            parse_pack_list("  kg ,  gtd  "),
+            vec!["kg".to_string(), "gtd".to_string()]
+        );
+        assert_eq!(
+            parse_pack_list("kg gtd"),
+            vec!["kg".to_string(), "gtd".to_string()]
+        );
+        assert_eq!(parse_pack_list(",,"), Vec::<String>::new());
+        assert_eq!(parse_pack_list(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn default_config_packs_falls_back_to_kg() {
+        let prior = std::env::var("KHIVE_PACKS").ok();
+        unsafe {
+            std::env::remove_var("KHIVE_PACKS");
+        }
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.packs, vec!["kg".to_string()]);
+        if let Some(v) = prior {
+            unsafe {
+                std::env::set_var("KHIVE_PACKS", v);
+            }
+        }
     }
 
     #[test]

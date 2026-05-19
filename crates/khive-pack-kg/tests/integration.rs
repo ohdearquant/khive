@@ -5,15 +5,38 @@
 //! runtime so there is no I/O dependency.
 
 use khive_pack_kg::KgPack;
-use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_runtime::pack::VerbDef;
+use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use serde_json::{json, Value};
 
 // ---- Helpers ----
 
-fn pack() -> KgPack {
+/// Test fixture: a `VerbRegistry` containing a freshly registered `KgPack`,
+/// plus pass-through metadata methods so existing tests keep working.
+///
+/// All dispatch goes through the registry — exercising the same path the MCP
+/// server uses, including the kind-hook flow introduced in ADR-030.
+struct Fixture {
+    registry: VerbRegistry,
+}
+
+impl Fixture {
+    async fn dispatch(&self, verb: &str, args: Value) -> Result<Value, RuntimeError> {
+        self.registry.dispatch(verb, args).await
+    }
+
+    fn verbs(&self) -> Vec<&'static VerbDef> {
+        self.registry.all_verbs()
+    }
+}
+
+fn pack() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    KgPack::new(rt)
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    Fixture {
+        registry: builder.build(),
+    }
 }
 
 fn is_invalid_input(err: &RuntimeError) -> bool {

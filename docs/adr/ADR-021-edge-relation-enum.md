@@ -6,11 +6,14 @@
 
 ## Context
 
-ADR-002 defines a closed set of edge relations (13 canonical names in 6 categories — 11
-entity-to-entity relations, `supersedes` for same-substrate (note→note or entity→entity), and
-`annotates` for cross-substrate (note→any substrate)). The natural Rust representation
-stores `Edge.relation` as `String` and validates against the canonical set at write time. This is
-the same shape that entity kinds and note kinds had before ADR-001 and ADR-019:
+ADR-002 defines a closed set of edge relations (13 canonical names in 6 categories). Their
+**base** endpoint contract is: 11 default-entity-to-entity relations, `supersedes` for
+same-substrate (note→note or entity→entity), and `annotates` for cross-substrate (note→any
+substrate). [ADR-031](ADR-031-pack-extensible-edge-endpoints.md) additively extends this
+per-relation endpoint contract via pack-declared `EDGE_RULES` — the relation set itself
+remains closed at 13. The natural Rust representation stores `Edge.relation` as `String` and
+validates against the canonical set at write time. This is the same shape that entity kinds
+and note kinds had before ADR-001 and ADR-019:
 
 - No compile-time guarantees.
 - Validation happens at storage boundaries but the type is unconstrained downstream.
@@ -230,6 +233,11 @@ re-encoding the grouping in every consumer.
    queries later, encode the mapping then.
 3. **What about future extensions?** ADR amendment process: bump ADR-002 + ADR-021 together; add the
    variant; update all consumers via the compiler errors. Discipline by design.
+4. **What about pack-specific endpoint shapes (e.g. task→task `depends_on`)?**
+   [ADR-031](ADR-031-pack-extensible-edge-endpoints.md) introduced pack-extensible _endpoint
+   rules_ on top of this enum. The closed 13-relation set is unchanged; what packs may extend is
+   the per-relation list of legal `(source-kind, target-kind)` pairs. Rules are additive only —
+   packs cannot tighten the ADR-002 base contract.
 
 ## References
 
@@ -238,3 +246,4 @@ re-encoding the grouping in every consumer.
 - ADR-019: Note Kind Taxonomy (closed enum, 5 variants — companion in the substrate-typing trilogy)
 - ADR-024: Note Search + Cross-Substrate Navigation (uses the `annotates` relation to make notes
   first-class graph nodes)
+- ADR-031: Pack-Extensible Edge Endpoints (additive per-pack endpoint rules over this enum)

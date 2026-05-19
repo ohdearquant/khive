@@ -144,7 +144,7 @@ pub struct GetParams {
 }
 
 pub struct UpdateParams {
-    pub id: String,          // UUID — substrate resolved internally
+    pub id: String,          // UUID — substrate resolved internally; entity or edge in v0.2
     // Entity patch fields:
     pub name: Option<String>,
     pub description: Option<Option<String>>,
@@ -153,10 +153,9 @@ pub struct UpdateParams {
     // Edge patch fields:
     pub relation: Option<String>,
     pub weight: Option<f64>,
-    // Note patch fields:
-    pub content: Option<String>,
-    pub note_kind: Option<String>,
-    pub salience: Option<f64>,
+    // Note patch fields are not yet wired — KG `update` returns NotFound for a note UUID in
+    // v0.2. Task lifecycle changes go through the GTD pack's `transition`; broader note
+    // property repair is deferred to a future ADR.
 }
 
 pub struct DeleteParams {

@@ -12,6 +12,7 @@ description = "khive stdio MCP server — the only user-facing Rust binary"
 khive-runtime = { version = "0.1.2", path = "../khive-runtime" }
 khive-request = { version = "0.1.2", path = "../khive-request" }
 khive-pack-kg = { version = "0.1.2", path = "../khive-pack-kg" }
+khive-pack-gtd = { version = "0.1.2", path = "../khive-pack-gtd" }
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 tokio = { workspace = true }
 futures = "0.3"

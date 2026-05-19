@@ -33,6 +33,7 @@ neighbors(node_id="<entity-id>", direction="both")
 ```
 
 Classify:
+
 - **Orphan** (0 edges): must fix — every entity needs at least one relationship
 - **Under-linked** (concepts < 4, projects < 3, documents < 2): should fix
 - **Healthy** (at or above target): skip
@@ -68,6 +69,7 @@ Supersession does NOT transfer annotations. The new note must explicitly declare
 ### 4. Fix orphans and under-linked entities
 
 For each orphan or under-linked entity, think about:
+
 - What is it a kind of? → `instance_of`
 - What does it extend? → `extends`
 - Who introduced it? → `introduced_by`
@@ -92,11 +94,13 @@ list(kind="edge", target_id="<entity-id>")
 ```
 
 Check for:
+
 - **Wrong direction**: `introduced_by` going paper → concept (should be concept → paper)
 - **Wrong relation**: `extends` used where `instance_of` fits better
 - **Low weight on confident relations**: definitional relations should be weight 1.0
 
 Fix with:
+
 ```
 update(id="<edge-id>", relation="<correct-relation>")
 update(id="<edge-id>", weight=1.0)
@@ -106,6 +110,7 @@ delete(id="<edge-id>")  # if the edge is just wrong
 ### 6. Report
 
 Summarize:
+
 - Entities audited: N
 - Orphans fixed: N (list them)
 - Under-linked fixed: N
@@ -115,13 +120,13 @@ Summarize:
 
 ## Density targets
 
-| Entity kind | Minimum edges | Required relationship types |
-|-------------|---------------|----------------------------|
-| `concept` | 4 | At least one parent (`instance_of` or `extends`), `introduced_by` if source exists, `competes_with` if alternatives exist |
-| `project` | 3 | `implements` (what concept), structural (`contains`/`part_of`), `depends_on` |
-| `document` | 2 | `introduced_by` edges FROM concepts it introduced |
-| `person` | 1 | `introduced_by` from their work |
-| `org` | 1 | `contains` or structural relationship |
+| Entity kind | Minimum edges | Required relationship types                                                                                               |
+| ----------- | ------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `concept`   | 4             | At least one parent (`instance_of` or `extends`), `introduced_by` if source exists, `competes_with` if alternatives exist |
+| `project`   | 3             | `implements` (what concept), structural (`contains`/`part_of`), `depends_on`                                              |
+| `document`  | 2             | `introduced_by` edges FROM concepts it introduced                                                                         |
+| `person`    | 1             | `introduced_by` from their work                                                                                           |
+| `org`       | 1             | `contains` or structural relationship                                                                                     |
 
 ## Data-vs-view principle
 

@@ -26,6 +26,12 @@ struct Args {
     /// Log level for stderr output (stdout is reserved for the MCP protocol).
     #[arg(long, env = "KHIVE_LOG", default_value = "warn")]
     log: String,
+
+    /// Pack to load into the verb registry. Repeat for multiple
+    /// (e.g. `--pack kg --pack gtd`). Falls back to `KHIVE_PACKS` env
+    /// (comma- or whitespace-separated) or `["kg"]` if neither is set.
+    #[arg(long = "pack")]
+    pack: Vec<String>,
 }
 
 #[tokio::main]
@@ -54,10 +60,18 @@ async fn main() -> anyhow::Result<()> {
         RuntimeConfig::default().embedding_model
     };
 
+    // CLI `--pack` overrides env-derived default. Empty means "use default".
+    let packs = if args.pack.is_empty() {
+        RuntimeConfig::default().packs
+    } else {
+        args.pack
+    };
+
     let config = RuntimeConfig {
         db_path,
         default_namespace: args.namespace,
         embedding_model,
+        packs,
     };
 
     let runtime = KhiveRuntime::new(config)?;
