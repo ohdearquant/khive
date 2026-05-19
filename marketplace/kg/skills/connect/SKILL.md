@@ -44,6 +44,7 @@ search(kind="entity", query="<related terms, parent concept, enabling technique>
 ```
 
 Think about these relationship dimensions:
+
 - **What is it a kind of?** → `instance_of` (specific → general)
 - **What does it build on?** → `extends` (child → parent)
 - **Who introduced it?** → `introduced_by` (concept → paper/person)
@@ -63,13 +64,13 @@ link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.
 
 **Direction rules** (the most common mistakes):
 
-| Relation | Points FROM → TO | Mnemonic |
-|----------|------------------|----------|
-| `introduced_by` | concept → paper | "LoRA was introduced_by Hu 2021" |
-| `extends` | child → parent | "QLoRA extends LoRA" |
-| `instance_of` | specific → general | "GQA is an instance_of grouped attention" |
-| `implements` | code → concept | "lattice-inference implements GQA" |
-| `depends_on` | consumer → dependency | "quantization depends_on calibration data" |
+| Relation        | Points FROM → TO      | Mnemonic                                   |
+| --------------- | --------------------- | ------------------------------------------ |
+| `introduced_by` | concept → paper       | "LoRA was introduced_by Hu 2021"           |
+| `extends`       | child → parent        | "QLoRA extends LoRA"                       |
+| `instance_of`   | specific → general    | "GQA is an instance_of grouped attention"  |
+| `implements`    | code → concept        | "lattice-inference implements GQA"         |
+| `depends_on`    | consumer → dependency | "quantization depends_on calibration data" |
 
 If the relationship doesn't fit any of the 13 relations, it's probably a **property** on the entity (e.g., "published in 2021" → `properties.year: "2021"`, not an edge).
 
@@ -92,6 +93,7 @@ Entity is at or above minimum density. Each edge has clear rationale. If you can
 ## What is NOT a relation
 
 These are properties, not edges:
+
 - "published in 2021" → `properties.year`
 - "uses Python" → `properties.language`
 - "has 7B parameters" → `properties.params`

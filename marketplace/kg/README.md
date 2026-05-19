@@ -28,33 +28,33 @@ request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
 request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\")]")  # parallel batch
 ```
 
-| Verb | What it does |
-|------|-------------|
-| `create` | Create entities or notes |
-| `get` | Fetch any record by UUID (or 8-char prefix) |
-| `list` | Browse with filters |
-| `update` | Patch entity/edge fields |
-| `delete` | Soft or hard delete |
-| `merge` | Deduplicate two entities |
-| `search` | Hybrid FTS5 + vector search |
-| `link` | Create typed directed edges |
-| `neighbors` | Immediate graph neighbors |
-| `traverse` | Multi-hop BFS |
-| `query` | GQL/SPARQL pattern matching |
+| Verb        | What it does                                |
+| ----------- | ------------------------------------------- |
+| `create`    | Create entities or notes                    |
+| `get`       | Fetch any record by UUID (or 8-char prefix) |
+| `list`      | Browse with filters                         |
+| `update`    | Patch entity/edge fields                    |
+| `delete`    | Soft or hard delete                         |
+| `merge`     | Deduplicate two entities                    |
+| `search`    | Hybrid FTS5 + vector search                 |
+| `link`      | Create typed directed edges                 |
+| `neighbors` | Immediate graph neighbors                   |
+| `traverse`  | Multi-hop BFS                               |
+| `query`     | GQL/SPARQL pattern matching                 |
 
 ### 4 Skills (workflow-shaped, not verb docs)
 
-| Skill | Command | What it does |
-|-------|---------|--------------|
-| digest | `/kg:digest` | Ingest material into the graph — extract entities, link them, verify density |
+| Skill   | Command       | What it does                                                                  |
+| ------- | ------------- | ----------------------------------------------------------------------------- |
+| digest  | `/kg:digest`  | Ingest material into the graph — extract entities, link them, verify density  |
 | explore | `/kg:explore` | Discover what the graph knows about a topic — traverse, narrate, surface gaps |
-| connect | `/kg:connect` | Wire a new concept into existing knowledge — find relations, reach density |
-| polish | `/kg:polish` | Audit and fix — orphans, low-degree nodes, duplicates, stale edges |
+| connect | `/kg:connect` | Wire a new concept into existing knowledge — find relations, reach density    |
+| polish  | `/kg:polish`  | Audit and fix — orphans, low-degree nodes, duplicates, stale edges            |
 
 ### 1 Agent
 
-| Agent | Purpose |
-|-------|---------|
+| Agent      | Purpose                                    |
+| ---------- | ------------------------------------------ |
 | researcher | Context-aware research with KG persistence |
 
 ## Schema

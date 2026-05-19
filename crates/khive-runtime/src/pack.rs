@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-pub use khive_types::VerbDef;
+pub use khive_types::{EdgeEndpointRule, EndpointKind, VerbDef};
 
 use crate::error::RuntimeError;
 use crate::KhiveRuntime;
@@ -42,6 +42,13 @@ pub trait PackRuntime: Send + Sync {
 
     /// Verbs this pack handles — must equal `<Self as Pack>::VERBS`.
     fn verbs(&self) -> &'static [VerbDef];
+
+    /// Pack-extensible edge endpoint rules — must equal `<Self as Pack>::EDGE_RULES`.
+    /// Defaults to empty so existing packs that don't extend the edge contract
+    /// can ignore it (ADR-031).
+    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
+        &[]
+    }
 
     /// Optional per-kind hook for shared CRUD specialization (ADR-030).
     ///
@@ -217,6 +224,18 @@ impl VerbRegistry {
             .iter()
             .flat_map(|p| p.entity_kinds().iter().copied())
             .filter(|k| seen.insert(*k))
+            .collect()
+    }
+
+    /// All pack-declared edge endpoint rules across registered packs (ADR-031).
+    ///
+    /// Order follows pack registration; duplicates are *not* deduplicated —
+    /// validation only checks membership, and an exact-duplicate rule is a
+    /// harmless restatement.
+    pub fn all_edge_rules(&self) -> Vec<EdgeEndpointRule> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.edge_rules().iter().copied())
             .collect()
     }
 }

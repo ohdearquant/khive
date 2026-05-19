@@ -1,9 +1,10 @@
 //! KhiveRuntime — composable handle to all storage capabilities.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use khive_db::StorageBackend;
 use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
+use khive_types::EdgeEndpointRule;
 use lattice_embed::{
     CachedEmbeddingService, EmbeddingModel, EmbeddingService, NativeEmbeddingService,
 };
@@ -72,6 +73,11 @@ pub struct KhiveRuntime {
     backend: Arc<StorageBackend>,
     config: RuntimeConfig,
     embedder: Arc<OnceCell<Arc<dyn EmbeddingService>>>,
+    /// Pack-extensible edge endpoint rules (ADR-031). Shared across clones
+    /// via `Arc<RwLock<_>>`; installed once by the transport after the
+    /// `VerbRegistry` is built. Empty until installed — base rules
+    /// (ADR-002) still apply on their own.
+    edge_rules: Arc<RwLock<Vec<EdgeEndpointRule>>>,
 }
 
 impl KhiveRuntime {
@@ -90,6 +96,7 @@ impl KhiveRuntime {
             backend: Arc::new(backend),
             config,
             embedder: Arc::new(OnceCell::new()),
+            edge_rules: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -179,6 +186,26 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Arc<dyn khive_storage::TextSearch>> {
         let key = format!("notes_{}", sanitize_key(self.ns(namespace)));
         Ok(self.backend.text(&key)?)
+    }
+
+    /// Install the pack-aggregated edge endpoint rules (ADR-031).
+    ///
+    /// Called by the transport layer after the `VerbRegistry` is built so
+    /// that runtime-layer edge validation (in `validate_edge_relation_endpoints`)
+    /// can consult pack rules in addition to the ADR-002 base contract. Idempotent:
+    /// later calls overwrite the previous rule set.
+    pub fn install_edge_rules(&self, rules: Vec<EdgeEndpointRule>) {
+        if let Ok(mut guard) = self.edge_rules.write() {
+            *guard = rules;
+        }
+    }
+
+    /// Snapshot of currently-installed pack edge rules.
+    pub(crate) fn pack_edge_rules(&self) -> Vec<EdgeEndpointRule> {
+        self.edge_rules
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Get the lazily-initialized embedding service.

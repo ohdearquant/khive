@@ -82,11 +82,12 @@ impl KhiveMcpServer {
         let packs: Vec<String> = runtime.config().packs.clone();
         Self::with_packs(runtime, &packs).unwrap_or_else(|err| {
             tracing::warn!("pack registration: {err}; falling back to kg only");
+            let recovered_runtime = err.runtime;
             let mut builder = VerbRegistryBuilder::new();
-            builder.register(KgPack::new(err.runtime));
-            Self {
-                registry: builder.build(),
-            }
+            builder.register(KgPack::new(recovered_runtime.clone()));
+            let registry = builder.build();
+            recovered_runtime.install_edge_rules(registry.all_edge_rules());
+            Self { registry }
         })
     }
 
@@ -117,9 +118,11 @@ impl KhiveMcpServer {
                 }
             }
         }
-        Ok(Self {
-            registry: builder.build(),
-        })
+        let registry = builder.build();
+        // ADR-031: aggregate pack-declared edge endpoint rules into the runtime
+        // so `validate_edge_relation_endpoints` can consult them.
+        runtime.install_edge_rules(registry.all_edge_rules());
+        Ok(Self { registry })
     }
 
     /// Serve over stdio (blocks until the connection closes).

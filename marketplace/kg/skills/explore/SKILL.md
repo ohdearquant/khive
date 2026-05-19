@@ -44,6 +44,7 @@ traverse(roots=["<entity-id>"], max_depth=3, direction="out",
 ```
 
 Common traversal patterns:
+
 - **Lineage** (what does X build on): `direction="out"`, `relations=["extends", "variant_of", "instance_of"]`
 - **Descendants** (what builds on X): `direction="in"`, `relations=["extends", "variant_of", "implements"]`
 - **Notes about X**: `direction="in"`, `relations=["annotates"]`
@@ -58,6 +59,7 @@ query("MATCH (a:concept)-[:extends]->(b:concept) WHERE b.name = 'LoRA' RETURN a.
 ```
 
 **GQL constraints** (the parser is limited):
+
 - Properties in WHERE use `a.name`, `a.id`, `a.entity_kind` (top-level fields only)
 - For JSON properties: use `a.domain`, `a.type` etc. (accessed via json_extract internally)
 - `RETURN a.properties` gets the full JSON blob
@@ -67,6 +69,7 @@ query("MATCH (a:concept)-[:extends]->(b:concept) WHERE b.name = 'LoRA' RETURN a.
 ### 4. Narrate
 
 Synthesize what you found into a coherent picture:
+
 - What concepts exist and how they relate
 - What the derivation chain looks like (X extends Y which extends Z)
 - What notes say (observations, insights, decisions)
@@ -75,6 +78,7 @@ Synthesize what you found into a coherent picture:
 ### 5. Surface gaps
 
 Identify what's missing:
+
 - Concepts mentioned but not in the graph
 - Entities with low edge count (underdeveloped)
 - Questions filed but unresolved
@@ -84,13 +88,13 @@ Report gaps as actionable next steps (e.g., "X exists but has no `introduced_by`
 
 ## Choosing the right verb
 
-| Want to... | Use |
-|------------|-----|
-| Find by content/similarity | `search(kind="entity\|note", query="...")` |
-| Immediate connections | `neighbors(node_id, direction, relations)` |
-| Multi-hop reachability | `traverse(roots, max_depth, direction, relations)` |
-| Structural patterns | `query("MATCH ... RETURN ...")` |
-| Browse a category | `list(kind="entity", entity_kind="concept", limit=50)` |
+| Want to...                 | Use                                                    |
+| -------------------------- | ------------------------------------------------------ |
+| Find by content/similarity | `search(kind="entity\|note", query="...")`             |
+| Immediate connections      | `neighbors(node_id, direction, relations)`             |
+| Multi-hop reachability     | `traverse(roots, max_depth, direction, relations)`     |
+| Structural patterns        | `query("MATCH ... RETURN ...")`                        |
+| Browse a category          | `list(kind="entity", entity_kind="concept", limit=50)` |
 
 ## Stop condition
 

@@ -406,10 +406,11 @@ async fn kg_create_with_note_kind_task_invokes_gtd_hook_defaults() -> anyhow::Re
 async fn kg_create_with_note_kind_task_resolves_depends_on_into_properties() -> anyhow::Result<()> {
     let client = connect().await?;
 
-    // Stand up a target entity that the task will depend on. `depends_on`
-    // edges from a note source are rejected by ADR-002 validation, but the
-    // task hook *does* resolve the dependency UUIDs and stash them in
-    // properties — which is the source of truth per ADR-026.
+    // Stand up a target entity that the task will depend on. The GTD edge
+    // rule (ADR-031) covers task→task only, so the underlying
+    // `link(task, entity, depends_on)` is rejected as a best-effort side
+    // effect — but the hook still resolves the entity UUID into
+    // `properties.depends_on`, which is the property-side source of truth.
     let target = ok_one(
         &client,
         r#"create(kind="entity", entity_kind="concept", name="DependencyTarget")"#,
@@ -435,6 +436,43 @@ async fn kg_create_with_note_kind_task_resolves_depends_on_into_properties() -> 
     assert!(
         resolved.contains('-'),
         "depends_on stored as full UUID string, got: {resolved}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gtd_assign_creates_depends_on_edge_between_two_tasks() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let blocker = ok_one(&client, r#"assign(title="write spec")"#).await?;
+    let blocker_full = blocker["full_id"].as_str().unwrap().to_string();
+    let dependent = ok_one(
+        &client,
+        &format!(
+            r#"assign(title="implement feature", depends_on=["{}"])"#,
+            blocker_full
+        ),
+    )
+    .await?;
+    let dep_full = dependent["full_id"].as_str().unwrap().to_string();
+
+    // ADR-031: the GTD pack's EDGE_RULES adds task→task `depends_on`.
+    // `neighbors(node_id=dependent, direction="out", relations=["depends_on"])`
+    // should surface the blocker — proving the edge landed.
+    let neighbors = ok_one(
+        &client,
+        &format!(
+            r#"neighbors(node_id="{}", direction="out", relations=["depends_on"])"#,
+            dep_full
+        ),
+    )
+    .await?;
+
+    let hits = neighbors.as_array().expect("neighbors returns array");
+    let targets: Vec<&str> = hits.iter().filter_map(|h| h["node_id"].as_str()).collect();
+    assert!(
+        targets.iter().any(|t| *t == blocker_full),
+        "task→task depends_on edge missing — got targets {targets:?}"
     );
     Ok(())
 }

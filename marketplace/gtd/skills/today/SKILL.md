@@ -4,7 +4,7 @@ description: Pick what to work on right now — surface actionable tasks, narrow
 
 # Today
 
-You have a long list of tasks. You don't need to see all of them — you need to know what to *do next*. This skill walks you from "queue" to "first concrete action".
+You have a long list of tasks. You don't need to see all of them — you need to know what to _do next_. This skill walks you from "queue" to "first concrete action".
 
 ## Workflow
 
@@ -21,16 +21,19 @@ If the list is empty, you either have no committed work (process the inbox — s
 ### 2. Narrow by context if needed
 
 By assignee (if you collaborate with other agents):
+
 ```
 request(ops="next(assignee=\"lambda:khive\", limit=10)")
 ```
 
 By status — for example, "what's already in progress":
+
 ```
 request(ops="tasks(status=\"active\", limit=10)")
 ```
 
 By priority + status:
+
 ```
 request(ops="tasks(status=\"next\", priority=\"p0\")")
 ```
@@ -92,9 +95,9 @@ request(ops="[
 
 If both come back empty, you have no high-priority committed work. That's a planning signal — go to the `review` skill.
 
-### "Recall similar past work" (cross-pack)
+### "Find similar past work" (cross-pack)
 
-If the `kg` pack is also loaded, `recall` ranges over tasks and notes alike — tasks are just notes with `kind="task"`. To find prior work on the same topic:
+If the `kg` pack is also loaded, `search(kind="note", ...)` ranges over tasks and research notes alike — tasks are just notes with `kind="task"`. To find prior work on the same topic:
 
 ```
 request(ops="search(kind=\"note\", query=\"<short topic phrase>\", limit=5)")

@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, KindHook, RuntimeError, VerbRegistry};
-use khive_types::{Pack, VerbDef};
+use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, Pack, VerbDef};
 
 use crate::hook::TaskHook;
 
@@ -38,7 +38,17 @@ impl Pack for GtdPack {
     const NOTE_KINDS: &'static [&'static str] = &["task"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const VERBS: &'static [VerbDef] = &GTD_VERBS;
+    const EDGE_RULES: &'static [EdgeEndpointRule] = &GTD_EDGE_RULES;
 }
+
+/// ADR-031: GTD opts task notes into `depends_on` between tasks. The base
+/// ADR-002 contract keeps `depends_on` as entity→entity for KG semantics;
+/// this rule additively extends it to task→task so blockers are graph-traversable.
+static GTD_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
+    relation: EdgeRelation::DependsOn,
+    source: EndpointKind::NoteOfKind("task"),
+    target: EndpointKind::NoteOfKind("task"),
+}];
 
 static GTD_VERBS: [VerbDef; 5] = [
     VerbDef {
@@ -89,6 +99,10 @@ impl PackRuntime for GtdPack {
 
     fn verbs(&self) -> &'static [VerbDef] {
         &GTD_VERBS
+    }
+
+    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
+        <GtdPack as Pack>::EDGE_RULES
     }
 
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {

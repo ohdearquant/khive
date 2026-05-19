@@ -13,7 +13,7 @@ use khive_storage::types::{
     TextSearchRequest, TraversalRequest, VectorSearchRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event};
-use khive_types::SubstrateKind;
+use khive_types::{EdgeEndpointRule, EndpointKind, SubstrateKind};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::KhiveRuntime;
@@ -31,6 +31,45 @@ pub enum Resolved {
     Entity(Entity),
     Note(Note),
     Event(Event),
+}
+
+/// Map a resolved endpoint to its `(substrate, kind)` pair, or `None` if
+/// the substrate is not a valid edge endpoint (events, edges).
+fn resolved_pair(r: Option<&Resolved>) -> Option<(&'static str, &str)> {
+    match r? {
+        Resolved::Entity(e) => Some(("entity", e.kind.as_str())),
+        Resolved::Note(n) => Some(("note", n.kind.as_str())),
+        Resolved::Event(_) => None,
+    }
+}
+
+/// `true` if `spec` matches the given substrate + kind pair.
+fn endpoint_matches(spec: &EndpointKind, substrate: &str, kind: &str) -> bool {
+    match spec {
+        EndpointKind::EntityOfKind(k) => substrate == "entity" && *k == kind,
+        EndpointKind::NoteOfKind(k) => substrate == "note" && *k == kind,
+    }
+}
+
+/// `true` if any pack-declared edge endpoint rule allows the
+/// `(source, relation, target)` triple. ADR-031: rules are additive only.
+fn pack_rule_allows(
+    rules: &[EdgeEndpointRule],
+    relation: EdgeRelation,
+    src: Option<&Resolved>,
+    tgt: Option<&Resolved>,
+) -> bool {
+    let Some((src_sub, src_kind)) = resolved_pair(src) else {
+        return false;
+    };
+    let Some((tgt_sub, tgt_kind)) = resolved_pair(tgt) else {
+        return false;
+    };
+    rules.iter().any(|r| {
+        r.relation == relation
+            && endpoint_matches(&r.source, src_sub, src_kind)
+            && endpoint_matches(&r.target, tgt_sub, tgt_kind)
+    })
 }
 
 impl KhiveRuntime {
@@ -231,11 +270,26 @@ impl KhiveRuntime {
                 }
             }
         } else {
-            // All 11 entity→entity relations: both endpoints must be entities.
-            // resolve() covers entity/note/event; get_edge() covers edges (not in resolve).
-            // None from resolve + Some from get_edge → InvalidInput (wrong substrate kind).
-            // None from both → NotFound (phantom / cross-namespace).
-            match self.resolve(namespace, source_id).await? {
+            // All 11 entity-default relations: ADR-002 base contract is
+            // entity→entity. ADR-031 allows packs to extend allowed endpoint
+            // pairs additively (e.g. GTD lets `depends_on` span task→task).
+            //
+            // Strategy: resolve both endpoints once, consult pack rules; on
+            // miss, fall through to the original base-rule error messages.
+            let src_res = self.resolve(namespace, source_id).await?;
+            let tgt_res = self.resolve(namespace, target_id).await?;
+
+            if pack_rule_allows(
+                &self.pack_edge_rules(),
+                relation,
+                src_res.as_ref(),
+                tgt_res.as_ref(),
+            ) {
+                return Ok(());
+            }
+
+            // Base-rule check. Same error messages as the pre-ADR-031 surface.
+            match src_res {
                 Some(Resolved::Entity(_)) => {}
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -255,7 +309,7 @@ impl KhiveRuntime {
                     )));
                 }
             }
-            match self.resolve(namespace, target_id).await? {
+            match tgt_res {
                 Some(Resolved::Entity(_)) => {}
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(

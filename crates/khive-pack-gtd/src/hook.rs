@@ -110,9 +110,13 @@ impl KindHook for TaskHook {
         if let Some(v) = args.get("assignee").and_then(Value::as_str) {
             obj.insert("assignee".into(), json!(v));
         }
-        if let Some(ref pri) = priority {
-            obj.insert("priority".into(), json!(pri.to_ascii_lowercase()));
-        }
+        // Always persist priority (defaults to "p2") so listing filters can
+        // match defaulted tasks via `properties.priority`.
+        let priority_value = priority
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "p2".to_string());
+        obj.insert("priority".into(), json!(priority_value));
         if let Some(v) = args.get("due").and_then(Value::as_str) {
             obj.insert("due".into(), json!(v));
         }

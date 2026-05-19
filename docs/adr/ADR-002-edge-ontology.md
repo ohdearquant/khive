@@ -168,11 +168,19 @@ by ADR-021). SQL TEXT column for persistence; serialized via `Display`, deserial
 Validation at compile time — invalid relations cannot be constructed. Agents must consult this ADR
 before creating edges.
 
+The **per-relation endpoint contract** described above is the _base_ contract. Since
+[ADR-031](ADR-031-pack-extensible-edge-endpoints.md), packs may declare additive endpoint rules
+(e.g. GTD allowing `depends_on` between task notes). Rules only broaden; they cannot tighten
+the base contract, and the closed 13-relation taxonomy is unchanged. Consumers reasoning about
+which `(source, relation, target)` triples are legal must consult both this ADR and the loaded
+packs' `EDGE_RULES`.
+
 ## References
 
 - ADR-001: Entity Kind Taxonomy (defines node kinds that edges connect)
 - ADR-021: EdgeRelation Enum (closes the type at compile time; the 13th relation `annotates` was
   added when notes became first-class graph nodes)
+- ADR-031: Pack-Extensible Edge Endpoints (additive per-pack endpoint rules)
 - `crates/khive-types/src/edge.rs`: `EdgeRelation`, `EdgeCategory` enum implementations
 - `crates/khive-storage/src/types.rs`: `Edge`, `EdgeFilter` types
 - Edge metadata schema: open JSON in `Edge.metadata` for relation-specific annotations

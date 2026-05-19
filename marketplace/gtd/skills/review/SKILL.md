@@ -21,7 +21,7 @@ For each item, make one decision and move it. The five legal moves from `inbox`:
 | Move        | When                                                                 |
 | ----------- | -------------------------------------------------------------------- |
 | `next`      | You'll commit to doing it in the current period (today / this week). |
-| `active`    | You're starting *right now*.                                         |
+| `active`    | You're starting _right now_.                                         |
 | `waiting`   | You can't do it yet — note who/what you're waiting on.               |
 | `someday`   | Worth keeping but no commitment date.                                |
 | `done`      | Already done (captured retroactively).                               |
@@ -50,7 +50,7 @@ If something's been `active` for more than a few days without progress, it's pro
 - Finish it: `complete(id=..., result="<one line>")`
 - Cancel it: `transition(id=..., status="cancelled", note="<why>")`
 
-Active should reflect *now*, not aspiration.
+Active should reflect _now_, not aspiration.
 
 ### 3. Unblock `waiting`
 
@@ -71,6 +71,7 @@ request(ops="tasks(status=\"someday\", limit=50)")
 ```
 
 The `someday` list will rot if you never look at it. For each, ask: "would I be sad if this never happens?"
+
 - Yes → promote to `next` and commit, or set a `due` to make it real.
 - No → `cancelled`.
 
@@ -96,9 +97,9 @@ request(ops="[
 
 Process those three, ignore `someday` for the short version.
 
-### Recall + review
+### Review with cross-pack search
 
-If the `kg` pack is loaded, recall the past week's recorded insights before reviewing — it surfaces commitments that may not have made it into a task:
+If the `kg` pack is loaded, search the past week's recorded insights before reviewing — it surfaces commitments that may not have made it into a task:
 
 ```
 request(ops="search(kind=\"note\", query=\"commitment OR promise OR todo\", limit=10)")
@@ -109,6 +110,7 @@ Any unfulfilled commitments get added via `assign` in the same session.
 ### Carrying a task forward
 
 If a task has been `next` for multiple reviews without progress, that's a signal — either:
+
 - It's actually not next (downgrade to `someday`).
 - It's blocked (move to `waiting` + describe the blocker).
 - It's the wrong granularity (cancel, then capture smaller, more concrete sub-tasks).
@@ -120,4 +122,4 @@ Don't let zombies linger in `next`. They erode trust in the actionable list.
 - **Reviewing without making decisions.** If you read the inbox without transitioning, the next review will be longer. Make a call on every item.
 - **Hoarding `someday`.** A list of 200 maybe-projects is no different from no list. Cull aggressively — anything you wouldn't actively pull onto `next` in the next three months is `cancelled`.
 - **Never reopening `done`.** GTD's lifecycle allows `done → next` / `done → active` for a reason: if a task came back, it isn't a new task, it's the same one re-opening.
-- **Batch transitioning without notes.** When deferring, killing, or unblocking, take three seconds to add a `note` — future you (and future agents reading recall) need the context.
+- **Batch transitioning without notes.** When deferring, killing, or unblocking, take three seconds to add a `note` — future you (and future agents searching task content) need the context.

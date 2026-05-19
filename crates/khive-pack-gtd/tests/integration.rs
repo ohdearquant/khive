@@ -39,10 +39,12 @@ impl Fixture {
 
 fn pack(rt: KhiveRuntime) -> Fixture {
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(GtdPack::new(rt));
-    Fixture {
-        registry: builder.build(),
-    }
+    builder.register(GtdPack::new(rt.clone()));
+    let registry = builder.build();
+    // Mirror what the MCP transport does at startup (ADR-031): install
+    // pack-declared edge endpoint rules so validation can consult them.
+    rt.install_edge_rules(registry.all_edge_rules());
+    Fixture { registry }
 }
 
 async fn assign(pack: &Fixture, body: Value) -> Value {
@@ -299,4 +301,80 @@ async fn unknown_verb_returns_invalid_input() {
     let msg = err.to_string();
     assert!(msg.contains("unknown verb"), "got: {msg}");
     assert!(msg.contains("retire"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn assign_creates_depends_on_edge_between_tasks() {
+    use khive_storage::types::{Direction, NeighborQuery};
+    use khive_storage::EdgeRelation;
+
+    let rt = rt();
+    let pack = pack(rt.clone());
+
+    let blocker = assign(&pack, json!({"title": "write spec"})).await;
+    let blocker_full = blocker["full_id"].as_str().unwrap();
+    let dependent = assign(
+        &pack,
+        json!({"title": "implement feature", "depends_on": [blocker_full]}),
+    )
+    .await;
+    let dep_full = dependent["full_id"].as_str().unwrap();
+
+    let dep_uuid = uuid::Uuid::parse_str(dep_full).unwrap();
+    let blocker_uuid = uuid::Uuid::parse_str(blocker_full).unwrap();
+
+    let graph = rt.graph(None).expect("graph store");
+    let neighbors = graph
+        .neighbors(
+            dep_uuid,
+            NeighborQuery {
+                direction: Direction::Out,
+                relations: Some(vec![EdgeRelation::DependsOn]),
+                limit: Some(16),
+                min_weight: None,
+            },
+        )
+        .await
+        .expect("neighbors query");
+
+    let targets: Vec<_> = neighbors.iter().map(|hit| hit.node_id).collect();
+    assert!(
+        targets.contains(&blocker_uuid),
+        "ADR-031: task→task depends_on edge should exist; got targets {targets:?}"
+    );
+}
+
+#[tokio::test]
+async fn assign_rejects_depends_on_when_target_is_non_task_note() {
+    let rt = rt();
+    let pack = pack(rt.clone());
+
+    // Create a non-task note via runtime (e.g. an observation). The GTD edge
+    // rule allows task→task only — task→observation should fail.
+    let other = rt
+        .create_note(
+            None,
+            "observation",
+            None,
+            "an observation",
+            0.5,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation");
+    let other_full = other.id.as_hyphenated().to_string();
+
+    let err = pack
+        .dispatch(
+            "assign",
+            json!({"title": "depends on observation", "depends_on": [other_full]}),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("must be an entity"),
+        "expected base-rule rejection; got: {msg}"
+    );
 }

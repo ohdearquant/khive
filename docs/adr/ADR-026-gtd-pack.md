@@ -73,12 +73,18 @@ defers kind-discriminated routing; this pack avoids the deferral by choosing dis
 ### Side-effects on `assign`
 
 - `depends_on` IDs (resolved against the namespace, full UUID or 8-char short hex) are stored in
-  `properties.depends_on` **and** recorded as `depends_on` graph edges (`EdgeRelation::DependsOn`).
-  Edge creation is best-effort: a failed link is logged via `tracing::warn!` but does not abort the
-  assign — the property captures the same information for queries.
+  `properties.depends_on` **and** recorded as `depends_on` graph edges
+  (`EdgeRelation::DependsOn`). The edge is enabled by the pack's
+  [`EDGE_RULES`](ADR-031-pack-extensible-edge-endpoints.md) entry that allows
+  `depends_on` between two `task` notes — the base ADR-002 contract would otherwise reject a
+  note source for non-`annotates` relations.
+- Edge creation is best-effort from `TaskHook::after_create`: a failed link is logged via
+  `tracing::warn!` but does not abort the assign — the property captures the same information
+  for queries, and ADR-030 requires post-write hooks not to bubble errors that would mislead the
+  caller after a successful storage write.
 - The body indexed for hybrid search is the task description (falling back to the title when no
-  description is supplied), so `recall`-style queries against task content work the same as for
-  any other note kind.
+  description is supplied), so `search(kind="note", query=...)` over task content works the same
+  as for any other note kind.
 
 ### Wire shape
 
@@ -146,15 +152,19 @@ is `gtd`, so installing the plugin gives a task-only MCP surface without touchin
 - **Properties** keep the record self-describing — agents reading a task see its deps directly
   without an extra `neighbors` query.
 - **Edges** make the dependency graph queryable: "what blocks task X?" is a one-hop traversal.
+  The substrate-aware edge endpoint mechanism (ADR-031) is what makes this legal — the pack
+  declares the rule once and the runtime accepts task→task `depends_on` thereafter.
 - The redundancy is bounded (only at write time, only on `assign`) and convergent (the property
-  is authoritative; edge failures are non-fatal and logged).
+  is authoritative; edge failures from `after_create` are non-fatal and logged per ADR-030).
 
 ### Why `transition` separately from `update`
 
-`update` (KG pack) patches arbitrary properties. `transition` enforces the lifecycle table —
-illegal jumps (`done → inbox`) are rejected with the allowed-set message. If a user wants to bypass
-validation (e.g. data repair), they can still call `update` with `properties.status` set directly;
-the KG pack is the escape hatch. `transition` is the agent-friendly path.
+`update` (KG pack) patches arbitrary properties of _entities and edges_. `transition` enforces
+the GTD lifecycle table — illegal jumps (`done → inbox`) are rejected with the allowed-set
+message. KG `update` does **not** currently dispatch to notes (and therefore not to tasks); note
+property repair beyond status is out of scope for v0.2 and will be revisited when a note-update
+path is needed. `transition` covers status changes; other property edits would require a future
+verb or KG update extension.
 
 ### Why `tasks` not `task_list`
 
@@ -164,12 +174,12 @@ seen — they read like database-table names rather than verbs. `tasks` is a ver
 
 ## Alternatives Considered
 
-| Alternative                                                            | Pros                                | Cons                                                                       | Why rejected                                          |
-| ---------------------------------------------------------------------- | ----------------------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------- |
-| New `tasks` table + dedicated store trait + migration                  | Pure shape; indexed columns         | New substrate everywhere (migrations, traits, runtime ops, ~1000 LOC)      | The notes substrate already covers every query we run |
-| Reuse `create` / `list` / `update` / `delete` with `kind="task"`       | Verb count stays small              | KG pack wins first-registered routing; would need kind-routing to fix      | ADR-025 explicitly defers kind routing                |
-| One mega-verb `task(action="...", args={...})`                         | Single tool per pack                | Loses per-verb schema; redundant with the request DSL one level up         | The DSL already gives us batch composition            |
-| Bundle GTD into KG pack                                                | One install                         | Couples research/KG workflows to task management; KG pack grows unbounded  | Each pack should own one coherent concern             |
+| Alternative                                                      | Pros                        | Cons                                                                      | Why rejected                                          |
+| ---------------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------- |
+| New `tasks` table + dedicated store trait + migration            | Pure shape; indexed columns | New substrate everywhere (migrations, traits, runtime ops, ~1000 LOC)     | The notes substrate already covers every query we run |
+| Reuse `create` / `list` / `update` / `delete` with `kind="task"` | Verb count stays small      | KG pack wins first-registered routing; would need kind-routing to fix     | ADR-025 explicitly defers kind routing                |
+| One mega-verb `task(action="...", args={...})`                   | Single tool per pack        | Loses per-verb schema; redundant with the request DSL one level up        | The DSL already gives us batch composition            |
+| Bundle GTD into KG pack                                          | One install                 | Couples research/KG workflows to task management; KG pack grows unbounded | Each pack should own one coherent concern             |
 
 ## Consequences
 
@@ -184,7 +194,7 @@ seen — they read like database-table names rather than verbs. `tasks` is a ver
 
 ### Negative
 
-- The `task` note kind is *not* a closed enum in code — it joins the open per-pack vocabulary set.
+- The `task` note kind is _not_ a closed enum in code — it joins the open per-pack vocabulary set.
   Validators must consult `VerbRegistry::all_note_kinds()` rather than hard-coding the kg-list.
   Already the case post-ADR-025; this ADR reinforces the pattern.
 - `next` / `tasks` scan up to 500 recent tasks and filter in-memory. Fine for personal/agent
@@ -200,15 +210,15 @@ seen — they read like database-table names rather than verbs. `tasks` is a ver
 
 ## Implementation Status
 
-| Step                                                             | Where                                                     | Status |
-| ---------------------------------------------------------------- | --------------------------------------------------------- | ------ |
-| 1. New crate `khive-pack-gtd` with `Pack` + `PackRuntime` impl   | `crates/khive-pack-gtd/`                                  | done   |
-| 2. GTD schema (statuses, priorities, lifecycle table)            | `crates/khive-pack-gtd/src/schema.rs`                     | done   |
-| 3. Handlers — `assign`, `next`, `complete`, `tasks`, `transition`| `crates/khive-pack-gtd/src/handlers.rs`                   | done   |
-| 4. Pack-config registration via `RuntimeConfig::packs`           | `crates/khive-runtime/src/runtime.rs`                     | done   |
-| 5. MCP wiring (single `request` tool dispatches gtd verbs)       | `crates/khive-mcp/src/server.rs`                          | done   |
-| 6. Tests (6 unit + 14 pack integration + 5 MCP-layer integration)| `crates/khive-pack-gtd/`, `crates/khive-mcp/tests/`       | done   |
-| 7. Marketplace plugin entry with skills                          | `marketplace/gtd/`                                        | done   |
+| Step                                                              | Where                                               | Status |
+| ----------------------------------------------------------------- | --------------------------------------------------- | ------ |
+| 1. New crate `khive-pack-gtd` with `Pack` + `PackRuntime` impl    | `crates/khive-pack-gtd/`                            | done   |
+| 2. GTD schema (statuses, priorities, lifecycle table)             | `crates/khive-pack-gtd/src/schema.rs`               | done   |
+| 3. Handlers — `assign`, `next`, `complete`, `tasks`, `transition` | `crates/khive-pack-gtd/src/handlers.rs`             | done   |
+| 4. Pack-config registration via `RuntimeConfig::packs`            | `crates/khive-runtime/src/runtime.rs`               | done   |
+| 5. MCP wiring (single `request` tool dispatches gtd verbs)        | `crates/khive-mcp/src/server.rs`                    | done   |
+| 6. Tests (6 unit + 14 pack integration + 5 MCP-layer integration) | `crates/khive-pack-gtd/`, `crates/khive-mcp/tests/` | done   |
+| 7. Marketplace plugin entry with skills                           | `marketplace/gtd/`                                  | done   |
 
 ## References
 
@@ -217,3 +227,5 @@ seen — they read like database-table names rather than verbs. `tasks` is a ver
 - [ADR-021](ADR-021-edge-relation-enum.md): EdgeRelation Enum (closed; `depends_on` is a member)
 - [ADR-023](ADR-023-verb-consolidated-mcp-surface.md): KG verbs (sibling pack)
 - [ADR-025](ADR-025-pack-standard.md): Pack Standard (composition mechanism this pack uses)
+- [ADR-031](ADR-031-pack-extensible-edge-endpoints.md): Pack-Extensible Edge Endpoints
+  (the mechanism that legalises `depends_on` between task notes)

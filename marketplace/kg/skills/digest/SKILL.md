@@ -38,14 +38,14 @@ create(kind="entity", entity_kind="<kind>", name="<short canonical name>",
 
 **6 entity kinds** (closed — pick the best fit, don't invent):
 
-| Kind | Use for |
-|------|---------|
-| `concept` | Algorithms, techniques, architectures, models, research gaps |
-| `document` | Papers, preprints, reports, blog posts |
-| `dataset` | Benchmarks, corpora, evaluation sets |
-| `project` | Codebases, libraries, tools, frameworks |
-| `person` | Researchers, engineers, authors |
-| `org` | Labs, companies, institutions |
+| Kind       | Use for                                                      |
+| ---------- | ------------------------------------------------------------ |
+| `concept`  | Algorithms, techniques, architectures, models, research gaps |
+| `document` | Papers, preprints, reports, blog posts                       |
+| `dataset`  | Benchmarks, corpora, evaluation sets                         |
+| `project`  | Codebases, libraries, tools, frameworks                      |
+| `person`   | Researchers, engineers, authors                              |
+| `org`      | Labs, companies, institutions                                |
 
 **Naming**: short canonical name people actually say. `LoRA` not `Low-Rank Adaptation of Large Language Models`. Full titles go in `properties`.
 
@@ -59,21 +59,21 @@ link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.
 
 **13 relations** (closed — map to these, don't invent):
 
-| Category | Relation | Direction | When |
-|----------|----------|-----------|------|
-| Structure | `contains` | parent → child | System has component |
-| Structure | `part_of` | child → parent | Inverse of contains |
-| Structure | `instance_of` | specific → general | X is a case of Y |
-| Derivation | `extends` | child → parent | Builds on, generalizes |
-| Derivation | `variant_of` | variant → original | Modified version |
-| Derivation | `introduced_by` | concept → paper/person | First described in |
-| Derivation | `supersedes` | new → old | Replaces entirely |
-| Dependency | `depends_on` | consumer → dep | Hard requirement |
-| Dependency | `enables` | prerequisite → outcome | Makes possible |
-| Implementation | `implements` | code → concept | Code realizes algorithm |
-| Lateral | `competes_with` | A ↔ B | Alternative approaches |
-| Lateral | `composed_with` | A ↔ B | Used together |
-| Annotation | `annotates` | note → any substrate | Note observes/comments on |
+| Category       | Relation        | Direction              | When                      |
+| -------------- | --------------- | ---------------------- | ------------------------- |
+| Structure      | `contains`      | parent → child         | System has component      |
+| Structure      | `part_of`       | child → parent         | Inverse of contains       |
+| Structure      | `instance_of`   | specific → general     | X is a case of Y          |
+| Derivation     | `extends`       | child → parent         | Builds on, generalizes    |
+| Derivation     | `variant_of`    | variant → original     | Modified version          |
+| Derivation     | `introduced_by` | concept → paper/person | First described in        |
+| Derivation     | `supersedes`    | new → old              | Replaces entirely         |
+| Dependency     | `depends_on`    | consumer → dep         | Hard requirement          |
+| Dependency     | `enables`       | prerequisite → outcome | Makes possible            |
+| Implementation | `implements`    | code → concept         | Code realizes algorithm   |
+| Lateral        | `competes_with` | A ↔ B                  | Alternative approaches    |
+| Lateral        | `composed_with` | A ↔ B                  | Used together             |
+| Annotation     | `annotates`     | note → any substrate   | Note observes/comments on |
 
 **Direction matters.** `introduced_by` goes FROM the concept TO the paper (the concept was introduced by the paper). If you get direction wrong, the traversal breaks.
 
@@ -113,6 +113,7 @@ Material exhausted. Every entity above minimum density. No orphans (0-edge nodes
 ## Error handling
 
 If a tool returns an error, read the message — it lists valid values. Common cases:
+
 - Invalid `entity_kind` or `note_kind` → the error says which values are valid
 - Invalid `relation` → use only the 13 above
 - ID not found → check the UUID; use `search` to find the correct one

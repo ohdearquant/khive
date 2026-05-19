@@ -230,6 +230,11 @@ re-encoding the grouping in every consumer.
    queries later, encode the mapping then.
 3. **What about future extensions?** ADR amendment process: bump ADR-002 + ADR-021 together; add the
    variant; update all consumers via the compiler errors. Discipline by design.
+4. **What about pack-specific endpoint shapes (e.g. task→task `depends_on`)?**
+   [ADR-031](ADR-031-pack-extensible-edge-endpoints.md) introduced pack-extensible _endpoint
+   rules_ on top of this enum. The closed 13-relation set is unchanged; what packs may extend is
+   the per-relation list of legal `(source-kind, target-kind)` pairs. Rules are additive only —
+   packs cannot tighten the ADR-002 base contract.
 
 ## References
 
@@ -238,3 +243,4 @@ re-encoding the grouping in every consumer.
 - ADR-019: Note Kind Taxonomy (closed enum, 5 variants — companion in the substrate-typing trilogy)
 - ADR-024: Note Search + Cross-Substrate Navigation (uses the `annotates` relation to make notes
   first-class graph nodes)
+- ADR-031: Pack-Extensible Edge Endpoints (additive per-pack endpoint rules over this enum)

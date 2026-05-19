@@ -260,15 +260,25 @@ impl GtdPack {
             }
         }
 
-        let mut props = json!({ "status": status.to_string() });
+        // Always persist priority (defaults to "p2") so listing filters can
+        // match defaulted tasks via `properties.priority`. The render layer
+        // already shows "p2" for unset priority, so making it explicit on
+        // disk keeps render / sort / filter aligned.
+        let priority = p
+            .priority
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "p2".to_string());
+
+        let mut props = json!({
+            "status": status.to_string(),
+            "priority": priority,
+        });
         if let Some(ref desc) = p.description {
             props["description"] = json!(desc);
         }
         if let Some(ref assignee) = p.assignee {
             props["assignee"] = json!(assignee);
-        }
-        if let Some(ref pri) = p.priority {
-            props["priority"] = json!(pri.to_ascii_lowercase());
         }
         if let Some(ref due) = p.due {
             props["due"] = json!(due);
@@ -307,11 +317,12 @@ impl GtdPack {
             )
             .await?;
 
-        // Best-effort: record `depends_on` as `depends_on` graph edges. Failure is
-        // non-fatal — the property captures the same information for queries.
+        // Record `depends_on` as `depends_on` graph edges (ADR-031: the GTD
+        // pack's `EDGE_RULES` extends the entity-default contract to allow
+        // task→task here). The property captures the same information, but
+        // the edges make blockers traversable through `neighbors`/`traverse`.
         for dep_uuid in resolved_deps {
-            if let Err(e) = self
-                .runtime()
+            self.runtime()
                 .link(
                     p.namespace.as_deref(),
                     note.id,
@@ -319,10 +330,7 @@ impl GtdPack {
                     EdgeRelation::DependsOn,
                     1.0,
                 )
-                .await
-            {
-                tracing::warn!("assign: depends_on edge failed (non-fatal): {e}");
-            }
+                .await?;
         }
 
         Ok(render_task(&note))

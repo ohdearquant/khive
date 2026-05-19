@@ -60,6 +60,11 @@ pub trait Pack {
     /// Verbs this pack handles. The runtime routes verb calls to the pack
     /// that declares them.
     const VERBS: &'static [VerbDef];
+
+    /// Additive edge endpoint rules contributed by this pack (ADR-031).
+    /// Default empty; packs that don't extend the ADR-002 base contract can
+    /// leave this unset.
+    const EDGE_RULES: &'static [EdgeEndpointRule] = &[];
 }
 ```
 
@@ -83,6 +88,8 @@ pub trait PackRuntime: Send + Sync {
     fn note_kinds(&self) -> &'static [&'static str];
     fn entity_kinds(&self) -> &'static [&'static str];
     fn verbs(&self) -> &'static [VerbDef];
+    /// Mirrors `Pack::EDGE_RULES` (ADR-031); default empty.
+    fn edge_rules(&self) -> &'static [EdgeEndpointRule] { &[] }
     async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError>;
 }
 ```
@@ -227,3 +234,4 @@ exists but routing logic is not yet implemented.
 - ADR-001: Entity Kind Taxonomy (6 KG entity kinds; `kg` pack encodes these)
 - ADR-019: Note Kind Taxonomy (5 KG note kinds; `kg` pack encodes these)
 - ADR-021: EdgeRelation Enum (edge relations stay a closed enum — Pack does not extend them)
+- ADR-031: Pack-Extensible Edge Endpoints (the `EDGE_RULES` const added to this trait)
