@@ -523,6 +523,7 @@ async fn file_backed_runtime_persists() {
             db_path: Some(path.clone()),
             default_namespace: "local".to_string(),
             embedding_model: None,
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
             packs: vec!["kg".to_string()],
         };
         let rt = KhiveRuntime::new(config).unwrap();
@@ -537,6 +538,7 @@ async fn file_backed_runtime_persists() {
             db_path: Some(path.clone()),
             default_namespace: "local".to_string(),
             embedding_model: None,
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
             packs: vec!["kg".to_string()],
         };
         let rt = KhiveRuntime::new(config).unwrap();

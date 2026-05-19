@@ -14,6 +14,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use khive_gate::{ActorRef, AllowAllGate, GateDecision, GateRef, GateRequest};
+use khive_types::Namespace;
 use serde_json::Value;
 
 pub use khive_types::{EdgeEndpointRule, EndpointKind, VerbDef};
@@ -121,11 +123,17 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
 /// immutable and cheaply cloneable.
 pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
+    gate: GateRef,
+    default_namespace: String,
 }
 
 impl VerbRegistryBuilder {
     pub fn new() -> Self {
-        Self { packs: Vec::new() }
+        Self {
+            packs: Vec::new(),
+            gate: std::sync::Arc::new(AllowAllGate),
+            default_namespace: Namespace::default_ns().as_str().to_string(),
+        }
     }
 
     /// Register a pack. The bound `P: Pack + PackRuntime` ensures the pack
@@ -135,10 +143,30 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Set the authorization gate consulted on every dispatch (ADR-029).
+    ///
+    /// Defaults to `AllowAllGate` if not set. In v0.2 the gate is **advisory** —
+    /// deny decisions are logged via `tracing::warn!` but do not block dispatch.
+    pub fn with_gate(&mut self, gate: GateRef) -> &mut Self {
+        self.gate = gate;
+        self
+    }
+
+    /// Set the namespace surfaced to the gate when a verb does not carry an
+    /// explicit `namespace` argument. Transports should plumb the runtime's
+    /// `default_namespace` so the gate's `input.namespace` always reflects
+    /// the operation's true tenant (ADR-029 + ADR-007).
+    pub fn with_default_namespace(&mut self, ns: impl Into<String>) -> &mut Self {
+        self.default_namespace = ns.into();
+        self
+    }
+
     /// Consume the builder and produce an immutable, cloneable registry.
     pub fn build(self) -> VerbRegistry {
         VerbRegistry {
             packs: std::sync::Arc::new(self.packs),
+            gate: self.gate,
+            default_namespace: self.default_namespace,
         }
     }
 }
@@ -155,13 +183,56 @@ impl Default for VerbRegistryBuilder {
 #[derive(Clone)]
 pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
+    gate: GateRef,
+    default_namespace: String,
 }
 
 impl VerbRegistry {
     /// Dispatch a verb to the first pack that handles it.
     ///
     /// When multiple packs declare the same verb, the first registered pack wins.
+    ///
+    /// The configured [`Gate`](khive_gate::Gate) is consulted before dispatch
+    /// (ADR-029). In v0.2 the check is **advisory** — `Deny` decisions are
+    /// logged via `tracing::warn!` but do not abort the call. v0.3 will make
+    /// deny authoritative.
+    ///
+    /// The synthesized `GateRequest` carries `ActorRef::anonymous()` and the
+    /// operation's namespace — pulled from `params["namespace"]` when present
+    /// (including an explicit empty string, which `KhiveRuntime::ns` also
+    /// preserves), otherwise the registry's default namespace (configured via
+    /// [`VerbRegistryBuilder::with_default_namespace`]). Gate-visible
+    /// namespace and runtime-visible namespace MUST stay aligned; coercing an
+    /// empty string here while the runtime keeps `""` would create an
+    /// authorization/audit blind spot on the field ADR-029 declares public.
+    /// Transports that have richer caller context (auth headers, session
+    /// info) will gain a sibling dispatch path in a follow-up.
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
+        let ns_str = params
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.default_namespace);
+        let gate_req = GateRequest::new(
+            ActorRef::anonymous(),
+            Namespace::new(ns_str),
+            verb,
+            params.clone(),
+        );
+        match self.gate.check(&gate_req) {
+            Ok(GateDecision::Allow { .. }) => {}
+            Ok(GateDecision::Deny { reason }) => {
+                tracing::warn!(
+                    verb,
+                    reason = %reason,
+                    "gate deny (advisory in v0.2; not enforced)"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(verb, error = %err, "gate check failed (advisory)");
+            }
+        }
+        // TODO(ADR-032): emit `EventKind::GateCheck` event for deny / audit-obligation cases.
+
         for pack in self.packs.iter() {
             if pack.verbs().iter().any(|v| v.name == verb) {
                 return pack.dispatch(verb, params, self).await;
@@ -384,5 +455,128 @@ mod tests {
         let reg = build_registry();
         let kinds = reg.all_entity_kinds();
         assert_eq!(kinds, vec!["widget", "gadget"]);
+    }
+
+    // ---- Gate wiring (ADR-029) ----
+
+    use khive_gate::{Gate, GateError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default, Debug)]
+    struct CountingGate {
+        calls: AtomicUsize,
+        deny_verb: Option<&'static str>,
+    }
+
+    impl Gate for CountingGate {
+        fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if Some(req.verb.as_str()) == self.deny_verb {
+                Ok(GateDecision::deny(format!("test deny for {}", req.verb)))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_consults_the_gate() {
+        let gate = Arc::new(CountingGate::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build();
+
+        reg.dispatch("list", Value::Null).await.unwrap();
+        reg.dispatch("create", Value::Null).await.unwrap();
+        assert_eq!(
+            gate.calls.load(Ordering::SeqCst),
+            2,
+            "gate should be consulted once per dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_proceeds_on_deny_advisory_in_v02() {
+        let gate = Arc::new(CountingGate {
+            calls: AtomicUsize::new(0),
+            deny_verb: Some("create"),
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build();
+
+        // Gate denies — but dispatch proceeds because the gate is advisory.
+        let res = reg.dispatch("create", Value::Null).await.unwrap();
+        assert_eq!(res["pack"], "alpha");
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_uses_allow_all_gate_by_default() {
+        // No `with_gate` call — builder should use `AllowAllGate` so dispatch works.
+        let reg = build_registry();
+        let res = reg.dispatch("list", Value::Null).await.unwrap();
+        assert_eq!(res["pack"], "alpha");
+    }
+
+    // Captures the namespace each call sees so we can assert what the gate
+    // actually receives — codex round-1 caught us hard-wiring `default_ns()`.
+    #[derive(Default, Debug)]
+    struct NamespaceCapturingGate {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Gate for NamespaceCapturingGate {
+        fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(req.namespace.as_str().to_string());
+            Ok(GateDecision::allow())
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_propagates_params_namespace_to_gate() {
+        let gate = Arc::new(NamespaceCapturingGate::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        builder.with_default_namespace("tenant-x");
+        let reg = builder.build();
+
+        // Explicit namespace in params wins.
+        reg.dispatch("list", serde_json::json!({"namespace": "tenant-y"}))
+            .await
+            .unwrap();
+        // Missing namespace → registry default.
+        reg.dispatch("list", Value::Null).await.unwrap();
+        // Explicit empty namespace string is preserved (it is what
+        // `KhiveRuntime::ns` would also see). Gate and runtime MUST agree on
+        // the namespace they observe; coercing here while the runtime
+        // continues to honor `""` would create an audit blind spot.
+        reg.dispatch("list", serde_json::json!({"namespace": ""}))
+            .await
+            .unwrap();
+
+        let seen = gate.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec!["tenant-y", "tenant-x", ""]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_falls_back_to_local_when_no_default_set() {
+        // Builder default mirrors `Namespace::default_ns()`.
+        let gate = Arc::new(NamespaceCapturingGate::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build();
+
+        reg.dispatch("list", Value::Null).await.unwrap();
+        let seen = gate.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec!["local"]);
     }
 }

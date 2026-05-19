@@ -74,6 +74,9 @@ pub const BUILTIN_PACKS: &[&str] = &["kg", "gtd"];
 impl KhiveMcpServer {
     /// Build a server using the pack list from `runtime.config().packs`.
     ///
+    /// The authorization gate from `runtime.config().gate` is threaded into the
+    /// registry (advisory in v0.2 per ADR-029).
+    ///
     /// Always returns a server. Unknown pack names are logged via `tracing::warn!`
     /// rather than rejected — startup must remain robust if a future binary drops
     /// a pack that an older config still names. Use [`Self::with_packs`] for
@@ -83,7 +86,11 @@ impl KhiveMcpServer {
         Self::with_packs(runtime, &packs).unwrap_or_else(|err| {
             tracing::warn!("pack registration: {err}; falling back to kg only");
             let recovered_runtime = err.runtime;
+            let gate = recovered_runtime.config().gate.clone();
+            let default_namespace = recovered_runtime.config().default_namespace.clone();
             let mut builder = VerbRegistryBuilder::new();
+            builder.with_gate(gate);
+            builder.with_default_namespace(default_namespace);
             builder.register(KgPack::new(recovered_runtime.clone()));
             let registry = builder.build();
             recovered_runtime.install_edge_rules(registry.all_edge_rules());
@@ -97,7 +104,11 @@ impl KhiveMcpServer {
     // deref for no real benefit.
     #[allow(clippy::result_large_err)]
     pub fn with_packs(runtime: KhiveRuntime, packs: &[String]) -> Result<Self, PackRegError> {
+        let gate = runtime.config().gate.clone();
+        let default_namespace = runtime.config().default_namespace.clone();
         let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(gate);
+        builder.with_default_namespace(default_namespace);
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for name in packs {
             if !seen.insert(name.as_str()) {

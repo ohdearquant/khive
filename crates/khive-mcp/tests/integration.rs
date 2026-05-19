@@ -16,6 +16,7 @@ fn make_server() -> KhiveMcpServer {
         default_namespace: "test".to_string(),
         embedding_model: None,
         packs: vec!["kg".to_string(), "gtd".to_string()],
+        ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
     KhiveMcpServer::new(runtime)
@@ -328,6 +329,7 @@ async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
         default_namespace: "test".to_string(),
         embedding_model: None,
         packs: vec!["kg".to_string()],
+        ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).unwrap();
     let server = KhiveMcpServer::new(runtime);
@@ -347,6 +349,7 @@ async fn pack_only_gtd_omits_kg_verbs_from_catalog() {
         default_namespace: "test".to_string(),
         embedding_model: None,
         packs: vec!["gtd".to_string()],
+        ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).unwrap();
     let server = KhiveMcpServer::new(runtime);

@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         default_namespace: args.namespace,
         embedding_model,
         packs,
+        ..RuntimeConfig::default()
     };
 
     let runtime = KhiveRuntime::new(config)?;
