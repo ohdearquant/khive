@@ -66,12 +66,12 @@ merging.
 
 **Note merge is deferred past v0.1.** In v0.1, `merge` is entity-only. Deduplicating two notes
 that record the same observation is not yet supported — add a `supersedes` edge manually via
-`link(source=new_note_id, target=old_note_id, relation="supersedes")` as a workaround until
+`link(source_id=new_note_id, target_id=old_note_id, relation="supersedes")` as a workaround until
 note merge lands.
 
 Supersession (history-preserving replacement via a `supersedes` edge) is a planned operation
 deferred past v0.1. Agents that need to mark any record obsolete can add a `supersedes` edge
-manually via `link(source=new_id, target=old_id, relation="supersedes")`.
+manually via `link(source_id=new_id, target_id=old_id, relation="supersedes")`.
 
 ### Versioning tools (when ADR-015 ships)
 
@@ -220,11 +220,16 @@ pub struct MergeParams {
 Per-kind irrelevant fields are simply ignored when present and omitted in the JSON-schema-friendly
 way (all optional except `kind` and the kind-specific minimum).
 
-### `remember` and `recall` are removed entirely
+### `remember` and `recall` are removed from the base KG pack
 
-The agent surface has no `remember` or `recall`. Notes are created via
+The **base KG pack** agent surface has no `remember` or `recall`. Notes are created via
 `create(kind="note", content="...", note_kind="observation", annotates=[...])`. Notes are searched
 via `search(kind="note", query="...", limit=...)`.
+
+> **Amendment (ADR-036):** When `khive-pack-memory` is loaded (`KHIVE_PACKS=kg,memory`), the
+> memory pack registers `remember` and `recall` as pack-owned verbs with a `memory` note kind
+> and decay-weighted recall. These verbs and the `memory` kind are absent from KG-only
+> deployments. See [ADR-036](ADR-036-memory-pack-semantics.md).
 
 Reason: `remember` and `recall` are loaded words for agents — they imply specific memory semantics
 that may not match what's actually happening (the system stores a typed note with an explicit kind

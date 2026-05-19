@@ -41,6 +41,12 @@ alternatives. New decisions should be added as ADR-NNN-kebab-case-title.md using
 | [033](ADR-033-audit-envelope.md)                         | Audit Envelope                                       | accepted                                                           | `AuditEvent` type in `khive-gate`; one structured record per gate check; emitted via `tracing::info!` in v0.2; `EventStore` wiring shipped in v0.3 (ADR-035 closes this deferral)                                                                   |
 | [034](ADR-034-identity-session-metering-hooks.md)        | Identity, Session, Metering Hooks                    | planned                                                            | OSS extension traits — `ActorStore`, `SessionStore`, `Obligation::Meter`, `data.khive.namespace_owner` Rego contract — for downstream-implemented persistent identity, sessions, ownership policy, and metering sinks |
 | [035](ADR-035-hard-enforcement-and-audit-persistence.md) | Hard Authorization Enforcement and Audit Persistence | accepted                                                           | `Deny` → `RuntimeError::PermissionDenied` (authoritative v0.3); `Arc<dyn EventStore>` on `VerbRegistryBuilder`; audit events persisted to substrate in addition to tracing                                            |
+| [036](ADR-036-memory-pack-semantics.md)                  | Memory Pack Semantics                                | proposed                                                           | Pack-owned `memory` note kind with `memory_type` attribute; `remember`/`recall` verbs; decay-weighted recall via `salience × exp(-decay_factor × age_days)`; source tracking via `annotates` edges                    |
+| [037](ADR-037-inter-pack-vocabulary-dependencies.md)     | Inter-pack Vocabulary Dependencies                   | proposed                                                           | `Pack::REQUIRES` declaration; topological load order in `VerbRegistryBuilder::build`; name-based deps (no cross-crate compile coupling)                                                                               |
+| [038](ADR-038-events-surface.md)                         | Events Surface                                       | proposed                                                           | Promotes `EventStore` from audit sink to queryable substrate; `list(kind="event")` and `get(id=<event_uuid>)`; no new top-level verbs; immutability guards on create/update/delete                                    |
+| [039](ADR-039-bulk-import-adapters.md)                   | Bulk Import Adapters                                 | proposed                                                           | Generic `import` verb on KG pack; all-or-nothing atomicity; `on_conflict ∈ {error,skip,update}`; endpoint validation; reference adapters in sibling crate                                                             |
+| [040](ADR-040-embedding-model-migration.md)              | Embedding Model Migration                            | proposed                                                           | Multi-model coexistence; store-scoped model identity; per-dimension `vec_{dim}` virtual tables; `_embedding_models` registry; background re-embed job                                                                 |
+| [041](ADR-041-pluggable-vector-store.md)                 | Pluggable Vector Store                               | proposed                                                           | `VectorStore` trait expansion; `VectorStoreCapabilities` introspection; in-house `khive-vec-hnsw` crate; RuVector reference architecture with attribution                                                             |
 
 ## Reading Order
 
@@ -55,6 +61,7 @@ For new contributors:
 
 ## Status Values
 
+- **proposed**: Under review. Not yet normative; may change based on feedback.
 - **accepted**: Decision made. Implementation in progress or complete for v0.1.
 - **planned**: Designed but deferred to a later version (v0.2+). Tracked for forward compatibility.
 - **deprecated**: No longer guidance. See replacement ADR (none in v0.1).

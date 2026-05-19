@@ -140,9 +140,14 @@ just noticed — not a fully formed insight, not a decision, just "this seems wo
 
 Memory in this system is implemented as notes. There is no separate "memory" substrate. Notes are
 written via `create(kind="note", ...)` and searched via `search(kind="note", ...)` (per ADR-023).
-The storage type is `Note`; there is no `remember`/`recall` pair on the agent surface — those words
-carry implicit memory semantics that may not match what the system actually does (it stores a typed
-Note with optional graph edges).
+The storage type is `Note`; in **KG-only deployments** there is no `remember`/`recall` pair on the
+agent surface — those words carry implicit memory semantics that may not match what the system
+actually does (it stores a typed Note with optional graph edges).
+
+> **Amendment (ADR-036):** When `khive-pack-memory` is loaded (`KHIVE_PACKS=kg,memory`), the
+> memory pack registers a `memory` note kind and provides `remember`/`recall` verbs with
+> decay-weighted recall. The `memory` kind and verbs are absent from KG-only deployments.
+> See [ADR-036](ADR-036-memory-pack-semantics.md).
 
 ## Alternatives Considered
 
@@ -199,9 +204,10 @@ Notes use the same mechanism as entities:
 new_note --supersedes--> old_note
 ```
 
-The `supersede` verb (per ADR-023) is shorthand for
-`link(source=new_id, target=old_id, relation="supersedes", weight=1.0)`. There is no `superseded_by`
-column on the `notes` table — the edge is the single source of truth.
+In v0.1, supersession is performed via
+`link(source_id=new_id, target_id=old_id, relation="supersedes", weight=1.0)` (ADR-023 defers a
+dedicated `supersede` helper verb past v0.1). There is no `superseded_by` column on the `notes`
+table — the edge is the single source of truth.
 
 **Chains are graph walks.** If A is superseded by B and B by C, the graph contains:
 
@@ -216,8 +222,10 @@ edge has it as target. The runtime exposes this via a helper, but it's just a on
 **There is no "unsupersede".** If a supersession was wrong, the agent creates a new note that
 supersedes the superseding one (the chain stays auditable and forward-only).
 
-**Same mechanism for entities.** `supersede(kind="entity", new_id, old_id)` does the same thing for
-entity nodes — one verb, one relation, one mechanism, two substrate kinds.
+**Same mechanism for entities.** `link(source_id=new_entity_id, target_id=old_entity_id,
+relation="supersedes")` does the same thing for entity nodes — one relation, one mechanism, two
+substrate kinds. (A future `supersede` helper verb may wrap this if ADR-023 or a successor accepts
+it.)
 
 ## Implementation Plan
 
