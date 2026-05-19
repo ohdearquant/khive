@@ -346,11 +346,14 @@ async fn assign_creates_depends_on_edge_between_tasks() {
 
 #[tokio::test]
 async fn assign_rejects_depends_on_when_target_is_non_task_note() {
+    use khive_storage::types::PageRequest;
+
     let rt = rt();
     let pack = pack(rt.clone());
 
     // Create a non-task note via runtime (e.g. an observation). The GTD edge
-    // rule allows task→task only — task→observation should fail.
+    // rule allows task→task only — task→observation should fail upfront so
+    // the task is never persisted (ADR-030: no failure after successful write).
     let other = rt
         .create_note(
             None,
@@ -374,7 +377,29 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("must be an entity"),
-        "expected base-rule rejection; got: {msg}"
+        msg.contains("must be a task note"),
+        "expected ADR-031 pack-rule rejection; got: {msg}"
+    );
+
+    // Atomicity: the rejected `assign` must not leave a task row behind.
+    let notes = rt.notes(None).expect("note store");
+    let page = notes
+        .query_notes(
+            "local",
+            Some("task"),
+            PageRequest {
+                offset: 0,
+                limit: 64,
+            },
+        )
+        .await
+        .expect("query task notes");
+    assert!(
+        page.items.is_empty(),
+        "rejected assign must not persist a task; found {:?}",
+        page.items
+            .iter()
+            .filter_map(|n| n.name.clone())
+            .collect::<Vec<_>>()
     );
 }

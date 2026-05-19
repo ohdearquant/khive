@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_runtime::{KhiveRuntime, Resolved, RuntimeError};
 use khive_storage::EdgeRelation;
 
 use crate::schema::{
@@ -260,6 +260,41 @@ impl GtdPack {
             }
         }
 
+        // Pre-validate each dependency target before any storage write. The GTD
+        // pack's ADR-031 edge rule only allows `depends_on` between two task
+        // notes — if a caller passes a non-task UUID, fail upfront so we don't
+        // leave an orphaned task row whose post-write `link` is rejected (the
+        // ADR-030 contract makes after_create non-propagating, so propagating a
+        // link failure here would diverge `assign` from `create(note_kind="task")`
+        // and violate the "no failure after successful write" rule).
+        for dep_uuid in &resolved_deps {
+            match self
+                .runtime()
+                .resolve(p.namespace.as_deref(), *dep_uuid)
+                .await?
+            {
+                Some(Resolved::Note(n)) if n.kind == "task" => {}
+                Some(Resolved::Note(n)) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "depends_on target {dep_uuid} must be a task note for relation depends_on \
+                         (got note kind {:?}); the GTD pack's ADR-031 edge rule is task→task only",
+                        n.kind
+                    )));
+                }
+                Some(_) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "depends_on target {dep_uuid} must be a task note for relation depends_on \
+                         (got non-note substrate); the GTD pack's ADR-031 edge rule is task→task only"
+                    )));
+                }
+                None => {
+                    return Err(RuntimeError::NotFound(format!(
+                        "depends_on target {dep_uuid} not found in namespace"
+                    )));
+                }
+            }
+        }
+
         // Always persist priority (defaults to "p2") so listing filters can
         // match defaulted tasks via `properties.priority`. The render layer
         // already shows "p2" for unset priority, so making it explicit on
@@ -319,10 +354,14 @@ impl GtdPack {
 
         // Record `depends_on` as `depends_on` graph edges (ADR-031: the GTD
         // pack's `EDGE_RULES` extends the entity-default contract to allow
-        // task→task here). The property captures the same information, but
-        // the edges make blockers traversable through `neighbors`/`traverse`.
+        // task→task here). Endpoints were pre-validated above, so the only way
+        // this fails is a storage hiccup after the task is already persisted —
+        // per ADR-030, log and continue rather than mislead the caller with
+        // `ok: false` for a task that's already on disk. The property captures
+        // the same dependency information for queries that bypass the graph.
         for dep_uuid in resolved_deps {
-            self.runtime()
+            if let Err(e) = self
+                .runtime()
                 .link(
                     p.namespace.as_deref(),
                     note.id,
@@ -330,7 +369,15 @@ impl GtdPack {
                     EdgeRelation::DependsOn,
                     1.0,
                 )
-                .await?;
+                .await
+            {
+                tracing::warn!(
+                    from = %note.id,
+                    to = %dep_uuid,
+                    error = %e,
+                    "assign: depends_on edge failed after task write (non-fatal, ADR-030)"
+                );
+            }
         }
 
         Ok(render_task(&note))

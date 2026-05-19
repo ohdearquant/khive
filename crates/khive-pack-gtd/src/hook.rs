@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, KindHook, RuntimeError};
+use khive_runtime::{KhiveRuntime, KindHook, Resolved, RuntimeError};
 use khive_storage::EdgeRelation;
 
 use crate::handlers::resolve_uuid;
@@ -76,7 +76,11 @@ impl KindHook for TaskHook {
             .map(str::to_string);
 
         // Resolve depends_on entries (full UUID or 8+ hex prefix) to canonical
-        // UUID strings — matches the shape gtd's `assign` produces.
+        // UUID strings — matches the shape gtd's `assign` produces. Also
+        // pre-validate each target is a task note before the storage write so
+        // the kg-create path matches GTD `assign` and never leaves a task
+        // persisted with a `properties.depends_on` pointing at a non-task
+        // (the GTD ADR-031 edge rule only legalises task→task `depends_on`).
         let mut resolved_deps: Vec<String> = Vec::new();
         if let Some(arr) = args.get("depends_on").and_then(Value::as_array) {
             for entry in arr {
@@ -84,6 +88,27 @@ impl KindHook for TaskHook {
                     RuntimeError::InvalidInput("depends_on entries must be strings".into())
                 })?;
                 let uuid = resolve_uuid(raw, runtime, namespace.as_deref()).await?;
+                match runtime.resolve(namespace.as_deref(), uuid).await? {
+                    Some(Resolved::Note(n)) if n.kind == "task" => {}
+                    Some(Resolved::Note(n)) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "depends_on target {uuid} must be a task note for relation depends_on \
+                             (got note kind {:?}); the GTD pack's ADR-031 edge rule is task→task only",
+                            n.kind
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "depends_on target {uuid} must be a task note for relation depends_on \
+                             (got non-note substrate); the GTD pack's ADR-031 edge rule is task→task only"
+                        )));
+                    }
+                    None => {
+                        return Err(RuntimeError::NotFound(format!(
+                            "depends_on target {uuid} not found in namespace"
+                        )));
+                    }
+                }
                 resolved_deps.push(uuid.as_hyphenated().to_string());
             }
         }

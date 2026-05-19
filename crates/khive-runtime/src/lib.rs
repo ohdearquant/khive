@@ -34,6 +34,7 @@ pub use curation::{EdgeListFilter, EntityPatch, MergeStrategy, MergeSummary};
 pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::{PathNode, TraversalOptions};
+pub use operations::Resolved;
 pub use pack::{KindHook, PackRuntime, VerbRegistry, VerbRegistryBuilder};
 pub use portability::{ImportSummary, KgArchive};
 pub use retrieval::{SearchHit, SearchSource};

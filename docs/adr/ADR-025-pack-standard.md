@@ -123,21 +123,28 @@ deliberate relaxation from the compile-time enum approach — the enum approach 
 set is fixed at compile time; it does not work when the valid set is determined by which packs are
 loaded.
 
-### Edge relations stay closed
+### Edge relations stay closed; endpoints are pack-extensible
 
 `EdgeRelation` remains a closed enum (ADR-021). Edge relations define graph semantics — their
-meaning is universal across all packs. A `contains` edge means the same thing regardless of which
-pack the endpoints belong to. Packs cannot add edge relations.
+meaning is universal across all packs. A `contains` edge means the same thing regardless of
+which pack the endpoints belong to. Packs cannot add edge relations.
 
-### Built-in pack
+Packs _can_ additively extend the per-relation **endpoint** contract via
+[`EDGE_RULES`](ADR-031-pack-extensible-edge-endpoints.md). For example, the GTD pack lets
+`depends_on` connect two `task` notes even though the ADR-002 base contract is entity-to-entity
+for `depends_on`. Rules are additive only — packs cannot tighten the base contract.
 
-| Pack | Note kinds                                          | Entity kinds                                     | Location        |
-| ---- | --------------------------------------------------- | ------------------------------------------------ | --------------- |
-| kg   | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | `khive-pack-kg` |
+### Built-in packs
 
-The `kg` pack is the only pack shipped in the OSS distribution. It is registered into the
-`VerbRegistry` by the transport layer (step 5). Extension packs are separate crates that implement
-the `Pack` + `PackRuntime` traits and register alongside `kg` at init.
+| Pack | Note kinds                                          | Entity kinds                                     | Edge endpoint rules (ADR-031)       | Location         |
+| ---- | --------------------------------------------------- | ------------------------------------------------ | ----------------------------------- | ---------------- |
+| kg   | observation, insight, question, decision, reference | concept, document, dataset, project, person, org | (none — base ADR-002 contract only) | `khive-pack-kg`  |
+| gtd  | task                                                | (none)                                           | `depends_on: task → task`           | `khive-pack-gtd` |
+
+Both packs ship in the OSS distribution and are registered into the `VerbRegistry` by the
+transport layer based on `RuntimeConfig::packs` (default `["kg"]`; opt into GTD with
+`KHIVE_PACKS=kg,gtd` or `--pack gtd`). External extension packs are separate crates that
+implement the `Pack` + `PackRuntime` traits and register alongside the built-ins at init.
 
 ## Rationale
 

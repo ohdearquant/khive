@@ -6,11 +6,14 @@
 
 ## Context
 
-ADR-002 defines a closed set of edge relations (13 canonical names in 6 categories — 11
-entity-to-entity relations, `supersedes` for same-substrate (note→note or entity→entity), and
-`annotates` for cross-substrate (note→any substrate)). The natural Rust representation
-stores `Edge.relation` as `String` and validates against the canonical set at write time. This is
-the same shape that entity kinds and note kinds had before ADR-001 and ADR-019:
+ADR-002 defines a closed set of edge relations (13 canonical names in 6 categories). Their
+**base** endpoint contract is: 11 default-entity-to-entity relations, `supersedes` for
+same-substrate (note→note or entity→entity), and `annotates` for cross-substrate (note→any
+substrate). [ADR-031](ADR-031-pack-extensible-edge-endpoints.md) additively extends this
+per-relation endpoint contract via pack-declared `EDGE_RULES` — the relation set itself
+remains closed at 13. The natural Rust representation stores `Edge.relation` as `String` and
+validates against the canonical set at write time. This is the same shape that entity kinds
+and note kinds had before ADR-001 and ADR-019:
 
 - No compile-time guarantees.
 - Validation happens at storage boundaries but the type is unconstrained downstream.

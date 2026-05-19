@@ -403,32 +403,26 @@ async fn kg_create_with_note_kind_task_invokes_gtd_hook_defaults() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn kg_create_with_note_kind_task_resolves_depends_on_into_properties() -> anyhow::Result<()> {
+async fn kg_create_note_kind_task_resolves_depends_on_against_task_target() -> anyhow::Result<()> {
     let client = connect().await?;
 
-    // Stand up a target entity that the task will depend on. The GTD edge
-    // rule (ADR-031) covers task→task only, so the underlying
-    // `link(task, entity, depends_on)` is rejected as a best-effort side
-    // effect — but the hook still resolves the entity UUID into
-    // `properties.depends_on`, which is the property-side source of truth.
-    let target = ok_one(
-        &client,
-        r#"create(kind="entity", entity_kind="concept", name="DependencyTarget")"#,
-    )
-    .await?;
-    let target_id = target["id"].as_str().unwrap().to_string();
+    // Stand up a task that the new task will depend on. The GTD ADR-031 edge
+    // rule allows depends_on between two task notes, so this is the only
+    // shape the kg-create-with-task-kind path will accept.
+    let blocker = ok_one(&client, r#"assign(title="write spec")"#).await?;
+    let blocker_full = blocker["full_id"].as_str().unwrap().to_string();
 
     let task = ok_one(
         &client,
         &format!(
             r#"create(kind="note", note_kind="task", title="depends on something", depends_on=["{}"])"#,
-            target_id
+            blocker_full
         ),
     )
     .await?;
 
-    // Hook resolved the entity short/full id into a canonical UUID string
-    // and placed it in `properties.depends_on` — same shape gtd's `assign`
+    // Hook resolved the short/full id into a canonical UUID string and
+    // placed it in `properties.depends_on` — same shape gtd's `assign`
     // produces.
     let deps = task["properties"]["depends_on"].as_array().unwrap();
     assert_eq!(deps.len(), 1, "exactly one resolved dependency");
@@ -436,6 +430,53 @@ async fn kg_create_with_note_kind_task_resolves_depends_on_into_properties() -> 
     assert!(
         resolved.contains('-'),
         "depends_on stored as full UUID string, got: {resolved}"
+    );
+    assert_eq!(resolved, &blocker_full, "depends_on resolves to blocker");
+    Ok(())
+}
+
+#[tokio::test]
+async fn kg_create_note_kind_task_rejects_non_task_depends_on_before_write() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Stand up an entity target. The GTD ADR-031 edge rule is task→task only,
+    // so the kg-create path must reject this BEFORE the task is persisted —
+    // otherwise we'd leave a task with `properties.depends_on` pointing at a
+    // non-task (ADR-030 forbids reporting failure after a successful write).
+    let entity = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="DependencyTarget")"#,
+    )
+    .await?;
+    // Entity create returns the storage-layer struct keyed on `id` (full UUID),
+    // not the GTD task envelope shape.
+    let entity_full = entity["id"].as_str().unwrap().to_string();
+
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": format!(
+            r#"create(kind="note", note_kind="task", title="depends on entity", depends_on=["{}"])"#,
+            entity_full
+        )}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(first["ok"], false, "expected rejection: {first}");
+    let err = first["error"].as_str().unwrap();
+    assert!(
+        err.contains("must be a task note"),
+        "error must point to the GTD edge rule: {err}"
+    );
+
+    // And there should be no task with the supplied title — write was prevented.
+    let listed = ok_one(&client, r#"list(kind="note", note_kind="task")"#).await?;
+    let notes = listed.as_array().expect("note list");
+    let titles: Vec<&str> = notes.iter().filter_map(|n| n["name"].as_str()).collect();
+    assert!(
+        !titles.contains(&"depends on entity"),
+        "task must not be persisted when depends_on validation fails: {titles:?}"
     );
     Ok(())
 }
