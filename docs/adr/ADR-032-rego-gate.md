@@ -98,7 +98,7 @@ Output shape (tagged by `decision`):
 ```
 
 Obligation kinds — `audit`, `rate_limit`, `custom` — match `Obligation`'s serde shape from
-`khive-gate`. Advisory in v0.2, enforced in v0.3 + audit envelope (ADR-033 planned).
+`khive-gate`. Advisory in v0.2, enforced in v0.3. Audit envelope defined by ADR-033.
 
 ### Default entrypoint
 
@@ -218,7 +218,7 @@ is the documented best practice.
 | `Gate::impl_name()` default + override                        | `crates/khive-gate/src/lib.rs` + `khive-gate-rego/src/lib.rs` | done                        |
 | Integration tests (allow / deny / obligations / errors / dir) | `crates/khive-gate-rego/tests/integration.rs`                 | done                        |
 | Example policies                                              | `crates/khive-gate-rego/tests/fixtures/`                      | done                        |
-| Audit envelope wiring (`EventKind::GateCheck`)                | TBD                                                           | ADR-033 (planned)           |
+| Audit envelope wiring (`AuditEvent` via tracing)              | `crates/khive-gate/src/lib.rs` (type)                         | accepted (ADR-033)          |
 | Hard enforcement at dispatch site (deny → error)              | `crates/khive-runtime/src/pack.rs`                            | deferred to v0.3            |
 | Engine pool / `CompiledPolicy` for contention                 | `crates/khive-gate-rego/`                                     | deferred (benchmark-driven) |
 

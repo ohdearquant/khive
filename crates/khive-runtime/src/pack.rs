@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use khive_gate::{ActorRef, AllowAllGate, GateDecision, GateRef, GateRequest};
+use khive_gate::{ActorRef, AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
 use khive_types::Namespace;
 use serde_json::Value;
 
@@ -218,20 +218,31 @@ impl VerbRegistry {
             verb,
             params.clone(),
         );
+        // Consult the gate and emit a structured audit event (ADR-033).
+        // In v0.2 the gate is advisory — Deny is logged but does not block.
+        // The audit event is emitted via tracing::info! as structured JSON.
+        // Storage-backed emission (EventStore::append_event) is deferred to v0.3
+        // when VerbRegistry gains a runtime handle; see ADR-033 §"Implementation Status".
         match self.gate.check(&gate_req) {
-            Ok(GateDecision::Allow { .. }) => {}
-            Ok(GateDecision::Deny { reason }) => {
-                tracing::warn!(
-                    verb,
-                    reason = %reason,
-                    "gate deny (advisory in v0.2; not enforced)"
+            Ok(decision) => {
+                if matches!(decision, GateDecision::Deny { .. }) {
+                    tracing::warn!(
+                        verb,
+                        reason = %match &decision { GateDecision::Deny { reason } => reason.as_str(), _ => "" },
+                        "gate deny (advisory in v0.2; not enforced)"
+                    );
+                }
+                let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
+                tracing::info!(
+                    audit_event = %serde_json::to_string(&audit)
+                        .unwrap_or_else(|_| "{\"error\":\"serialize\"}".into()),
+                    "gate.check"
                 );
             }
             Err(err) => {
                 tracing::warn!(verb, error = %err, "gate check failed (advisory)");
             }
         }
-        // TODO(ADR-033): emit `EventKind::GateCheck` event for deny / audit-obligation cases.
 
         for pack in self.packs.iter() {
             if pack.verbs().iter().any(|v| v.name == verb) {
@@ -578,5 +589,299 @@ mod tests {
         reg.dispatch("list", Value::Null).await.unwrap();
         let seen = gate.seen.lock().unwrap().clone();
         assert_eq!(seen, vec!["local"]);
+    }
+
+    // ---- Audit event emission (ADR-033) ----
+
+    use khive_gate::{AuditDecision, AuditEvent, Obligation};
+
+    /// A gate that records every audit event emitted via from_check.
+    #[derive(Default, Debug)]
+    struct AuditCapturingGate {
+        events: std::sync::Mutex<Vec<AuditEvent>>,
+        deny_verb: Option<&'static str>,
+    }
+
+    impl Gate for AuditCapturingGate {
+        fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+            let decision = if Some(req.verb.as_str()) == self.deny_verb {
+                GateDecision::deny("test deny")
+            } else {
+                GateDecision::allow_with(vec![Obligation::Audit {
+                    tag: format!("{}.check", req.verb),
+                }])
+            };
+            // Capture what dispatch will also emit.
+            let ev = AuditEvent::from_check(req, &decision, self.impl_name());
+            self.events.lock().unwrap().push(ev);
+            Ok(decision)
+        }
+
+        fn impl_name(&self) -> &'static str {
+            "AuditCapturingGate"
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_emits_one_audit_event_per_call() {
+        let gate = Arc::new(AuditCapturingGate::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build();
+
+        reg.dispatch("list", Value::Null).await.unwrap();
+        reg.dispatch("create", Value::Null).await.unwrap();
+
+        let evs = gate.events.lock().unwrap();
+        assert_eq!(evs.len(), 2, "exactly one audit event per dispatch call");
+    }
+
+    #[tokio::test]
+    async fn dispatch_audit_event_allow_carries_obligations() {
+        let gate = Arc::new(AuditCapturingGate::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build();
+
+        reg.dispatch("list", Value::Null).await.unwrap();
+
+        let evs = gate.events.lock().unwrap();
+        let ev = &evs[0];
+        assert_eq!(ev.verb, "list");
+        assert_eq!(ev.decision, AuditDecision::Allow);
+        assert!(ev.deny_reason.is_none());
+        assert_eq!(ev.obligations.len(), 1);
+        assert_eq!(ev.gate_impl, "AuditCapturingGate");
+    }
+
+    #[tokio::test]
+    async fn dispatch_audit_event_deny_carries_reason() {
+        let gate = Arc::new(AuditCapturingGate {
+            events: Default::default(),
+            deny_verb: Some("create"),
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build();
+
+        // Gate denies but dispatch still succeeds (advisory v0.2).
+        let res = reg.dispatch("create", Value::Null).await.unwrap();
+        assert_eq!(res["pack"], "alpha");
+
+        let evs = gate.events.lock().unwrap();
+        let ev = &evs[0];
+        assert_eq!(ev.verb, "create");
+        assert_eq!(ev.decision, AuditDecision::Deny);
+        assert_eq!(ev.deny_reason.as_deref(), Some("test deny"));
+        assert!(ev.obligations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_audit_event_fields_match_gate_request() {
+        let gate = Arc::new(AuditCapturingGate::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(gate.clone());
+        builder.with_default_namespace("tenant-z");
+        let reg = builder.build();
+
+        reg.dispatch("list", serde_json::json!({"namespace": "tenant-q"}))
+            .await
+            .unwrap();
+
+        let evs = gate.events.lock().unwrap();
+        let ev = &evs[0];
+        // Namespace from params wins (ADR-029 alignment rule).
+        assert_eq!(ev.namespace, "tenant-q");
+        assert_eq!(ev.verb, "list");
+        assert_eq!(ev.actor.kind, "anonymous");
+    }
+
+    // ---- Audit tracing emission (ADR-033 §"Emission site") ----
+    //
+    // The AuditCapturingGate tests above prove that AuditEvent::from_check is
+    // called with the right inputs, but they observe the event *inside* the
+    // gate impl — they would still pass if dispatch's
+    // `tracing::info!(audit_event = ..., "gate.check")` were deleted or
+    // renamed. The tests below install a capture Layer and assert on the
+    // actual tracing event surfaced from dispatch. This locks the public
+    // observability contract from ADR-033: one `gate.check` info event per
+    // dispatch, carrying an `audit_event` field that round-trips back to an
+    // `AuditEvent`.
+
+    use std::sync::Mutex as StdMutex;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedEvent {
+        message: Option<String>,
+        audit_event: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct CapturedEventVisitor(CapturedEvent);
+
+    impl Visit for CapturedEventVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            match field.name() {
+                "message" => self.0.message = Some(value.to_string()),
+                "audit_event" => self.0.audit_event = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            // `tracing::info!(audit_event = %expr, "msg")` records via the
+            // Display-wrapped Debug path, so we receive the JSON string here.
+            // `"msg"` literal records as a `message` field via `record_debug`
+            // with a quoted Debug representation; strip the surrounding quotes
+            // so the captured message matches the source.
+            let formatted = format!("{value:?}");
+            let cleaned = formatted
+                .trim_start_matches('"')
+                .trim_end_matches('"')
+                .to_string();
+            match field.name() {
+                "message" => self.0.message = Some(cleaned),
+                "audit_event" => self.0.audit_event = Some(cleaned),
+                _ => {}
+            }
+        }
+    }
+
+    struct CaptureLayer(Arc<StdMutex<Vec<CapturedEvent>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = CapturedEventVisitor::default();
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    /// Run an async block under a scoped tracing subscriber and return the
+    /// events captured during the run. Uses a current-thread tokio runtime so
+    /// the thread-local subscriber set by `with_default` covers every task
+    /// spawned in the body.
+    fn capture_dispatch_events<Fut>(future: Fut) -> Vec<CapturedEvent>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        let captured: Arc<StdMutex<Vec<CapturedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread tokio runtime");
+            rt.block_on(future);
+        });
+
+        let guard = captured.lock().unwrap();
+        guard.clone()
+    }
+
+    /// Pull every captured event whose `message` matches `"gate.check"`.
+    fn gate_check_events(events: &[CapturedEvent]) -> Vec<&CapturedEvent> {
+        events
+            .iter()
+            .filter(|e| e.message.as_deref() == Some("gate.check"))
+            .collect()
+    }
+
+    #[test]
+    fn dispatch_tracing_emits_one_gate_check_event_on_allow() {
+        let events = capture_dispatch_events(async {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(AlphaPack);
+            builder.with_gate(Arc::new(AllowAllGate));
+            builder.with_default_namespace("tenant-default");
+            let reg = builder.build();
+            reg.dispatch("list", serde_json::json!({"namespace": "tenant-q"}))
+                .await
+                .unwrap();
+        });
+
+        let gate_events = gate_check_events(&events);
+        assert_eq!(
+            gate_events.len(),
+            1,
+            "exactly one gate.check tracing event per dispatch (allow); got {gate_events:?}"
+        );
+        let payload = gate_events[0]
+            .audit_event
+            .as_ref()
+            .expect("gate.check event must carry an audit_event field");
+        let audit: khive_gate::AuditEvent =
+            serde_json::from_str(payload).expect("audit_event payload must decode to AuditEvent");
+        assert_eq!(audit.decision, AuditDecision::Allow);
+        assert_eq!(audit.verb, "list");
+        assert_eq!(audit.namespace, "tenant-q");
+        assert_eq!(audit.gate_impl, "AllowAllGate");
+        assert!(
+            audit.deny_reason.is_none(),
+            "deny_reason must be None on Allow"
+        );
+    }
+
+    #[test]
+    fn dispatch_tracing_emits_gate_check_event_with_deny_payload() {
+        #[derive(Debug)]
+        struct AlwaysDenyGate;
+        impl Gate for AlwaysDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::deny("denied by test gate"))
+            }
+            fn impl_name(&self) -> &'static str {
+                "AlwaysDenyGate"
+            }
+        }
+
+        let events = capture_dispatch_events(async {
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(AlphaPack);
+            builder.with_gate(Arc::new(AlwaysDenyGate));
+            let reg = builder.build();
+            // Advisory in v0.2 — dispatch succeeds even when the gate denies.
+            reg.dispatch("create", serde_json::Value::Null)
+                .await
+                .unwrap();
+        });
+
+        let gate_events = gate_check_events(&events);
+        assert_eq!(
+            gate_events.len(),
+            1,
+            "exactly one gate.check tracing event per dispatch (deny); got {gate_events:?}"
+        );
+        let payload = gate_events[0]
+            .audit_event
+            .as_ref()
+            .expect("gate.check event must carry an audit_event field on Deny");
+        let audit: khive_gate::AuditEvent =
+            serde_json::from_str(payload).expect("audit_event payload must decode to AuditEvent");
+        assert_eq!(audit.decision, AuditDecision::Deny);
+        assert_eq!(audit.deny_reason.as_deref(), Some("denied by test gate"));
+        assert_eq!(audit.gate_impl, "AlwaysDenyGate");
+        // Wire-shape rule from ADR-033: obligations is always serialized as an
+        // array, empty on Deny. Round-trip back through serde_json::Value to
+        // confirm the field exists on the wire and is `[]`, not missing.
+        let payload_json: serde_json::Value =
+            serde_json::from_str(payload).expect("payload must be valid JSON");
+        assert_eq!(
+            payload_json["obligations"],
+            serde_json::Value::Array(Vec::new()),
+            "obligations must be `[]` on Deny on the tracing payload, not omitted"
+        );
     }
 }

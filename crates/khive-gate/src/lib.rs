@@ -195,11 +195,83 @@ pub enum GateError {
 pub trait Gate: Send + Sync + std::fmt::Debug {
     fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError>;
 
-    /// Short name of this backend — surfaced in audit events (ADR-033 planned)
-    /// so downstream tooling can tell `RegoGate` results apart from
+    /// Short name of this backend — surfaced in audit events (ADR-033) so
+    /// downstream tooling can tell `RegoGate` results apart from
     /// `LionGate<RegoGate>` results without parsing the type.
     fn impl_name(&self) -> &'static str {
         "Gate"
+    }
+}
+
+// ---------- Audit event (ADR-033) ----------
+
+/// Structured audit record emitted once per gate consultation (ADR-033).
+///
+/// The JSON projection of this struct is the **public contract** — field names
+/// are stable. Adding fields is non-breaking; removing or renaming requires a
+/// new ADR.
+///
+/// In v0.2 events are emitted via `tracing::info!` as structured JSON. The
+/// `EventStore` write path is deferred to v0.3 when the `VerbRegistry` gains
+/// a runtime handle (see ADR-033 §"Implementation Status").
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEvent {
+    /// Wall-clock timestamp of the gate check (UTC, RFC3339 in JSON).
+    pub timestamp: DateTime<Utc>,
+    /// Caller identity as given to the gate.
+    pub actor: ActorRef,
+    /// Namespace in which the verb was invoked.
+    pub namespace: String,
+    /// Verb being dispatched.
+    pub verb: String,
+    /// Gate outcome — `"allow"` or `"deny"`.
+    pub decision: AuditDecision,
+    /// Deny reason, present only when `decision == "deny"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_reason: Option<String>,
+    /// Obligations attached by the policy on Allow (empty array on Deny).
+    /// Always serialized — `obligations: []` is the wire shape when there
+    /// are none, so non-Rust consumers do not need to special-case absence
+    /// vs. emptiness.
+    #[serde(default)]
+    pub obligations: Vec<Obligation>,
+    /// Name of the gate implementation that produced this decision.
+    pub gate_impl: String,
+    /// Correlation token — `GateContext::session_id` when present, else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// The outcome field of an [`AuditEvent`], serialised as `"allow"` / `"deny"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDecision {
+    Allow,
+    Deny,
+}
+
+impl AuditEvent {
+    /// Build an `AuditEvent` from the gate inputs and output.
+    pub fn from_check(req: &GateRequest, decision: &GateDecision, gate_impl: &str) -> Self {
+        let (audit_decision, deny_reason, obligations) = match decision {
+            GateDecision::Allow { obligations } => {
+                (AuditDecision::Allow, None, obligations.clone())
+            }
+            GateDecision::Deny { reason } => {
+                (AuditDecision::Deny, Some(reason.clone()), Vec::new())
+            }
+        };
+        Self {
+            timestamp: req.context.timestamp.unwrap_or_else(chrono::Utc::now),
+            actor: req.actor.clone(),
+            namespace: req.namespace.as_str().to_string(),
+            verb: req.verb.clone(),
+            decision: audit_decision,
+            deny_reason,
+            obligations,
+            gate_impl: gate_impl.to_string(),
+            session_id: req.context.session_id.clone(),
+        }
     }
 }
 
@@ -365,5 +437,103 @@ mod tests {
     #[test]
     fn obligation_custom_round_trips_bool() {
         assert_custom_round_trips(serde_json::json!(true));
+    }
+
+    // ---- AuditEvent (ADR-033) ----
+
+    fn sample_req_with_session() -> GateRequest {
+        GateRequest::new(
+            ActorRef::new("user", "ocean"),
+            Namespace::default_ns(),
+            "create",
+            json!({"kind": "concept"}),
+        )
+        .with_context(GateContext {
+            session_id: Some("sess-abc".into()),
+            timestamp: None,
+            source: Some("mcp".into()),
+        })
+    }
+
+    #[test]
+    fn audit_event_roundtrips_through_serde_stable_shape() {
+        let req = sample_req_with_session();
+        let decision = GateDecision::allow_with(vec![Obligation::Audit {
+            tag: "create.attempt".into(),
+        }]);
+        let ev = AuditEvent::from_check(&req, &decision, "AllowAllGate");
+
+        let json = serde_json::to_value(&ev).unwrap();
+
+        // All required fields present with correct values.
+        assert_eq!(json["actor"]["kind"], "user");
+        assert_eq!(json["actor"]["id"], "ocean");
+        assert_eq!(json["namespace"], "local");
+        assert_eq!(json["verb"], "create");
+        assert_eq!(json["decision"], "allow");
+        assert_eq!(json["gate_impl"], "AllowAllGate");
+        assert_eq!(json["session_id"], "sess-abc");
+        // deny_reason absent on Allow.
+        assert!(json.get("deny_reason").is_none() || json["deny_reason"].is_null());
+        // obligations populated.
+        assert_eq!(json["obligations"][0]["kind"], "audit");
+        assert_eq!(json["obligations"][0]["tag"], "create.attempt");
+        // timestamp present and non-null.
+        assert!(json["timestamp"].is_string());
+
+        // Full round-trip.
+        let back: AuditEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back.verb, "create");
+        assert_eq!(back.decision, AuditDecision::Allow);
+        assert!(back.deny_reason.is_none());
+        assert_eq!(back.obligations.len(), 1);
+    }
+
+    #[test]
+    fn audit_event_deny_path_carries_reason() {
+        let req = sample_request(); // anonymous, no session
+        let decision = GateDecision::deny("forbidden: no write for anonymous");
+        let ev = AuditEvent::from_check(&req, &decision, "RegoGate");
+
+        let json = serde_json::to_value(&ev).unwrap();
+
+        assert_eq!(json["decision"], "deny");
+        assert_eq!(json["deny_reason"], "forbidden: no write for anonymous");
+        assert_eq!(json["gate_impl"], "RegoGate");
+        // obligations is always present on the wire, empty on Deny.
+        assert_eq!(
+            json["obligations"],
+            serde_json::Value::Array(Vec::new()),
+            "obligations must be an empty array on Deny, not omitted"
+        );
+        // session_id absent when not in context.
+        assert!(json.get("session_id").is_none() || json["session_id"].is_null());
+    }
+
+    #[test]
+    fn audit_event_allow_no_obligations() {
+        let req = sample_request();
+        let decision = GateDecision::allow();
+        let ev = AuditEvent::from_check(&req, &decision, "AllowAllGate");
+        assert_eq!(ev.decision, AuditDecision::Allow);
+        assert!(ev.deny_reason.is_none());
+        assert!(ev.obligations.is_empty());
+        // obligations is always present on the wire as an empty array — the
+        // public JSON contract does not depend on Rust's `#[serde(default)]`
+        // behavior at the consumer side.
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json["obligations"],
+            serde_json::Value::Array(Vec::new()),
+            "obligations must serialize as an empty array, not be omitted"
+        );
+    }
+
+    #[test]
+    fn audit_decision_serialises_as_snake_case() {
+        let allow = serde_json::to_value(AuditDecision::Allow).unwrap();
+        assert_eq!(allow, "allow");
+        let deny = serde_json::to_value(AuditDecision::Deny).unwrap();
+        assert_eq!(deny, "deny");
     }
 }

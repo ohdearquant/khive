@@ -35,8 +35,8 @@ pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::{PathNode, TraversalOptions};
 pub use khive_gate::{
-    ActorRef, AllowAllGate, Gate, GateContext, GateDecision, GateError, GateRef, GateRequest,
-    Obligation,
+    ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
+    GateRef, GateRequest, Obligation,
 };
 pub use operations::Resolved;
 pub use pack::{KindHook, PackRuntime, VerbRegistry, VerbRegistryBuilder};

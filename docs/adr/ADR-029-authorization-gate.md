@@ -203,7 +203,7 @@ today is the wrong default.
 | Dispatch-site gate consultation (advisory)         | `crates/khive-runtime/src/pack.rs` (registry) | done                 |
 | `khive-gate-rego` crate (`RegoGate`)               | `crates/khive-gate-rego/`                     | done (ADR-032)       |
 | `LionGate<G>` migration in khive-cloud             | `khive-cloud/crates/gate/`                    | planned (cloud-side) |
-| Audit envelope (`EventKind::GateCheck`)            | TBD                                           | planned (ADR-033)    |
+| Audit envelope (`AuditEvent` via tracing)          | `crates/khive-gate/src/lib.rs` (type)         | accepted (ADR-033)   |
 | Hard enforcement (deny → dispatch error)           | `crates/khive-runtime/src/pack.rs`            | deferred to v0.3     |
 
 ## Open Questions
