@@ -103,6 +103,12 @@ If the `kg` pack is also loaded, `search(kind="note", ...)` ranges over tasks an
 request(ops="search(kind=\"note\", query=\"<short topic phrase>\", limit=5)")
 ```
 
+To narrow to tasks specifically:
+
+```
+request(ops="search(kind=\"task\", query=\"<short topic phrase>\", limit=5)")
+```
+
 Past completed tasks (status=done) will surface here too, useful as a "what did I do last time I worked on this".
 
 ## Anti-patterns

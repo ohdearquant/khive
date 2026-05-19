@@ -5,7 +5,7 @@
 use std::str::FromStr;
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
@@ -55,6 +55,116 @@ fn canonical_note_kind(raw: &str, registry: &VerbRegistry) -> Result<String, Run
         "unknown note_kind {raw:?}; valid: {}",
         all.join(" | ")
     )))
+}
+
+// ---- Granular `kind` discriminator (CRUD verbs) ----
+//
+// The wire-level `kind` param accepts either a substrate-level name
+// (`"entity"`, `"note"`, `"edge"`) or any pack-registered granular kind
+// (`"concept"`, `"task"`, …). The granular form infers the substrate from the
+// registry and lets the call site skip the legacy `entity_kind` /
+// `note_kind` subfield.
+//
+// Substrate-level names are reserved; they're matched first so that a future
+// pack accidentally registering `"entity"` as a kind name doesn't shadow the
+// substrate-wide form.
+
+/// Resolved shape of a `kind` discriminator string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KindSpec {
+    /// `kind="entity"` — substrate-wide, no implicit kind filter.
+    Entity { specific: Option<String> },
+    /// `kind="note"` — substrate-wide, no implicit kind filter.
+    Note { specific: Option<String> },
+    /// `kind="edge"` — only valid for `list`.
+    Edge,
+}
+
+impl KindSpec {
+    pub(crate) fn substrate_label(&self) -> &'static str {
+        match self {
+            KindSpec::Entity { .. } => "entity",
+            KindSpec::Note { .. } => "note",
+            KindSpec::Edge => "edge",
+        }
+    }
+}
+
+/// Resolve a wire-level `kind` value into a [`KindSpec`].
+///
+/// Order:
+/// 1. Substrate-level reserved names (`entity` / `note` / `edge`).
+/// 2. kg's typed enums (alias-tolerant — `"paper"` → `"document"`).
+/// 3. Pack-registered entity kinds in `registry.all_entity_kinds()`.
+/// 4. Pack-registered note kinds in `registry.all_note_kinds()`.
+/// 5. Unknown → `InvalidInput` listing every legal value.
+pub(crate) fn resolve_kind_spec(
+    raw: &str,
+    registry: &VerbRegistry,
+) -> Result<KindSpec, RuntimeError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "entity" => return Ok(KindSpec::Entity { specific: None }),
+        "note" => return Ok(KindSpec::Note { specific: None }),
+        "edge" => return Ok(KindSpec::Edge),
+        _ => {}
+    }
+
+    // kg-typed enums first so aliases like "paper" → "document" still work.
+    if let Ok(k) = EntityKind::from_str(raw) {
+        return Ok(KindSpec::Entity {
+            specific: Some(k.name().to_string()),
+        });
+    }
+    if let Ok(k) = NoteKind::from_str(raw) {
+        return Ok(KindSpec::Note {
+            specific: Some(k.name().to_string()),
+        });
+    }
+
+    // Pack-registered granular kinds.
+    if registry.all_entity_kinds().contains(&normalized.as_str()) {
+        return Ok(KindSpec::Entity {
+            specific: Some(normalized),
+        });
+    }
+    if registry.all_note_kinds().contains(&normalized.as_str()) {
+        return Ok(KindSpec::Note {
+            specific: Some(normalized),
+        });
+    }
+
+    let mut all: Vec<String> = vec!["entity".into(), "note".into(), "edge".into()];
+    all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
+    all.extend(registry.all_note_kinds().iter().map(|s| (*s).to_string()));
+    all.sort();
+    all.dedup();
+    Err(RuntimeError::InvalidInput(format!(
+        "unknown kind {raw:?}; valid: {}",
+        all.join(" | ")
+    )))
+}
+
+/// Reconcile a granular `kind` with a legacy `entity_kind`/`note_kind` subfield.
+/// If both are supplied, they must canonicalize to the same value.
+fn reconcile_specific(
+    spec_specific: Option<String>,
+    legacy_raw: Option<&str>,
+    canonicalize: impl Fn(&str) -> Result<String, RuntimeError>,
+    legacy_field: &str,
+) -> Result<Option<String>, RuntimeError> {
+    let legacy_canonical = match legacy_raw {
+        Some(s) => Some(canonicalize(s)?),
+        None => None,
+    };
+    match (spec_specific, legacy_canonical) {
+        (Some(a), Some(b)) if a != b => Err(RuntimeError::InvalidInput(format!(
+            "kind={a:?} contradicts {legacy_field}={b:?}; pick one"
+        ))),
+        (Some(a), _) => Ok(Some(a)),
+        (None, b) => Ok(b),
+    }
 }
 
 // ---- Param structs (serde-only, no rmcp dependency) ----
@@ -125,6 +235,8 @@ struct SearchParams {
     namespace: Option<String>,
     query: String,
     limit: Option<u32>,
+    entity_kind: Option<String>,
+    note_kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -222,49 +334,81 @@ impl KgPack {
         mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        // Read the discriminator pair without consuming params (the hook may mutate).
-        let kind = params
+        // Read the discriminator without consuming params (the hook may mutate).
+        let raw_kind = params
             .get("kind")
             .and_then(Value::as_str)
             .ok_or_else(|| RuntimeError::InvalidInput("create requires 'kind'".into()))?
             .to_string();
 
-        // Canonicalize the sub-discriminator (entity_kind / note_kind) and look up
-        // an optional hook for it (ADR-030). Returns the canonical kind string +
-        // hook. For entities the hook is rarely used today; for notes it's how
-        // gtd's `task` kind layers defaults + edges over the shared CRUD path.
-        let (sub_kind, hook) = match kind.as_str() {
-            "entity" => {
-                let raw = params
+        // Resolve the granular form (`kind="concept"`, `kind="task"`, …) or the
+        // legacy substrate-level form (`kind="entity"` + `entity_kind=…`).
+        let spec = resolve_kind_spec(&raw_kind, registry)?;
+
+        // Canonicalize the sub-discriminator + look up the kind hook (ADR-030).
+        // For entities the hook is rarely used; for notes it's how gtd's `task`
+        // kind layers defaults + edges over the shared CRUD path.
+        let (sub_kind, hook) = match &spec {
+            KindSpec::Entity { specific } => {
+                let legacy = params
                     .get("entity_kind")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                match raw {
-                    Some(s) => {
-                        let canonical = canonical_entity_kind(&s, registry)?;
-                        let hook = registry.find_kind_hook(&canonical);
-                        (Some(canonical), hook)
-                    }
-                    None => {
-                        return Err(RuntimeError::InvalidInput(
-                            "kind=entity requires 'entity_kind' (concept | document | dataset | project | person | org)".into(),
-                        ));
-                    }
-                }
-            }
-            "note" => {
-                let raw = params
-                    .get("note_kind")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "observation".to_string());
-                let canonical = canonical_note_kind(&raw, registry)?;
+                let canonical = reconcile_specific(
+                    specific.clone(),
+                    legacy.as_deref(),
+                    |s| canonical_entity_kind(s, registry),
+                    "entity_kind",
+                )?
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput(
+                        "kind=entity requires a specific kind: either kind=<concept|document|dataset|project|person|org> directly, or kind=entity + entity_kind=<…>".into(),
+                    )
+                })?;
                 let hook = registry.find_kind_hook(&canonical);
                 (Some(canonical), hook)
             }
-            _ => (None, None),
+            KindSpec::Note { specific } => {
+                let legacy = params
+                    .get("note_kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty());
+                let canonical = reconcile_specific(
+                    specific.clone(),
+                    legacy.as_deref(),
+                    |s| canonical_note_kind(s, registry),
+                    "note_kind",
+                )?
+                .unwrap_or_else(|| "observation".to_string());
+                let hook = registry.find_kind_hook(&canonical);
+                (Some(canonical), hook)
+            }
+            KindSpec::Edge => {
+                return Err(RuntimeError::InvalidInput(
+                    "kind=edge is not creatable via `create` — use `link` for edges".into(),
+                ));
+            }
         };
+
+        // Rewrite `kind` to the substrate label so downstream `CreateParams`
+        // matching stays substrate-discriminated; granular form is now absorbed.
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("kind".into(), json!(spec.substrate_label()));
+            // Also normalize the legacy subfield so the hook sees the canonical
+            // value when the user passed only the granular form.
+            if let Some(ref canonical) = sub_kind {
+                match spec {
+                    KindSpec::Entity { .. } => {
+                        obj.insert("entity_kind".into(), json!(canonical));
+                    }
+                    KindSpec::Note { .. } => {
+                        obj.insert("note_kind".into(), json!(canonical));
+                    }
+                    KindSpec::Edge => {}
+                }
+            }
+        }
 
         if let Some(ref h) = hook {
             h.prepare_create(&self.runtime, &mut params).await?;
@@ -376,12 +520,15 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: ListParams = deser(params)?;
-        match p.kind.as_str() {
-            "entity" => {
-                let kind_filter = match p.entity_kind.as_deref() {
-                    Some(k) => Some(canonical_entity_kind(k, registry)?),
-                    None => None,
-                };
+        let spec = resolve_kind_spec(&p.kind, registry)?;
+        match spec {
+            KindSpec::Entity { specific } => {
+                let kind_filter = reconcile_specific(
+                    specific,
+                    p.entity_kind.as_deref(),
+                    |s| canonical_entity_kind(s, registry),
+                    "entity_kind",
+                )?;
                 let limit = p.limit.unwrap_or(50).min(500);
                 let entities = self
                     .runtime
@@ -389,7 +536,7 @@ impl KgPack {
                     .await?;
                 to_json(&entities)
             }
-            "edge" => {
+            KindSpec::Edge => {
                 let source_id = match p.source_id.as_deref() {
                     Some(s) => {
                         Some(resolve_uuid_async(s, &self.runtime, p.namespace.as_deref()).await?)
@@ -422,11 +569,13 @@ impl KgPack {
                     .await?;
                 to_json(&edges)
             }
-            "note" => {
-                let kind_filter = match p.note_kind.as_deref() {
-                    None | Some("") => None,
-                    Some(s) => Some(canonical_note_kind(s, registry)?),
-                };
+            KindSpec::Note { specific } => {
+                let kind_filter = reconcile_specific(
+                    specific,
+                    p.note_kind.as_deref().filter(|s| !s.is_empty()),
+                    |s| canonical_note_kind(s, registry),
+                    "note_kind",
+                )?;
                 let limit = p.limit.unwrap_or(20).min(200);
                 let notes = self
                     .runtime
@@ -434,9 +583,6 @@ impl KgPack {
                     .await?;
                 to_json(&notes)
             }
-            other => Err(RuntimeError::InvalidInput(format!(
-                "unknown kind {other:?}; valid: entity | edge | note"
-            ))),
         }
     }
 
@@ -528,12 +674,19 @@ impl KgPack {
     pub(crate) async fn handle_search(
         &self,
         params: Value,
-        _registry: &VerbRegistry,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: SearchParams = deser(params)?;
         let limit = p.limit.unwrap_or(10).min(100);
-        match p.kind.as_str() {
-            "entity" => {
+        let spec = resolve_kind_spec(&p.kind, registry)?;
+        match spec {
+            KindSpec::Entity { specific } => {
+                let kind_filter = reconcile_specific(
+                    specific,
+                    p.entity_kind.as_deref(),
+                    |s| canonical_entity_kind(s, registry),
+                    "entity_kind",
+                )?;
                 let query_vector = if self.runtime.config().embedding_model.is_some() {
                     Some(self.runtime.embed(&p.query).await?)
                 } else {
@@ -541,7 +694,13 @@ impl KgPack {
                 };
                 let hits = self
                     .runtime
-                    .hybrid_search(p.namespace.as_deref(), &p.query, query_vector, limit)
+                    .hybrid_search(
+                        p.namespace.as_deref(),
+                        &p.query,
+                        query_vector,
+                        limit,
+                        kind_filter.as_deref(),
+                    )
                     .await?;
                 let result: Vec<Value> = hits
                     .iter()
@@ -556,7 +715,13 @@ impl KgPack {
                     .collect();
                 to_json(&result)
             }
-            "note" => {
+            KindSpec::Note { specific } => {
+                let kind_filter = reconcile_specific(
+                    specific,
+                    p.note_kind.as_deref().filter(|s| !s.is_empty()),
+                    |s| canonical_note_kind(s, registry),
+                    "note_kind",
+                )?;
                 let query_vector = if self.runtime.config().embedding_model.is_some() {
                     Some(self.runtime.embed(&p.query).await?)
                 } else {
@@ -564,7 +729,13 @@ impl KgPack {
                 };
                 let hits = self
                     .runtime
-                    .search_notes(p.namespace.as_deref(), &p.query, query_vector, limit)
+                    .search_notes(
+                        p.namespace.as_deref(),
+                        &p.query,
+                        query_vector,
+                        limit,
+                        kind_filter.as_deref(),
+                    )
                     .await?;
                 let result: Vec<Value> = hits
                     .iter()
@@ -577,9 +748,9 @@ impl KgPack {
                     .collect();
                 to_json(&result)
             }
-            other => Err(RuntimeError::InvalidInput(format!(
-                "unknown kind {other:?}; valid: entity | note"
-            ))),
+            KindSpec::Edge => Err(RuntimeError::InvalidInput(
+                "search does not support kind=edge — use `list(kind=\"edge\", ...)` for edge browsing".into(),
+            )),
         }
     }
 

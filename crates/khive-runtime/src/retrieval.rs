@@ -78,14 +78,22 @@ impl KhiveRuntime {
     /// - Always performs text search over `query_text`.
     /// - If `query_vector` is `Some`, also performs vector search and fuses both lists.
     /// - If `None`, returns text-only results — no vector store needed.
+    /// - If `entity_kind` is `Some`, the alive-set query filters to that kind.
+    ///   The text/vector candidate pools are unfiltered up front; the kind
+    ///   filter applies at the alive-check stage where we already fetch each
+    ///   candidate to confirm it isn't soft-deleted.
     ///
     /// `limit` caps the final returned list; internally pulls `limit * 4` candidates per path.
+    /// The fused candidate set is kept untruncated until after the alive + kind filter so
+    /// that right-kind hits ranked below `limit` in the raw fusion still surface when
+    /// higher-ranked candidates are wrong-kind or soft-deleted.
     pub async fn hybrid_search(
         &self,
         namespace: Option<&str>,
         query_text: &str,
         query_vector: Option<Vec<f32>>,
         limit: u32,
+        entity_kind: Option<&str>,
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
@@ -117,10 +125,13 @@ impl KhiveRuntime {
             Vec::new()
         };
 
-        let mut fused = rrf_fuse(text_hits, vector_hits, limit as usize);
+        // Fuse without truncating: keep the full candidate pool through the
+        // alive/kind filter so right-kind hits below rank `limit` aren't lost.
+        let mut fused = rrf_fuse(text_hits, vector_hits, candidates as usize);
 
-        // Filter out soft-deleted entities. A single query fetches all alive IDs from the
-        // fused set; any ID absent from the result has been soft-deleted (deleted_at IS NOT NULL).
+        // Filter to alive entities (and optionally to a specific kind). A single
+        // query fetches all alive IDs that match the kind constraint from the
+        // fused set; any ID absent has been soft-deleted or doesn't match.
         if !fused.is_empty() {
             let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
             let alive_page = self
@@ -129,6 +140,7 @@ impl KhiveRuntime {
                     self.ns(namespace),
                     EntityFilter {
                         ids: candidate_ids,
+                        kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
                         ..EntityFilter::default()
                     },
                     PageRequest {
@@ -141,6 +153,7 @@ impl KhiveRuntime {
             fused.retain(|h| alive.contains(&h.entity_id));
         }
 
+        fused.truncate(limit as usize);
         Ok(fused)
     }
 

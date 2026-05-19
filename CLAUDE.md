@@ -152,19 +152,24 @@ Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (
 
 ### KG pack verbs (11 — ADR-023 + ADR-024)
 
-| Verb        | Args                                  | What it does                                                  |
-| ----------- | ------------------------------------- | ------------------------------------------------------------- |
-| `create`    | `kind=entity\|note` + fields          | Create an entity or note                                      |
-| `get`       | `id` (UUID)                           | Fetch any record — auto-detects entity/note/edge              |
-| `list`      | `kind=entity\|edge\|note` + filters   | Structured browse with pagination                             |
-| `update`    | `id` + patch fields                   | Patch entity (name/desc/props/tags) or edge (relation/weight) |
-| `delete`    | `id`, `hard?`                         | Soft-delete (default) or hard-delete with edge cascade        |
-| `merge`     | `into_id`, `from_id`                  | Deduplicate two entities (v0.1: entity-only)                  |
-| `search`    | `kind=entity\|note`, `query`          | Hybrid FTS5 + vector search with RRF fusion                   |
-| `link`      | `source_id`, `target_id`, `relation`  | Create a typed directed edge                                  |
-| `neighbors` | `node_id`, `direction?`, `relations?` | Immediate graph neighbors                                     |
-| `traverse`  | `roots`, `max_depth?`, `relations?`   | Multi-hop BFS with filters                                    |
-| `query`     | GQL or SPARQL string                  | Pattern matching compiled to SQL                              |
+`create`, `list`, and `search` take a `kind` discriminant. It accepts either the substrate-level
+name (`entity`, `note`, `edge`) **or** a pack-registered granular kind (`concept`, `document`,
+`task`, `observation`, …). The registry resolves which substrate the granular form lives in.
+Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filter is rejected.
+
+| Verb        | Args                                         | What it does                                                  |
+| ----------- | -------------------------------------------- | ------------------------------------------------------------- |
+| `create`    | `kind=<substrate\|granular>` + fields        | Create an entity or note                                      |
+| `get`       | `id` (UUID)                                  | Fetch any record — auto-detects entity/note/edge              |
+| `list`      | `kind=<substrate\|granular>\|edge` + filters | Structured browse with pagination                             |
+| `update`    | `id` + patch fields                          | Patch entity (name/desc/props/tags) or edge (relation/weight) |
+| `delete`    | `id`, `hard?`                                | Soft-delete (default) or hard-delete with edge cascade        |
+| `merge`     | `into_id`, `from_id`                         | Deduplicate two entities (v0.1: entity-only)                  |
+| `search`    | `kind=<substrate\|granular>`, `query`        | Hybrid FTS5 + vector search with RRF fusion                   |
+| `link`      | `source_id`, `target_id`, `relation`         | Create a typed directed edge                                  |
+| `neighbors` | `node_id`, `direction?`, `relations?`        | Immediate graph neighbors                                     |
+| `traverse`  | `roots`, `max_depth?`, `relations?`          | Multi-hop BFS with filters                                    |
+| `query`     | GQL or SPARQL string                         | Pattern matching compiled to SQL                              |
 
 ### GTD pack verbs (5 — ADR-026, optional)
 

@@ -88,16 +88,36 @@ Only three verbs take a `kind` discriminant: `create`, `list`, and `search`. The
 verbs (`get`, `update`, `delete`, `merge`) are UUID-only — the handler resolves the substrate
 internally and no `kind` is required.
 
-For the three verbs that do use `kind`:
+The `kind` discriminant accepts **either** a substrate-level name **or** a pack-registered
+granular kind. Both forms resolve through the same `VerbRegistry` vocabulary
+([ADR-025](ADR-025-pack-standard.md)).
 
-- `kind="entity"` → routes to entity store. Additional required field `entity_kind` for `create`
-  (concept|document|dataset|project|person|org per ADR-001).
+**Substrate-level (backwards-compatible):**
+
+- `kind="entity"` → routes to entity store. For `create`, requires `entity_kind`
+  (concept|document|dataset|project|person|org per ADR-001). For `list`/`search`, ranges over
+  every entity kind unless `entity_kind` is supplied as a sub-filter.
 - `kind="edge"` → routes to graph store. Used by `list` only.
-- `kind="note"` → routes to note store. Additional required field `note_kind` for `create`
-  (observation|insight|question|decision|reference per ADR-019; defaults to `observation`).
-  Notes also accept an optional `name` field for titled notes (analogous to entity `name`).
+- `kind="note"` → routes to note store. For `create`, requires `note_kind`
+  (observation|insight|question|decision|reference per ADR-019, plus any pack-registered note
+  kinds like `task` from ADR-026; defaults to `observation`). For `list`/`search`, ranges over
+  every note kind unless `note_kind` is supplied.
 
-Unknown `kind` returns `invalid_params` with the valid options listed.
+**Granular (substrate inferred from the registry):**
+
+- `kind="<entity-kind>"` (e.g. `concept`, `document`, `task`) is shorthand for the
+  matching substrate plus that specific kind. `create(kind="concept", name=...)` is equivalent
+  to `create(kind="entity", entity_kind="concept", name=...)`. `list(kind="task")` is
+  equivalent to `list(kind="note", note_kind="task")`. `search(kind="task", query=...)` filters
+  hits to task notes only.
+- A granular `kind` and a legacy `entity_kind`/`note_kind` sub-filter that disagree are
+  rejected with `invalid_params` ("kind=X contradicts Y=Z; pick one"). When they agree, the
+  call succeeds.
+- The registry's `all_entity_kinds()` and `all_note_kinds()` are the source of truth for which
+  granular kinds resolve — agents see kg + every loaded pack's vocabulary at once.
+
+Unknown `kind` returns `invalid_params` with the merged valid set listed
+(`entity | note | edge | concept | document | … | task | observation | …`).
 
 ### Short UUID prefix resolution
 
@@ -180,10 +200,14 @@ pub struct ListParams {
 }
 
 pub struct SearchParams {
-    pub kind: String,        // "entity" | "note"
+    pub kind: String,        // "entity" | "note" | granular (e.g. "concept" | "task")
     pub namespace: Option<String>,
     pub query: String,
     pub limit: Option<u32>,
+    // Sub-filters honored when kind="entity" / "note". Contradicting the
+    // granular form (e.g. kind="concept" + entity_kind="document") is rejected.
+    pub entity_kind: Option<String>,
+    pub note_kind: Option<String>,
 }
 
 pub struct MergeParams {

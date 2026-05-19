@@ -514,6 +514,7 @@ impl KhiveRuntime {
         query_text: &str,
         query_vector: Option<Vec<f32>>,
         limit: u32,
+        note_kind: Option<&str>,
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
         const RRF_K: usize = 60;
         let candidates = limit.saturating_mul(4).max(limit);
@@ -566,14 +567,23 @@ impl KhiveRuntime {
             return Ok(vec![]);
         }
 
-        // Fetch each candidate note individually to get salience and apply soft-delete filter.
+        // Fetch each candidate note individually to get salience and apply
+        // soft-delete + (optional) kind filtering. Notes whose `kind` doesn't
+        // match `note_kind` are dropped post-fetch — they're a small set
+        // bounded by `candidates`, so the extra read is cheap.
         let note_store = self.notes(namespace)?;
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
             if let Some(note) = note_store.get_note(*id).await? {
-                if note.deleted_at.is_none() {
-                    alive_notes.insert(*id, note);
+                if note.deleted_at.is_some() {
+                    continue;
                 }
+                if let Some(want_kind) = note_kind {
+                    if note.kind != want_kind {
+                        continue;
+                    }
+                }
+                alive_notes.insert(*id, note);
             }
         }
 
@@ -1528,7 +1538,7 @@ mod tests {
         .unwrap();
 
         let results = rt
-            .search_notes(None, "GQA KV cache", None, 10)
+            .search_notes(None, "GQA KV cache", None, 10, None)
             .await
             .unwrap();
 
@@ -1559,7 +1569,7 @@ mod tests {
             .unwrap();
 
         let results = rt
-            .search_notes(None, "RoPE rotary positional", None, 10)
+            .search_notes(None, "RoPE rotary positional", None, 10, None)
             .await
             .unwrap();
 
@@ -1945,7 +1955,7 @@ mod tests {
 
         // FTS must not contain the content either.
         let search_hits = rt
-            .search_notes(None, "should not persist", None, 10)
+            .search_notes(None, "should not persist", None, 10, None)
             .await
             .unwrap();
         assert!(
