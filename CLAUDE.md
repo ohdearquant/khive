@@ -82,25 +82,25 @@ not shipped.
 
 ## Directory map
 
-| Path                    | Purpose                                                                      |
-| ----------------------- | ---------------------------------------------------------------------------- |
-| `crates/khive-types`    | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait      |
-| `crates/khive-score`    | Deterministic i64 fixed-point scoring + RRF                                  |
-| `crates/khive-storage`  | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                   |
-| `crates/khive-db`       | SQLite backend + sqlite-vec + FTS5 trigram                                   |
-| `crates/khive-query`    | GQL + SPARQL parsers, AST validation, SQL compiler                           |
-| `crates/khive-runtime`  | Service API + VerbRegistry + PackRuntime trait                               |
-| `crates/khive-request`  | Request DSL parser (function-call + JSON; pipe/LNDL planned)                 |
-| `crates/khive-pack-kg`     | KG pack: vocabulary, 11 verb handlers, kind validation                           |
-| `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)     |
-| `crates/khive-pack-memory` | Memory pack: `remember`/`recall` verbs, decay-weighted recall ([ADR-036](docs/adr/ADR-036-memory-pack-semantics.md)) |
+| Path                       | Purpose                                                                                                                              |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/khive-types`       | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                                              |
+| `crates/khive-score`       | Deterministic i64 fixed-point scoring + RRF                                                                                          |
+| `crates/khive-storage`     | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                                                           |
+| `crates/khive-db`          | SQLite backend + sqlite-vec + FTS5 trigram                                                                                           |
+| `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                                   |
+| `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                                       |
+| `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                                         |
+| `crates/khive-pack-kg`     | KG pack: vocabulary, 11 verb handlers, kind validation                                                                               |
+| `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                                         |
+| `crates/khive-pack-memory` | Memory pack: `remember`/`recall` verbs, decay-weighted recall ([ADR-036](docs/adr/ADR-036-memory-pack-semantics.md))                 |
 | `crates/khive-vcs`         | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-042](docs/adr/ADR-042-kg-versioning-implementation.md)) |
-| `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-043](docs/adr/ADR-043-kg-merge-algorithm.md)) |
-| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry                       |
-| `docs/adr/`             | Architecture Decision Records (the design contract)                          |
-| `marketplace/`          | Claude Code plugins (`kg`, `gtd`) — install via `/plugin install`            |
-| `tests/smoke_test.py`   | End-to-end binary smoke test (drives every verb via the `request` DSL)       |
-| `scripts/publish.sh`    | Publish all crates to crates.io in dependency order                          |
+| `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-043](docs/adr/ADR-043-kg-merge-algorithm.md))       |
+| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry                                                                           |
+| `docs/adr/`                | Architecture Decision Records (the design contract)                                                                                  |
+| `marketplace/`             | Claude Code plugins (`kg`, `gtd`) — install via `/plugin install`                                                                    |
+| `tests/smoke_test.py`      | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                               |
+| `scripts/publish.sh`       | Publish all crates to crates.io in dependency order                                                                                  |
 
 ---
 

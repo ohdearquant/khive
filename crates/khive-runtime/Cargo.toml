@@ -31,3 +31,4 @@ tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
+serial_test = "3"
