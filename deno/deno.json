@@ -1,0 +1,41 @@
+{
+  "name": "khive",
+  "version": "0.1.0",
+  "description": "khive — research knowledge graph CLI + HTTP server (TypeScript over Rust runtime)",
+  "license": "Apache-2.0",
+  "exports": {
+    "./cli": "./src/cli.ts",
+    "./server": "./src/server.ts"
+  },
+  "tasks": {
+    "server": "deno run --watch --allow-net --allow-read --allow-env --allow-run src/server.ts",
+    "server:start": "deno run --allow-net --allow-read --allow-env --allow-run src/server.ts",
+    "cli": "deno run --allow-net --allow-read --allow-env --allow-run src/cli.ts",
+    "compile:cli": "deno compile --allow-net --allow-read --allow-env --allow-run --output ../target/khive src/cli.ts",
+    "compile:server": "deno compile --allow-net --allow-read --allow-env --allow-run --output ../target/khive-server src/server.ts",
+    "test": "deno test --allow-net --allow-read --allow-env --allow-run src/",
+    "check": "deno check src/server.ts src/cli.ts",
+    "fmt": "deno fmt src/",
+    "lint": "deno lint src/"
+  },
+  "imports": {
+    "@hono/hono": "jsr:@hono/hono@^4.6.0",
+    "@modelcontextprotocol/sdk": "npm:@modelcontextprotocol/sdk@^1.0.0",
+    "@std/assert": "jsr:@std/assert@^1.0.0",
+    "@std/cli": "jsr:@std/cli@^1.0.0",
+    "@std/path": "jsr:@std/path@^1.0.0",
+    "@anthropic-ai/sdk": "npm:@anthropic-ai/sdk@^0.30.0",
+    "openai": "npm:openai@^4.70.0"
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "singleQuote": false,
+    "semiColons": true
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    }
+  }
+}
