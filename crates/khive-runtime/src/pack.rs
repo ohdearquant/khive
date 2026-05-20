@@ -199,11 +199,16 @@ impl VerbRegistryBuilder {
     /// pack set, or if a circular dependency is detected.
     pub fn build(self) -> Result<VerbRegistry, RuntimeError> {
         let packs = self.packs;
-        let name_to_idx: HashMap<&str, usize> = packs
-            .iter()
-            .enumerate()
-            .map(|(idx, pack)| (pack.name(), idx))
-            .collect();
+        let mut name_to_idx: HashMap<&str, usize> = HashMap::with_capacity(packs.len());
+        for (idx, pack) in packs.iter().enumerate() {
+            if let Some(prev_idx) = name_to_idx.insert(pack.name(), idx) {
+                return Err(RuntimeError::PackRedeclared {
+                    name: pack.name().to_string(),
+                    first_idx: prev_idx,
+                    second_idx: idx,
+                });
+            }
+        }
 
         let mut missing: Vec<MissingPackDependency> = Vec::new();
         let mut indegree = vec![0usize; packs.len()];

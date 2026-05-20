@@ -96,6 +96,13 @@ pub enum RuntimeError {
     #[error("{0}")]
     CircularPackDependency(CircularPackDependency),
 
+    #[error("pack '{name}' registered twice (indices {first_idx} and {second_idx})")]
+    PackRedeclared {
+        name: String,
+        first_idx: usize,
+        second_idx: usize,
+    },
+
     /// Gate denied this verb invocation (ADR-035).
     ///
     /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns
