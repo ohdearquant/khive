@@ -53,8 +53,11 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg  — KG vocabulary + 11 verb handlers (ADR-025) │
-│  khive-pack-gtd — GTD lifecycle, 5 verbs (ADR-026, optional) │
+│  khive-pack-kg     — KG vocabulary + 11 verb handlers (ADR-025)     │
+│  khive-pack-gtd    — GTD lifecycle, 5 verbs (ADR-026, optional)     │
+│  khive-pack-memory — memory/recall verbs + decay (ADR-036, optional)│
+│  khive-vcs         — KG versioning: snapshots/branches (ADR-042)    │
+│  khive-merge       — three-way KG merge algorithm (ADR-043)         │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -88,9 +91,12 @@ not shipped.
 | `crates/khive-query`    | GQL + SPARQL parsers, AST validation, SQL compiler                           |
 | `crates/khive-runtime`  | Service API + VerbRegistry + PackRuntime trait                               |
 | `crates/khive-request`  | Request DSL parser (function-call + JSON; pipe/LNDL planned)                 |
-| `crates/khive-pack-kg`  | KG pack: vocabulary, 11 verb handlers, kind validation                       |
-| `crates/khive-pack-gtd` | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition) |
-| `crates/khive-mcp`      | Stdio MCP binary — single `request` tool over VerbRegistry                   |
+| `crates/khive-pack-kg`     | KG pack: vocabulary, 11 verb handlers, kind validation                           |
+| `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)     |
+| `crates/khive-pack-memory` | Memory pack: `remember`/`recall` verbs, decay-weighted recall ([ADR-036](docs/adr/ADR-036-memory-pack-semantics.md)) |
+| `crates/khive-vcs`         | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-042](docs/adr/ADR-042-kg-versioning-implementation.md)) |
+| `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-043](docs/adr/ADR-043-kg-merge-algorithm.md)) |
+| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry                       |
 | `docs/adr/`             | Architecture Decision Records (the design contract)                          |
 | `marketplace/`          | Claude Code plugins (`kg`, `gtd`) — install via `/plugin install`            |
 | `tests/smoke_test.py`   | End-to-end binary smoke test (drives every verb via the `request` DSL)       |

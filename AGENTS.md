@@ -32,10 +32,15 @@ or JSON form ([ADR-020](docs/adr/ADR-020-request-dsl.md),
 | `neighbors` | Immediate neighbors of a node                    | "What connects to this entity?"                          |
 | `query`     | GQL/SPARQL query string → SQL                    | Complex pattern matching over the graph                  |
 | `merge`     | Deduplicate two entities into one (v0.1)         | "LoRA" and "Low-Rank Adaptation" are the same concept    |
+| `remember`  | Store a memory (memory pack — [ADR-036](docs/adr/ADR-036-memory-pack-semantics.md)) | Cross-session context, agent state, working memory |
+| `recall`    | Semantic search over memories with decay weighting (memory pack — [ADR-036](docs/adr/ADR-036-memory-pack-semantics.md)) | Retrieve what you stored in prior sessions |
 
-**One MCP tool (`request`), 11 verbs inside it.** `get`, `update`, `delete` are UUID-only — they
-auto-detect whether the record is an entity, note, or edge. `create`, `list`, `search` require
-`kind=entity|note` (or `kind=edge` for `list`).
+**One MCP tool (`request`), 11 core verbs + 2 memory-pack verbs.** `get`, `update`, `delete` are
+UUID-only — they auto-detect whether the record is an entity, note, or edge. `create`, `list`,
+`search` require `kind=entity|note` (or `kind=edge` for `list`; `kind=event` for audit events per
+[ADR-038](docs/adr/ADR-038-events-surface.md)).
+
+`remember` and `recall` require the memory pack: `KHIVE_PACKS=kg,memory`.
 
 ### How to call a verb
 
