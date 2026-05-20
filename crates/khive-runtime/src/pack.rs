@@ -987,6 +987,11 @@ mod tests {
     // `AuditEvent`.
 
     use std::sync::Mutex as StdMutex;
+
+    // Serialize tracing capture tests — with_default is thread-local, so
+    // parallel tests with different subscribers race on CI.
+    static TRACING_TEST_LOCK: std::sync::LazyLock<StdMutex<()>> =
+        std::sync::LazyLock::new(|| StdMutex::new(()));
     use tracing::field::{Field, Visit};
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Layer;
@@ -1050,6 +1055,7 @@ mod tests {
     where
         Fut: std::future::Future<Output = ()>,
     {
+        let _serial = TRACING_TEST_LOCK.lock().unwrap();
         let captured: Arc<StdMutex<Vec<CapturedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
 
