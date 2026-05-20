@@ -1,6 +1,6 @@
 # ADR-047: Frontend Views — KG Explorer and GTD Board
 
-**Status**: proposed\
+**Status**: superseded — superseded by ADR-049, which moved to khive-cloud ADR-030\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 

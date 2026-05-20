@@ -1,6 +1,6 @@
 # ADR-045: Swarm Telemetry Dashboard
 
-**Status**: proposed\
+**Status**: superseded — superseded by ADR-049, which moved to khive-cloud ADR-030\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
