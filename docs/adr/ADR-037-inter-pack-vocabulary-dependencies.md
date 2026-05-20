@@ -1,6 +1,6 @@
 # ADR-037: Inter-pack Vocabulary Dependencies
 
-**Status**: proposed  **Date**: 2026-05-19
+**Status**: accepted  **Date**: 2026-05-19
 **Authors**: khive maintainers
 
 ## Context
@@ -193,13 +193,13 @@ parse the string for an optional version constraint.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-| --- | --- | --- | --- |
-| **Implicit load order** (status quo) | Zero friction | Dependency is invisible; runtime error message is misleading; discovered at first cross-pack operation | Does not scale beyond two packs; poor operator experience |
-| **Runtime-only check** (detect missing kind on `link()`) | No API change to `Pack` | Error appears mid-session; message doesn't attribute missing pack; doesn't fail fast | Accepted risk today because no cross-pack refs exist; unacceptable as packs grow |
-| **Type-level dependencies** (`TypeId` or generic bounds) | Compile-time guarantee | Requires crate-level dep between pack crates; breaks `no_std`; polymorphism overhead | Crate coupling defeats the purpose of loose pack composition |
-| **Semver version constraints** (`"kg@>=0.2"`) | Future-proof for ecosystem | Parsing complexity; no operational need with single-workspace deployment | Out of scope for v0.1; string syntax leaves room to add it later without breaking change |
-| **Separate registry call** (`builder.add_dependency("crm","kg")`) | Keeps `Pack` trait lean | Declaration is separated from the vocabulary reference that created the need; easy to forget | Co-location of declaration and reference is the stronger invariant |
+| Alternative                                                       | Pros                       | Cons                                                                                                   | Why rejected                                                                             |
+| ----------------------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| **Implicit load order** (status quo)                              | Zero friction              | Dependency is invisible; runtime error message is misleading; discovered at first cross-pack operation | Does not scale beyond two packs; poor operator experience                                |
+| **Runtime-only check** (detect missing kind on `link()`)          | No API change to `Pack`    | Error appears mid-session; message doesn't attribute missing pack; doesn't fail fast                   | Accepted risk today because no cross-pack refs exist; unacceptable as packs grow         |
+| **Type-level dependencies** (`TypeId` or generic bounds)          | Compile-time guarantee     | Requires crate-level dep between pack crates; breaks `no_std`; polymorphism overhead                   | Crate coupling defeats the purpose of loose pack composition                             |
+| **Semver version constraints** (`"kg@>=0.2"`)                     | Future-proof for ecosystem | Parsing complexity; no operational need with single-workspace deployment                               | Out of scope for v0.1; string syntax leaves room to add it later without breaking change |
+| **Separate registry call** (`builder.add_dependency("crm","kg")`) | Keeps `Pack` trait lean    | Declaration is separated from the vocabulary reference that created the need; easy to forget           | Co-location of declaration and reference is the stronger invariant                       |
 
 ## Consequences
 
@@ -232,12 +232,12 @@ parse the string for an optional version constraint.
 
 Three files change; all changes are additive.
 
-| File | Change |
-| --- | --- |
-| `crates/khive-types/src/pack.rs` | Add `const REQUIRES: &'static [&'static str] = &[]` to the `Pack` trait (after `EDGE_RULES`, line 87) |
+| File                               | Change                                                                                                                                                                                                                                        |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/khive-types/src/pack.rs`   | Add `const REQUIRES: &'static [&'static str] = &[]` to the `Pack` trait (after `EDGE_RULES`, line 87)                                                                                                                                         |
 | `crates/khive-runtime/src/pack.rs` | Add `fn requires(&self) -> &'static [&'static str] { &[] }` to `PackRuntime` (after `edge_rules`, ~line 53); add `pack_requires` lookup to `VerbRegistry`; extend `VerbRegistryBuilder::build` with the dependency check and topological sort |
-| `crates/khive-pack-kg/src/lib.rs` | No-op: `KgPack` gets `const REQUIRES = &[]` (default; explicit for documentation clarity) |
-| `crates/khive-pack-gtd/src/lib.rs` | No-op: `GtdPack` gets `const REQUIRES = &[]` (default; explicit for documentation clarity) |
+| `crates/khive-pack-kg/src/lib.rs`  | No-op: `KgPack` gets `const REQUIRES = &[]` (default; explicit for documentation clarity)                                                                                                                                                     |
+| `crates/khive-pack-gtd/src/lib.rs` | No-op: `GtdPack` gets `const REQUIRES = &[]` (default; explicit for documentation clarity)                                                                                                                                                    |
 
 `VerbRegistryBuilder::build` collects all pack names, walks each pack's `requires()`, accumulates
 any missing-dependency errors, then performs a DFS topological sort (cycle = error) before

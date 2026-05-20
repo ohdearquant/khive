@@ -39,30 +39,41 @@ pub struct KhiveMcpServer {
     registry: VerbRegistry,
 }
 
-/// Returned by [`KhiveMcpServer::with_packs`] when a name in the requested pack
-/// list doesn't map to a known built-in pack. The original runtime is returned
-/// so the caller can recover (e.g. retry with a smaller list).
+/// Failure reason inside a [`PackRegError`].
+pub enum PackRegFailure {
+    UnknownPack(String),
+    Registry(khive_runtime::RuntimeError),
+}
+
+/// Returned by [`KhiveMcpServer::with_packs`] when pack registration fails.
+/// The original runtime is returned so the caller can recover.
 pub struct PackRegError {
-    pub unknown: String,
+    pub failure: PackRegFailure,
     pub runtime: KhiveRuntime,
 }
 
 impl std::fmt::Debug for PackRegError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PackRegError")
-            .field("unknown", &self.unknown)
-            .finish_non_exhaustive()
+        let mut dbg = f.debug_struct("PackRegError");
+        match &self.failure {
+            PackRegFailure::UnknownPack(unknown) => dbg.field("unknown", unknown),
+            PackRegFailure::Registry(source) => dbg.field("source", source),
+        }
+        .finish_non_exhaustive()
     }
 }
 
 impl std::fmt::Display for PackRegError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "unknown pack name {:?} — built-in packs: {}",
-            self.unknown,
-            BUILTIN_PACKS.join(", ")
-        )
+        match &self.failure {
+            PackRegFailure::UnknownPack(unknown) => write!(
+                f,
+                "unknown pack name {:?} — built-in packs: {}",
+                unknown,
+                BUILTIN_PACKS.join(", ")
+            ),
+            PackRegFailure::Registry(source) => write!(f, "pack registry build failed: {source}"),
+        }
     }
 }
 
@@ -103,7 +114,7 @@ impl KhiveMcpServer {
             // this code path stays free of direct pack-type imports.
             KgDialect::register("kg", recovered_runtime.clone(), &mut builder)
                 .expect("kg is a known pack name");
-            let registry = builder.build();
+            let registry = builder.build().expect("fallback kg registry builds");
             recovered_runtime.install_edge_rules(registry.all_edge_rules());
             Self { registry }
         })
@@ -130,10 +141,16 @@ impl KhiveMcpServer {
                 continue;
             }
             if let Err(unknown) = KgDialect::register(name, runtime.clone(), &mut builder) {
-                return Err(PackRegError { unknown, runtime });
+                return Err(PackRegError {
+                    failure: PackRegFailure::UnknownPack(unknown),
+                    runtime,
+                });
             }
         }
-        let registry = builder.build();
+        let registry = builder.build().map_err(|source| PackRegError {
+            failure: PackRegFailure::Registry(source),
+            runtime: runtime.clone(),
+        })?;
         // ADR-031: aggregate pack-declared edge endpoint rules into the runtime
         // so `validate_edge_relation_endpoints` can consult them.
         runtime.install_edge_rules(registry.all_edge_rules());

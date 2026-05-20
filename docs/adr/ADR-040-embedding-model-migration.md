@@ -57,6 +57,7 @@ is tracked in `_embedding_models.is_active`. (sqlite-vec's fixed-dimension const
 separate virtual table is required for each distinct embedding dimension — see D3.)
 
 When a user switches the active model:
+
 1. The runtime registers the new model in `_embedding_models` (if absent) and marks it active.
 2. Old rows for the previous model remain in the table — they are not deleted.
 3. Searches use the active model's vectors. Rows with no vector for the active model are
@@ -201,13 +202,13 @@ matters; the `"default"` sentinel is practical for users who do not track checkp
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-| ----------- | ---- | ---- | ------------ |
-| **Option A: single active model, delete old vectors on switch** | Simpler schema; no multi-model dispatch | Irreversible data loss; no rollback without full re-embed; hostile to model A/B evaluation | Rejected — local inference makes keeping old vectors cheap; data loss is the worse trade-off |
-| **Eager re-embed: block server until all vectors are updated on model switch** | Predictable state after switch; no partial-coverage period | Blocking latency is unbounded for large namespaces; inconsistent with lazy model load (ADR-012) | Rejected — unacceptable for any namespace with thousands of records |
-| **Lazy re-embed: re-embed records only when touched post-switch** | Zero overhead at switch time; no background goroutine | Unbounded tail: stale records may never get re-embedded; misleading search coverage | Rejected — coverage is the invariant we want; lazy provides no bound on when it is restored |
-| **Per-model-variant separate tables (vec_{model_key} as today)** | Clean isolation per model; no dispatch logic | Table proliferation; FKs cannot span virtual tables; no active-model tracking; does not fix silent dimension mismatch | Rejected — the `_embedding_models` registry + per-dimension dispatch design consolidates this cleanly |
-| **Store model identity as a column on entities/notes (not a separate table)** | No extra table | Denormalized; makes active-model tracking harder; harder to enumerate all registered models | Rejected — separate `_embedding_models` table is clean and queryable |
+| Alternative                                                                    | Pros                                                       | Cons                                                                                                                  | Why rejected                                                                                          |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **Option A: single active model, delete old vectors on switch**                | Simpler schema; no multi-model dispatch                    | Irreversible data loss; no rollback without full re-embed; hostile to model A/B evaluation                            | Rejected — local inference makes keeping old vectors cheap; data loss is the worse trade-off          |
+| **Eager re-embed: block server until all vectors are updated on model switch** | Predictable state after switch; no partial-coverage period | Blocking latency is unbounded for large namespaces; inconsistent with lazy model load (ADR-012)                       | Rejected — unacceptable for any namespace with thousands of records                                   |
+| **Lazy re-embed: re-embed records only when touched post-switch**              | Zero overhead at switch time; no background goroutine      | Unbounded tail: stale records may never get re-embedded; misleading search coverage                                   | Rejected — coverage is the invariant we want; lazy provides no bound on when it is restored           |
+| **Per-model-variant separate tables (vec_{model_key} as today)**               | Clean isolation per model; no dispatch logic               | Table proliferation; FKs cannot span virtual tables; no active-model tracking; does not fix silent dimension mismatch | Rejected — the `_embedding_models` registry + per-dimension dispatch design consolidates this cleanly |
+| **Store model identity as a column on entities/notes (not a separate table)**  | No extra table                                             | Denormalized; makes active-model tracking harder; harder to enumerate all registered models                           | Rejected — separate `_embedding_models` table is clean and queryable                                  |
 
 ## Consequences
 
@@ -347,6 +348,7 @@ pub async fn reembed_namespace(
 ```
 
 The job:
+
 1. Pages through `entities` and `notes` in the namespace using `list` operations.
 2. For each batch, filters to records without a row in `vec_{dim}` for `model_id =
    active_model_id`.
@@ -379,33 +381,39 @@ subcommand is an administrative path; it is NOT exposed via the MCP `request` ve
 The following test scenarios must be present before this ADR is considered implemented:
 
 **T1: Model registration and active-model tracking**
+
 - Create a runtime with `EmbeddingModel::AllMiniLmL6V2`.
 - Verify `_embedding_models` has one row with `is_active = 1` and `dim = 384`.
 - Switch to `EmbeddingModel::BgeBaseEnV15`.
 - Verify the original row has `is_active = 0` and a new row with `dim = 768` has `is_active = 1`.
 
 **T2: Multi-model coexistence — vectors for old model survive switch**
+
 - Index N entities with `AllMiniLmL6V2`.
 - Switch active model to `BgeBaseEnV15`.
 - Query `vec_384` for the old `model_id`: rows are still present.
 - Query `vec_768` for the new `model_id`: no rows yet (re-embed not run).
 
 **T3: Search graceful degradation before re-embed**
+
 - Same setup as T2, post-switch, before re-embed.
 - Call `search(kind="entity", query="...")`.
 - Verify call returns results (FTS5 text hits) without panic or dimension error.
 - Verify no vector-source hits are returned for the new model before re-embed.
 
 **T4: Background re-embed restores full coverage**
+
 - Index N entities. Switch active model. Run `reembed_namespace` to completion.
 - Verify `vec_{dim}` has N rows for the new `model_id`.
 - Verify `search` now returns vector-source hits for the new model.
 
 **T5: Re-embed job is idempotent**
+
 - Run `reembed_namespace` twice on the same namespace and model.
 - Verify record count does not double; verify no duplicate `subject_id + model_id` rows.
 
 **T6: Dimension mismatch is rejected at insert, not silently stored**
+
 - Attempt to insert a 384-dim vector into a store configured for 768-dim.
 - Verify the insert returns an error, not silent corruption.
 

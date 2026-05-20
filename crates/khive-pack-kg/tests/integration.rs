@@ -37,6 +37,17 @@ fn pack() -> Fixture {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt));
     Fixture {
+        registry: builder.build().expect("registry builds"),
+    }
+}
+
+fn pack_with_events() -> Fixture {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let event_store = rt.events(None).expect("event store must be available");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_event_store(event_store);
+    builder.register(KgPack::new(rt));
+    Fixture {
         registry: builder.build(),
     }
 }
@@ -835,27 +846,22 @@ async fn create_note_non_kg_kind_rejected_by_pack_validation() {
 //
 // These tests prove that the `resolve_kind_spec` routing in `handle_search` is
 // driven entirely by `VerbRegistry.all_entity_kinds()` / `all_note_kinds()`,
-// with no hard-coded kind list. A fake MemoryPack registers `"semantic"` and
-// `"episodic"` as note kinds. Once registered, `search(kind="semantic")`
-// must route to note-search (not error), and `search(kind="bogus")` must list
-// `"semantic"` among the valid options.
-//
-// This is the prerequisite contract for Lane B (memory pack): when the real
-// memory pack lands, it only needs to declare `NOTE_KINDS = &["semantic",
-// "episodic"]` in its `Pack` impl — the verb routing requires no changes here.
+// with no hard-coded kind list. A fake MemoryPack registers `"memory"` as a
+// note kind (ADR-036: one kind, advisory memory_type property). Once registered,
+// `search(kind="memory")` must route to note-search (not error), and
+// `search(kind="bogus")` must list `"memory"` among the valid options.
 
-/// A minimal second pack that declares `"semantic"` and `"episodic"` as note
-/// kinds. It does not handle any verbs itself — dispatch falls through to the
-/// KG pack that owns `search`. This mirrors the real memory pack's shape where
-/// the memory-pack registers kinds and lifecycle verbs while KG provides the
-/// generic CRUD verbs.
+/// A minimal second pack that declares `"memory"` as a note kind (ADR-036).
+/// It does not handle any verbs itself — dispatch falls through to the KG pack
+/// that owns `search`. Requires "kg" per ADR-037 so topo sort puts kg first.
 struct FakeMemoryPack;
 
 impl Pack for FakeMemoryPack {
     const NAME: &'static str = "memory";
-    const NOTE_KINDS: &'static [&'static str] = &["semantic", "episodic"];
+    const NOTE_KINDS: &'static [&'static str] = &["memory"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const VERBS: &'static [VerbDef] = &[];
+    const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
 #[async_trait]
@@ -876,13 +882,16 @@ impl PackRuntime for FakeMemoryPack {
         FakeMemoryPack::VERBS
     }
 
+    fn requires(&self) -> &'static [&'static str] {
+        FakeMemoryPack::REQUIRES
+    }
+
     async fn dispatch(
         &self,
         verb: &str,
         _params: Value,
         _registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        // FakeMemoryPack declares no verbs — callers should not dispatch to it.
         Err(RuntimeError::InvalidInput(format!(
             "FakeMemoryPack does not handle verb {verb:?}"
         )))
@@ -897,67 +906,60 @@ fn pack_with_memory() -> Fixture {
     builder.register(KgPack::new(rt));
     builder.register(FakeMemoryPack);
     Fixture {
-        registry: builder.build(),
+        registry: builder.build().expect("registry builds"),
     }
 }
 
 #[tokio::test]
-async fn registry_exposes_semantic_kind_once_memory_pack_registered() {
-    // When FakeMemoryPack is loaded, `all_note_kinds()` must include "semantic"
-    // and "episodic" — these are the kinds the real memory pack will advertise.
+async fn registry_exposes_memory_kind_once_memory_pack_registered() {
+    // When FakeMemoryPack is loaded, `all_note_kinds()` must include "memory"
+    // (ADR-036: one kind, advisory memory_type property).
     let fixture = pack_with_memory();
     let note_kinds = fixture.registry.all_note_kinds();
     assert!(
-        note_kinds.contains(&"semantic"),
-        "registry must advertise 'semantic' once memory pack is loaded; got: {note_kinds:?}"
+        note_kinds.contains(&"memory"),
+        "registry must advertise 'memory' once memory pack is loaded; got: {note_kinds:?}"
     );
     assert!(
-        note_kinds.contains(&"episodic"),
-        "registry must advertise 'episodic' once memory pack is loaded; got: {note_kinds:?}"
+        !note_kinds.contains(&"semantic") && !note_kinds.contains(&"episodic"),
+        "memory_type must not be exposed as separate note kinds; got: {note_kinds:?}"
     );
 }
 
 #[tokio::test]
-async fn search_kind_semantic_routes_to_note_substrate_via_registry() {
-    // `search(kind="semantic")` must resolve through the registry (not fail) and
-    // route to note-search with kind_filter="semantic". With no notes stored the
-    // result is an empty array, not an error.
+async fn search_kind_memory_routes_to_note_substrate_via_registry() {
     let fixture = pack_with_memory();
 
-    // First create a note with kind="semantic" so we have something to search.
-    // The kg `create` verb resolves `kind="semantic"` to the note substrate via
-    // `resolve_kind_spec` — this exercises the same registry path.
     let created = fixture
         .dispatch(
             "create",
             json!({
-                "kind": "semantic",
-                "content": "registry driven kind routing for semantic memories"
+                "kind": "memory",
+                "content": "registry driven kind routing for memory notes",
+                "properties": {"memory_type": "semantic"}
             }),
         )
         .await
-        .expect("create with kind=semantic must succeed when memory pack is loaded");
+        .expect("create with kind=memory must succeed when memory pack is loaded");
     assert_eq!(
         created.get("kind").and_then(Value::as_str),
-        Some("semantic"),
-        "note created with kind=semantic must be stored as kind=semantic; got: {created}"
+        Some("memory"),
+        "note created with kind=memory must be stored as kind=memory; got: {created}"
     );
 
-    // Now search with kind="semantic" — must route to note-search, not error.
     let result = fixture
         .dispatch(
             "search",
-            json!({"kind": "semantic", "query": "registry driven kind routing", "limit": 5}),
+            json!({"kind": "memory", "query": "registry driven kind routing", "limit": 5}),
         )
         .await
-        .expect("search(kind=\"semantic\") must succeed once memory pack registers the kind");
+        .expect("search(kind=\"memory\") must succeed once memory pack registers the kind");
 
     let hits = result.as_array().expect("search result must be array");
     assert!(
         !hits.is_empty(),
-        "search(kind=\"semantic\") must find the note we just created; got: {hits:?}"
+        "search(kind=\"memory\") must find the note we just created; got: {hits:?}"
     );
-    // Each hit must carry note_id (note-substrate response shape).
     for hit in hits {
         assert!(
             hit.get("note_id").is_some(),
@@ -1006,7 +1008,7 @@ async fn search_kind_entity_still_works_alongside_memory_pack() {
 }
 
 #[tokio::test]
-async fn search_bogus_kind_lists_semantic_and_episodic_in_error() {
+async fn search_bogus_kind_lists_memory_in_error() {
     // The error message for an unknown kind must list ALL registered kinds,
     // including those contributed by FakeMemoryPack. This proves the error
     // path walks the full merged registry, not a hard-coded list.
@@ -1023,22 +1025,684 @@ async fn search_bogus_kind_lists_semantic_and_episodic_in_error() {
     );
     let msg = invalid_input_message(&err);
     assert!(msg.contains("bogus"), "error must name the bad kind: {msg}");
-    // Substrate-level names.
     assert!(msg.contains("entity"), "error must list 'entity': {msg}");
     assert!(msg.contains("note"), "error must list 'note': {msg}");
-    // KG pack kinds.
     assert!(msg.contains("concept"), "error must list 'concept': {msg}");
     assert!(
         msg.contains("observation"),
         "error must list 'observation': {msg}"
     );
-    // FakeMemoryPack kinds — these prove the merged registry drives the error.
     assert!(
-        msg.contains("semantic"),
-        "error must list 'semantic' (contributed by memory pack): {msg}"
+        msg.contains("memory"),
+        "error must list 'memory' (contributed by memory pack): {msg}"
     );
     assert!(
-        msg.contains("episodic"),
-        "error must list 'episodic' (contributed by memory pack): {msg}"
+        !msg.contains("semantic") && !msg.contains("episodic"),
+        "memory_type values must not be listed as note kinds: {msg}"
+    );
+}
+
+// ── ADR-038: Events Surface ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_event_kind_returns_immutable_error() {
+    let pack = pack();
+    let err = pack
+        .dispatch("create", json!({"kind": "event"}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "create(kind=event) must return InvalidInput; got: {err:?}"
+    );
+    assert_eq!(
+        invalid_input_message(&err),
+        "events are immutable — create/update/delete are not permitted",
+        "immutable-event message must match exactly"
+    );
+}
+
+// ── Issue #65: link verb name resolution ─────────────────────────────────────
+//
+// When `source_id` or `target_id` is not a UUID or hex prefix, the link handler
+// must treat the value as an entity name and resolve it to a UUID.
+
+#[tokio::test]
+async fn link_by_name_exact_match_succeeds() {
+    let pack = pack();
+
+    // Create two entities with well-known names.
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "SourceEntity", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create SourceEntity must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "TargetEntity", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create TargetEntity must succeed");
+
+    // Link using names instead of UUIDs.
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "SourceEntity",
+                "target_id": "TargetEntity",
+                "relation": "extends"
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "link by entity name must succeed; got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_event_kind_returns_array() {
+    let pack = pack_with_events();
+    // Create an entity first so there are audit events to find.
+    pack.dispatch("create", json!({"kind": "concept", "name": "AuditTarget"}))
+        .await
+        .expect("create must succeed");
+
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 10}),
+        )
+        .await
+        .expect("list(kind=event) must succeed");
+
+    let arr = result.as_array().expect("list must return a JSON array");
+    assert!(
+        !arr.is_empty(),
+        "at least one create audit event must be present"
+    );
+    assert!(
+        arr.iter()
+            .all(|e| e.get("verb").and_then(Value::as_str) == Some("create")),
+        "all returned events must have verb=create when filtered"
+    );
+    assert!(
+        arr.iter()
+            .all(|e| e.get("outcome").and_then(Value::as_str) == Some("success")),
+        "all returned events must have outcome=success"
+    );
+}
+
+#[tokio::test]
+async fn get_event_uuid_returns_event_wrapper() {
+    let pack = pack_with_events();
+    pack.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "GetEventTarget"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    // List create events to get an event UUID.
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+    let events = list_result.as_array().expect("list must be array");
+    assert!(!events.is_empty(), "must have at least one create event");
+    let event_id = events[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("event must have id field")
+        .to_string();
+
+    let get_result = pack
+        .dispatch("get", json!({"id": event_id}))
+        .await
+        .expect("get(id=event_uuid) must succeed");
+
+    assert_eq!(
+        get_result.get("kind").and_then(Value::as_str),
+        Some("event"),
+        "get wrapper must have kind=event"
+    );
+    let data = get_result.get("data").expect("get must have data field");
+    assert_eq!(
+        data.get("id").and_then(Value::as_str),
+        Some(event_id.as_str()),
+        "data.id must match the requested event UUID"
+    );
+    assert_eq!(
+        data.get("verb").and_then(Value::as_str),
+        Some("create"),
+        "data.verb must be create"
+    );
+    assert_eq!(
+        data.get("outcome").and_then(Value::as_str),
+        Some("success"),
+        "data.outcome must be success"
+    );
+}
+
+#[tokio::test]
+async fn update_event_uuid_returns_immutable_error() {
+    let pack = pack_with_events();
+    pack.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "UpdateEventTarget"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+    let events = list_result.as_array().expect("list must be array");
+    let event_id = events[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("event must have id")
+        .to_string();
+
+    let err = pack
+        .dispatch(
+            "update",
+            json!({"id": event_id, "name": "should-not-apply"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "update on event UUID must return InvalidInput; got: {err:?}"
+    );
+    assert_eq!(
+        invalid_input_message(&err),
+        "events are immutable — create/update/delete are not permitted"
+    );
+}
+
+#[tokio::test]
+async fn delete_event_uuid_returns_immutable_error_and_event_persists() {
+    let pack = pack_with_events();
+    pack.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "DeleteEventTarget"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+    let events = list_result.as_array().expect("list must be array");
+    let event_id = events[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("event must have id")
+        .to_string();
+
+    let err = pack
+        .dispatch("delete", json!({"id": event_id}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "delete on event UUID must return InvalidInput; got: {err:?}"
+    );
+    assert_eq!(
+        invalid_input_message(&err),
+        "events are immutable — create/update/delete are not permitted"
+    );
+
+    // Event must still be fetchable after the failed delete.
+    let get_result = pack
+        .dispatch("get", json!({"id": event_id}))
+        .await
+        .expect("get after failed delete must succeed");
+    assert_eq!(
+        get_result.get("kind").and_then(Value::as_str),
+        Some("event"),
+        "event must still exist after failed delete"
+    );
+}
+
+#[tokio::test]
+async fn list_events_pagination_returns_distinct_pages() {
+    let pack = pack_with_events();
+    // Create three entities to generate three create audit events.
+    for name in ["Paginable-A", "Paginable-B", "Paginable-C"] {
+        pack.dispatch("create", json!({"kind": "concept", "name": name}))
+            .await
+            .expect("create must succeed");
+    }
+
+    let page1 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 2, "offset": 0}),
+        )
+        .await
+        .expect("page 1 must succeed");
+    let arr1 = page1.as_array().expect("must be array");
+    assert_eq!(arr1.len(), 2, "page 1 must contain exactly 2 events");
+
+    let page2 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 2, "offset": 2}),
+        )
+        .await
+        .expect("page 2 must succeed");
+    let arr2 = page2.as_array().expect("must be array");
+    assert!(
+        !arr2.is_empty(),
+        "page 2 must contain at least 1 event (3 creates total)"
+    );
+
+    let id1 = arr1[0].get("id").and_then(Value::as_str).unwrap();
+    let id2_first = arr2[0].get("id").and_then(Value::as_str).unwrap();
+    assert_ne!(
+        id1, id2_first,
+        "first event on page 1 and first event on page 2 must differ"
+    );
+}
+
+#[tokio::test]
+async fn list_unknown_kind_includes_event_in_valid_list() {
+    let pack = pack();
+    let err = pack
+        .dispatch("list", json!({"kind": "bogus"}))
+        .await
+        .unwrap_err();
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("event"),
+        "unknown-kind error must list 'event' as valid: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn link_by_name_case_insensitive_match_succeeds() {
+    let pack = pack();
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "CaseSource", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create CaseSource must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "CaseTarget", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create CaseTarget must succeed");
+
+    // Lowercase versions of the names should still resolve.
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "casesource",
+                "target_id": "casetarget",
+                "relation": "extends"
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "link with lowercase name must succeed (case-insensitive match); got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn link_by_name_not_found_returns_not_found_error() {
+    let pack = pack();
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "ExistingEntity", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create ExistingEntity must succeed");
+
+    let err = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "ExistingEntity",
+                "target_id": "NoSuchEntity",
+                "relation": "extends"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "link with non-existent name must return NotFound; got: {err:?}"
+    );
+    let msg = match &err {
+        RuntimeError::NotFound(m) => m.as_str(),
+        _ => unreachable!(),
+    };
+    assert!(
+        msg.contains("NoSuchEntity"),
+        "error must name the missing entity: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn link_by_name_ambiguous_returns_ambiguous_error() {
+    let pack = pack();
+
+    // Create two entities with the same name in the same namespace.
+    // The underlying store allows duplicate names (no unique constraint).
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "DuplicateName", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create first DuplicateName must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "DuplicateName", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create second DuplicateName must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "UniqueTarget", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create UniqueTarget must succeed");
+
+    let err = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "DuplicateName",
+                "target_id": "UniqueTarget",
+                "relation": "extends"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, RuntimeError::Ambiguous(_)),
+        "link with ambiguous name must return Ambiguous; got: {err:?}"
+    );
+    let msg = match &err {
+        RuntimeError::Ambiguous(m) => m.as_str(),
+        _ => unreachable!(),
+    };
+    assert!(
+        msg.contains("DuplicateName"),
+        "error must name the ambiguous entity: {msg}"
+    );
+    assert!(
+        msg.contains("found 2"),
+        "error must report the count of matches: {msg}"
+    );
+}
+
+// ── Issue #66: MCP display formatting ────────────────────────────────────────
+//
+// By default, link output uses 8-char short IDs and YYYY/MM/DD dates.
+// With verbose=true, full UUIDs and ISO 8601 timestamps are shown.
+
+#[tokio::test]
+async fn link_default_output_uses_short_ids() {
+    let pack = pack();
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "ShortSrc", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create ShortSrc must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "ShortTgt", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create ShortTgt must succeed");
+
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "ShortSrc",
+                "target_id": "ShortTgt",
+                "relation": "extends"
+            }),
+        )
+        .await
+        .expect("link must succeed");
+
+    // By default (no verbose param), IDs should be 8 characters.
+    let id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id must be present");
+    assert_eq!(
+        id.len(),
+        8,
+        "default output must use 8-char short ID; got: {id:?}"
+    );
+
+    let src_id = result
+        .get("source_id")
+        .and_then(|v| v.as_str())
+        .expect("source_id must be present");
+    assert_eq!(
+        src_id.len(),
+        8,
+        "default output must use 8-char short source_id; got: {src_id:?}"
+    );
+
+    let tgt_id = result
+        .get("target_id")
+        .and_then(|v| v.as_str())
+        .expect("target_id must be present");
+    assert_eq!(
+        tgt_id.len(),
+        8,
+        "default output must use 8-char short target_id; got: {tgt_id:?}"
+    );
+}
+
+#[tokio::test]
+async fn link_default_output_formats_date_as_yyyy_mm_dd() {
+    let pack = pack();
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "DateSrc", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create DateSrc must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "DateTgt", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create DateTgt must succeed");
+
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "DateSrc",
+                "target_id": "DateTgt",
+                "relation": "extends"
+            }),
+        )
+        .await
+        .expect("link must succeed");
+
+    let created_at = result
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .expect("created_at must be a string");
+
+    // YYYY/MM/DD format: exactly 10 chars, two slashes at positions 4 and 7.
+    assert_eq!(
+        created_at.len(),
+        10,
+        "default created_at must be 10 chars (YYYY/MM/DD); got: {created_at:?}"
+    );
+    assert_eq!(
+        &created_at[4..5],
+        "/",
+        "first separator must be '/' at index 4; got: {created_at:?}"
+    );
+    assert_eq!(
+        &created_at[7..8],
+        "/",
+        "second separator must be '/' at index 7; got: {created_at:?}"
+    );
+}
+
+#[tokio::test]
+async fn search_event_kind_returns_invalid_input() {
+    let pack = pack();
+    let err = pack
+        .dispatch("search", json!({"kind": "event", "query": "anything"}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "search(kind=event) must return InvalidInput; got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn link_verbose_output_uses_full_uuids() {
+    let pack = pack();
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "VerboseSrc", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create VerboseSrc must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "VerboseTgt", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create VerboseTgt must succeed");
+
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "VerboseSrc",
+                "target_id": "VerboseTgt",
+                "relation": "extends",
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("link with verbose=true must succeed");
+
+    // With verbose=true, IDs should be full UUIDs (36 chars: 32 hex + 4 dashes).
+    let id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id must be present");
+    assert_eq!(
+        id.len(),
+        36,
+        "verbose output must use full UUID (36 chars); got: {id:?}"
+    );
+
+    let src_id = result
+        .get("source_id")
+        .and_then(|v| v.as_str())
+        .expect("source_id must be present");
+    assert_eq!(
+        src_id.len(),
+        36,
+        "verbose source_id must be full UUID; got: {src_id:?}"
+    );
+
+    let tgt_id = result
+        .get("target_id")
+        .and_then(|v| v.as_str())
+        .expect("target_id must be present");
+    assert_eq!(
+        tgt_id.len(),
+        36,
+        "verbose target_id must be full UUID; got: {tgt_id:?}"
+    );
+}
+
+#[tokio::test]
+async fn link_verbose_output_uses_iso_datetime() {
+    let pack = pack();
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "IsoSrc", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create IsoSrc must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "IsoTgt", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create IsoTgt must succeed");
+
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "IsoSrc",
+                "target_id": "IsoTgt",
+                "relation": "extends",
+                "verbose": true
+            }),
+        )
+        .await
+        .expect("link with verbose=true must succeed");
+
+    // With verbose=true, created_at is an ISO 8601 datetime (longer than 10 chars
+    // and contains 'T' as date/time separator).
+    let created_at = result
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .expect("created_at must be a string in verbose mode");
+    assert!(
+        created_at.contains('T'),
+        "verbose created_at must be ISO 8601 (contains 'T'); got: {created_at:?}"
+    );
+    assert!(
+        created_at.len() > 10,
+        "verbose created_at must be longer than YYYY/MM/DD; got: {created_at:?}"
     );
 }

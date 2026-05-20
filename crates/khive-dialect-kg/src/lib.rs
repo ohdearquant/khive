@@ -16,6 +16,7 @@
 
 pub use khive_pack_gtd::GtdPack;
 pub use khive_pack_kg::KgPack;
+pub use khive_pack_memory::MemoryPack;
 
 use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
 
@@ -23,7 +24,7 @@ use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
 ///
 /// Used by `khive-mcp` to build its `BUILTIN_PACKS` constant and error
 /// messages without importing either pack crate directly.
-pub const BUILTIN_PACK_NAMES: &[&str] = &["kg", "gtd"];
+pub const BUILTIN_PACK_NAMES: &[&str] = &["kg", "gtd", "memory"];
 
 /// Register a named pack from this dialect into `builder`.
 ///
@@ -42,6 +43,10 @@ pub fn register_pack(
         }
         "gtd" => {
             builder.register(GtdPack::new(runtime));
+            Ok(())
+        }
+        "memory" => {
+            builder.register(MemoryPack::new(runtime));
             Ok(())
         }
         other => Err(other.to_string()),
@@ -67,6 +72,7 @@ mod tests {
     fn builtin_pack_names_includes_kg_and_gtd() {
         assert!(BUILTIN_PACK_NAMES.contains(&"kg"));
         assert!(BUILTIN_PACK_NAMES.contains(&"gtd"));
+        assert!(BUILTIN_PACK_NAMES.contains(&"memory"));
     }
 
     #[test]
@@ -74,7 +80,7 @@ mod tests {
         let rt = make_runtime();
         let mut builder = VerbRegistryBuilder::new();
         register_pack("kg", rt, &mut builder).expect("kg registration must succeed");
-        let registry = builder.build();
+        let registry = builder.build().expect("registry builds");
         let verb_names: Vec<&str> = registry.all_verbs().iter().map(|v| v.name).collect();
         // KG pack registers 11 verbs; spot-check a few.
         assert!(verb_names.contains(&"create"));
@@ -87,7 +93,7 @@ mod tests {
         let rt = make_runtime();
         let mut builder = VerbRegistryBuilder::new();
         register_pack("gtd", rt, &mut builder).expect("gtd registration must succeed");
-        let registry = builder.build();
+        let registry = builder.build().expect("registry builds");
         let verb_names: Vec<&str> = registry.all_verbs().iter().map(|v| v.name).collect();
         assert!(verb_names.contains(&"assign"));
         assert!(verb_names.contains(&"next"));
@@ -98,23 +104,28 @@ mod tests {
     fn register_unknown_pack_returns_err() {
         let rt = make_runtime();
         let mut builder = VerbRegistryBuilder::new();
-        let err =
-            register_pack("memory", rt, &mut builder).expect_err("unknown pack must return Err");
-        assert_eq!(err, "memory");
+        let err = register_pack("nosuchpack", rt, &mut builder)
+            .expect_err("unknown pack must return Err");
+        assert_eq!(err, "nosuchpack");
     }
 
     #[test]
     fn both_packs_register_together() {
         let rt1 = make_runtime();
         let rt2 = make_runtime();
+        let rt3 = make_runtime();
         let mut builder = VerbRegistryBuilder::new();
         register_pack("kg", rt1, &mut builder).unwrap();
         register_pack("gtd", rt2, &mut builder).unwrap();
-        let registry = builder.build();
+        register_pack("memory", rt3, &mut builder).unwrap();
+        let registry = builder.build().expect("registry builds");
         let verb_names: Vec<&str> = registry.all_verbs().iter().map(|v| v.name).collect();
         // KG verbs present
         assert!(verb_names.contains(&"link"));
         // GTD verbs present
         assert!(verb_names.contains(&"transition"));
+        // Memory verbs present
+        assert!(verb_names.contains(&"remember"));
+        assert!(verb_names.contains(&"recall"));
     }
 }

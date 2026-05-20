@@ -1,6 +1,6 @@
 # ADR-036: Memory Pack Semantics
 
-**Status**: proposed\
+**Status**: accepted\
 **Date**: 2026-05-19\
 **Authors**: khive maintainers
 
@@ -63,14 +63,14 @@ The memory pack registers a **single** note kind: `memory`. Both episodic and se
 are stored under this kind. The episodic/semantic distinction is carried as a `memory_type`
 attribute on the note, not as a separate kind value:
 
-| Attribute     | Values                          | Default       | Storage              |
-| ------------- | ------------------------------- | ------------- | -------------------- |
-| `memory_type` | `"episodic"` \| `"semantic"`    | `"episodic"`  | `note.properties`    |
+| Attribute     | Values                       | Default      | Storage           |
+| ------------- | ---------------------------- | ------------ | ----------------- |
+| `memory_type` | `"episodic"` \| `"semantic"` | `"episodic"` | `note.properties` |
 
-| memory_type | Shape                                     | Examples                                                               |
-| ----------- | ----------------------------------------- | ---------------------------------------------------------------------- |
-| `episodic`  | Time-anchored, event-shaped               | "On 2026-05-19 Ocean said prefer `uv run` over `python`"               |
-| `semantic`  | Abstracted, fact-shaped                   | "Ocean prefers `uv run` over `python`"                                 |
+| memory_type | Shape                       | Examples                                                 |
+| ----------- | --------------------------- | -------------------------------------------------------- |
+| `episodic`  | Time-anchored, event-shaped | "On 2026-05-19 Ocean said prefer `uv run` over `python`" |
+| `semantic`  | Abstracted, fact-shaped     | "Ocean prefers `uv run` over `python`"                   |
 
 The distinction is **advisory, not enforced**: nothing structurally validates that `episodic`
 memories carry timestamps. Agents choose `memory_type` based on whether the content is primarily
@@ -226,7 +226,7 @@ decay-weighted fusion. Neither is merely cosmetic.
 
 A meta note on agent ergonomics: the MCP surface exposes a single `request` tool (ADR-027);
 agents do not call `remember` or `recall` as MCP tools, they call `request(ops="remember(...)")`.
-Verb names are part of the *pack contract* and are documented through skills/plugins, not
+Verb names are part of the _pack contract_ and are documented through skills/plugins, not
 through separate MCP tool registrations. The naming choice here is about contract clarity, not
 MCP-level discoverability.
 
@@ -296,14 +296,14 @@ same `annotates` edge with no special-casing.
 
 ## Alternatives Considered
 
-| Alternative                                                                  | Pros                                                          | Cons                                                                                                                              | Why rejected                                                                                              |
-| ---------------------------------------------------------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| Remove `remember`/`recall`; pack provides kind only, not verbs               | Keeps ADR-023 text unchanged; simpler pack                    | Loses domain-specific preconditions; contradicts GTD precedent; leaves PR #58 semantically hollow                                 | ADR-026 establishes pack-owned verbs as the right pattern; amendment is cheaper                           |
-| Two memory kinds (`episodic`/`semantic`) instead of one + `memory_type`      | Sharper kind discriminator at the substrate                   | Forces two-search merge in `recall`; complicates per-`memory_type` retrieval policy; diverges from the reference implementation  | One kind + attribute is the canonical pattern and removes a class of recall-filter bugs                   |
-| Defer decay to v0.2                                                          | Smaller v0.1 surface                                          | Decay column already exists; canonical pipeline has decay baked in; agents reading "memory" without decay get stale results       | Decay is structural for a memory model, not an optimisation; wire it now                                  |
-| Introduce a separate `importance` column instead of aliasing `salience`      | Domain-specific column name in storage                        | Duplicates the rerank signal; forces every reader/writer to know which column to consult                                          | The user-facing name lives on the verb argument, not the column                                           |
-| Store `source` as a free string in `note.properties`                         | Simpler handler; no edge creation step                        | Couples memory to a future actor-identity string format; not traversable via `neighbors` / `traverse`                              | Edges are the right substrate for "this came from X" relationships                                        |
-| Enforce `episodic`/`semantic` distinction via structural validation          | `memory_type` carries stronger invariant                      | Arbitrary; agents disagree on what "time-anchored" means; validation complexity outweighs gain                                    | Advisory distinction is sufficient; per-`memory_type` retrieval can still branch on the attribute        |
+| Alternative                                                             | Pros                                        | Cons                                                                                                                            | Why rejected                                                                                      |
+| ----------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Remove `remember`/`recall`; pack provides kind only, not verbs          | Keeps ADR-023 text unchanged; simpler pack  | Loses domain-specific preconditions; contradicts GTD precedent; leaves PR #58 semantically hollow                               | ADR-026 establishes pack-owned verbs as the right pattern; amendment is cheaper                   |
+| Two memory kinds (`episodic`/`semantic`) instead of one + `memory_type` | Sharper kind discriminator at the substrate | Forces two-search merge in `recall`; complicates per-`memory_type` retrieval policy; diverges from the reference implementation | One kind + attribute is the canonical pattern and removes a class of recall-filter bugs           |
+| Defer decay to v0.2                                                     | Smaller v0.1 surface                        | Decay column already exists; canonical pipeline has decay baked in; agents reading "memory" without decay get stale results     | Decay is structural for a memory model, not an optimisation; wire it now                          |
+| Introduce a separate `importance` column instead of aliasing `salience` | Domain-specific column name in storage      | Duplicates the rerank signal; forces every reader/writer to know which column to consult                                        | The user-facing name lives on the verb argument, not the column                                   |
+| Store `source` as a free string in `note.properties`                    | Simpler handler; no edge creation step      | Couples memory to a future actor-identity string format; not traversable via `neighbors` / `traverse`                           | Edges are the right substrate for "this came from X" relationships                                |
+| Enforce `episodic`/`semantic` distinction via structural validation     | `memory_type` carries stronger invariant    | Arbitrary; agents disagree on what "time-anchored" means; validation complexity outweighs gain                                  | Advisory distinction is sufficient; per-`memory_type` retrieval can still branch on the attribute |
 
 ## Consequences
 

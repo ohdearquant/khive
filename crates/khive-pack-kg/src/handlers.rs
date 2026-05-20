@@ -4,6 +4,7 @@
 
 use std::str::FromStr;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -12,7 +13,7 @@ use khive_runtime::{
     EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
-use khive_storage::EdgeRelation;
+use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
 
 use crate::vocab::{EntityKind, NoteKind};
 use crate::KgPack;
@@ -78,6 +79,8 @@ pub(crate) enum KindSpec {
     Note { specific: Option<String> },
     /// `kind="edge"` — only valid for `list`.
     Edge,
+    /// `kind="event"` — only valid for `list`; `get` resolves events by UUID.
+    Event,
 }
 
 impl KindSpec {
@@ -86,6 +89,7 @@ impl KindSpec {
             KindSpec::Entity { .. } => "entity",
             KindSpec::Note { .. } => "note",
             KindSpec::Edge => "edge",
+            KindSpec::Event => "event",
         }
     }
 }
@@ -108,6 +112,7 @@ pub(crate) fn resolve_kind_spec(
         "entity" => return Ok(KindSpec::Entity { specific: None }),
         "note" => return Ok(KindSpec::Note { specific: None }),
         "edge" => return Ok(KindSpec::Edge),
+        "event" => return Ok(KindSpec::Event),
         _ => {}
     }
 
@@ -135,7 +140,12 @@ pub(crate) fn resolve_kind_spec(
         });
     }
 
-    let mut all: Vec<String> = vec!["entity".into(), "note".into(), "edge".into()];
+    let mut all: Vec<String> = vec![
+        "entity".into(),
+        "note".into(),
+        "edge".into(),
+        "event".into(),
+    ];
     all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
     all.extend(registry.all_note_kinds().iter().map(|s| (*s).to_string()));
     all.sort();
@@ -193,6 +203,7 @@ struct ListParams {
     kind: String,
     namespace: Option<String>,
     limit: Option<u32>,
+    offset: Option<u32>,
     entity_kind: Option<String>,
     source_id: Option<String>,
     target_id: Option<String>,
@@ -200,6 +211,14 @@ struct ListParams {
     min_weight: Option<f64>,
     max_weight: Option<f64>,
     note_kind: Option<String>,
+    // event-specific filters
+    verb: Option<String>,
+    verbs: Option<Vec<String>>,
+    outcome: Option<String>,
+    actor: Option<String>,
+    substrate: Option<String>,
+    since: Option<i64>,
+    until: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -246,6 +265,9 @@ struct LinkParams {
     target_id: String,
     relation: String,
     weight: Option<f64>,
+    /// When `true`, output uses full UUIDs and ISO 8601 timestamps instead of
+    /// the default 8-char short IDs and YYYY/MM/DD date format.
+    verbose: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -275,6 +297,71 @@ struct QueryParams {
 
 // ---- Helpers ----
 
+/// Resolve an entity name to its UUID.
+///
+/// Strategy (for issue #65):
+/// 1. Exact case-insensitive name match — returns the entity's UUID.
+/// 2. If 0 matches: `NotFound("entity not found: '{name}'")`
+/// 3. If multiple matches: `Ambiguous("ambiguous name '{name}': found N entities [id1, id2, ...]")`
+///
+/// Only searches `entity` substrate (notes and edges don't have meaningful
+/// user-facing names in the same sense).
+async fn resolve_name_async(
+    name: &str,
+    runtime: &KhiveRuntime,
+    namespace: Option<&str>,
+) -> Result<Uuid, RuntimeError> {
+    // Use EntityFilter.name_prefix with the full name to do an exact match.
+    // The DB implements `name LIKE '?%'` so we get back all names that start
+    // with `name`. We then filter to exact (case-insensitive) matches.
+    let filter = EntityFilter {
+        name_prefix: Some(name.to_string()),
+        ..Default::default()
+    };
+    let page = runtime
+        .entities(namespace)?
+        .query_entities(
+            runtime.ns(namespace),
+            filter,
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let name_lower = name.to_ascii_lowercase();
+    let exact: Vec<_> = page
+        .items
+        .into_iter()
+        .filter(|e| e.name.to_ascii_lowercase() == name_lower && e.deleted_at.is_none())
+        .collect();
+
+    match exact.len() {
+        0 => Err(RuntimeError::NotFound(format!(
+            "entity not found: {name:?}"
+        ))),
+        1 => Ok(exact[0].id),
+        n => {
+            let ids: Vec<String> = exact
+                .iter()
+                .map(|e| e.id.to_string()[..8].to_string())
+                .collect();
+            Err(RuntimeError::Ambiguous(format!(
+                "ambiguous name {name:?}: found {n} entities [{}]",
+                ids.join(", ")
+            )))
+        }
+    }
+}
+
+/// Resolve a string to a UUID for use as an edge endpoint (source or target).
+///
+/// Resolution order (issue #65):
+/// 1. Full UUID string — parse directly.
+/// 2. 8+ hex-character prefix — delegate to `runtime.resolve_prefix`.
+/// 3. Everything else — treat as an entity name and call `resolve_name_async`.
 async fn resolve_uuid_async(
     s: &str,
     runtime: &KhiveRuntime,
@@ -294,9 +381,55 @@ async fn resolve_uuid_async(
             Err(e) => return Err(e),
         }
     }
-    Err(RuntimeError::InvalidInput(format!(
-        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
-    )))
+    // Fall back to name-based resolution (issue #65).
+    resolve_name_async(s, runtime, namespace).await
+}
+
+// ---- Output formatting helpers (issue #66) ----
+
+/// Truncate a UUID string to 8 characters for compact display.
+fn short_id(full_uuid: &str) -> &str {
+    if full_uuid.len() >= 8 {
+        &full_uuid[..8]
+    } else {
+        full_uuid
+    }
+}
+
+/// Format a `DateTime<Utc>` as YYYY/MM/DD for compact display.
+fn format_datetime(dt: &DateTime<Utc>) -> String {
+    dt.format("%Y/%m/%d").to_string()
+}
+
+/// Post-process a serialized edge JSON to use compact IDs and dates by default.
+///
+/// When `verbose = false` (default):
+/// - UUID fields (`id`, `source_id`, `target_id`) → 8-char short IDs.
+/// - `created_at` (ISO 8601 string from `DateTime<Utc>`) → YYYY/MM/DD.
+///
+/// When `verbose = true`: returns the value unchanged.
+fn format_edge_output(mut v: Value, verbose: bool) -> Value {
+    if verbose {
+        return v;
+    }
+    if let Some(obj) = v.as_object_mut() {
+        for key in &["id", "source_id", "target_id"] {
+            if let Some(val) = obj.get_mut(*key) {
+                if let Some(s) = val.as_str() {
+                    *val = json!(short_id(s));
+                }
+            }
+        }
+        if let Some(created_at) = obj.get_mut("created_at") {
+            if let Some(s) = created_at.as_str() {
+                // Edge.created_at serializes as ISO 8601 via serde.
+                if let Ok(dt) = s.parse::<DateTime<Utc>>() {
+                    *created_at = json!(format_datetime(&dt));
+                }
+            }
+        }
+    }
+    v
 }
 
 fn parse_direction(s: Option<&str>) -> Direction {
@@ -315,6 +448,65 @@ fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
              competes_with | composed_with | annotates"
         ))
     })
+}
+
+const IMMUTABLE_EVENT_MSG: &str = "events are immutable — create/update/delete are not permitted";
+
+fn immutable_event_error() -> RuntimeError {
+    RuntimeError::InvalidInput(IMMUTABLE_EVENT_MSG.into())
+}
+
+fn parse_event_outcome(raw: &str) -> Result<EventOutcome, RuntimeError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "success" => Ok(EventOutcome::Success),
+        "denied" => Ok(EventOutcome::Denied),
+        "error" => Ok(EventOutcome::Error),
+        _ => Err(RuntimeError::InvalidInput(format!(
+            "unknown outcome {raw:?}; valid: success | denied | error"
+        ))),
+    }
+}
+
+fn parse_event_substrate(raw: &str) -> Result<SubstrateKind, RuntimeError> {
+    raw.trim()
+        .to_ascii_lowercase()
+        .parse::<SubstrateKind>()
+        .map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "unknown substrate {raw:?}; valid: note | entity | event"
+            ))
+        })
+}
+
+fn event_filter_from_params(
+    p: &ListParams,
+) -> Result<(EventFilter, Option<EventOutcome>), RuntimeError> {
+    let mut verbs = Vec::new();
+    if let Some(verb) = &p.verb {
+        verbs.push(verb.clone());
+    }
+    if let Some(more) = &p.verbs {
+        verbs.extend(more.clone());
+    }
+
+    let substrates = match p.substrate.as_deref() {
+        Some(raw) => vec![parse_event_substrate(raw)?],
+        None => Vec::new(),
+    };
+
+    let outcome = p.outcome.as_deref().map(parse_event_outcome).transpose()?;
+
+    Ok((
+        EventFilter {
+            verbs,
+            substrates,
+            actors: p.actor.clone().into_iter().collect(),
+            after: p.since,
+            before: p.until,
+            ..EventFilter::default()
+        },
+        outcome,
+    ))
 }
 
 fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError> {
@@ -384,6 +576,9 @@ impl KgPack {
                 let hook = registry.find_kind_hook(&canonical);
                 (Some(canonical), hook)
             }
+            KindSpec::Event => {
+                return Err(immutable_event_error());
+            }
             KindSpec::Edge => {
                 return Err(RuntimeError::InvalidInput(
                     "kind=edge is not creatable via `create` — use `link` for edges".into(),
@@ -405,7 +600,7 @@ impl KgPack {
                     KindSpec::Note { .. } => {
                         obj.insert("note_kind".into(), json!(canonical));
                     }
-                    KindSpec::Edge => {}
+                    KindSpec::Edge | KindSpec::Event => {}
                 }
             }
         }
@@ -511,6 +706,18 @@ impl KgPack {
             return to_json(&serde_json::json!({"kind": "edge", "data": edge}));
         }
 
+        if let Some(event) = self
+            .runtime
+            .events(ns)?
+            .get_event(id)
+            .await
+            .map_err(RuntimeError::Storage)?
+        {
+            if event.namespace == self.runtime.ns(ns) {
+                return to_json(&serde_json::json!({"kind": "event", "data": event}));
+            }
+        }
+
         Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
     }
 
@@ -583,6 +790,66 @@ impl KgPack {
                     .await?;
                 to_json(&notes)
             }
+            KindSpec::Event => {
+                let limit = p.limit.unwrap_or(100).clamp(1, 1000);
+                let offset = p.offset.unwrap_or(0);
+                let (filter, outcome) = event_filter_from_params(&p)?;
+
+                if let Some(wanted_outcome) = outcome {
+                    let mut items = Vec::new();
+                    let mut skipped = 0u32;
+                    let mut raw_offset = 0u32;
+                    let scan_ceiling = offset.saturating_add(limit).saturating_mul(20);
+
+                    while (items.len() as u32) < limit {
+                        let remaining = scan_ceiling.saturating_sub(raw_offset);
+                        if remaining == 0 {
+                            break;
+                        }
+                        let batch_size = 100u32.min(remaining);
+                        let page = self
+                            .runtime
+                            .list_events(
+                                p.namespace.as_deref(),
+                                filter.clone(),
+                                batch_size,
+                                raw_offset,
+                            )
+                            .await?;
+                        let batch_len = page.items.len() as u32;
+                        if batch_len == 0 {
+                            break;
+                        }
+                        raw_offset = raw_offset.saturating_add(batch_len);
+                        let eof = batch_len < batch_size;
+
+                        for event in page.items {
+                            if event.outcome != wanted_outcome {
+                                continue;
+                            }
+                            if skipped < offset {
+                                skipped += 1;
+                                continue;
+                            }
+                            items.push(event);
+                            if (items.len() as u32) >= limit {
+                                break;
+                            }
+                        }
+
+                        if eof {
+                            break;
+                        }
+                    }
+                    to_json(&items)
+                } else {
+                    let page = self
+                        .runtime
+                        .list_events(p.namespace.as_deref(), filter, limit, offset)
+                        .await?;
+                    to_json(&page.items)
+                }
+            }
         }
     }
 
@@ -590,6 +857,17 @@ impl KgPack {
         let p: UpdateParams = deser(params)?;
         let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
         let ns = p.namespace.as_deref();
+
+        if self
+            .runtime
+            .events(ns)?
+            .get_event(id)
+            .await
+            .map_err(RuntimeError::Storage)?
+            .is_some()
+        {
+            return Err(immutable_event_error());
+        }
 
         if self.runtime.get_entity(ns, id).await?.is_some() {
             let description = match p.description {
@@ -625,6 +903,17 @@ impl KgPack {
         let p: DeleteParams = deser(params)?;
         let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
         let ns = p.namespace.as_deref();
+
+        if self
+            .runtime
+            .events(ns)?
+            .get_event(id)
+            .await
+            .map_err(RuntimeError::Storage)?
+            .is_some()
+        {
+            return Err(immutable_event_error());
+        }
 
         if self.runtime.get_entity(ns, id).await?.is_some() {
             let deleted = self
@@ -751,11 +1040,15 @@ impl KgPack {
             KindSpec::Edge => Err(RuntimeError::InvalidInput(
                 "search does not support kind=edge — use `list(kind=\"edge\", ...)` for edge browsing".into(),
             )),
+            KindSpec::Event => Err(RuntimeError::InvalidInput(
+                "search does not support kind=event — use `list(kind=\"event\", ...)` for event browsing".into(),
+            )),
         }
     }
 
     pub(crate) async fn handle_link(&self, params: Value) -> Result<Value, RuntimeError> {
         let p: LinkParams = deser(params)?;
+        let verbose = p.verbose.unwrap_or(false);
         let source =
             resolve_uuid_async(&p.source_id, &self.runtime, p.namespace.as_deref()).await?;
         let target =
@@ -766,7 +1059,8 @@ impl KgPack {
             .runtime
             .link(p.namespace.as_deref(), source, target, relation, weight)
             .await?;
-        to_json(&edge)
+        let raw = to_json(&edge)?;
+        Ok(format_edge_output(raw, verbose))
     }
 
     pub(crate) async fn handle_neighbors(&self, params: Value) -> Result<Value, RuntimeError> {

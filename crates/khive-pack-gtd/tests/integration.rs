@@ -40,7 +40,7 @@ impl Fixture {
 fn pack(rt: KhiveRuntime) -> Fixture {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(GtdPack::new(rt.clone()));
-    let registry = builder.build();
+    let registry = builder.build().expect("registry builds");
     // Mirror what the MCP transport does at startup (ADR-031): install
     // pack-declared edge endpoint rules so validation can consult them.
     rt.install_edge_rules(registry.all_edge_rules());

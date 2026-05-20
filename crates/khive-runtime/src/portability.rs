@@ -74,6 +74,12 @@ pub struct ExportedEdge {
 pub struct ImportSummary {
     pub entities_imported: usize,
     pub edges_imported: usize,
+    /// Number of edges that were skipped because one or both endpoint UUIDs
+    /// were not found in the target namespace after entity import.
+    ///
+    /// A non-zero value indicates the archive contained dangling edges (edges
+    /// referencing entities not present in the archive or the existing graph).
+    pub edges_skipped: usize,
 }
 
 // ── KhiveRuntime impl ─────────────────────────────────────────────────────────
@@ -226,10 +232,39 @@ impl KhiveRuntime {
             entities_imported += 1;
         }
 
-        // Import edges.
+        // Import edges — validate both endpoints before inserting.
+        //
+        // An untrusted archive may contain edges whose source or target UUIDs
+        // do not correspond to any entity in the target namespace. Inserting
+        // such edges would leave dangling references in the graph store. We
+        // therefore check each endpoint with `get_entity` (namespace-scoped,
+        // fail-closed) and skip any edge whose source or target is absent.
         let graph = self.graph(Some(&ns))?;
         let mut edges_imported = 0usize;
+        let mut edges_skipped = 0usize;
         for ee in &archive.edges {
+            let source_ok = self.get_entity(Some(&ns), ee.source).await?.is_some();
+            if !source_ok {
+                tracing::warn!(
+                    source = %ee.source,
+                    target = %ee.target,
+                    relation = ?ee.relation,
+                    "import_kg: skipping edge — source entity not found in namespace {ns:?}"
+                );
+                edges_skipped += 1;
+                continue;
+            }
+            let target_ok = self.get_entity(Some(&ns), ee.target).await?.is_some();
+            if !target_ok {
+                tracing::warn!(
+                    source = %ee.source,
+                    target = %ee.target,
+                    relation = ?ee.relation,
+                    "import_kg: skipping edge — target entity not found in namespace {ns:?}"
+                );
+                edges_skipped += 1;
+                continue;
+            }
             let edge = khive_storage::types::Edge {
                 id: LinkId::from(Uuid::new_v4()),
                 source_id: ee.source,
@@ -246,6 +281,7 @@ impl KhiveRuntime {
         Ok(ImportSummary {
             entities_imported,
             edges_imported,
+            edges_skipped,
         })
     }
 
@@ -423,6 +459,234 @@ mod tests {
         assert!(
             result.is_err(),
             "non-canonical relation should fail to deserialize"
+        );
+    }
+
+    // ── Dangling-edge validation tests (issue #28) ────────────────────────────
+
+    /// 6. Edge with dangling source (source UUID not in entity table) is skipped.
+    ///
+    /// The archive has one entity + one edge whose source is a phantom UUID.
+    /// Import succeeds, entities_imported=1, edges_imported=0, edges_skipped=1.
+    #[tokio::test]
+    async fn import_edge_with_dangling_source_is_skipped() {
+        let phantom_source = Uuid::parse_str("deadbeef-dead-4ead-dead-deadbeefcafe").unwrap();
+
+        let rt = make_rt().await;
+        // Create an entity that will be the real target.
+        let real = rt
+            .create_entity(None, "concept", "Real", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Build archive manually: one real entity, one edge with phantom source.
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![ExportedEntity {
+                id: real.id,
+                kind: "concept".to_string(),
+                name: "Real".to_string(),
+                description: None,
+                properties: None,
+                tags: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            edges: vec![ExportedEdge {
+                source: phantom_source,
+                target: real.id,
+                relation: EdgeRelation::Extends,
+                weight: 1.0,
+            }],
+        };
+
+        let dst = make_rt().await;
+        let summary = dst.import_kg(&archive, None).await.unwrap();
+        assert_eq!(summary.entities_imported, 1);
+        assert_eq!(
+            summary.edges_imported, 0,
+            "dangling source must not be imported"
+        );
+        assert_eq!(
+            summary.edges_skipped, 1,
+            "dangling source must be counted as skipped"
+        );
+    }
+
+    /// 7. Edge with dangling target (target UUID not in entity table) is skipped.
+    ///
+    /// The archive has one entity + one edge whose target is a phantom UUID.
+    /// Import succeeds, entities_imported=1, edges_imported=0, edges_skipped=1.
+    #[tokio::test]
+    async fn import_edge_with_dangling_target_is_skipped() {
+        let phantom_target = Uuid::parse_str("cafebabe-cafe-4abe-cafe-cafebabecafe").unwrap();
+
+        let rt = make_rt().await;
+        let real = rt
+            .create_entity(None, "concept", "Source", None, None, vec![])
+            .await
+            .unwrap();
+
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![ExportedEntity {
+                id: real.id,
+                kind: "concept".to_string(),
+                name: "Source".to_string(),
+                description: None,
+                properties: None,
+                tags: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            edges: vec![ExportedEdge {
+                source: real.id,
+                target: phantom_target,
+                relation: EdgeRelation::DependsOn,
+                weight: 0.8,
+            }],
+        };
+
+        let dst = make_rt().await;
+        let summary = dst.import_kg(&archive, None).await.unwrap();
+        assert_eq!(summary.entities_imported, 1);
+        assert_eq!(
+            summary.edges_imported, 0,
+            "dangling target must not be imported"
+        );
+        assert_eq!(
+            summary.edges_skipped, 1,
+            "dangling target must be counted as skipped"
+        );
+    }
+
+    /// 8. Mixed batch: some valid edges and some dangling edges — correct counts reported.
+    ///
+    /// Archive has 3 entities, 2 valid edges, and 1 dangling edge (phantom target).
+    /// Import succeeds with edges_imported=2, edges_skipped=1.
+    #[tokio::test]
+    async fn import_mixed_edges_reports_correct_counts() {
+        let phantom = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+
+        let src = make_rt().await;
+        let a = src
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = src
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        let c = src
+            .create_entity(None, "concept", "C", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Build archive with 3 entities and 3 edges: 2 valid, 1 dangling.
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![
+                ExportedEntity {
+                    id: a.id,
+                    kind: "concept".to_string(),
+                    name: "A".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                ExportedEntity {
+                    id: b.id,
+                    kind: "concept".to_string(),
+                    name: "B".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                ExportedEntity {
+                    id: c.id,
+                    kind: "concept".to_string(),
+                    name: "C".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            ],
+            edges: vec![
+                // Valid: A → B
+                ExportedEdge {
+                    source: a.id,
+                    target: b.id,
+                    relation: EdgeRelation::Extends,
+                    weight: 1.0,
+                },
+                // Valid: B → C
+                ExportedEdge {
+                    source: b.id,
+                    target: c.id,
+                    relation: EdgeRelation::DependsOn,
+                    weight: 0.9,
+                },
+                // Dangling: A → phantom
+                ExportedEdge {
+                    source: a.id,
+                    target: phantom,
+                    relation: EdgeRelation::Enables,
+                    weight: 0.5,
+                },
+            ],
+        };
+
+        let dst = make_rt().await;
+        let summary = dst.import_kg(&archive, None).await.unwrap();
+        assert_eq!(summary.entities_imported, 3);
+        assert_eq!(
+            summary.edges_imported, 2,
+            "only valid edges must be imported"
+        );
+        assert_eq!(
+            summary.edges_skipped, 1,
+            "one dangling edge must be reported"
+        );
+    }
+
+    /// 9. All-valid edges produce edges_skipped=0 (no regression on the happy path).
+    #[tokio::test]
+    async fn import_all_valid_edges_reports_zero_skipped() {
+        let src = make_rt().await;
+        let e1 = src
+            .create_entity(None, "concept", "E1", None, None, vec![])
+            .await
+            .unwrap();
+        let e2 = src
+            .create_entity(None, "concept", "E2", None, None, vec![])
+            .await
+            .unwrap();
+        src.link(None, e1.id, e2.id, EdgeRelation::VariantOf, 0.7)
+            .await
+            .unwrap();
+
+        let archive = src.export_kg(None).await.unwrap();
+        let dst = make_rt().await;
+        let summary = dst.import_kg(&archive, None).await.unwrap();
+        assert_eq!(summary.edges_imported, 1);
+        assert_eq!(
+            summary.edges_skipped, 0,
+            "no edges should be skipped when all endpoints exist"
         );
     }
 }

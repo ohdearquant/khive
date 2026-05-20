@@ -11,6 +11,7 @@
 //! get a cheaply-cloneable `VerbRegistry`. Registration is only possible
 //! through the builder.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,7 +22,9 @@ use serde_json::Value;
 
 pub use khive_types::{EdgeEndpointRule, EndpointKind, VerbDef};
 
-use crate::error::RuntimeError;
+use crate::error::{
+    CircularPackDependency, MissingPackDependencies, MissingPackDependency, RuntimeError,
+};
 use crate::KhiveRuntime;
 
 /// Async dispatch trait for packs (ADR-025).
@@ -50,6 +53,12 @@ pub trait PackRuntime: Send + Sync {
     /// Defaults to empty so existing packs that don't extend the edge contract
     /// can ignore it (ADR-031).
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
+        &[]
+    }
+
+    /// Pack names whose vocabulary this pack references (ADR-037).
+    /// Defaults to empty so existing packs compile without changes.
+    fn requires(&self) -> &'static [&'static str] {
         &[]
     }
 
@@ -184,14 +193,155 @@ impl VerbRegistryBuilder {
     }
 
     /// Consume the builder and produce an immutable, cloneable registry.
-    pub fn build(self) -> VerbRegistry {
-        VerbRegistry {
-            packs: std::sync::Arc::new(self.packs),
+    ///
+    /// Performs a topological sort of packs using Kahn's algorithm (ADR-037).
+    /// Returns an error if any declared dependency is missing from the loaded
+    /// pack set, or if a circular dependency is detected.
+    pub fn build(self) -> Result<VerbRegistry, RuntimeError> {
+        let packs = self.packs;
+        let mut name_to_idx: HashMap<&str, usize> = HashMap::with_capacity(packs.len());
+        for (idx, pack) in packs.iter().enumerate() {
+            if let Some(prev_idx) = name_to_idx.insert(pack.name(), idx) {
+                return Err(RuntimeError::PackRedeclared {
+                    name: pack.name().to_string(),
+                    first_idx: prev_idx,
+                    second_idx: idx,
+                });
+            }
+        }
+
+        let mut missing: Vec<MissingPackDependency> = Vec::new();
+        let mut indegree = vec![0usize; packs.len()];
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); packs.len()];
+
+        for (idx, pack) in packs.iter().enumerate() {
+            for &requires in pack.requires() {
+                match name_to_idx.get(requires).copied() {
+                    Some(dep_idx) => {
+                        dependents[dep_idx].push(idx);
+                        indegree[idx] += 1;
+                    }
+                    None => missing.push(MissingPackDependency {
+                        from: pack.name().to_string(),
+                        requires: requires.to_string(),
+                    }),
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            return if missing.len() == 1 {
+                Err(RuntimeError::MissingPackDependency(missing.remove(0)))
+            } else {
+                Err(RuntimeError::MissingPackDependencies(
+                    MissingPackDependencies { missing },
+                ))
+            };
+        }
+
+        let mut ready: VecDeque<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, degree)| (*degree == 0).then_some(idx))
+            .collect();
+        let mut ordered_indices = Vec::with_capacity(packs.len());
+
+        while let Some(idx) = ready.pop_front() {
+            ordered_indices.push(idx);
+            for &dep_idx in &dependents[idx] {
+                indegree[dep_idx] -= 1;
+                if indegree[dep_idx] == 0 {
+                    ready.push_back(dep_idx);
+                }
+            }
+        }
+
+        if ordered_indices.len() != packs.len() {
+            let cycle_nodes: HashSet<usize> = indegree
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, degree)| (*degree > 0).then_some(idx))
+                .collect();
+            let cycle = find_pack_dependency_cycle(&packs, &name_to_idx, &cycle_nodes);
+            return Err(RuntimeError::CircularPackDependency(
+                CircularPackDependency { cycle },
+            ));
+        }
+
+        let mut slots: Vec<Option<Box<dyn PackRuntime>>> = packs.into_iter().map(Some).collect();
+        let ordered_packs: Vec<Box<dyn PackRuntime>> = ordered_indices
+            .into_iter()
+            .map(|idx| slots[idx].take().expect("topological index must exist"))
+            .collect();
+
+        Ok(VerbRegistry {
+            packs: Arc::new(ordered_packs),
             gate: self.gate,
             default_namespace: self.default_namespace,
             event_store: self.event_store,
+        })
+    }
+}
+
+fn find_pack_dependency_cycle(
+    packs: &[Box<dyn PackRuntime>],
+    name_to_idx: &HashMap<&str, usize>,
+    cycle_nodes: &HashSet<usize>,
+) -> Vec<String> {
+    fn visit(
+        idx: usize,
+        packs: &[Box<dyn PackRuntime>],
+        name_to_idx: &HashMap<&str, usize>,
+        cycle_nodes: &HashSet<usize>,
+        visiting: &mut Vec<usize>,
+        visited: &mut HashSet<usize>,
+    ) -> Option<Vec<String>> {
+        if let Some(pos) = visiting.iter().position(|&seen| seen == idx) {
+            let mut cycle: Vec<String> = visiting[pos..]
+                .iter()
+                .map(|&i| packs[i].name().to_string())
+                .collect();
+            cycle.push(packs[idx].name().to_string());
+            return Some(cycle);
+        }
+        if !visited.insert(idx) {
+            return None;
+        }
+        visiting.push(idx);
+        for &req in packs[idx].requires() {
+            let Some(&dep_idx) = name_to_idx.get(req) else {
+                continue;
+            };
+            if cycle_nodes.contains(&dep_idx) {
+                if let Some(cycle) =
+                    visit(dep_idx, packs, name_to_idx, cycle_nodes, visiting, visited)
+                {
+                    return Some(cycle);
+                }
+            }
+        }
+        visiting.pop();
+        None
+    }
+
+    let mut visited = HashSet::new();
+    for &idx in cycle_nodes {
+        let mut visiting = Vec::new();
+        if let Some(cycle) = visit(
+            idx,
+            packs,
+            name_to_idx,
+            cycle_nodes,
+            &mut visiting,
+            &mut visited,
+        ) {
+            return cycle;
         }
     }
+    cycle_nodes
+        .iter()
+        .map(|&idx| packs[idx].name().to_string())
+        .collect()
 }
 
 impl Default for VerbRegistryBuilder {
@@ -391,9 +541,22 @@ impl VerbRegistry {
             .collect()
     }
 
+    /// Names of packs in topological load order.
+    pub fn pack_names(&self) -> Vec<&str> {
+        self.packs.iter().map(|p| p.name()).collect()
+    }
+
+    /// Declared dependencies for a registered pack (ADR-037).
+    pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.packs
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.requires())
+    }
+
     /// All pack-declared edge endpoint rules across registered packs (ADR-031).
     ///
-    /// Order follows pack registration; duplicates are *not* deduplicated —
+    /// Order follows topological pack registration; duplicates are *not* deduplicated —
     /// validation only checks membership, and an exact-duplicate rule is a
     /// harmless restatement.
     pub fn all_edge_rules(&self) -> Vec<EdgeEndpointRule> {
@@ -497,7 +660,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.register(BetaPack);
-        builder.build()
+        builder.build().expect("registry builds")
     }
 
     #[tokio::test]
@@ -579,7 +742,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_gate(gate.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         reg.dispatch("list", Value::Null).await.unwrap();
         reg.dispatch("create", Value::Null).await.unwrap();
@@ -599,7 +762,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_gate(gate.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         // Gate denies — dispatch now returns PermissionDenied (hard enforcement, ADR-035).
         let err = reg.dispatch("create", Value::Null).await.unwrap_err();
@@ -629,7 +792,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_gate(gate.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         let res = reg.dispatch("list", Value::Null).await.unwrap();
         assert_eq!(res["pack"], "alpha");
@@ -667,7 +830,7 @@ mod tests {
         builder.register(AlphaPack);
         builder.with_gate(gate.clone());
         builder.with_default_namespace("tenant-x");
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         // Explicit namespace in params wins.
         reg.dispatch("list", serde_json::json!({"namespace": "tenant-y"}))
@@ -694,7 +857,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_gate(gate.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         reg.dispatch("list", Value::Null).await.unwrap();
         let seen = gate.seen.lock().unwrap().clone();
@@ -738,7 +901,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_gate(gate.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         reg.dispatch("list", Value::Null).await.unwrap();
         reg.dispatch("create", Value::Null).await.unwrap();
@@ -753,7 +916,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_gate(gate.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         reg.dispatch("list", Value::Null).await.unwrap();
 
@@ -775,7 +938,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_gate(gate.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         // Gate denies — dispatch returns PermissionDenied (hard enforcement, ADR-035).
         // The audit event is still recorded (captured inside the gate impl).
@@ -797,7 +960,7 @@ mod tests {
         builder.register(AlphaPack);
         builder.with_gate(gate.clone());
         builder.with_default_namespace("tenant-z");
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         reg.dispatch("list", serde_json::json!({"namespace": "tenant-q"}))
             .await
@@ -917,7 +1080,7 @@ mod tests {
             builder.register(AlphaPack);
             builder.with_gate(Arc::new(AllowAllGate));
             builder.with_default_namespace("tenant-default");
-            let reg = builder.build();
+            let reg = builder.build().expect("registry builds");
             reg.dispatch("list", serde_json::json!({"namespace": "tenant-q"}))
                 .await
                 .unwrap();
@@ -1010,7 +1173,7 @@ mod tests {
         // No gate set — AllowAllGate is the default. Dispatch must succeed.
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         let res = reg.dispatch("list", Value::Null).await.unwrap();
         assert_eq!(
@@ -1078,7 +1241,7 @@ mod tests {
             invoked: invoked.clone(),
         });
         builder.with_gate(Arc::new(AlwaysDenyGate));
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         let err = reg.dispatch("guarded", Value::Null).await.unwrap_err();
         assert!(
@@ -1098,7 +1261,7 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         builder.with_event_store(store.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         reg.dispatch("list", serde_json::json!({"namespace": "test-ns"}))
             .await
@@ -1139,7 +1302,7 @@ mod tests {
         builder.register(AlphaPack);
         builder.with_gate(Arc::new(AlwaysDenyGate));
         builder.with_event_store(store.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         // Hard enforce → PermissionDenied returned.
         let err = reg
@@ -1181,7 +1344,7 @@ mod tests {
         builder.register(AlphaPack);
         builder.with_gate(Arc::new(FailingGate));
         builder.with_event_store(store.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         // Gate Err → fail-open, dispatch proceeds.
         let res = reg.dispatch("list", Value::Null).await.unwrap();
@@ -1204,7 +1367,7 @@ mod tests {
         // verify the absence of event_store does not break dispatch.)
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         let res = reg.dispatch("list", Value::Null).await.unwrap();
         assert_eq!(res["pack"], "alpha");
@@ -1227,7 +1390,7 @@ mod tests {
             let mut builder = VerbRegistryBuilder::new();
             builder.register(AlphaPack);
             builder.with_gate(Arc::new(AlwaysDenyGate));
-            let reg = builder.build();
+            let reg = builder.build().expect("registry builds");
             // Hard enforcement (ADR-035) — dispatch returns PermissionDenied on Deny.
             // The tracing audit event is still emitted before the error is returned.
             let _ = reg.dispatch("create", serde_json::Value::Null).await;
@@ -1285,7 +1448,7 @@ mod tests {
         builder.register(AlphaPack);
         builder.with_gate(Arc::new(DenyGateWithName));
         builder.with_event_store(store.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         // Dispatch is denied — PermissionDenied returned.
         let err = reg
@@ -1364,7 +1527,7 @@ mod tests {
         builder.register(AlphaPack);
         builder.with_gate(Arc::new(ObligationGate));
         builder.with_event_store(store.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         reg.dispatch("list", serde_json::json!({"namespace": "test-ns"}))
             .await
@@ -1437,7 +1600,7 @@ mod tests {
         builder.register(AlphaPack);
         builder.with_gate(Arc::new(SqlTestDenyGate));
         builder.with_event_store(sql_store.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         // Dispatch is denied — PermissionDenied returned.
         let err = reg
@@ -1539,7 +1702,7 @@ mod tests {
         builder.register(AlphaPack);
         builder.with_gate(Arc::new(SqlTestAllowWithObligationGate));
         builder.with_event_store(sql_store.clone());
-        let reg = builder.build();
+        let reg = builder.build().expect("registry builds");
 
         // Dispatch succeeds — the gate allows with obligations.
         reg.dispatch("list", serde_json::json!({"namespace": "test-ns"}))
@@ -1612,5 +1775,298 @@ mod tests {
             ),
             other => panic!("expected Audit obligation, got {other:?}"),
         }
+    }
+}
+
+// ---- ADR-037: inter-pack dependency checking ----
+
+#[cfg(test)]
+mod dep_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use khive_types::Pack;
+    use serde_json::Value;
+
+    struct KgDepPack;
+    struct MemoryDepPack;
+    struct ADepPack;
+    struct BDepPack;
+
+    impl Pack for KgDepPack {
+        const NAME: &'static str = "kg_dep";
+        const NOTE_KINDS: &'static [&'static str] = &["observation"];
+        const ENTITY_KINDS: &'static [&'static str] = &["concept"];
+        const VERBS: &'static [VerbDef] = &[];
+    }
+
+    impl Pack for MemoryDepPack {
+        const NAME: &'static str = "memory_dep";
+        const NOTE_KINDS: &'static [&'static str] = &["memory"];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const VERBS: &'static [VerbDef] = &[];
+        const REQUIRES: &'static [&'static str] = &["kg_dep"];
+    }
+
+    impl Pack for ADepPack {
+        const NAME: &'static str = "pack_a";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const VERBS: &'static [VerbDef] = &[];
+        const REQUIRES: &'static [&'static str] = &["pack_b"];
+    }
+
+    impl Pack for BDepPack {
+        const NAME: &'static str = "pack_b";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const VERBS: &'static [VerbDef] = &[];
+        const REQUIRES: &'static [&'static str] = &["pack_a"];
+    }
+
+    #[async_trait]
+    impl PackRuntime for KgDepPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn verbs(&self) -> &'static [VerbDef] {
+            Self::VERBS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _: Value,
+            _: &VerbRegistry,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::InvalidInput(format!(
+                "KgDepPack has no verbs: {verb}"
+            )))
+        }
+    }
+
+    #[async_trait]
+    impl PackRuntime for MemoryDepPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn verbs(&self) -> &'static [VerbDef] {
+            Self::VERBS
+        }
+        fn requires(&self) -> &'static [&'static str] {
+            Self::REQUIRES
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _: Value,
+            _: &VerbRegistry,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::InvalidInput(format!(
+                "MemoryDepPack has no verbs: {verb}"
+            )))
+        }
+    }
+
+    #[async_trait]
+    impl PackRuntime for ADepPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn verbs(&self) -> &'static [VerbDef] {
+            Self::VERBS
+        }
+        fn requires(&self) -> &'static [&'static str] {
+            Self::REQUIRES
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _: Value,
+            _: &VerbRegistry,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::InvalidInput(format!(
+                "ADepPack has no verbs: {verb}"
+            )))
+        }
+    }
+
+    #[async_trait]
+    impl PackRuntime for BDepPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn verbs(&self) -> &'static [VerbDef] {
+            Self::VERBS
+        }
+        fn requires(&self) -> &'static [&'static str] {
+            Self::REQUIRES
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _: Value,
+            _: &VerbRegistry,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::InvalidInput(format!(
+                "BDepPack has no verbs: {verb}"
+            )))
+        }
+    }
+
+    #[test]
+    fn test_pack_deps_happy_path() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(MemoryDepPack);
+        builder.register(KgDepPack);
+        let reg = builder
+            .build()
+            .expect("kg_dep satisfies memory_dep dependency");
+        assert_eq!(reg.pack_requires("memory_dep").unwrap(), &["kg_dep"]);
+        let names = reg.pack_names();
+        let kg_pos = names.iter().position(|&n| n == "kg_dep").unwrap();
+        let mem_pos = names.iter().position(|&n| n == "memory_dep").unwrap();
+        assert!(
+            kg_pos < mem_pos,
+            "kg_dep must be loaded before memory_dep; order: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_pack_deps_missing() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(MemoryDepPack);
+        let err = match builder.build() {
+            Ok(_) => panic!("expected Err, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, RuntimeError::MissingPackDependency(_)),
+            "expected MissingPackDependency, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory_dep"),
+            "error must name the dependent pack: {msg}"
+        );
+        assert!(
+            msg.contains("kg_dep"),
+            "error must name the missing dep: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_pack_deps_circular() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(ADepPack);
+        builder.register(BDepPack);
+        let err = match builder.build() {
+            Ok(_) => panic!("expected Err, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, RuntimeError::CircularPackDependency(_)),
+            "expected CircularPackDependency, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("pack_a"), "error must name pack_a: {msg}");
+        assert!(msg.contains("pack_b"), "error must name pack_b: {msg}");
+    }
+
+    #[test]
+    fn test_pack_deps_no_deps() {
+        struct NoDepsA;
+        struct NoDepsB;
+
+        impl Pack for NoDepsA {
+            const NAME: &'static str = "no_deps_a";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const VERBS: &'static [VerbDef] = &[];
+        }
+
+        impl Pack for NoDepsB {
+            const NAME: &'static str = "no_deps_b";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const VERBS: &'static [VerbDef] = &[];
+        }
+
+        #[async_trait]
+        impl PackRuntime for NoDepsA {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn verbs(&self) -> &'static [VerbDef] {
+                Self::VERBS
+            }
+            async fn dispatch(
+                &self,
+                verb: &str,
+                _: Value,
+                _: &VerbRegistry,
+            ) -> Result<Value, RuntimeError> {
+                Err(RuntimeError::InvalidInput(format!("NoDepsA: {verb}")))
+            }
+        }
+
+        #[async_trait]
+        impl PackRuntime for NoDepsB {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn verbs(&self) -> &'static [VerbDef] {
+                Self::VERBS
+            }
+            async fn dispatch(
+                &self,
+                verb: &str,
+                _: Value,
+                _: &VerbRegistry,
+            ) -> Result<Value, RuntimeError> {
+                Err(RuntimeError::InvalidInput(format!("NoDepsB: {verb}")))
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(NoDepsA);
+        builder.register(NoDepsB);
+        let reg = builder.build().expect("packs with REQUIRES=&[] build");
+        assert_eq!(reg.pack_requires("no_deps_a").unwrap(), &[] as &[&str]);
+        assert_eq!(reg.pack_requires("no_deps_b").unwrap(), &[] as &[&str]);
     }
 }
