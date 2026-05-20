@@ -222,22 +222,28 @@ error: schema.yaml has merge conflicts that require manual resolution
 
 ### 7. Remote Operations
 
-The remote model delegates to git for transport. Cloud sync (khive.ai) is an optional additional
-push target, not the primary mechanism.
+The remote model delegates entirely to git for transport. This follows the `git` / `gh` design
+split: `khive kg push/pull` wraps git push/pull (transport to any remote — GitHub, GitLab,
+khive.ai, self-hosted), while platform-specific operations (forking, pull requests, collaborator
+management) belong in the khive.ai cloud CLI or web UI (see khive-cloud ADRs).
+
+khive.ai is a git remote, not a separate transport. Users who want khive.ai hosting configure it
+as their git remote (`git remote add origin https://khive.ai/<user>/<project>.git`), and
+`khive kg push/pull` works without any special flags.
 
 **Push:**
 
 ```
 khive kg push                        →  git push (current branch to configured remote)
-                                        + optional POST /v1/projects/:ns/sync to khive.ai
+                                        + advisory sync notification if authenticated to khive.ai
 khive kg push --remote origin        →  git push origin <current-branch>
-khive kg push --cloud                →  POST /v1/projects/:ns/sync to khive.ai only
-                                        (no git remote required)
 ```
 
-The cloud sync call sends the committed NDJSON files to khive.ai and returns a sync receipt. It
-does not replace git push — it enables users without their own git hosting to share KGs through
-the khive.ai platform.
+When authenticated to khive.ai (via `khive auth login`, see ADR-051), a successful git push
+triggers an advisory sync notification (`POST /v1/projects/:ns/sync`) that tells khive.ai to
+import the updated NDJSON into its hosted KG index. This notification is automatic and
+non-blocking — if it fails (network error, not authenticated, khive.ai downtime), the git push
+still succeeds and the user's data is safe. See ADR-051 §5 for the full push execution sequence.
 
 **Pull:**
 
@@ -245,9 +251,6 @@ the khive.ai platform.
 khive kg pull                        →  git pull --ff-only (fast-forward by default)
                                         + rebuild working.db from updated NDJSON
 khive kg pull --remote origin        →  git pull origin <current-branch>
-                                        + rebuild working.db
-khive kg pull --cloud                →  fetch NDJSON from khive.ai
-                                        + write to .khive/kg/
                                         + rebuild working.db
 ```
 
@@ -257,8 +260,8 @@ rebuild path. If the pull cannot fast-forward, it fails with an error directing 
 
 **Local-only mode (no remote configured):**
 
-`khive kg push` and `khive kg pull` print an error if neither a git remote nor `--cloud` is
-specified. All branching and merging continue to work locally via git.
+`khive kg push` and `khive kg pull` require a configured git remote. If no remote exists, they
+print an error. All branching and merging continue to work locally via git.
 
 ### 8. Stash Support
 
@@ -430,8 +433,8 @@ khive kg resolve [--ours|--theirs|--merge-properties] [--entity <id> ...]
 khive kg stash                       — export + git stash + rebuild DB
 khive kg stash pop                   — git stash pop + rebuild DB
 khive kg stash list                  — git stash list (filtered)
-khive kg push [--remote <r>] [--cloud]
-khive kg pull [--remote <r>] [--cloud]
+khive kg push [--remote <r>]
+khive kg pull [--remote <r>]
 ```
 
 All commands are in the `khive kg` CLI (`deno/src/kg/`) and use the `khive-vcs` crate for the
@@ -450,7 +453,7 @@ dependency is added — git is already a required runtime dependency (ADR-048 §
   re-sort, validate call.
 - `stash.rs`: `stash()`, `stash_pop()` — export, git stash, rebuild.
 - `remote.rs` (extends ADR-048 §Remote cache): `push()`, `pull()` — git push/pull wrappers
-  with optional cloud sync POST.
+  with advisory cloud sync notification when authenticated (ADR-051).
 
 ### No new DB schema changes
 
@@ -465,7 +468,7 @@ defined by ADR-052 and requires no additions.
 | B2 | `resolve` command (conflict resolution) | v0.5 |
 | B3 | `stash` / `stash pop` / `stash list` | v0.5 |
 | B4 | `push` / `pull` (git remote) | v0.5 |
-| B5 | `push --cloud` / `pull --cloud` (khive.ai sync) | v0.6 |
+| B5 | Advisory cloud sync notification on push (automatic when authenticated) | v0.6 |
 | B6 | `khive kg log --entity` (field-level history rendering) | v0.6 |
 
 B1 and B2 are the core branching and merge workflow. B3–B6 are supporting operations that

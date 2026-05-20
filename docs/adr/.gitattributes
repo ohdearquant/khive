@@ -1,0 +1,3 @@
+# ADR-053 contains intentional conflict marker examples for merge documentation.
+# Disable conflict marker detection so `git diff --check` does not flag them.
+ADR-053-kg-branching-and-merge.md conflict-marker-size=0

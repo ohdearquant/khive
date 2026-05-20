@@ -626,6 +626,31 @@ No new MCP tools. The `khive kg` subcommands (`init`, `export`, `import`, `valid
 `update`) are CLI commands in the Deno CLI (`deno/src/kg/`), not MCP tools. The MCP server surface (ADR-027)
 is unchanged. Git operations are not surfaced through MCP.
 
+### CLI distribution
+
+The `khive` CLI is a Deno TypeScript application. Distribution uses `deno compile` to produce
+self-contained platform binaries (no Deno runtime required at install time):
+
+```
+deno compile --allow-read --allow-write --allow-run --allow-env \
+  --output khive deno/src/main.ts
+```
+
+**npm distribution** (primary install path for OSS users):
+
+```bash
+npx khive kg init              # run without installing
+npm install -g khive           # global install
+```
+
+The npm package contains pre-compiled platform binaries (darwin-arm64, darwin-x64, linux-x64,
+linux-arm64, windows-x64) produced by `deno compile` in CI. The `bin` field in `package.json`
+points to a platform-selection shim that resolves to the correct binary. This is the same
+distribution model used by `esbuild`, `turbo`, and other Rust/Go tools distributed via npm.
+
+No Rust CLI binary is produced. The Rust crates (`khive-vcs`, `khive-merge`, etc.) are library
+crates consumed by the MCP server binary (`khive-mcp`). The user-facing CLI is Deno-only.
+
 ### Schema format
 
 `schema.yaml` is validated by `khive-vcs` against a built-in JSON Schema on every `validate`

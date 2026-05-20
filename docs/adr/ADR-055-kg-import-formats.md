@@ -285,6 +285,27 @@ proceeds. If the import subsequently fails (validation error, referential integr
 `schema.yaml` changes are not rolled back — the added kinds remain. This is intentional: the schema
 expansion is a deliberate act separate from whether the data load succeeded.
 
+### Flag interaction matrix
+
+Not all flag combinations are valid. The following matrix defines the behavior:
+
+| `--schema-mode` | `--on-conflict error` | `--on-conflict skip` | `--on-conflict update` | `--continue` | `--mapping` |
+|---|---|---|---|---|---|
+| `strict` (default) | default | ok | ok | ok (implies skip) | ok (mapping applied before validation) |
+| `infer` | ok | ok | ok | ok (implies skip) | ok (mapping applied before infer) |
+| `force` | ok | ok | ok | ok (implies skip) | ok (mapping applied before bypass) |
+
+**Rejected combinations:**
+
+| Combination | Error |
+|---|---|
+| `--continue --on-conflict error` | rejected: contradictory (skip-existing vs error-on-existing) |
+| `--continue --on-conflict update` | rejected: ambiguous (skip-existing vs update-existing) |
+| `--continue --on-conflict skip` | rejected: redundant (`--continue` already implies skip; use `--continue` alone) |
+
+`--continue` is syntactic sugar for `--on-conflict skip`. It cannot be combined with any explicit
+`--on-conflict` value to avoid ambiguity. The flags are mutually exclusive: use one or the other.
+
 ### 5. Validation on import
 
 All adapter output passes through the full `khive kg validate` pipeline before database writes:
