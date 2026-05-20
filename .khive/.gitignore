@@ -1,0 +1,8 @@
+# Ignore everything by default
+*
+
+# Except KG data (committed to git)
+!.gitignore
+!kg/
+!kg/**
+!config.toml
