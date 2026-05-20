@@ -306,7 +306,9 @@ standalone mode is used. The search stops at the filesystem root.
 
 2. If the current directory is not a git repository: run `git init`.
 
-3. Create `.khive/kg/` and `.khive/kg/.state/` if they do not already exist.
+3. Create `.khive/kg/`, `.khive/kg/.state/`, and `.khive/kg/migrations/` if they do not already
+   exist. Add a `.gitkeep` file to `migrations/` so the directory is tracked by git (ADR-054
+   expects this directory for schema migration sequences).
 
 4. If `schema.yaml` does not already exist: write default `schema.yaml` (full ADR-001 entity
    kinds + ADR-002 edge relations, `format_version: "1.0.0"`, `ontology_version: "1.0.0"`,
@@ -324,8 +326,8 @@ standalone mode is used. The search stops at the filesystem root.
 8. Append `.khive/kg/.state/` to `.gitignore` (creating `.gitignore` if absent, idempotent
    if the entry already exists).
 
-9. Stage the three KG files and `.gitignore`:
-   `git add .khive/kg/schema.yaml .khive/kg/entities.ndjson .khive/kg/edges.ndjson .gitignore`.
+9. Stage the KG files, migrations directory, and `.gitignore`:
+   `git add .khive/kg/schema.yaml .khive/kg/entities.ndjson .khive/kg/edges.ndjson .khive/kg/migrations/.gitkeep .gitignore`.
 
 10. Emit: "KG initialized. Run `khive kg status` to check state."
 

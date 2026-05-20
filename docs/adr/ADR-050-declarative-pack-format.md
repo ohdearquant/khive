@@ -158,7 +158,7 @@ display) but does not enforce property presence. Required properties are a futur
 `packs` section that declares which packs are installed in this project:
 
 ```yaml
-format_version: "1.0.0"
+format_version: "1.1.0"
 ontology_version: "1.0.0"
 
 packs:

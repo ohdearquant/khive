@@ -376,8 +376,11 @@ Transaction model:
   This is useful for importing into a non-empty database, not for recovering from an interrupted
   import. The transaction for the new records being imported is still atomic: if any new record
   fails validation, all new records roll back (existing records already in the DB are unaffected).
-- `--continue` is rejected when combined with `--on-conflict error`, since the semantics are
-  contradictory (error on any conflict vs. silently skip conflicts).
+- `--continue` is rejected when combined with any explicit `--on-conflict` value. `--continue`
+  always implies `--on-conflict skip`; combining it with `error` (contradictory: error on
+  conflict vs. skip conflicts) or `update` (ambiguous: skip-existing and update-existing cannot
+  both be the active policy) is an error. Users who want `skip` semantics should use
+  `--continue` alone, not `--continue --on-conflict skip`.
 
 ### 8. CLI summary
 

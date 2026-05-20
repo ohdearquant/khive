@@ -309,7 +309,6 @@ If entities of `model`, `benchmark`, or `training_run` exist, the CLI refuses:
 ERROR: cannot remove pack 'ml-papers' — 42 entities of kind 'model' exist.
   Options:
     --migrate-to concept    re-kind all matching entities to 'concept' (creates a migration)
-    --force                 remove pack and mark affected entities invalid (not recommended)
     --dry-run               show affected entities without removing
 ```
 
@@ -318,8 +317,8 @@ entity kinds to the target kind, and adds it to `.khive/kg/migrations/`. It then
 major `ontology_version` (because kinds are being removed from the schema). The user applies the
 migration and commits.
 
-Pack removal without `--migrate-to` and without `--force` always fails when affected entities
-exist, enforcing the backward compatibility rule that data is never silently dropped.
+Pack removal without `--migrate-to` always fails when affected entities exist, enforcing the
+backward compatibility rule that data is never silently dropped.
 
 #### Atomic `remove_pack` operation
 
@@ -418,7 +417,7 @@ Schema diff: main..feat/ml-vocab
 
 + pack: ml-papers @ 1.0.0
 
-  version: 1.0.0 → 1.2.0
+  ontology_version: 1.0.0 → 1.2.0
 ```
 
 `khive kg schema diff` is a presentation layer over `git diff schema.yaml` — it parses both YAML
@@ -493,10 +492,10 @@ the pack vocabulary from `schema.yaml` would leave those entities in a state tha
 validate` rejects. This would mean a collaborator who has not installed the pack cannot validate
 the corpus, creating a fragmented state.
 
-Requiring an explicit migration — either `--migrate-to <kind>` or `--force` — ensures the corpus
-is always in a state that is valid under the current schema. The majority use case (removing a
-pack with no entities of its kinds) proceeds without friction; only the edge case (entities exist
-of removed-pack kinds) requires a migration.
+Requiring an explicit migration (`--migrate-to <kind>`) ensures the corpus is always in a state
+that is valid under the current schema. The majority use case (removing a pack with no entities
+of its kinds) proceeds without friction; only the edge case (entities exist of removed-pack
+kinds) requires a migration.
 
 ### Why `on_existing: error` is the default for `remove_kind`
 

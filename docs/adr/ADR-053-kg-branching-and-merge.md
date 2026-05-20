@@ -80,9 +80,10 @@ from the new files. The sequence is:
 2. **`git checkout <branch>`**: switches the NDJSON files to the target branch's committed state.
    The `--no-verify` flag is NOT passed — git hooks run normally.
 
-3. **Rebuild `working.db`**: drop and reimport from the new NDJSON files. This is the same
-   operation as `khive kg import --on-conflict update` applied to a fresh database. The
-   implementation reuses the `import.rs` path from `khive-vcs`.
+3. **Rebuild `working.db`**: rebuild from the new NDJSON files using the ADR-052 atomic rebuild
+   path: validate NDJSON, import into a temporary database in one write transaction, then
+   atomically rename into `.state/working.db`. No `--on-conflict` logic is needed — this is
+   a full materialized-view rebuild from committed files, not an incremental import.
 
    Performance estimate: 10K entities + 50K edges takes approximately 2–3 seconds on modern
    hardware with batch INSERT. For large KGs (100K+ entities), an incremental rebuild is
@@ -241,8 +242,8 @@ the khive.ai platform.
 **Pull:**
 
 ```
-khive kg pull                        →  git pull (merge or rebase per git config)
-                                        + rebuild working.db from merged NDJSON
+khive kg pull                        →  git pull --ff-only (fast-forward by default)
+                                        + rebuild working.db from updated NDJSON
 khive kg pull --remote origin        →  git pull origin <current-branch>
                                         + rebuild working.db
 khive kg pull --cloud                →  fetch NDJSON from khive.ai
@@ -250,9 +251,9 @@ khive kg pull --cloud                →  fetch NDJSON from khive.ai
                                         + rebuild working.db
 ```
 
-After any pull that changes the NDJSON files, `working.db` is rebuilt. If the pull produces
-conflicts (from `git pull --merge` hitting a conflict), the process pauses at the conflict
-resolution step (§5) before rebuilding.
+After any pull that changes the NDJSON files, `working.db` is rebuilt via the ADR-052 atomic
+rebuild path. If the pull cannot fast-forward, it fails with an error directing the user to
+`khive kg merge` for explicit merge handling (see §5).
 
 **Local-only mode (no remote configured):**
 
@@ -411,8 +412,8 @@ conflicts are rare (additive KG work), not for the case where conflicts are expe
 
 - The branch model is additive over ADR-048 and ADR-052. No existing operations change meaning.
   `khive kg commit`, `status`, `export`, and `import` behave identically on any branch.
-- The `working.db` rebuild is the same codepath as `khive kg import --on-conflict update` on a
-  fresh DB. No new import logic is needed.
+- The `working.db` rebuild delegates to the ADR-052 atomic rebuild path (validate → temp DB →
+  atomic rename). No new import logic is needed.
 
 ## Implementation
 
