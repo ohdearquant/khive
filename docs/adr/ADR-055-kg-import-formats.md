@@ -262,15 +262,18 @@ behavior is controlled by the `--schema-mode` flag:
   The import fails with a structured error listing every violation. This is the correct mode for
   maintaining a curated KG.
 - `--schema-mode infer`: accept unknown entity kinds and unknown entity properties. Add new entity
-  kinds to `schema.yaml#entity_kinds`. The schema version minor component is incremented. The
-  import summary reports every schema addition made.
+  kinds to `schema.yaml#entity_kinds`. The `ontology_version` minor component is incremented.
+  The import summary reports every schema addition made.
   **Edge relations are a closed set (ADR-002). `--schema-mode infer` does not add new relations;
-  unknown edge relations are always rejected in `strict` and `infer` modes.** Only
-  `--schema-mode force` bypasses edge relation validation (see below).
-- `--schema-mode force`: skip schema validation entirely. Records with unknown kinds and unknown
-  edge relations are accepted without error. This is an escape hatch from ADR-048's validation
-  guarantees and should be used only for exploratory imports from external ontologies. The
-  resulting graph may not pass `khive kg validate`.
+  unknown edge relations are always rejected in `strict` and `infer` modes.** See `force` mode
+  below for the complete statement on edge relation validation.
+- `--schema-mode force`: skip kind membership and property schema validation. Records with
+  unknown entity kinds and unknown entity properties are accepted without error. **Edge relation
+  names are always validated against the ADR-002 closed set, regardless of `--schema-mode`.**
+  Unknown edge relation strings are rejected in all three modes; only `kind` and property
+  validation is bypassed by `force`. This is an escape hatch for exploratory imports from
+  external ontologies with non-standard entity type systems. The resulting graph may not pass
+  `khive kg validate` (due to unknown entity kinds), but all edges use canonical relation names.
 
 `--mapping <path>` specifies the path to the mapping file. When `--mapping` is provided, its
 `kind_mapping` and `relation_mapping` sections are applied regardless of `--schema-mode`. Mapping
@@ -356,7 +359,10 @@ Large file handling:
 - All adapters use streaming parsers. The full source file is never loaded into memory. For CSV,
   this means row-by-row processing via a streaming CSV reader. For JSON, a streaming JSON parser
   (jq-style token stream). For BibTeX, entry-by-entry streaming.
-- Database writes use batch INSERT of 50 records per transaction (consistent with ADR-048 §7).
+- Database writes use a single outer transaction for the entire import. Within that transaction,
+  INSERT statements are batched at 50 rows per statement for performance (consistent with
+  ADR-048 §7). This is not 50 rows per separate transaction — it is 50 rows per INSERT statement,
+  all within one outer transaction that spans the full import.
 - Progress is reported to stderr for any import that takes more than 2 seconds (entity count, edges
   count, elapsed time, estimated remaining time).
 

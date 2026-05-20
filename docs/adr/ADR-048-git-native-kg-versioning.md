@@ -130,6 +130,7 @@ are in use, what cross-repo references exist, and pins the schema version.
 
 ```yaml
 format_version: "1.0.0"   # semver; file format compatibility version (what fields are valid here)
+khive_version: "0.1.0"    # CLI version that wrote this file (informational)
 
 entity_kinds:
   - concept
@@ -202,8 +203,9 @@ Four commands replace all of ADR-042's VCS operations:
 #### `khive kg init`
 
 Creates `.khive/kg/` with a default `schema.yaml` using the full ADR-001 entity kinds and ADR-002
-edge relations. Creates empty `entities.ndjson` and `edges.ndjson` files. Errors if `.khive/kg/`
-already exists.
+edge relations. The generated `schema.yaml` includes `format_version` and `khive_version` (the CLI
+version that created it, informational). Creates empty `entities.ndjson` and `edges.ndjson` files.
+Errors if `.khive/kg/` already exists.
 
 #### `khive kg export`
 
@@ -621,7 +623,7 @@ in development environments.
 ### MCP surface
 
 No new MCP tools. The `khive kg` subcommands (`init`, `export`, `import`, `validate`, `diff`,
-`update`) are CLI commands in `crates/khive-cli/`, not MCP tools. The MCP server surface (ADR-027)
+`update`) are CLI commands in the Deno CLI (`deno/src/kg/`), not MCP tools. The MCP server surface (ADR-027)
 is unchanged. Git operations are not surfaced through MCP.
 
 ### Schema format

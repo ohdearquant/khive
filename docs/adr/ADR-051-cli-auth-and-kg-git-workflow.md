@@ -247,22 +247,27 @@ khive kg pull
 
 **Execution sequence:**
 
-1. `git pull origin <current-branch>` (standard git pull; fast-forward only by default).
-2. Check whether `.khive/kg/` files changed in the pull:
+1. Run the ADR-052 dirty check (DB-vs-NDJSON diff). If the diff is non-empty, refuse with:
+   "Uncommitted changes in working.db. Run `khive kg commit` or `khive kg reset` first."
+   This matches the behavior of `git pull` when there are uncommitted local file changes — the
+   pull is blocked until the working state is clean or explicitly discarded.
+2. `git pull origin <current-branch>` (standard git pull; fast-forward only by default).
+3. Check whether `.khive/kg/` files changed in the pull:
    `git diff HEAD@{1} HEAD -- .khive/kg/` (non-empty output → files changed).
-3. If `.khive/kg/` files changed:
-   Run `khive kg import --on-conflict update`.
-4. Print a summary of what changed:
+4. If `.khive/kg/` files changed: run the ADR-052 atomic rebuild (validate → temp DB → swap).
+   This is identical to the checkout/pull flow defined in ADR-052 §5. The DB is fully rebuilt
+   from the post-pull NDJSON files; no `--on-conflict` logic is needed.
+5. Print a summary of what changed:
    ```
    Pulled main from origin (a1b2c3d → f9e8d7c)
    KG updated: +3 entities, +7 edges, 0 conflicts
    ```
 
-If `git pull` produces a merge conflict, the command aborts after the pull step with the standard
+If `git pull` produces a merge conflict, the command aborts after step 2 with the standard
 git merge-conflict message. The user must resolve the conflict, run `khive kg validate`, and
-re-commit before the import step can proceed. No partial import is performed.
+re-commit before the rebuild step can proceed. No partial DB change is made.
 
-If `.khive/kg/` was not modified by the pull, no import is run.
+If `.khive/kg/` was not modified by the pull, no DB rebuild is run.
 
 ### 7. `khive kg branch`
 
@@ -395,22 +400,21 @@ Treating the sync as a hard dependency would make `khive kg push` fail in enviro
 internet access to khive.ai (air-gapped labs, offline development), which is contrary to the
 OSS-first philosophy: the CLI should work fully locally without a cloud account.
 
-### Why `khive kg pull` runs `import --on-conflict update`
+### Why `khive kg pull` delegates to ADR-052's atomic rebuild
 
 After a pull, the NDJSON files represent the definitive agreed state of the KG (the state that
-other contributors committed and pushed). Local edits that conflict with the pulled state lose: the
-pull wins. This matches git's semantics — after a pull, the working tree reflects the merged
-history.
+other contributors committed and pushed). The DB must be fully consistent with those files.
 
-`--on-conflict error` (the default) would abort the import if any UUID already exists in the local
-database, which would happen on every pull for any entity that was present before the pull. That
-would make `khive kg pull` useless in practice.
+The ADR-052 atomic rebuild (validate → temp DB → swap) is the correct mechanism: it validates the
+NDJSON before touching the DB, builds the new DB in a temp file, and atomically renames it into
+place. The result is a DB that is a guaranteed materialized view of the post-pull NDJSON. There is
+no partial state, no conflict-mode guessing, and no risk of a partially-applied update leaving the
+DB inconsistent.
 
-`--on-conflict skip` would silently ignore incoming changes, which would leave the local database
-stale.
-
-`--on-conflict update` overwrites local records with the pulled state, which is the correct
-semantics for a pull: the pulled state supersedes whatever was local.
+The dirty-check guard in step 1 prevents silently discarding uncommitted local work. This is the
+same gate `git pull` uses for uncommitted file changes — the pull is blocked until the working
+state is clean. Developers who want to abandon uncommitted DB changes can run `khive kg reset`
+explicitly; this is a deliberate action, not an implicit side-effect of pull.
 
 ### Why namespace detection falls back to git remote URL
 
@@ -428,7 +432,7 @@ configure the namespace.
 | Store tokens in system keychain | Stronger isolation than file permissions | Platform-specific code; unavailable in Docker/CI; not portable for `api_url` config field | File with `0600` is portable and auditable; keychain can be layered on top |
 | `khive kg commit` without automatic export | User controls export timing | Developer forgets to export after last edit; commits stale NDJSON | Correctness invariant: commit ≡ export + validate + git commit. Auto-export is the right default. |
 | `khive kg push` fails on cloud sync error | Stricter guarantee that khive.ai is in sync | Breaks offline workflow; couples git operation to cloud availability | OSS-first: CLI must work without cloud. Sync is advisory. |
-| `khive kg pull` with `--on-conflict error` | Explicit: surfaces every conflict | Requires manual resolution of every import after every pull; unworkable | Pulled state must win; `update` is the correct semantic |
+| `khive kg pull` with `--on-conflict update` import | Simple import; no full rebuild | Leaves DB schema inconsistent if import adds columns it doesn't know about; no atomic swap guarantee | ADR-052 atomic rebuild is cleaner and idempotent; no conflict-mode needed |
 | Separate `khive sync` command instead of integrating into push/pull | Explicit: user controls when to sync | Adds friction; developers forget to sync; status diverges | Integrating sync into push/pull matches the `git push` UX expectation |
 | Reuse `gh` for auth | No additional auth code | Couples khive to GitHub specifically; excludes Google-auth users; khive.ai is its own identity provider | khive.ai is a platform, not a GitHub wrapper; must support its own OAuth |
 
@@ -461,11 +465,12 @@ configure the namespace.
   the home directory can read the access token. This is the same exposure as `~/.config/gh/hosts.yml`
   (the `gh` credentials file). The `0600` permissions prevent access by other OS users but do not
   protect against the current user's own processes or physical access.
-- `khive kg pull` uses `--on-conflict update`, which means local edits that were not yet exported
-  and committed will be overwritten by the pulled state. This is correct git semantics but
-  surprising to developers who modified the live database without running `khive kg commit` first.
-  Mitigation: `khive kg status` shows uncommitted local changes; `khive kg pull` should print a
-  warning if there are uncommitted changes before running the pull.
+- `khive kg pull` runs the ADR-052 atomic rebuild after the git pull, which fully replaces
+  `working.db` with the pulled state. The dirty-check guard in step 1 prevents this from
+  silently discarding uncommitted local work — pull is refused if the DB-vs-NDJSON diff is
+  non-empty. Developers must explicitly run `khive kg commit` or `khive kg reset` first.
+  This is the correct behavior, but developers who are not aware of the dirty-check gate may
+  be surprised that pull blocks instead of overwriting.
 
 ### Neutral
 

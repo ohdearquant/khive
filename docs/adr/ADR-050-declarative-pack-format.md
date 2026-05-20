@@ -158,7 +158,8 @@ display) but does not enforce property presence. Required properties are a futur
 `packs` section that declares which packs are installed in this project:
 
 ```yaml
-version: "1.0.0"
+format_version: "1.0.0"
+ontology_version: "1.0.0"
 
 packs:
   - name: kg
@@ -360,8 +361,13 @@ no-op. Installing a new version replaces the existing entry.
 khive pack remove <name>
 ```
 
-Removes the pack entry from `schema.yaml#packs` and re-computes the merged vocabulary sections.
-Does not delete the local cache — the cached `pack.yaml` remains at `~/.khive/packs/<name>/`.
+Pack removal follows the atomic `remove_pack` sequence defined in ADR-054: (1) check for
+entities using pack-owned kinds; (2) if found, require `--migrate-to <kind>` or refuse;
+(3) execute data migration to re-kind affected entities; (4) remove the pack entry from
+`schema.yaml#packs`; (5) recompute the merged vocabulary sections (`entity_kinds`,
+`note_kinds`, edge endpoint rules); (6) bump `ontology_version` (major increment, because
+kind removal is a breaking change). Does not delete the local cache — the cached `pack.yaml`
+remains at `~/.khive/packs/<name>/`.
 
 #### Discovery (cloud-dependent stubs in v0.3)
 

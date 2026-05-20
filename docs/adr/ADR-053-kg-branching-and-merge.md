@@ -25,9 +25,11 @@ entity level, and how remotes (GitHub and khive.ai cloud) interact with the bran
 ### Relationship to ADR-052
 
 ADR-052 defines the `.state/` directory under `.khive/kg/`: `working.db` (the live DB) and
-`dirty` flag tracking. This ADR sits on top of that model: every branch operation must maintain
-the ADR-052 invariant that `working.db` reflects the state of the current branch's committed
-snapshot plus any uncommitted working changes.
+`HEAD` (the committed snapshot reference). Status — whether the working tree is dirty — is
+computed via a DB-vs-committed-NDJSON diff as specified in ADR-052. This ADR sits on top of
+that model: every branch operation must maintain the ADR-052 invariant that `working.db`
+reflects the state of the current branch's committed snapshot plus any uncommitted working
+changes.
 
 ## Decision
 
@@ -63,8 +65,9 @@ as a cheap local read for the khive CLI to avoid a subprocess call on every verb
 Switching branches changes which NDJSON files are present on disk. `working.db` must be rebuilt
 from the new files. The sequence is:
 
-1. **Dirty check**: run `khive kg status`. If the working tree is dirty (uncommitted changes in
-   `working.db` relative to the base snapshot), refuse the checkout and print:
+1. **Dirty check**: run the ADR-052 DB-vs-committed-NDJSON diff (same operation as
+   `khive kg status`). If the working tree is dirty (uncommitted changes present), refuse
+   the checkout and print:
 
    ```
    error: cannot checkout 'experiments' — uncommitted KG changes present
@@ -163,11 +166,15 @@ internal UUID.
 | Weight change on same edge | `--ours` / `--theirs` apply to the conflicting edge line |
 | Property change on same edge | `--merge-properties` merges non-overlapping property changes; overlapping changes use `--ours` with a warning |
 | Delete vs. edit on same edge | Treated as a conflict; requires explicit `--ours` or `--theirs` |
-| Same composite key, different edge UUIDs | Keep the UUID from the branch being merged into (`--ours` UUID wins); the `(source, target, relation)` identity is preserved |
+| Same composite key, different edge UUIDs | Strategy determines the winning line: `--ours` keeps our edge UUID (the full line from the current branch), `--theirs` keeps their edge UUID (the full line from the incoming branch). The `(source, target, relation)` composite key is the conflict trigger; the strategy determines which edge_id and properties win. |
 
-The `--ours`, `--theirs`, and `--merge-properties` flags apply identically to edge conflict lines
-as to entity conflict lines. `--entity <id>` has a corresponding `--edge <source> <target> <relation>` for
-per-edge overrides when a global strategy is in use.
+`--ours` applies the current branch's full edge line for all conflicting edges. `--theirs`
+applies the incoming branch's full edge line. `--merge-properties` keeps the current branch's
+edge_id but merges non-overlapping property changes from the incoming branch; for overlapping
+property keys, the current branch value wins and a warning is emitted.
+
+`--entity <id>` has a corresponding `--edge <source> <target> <relation>` for per-edge
+overrides when a global strategy is in use.
 
 After edge conflict resolution, `edges.ndjson` is re-sorted by the composite key (same sort
 invariant as `entities.ndjson` by UUID).
@@ -323,7 +330,7 @@ by `khive kg update <remote>` (ADR-048 §4), not at merge time.
 ### Custom branch metadata (not git branches)
 
 A `kg_branches` table in SQLite storing branch names, HEAD commit references, and per-branch
-dirty flags. Rejected: this recreates git's ref infrastructure in a worse form. Branches would
+status fields. Rejected: this recreates git's ref infrastructure in a worse form. Branches would
 not interoperate with GitHub PRs, CI runners, or any git tooling. The complexity of keeping
 custom branch state in sync with git state adds maintenance cost without benefit.
 
@@ -468,7 +475,7 @@ improve the experience but are not blockers for using branches.
 - ADR-010: KG Versioning Direction — "GitHub for knowledge graphs" positioning
 - ADR-048: Git-Native KG Versioning — NDJSON format, cross-repo references, CLI commands
 - ADR-051: CLI Authentication and KG Git Workflow Commands — `khive kg commit/push/pull/status/branch/log` interface
-- ADR-052: KG Storage Model — working.db, base snapshots, dirty tracking, `.state/` layout
+- ADR-052: KG Storage Model — working.db, HEAD, DB-vs-NDJSON diff status, `.state/` layout
 - ADR-043: KG Merge Algorithm — original three-way merge design (substantially reduced in scope by ADR-048; further narrowed by this ADR to the conflict-resolution pass only)
 - ADR-002: Closed Edge Ontology — why schema conflicts require manual review
 - git merge documentation: https://git-scm.com/docs/git-merge

@@ -413,7 +413,7 @@ Schema diff: main..feat/ml-vocab
   + paper_url (string, optional)
   + domain.values: added "fine-tuning", "quantization"
 
-~ edge_relation: trained_on
+~ edge_relation: depends_on
   + endpoint: (training_run, dataset)
 
 + pack: ml-papers @ 1.0.0

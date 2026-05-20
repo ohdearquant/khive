@@ -90,7 +90,7 @@ The URL structure:
 ```
 
 URL params carry per-tab view state so workspaces are bookmarkable. The `:namespace` segment is
-the exact namespace string (e.g., `khive-oss`, `lambda:khive`, `local`).
+the exact namespace string (e.g., `khive-oss`, `lambda-khive`, `local`).
 
 ### D2: Project picker
 

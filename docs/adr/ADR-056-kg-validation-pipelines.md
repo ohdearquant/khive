@@ -154,7 +154,8 @@ export interface Edge {
 }
 
 export interface Schema {
-  version: string;
+  format_version: string;
+  ontology_version: string;
   entity_kinds: string[];
   edge_relations: Array<{ relation: string; category: string }>;
   properties: Record<string, Array<{ key: string; values?: string[] }>>;

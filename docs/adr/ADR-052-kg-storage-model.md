@@ -107,8 +107,8 @@ CREATE TABLE entities (
     description TEXT,
     properties  TEXT NOT NULL DEFAULT '{}',  -- JSON object
     tags        TEXT NOT NULL DEFAULT '[]',  -- JSON array
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at  TEXT DEFAULT NULL,     -- ISO8601 or NULL if absent in NDJSON
+    updated_at  TEXT DEFAULT NULL      -- ISO8601 or NULL if absent in NDJSON
 );
 
 CREATE INDEX idx_entities_kind ON entities(kind);
@@ -132,8 +132,8 @@ CREATE TABLE edges (
     relation    TEXT NOT NULL,
     weight      REAL NOT NULL DEFAULT 1.0,
     properties  TEXT NOT NULL DEFAULT '{}',  -- JSON object
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    created_at  TEXT DEFAULT NULL,     -- ISO8601 or NULL if absent in NDJSON
+    updated_at  TEXT DEFAULT NULL,     -- ISO8601 or NULL if absent in NDJSON
     PRIMARY KEY (source, target, relation)   -- composite, mirrors NDJSON sort key
 );
 
@@ -296,21 +296,48 @@ standalone mode is used. The search stops at the filesystem root.
 
 `khive kg init` performs the following:
 
-1. If `.khive/kg/` already exists: error "KG already initialized in this directory."
+1. **Detect state**:
+   - If `.khive/kg/` exists AND `.state/working.db` exists: error
+     "KG already initialized in this directory (working.db found). Run `khive kg status` to
+     check state, or `khive kg reset` to rebuild from committed files."
+   - If `.khive/kg/` exists AND `.state/working.db` is absent (fresh clone):
+     bootstrap mode — skip to step 3 (skip creating files that already exist).
+   - If `.khive/kg/` does not exist: fresh init — execute all steps below.
+
 2. If the current directory is not a git repository: run `git init`.
-3. Create `.khive/kg/` and `.khive/kg/.state/`.
-4. Write default `schema.yaml` (full ADR-001 entity kinds + ADR-002 edge relations,
-   `format_version: "1.0.0"`, `ontology_version: "1.0.0"`, empty `remotes: []`).
-5. Write empty `entities.ndjson` (single `\n`) and `edges.ndjson` (single `\n`).
-6. Create empty `working.db` with the §4 schema.
+
+3. Create `.khive/kg/` and `.khive/kg/.state/` if they do not already exist.
+
+4. If `schema.yaml` does not already exist: write default `schema.yaml` (full ADR-001 entity
+   kinds + ADR-002 edge relations, `format_version: "1.0.0"`, `ontology_version: "1.0.0"`,
+   `khive_version: "<current>"`, empty `remotes: []`).
+
+5. If `entities.ndjson` does not already exist: write empty `entities.ndjson` (single `\n`).
+   If `edges.ndjson` does not already exist: write empty `edges.ndjson` (single `\n`).
+
+6. If committed NDJSON files are non-empty (bootstrap mode): run the §5 atomic rebuild
+   (validate → temp DB → swap) to populate `working.db` from the existing NDJSON files.
+   If the NDJSON files are empty (fresh init): create empty `working.db` with the §4 schema.
+
 7. Write current git branch to `.state/HEAD`.
-8. Append `.khive/kg/.state/` to `.gitignore` (creating `.gitignore` if absent).
+
+8. Append `.khive/kg/.state/` to `.gitignore` (creating `.gitignore` if absent, idempotent
+   if the entry already exists).
+
 9. Stage the three KG files and `.gitignore`:
    `git add .khive/kg/schema.yaml .khive/kg/entities.ndjson .khive/kg/edges.ndjson .gitignore`.
+
 10. Emit: "KG initialized. Run `khive kg status` to check state."
 
 `khive kg init` does not make a git commit. Staging the files is sufficient — the first
 `khive kg commit` will commit them alongside actual graph content.
+
+**Fresh clone bootstrap**: On a fresh clone, `.khive/kg/` contains tracked NDJSON files but no
+`.state/` directory (`.state/` is gitignored). Running `khive kg init` detects this state
+(`.khive/kg/` present, `working.db` absent) and bootstraps `.state/working.db` via the atomic
+rebuild flow (§5). This is the expected onboarding path for contributors joining an existing KG
+project. No data is lost or overwritten — the NDJSON files are the source of truth, and the
+DB is rebuilt from them deterministically.
 
 ## Alternatives Considered
 
@@ -380,9 +407,11 @@ limitation of the implementation.
 - The serialization is deterministic: the same logical graph state always produces
   bit-identical NDJSON files. This means `git diff` on the NDJSON files is a reliable
   signal — if `git diff` shows no changes, the DB and files are in sync.
-- The DB schema mirrors the NDJSON fields with timestamp defaults added. Import and export
-  are mechanical field mappings; the only transformation is that optional NDJSON timestamps
-  become DB column values (defaulting to insertion time when absent).
+- The DB schema mirrors the NDJSON fields exactly. Import is a mechanical field mapping:
+  optional NDJSON timestamps become DB column values (NULL when absent from the NDJSON record).
+  Export omits NULL timestamps, matching the source. This makes import → export a round-trip
+  identity: importing an old NDJSON file without timestamps writes NULL to the DB, and exporting
+  that DB omits the timestamp fields — producing bit-identical output to the source file.
 - Mode detection is implicit and consistent with git's own heuristic. Users do not need
   to configure which mode they are in — the presence of `working.db` in the directory
   tree is sufficient.
