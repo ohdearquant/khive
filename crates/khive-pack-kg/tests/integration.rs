@@ -41,6 +41,17 @@ fn pack() -> Fixture {
     }
 }
 
+fn pack_with_events() -> Fixture {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let event_store = rt.events(None).expect("event store must be available");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_event_store(event_store);
+    builder.register(KgPack::new(rt));
+    Fixture {
+        registry: builder.build(),
+    }
+}
+
 fn is_invalid_input(err: &RuntimeError) -> bool {
     matches!(err, RuntimeError::InvalidInput(_))
 }
@@ -1040,5 +1051,270 @@ async fn search_bogus_kind_lists_semantic_and_episodic_in_error() {
     assert!(
         msg.contains("episodic"),
         "error must list 'episodic' (contributed by memory pack): {msg}"
+    );
+}
+
+// ── ADR-038: Events Surface ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_event_kind_returns_immutable_error() {
+    let pack = pack();
+    let err = pack
+        .dispatch("create", json!({"kind": "event"}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "create(kind=event) must return InvalidInput; got: {err:?}"
+    );
+    assert_eq!(
+        invalid_input_message(&err),
+        "events are immutable — create/update/delete are not permitted",
+        "immutable-event message must match exactly"
+    );
+}
+
+#[tokio::test]
+async fn list_event_kind_returns_array() {
+    let pack = pack_with_events();
+    // Create an entity first so there are audit events to find.
+    pack.dispatch("create", json!({"kind": "concept", "name": "AuditTarget"}))
+        .await
+        .expect("create must succeed");
+
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 10}),
+        )
+        .await
+        .expect("list(kind=event) must succeed");
+
+    let arr = result.as_array().expect("list must return a JSON array");
+    assert!(
+        !arr.is_empty(),
+        "at least one create audit event must be present"
+    );
+    assert!(
+        arr.iter()
+            .all(|e| e.get("verb").and_then(Value::as_str) == Some("create")),
+        "all returned events must have verb=create when filtered"
+    );
+    assert!(
+        arr.iter()
+            .all(|e| e.get("outcome").and_then(Value::as_str) == Some("success")),
+        "all returned events must have outcome=success"
+    );
+}
+
+#[tokio::test]
+async fn get_event_uuid_returns_event_wrapper() {
+    let pack = pack_with_events();
+    pack.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "GetEventTarget"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    // List create events to get an event UUID.
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+    let events = list_result.as_array().expect("list must be array");
+    assert!(!events.is_empty(), "must have at least one create event");
+    let event_id = events[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("event must have id field")
+        .to_string();
+
+    let get_result = pack
+        .dispatch("get", json!({"id": event_id}))
+        .await
+        .expect("get(id=event_uuid) must succeed");
+
+    assert_eq!(
+        get_result.get("kind").and_then(Value::as_str),
+        Some("event"),
+        "get wrapper must have kind=event"
+    );
+    let data = get_result.get("data").expect("get must have data field");
+    assert_eq!(
+        data.get("id").and_then(Value::as_str),
+        Some(event_id.as_str()),
+        "data.id must match the requested event UUID"
+    );
+    assert_eq!(
+        data.get("verb").and_then(Value::as_str),
+        Some("create"),
+        "data.verb must be create"
+    );
+    assert_eq!(
+        data.get("outcome").and_then(Value::as_str),
+        Some("success"),
+        "data.outcome must be success"
+    );
+}
+
+#[tokio::test]
+async fn update_event_uuid_returns_immutable_error() {
+    let pack = pack_with_events();
+    pack.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "UpdateEventTarget"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+    let events = list_result.as_array().expect("list must be array");
+    let event_id = events[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("event must have id")
+        .to_string();
+
+    let err = pack
+        .dispatch(
+            "update",
+            json!({"id": event_id, "name": "should-not-apply"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "update on event UUID must return InvalidInput; got: {err:?}"
+    );
+    assert_eq!(
+        invalid_input_message(&err),
+        "events are immutable — create/update/delete are not permitted"
+    );
+}
+
+#[tokio::test]
+async fn delete_event_uuid_returns_immutable_error_and_event_persists() {
+    let pack = pack_with_events();
+    pack.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "DeleteEventTarget"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+    let events = list_result.as_array().expect("list must be array");
+    let event_id = events[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("event must have id")
+        .to_string();
+
+    let err = pack
+        .dispatch("delete", json!({"id": event_id}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "delete on event UUID must return InvalidInput; got: {err:?}"
+    );
+    assert_eq!(
+        invalid_input_message(&err),
+        "events are immutable — create/update/delete are not permitted"
+    );
+
+    // Event must still be fetchable after the failed delete.
+    let get_result = pack
+        .dispatch("get", json!({"id": event_id}))
+        .await
+        .expect("get after failed delete must succeed");
+    assert_eq!(
+        get_result.get("kind").and_then(Value::as_str),
+        Some("event"),
+        "event must still exist after failed delete"
+    );
+}
+
+#[tokio::test]
+async fn list_events_pagination_returns_distinct_pages() {
+    let pack = pack_with_events();
+    // Create three entities to generate three create audit events.
+    for name in ["Paginable-A", "Paginable-B", "Paginable-C"] {
+        pack.dispatch("create", json!({"kind": "concept", "name": name}))
+            .await
+            .expect("create must succeed");
+    }
+
+    let page1 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 2, "offset": 0}),
+        )
+        .await
+        .expect("page 1 must succeed");
+    let arr1 = page1.as_array().expect("must be array");
+    assert_eq!(arr1.len(), 2, "page 1 must contain exactly 2 events");
+
+    let page2 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 2, "offset": 2}),
+        )
+        .await
+        .expect("page 2 must succeed");
+    let arr2 = page2.as_array().expect("must be array");
+    assert!(
+        !arr2.is_empty(),
+        "page 2 must contain at least 1 event (3 creates total)"
+    );
+
+    let id1 = arr1[0].get("id").and_then(Value::as_str).unwrap();
+    let id2_first = arr2[0].get("id").and_then(Value::as_str).unwrap();
+    assert_ne!(
+        id1, id2_first,
+        "first event on page 1 and first event on page 2 must differ"
+    );
+}
+
+#[tokio::test]
+async fn list_unknown_kind_includes_event_in_valid_list() {
+    let pack = pack();
+    let err = pack
+        .dispatch("list", json!({"kind": "bogus"}))
+        .await
+        .unwrap_err();
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("event"),
+        "unknown-kind error must list 'event' as valid: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn search_event_kind_returns_invalid_input() {
+    let pack = pack();
+    let err = pack
+        .dispatch("search", json!({"kind": "event", "query": "anything"}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "search(kind=event) must return InvalidInput; got: {err:?}"
     );
 }

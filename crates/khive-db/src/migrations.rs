@@ -177,6 +177,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "add_name_to_notes",
         up: "ALTER TABLE notes ADD COLUMN name TEXT;",
     },
+    VersionedMigration {
+        version: 3,
+        name: "add_events_namespace_created_index",
+        up: "CREATE INDEX IF NOT EXISTS idx_events_ns_created ON events(namespace, created_at DESC);",
+    },
 ];
 
 const MIGRATION_TRACKING_TABLE: &str = "\
@@ -314,17 +319,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
-        // Verify the tracking table has rows for V1 and V2.
+        // Verify the tracking table has rows for V1, V2, and V3.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -352,54 +357,54 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 2);
-        assert_eq!(v2, 2);
+        assert_eq!(v1, 3);
+        assert_eq!(v2, 3);
 
-        // Should still have exactly two rows in the tracking table (V1 + V2).
+        // Should still have exactly three rows in the tracking table (V1 + V2 + V3).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v3 = VersionedMigration {
-            version: 3,
+        let bad_v4 = VersionedMigration {
+            version: 4,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1 + V2) so the DB is at V2.
-        run_migrations(&mut conn).expect("V1+V2 should apply cleanly");
+        // Apply all real migrations (V1 + V2 + V3) so the DB is at V3.
+        run_migrations(&mut conn).expect("V1+V2+V3 should apply cleanly");
 
-        // Now manually drive the bad V3 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v3);
+        // Now manually drive the bad V4 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v4);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V2 — no V3 row in tracking.
-        let v3_count: i64 = conn
+        // DB should still be at V3 — no V4 row in tracking.
+        let v4_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 3",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 4",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v3_count, 0, "V3 must not be recorded after rollback");
+        assert_eq!(v4_count, 0, "V4 must not be recorded after rollback");
 
-        // V1 and V2 should still be there.
+        // V1, V2, and V3 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(applied_count, 2, "V1 and V2 must still be recorded");
+        assert_eq!(applied_count, 3, "V1, V2, and V3 must still be recorded");
     }
 
     #[test]
@@ -423,9 +428,9 @@ mod tests {
         assert!(has_name, "NOTES_DDL should include name column");
 
         // Now run versioned migrations — V2 should detect the existing column
-        // and skip the ALTER TABLE without error.
+        // and skip the ALTER TABLE without error. V3 adds the composite index.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
