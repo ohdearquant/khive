@@ -66,7 +66,7 @@ pub fn apply_theirs(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) -> K
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
+    use khive_runtime::portability::{ExportedEntity, KgArchive};
     use uuid::Uuid;
 
     use super::*;
@@ -98,8 +98,8 @@ mod tests {
     #[test]
     fn apply_ours_uses_ours_version() {
         let id = Uuid::new_v4();
-        let mut e_ours = entity(id, "OursName");
-        let mut e_theirs = entity(id, "TheirsName");
+        let e_ours = entity(id, "OursName");
+        let e_theirs = entity(id, "TheirsName");
         let mut base = empty();
         base.entities = vec![entity(id, "Original")];
         let mut ours = empty();
