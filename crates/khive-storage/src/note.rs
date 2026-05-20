@@ -82,6 +82,16 @@ pub trait NoteStore: Send + Sync + 'static {
     ) -> StorageResult<Page<Note>>;
     async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
 
+    async fn get_notes_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(n) = self.get_note(id).await? {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
     async fn upsert_note_if_below_quota(&self, note: Note, max_notes: u64) -> StorageResult<bool> {
         let count = self.count_notes(&note.namespace, None).await?;
         if count >= max_notes {

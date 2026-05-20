@@ -295,6 +295,37 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn get_notes_batch(&self, ids: &[Uuid]) -> Result<Vec<Note>, StorageError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+
+        self.with_reader("get_notes_batch", move |conn| {
+            let placeholders: String = (1..=id_strings.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, namespace, kind, name, content, salience, decay_factor, expires_at, \
+                 properties, created_at, updated_at, deleted_at \
+                 FROM notes WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = id_strings
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(params.as_slice(), read_note)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn delete_note(&self, id: Uuid, mode: DeleteMode) -> Result<bool, StorageError> {
         let id_str = id.to_string();
 
