@@ -65,7 +65,7 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
   // ── 1. Load schema ────────────────────────────────────────────────────────
   let schemaEntityKinds: Set<string> = new Set(ENTITY_KINDS);
   let schemaRelations: Set<string> = new Set(EDGE_RELATIONS);
-  let schemaRemotes: Set<string> = new Set();
+  const schemaRemotes: Set<string> = new Set();
 
   try {
     const schema = await loadSchema(repoRoot);
