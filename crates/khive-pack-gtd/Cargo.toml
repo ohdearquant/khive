@@ -9,9 +9,9 @@ homepage.workspace = true
 description = "GTD verb pack — task lifecycle (assign/next/complete/transition) over the notes substrate"
 
 [dependencies]
-khive-types = { version = "0.1.3", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.1.3", path = "../khive-runtime" }
-khive-storage = { version = "0.1.3", path = "../khive-storage" }
+khive-types = { version = "0.1.4", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.1.4", path = "../khive-runtime" }
+khive-storage = { version = "0.1.4", path = "../khive-storage" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

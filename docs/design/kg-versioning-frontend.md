@@ -22,16 +22,16 @@ graphs. The interface covers four primary surfaces:
 
 ## Technology Stack
 
-| Layer | Choice | Rationale |
-|---|---|---|
-| Framework | Next.js 15 (App Router) | Established scaffold in PR #25; server components for data fetching |
-| UI library | React 19 | Concurrent mode for responsive graph rendering |
-| Graph rendering | React Flow v12 | Declarative DAG nodes; built-in minimap, zoom, pan |
-| Diff highlighting | `diff2html` + custom CSS | Unified diff format with entity-aware coloring |
-| State management | React Context + `useReducer` | No global state library needed for v0.1 scope |
-| Data fetching | `fetch` + SWR | Stale-while-revalidate for snapshot lists |
-| Styling | Tailwind CSS 4 | Consistent with the PR #25 scaffold |
-| Type generation | `zod` schemas from Rust types | Backend types compile-time validated on the TS side |
+| Layer             | Choice                        | Rationale                                                           |
+| ----------------- | ----------------------------- | ------------------------------------------------------------------- |
+| Framework         | Next.js 15 (App Router)       | Established scaffold in PR #25; server components for data fetching |
+| UI library        | React 19                      | Concurrent mode for responsive graph rendering                      |
+| Graph rendering   | React Flow v12                | Declarative DAG nodes; built-in minimap, zoom, pan                  |
+| Diff highlighting | `diff2html` + custom CSS      | Unified diff format with entity-aware coloring                      |
+| State management  | React Context + `useReducer`  | No global state library needed for v0.1 scope                       |
+| Data fetching     | `fetch` + SWR                 | Stale-while-revalidate for snapshot lists                           |
+| Styling           | Tailwind CSS 4                | Consistent with the PR #25 scaffold                                 |
+| Type generation   | `zod` schemas from Rust types | Backend types compile-time validated on the TS side                 |
 
 ---
 
@@ -79,11 +79,11 @@ branch HEAD markers show where named branches currently point.
 
 ```tsx
 interface SnapshotNodeData {
-  id: string;            // "sha256:..."
-  shortId: string;       // first 8 chars of hex
+  id: string; // "sha256:..."
+  shortId: string; // first 8 chars of hex
   message: string;
   author?: string;
-  createdAt: string;     // formatted timestamp
+  createdAt: string; // formatted timestamp
   entityCount: number;
   edgeCount: number;
   branchLabels: string[]; // ["main", "experimental"]
@@ -92,6 +92,7 @@ interface SnapshotNodeData {
 ```
 
 Renders as a rounded rectangle with:
+
 - Top row: `shortId` (monospace, green if HEAD, grey otherwise) + branch chips
 - Middle row: commit message (truncated at 60 chars)
 - Bottom row: entity count + edge count + timestamp
@@ -350,12 +351,12 @@ Mirroring the Rust types from `khive-vcs`:
 
 ```ts
 interface KgSnapshot {
-  id: string;           // "sha256:..."
+  id: string; // "sha256:..."
   namespace: string;
   parentId: string | null;
   message: string;
   author: string | null;
-  createdAt: number;    // Unix microseconds
+  createdAt: number; // Unix microseconds
   entityCount: number;
   edgeCount: number;
 }
@@ -372,9 +373,27 @@ type MergeConflict =
   | { type: "name_conflict"; entityId: string; ours: string; theirs: string }
   | { type: "kind_conflict"; entityId: string; ours: string; theirs: string }
   | { type: "property_mismatch"; entityId: string; key: string; ours: unknown; theirs: unknown }
-  | { type: "modify_delete"; entityId: string; modifiedIn: "ours" | "theirs"; deletedIn: "ours" | "theirs" }
-  | { type: "edge_modify_delete"; sourceId: string; targetId: string; relation: string; modifiedIn: "ours" | "theirs"; deletedIn: "ours" | "theirs" }
-  | { type: "dangling_edge"; sourceId: string; targetId: string; relation: string; missingEndpoint: string };
+  | {
+    type: "modify_delete";
+    entityId: string;
+    modifiedIn: "ours" | "theirs";
+    deletedIn: "ours" | "theirs";
+  }
+  | {
+    type: "edge_modify_delete";
+    sourceId: string;
+    targetId: string;
+    relation: string;
+    modifiedIn: "ours" | "theirs";
+    deletedIn: "ours" | "theirs";
+  }
+  | {
+    type: "dangling_edge";
+    sourceId: string;
+    targetId: string;
+    relation: string;
+    missingEndpoint: string;
+  };
 ```
 
 Zod schemas validate these at the API boundary before they enter React state.

@@ -51,8 +51,7 @@ async fn collect_ancestors(
 
 #[cfg(test)]
 mod tests {
-    use khive_runtime::KhiveRuntime;
-    use khive_vcs::{SnapshotId, VcsError};
+    use khive_vcs::SnapshotId;
 
     // LCA on identical IDs should return that ID immediately.
     // (No runtime needed since the early-exit fires before any DB reads.)

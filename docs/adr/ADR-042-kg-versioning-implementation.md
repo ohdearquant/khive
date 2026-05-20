@@ -483,14 +483,14 @@ callers the information they need to wait if freshness matters.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-|---|---|---|---|
-| gRPC remote protocol | Better streaming, strongly typed | `protobuf` compile dep; complex for v0.1 scale | HTTP is sufficient at v0.1 archive sizes; upgrade later |
-| Pull = fetch + auto-merge | Fewer steps for the common case | Hides merge decisions; ADR-015 and ADR-043 require explicit merge | Violates "agent provides judgment" principle |
-| Content-defined chunking for snapshots | O(changed entities) storage per commit | Object store complexity; not justified at v0.1 scale | Defer to v0.5 with delta format |
-| `dirty` flag derived from hash recompute | Always accurate | O(N) on every checkout guard; blocks on large namespaces | O(1) transactional flag wins |
-| Vector rebuild synchronous | Consistent immediately after checkout | Blocks checkout for minutes on large namespaces | User experience is unacceptable |
-| Merge-on-pull default | Familiar to git users | Hides conflicts; wrong for research KG correctness | ADR-015 §D.3 rationale applies |
+| Alternative                              | Pros                                   | Cons                                                              | Why rejected                                            |
+| ---------------------------------------- | -------------------------------------- | ----------------------------------------------------------------- | ------------------------------------------------------- |
+| gRPC remote protocol                     | Better streaming, strongly typed       | `protobuf` compile dep; complex for v0.1 scale                    | HTTP is sufficient at v0.1 archive sizes; upgrade later |
+| Pull = fetch + auto-merge                | Fewer steps for the common case        | Hides merge decisions; ADR-015 and ADR-043 require explicit merge | Violates "agent provides judgment" principle            |
+| Content-defined chunking for snapshots   | O(changed entities) storage per commit | Object store complexity; not justified at v0.1 scale              | Defer to v0.5 with delta format                         |
+| `dirty` flag derived from hash recompute | Always accurate                        | O(N) on every checkout guard; blocks on large namespaces          | O(1) transactional flag wins                            |
+| Vector rebuild synchronous               | Consistent immediately after checkout  | Blocks checkout for minutes on large namespaces                   | User experience is unacceptable                         |
+| Merge-on-pull default                    | Familiar to git users                  | Hides conflicts; wrong for research KG correctness                | ADR-015 §D.3 rationale applies                          |
 
 ## Consequences
 
@@ -578,14 +578,14 @@ callers the information they need to wait if freshness matters.
 
 ### Coverage targets
 
-| Module | Target |
-|--------|--------|
-| `hash.rs` — canonical JSON + SHA-256 | 95% |
-| `snapshot.rs` — commit + dirty detection | 90% |
-| `branch.rs` — branch + checkout | 90% |
-| `log.rs` | 85% |
-| `remote.rs` — push + pull | 85% |
-| MCP tool wiring | 80% |
+| Module                                   | Target |
+| ---------------------------------------- | ------ |
+| `hash.rs` — canonical JSON + SHA-256     | 95%    |
+| `snapshot.rs` — commit + dirty detection | 90%    |
+| `branch.rs` — branch + checkout          | 90%    |
+| `log.rs`                                 | 85%    |
+| `remote.rs` — push + pull                | 85%    |
+| MCP tool wiring                          | 80%    |
 
 ## References
 

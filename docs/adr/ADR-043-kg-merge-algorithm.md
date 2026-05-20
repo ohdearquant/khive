@@ -127,20 +127,20 @@ ops for the merge use case (not `diff_summary`, not `apply_diff`).
 
 For each UUID that appears in any of base, ours, or theirs:
 
-| In base? | In ours? | In theirs? | Category |
-|---|---|---|---|
-| No | Yes | No | Added in ours only → include in merge |
-| No | No | Yes | Added in theirs only → include in merge |
-| No | Yes | Yes | Added in both → `duplicate_add`; see §4.1 |
-| Yes | Yes | Yes, same | Unchanged by both → include as-is |
-| Yes | Yes (modified) | Yes, same as base | Modified in ours only → take ours |
-| Yes | Yes, same as base | Yes (modified) | Modified in theirs only → take theirs |
-| Yes | Yes (modified) | Yes (modified differently) | Modified in both → `property_conflict` or auto-resolve; see §4.2 |
-| Yes | No (deleted) | Yes, same as base | Deleted in ours only → delete in merge |
-| Yes | Yes, same as base | No (deleted) | Deleted in theirs only → delete in merge |
-| Yes | Yes (modified) | No (deleted) | `modify_delete` conflict → report |
-| Yes | No (deleted) | Yes (modified) | `modify_delete` conflict → report |
-| Yes | No (deleted) | No (deleted) | Deleted in both → delete in merge (no conflict) |
+| In base? | In ours?          | In theirs?                 | Category                                                         |
+| -------- | ----------------- | -------------------------- | ---------------------------------------------------------------- |
+| No       | Yes               | No                         | Added in ours only → include in merge                            |
+| No       | No                | Yes                        | Added in theirs only → include in merge                          |
+| No       | Yes               | Yes                        | Added in both → `duplicate_add`; see §4.1                        |
+| Yes      | Yes               | Yes, same                  | Unchanged by both → include as-is                                |
+| Yes      | Yes (modified)    | Yes, same as base          | Modified in ours only → take ours                                |
+| Yes      | Yes, same as base | Yes (modified)             | Modified in theirs only → take theirs                            |
+| Yes      | Yes (modified)    | Yes (modified differently) | Modified in both → `property_conflict` or auto-resolve; see §4.2 |
+| Yes      | No (deleted)      | Yes, same as base          | Deleted in ours only → delete in merge                           |
+| Yes      | Yes, same as base | No (deleted)               | Deleted in theirs only → delete in merge                         |
+| Yes      | Yes (modified)    | No (deleted)               | `modify_delete` conflict → report                                |
+| Yes      | No (deleted)      | Yes (modified)             | `modify_delete` conflict → report                                |
+| Yes      | No (deleted)      | No (deleted)               | Deleted in both → delete in merge (no conflict)                  |
 
 #### 4.1 Duplicate add (same UUID in ours and theirs, absent in base)
 
@@ -167,14 +167,14 @@ pub struct EntityChange {
 
 Field-level auto-resolution rules (all applied before conflict reporting):
 
-| Field | Rule |
-|---|---|
-| `name` | Both changed to same value → take it. Different values → `name_conflict` (always report). |
-| `description` | Both changed → `ours` wins (annotation, not identity). |
-| `tags` | Both changed → union of both sets. |
-| `kind` | Both changed to same value → take it. Different values → `kind_conflict` (always report). |
+| Field              | Rule                                                                                                                                                                                           |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`             | Both changed to same value → take it. Different values → `name_conflict` (always report).                                                                                                      |
+| `description`      | Both changed → `ours` wins (annotation, not identity).                                                                                                                                         |
+| `tags`             | Both changed → union of both sets.                                                                                                                                                             |
+| `kind`             | Both changed to same value → take it. Different values → `kind_conflict` (always report).                                                                                                      |
 | `properties` key K | Only ours set K → take ours. Only theirs set K → take theirs. Both set K to same value → take it. Both set K to different values → `property_mismatch` (report unless strategy = Ours/Theirs). |
-| `properties` key K | Only ours deleted K (key absent) → delete K in merge. Same for theirs. Both delete K → delete in merge. |
+| `properties` key K | Only ours deleted K (key absent) → delete K in merge. Same for theirs. Both delete K → delete in merge.                                                                                        |
 
 `name_conflict` and `kind_conflict` are always reported (never auto-resolved by `Auto` strategy)
 because name and kind have identity semantics.
@@ -185,20 +185,20 @@ Edge identity uses the composite key `(source_id, target_id, relation)` (ADR-017
 
 For each composite key appearing in any of base, ours, or theirs:
 
-| In base? | In ours? | In theirs? | Action |
-|---|---|---|---|
-| No | Yes | No | Added in ours only → include |
-| No | No | Yes | Added in theirs only → include |
-| No | Yes (weight W1) | Yes (weight W2) | Both added same edge; W1 == W2 → include. W1 ≠ W2 → `duplicate_edge_weight`; auto-resolve: `max(W1, W2)` |
-| Yes | Yes (same weight) | Yes (same weight) | Unchanged → include |
-| Yes | Yes (modified weight) | Yes (same as base) | Modified in ours only → take ours |
-| Yes | Yes (same as base) | Yes (modified weight) | Modified in theirs only → take theirs |
-| Yes | Yes (W1) | Yes (W2, W1 ≠ W2) | Both modified weight differently → `duplicate_edge_weight`; auto-resolve: `max(W1, W2)` |
-| Yes | No | Yes (same as base) | Deleted in ours → delete in merge |
-| Yes | Yes (same as base) | No | Deleted in theirs → delete in merge |
-| Yes | Yes (modified) | No | `modify_delete` conflict → report |
-| Yes | No | Yes (modified) | `modify_delete` conflict → report |
-| Yes | No | No | Deleted in both → delete in merge |
+| In base? | In ours?              | In theirs?            | Action                                                                                                   |
+| -------- | --------------------- | --------------------- | -------------------------------------------------------------------------------------------------------- |
+| No       | Yes                   | No                    | Added in ours only → include                                                                             |
+| No       | No                    | Yes                   | Added in theirs only → include                                                                           |
+| No       | Yes (weight W1)       | Yes (weight W2)       | Both added same edge; W1 == W2 → include. W1 ≠ W2 → `duplicate_edge_weight`; auto-resolve: `max(W1, W2)` |
+| Yes      | Yes (same weight)     | Yes (same weight)     | Unchanged → include                                                                                      |
+| Yes      | Yes (modified weight) | Yes (same as base)    | Modified in ours only → take ours                                                                        |
+| Yes      | Yes (same as base)    | Yes (modified weight) | Modified in theirs only → take theirs                                                                    |
+| Yes      | Yes (W1)              | Yes (W2, W1 ≠ W2)     | Both modified weight differently → `duplicate_edge_weight`; auto-resolve: `max(W1, W2)`                  |
+| Yes      | No                    | Yes (same as base)    | Deleted in ours → delete in merge                                                                        |
+| Yes      | Yes (same as base)    | No                    | Deleted in theirs → delete in merge                                                                      |
+| Yes      | Yes (modified)        | No                    | `modify_delete` conflict → report                                                                        |
+| Yes      | No                    | Yes (modified)        | `modify_delete` conflict → report                                                                        |
+| Yes      | No                    | No                    | Deleted in both → delete in merge                                                                        |
 
 **Edge endpoint validation**: after the entity merge produces the merged entity set, validate that
 every edge in the merged edge set has both endpoints present. An edge whose source or target was
@@ -445,14 +445,14 @@ model.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-|---|---|---|---|
-| CRDT-based automatic merge | No conflicts to report; always produces a result | Silently wrong on semantic contradictions; ADR-010 rejected this | Safety requirement overrides convenience |
-| Git paint-walk LCA | Handles diamond merge histories | Significantly more complex; not needed for v0.1 branch model | Premature generalization |
-| Recursive property merge | Fine-grained conflict detection in nested JSON | Unbounded complexity; inconsistent with ADR-014's wholesale property replace semantics | Not worth the complexity |
-| Single `khive-vcs` crate containing merge | Fewer crates | v0.4 users blocked on merge implementation before they can use `commit`/`branch` | Phasing requires independence |
-| Auto-resolve all conflicts with last-write-wins by default | Fewer merge failures for agents | Silently corrupts research KG; violates "agent provides judgment" principle | Research KG quality requirement |
-| Report semantic contradictions (e.g., conflicting edge relations) | More complete conflict detection | Requires domain reasoning; cannot be implemented in a general merge algorithm | Defer to v0.6 semantic analysis |
+| Alternative                                                       | Pros                                             | Cons                                                                                   | Why rejected                             |
+| ----------------------------------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------- | ---------------------------------------- |
+| CRDT-based automatic merge                                        | No conflicts to report; always produces a result | Silently wrong on semantic contradictions; ADR-010 rejected this                       | Safety requirement overrides convenience |
+| Git paint-walk LCA                                                | Handles diamond merge histories                  | Significantly more complex; not needed for v0.1 branch model                           | Premature generalization                 |
+| Recursive property merge                                          | Fine-grained conflict detection in nested JSON   | Unbounded complexity; inconsistent with ADR-014's wholesale property replace semantics | Not worth the complexity                 |
+| Single `khive-vcs` crate containing merge                         | Fewer crates                                     | v0.4 users blocked on merge implementation before they can use `commit`/`branch`       | Phasing requires independence            |
+| Auto-resolve all conflicts with last-write-wins by default        | Fewer merge failures for agents                  | Silently corrupts research KG; violates "agent provides judgment" principle            | Research KG quality requirement          |
+| Report semantic contradictions (e.g., conflicting edge relations) | More complete conflict detection                 | Requires domain reasoning; cannot be implemented in a general merge algorithm          | Defer to v0.6 semantic analysis          |
 
 ## Consequences
 

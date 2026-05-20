@@ -9,9 +9,9 @@ homepage.workspace = true
 description = "Memory verb pack — remember/recall semantics with decay-aware ranking"
 
 [dependencies]
-khive-types = { version = "0.1.3", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.1.3", path = "../khive-runtime" }
-khive-storage = { version = "0.1.3", path = "../khive-storage" }
+khive-types = { version = "0.1.4", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.1.4", path = "../khive-runtime" }
+khive-storage = { version = "0.1.4", path = "../khive-storage" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -20,7 +20,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
-khive-pack-kg = { version = "0.1.3", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.1.4", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
