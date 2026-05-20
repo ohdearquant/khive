@@ -4,7 +4,6 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -388,47 +387,11 @@ async fn resolve_uuid_async(
 // ---- Output formatting helpers (issue #66) ----
 
 /// Truncate a UUID string to 8 characters for compact display.
-fn short_id(full_uuid: &str) -> &str {
-    if full_uuid.len() >= 8 {
-        &full_uuid[..8]
-    } else {
-        full_uuid
-    }
-}
-
-/// Format a `DateTime<Utc>` as YYYY/MM/DD for compact display.
-fn format_datetime(dt: &DateTime<Utc>) -> String {
-    dt.format("%Y/%m/%d").to_string()
-}
-
-/// Post-process a serialized edge JSON to use compact IDs and dates by default.
+/// Post-process a serialized edge JSON for display.
 ///
-/// When `verbose = false` (default):
-/// - UUID fields (`id`, `source_id`, `target_id`) → 8-char short IDs.
-/// - `created_at` (ISO 8601 string from `DateTime<Utc>`) → YYYY/MM/DD.
-///
-/// When `verbose = true`: returns the value unchanged.
-fn format_edge_output(mut v: Value, verbose: bool) -> Value {
-    if verbose {
-        return v;
-    }
-    if let Some(obj) = v.as_object_mut() {
-        for key in &["id", "source_id", "target_id"] {
-            if let Some(val) = obj.get_mut(*key) {
-                if let Some(s) = val.as_str() {
-                    *val = json!(short_id(s));
-                }
-            }
-        }
-        if let Some(created_at) = obj.get_mut("created_at") {
-            if let Some(s) = created_at.as_str() {
-                // Edge.created_at serializes as ISO 8601 via serde.
-                if let Ok(dt) = s.parse::<DateTime<Utc>>() {
-                    *created_at = json!(format_datetime(&dt));
-                }
-            }
-        }
-    }
+/// Display formatting (short IDs, compact dates) belongs in the CLI/UI layer,
+/// not in the MCP response. Returns the value unchanged.
+fn format_edge_output(v: Value, _verbose: bool) -> Value {
     v
 }
 
