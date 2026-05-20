@@ -47,14 +47,16 @@ Run 'khive <group> <subcommand> --help' for detailed usage.`);
 function printKgUsage(): void {
   console.log(`Usage: khive kg <subcommand>
 
-Subcommands:
+Subcommands (Phase C1 — file-level operations):
   init          Initialise .khive/kg/ in the current git repo
+  validate      Validate NDJSON files against schema
+  commit        Validate + stage + git commit .khive/kg/ files
+  sync          Validate NDJSON (DB rebuild: Phase C2)
+  status        Show entity/edge counts and uncommitted changes
+
+Planned (Phase C2+):
   export        Export live DB to NDJSON files
   import        Import NDJSON files into working.db
-  validate      Validate NDJSON files against schema
-  commit        Export + validate + git commit
-  sync          Rebuild working.db from NDJSON
-  status        Show KG status
   diff          Entity-aware diff
   embed         Embed entities for vector search
   update        Advance a remote pin`);

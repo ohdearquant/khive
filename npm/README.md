@@ -13,11 +13,11 @@ npx khive kg init
 ## Commands
 
 ```bash
-khive kg init          # Initialize .khive/kg/ in a git repo
-khive kg commit -m "msg"  # Export + validate + git commit
-khive kg sync          # Rebuild working.db from NDJSON
-khive kg status        # Show entity/edge counts
-khive kg validate      # Check NDJSON against schema
+khive kg init              # Initialize .khive/kg/ in a git repo
+khive kg validate          # Check NDJSON files against schema
+khive kg commit -m "msg"   # Validate + stage + git commit
+khive kg sync              # Validate NDJSON (DB rebuild: Phase C2)
+khive kg status            # Show entity/edge counts and uncommitted changes
 ```
 
 ## Documentation

@@ -65,6 +65,7 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
   // ── 1. Load schema ────────────────────────────────────────────────────────
   let schemaEntityKinds: Set<string> = new Set(ENTITY_KINDS);
   let schemaRelations: Set<string> = new Set(EDGE_RELATIONS);
+  let schemaRemotes: Set<string> | null = null;
 
   try {
     const schema = await loadSchema(repoRoot);
@@ -78,13 +79,33 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
     if (schema.edge_relations.length > 0) {
       schemaRelations = new Set(schema.edge_relations.map((r) => r.relation));
     }
+    if (schema.remotes && schema.remotes.length > 0) {
+      schemaRemotes = new Set<string>();
+      for (const r of schema.remotes) {
+        if (!r.name || !r.repo || !r.path || !r.commit) {
+          errors.push({
+            file: SCHEMA_FILE,
+            line: 0,
+            message: `Remote '${
+              r.name || "(unnamed)"
+            }' missing required fields (name, repo, path, commit)`,
+          });
+        } else if (!/^[0-9a-f]{40}$/i.test(r.commit)) {
+          errors.push({
+            file: SCHEMA_FILE,
+            line: 0,
+            message: `Remote '${r.name}' commit must be a 40-character SHA, got '${r.commit}'`,
+          });
+        }
+        if (r.name) schemaRemotes.add(r.name);
+      }
+    }
   } catch (err) {
     errors.push({
       file: SCHEMA_FILE,
       line: 0,
       message: `Cannot load schema.yaml: ${(err as Error).message}`,
     });
-    // Proceed with default closed sets so we can still validate NDJSON files
   }
 
   // ── 2. Validate entities.ndjson ───────────────────────────────────────────
@@ -138,7 +159,8 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
         errors.push({
           file: ENTITIES_FILE,
           line,
-          message: `Entity out of sort order: '${entity.id}' must come after '${prevEntityId}' (entities.ndjson must be UUID-ascending)`,
+          message:
+            `Entity out of sort order: '${entity.id}' must come after '${prevEntityId}' (entities.ndjson must be UUID-ascending)`,
         });
       }
       prevEntityId = entity.id;
@@ -191,24 +213,54 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
         });
       }
 
-      // Referential integrity: local UUIDs must exist in entities.ndjson.
-      // Remote references (starting with a non-UUID prefix) are allowed through.
-      const isRemoteRef = (v: string) =>
-        !(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v));
+      // Referential integrity: source MUST be a local UUID. target may be a
+      // remote reference in `<remote>:<uuid>` format (ADR-048 §5).
+      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const REMOTE_REF_RE =
+        /^([a-z][a-z0-9_-]*):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 
-      if (!isRemoteRef(edge.source) && !seenEntityIds.has(edge.source)) {
+      if (!UUID_RE.test(edge.source)) {
+        errors.push({
+          file: EDGES_FILE,
+          line,
+          message: `Edge source must be a local UUID, got '${edge.source}'`,
+        });
+      } else if (!seenEntityIds.has(edge.source)) {
         errors.push({
           file: EDGES_FILE,
           line,
           message: `Edge source '${edge.source}' does not reference a known entity id`,
         });
       }
-      if (!isRemoteRef(edge.target) && !seenEntityIds.has(edge.target)) {
-        errors.push({
-          file: EDGES_FILE,
-          line,
-          message: `Edge target '${edge.target}' does not reference a known entity id`,
-        });
+
+      if (UUID_RE.test(edge.target)) {
+        if (!seenEntityIds.has(edge.target)) {
+          errors.push({
+            file: EDGES_FILE,
+            line,
+            message: `Edge target '${edge.target}' does not reference a known entity id`,
+          });
+        }
+      } else {
+        const remoteMatch = REMOTE_REF_RE.exec(edge.target);
+        if (!remoteMatch) {
+          errors.push({
+            file: EDGES_FILE,
+            line,
+            message:
+              `Edge target '${edge.target}' is neither a UUID nor a valid remote ref (<remote>:<uuid>)`,
+          });
+        } else {
+          const remoteName = remoteMatch[1];
+          if (schemaRemotes && !schemaRemotes.has(remoteName)) {
+            errors.push({
+              file: EDGES_FILE,
+              line,
+              message:
+                `Edge target references undeclared remote '${remoteName}' (not in schema.yaml#remotes)`,
+            });
+          }
+        }
       }
 
       // Duplicate edge_id check
@@ -227,7 +279,8 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
         errors.push({
           file: EDGES_FILE,
           line,
-          message: `Duplicate edge composite key (source, target, relation): (${edge.source}, ${edge.target}, ${edge.relation})`,
+          message:
+            `Duplicate edge composite key (source, target, relation): (${edge.source}, ${edge.target}, ${edge.relation})`,
         });
       }
       seenCompositeKeys.add(compositeKey);
@@ -237,7 +290,8 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
         errors.push({
           file: EDGES_FILE,
           line,
-          message: `Edge out of sort order at composite key '${edge.source}+${edge.target}+${edge.relation}' (edges.ndjson must be composite-key-ascending)`,
+          message:
+            `Edge out of sort order at composite key '${edge.source}+${edge.target}+${edge.relation}' (edges.ndjson must be composite-key-ascending)`,
         });
       }
       prevCompositeKey = compositeKey;

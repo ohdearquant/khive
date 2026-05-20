@@ -65,7 +65,7 @@ allowlist pattern to control what is committed:
 ├── kg/                  # committed — the knowledge graph (versioned in git)
 │   ├── schema.yaml      #   ontology: entity kinds, edge relations, endpoint rules, remotes
 │   ├── entities.ndjson  #   one entity record per line, sorted by UUID
-│   ├── edges.ndjson     #   one edge record per line, sorted by source_id+target_id+relation
+│   ├── edges.ndjson     #   one edge record per line, sorted by source+target+relation
 │   └── migrations/      #   schema migration scripts (ADR-054)
 ├── config.toml          # committed — project configuration (embed model, settings; ADR-057)
 └── state/               # gitignored — derived runtime state
@@ -110,7 +110,7 @@ NDJSON (Newline-Delimited JSON) uses one self-contained JSON record per line wit
 **Sorting rule**: files are kept in sorted primary-key order at all times.
 
 - `entities.ndjson`: sorted by entity UUID (string, case-insensitive ascending).
-- `edges.ndjson`: sorted by `(source_id, target_id, relation)` (all ascending, lexicographic).
+- `edges.ndjson`: sorted by `(source, target, relation)` (all ascending, lexicographic).
 
 Sorting is the key design choice. It ensures that:
 
@@ -241,7 +241,7 @@ Errors if `.khive/kg/` already exists.
 
 Reads all live (non-soft-deleted) entities and edges from the local SQLite database for the
 current namespace and writes them to `.khive/kg/entities.ndjson` and `.khive/kg/edges.ndjson`.
-Entities are sorted by UUID; edges are sorted by `(source_id, target_id, relation)`.
+Entities are sorted by UUID; edges are sorted by `(source, target, relation)`.
 
 After export, the files can be committed with `git add .khive/kg/ && git commit`.
 

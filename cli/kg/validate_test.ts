@@ -295,9 +295,7 @@ Deno.test("validate: rejects edge relation not in schema", async () => {
     const result = await validate(dir);
     assertEquals(result.valid, false);
     assertEquals(
-      result.errors.some((e) =>
-        e.message.includes("not declared in schema.yaml edge_relations")
-      ),
+      result.errors.some((e) => e.message.includes("not declared in schema.yaml edge_relations")),
       true,
     );
   } finally {
