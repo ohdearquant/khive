@@ -4,6 +4,7 @@
 
 use std::str::FromStr;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -12,7 +13,7 @@ use khive_runtime::{
     EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
-use khive_storage::EdgeRelation;
+use khive_storage::{EdgeRelation, EntityFilter};
 
 use crate::vocab::{EntityKind, NoteKind};
 use crate::KgPack;
@@ -246,6 +247,9 @@ struct LinkParams {
     target_id: String,
     relation: String,
     weight: Option<f64>,
+    /// When `true`, output uses full UUIDs and ISO 8601 timestamps instead of
+    /// the default 8-char short IDs and YYYY/MM/DD date format.
+    verbose: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -275,6 +279,66 @@ struct QueryParams {
 
 // ---- Helpers ----
 
+/// Resolve an entity name to its UUID.
+///
+/// Strategy (for issue #65):
+/// 1. Exact case-insensitive name match — returns the entity's UUID.
+/// 2. If 0 matches: `NotFound("entity not found: '{name}'")`
+/// 3. If multiple matches: `Ambiguous("ambiguous name '{name}': found N entities [id1, id2, ...]")`
+///
+/// Only searches `entity` substrate (notes and edges don't have meaningful
+/// user-facing names in the same sense).
+async fn resolve_name_async(
+    name: &str,
+    runtime: &KhiveRuntime,
+    namespace: Option<&str>,
+) -> Result<Uuid, RuntimeError> {
+    // Use EntityFilter.name_prefix with the full name to do an exact match.
+    // The DB implements `name LIKE '?%'` so we get back all names that start
+    // with `name`. We then filter to exact (case-insensitive) matches.
+    let filter = EntityFilter {
+        name_prefix: Some(name.to_string()),
+        ..Default::default()
+    };
+    let page = runtime
+        .entities(namespace)?
+        .query_entities(
+            runtime.ns(namespace),
+            filter,
+            khive_storage::types::PageRequest { offset: 0, limit: 10 },
+        )
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let name_lower = name.to_ascii_lowercase();
+    let exact: Vec<_> = page
+        .items
+        .into_iter()
+        .filter(|e| e.name.to_ascii_lowercase() == name_lower && e.deleted_at.is_none())
+        .collect();
+
+    match exact.len() {
+        0 => Err(RuntimeError::NotFound(format!("entity not found: {name:?}"))),
+        1 => Ok(exact[0].id),
+        n => {
+            let ids: Vec<String> = exact
+                .iter()
+                .map(|e| e.id.to_string()[..8].to_string())
+                .collect();
+            Err(RuntimeError::Ambiguous(format!(
+                "ambiguous name {name:?}: found {n} entities [{}]",
+                ids.join(", ")
+            )))
+        }
+    }
+}
+
+/// Resolve a string to a UUID for use as an edge endpoint (source or target).
+///
+/// Resolution order (issue #65):
+/// 1. Full UUID string — parse directly.
+/// 2. 8+ hex-character prefix — delegate to `runtime.resolve_prefix`.
+/// 3. Everything else — treat as an entity name and call `resolve_name_async`.
 async fn resolve_uuid_async(
     s: &str,
     runtime: &KhiveRuntime,
@@ -294,9 +358,55 @@ async fn resolve_uuid_async(
             Err(e) => return Err(e),
         }
     }
-    Err(RuntimeError::InvalidInput(format!(
-        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
-    )))
+    // Fall back to name-based resolution (issue #65).
+    resolve_name_async(s, runtime, namespace).await
+}
+
+// ---- Output formatting helpers (issue #66) ----
+
+/// Truncate a UUID string to 8 characters for compact display.
+fn short_id(full_uuid: &str) -> &str {
+    if full_uuid.len() >= 8 {
+        &full_uuid[..8]
+    } else {
+        full_uuid
+    }
+}
+
+/// Format a `DateTime<Utc>` as YYYY/MM/DD for compact display.
+fn format_datetime(dt: &DateTime<Utc>) -> String {
+    dt.format("%Y/%m/%d").to_string()
+}
+
+/// Post-process a serialized edge JSON to use compact IDs and dates by default.
+///
+/// When `verbose = false` (default):
+/// - UUID fields (`id`, `source_id`, `target_id`) → 8-char short IDs.
+/// - `created_at` (ISO 8601 string from `DateTime<Utc>`) → YYYY/MM/DD.
+///
+/// When `verbose = true`: returns the value unchanged.
+fn format_edge_output(mut v: Value, verbose: bool) -> Value {
+    if verbose {
+        return v;
+    }
+    if let Some(obj) = v.as_object_mut() {
+        for key in &["id", "source_id", "target_id"] {
+            if let Some(val) = obj.get_mut(*key) {
+                if let Some(s) = val.as_str() {
+                    *val = json!(short_id(s));
+                }
+            }
+        }
+        if let Some(created_at) = obj.get_mut("created_at") {
+            if let Some(s) = created_at.as_str() {
+                // Edge.created_at serializes as ISO 8601 via serde.
+                if let Ok(dt) = s.parse::<DateTime<Utc>>() {
+                    *created_at = json!(format_datetime(&dt));
+                }
+            }
+        }
+    }
+    v
 }
 
 fn parse_direction(s: Option<&str>) -> Direction {
@@ -756,6 +866,7 @@ impl KgPack {
 
     pub(crate) async fn handle_link(&self, params: Value) -> Result<Value, RuntimeError> {
         let p: LinkParams = deser(params)?;
+        let verbose = p.verbose.unwrap_or(false);
         let source =
             resolve_uuid_async(&p.source_id, &self.runtime, p.namespace.as_deref()).await?;
         let target =
@@ -766,7 +877,8 @@ impl KgPack {
             .runtime
             .link(p.namespace.as_deref(), source, target, relation, weight)
             .await?;
-        to_json(&edge)
+        let raw = to_json(&edge)?;
+        Ok(format_edge_output(raw, verbose))
     }
 
     pub(crate) async fn handle_neighbors(&self, params: Value) -> Result<Value, RuntimeError> {
