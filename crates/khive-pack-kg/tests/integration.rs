@@ -48,7 +48,7 @@ fn pack_with_events() -> Fixture {
     builder.with_event_store(event_store);
     builder.register(KgPack::new(rt));
     Fixture {
-        registry: builder.build(),
+        registry: builder.build().expect("registry build must succeed"),
     }
 }
 

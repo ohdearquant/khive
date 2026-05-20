@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "Pluggable authorization gate trait + default AllowAllGate impl for khive verb dispatch."
 
 [dependencies]
-khive-types = { version = "0.1.3", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.1.4", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

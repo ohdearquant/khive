@@ -9,9 +9,9 @@ homepage.workspace = true
 description = "khive stdio MCP server — the only user-facing Rust binary"
 
 [dependencies]
-khive-runtime = { version = "0.1.3", path = "../khive-runtime" }
-khive-request = { version = "0.1.3", path = "../khive-request" }
-khive-dialect-kg = { version = "0.1.3", path = "../khive-dialect-kg" }
+khive-runtime = { version = "0.1.4", path = "../khive-runtime" }
+khive-request = { version = "0.1.4", path = "../khive-request" }
+khive-dialect-kg = { version = "0.1.4", path = "../khive-dialect-kg" }
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 tokio = { workspace = true }
 futures = "0.3"
@@ -25,7 +25,7 @@ anyhow = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rmcp = { version = "1.7", features = ["server", "transport-io", "client"] }
-khive-types = { version = "0.1.3", path = "../khive-types" }
+khive-types = { version = "0.1.4", path = "../khive-types" }
 async-trait = { workspace = true }
 
 [[bin]]
