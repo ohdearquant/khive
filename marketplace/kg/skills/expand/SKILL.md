@@ -29,6 +29,7 @@ The verb examples below show the inner call. Wrap each one as `request(ops="…"
 ## Input
 
 A single gap to expand. Either:
+
 - A concept UUID flagged by `gap` (roadmap, feature direction, research direction)
 - A `properties.domain` value flagged as an architectural gap
 - A set of UUIDs forming a `competes_with` clique flagged as decision debt
@@ -41,14 +42,14 @@ Working from a fresh inventory keeps expansion grounded.
 Pick the mode that matches the gap's category. One expansion = one mode. Do not
 chain modes inside a single skill invocation.
 
-| Gap type from `gap`           | Mode to run     |
-| ----------------------------- | --------------- |
-| Roadmap (researched-unbuilt)  | **Promote**     |
-| Architectural (domain orphan) | **Bridge**      |
-| Feature direction (enables→void) | **Extend**   |
-| Feature direction (decision debt) | **Resolve** |
-| Research direction (single-use paper) | **Extend** |
-| Research direction (narrow framing)   | **Extend** |
+| Gap type from `gap`                   | Mode to run |
+| ------------------------------------- | ----------- |
+| Roadmap (researched-unbuilt)          | **Promote** |
+| Architectural (domain orphan)         | **Bridge**  |
+| Feature direction (enables→void)      | **Extend**  |
+| Feature direction (decision debt)     | **Resolve** |
+| Research direction (single-use paper) | **Extend**  |
+| Research direction (narrow framing)   | **Extend**  |
 
 ### Mode: Promote — roadmap gap → project proposal
 
@@ -212,6 +213,7 @@ fabricating an edge.
 ## Report
 
 State for the record:
+
 - Which gap was the input (cite gap_inventory entry or source UUIDs)
 - Which mode ran
 - New entities created (UUIDs + names)

@@ -44,25 +44,25 @@ request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\
 
 ### 6 Skills (workflow-shaped, not verb docs)
 
-| Skill   | Command       | What it does                                                                                |
-| ------- | ------------- | ------------------------------------------------------------------------------------------- |
-| digest  | `/kg:digest`  | Ingest material into the graph — extract entities, link them, verify density                |
-| explore | `/kg:explore` | Discover what the graph knows about a topic — traverse, narrate, surface gaps               |
-| connect | `/kg:connect` | Wire a new concept into existing knowledge — find relations, reach density                  |
-| polish  | `/kg:polish`  | Audit and fix — orphans, low-degree nodes, duplicates, stale edges                          |
-| gap     | `/kg:gap`     | Strategic-gap survey — researched-but-unbuilt, decision debt, frontier ranking for planning |
+| Skill   | Command       | What it does                                                                                     |
+| ------- | ------------- | ------------------------------------------------------------------------------------------------ |
+| digest  | `/kg:digest`  | Ingest material into the graph — extract entities, link them, verify density                     |
+| explore | `/kg:explore` | Discover what the graph knows about a topic — traverse, narrate, surface gaps                    |
+| connect | `/kg:connect` | Wire a new concept into existing knowledge — find relations, reach density                       |
+| polish  | `/kg:polish`  | Audit and fix — orphans, low-degree nodes, duplicates, stale edges                               |
+| gap     | `/kg:gap`     | Strategic-gap survey — researched-but-unbuilt, decision debt, frontier ranking for planning      |
 | expand  | `/kg:expand`  | Self-expansion — take a gap and grow the graph to close it (promote / bridge / extend / resolve) |
 
 ### 6 Agents (specialized + a generic backstop)
 
-| Agent        | Purpose                                                                                       |
-| ------------ | --------------------------------------------------------------------------------------------- |
-| digester     | Bulk ingestion of source material → typed entities + edges + notes (batch-parallel friendly)  |
-| polisher     | Graph hygiene — orphans, under-linked, duplicates, wrong-direction edges                      |
-| gap-analyst  | Strategic-gap survey — produces `gap_inventory.md` + frontier ranking (read-only)             |
-| expander     | Self-expansion — closes a specific gap by adding new entities/edges with citation discipline  |
-| librarian    | Swarm health monitor — watches the agent task queue, surfaces stuck work, owns taxonomy escalation |
-| researcher   | Generic backstop — open-ended KG-aware research when no specialized agent fits                |
+| Agent       | Purpose                                                                                            |
+| ----------- | -------------------------------------------------------------------------------------------------- |
+| digester    | Bulk ingestion of source material → typed entities + edges + notes (batch-parallel friendly)       |
+| polisher    | Graph hygiene — orphans, under-linked, duplicates, wrong-direction edges                           |
+| gap-analyst | Strategic-gap survey — produces `gap_inventory.md` + frontier ranking (read-only)                  |
+| expander    | Self-expansion — closes a specific gap by adding new entities/edges with citation discipline       |
+| librarian   | Swarm health monitor — watches the agent task queue, surfaces stuck work, owns taxonomy escalation |
+| researcher  | Generic backstop — open-ended KG-aware research when no specialized agent fits                     |
 
 ### Swarm coordination via GTD pack
 

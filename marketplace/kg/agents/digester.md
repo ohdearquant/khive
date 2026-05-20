@@ -61,7 +61,7 @@ Before processing any source:
    on" → `link`. Do not encode relationships as property strings.
 
 5. **Anti-dupe via search before every create.** If `search(query=<name>)` returns a
-   match with the same kind, link to it. If a similar name returns a *different* kind
+   match with the same kind, link to it. If a similar name returns a _different_ kind
    (e.g., "LoRA" the paper-document vs "LoRA" the concept), they are intentionally
    separate — do not merge.
 
@@ -80,6 +80,7 @@ neighbors(node_id="<id>", direction="both")
 ```
 
 Targets:
+
 - concept ≥ 4 edges (at least: parent via instance_of/extends, introduced_by, one
   lateral or implementation edge)
 - project ≥ 3 edges (implements, structural, depends_on)

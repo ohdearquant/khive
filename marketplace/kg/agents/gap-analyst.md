@@ -88,35 +88,47 @@ A single artifact: `gap_inventory.md`. Structure:
 **Polish health**: <last polish run date, residual orphan count, residual dupe count>
 
 ## I. Roadmap gaps
+
 <list, each item: UUID, name, metric, why-it-matters one-liner, downstream concepts>
 
 ## II. Architectural gaps
+
 ### Missing layers
+
 <domains with concept_count >= 5 and project_count == 0>
 
 ### Orphan layers
+
 <projects with zero structural edges>
 
 ## III. Feature direction gaps
+
 ### Enables-into-void
+
 <concept --enables--> unbuilt-target patterns>
 
 ### Decision debt
+
 <competes_with cliques with no implementation>
 
 ## IV. Research direction gaps
+
 ### Single-use papers
+
 <papers with exactly 1 incoming introduced_by AND no downstream activity>
 
 ### Narrow framing
+
 <concepts in multi-option domains with 0 competes_with>
 
 ## Frontier ranking (top 20)
+
 | Rank | UUID | Concept | Score | Why |
-|------|------|---------|-------|-----|
+| ---- | ---- | ------- | ----- | --- |
 ```
 
 Also report to the caller:
+
 - Total findings count per category
 - Top 5 frontier items with one-sentence summaries
 - Any data-quality flags (status/edge mismatches, polish-needed signals)

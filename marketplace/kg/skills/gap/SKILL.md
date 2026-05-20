@@ -47,6 +47,7 @@ neighbors(node_id="<concept-id>", direction="out", relations=["implements"])
 ```
 
 Score:
+
 - `incoming_depends_on_count` — how many things wait on this
 - `outgoing_implements_count` — has any project realized it (should be 0 to count as roadmap gap)
 
@@ -71,6 +72,7 @@ What it surfaces: missing layers and orphan layers.
 **Missing layers**: domains thick with concepts and thin with projects.
 
 Aggregate concepts by `properties.domain`. For each domain:
+
 - count concepts
 - count projects whose `implements` edges land on concepts in that domain
 
@@ -142,6 +144,7 @@ score = (incoming_depends_on_count × adr_mention_weight) / penalty
 ```
 
 Where:
+
 - `incoming_depends_on_count`: how many other concepts list this as a dependency
 - `adr_mention_weight`: count of ADR documents that cite this concept via `introduced_by`
   (use 1 if zero ADRs cite it, to avoid zeroing-out)
@@ -158,34 +161,45 @@ Structure:
 # Gap Inventory — <date>
 
 ## I. Roadmap gaps
+
 - **<concept-name>** (`<8-char-id>`) — incoming_depends_on=N, status=researched, ADR-mentions=K
   - Why it matters: <brief, drawn from concept description>
   - Downstream: <list of dependent concept names>
 
 ## II. Architectural gaps
+
 ### Missing layers
+
 - domain=<X> — N concepts, 0 projects. Sample concepts: <names>
 
 ### Orphan layers
+
 - project=<name> (`<id>`) — 0 structural edges
 
 ## III. Feature direction gaps
+
 ### Enables-into-void
+
 - <concept> enables <unbuilt-target>
 
 ### Decision debt
+
 - clique={<A>, <B>, <C>} — 0 implementations
 
 ## IV. Research direction gaps
+
 ### Single-use papers
+
 - paper=<title> — cited by 1 concept (<name>), that concept has no competes_with, no implements
 
 ### Narrow framing
+
 - concept=<name> in domain=<X> — 0 competes_with edges in a multi-option domain
 
 ## Frontier ranking (top 20)
+
 | Rank | Concept | Score | Reason |
-|------|---------|-------|--------|
+| ---- | ------- | ----- | ------ |
 | 1    | ...     | ...   | ...    |
 ```
 
