@@ -953,7 +953,7 @@ impl PackRuntime for ErrorInjectPack {
 fn make_error_inject_server() -> KhiveMcpServer {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(ErrorInjectPack);
-    let registry = builder.build();
+    let registry = builder.build().expect("error-inject registry builds");
     KhiveMcpServer::from_registry(registry)
 }
 

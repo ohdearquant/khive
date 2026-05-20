@@ -1,6 +1,6 @@
 # ADR-036: Memory Pack Semantics
 
-**Status**: proposed\
+**Status**: accepted\
 **Date**: 2026-05-19\
 **Authors**: khive maintainers
 

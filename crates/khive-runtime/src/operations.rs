@@ -485,6 +485,73 @@ impl KhiveRuntime {
         Ok(note)
     }
 
+    /// Like [`create_note`] but also sets a non-zero decay factor on the note.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_decay(
+        &self,
+        namespace: Option<&str>,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        salience: f64,
+        decay_factor: f64,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<Note> {
+        let ns = self.ns(namespace);
+
+        for &target_id in &annotates {
+            if !self.substrate_exists_in_ns(namespace, target_id).await? {
+                return Err(RuntimeError::NotFound(format!(
+                    "create_note annotates target {target_id} not found in namespace"
+                )));
+            }
+        }
+
+        let mut note = Note::new(ns, kind, content)
+            .with_salience(salience)
+            .with_decay(decay_factor);
+        if let Some(n) = name {
+            note = note.with_name(n);
+        }
+        if let Some(p) = properties {
+            note = note.with_properties(p);
+        }
+        self.notes(Some(ns))?.upsert_note(note.clone()).await?;
+
+        let body = match &note.name {
+            Some(n) => format!("{n} {}", note.content),
+            None => note.content.clone(),
+        };
+
+        self.text_for_notes(Some(ns))?
+            .upsert_document(TextDocument {
+                subject_id: note.id,
+                kind: SubstrateKind::Note,
+                title: note.name.clone(),
+                body,
+                tags: vec![],
+                namespace: ns.to_string(),
+                metadata: note.properties.clone(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await?;
+
+        if self.config().embedding_model.is_some() {
+            let vector = self.embed(&note.content).await?;
+            self.vectors(Some(ns))?
+                .insert(note.id, SubstrateKind::Note, ns, vector)
+                .await?;
+        }
+
+        for target_id in annotates {
+            self.link(Some(ns), note.id, target_id, EdgeRelation::Annotates, 1.0)
+                .await?;
+        }
+
+        Ok(note)
+    }
+
     /// List notes, optionally filtered by kind.
     pub async fn list_notes(
         &self,
