@@ -2,19 +2,23 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Force dark theme — khive is a research tool, always dark */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #0a0a0a;
+  --foreground: #e5e5e5;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  color-scheme: dark;
 }
 
 body {
   color: var(--foreground);
   background: var(--background);
+}
+
+/* Thin scrollbar for dark theme */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #374151 transparent;
 }
