@@ -324,7 +324,7 @@ async fn resolve_name_async(
             filter,
             khive_storage::types::PageRequest {
                 offset: 0,
-                limit: 10,
+                limit: 100,
             },
         )
         .await

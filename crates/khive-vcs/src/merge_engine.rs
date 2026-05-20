@@ -93,7 +93,7 @@ pub enum BranchSide {
 /// (`NoOpMergeEngine`) returns `VcsError::MergeNotImplemented`. Register a
 /// `ThreeWayMergeEngine` from `khive-merge` at startup to enable full merge.
 pub trait MergeEngine: Send + Sync {
-    fn merge(
+    fn merge_branch(
         &self,
         base: &KgArchive,
         ours: &KgArchive,
@@ -109,7 +109,7 @@ pub trait MergeEngine: Send + Sync {
 pub struct NoOpMergeEngine;
 
 impl MergeEngine for NoOpMergeEngine {
-    fn merge(
+    fn merge_branch(
         &self,
         _base: &KgArchive,
         _ours: &KgArchive,
