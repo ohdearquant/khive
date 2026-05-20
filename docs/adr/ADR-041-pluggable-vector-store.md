@@ -161,16 +161,16 @@ would be both inaccurate and ungenerous.
 **Source**: GitHub API — README, `crates/ruvector-core/src/lib.rs`, `types.rs`, `vector_db.rs`,
 `Cargo.toml`, and recent commit log. All findings are from primary source.
 
-| Attribute | Value |
-| --------- | ----- |
-| Stars | 4,100 |
-| Language | Rust (primary) |
-| Version | 2.2.2 |
-| License | MIT |
-| Last commit | 2026-05-19 (active as of this reading) |
-| Created | 2025-11-19 (six months old) |
-| Rust edition | 2021, `rust-version = "1.77"` |
-| Crate count | 90+ (mono-repo: ruvector-core, ruvector-filter, ruvector-hnsw, ruvector-hyperbolic-hnsw, ruvector-postgres, ruvllm, ruvector-raft, ruvector-gnn, and many more) |
+| Attribute    | Value                                                                                                                                                           |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stars        | 4,100                                                                                                                                                           |
+| Language     | Rust (primary)                                                                                                                                                  |
+| Version      | 2.2.2                                                                                                                                                           |
+| License      | MIT                                                                                                                                                             |
+| Last commit  | 2026-05-19 (active as of this reading)                                                                                                                          |
+| Created      | 2025-11-19 (six months old)                                                                                                                                     |
+| Rust edition | 2021, `rust-version = "1.77"`                                                                                                                                   |
+| Crate count  | 90+ (mono-repo: ruvector-core, ruvector-filter, ruvector-hnsw, ruvector-hyperbolic-hnsw, ruvector-postgres, ruvllm, ruvector-raft, ruvector-gnn, and many more) |
 
 MIT license is compatible with khive's Apache-2.0 (MIT is permissive; Apache-2.0 can include MIT
 works). No copyleft concern.
@@ -180,6 +180,7 @@ works). No copyleft concern.
 From `crates/ruvector-core/src/lib.rs` (the module's own documentation block):
 
 > **Working Features (Tested & Benchmarked)**
+>
 > - HNSW Indexing: Approximate nearest neighbor search with O(log n) complexity
 > - SIMD Distance: SimSIMD-powered distance calculations (~16M ops/sec for 512-dim)
 > - Quantization: Scalar (4x), Int4 (8x), Product (8-16x), and binary (32x) compression
@@ -196,6 +197,7 @@ persistence via `redb` (an embedded key-value store). `simd = ["simsimd"]` — S
 acceleration. `parallel = ["rayon", "crossbeam"]` — parallel batch ops.
 
 Additional algorithms listed in the README (v2.1.0 features):
+
 - **DiskANN / Vamana** (`ruvector-core`): SSD-backed ANN with LRU page cache, claimed <10ms
   latency at billion scale.
 - **OPQ** (Optimized Product Quantization): learned rotation for 10–30% error reduction vs
@@ -233,13 +235,13 @@ The in-house implementation reuses the design shape RuVector validated. Specific
 - **Filter API**: a typed `VectorMetadataFilter` (namespaces, kinds, equality predicates) —
   similar in spirit to RuVector's `ruvector-filter::FilterExpression`, narrowed to khive's
   needs (we do not need range/compound predicates for v0.2). The `search_with_filter` method
-  shape is independent of any specific implementation; the *idea* of pushing filters into the
+  shape is independent of any specific implementation; the _idea_ of pushing filters into the
   index scan (vs post-filtering) is the RuVector contribution we adopt.
 - **`search_batch` for HyDE / multi-query**: a single method that takes N query vectors and
   amortises the index-walk overhead. RuVector exposes this in its index layer; we add it to
   our trait surface for the same reason.
 
-### Patterns deliberately *not* adopted
+### Patterns deliberately _not_ adopted
 
 - **DiskANN/Vamana, OPQ, ColBERT multi-vector, Hyperbolic HNSW**: powerful but well past the
   v0.2 scope. Tracked as candidate ideas for a future ANN-research ADR.
@@ -252,12 +254,14 @@ The in-house implementation reuses the design shape RuVector validated. Specific
 ### Maturity signals (why we do not adopt as a dependency)
 
 **Positive**:
+
 - Active: 5 commits on 2026-05-19 alone (supply-chain CI, NAPI binaries).
 - Benchmarks exist: 8 named benchmark targets (distance metrics, HNSW search, quantization,
   batch ops, SIMD). Claimed ~2.5K queries/sec on 10K vectors is plausible for HNSW.
 - Version 2.2.2 with `CHANGELOG.md` — versioned releases.
 
 **Concerns**:
+
 - **Young codebase**. First commit 2025-11-19. Vector stores typically need years of
   production burn-in to discover data-loss bugs at scale. Depending on a young one would put
   khive's correctness on a tighter clock than we want.
@@ -294,7 +298,7 @@ prior art is part of khive's documentation discipline.
 
 Some downstream users may want to plug RuVector directly into khive at deployment time — for
 example, to use a specific RuVector index variant we have not yet reimplemented in
-`khive-vec-hnsw`. The trait-based architecture supports this *without* khive taking on the
+`khive-vec-hnsw`. The trait-based architecture supports this _without_ khive taking on the
 dependency: any community-maintained crate that implements `VectorStore` can be wired through
 `RuntimeConfig.vector_store_kind` and an extension point on the runtime builder.
 
@@ -319,14 +323,14 @@ attribution path is bidirectional rather than one-way extraction.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-| ----------- | ---- | ---- | ------------ |
-| Keep sqlite-vec only | Zero config, already works, single file | O(n) scan ceiling, no quantization, no filter pushdown, WAL lock contention | Strategically wrong for 100K+ KGs |
-| Hard-fork sqlite-vec for HNSW | Stays in-process, familiar codebase | sqlite-vec is C extension code; HNSW graft is non-trivial; we'd own the fork | Maintenance burden exceeds benefit |
-| Multi-backend trait + in-house `khive-vec-hnsw` (this ADR) | Clean abstraction, ADR-005/009 compliant, zero risk to existing users, full quality-bar control, explicit RuVector attribution | Requires implementation work (HNSW + quantization + persistence) | **Selected** |
-| Adopt RuVector as a Cargo dependency (`khive-vec-ruvector` adapter crate) | Less initial implementation work; access to advanced features (DiskANN, OPQ, ColBERT) | Couples khive's quality bar to upstream lint posture; 90+ crate dep graph; release cadence we do not control; data-loss bug surface we cannot audit | Quality-bar and dependency-graph concerns outweigh the implementation-time savings |
-| Full microservice / sidecar (Qdrant, Weaviate, Milvus) | Production-tested, feature-rich | Requires network hop, Docker dep, complicates local-first KG, breaks ADR-012 in-process model | Wrong deployment model for khive |
-| pgvector (via future khive-db-postgres) | Production-quality HNSW in Postgres, pgvector is mature | Only relevant if Postgres backend (ADR-009 v0.3+) exists; doesn't help SQLite users | Follow ADR-009 path; out of scope for v0.2 |
+| Alternative                                                               | Pros                                                                                                                           | Cons                                                                                                                                                | Why rejected                                                                       |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Keep sqlite-vec only                                                      | Zero config, already works, single file                                                                                        | O(n) scan ceiling, no quantization, no filter pushdown, WAL lock contention                                                                         | Strategically wrong for 100K+ KGs                                                  |
+| Hard-fork sqlite-vec for HNSW                                             | Stays in-process, familiar codebase                                                                                            | sqlite-vec is C extension code; HNSW graft is non-trivial; we'd own the fork                                                                        | Maintenance burden exceeds benefit                                                 |
+| Multi-backend trait + in-house `khive-vec-hnsw` (this ADR)                | Clean abstraction, ADR-005/009 compliant, zero risk to existing users, full quality-bar control, explicit RuVector attribution | Requires implementation work (HNSW + quantization + persistence)                                                                                    | **Selected**                                                                       |
+| Adopt RuVector as a Cargo dependency (`khive-vec-ruvector` adapter crate) | Less initial implementation work; access to advanced features (DiskANN, OPQ, ColBERT)                                          | Couples khive's quality bar to upstream lint posture; 90+ crate dep graph; release cadence we do not control; data-loss bug surface we cannot audit | Quality-bar and dependency-graph concerns outweigh the implementation-time savings |
+| Full microservice / sidecar (Qdrant, Weaviate, Milvus)                    | Production-tested, feature-rich                                                                                                | Requires network hop, Docker dep, complicates local-first KG, breaks ADR-012 in-process model                                                       | Wrong deployment model for khive                                                   |
+| pgvector (via future khive-db-postgres)                                   | Production-quality HNSW in Postgres, pgvector is mature                                                                        | Only relevant if Postgres backend (ADR-009 v0.3+) exists; doesn't help SQLite users                                                                 | Follow ADR-009 path; out of scope for v0.2                                         |
 
 ## Q5: VectorStoreCapabilities
 
@@ -354,10 +358,10 @@ pub struct VectorStoreCapabilities {
 
 Example backend declarations (illustrative — not binding on the implementation PR):
 
-| Backend | filter | batch | quant | max_dims | index_kinds |
-| ------- | ------ | ----- | ----- | -------- | ----------- |
-| `SqliteVecStore` | false | false | false | 4096 | `[SqliteVec]` |
-| `HnswStore` (in-house) | true | true | true | None | `[Hnsw, Flat]` |
+| Backend                | filter | batch | quant | max_dims | index_kinds    |
+| ---------------------- | ------ | ----- | ----- | -------- | -------------- |
+| `SqliteVecStore`       | false  | false | false | 4096     | `[SqliteVec]`  |
+| `HnswStore` (in-house) | true   | true  | true  | None     | `[Hnsw, Flat]` |
 
 ## Q1: Expanded VectorStore Trait
 
@@ -501,11 +505,11 @@ ADR-005 (lines 44–45 and 89–91).
 
 Following ADR-009 (lines 28–39):
 
-| Crate | Backend | Status |
-| ----- | ------- | ------ |
-| `khive-db` | sqlite-vec (current) | v0.1 — ships by default |
-| `khive-vec-hnsw` | In-house HNSW + quantization + persistence | planned v0.2 — sibling crate, opt-in |
-| Community adapters | Qdrant, pgvector, Weaviate, RuVector-bridged, etc. | out-of-tree |
+| Crate              | Backend                                            | Status                               |
+| ------------------ | -------------------------------------------------- | ------------------------------------ |
+| `khive-db`         | sqlite-vec (current)                               | v0.1 — ships by default              |
+| `khive-vec-hnsw`   | In-house HNSW + quantization + persistence         | planned v0.2 — sibling crate, opt-in |
+| Community adapters | Qdrant, pgvector, Weaviate, RuVector-bridged, etc. | out-of-tree                          |
 
 `khive-vec-hnsw` skeleton:
 
