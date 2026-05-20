@@ -1,0 +1,49 @@
+#!/usr/bin/env node
+
+const { execFileSync } = require("child_process");
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
+
+const PLATFORM_MAP = {
+  "darwin-arm64": "khive-darwin-arm64",
+  "darwin-x64": "khive-darwin-x64",
+  "linux-arm64": "khive-linux-arm64",
+  "linux-x64": "khive-linux-x64",
+  "win32-x64": "khive-win32-x64.exe",
+};
+
+function getBinaryPath() {
+  const key = `${os.platform()}-${os.arch()}`;
+  const binaryName = PLATFORM_MAP[key];
+  if (!binaryName) {
+    console.error(`Unsupported platform: ${key}`);
+    console.error(`Supported: ${Object.keys(PLATFORM_MAP).join(", ")}`);
+    process.exit(1);
+  }
+
+  // Check for binary in the package's bin directory
+  const localPath = path.join(__dirname, binaryName);
+  if (fs.existsSync(localPath)) return localPath;
+
+  // Check if installed globally or via npx
+  const globalPath = path.join(__dirname, "..", "bin", binaryName);
+  if (fs.existsSync(globalPath)) return globalPath;
+
+  console.error(`Binary not found: ${binaryName}`);
+  console.error("Run 'npm install khive' to download platform binaries.");
+  process.exit(1);
+}
+
+try {
+  const binary = getBinaryPath();
+  const result = execFileSync(binary, process.argv.slice(2), {
+    stdio: "inherit",
+    env: process.env,
+  });
+} catch (err) {
+  if (err.status !== undefined) {
+    process.exit(err.status);
+  }
+  throw err;
+}

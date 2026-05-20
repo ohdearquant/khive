@@ -77,3 +77,6 @@ docs/_build/
 docs/.next/
 
 docs/adr/_review/
+
+# Compiled CLI binaries (built by scripts/compile.sh, not committed)
+npm/bin/khive-*
