@@ -42,20 +42,55 @@ request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\
 | `traverse`  | Multi-hop BFS                               |
 | `query`     | GQL/SPARQL pattern matching                 |
 
-### 4 Skills (workflow-shaped, not verb docs)
+### 6 Skills (workflow-shaped, not verb docs)
 
-| Skill   | Command       | What it does                                                                  |
-| ------- | ------------- | ----------------------------------------------------------------------------- |
-| digest  | `/kg:digest`  | Ingest material into the graph — extract entities, link them, verify density  |
-| explore | `/kg:explore` | Discover what the graph knows about a topic — traverse, narrate, surface gaps |
-| connect | `/kg:connect` | Wire a new concept into existing knowledge — find relations, reach density    |
-| polish  | `/kg:polish`  | Audit and fix — orphans, low-degree nodes, duplicates, stale edges            |
+| Skill   | Command       | What it does                                                                                |
+| ------- | ------------- | ------------------------------------------------------------------------------------------- |
+| digest  | `/kg:digest`  | Ingest material into the graph — extract entities, link them, verify density                |
+| explore | `/kg:explore` | Discover what the graph knows about a topic — traverse, narrate, surface gaps               |
+| connect | `/kg:connect` | Wire a new concept into existing knowledge — find relations, reach density                  |
+| polish  | `/kg:polish`  | Audit and fix — orphans, low-degree nodes, duplicates, stale edges                          |
+| gap     | `/kg:gap`     | Strategic-gap survey — researched-but-unbuilt, decision debt, frontier ranking for planning |
+| expand  | `/kg:expand`  | Self-expansion — take a gap and grow the graph to close it (promote / bridge / extend / resolve) |
 
-### 1 Agent
+### 6 Agents (specialized + a generic backstop)
 
-| Agent      | Purpose                                    |
-| ---------- | ------------------------------------------ |
-| researcher | Context-aware research with KG persistence |
+| Agent        | Purpose                                                                                       |
+| ------------ | --------------------------------------------------------------------------------------------- |
+| digester     | Bulk ingestion of source material → typed entities + edges + notes (batch-parallel friendly)  |
+| polisher     | Graph hygiene — orphans, under-linked, duplicates, wrong-direction edges                      |
+| gap-analyst  | Strategic-gap survey — produces `gap_inventory.md` + frontier ranking (read-only)             |
+| expander     | Self-expansion — closes a specific gap by adding new entities/edges with citation discipline  |
+| librarian    | Swarm health monitor — watches the agent task queue, surfaces stuck work, owns taxonomy escalation |
+| researcher   | Generic backstop — open-ended KG-aware research when no specialized agent fits                |
+
+### Swarm coordination via GTD pack
+
+The kg agents are designed to collaborate **via the GTD pack's task queue**, not by
+direct orchestration. Each agent on completion `assign`s follow-up tasks to the next
+agent in the pipeline, and at start runs `next(assignee=<self>)` to pull its queue.
+
+Pipeline shape:
+
+```
+digester ──► polisher ──► gap-analyst ──► expander ──► polisher (verify)
+                            │                    │
+                            └─► librarian        └─► digester (prior art)
+                                (taxonomy gaps)
+```
+
+To enable the swarm: install **both** `kg` and `gtd` packs.
+
+```bash
+/plugin install kg
+/plugin install gtd
+# or set: KHIVE_PACKS=kg,gtd
+```
+
+Each agent file documents its `Pickup protocol` and `Handoff protocol` sections —
+read those to understand which tasks land in your queue and which you assign on
+completion. A scheduled (or hook-triggered) `next(assignee=<agent>)` poll is enough
+to keep the swarm moving; no central orchestrator required.
 
 ## Schema
 
