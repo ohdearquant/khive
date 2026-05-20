@@ -44,7 +44,10 @@ pub enum EdgeChange {
     /// Deleted in branch.
     Deleted,
     /// Weight modified.
-    WeightModified { base_weight: f64, branch_weight: f64 },
+    WeightModified {
+        base_weight: f64,
+        branch_weight: f64,
+    },
 }
 
 /// Composite key for edge identity.
@@ -66,11 +69,9 @@ impl EdgeKey {
 }
 
 /// Compute entity changes between `base` and `branch`.
-pub fn diff_entities(
-    base: &KgArchive,
-    branch: &KgArchive,
-) -> HashMap<Uuid, EntityChange> {
-    let base_map: HashMap<Uuid, &ExportedEntity> = base.entities.iter().map(|e| (e.id, e)).collect();
+pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, EntityChange> {
+    let base_map: HashMap<Uuid, &ExportedEntity> =
+        base.entities.iter().map(|e| (e.id, e)).collect();
     let branch_map: HashMap<Uuid, &ExportedEntity> =
         branch.entities.iter().map(|e| (e.id, e)).collect();
 
@@ -100,10 +101,7 @@ pub fn diff_entities(
 }
 
 /// Compute edge changes between `base` and `branch`.
-pub fn diff_edges(
-    base: &KgArchive,
-    branch: &KgArchive,
-) -> HashMap<EdgeKey, EdgeChange> {
+pub fn diff_edges(base: &KgArchive, branch: &KgArchive) -> HashMap<EdgeKey, EdgeChange> {
     let base_map: HashMap<EdgeKey, f64> = base
         .edges
         .iter()
@@ -155,10 +153,7 @@ fn entities_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
         && properties_equal(&a.properties, &b.properties)
 }
 
-fn properties_equal(
-    a: &Option<serde_json::Value>,
-    b: &Option<serde_json::Value>,
-) -> bool {
+fn properties_equal(a: &Option<serde_json::Value>, b: &Option<serde_json::Value>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(av), Some(bv)) => av == bv,
@@ -257,7 +252,11 @@ mod tests {
         let base = make_archive(vec![], vec![e.clone()]);
         let branch = make_archive(vec![], vec![e]);
         let diff = diff_edges(&base, &branch);
-        let key = EdgeKey { source: a, target: b, relation: "extends".into() };
+        let key = EdgeKey {
+            source: a,
+            target: b,
+            relation: "extends".into(),
+        };
         assert!(matches!(diff[&key], EdgeChange::Unchanged));
     }
 
@@ -268,7 +267,11 @@ mod tests {
         let base = make_archive(vec![], vec![]);
         let branch = make_archive(vec![], vec![edge(a, b, 0.8)]);
         let diff = diff_edges(&base, &branch);
-        let key = EdgeKey { source: a, target: b, relation: "extends".into() };
+        let key = EdgeKey {
+            source: a,
+            target: b,
+            relation: "extends".into(),
+        };
         assert!(matches!(diff[&key], EdgeChange::Added(_)));
     }
 
@@ -279,7 +282,11 @@ mod tests {
         let base = make_archive(vec![], vec![edge(a, b, 0.5)]);
         let branch = make_archive(vec![], vec![edge(a, b, 1.0)]);
         let diff = diff_edges(&base, &branch);
-        let key = EdgeKey { source: a, target: b, relation: "extends".into() };
+        let key = EdgeKey {
+            source: a,
+            target: b,
+            relation: "extends".into(),
+        };
         assert!(matches!(
             diff[&key],
             EdgeChange::WeightModified {

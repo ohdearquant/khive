@@ -101,27 +101,31 @@ fn edge_to_canonical_value(e: &ExportedEdge) -> Value {
         "relation".to_string(),
         Value::String(e.relation.to_string()),
     );
-    obj.insert("weight".to_string(), Value::Number(
-        serde_json::Number::from_f64(e.weight).unwrap_or(serde_json::Number::from(0)),
-    ));
+    let weight_num = serde_json::Number::from_f64(e.weight)
+        .expect("edge weight must be finite (not NaN or Infinity)");
+    obj.insert("weight".to_string(), Value::Number(weight_num));
     Value::Object(obj)
 }
 
-/// Recursively sort the keys of a JSON object so the hash is key-order-independent.
-fn sort_properties_value(props: Option<Value>) -> Option<Value> {
-    match props? {
+/// Recursively sort the keys of a JSON value so the hash is key-order-independent.
+fn sort_value_recursive(val: Value) -> Value {
+    match val {
         Value::Object(map) => {
-            let mut sorted = Map::new();
-            let mut keys: Vec<String> = map.keys().cloned().collect();
-            keys.sort();
-            for k in keys {
-                let v = map[&k].clone();
-                sorted.insert(k, v);
-            }
-            Some(Value::Object(sorted))
+            let mut pairs: Vec<(String, Value)> = map.into_iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let sorted: Map<String, Value> = pairs
+                .into_iter()
+                .map(|(k, v)| (k, sort_value_recursive(v)))
+                .collect();
+            Value::Object(sorted)
         }
-        other => Some(other),
+        Value::Array(arr) => Value::Array(arr.into_iter().map(sort_value_recursive).collect()),
+        other => other,
     }
+}
+
+fn sort_properties_value(props: Option<Value>) -> Option<Value> {
+    props.map(sort_value_recursive)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

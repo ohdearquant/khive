@@ -22,7 +22,11 @@ pub fn merge_entities(
     let ours_diff = diff_entities(base, ours);
     let theirs_diff = diff_entities(base, theirs);
 
-    let all_ids: HashSet<Uuid> = ours_diff.keys().chain(theirs_diff.keys()).copied().collect();
+    let all_ids: HashSet<Uuid> = ours_diff
+        .keys()
+        .chain(theirs_diff.keys())
+        .copied()
+        .collect();
 
     let mut merged: Vec<ExportedEntity> = Vec::new();
     let mut conflicts: Vec<MergeConflict> = Vec::new();
@@ -36,10 +40,7 @@ pub fn merge_entities(
 
         match (ours_change, theirs_change) {
             // Both branches unchanged → include as-is from base.
-            (
-                Some(EntityChange::Unchanged),
-                Some(EntityChange::Unchanged),
-            ) => {
+            (Some(EntityChange::Unchanged), Some(EntityChange::Unchanged)) => {
                 if let Some(&e) = base_map.get(id) {
                     merged.push(e.clone());
                 }
@@ -74,14 +75,27 @@ pub fn merge_entities(
             | (None, Some(EntityChange::Deleted)) => {}
 
             // Modified in ours, unchanged in theirs → take ours.
-            (Some(EntityChange::Modified { branch: e_ours, .. }), Some(EntityChange::Unchanged))
+            (
+                Some(EntityChange::Modified { branch: e_ours, .. }),
+                Some(EntityChange::Unchanged),
+            )
             | (Some(EntityChange::Modified { branch: e_ours, .. }), None) => {
                 merged.push(e_ours.clone());
             }
 
             // Modified in theirs, unchanged in ours → take theirs.
-            (Some(EntityChange::Unchanged), Some(EntityChange::Modified { branch: e_theirs, .. }))
-            | (None, Some(EntityChange::Modified { branch: e_theirs, .. })) => {
+            (
+                Some(EntityChange::Unchanged),
+                Some(EntityChange::Modified {
+                    branch: e_theirs, ..
+                }),
+            )
+            | (
+                None,
+                Some(EntityChange::Modified {
+                    branch: e_theirs, ..
+                }),
+            ) => {
                 merged.push(e_theirs.clone());
             }
 
@@ -96,8 +110,7 @@ pub fn merge_entities(
                     branch: e_theirs,
                 }),
             ) => {
-                let (entity_result, field_conflicts) =
-                    field_level_merge(*id, e_ours, e_theirs);
+                let (entity_result, field_conflicts) = field_level_merge(*id, e_ours, e_theirs);
                 if field_conflicts.is_empty() {
                     merged.push(entity_result);
                 } else {
@@ -348,7 +361,10 @@ mod tests {
 
         let (_, conflicts) = merge_entities(&base, &ours, &theirs);
         assert!(!conflicts.is_empty());
-        assert!(matches!(conflicts[0], MergeConflict::PropertyMismatch { .. }));
+        assert!(matches!(
+            conflicts[0],
+            MergeConflict::PropertyMismatch { .. }
+        ));
     }
 
     #[test]

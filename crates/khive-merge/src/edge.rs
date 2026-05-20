@@ -27,15 +27,21 @@ pub fn merge_edges(
     let ours_diff = diff_edges(base, ours);
     let theirs_diff = diff_edges(base, theirs);
 
-    let all_keys: HashSet<EdgeKey> =
-        ours_diff.keys().chain(theirs_diff.keys()).cloned().collect();
+    let all_keys: HashSet<EdgeKey> = ours_diff
+        .keys()
+        .chain(theirs_diff.keys())
+        .cloned()
+        .collect();
 
     let mut merged: Vec<ExportedEdge> = Vec::new();
     let mut conflicts: Vec<MergeConflict> = Vec::new();
 
     // Build edge lookup from base for unchanged reference.
-    let base_edge_map: HashMap<EdgeKey, &ExportedEdge> =
-        base.edges.iter().map(|e| (EdgeKey::from_edge(e), e)).collect();
+    let base_edge_map: HashMap<EdgeKey, &ExportedEdge> = base
+        .edges
+        .iter()
+        .map(|e| (EdgeKey::from_edge(e), e))
+        .collect();
 
     for key in &all_keys {
         let ours_change = ours_diff.get(key);
@@ -86,10 +92,7 @@ pub fn merge_edges(
                 Some(EdgeChange::WeightModified { branch_weight, .. }),
                 Some(EdgeChange::Unchanged),
             )
-            | (
-                Some(EdgeChange::WeightModified { branch_weight, .. }),
-                None,
-            ) => {
+            | (Some(EdgeChange::WeightModified { branch_weight, .. }), None) => {
                 let edge = build_edge(key, *branch_weight);
                 merged.push(edge);
             }
@@ -99,18 +102,21 @@ pub fn merge_edges(
                 Some(EdgeChange::Unchanged),
                 Some(EdgeChange::WeightModified { branch_weight, .. }),
             )
-            | (
-                None,
-                Some(EdgeChange::WeightModified { branch_weight, .. }),
-            ) => {
+            | (None, Some(EdgeChange::WeightModified { branch_weight, .. })) => {
                 let edge = build_edge(key, *branch_weight);
                 merged.push(edge);
             }
 
             // Weight modified in both → auto-resolve: max weight.
             (
-                Some(EdgeChange::WeightModified { branch_weight: ours_w, .. }),
-                Some(EdgeChange::WeightModified { branch_weight: theirs_w, .. }),
+                Some(EdgeChange::WeightModified {
+                    branch_weight: ours_w,
+                    ..
+                }),
+                Some(EdgeChange::WeightModified {
+                    branch_weight: theirs_w,
+                    ..
+                }),
             ) => {
                 let edge = build_edge(key, f64::max(*ours_w, *theirs_w));
                 merged.push(edge);
@@ -178,7 +184,10 @@ fn build_edge(key: &EdgeKey, weight: f64) -> ExportedEdge {
     ExportedEdge {
         source: key.source,
         target: key.target,
-        relation: key.relation.parse().expect("valid relation from existing edge"),
+        relation: key
+            .relation
+            .parse()
+            .expect("valid relation from existing edge"),
         weight,
     }
 }
@@ -259,7 +268,9 @@ mod tests {
         let entity_ids: HashSet<Uuid> = [a].into_iter().collect();
         let conflicts = validate_dangling_edges(&edges, &entity_ids);
         assert_eq!(conflicts.len(), 1);
-        assert!(matches!(conflicts[0], MergeConflict::DanglingEdge { missing_endpoint, .. } if missing_endpoint == b));
+        assert!(
+            matches!(conflicts[0], MergeConflict::DanglingEdge { missing_endpoint, .. } if missing_endpoint == b)
+        );
     }
 
     #[test]

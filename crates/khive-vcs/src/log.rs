@@ -2,8 +2,8 @@
 //
 //! `log()` operation — list snapshot history for a branch (ADR-015 `log` tool).
 
-use khive_storage::types::{SqlStatement, SqlValue};
 use khive_runtime::KhiveRuntime;
+use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::error::VcsError;
 use crate::snapshot::row_to_snapshot;
@@ -51,11 +51,7 @@ pub async fn log(
         }
         Some(r) => match r.get("head_id") {
             Some(SqlValue::Text(s)) => SnapshotId::from_prefixed(s)?,
-            _ => {
-                return Err(VcsError::Internal(
-                    "branch head_id is not text".to_string(),
-                ))
-            }
+            _ => return Err(VcsError::Internal("branch head_id is not text".to_string())),
         },
     };
 

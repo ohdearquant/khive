@@ -13,7 +13,7 @@ use crate::error::VcsError;
 /// Invariant: always the string `"sha256:"` followed by exactly 64 lower-case
 /// hex characters. Enforced by `SnapshotId::from_hash`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SnapshotId(pub String);
+pub struct SnapshotId(String);
 
 impl SnapshotId {
     /// Construct from a raw hex digest (without the `"sha256:"` prefix).
@@ -33,9 +33,9 @@ impl SnapshotId {
 
     /// Construct from a full prefixed string (`"sha256:<hex64>"`).
     pub fn from_prefixed(s: &str) -> Result<Self, VcsError> {
-        let hex = s
-            .strip_prefix("sha256:")
-            .ok_or_else(|| VcsError::InvalidSnapshotId(format!("missing sha256: prefix in {:?}", s)))?;
+        let hex = s.strip_prefix("sha256:").ok_or_else(|| {
+            VcsError::InvalidSnapshotId(format!("missing sha256: prefix in {:?}", s))
+        })?;
         Self::from_hash(hex)
     }
 

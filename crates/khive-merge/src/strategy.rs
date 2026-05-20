@@ -14,10 +14,10 @@ use khive_runtime::portability::KgArchive;
 /// For every edge composite key:
 /// - Same logic as entities with weight → prefer ours weight.
 pub fn apply_ours(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) -> KgArchive {
-    use std::collections::HashSet;
-    use khive_runtime::portability::{ExportedEdge, ExportedEntity};
-    use uuid::Uuid;
     use crate::diff_local::EdgeKey;
+    use khive_runtime::portability::{ExportedEdge, ExportedEntity};
+    use std::collections::HashSet;
+    use uuid::Uuid;
 
     // Entity set: include ours entities; add theirs-only additions.
     let ours_ids: HashSet<Uuid> = ours.entities.iter().map(|e| e.id).collect();
@@ -32,10 +32,8 @@ pub fn apply_ours(base: &KgArchive, ours: &KgArchive, theirs: &KgArchive) -> KgA
     }
 
     // Edge set.
-    let ours_keys: HashSet<EdgeKey> =
-        ours.edges.iter().map(EdgeKey::from_edge).collect();
-    let base_keys: HashSet<EdgeKey> =
-        base.edges.iter().map(EdgeKey::from_edge).collect();
+    let ours_keys: HashSet<EdgeKey> = ours.edges.iter().map(EdgeKey::from_edge).collect();
+    let base_keys: HashSet<EdgeKey> = base.edges.iter().map(EdgeKey::from_edge).collect();
 
     let mut edges: Vec<ExportedEdge> = ours.edges.clone();
     for e in &theirs.edges {

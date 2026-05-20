@@ -3,8 +3,8 @@
 //! `branch()` and `checkout()` operations (ADR-042 §4, ADR-015 §D.2).
 
 use chrono::Utc;
-use khive_storage::types::{SqlStatement, SqlValue};
 use khive_runtime::KhiveRuntime;
+use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::error::VcsError;
 use crate::snapshot::load_archive;
@@ -56,11 +56,7 @@ pub async fn create_branch(
             }
             Some(r) => match r.get("head_id") {
                 Some(SqlValue::Text(s)) => SnapshotId::from_prefixed(s)?,
-                _ => {
-                    return Err(VcsError::Internal(
-                        "branch head_id is not text".to_string(),
-                    ))
-                }
+                _ => return Err(VcsError::Internal("branch head_id is not text".to_string())),
             },
         }
     };
@@ -136,10 +132,7 @@ pub async fn get_branch(
             sql: "SELECT namespace, name, head_id, created_at, updated_at \
                   FROM kg_branches WHERE namespace = ? AND name = ?"
                 .to_string(),
-            params: vec![
-                SqlValue::Text(ns),
-                SqlValue::Text(name.to_string()),
-            ],
+            params: vec![SqlValue::Text(ns), SqlValue::Text(name.to_string())],
             label: None,
         })
         .await

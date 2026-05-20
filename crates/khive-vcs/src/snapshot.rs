@@ -3,8 +3,8 @@
 //! `commit()` operation — snapshot the current namespace state (ADR-042 §2, ADR-015 §D.1).
 
 use chrono::Utc;
-use khive_storage::types::{SqlStatement, SqlValue};
 use khive_runtime::KhiveRuntime;
+use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::error::VcsError;
 use crate::hash::snapshot_id_for_archive;
@@ -163,8 +163,7 @@ pub async fn load_archive(
 
     let row = reader
         .query_row(SqlStatement {
-            sql: "SELECT archive_json FROM kg_snapshot_archives WHERE snapshot_id = ?"
-                .to_string(),
+            sql: "SELECT archive_json FROM kg_snapshot_archives WHERE snapshot_id = ?".to_string(),
             params: vec![SqlValue::Text(snapshot_id.as_str().to_string())],
             label: Some("vcs:load_archive".to_string()),
         })
@@ -247,9 +246,7 @@ async fn load_snapshot_metadata(
     row_to_snapshot(&row)
 }
 
-pub(crate) fn row_to_snapshot(
-    row: &khive_storage::types::SqlRow,
-) -> Result<KgSnapshot, VcsError> {
+pub(crate) fn row_to_snapshot(row: &khive_storage::types::SqlRow) -> Result<KgSnapshot, VcsError> {
     let id = match row.get("id") {
         Some(SqlValue::Text(s)) => SnapshotId::from_prefixed(s)?,
         _ => return Err(VcsError::Internal("missing id column".into())),
@@ -296,10 +293,7 @@ pub(crate) fn row_to_snapshot(
 }
 
 /// Load the current VCS state for a namespace.
-pub async fn load_vcs_state(
-    runtime: &KhiveRuntime,
-    namespace: &str,
-) -> Result<VcsState, VcsError> {
+pub async fn load_vcs_state(runtime: &KhiveRuntime, namespace: &str) -> Result<VcsState, VcsError> {
     let sql = runtime.sql();
     let mut reader = sql
         .reader()

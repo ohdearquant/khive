@@ -241,7 +241,9 @@ mod tests {
         let base = empty("test");
         let ours = empty("test");
         let theirs = empty("test");
-        let result = engine.merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+        let result = engine
+            .merge(&base, &ours, &theirs, MergeStrategy::Auto)
+            .unwrap();
         assert!(matches!(result, MergeResult::Clean { .. }));
     }
 }
