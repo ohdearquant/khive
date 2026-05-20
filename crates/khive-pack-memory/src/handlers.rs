@@ -60,14 +60,11 @@ impl MemoryPack {
         }
 
         let importance = p.importance.unwrap_or(0.5).clamp(0.0, 1.0);
-        let decay_factor = p.decay_factor.unwrap_or(0.01).max(0.0);
+        let decay_factor = p.decay_factor.unwrap_or(0.01).clamp(0.0, 1.0);
 
         let mut props = serde_json::json!({});
         if let Some(mt) = &p.memory_type {
             props["memory_type"] = json!(mt);
-        }
-        if let Some(sid) = &p.source_id {
-            props["source_id"] = json!(sid);
         }
         if let Some(tags) = &p.tags {
             if !tags.is_empty() {
@@ -159,33 +156,61 @@ impl MemoryPack {
             vec![]
         };
 
-        // RRF fusion (raw f64)
+        // Pre-filter candidates to memory kind before RRF fusion so non-memory
+        // notes do not consume ranked-slot budget (ADR-036 §6).
+        let note_store = self.runtime.notes(p.namespace.as_deref())?;
+        let now_micros = chrono::Utc::now().timestamp_micros();
+
+        let mut memory_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let candidate_ids: Vec<Uuid> = {
+            let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+            let mut ids: Vec<Uuid> = Vec::new();
+            for id in text_hits
+                .iter()
+                .map(|h| h.subject_id)
+                .chain(vector_hits.iter().map(|h| h.subject_id))
+            {
+                if seen.insert(id) {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+        let mut notes_by_id: HashMap<Uuid, khive_storage::note::Note> = HashMap::new();
+        for id in &candidate_ids {
+            if let Some(note) = note_store.get_note(*id).await? {
+                if note.deleted_at.is_none() && note.kind == "memory" {
+                    memory_ids.insert(*id);
+                    notes_by_id.insert(*id, note);
+                }
+            }
+        }
+
+        // RRF fusion (raw f64) — only over memory-kind candidates.
         let mut buckets: HashMap<Uuid, f64> = HashMap::new();
         for (i, hit) in text_hits.into_iter().enumerate() {
-            let rank = (i + 1) as f64;
-            *buckets.entry(hit.subject_id).or_default() += 1.0 / (RRF_K + rank);
+            if memory_ids.contains(&hit.subject_id) {
+                let rank = (i + 1) as f64;
+                *buckets.entry(hit.subject_id).or_default() += 1.0 / (RRF_K + rank);
+            }
         }
         for (i, hit) in vector_hits.into_iter().enumerate() {
-            let rank = (i + 1) as f64;
-            *buckets.entry(hit.subject_id).or_default() += 1.0 / (RRF_K + rank);
+            if memory_ids.contains(&hit.subject_id) {
+                let rank = (i + 1) as f64;
+                *buckets.entry(hit.subject_id).or_default() += 1.0 / (RRF_K + rank);
+            }
         }
 
         if buckets.is_empty() {
             return to_json(&Vec::<Value>::new());
         }
 
-        let note_store = self.runtime.notes(p.namespace.as_deref())?;
-        let now_micros = chrono::Utc::now().timestamp_micros();
-
         let mut ranked: Vec<(Uuid, f64, khive_storage::note::Note)> = Vec::new();
         for (&id, &rrf) in &buckets {
-            let note = match note_store.get_note(id).await? {
-                Some(n) if n.deleted_at.is_none() => n,
-                _ => continue,
+            let note = match notes_by_id.remove(&id) {
+                Some(n) => n,
+                None => continue,
             };
-            if note.kind != "memory" {
-                continue;
-            }
             if let Some(mt) = &p.memory_type {
                 let stored = note
                     .properties

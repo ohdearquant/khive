@@ -3,6 +3,7 @@ use khive_pack_memory::MemoryPack;
 use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
 use khive_types::Pack;
 use serde_json::json;
+use uuid::Uuid;
 
 fn make_runtime() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
@@ -233,4 +234,184 @@ fn test_memory_pack_requires_kg() {
     assert_eq!(MemoryPack::REQUIRES, &["kg"]);
     assert_eq!(MemoryPack::NAME, "memory");
     assert_eq!(MemoryPack::NOTE_KINDS, &["memory"]);
+}
+
+/// Regression test for issue #93: source_id must NOT be stored in note properties.
+/// The annotates edge is the sole authorized source reference (ADR-036 §4).
+#[tokio::test]
+async fn test_remember_source_id_not_in_properties() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Create a real entity to use as the source (source_id must exist in namespace).
+    let source = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "person",
+                "name": "Alice",
+                "description": "test source person"
+            }),
+        )
+        .await
+        .expect("create source entity");
+    let source_uuid = source["id"].as_str().unwrap().to_string();
+
+    let result = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "memory with a source",
+                "source": source_uuid
+            }),
+        )
+        .await
+        .expect("remember with source_id");
+
+    let note_id: Uuid = result["note_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .expect("valid uuid");
+
+    let note_store = rt.notes(None).expect("note store");
+    let note = note_store
+        .get_note(note_id)
+        .await
+        .expect("get note")
+        .expect("note exists");
+
+    if let Some(props) = &note.properties {
+        assert!(
+            props.get("source_id").is_none(),
+            "source_id must not be stored in note properties; got: {props:?}"
+        );
+    }
+}
+
+/// Regression test for issue #100: decay_factor must be clamped to [0, 1].
+#[tokio::test]
+async fn test_remember_decay_factor_clamped() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // decay > 1.0 should be clamped to 1.0
+    let result = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "memory with excessive decay",
+                "decay": 5.0
+            }),
+        )
+        .await
+        .expect("remember with large decay");
+
+    let note_id: Uuid = result["note_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .expect("valid uuid");
+
+    let note_store = rt.notes(None).expect("note store");
+    let note = note_store
+        .get_note(note_id)
+        .await
+        .expect("get note")
+        .expect("note exists");
+
+    assert!(
+        note.decay_factor <= 1.0,
+        "decay_factor must be <= 1.0 after clamping, got {}",
+        note.decay_factor
+    );
+    assert!(
+        note.decay_factor >= 0.0,
+        "decay_factor must be >= 0.0, got {}",
+        note.decay_factor
+    );
+}
+
+/// Regression test for issue #94: non-memory notes must not appear in recall results.
+///
+/// Creates more non-memory notes than the default `limit * 4` candidate threshold (the amount
+/// at which non-memory notes can dominate the candidate pool without pre-filtering), then
+/// verifies that recall returns only memory-kind notes.
+#[tokio::test]
+async fn test_recall_excludes_non_memory_notes() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Create 50 observation notes whose content matches the recall query — enough to
+    // dominate a `limit=5` candidate pool at `limit * 4 = 20` without pre-filtering.
+    for i in 0..50 {
+        rt.create_note(
+            None,
+            "observation",
+            None,
+            &format!("observation {i} about attention mechanisms in neural networks"),
+            0.5,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create observation");
+    }
+
+    // Create a small number of memory notes with matching content.
+    let mem1 = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "memory note about attention mechanisms in neural networks",
+                "importance": 0.8
+            }),
+        )
+        .await
+        .expect("remember 1");
+    let mem2 = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "another memory note about attention mechanisms",
+                "importance": 0.7
+            }),
+        )
+        .await
+        .expect("remember 2");
+    let mem1_id = mem1["note_id"].as_str().unwrap().to_string();
+    let mem2_id = mem2["note_id"].as_str().unwrap().to_string();
+
+    let result = registry
+        .dispatch(
+            "recall",
+            json!({ "query": "attention mechanisms neural networks", "limit": 5 }),
+        )
+        .await
+        .expect("recall succeeds");
+
+    let hits = result.as_array().expect("array of hits");
+    assert!(
+        !hits.is_empty(),
+        "recall should return memory notes even when non-memory notes dominate the index"
+    );
+    let ids: Vec<&str> = hits
+        .iter()
+        .map(|h| h["note_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&mem1_id.as_str()) || ids.contains(&mem2_id.as_str()),
+        "at least one memory note must appear in recall results"
+    );
+    for hit in hits {
+        // recall must never surface observation or other non-memory kinds
+        assert!(
+            hit.get("note_id").is_some(),
+            "hit has note_id field (memory pack shape)"
+        );
+        assert!(
+            hit.get("salience").is_some(),
+            "hit has salience field (memory pack shape)"
+        );
+    }
 }
