@@ -54,13 +54,18 @@ logs/
 Thumbs.db
 ehthumbs.db
 
-# khive runtime data
+# khive runtime data (working databases, not committed)
 *.db
 *.db-shm
 *.db-wal
 *.sqlite
 *.sqlite3
-.khive/
+
+# khive KG layout:
+#   .khive/kg/       — committed (NDJSON + schema.yaml)
+#   .khive/config.toml — committed (project config)
+#   .khive/state/    — gitignored (working.db, derived from NDJSON)
+.khive/state/
 
 # Test artifacts
 test_models/
@@ -72,3 +77,6 @@ docs/_build/
 docs/.next/
 
 docs/adr/_review/
+
+# Compiled CLI binaries (built by scripts/compile.sh, not committed)
+npm/bin/khive-*

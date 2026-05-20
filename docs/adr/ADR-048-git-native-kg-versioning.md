@@ -56,17 +56,47 @@ handled by git.
 
 ### 1. File layout
 
-The KG for a project is serialized into three files under `.khive/kg/`:
+The `.khive/` directory is the root for all khive project data. A `.khive/.gitignore` uses an
+allowlist pattern to control what is committed:
 
 ```
-.khive/kg/
-  schema.yaml          # ontology: entity kinds, edge relations, endpoint rules, remotes
-  entities.ndjson      # one entity record per line, sorted by UUID
-  edges.ndjson         # one edge record per line, sorted by source_id+target_id+relation
+.khive/
+├── .gitignore           # allowlist: ignores everything except kg/ and config.toml
+├── kg/                  # committed — the knowledge graph (versioned in git)
+│   ├── schema.yaml      #   ontology: entity kinds, edge relations, endpoint rules, remotes
+│   ├── entities.ndjson  #   one entity record per line, sorted by UUID
+│   ├── edges.ndjson     #   one edge record per line, sorted by source+target+relation
+│   └── migrations/      #   schema migration scripts (ADR-054)
+├── config.toml          # committed — project configuration (embed model, settings; ADR-057)
+└── state/               # gitignored — derived runtime state
+    └── working.db       #   SQLite working database, rebuilt by `khive kg sync`
 ```
 
-These files are committed to the project's git repository alongside source code, documentation,
-and configuration. Git provides the commit history; GitHub provides diffs, PRs, and review.
+**`.khive/.gitignore`** (created by `khive kg init`):
+
+```gitignore
+# Ignore everything by default
+*
+
+# Except KG data (committed to git)
+!.gitignore
+!kg/
+!kg/**
+!config.toml
+```
+
+This allowlist pattern ensures that internal workspace directories (notes, discover, reprompt,
+state, etc.) are automatically ignored without explicit entries. Only the KG data files and
+project configuration are tracked by git.
+
+**`state/working.db`** is the SQLite working database — the live queryable representation of
+the NDJSON data. It is derived state: `khive kg sync` rebuilds it from the committed NDJSON
+files. It is never committed to git. Any command that needs the working DB auto-creates
+`.khive/state/` if it does not exist (no `init` required after `git clone`).
+
+The three KG data files under `kg/` are committed to the project's git repository alongside
+source code, documentation, and configuration. Git provides the commit history; GitHub provides
+diffs, PRs, and review.
 
 Every file is UTF-8 plain text. The `.khive/kg/` directory should be included in the project's
 `.gitattributes` with `text eol=lf` to ensure line-ending stability across platforms, which is
@@ -80,7 +110,7 @@ NDJSON (Newline-Delimited JSON) uses one self-contained JSON record per line wit
 **Sorting rule**: files are kept in sorted primary-key order at all times.
 
 - `entities.ndjson`: sorted by entity UUID (string, case-insensitive ascending).
-- `edges.ndjson`: sorted by `(source_id, target_id, relation)` (all ascending, lexicographic).
+- `edges.ndjson`: sorted by `(source, target, relation)` (all ascending, lexicographic).
 
 Sorting is the key design choice. It ensures that:
 
@@ -211,7 +241,7 @@ Errors if `.khive/kg/` already exists.
 
 Reads all live (non-soft-deleted) entities and edges from the local SQLite database for the
 current namespace and writes them to `.khive/kg/entities.ndjson` and `.khive/kg/edges.ndjson`.
-Entities are sorted by UUID; edges are sorted by `(source_id, target_id, relation)`.
+Entities are sorted by UUID; edges are sorted by `(source, target, relation)`.
 
 After export, the files can be committed with `git add .khive/kg/ && git commit`.
 

@@ -1,0 +1,127 @@
+/**
+ * `khive kg commit` — validate + git commit (Phase C1).
+ *
+ * Phase C1 scope: validate the existing NDJSON files, stage them, and create a git commit.
+ * Export from a live DB (the `khive kg export` step) is Phase C2 and is not yet integrated.
+ * Until Phase C2, this command operates on NDJSON files that are managed directly by the
+ * author (not generated from a Rust DB).
+ */
+
+import { exec, getCurrentBranch, gitAdd, gitCommit } from "../lib/git.ts";
+import { EDGES_FILE, ensureStateDir, ENTITIES_FILE, SCHEMA_FILE } from "../lib/paths.ts";
+import { countLines } from "../lib/ndjson.ts";
+import { printValidationResult, validate } from "./validate.ts";
+
+// ─── Prompt helper ────────────────────────────────────────────────────────────
+
+/** Read a single line from stdin. Returns empty string on EOF. */
+async function readLine(): Promise<string> {
+  const buf = new Uint8Array(1024);
+  const n = await Deno.stdin.read(buf);
+  if (n === null) return "";
+  return new TextDecoder().decode(buf.subarray(0, n)).trim();
+}
+
+// ─── Staged-change check ──────────────────────────────────────────────────────
+
+/**
+ * Returns true if there are staged changes to .khive/kg/ files.
+ * Uses `git diff --cached --quiet` — exit code 1 means changes are staged.
+ */
+async function hasStagedKgChanges(repoRoot: string): Promise<boolean> {
+  const result = await exec([
+    "git",
+    "diff",
+    "--cached",
+    "--quiet",
+    "--",
+    `${repoRoot}/${ENTITIES_FILE}`,
+    `${repoRoot}/${EDGES_FILE}`,
+    `${repoRoot}/${SCHEMA_FILE}`,
+  ]);
+  // exit 0 = no staged changes, exit 1 = staged changes present
+  return result.code === 1;
+}
+
+// ─── CLI entry point ──────────────────────────────────────────────────────────
+
+/**
+ * `khive kg commit` command.
+ *
+ * Args:
+ *   -m <message>   Commit message (prompts if omitted).
+ *
+ * Exits 0 on success or when there is nothing to commit.
+ * Exits 1 on validation failure or git error.
+ */
+export async function runCommit(repoRoot: string, args: string[]): Promise<void> {
+  // Ensure .khive/state/ exists — works even after git clone without init
+  await ensureStateDir(repoRoot);
+
+  // ── 1. Parse -m flag ──────────────────────────────────────────────────────
+  let message: string | undefined;
+  const mIdx = args.indexOf("-m");
+  if (mIdx !== -1 && args[mIdx + 1]) {
+    message = args[mIdx + 1];
+  }
+
+  if (!message) {
+    // Prompt via stdin
+    console.log("Commit message: ");
+    message = await readLine();
+    if (!message) {
+      console.error("Commit message is required.");
+      Deno.exit(1);
+    }
+  }
+
+  // ── 2. Export step (Phase C1: validation pass on existing NDJSON) ─────────
+  // When `khive kg export` is available, this step will run:
+  //   await runExport(repoRoot);
+  // For now we validate the existing NDJSON files, which is the same
+  // correctness guarantee for KG repos that manage NDJSON manually.
+  console.log("Validating KG files...");
+  const validationResult = await validate(repoRoot);
+
+  if (!validationResult.valid) {
+    printValidationResult(validationResult);
+    console.error("\nCommit aborted: fix validation errors first.");
+    Deno.exit(1);
+  }
+
+  // ── 3. Stage KG files ─────────────────────────────────────────────────────
+  await gitAdd([
+    `${repoRoot}/${ENTITIES_FILE}`,
+    `${repoRoot}/${EDGES_FILE}`,
+    `${repoRoot}/${SCHEMA_FILE}`,
+  ]);
+
+  // ── 4. Check for staged changes ───────────────────────────────────────────
+  const hasChanges = await hasStagedKgChanges(repoRoot);
+  if (!hasChanges) {
+    console.log("Nothing to commit (KG is clean)");
+    return;
+  }
+
+  // ── 5. Git commit ─────────────────────────────────────────────────────────
+  let shortSha: string;
+  try {
+    shortSha = await gitCommit(message);
+  } catch (err) {
+    console.error(`git commit failed: ${(err as Error).message}`);
+    Deno.exit(1);
+  }
+
+  // ── 6. Print summary ──────────────────────────────────────────────────────
+  const branch = await getCurrentBranch();
+  const entityCount = await countLines(`${repoRoot}/${ENTITIES_FILE}`);
+  const edgeCount = await countLines(`${repoRoot}/${EDGES_FILE}`);
+
+  const entityChanged = validationResult.entityCount;
+  const edgeChanged = validationResult.edgeCount;
+
+  console.log(`[${branch} ${shortSha}] ${message}`);
+  console.log(
+    `  ${entityCount} entities, ${edgeCount} edges (${entityChanged} validated, ${edgeChanged} edges validated)`,
+  );
+}

@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  compile:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: khive-darwin-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary: khive-darwin-x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: khive-linux-x64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary: khive-linux-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: khive-win32-x64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Compile
+        run: |
+          deno compile \
+            --allow-read --allow-write --allow-run --allow-env \
+            --target ${{ matrix.target }} \
+            --output npm/bin/${{ matrix.binary }} \
+            cli/main.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: npm/bin/${{ matrix.binary }}
+
+  publish:
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: npm/bin
+          merge-multiple: true
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          jq --arg v "$VERSION" '.version = $v' npm/package.json > tmp.json
+          mv tmp.json npm/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Publish
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

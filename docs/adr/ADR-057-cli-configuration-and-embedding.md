@@ -57,6 +57,10 @@ The CLI resolves configuration from two TOML files, merged at runtime.
 .khive/config.toml
 ```
 
+This file is part of the `.khive/` directory layout defined in ADR-048 §1. The `.khive/.gitignore`
+uses an allowlist that explicitly includes `config.toml` alongside `kg/` — all other `.khive/`
+contents (state/, notes/, discover/, etc.) are gitignored by default.
+
 **User-level** (not committed, machine-specific defaults):
 
 ```

@@ -166,7 +166,7 @@ context, not the whole graph.
 **Edges**:
 
 - Labeled with relation name, rendered as directed arrows
-- Relation-to-color mapping (derived from the 5 ADR-002 categories):
+- Relation-to-color mapping (derived from the 6 ADR-002 categories):
   - Structure (contains / part_of / instance_of): gray
   - Derivation (extends / variant_of / introduced_by / supersedes): purple
   - Dependency (depends_on / enables): orange
@@ -648,7 +648,7 @@ server in one batch. This is the designed use case for the batch syntax.
 ## References
 
 - [ADR-001](ADR-001-entity-kind-taxonomy.md): Entity Kind Taxonomy (6 kinds, their properties)
-- [ADR-002](ADR-002-edge-ontology.md): Closed Edge Ontology (13 relations, 5 categories)
+- [ADR-002](ADR-002-edge-ontology.md): Closed Edge Ontology (13 relations, 6 categories)
 - [ADR-003](ADR-003-four-layer-architecture.md): Four-Layer Architecture (frontend layer context)
 - [ADR-008](ADR-008-query-layer-separation.md): Query Layer Separation (path finder dependency)
 - [ADR-011](ADR-011-deno-mcp-only-server.md): Deno User Surfaces (HTTP gateway; frontend calls Deno)
