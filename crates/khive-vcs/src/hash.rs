@@ -59,7 +59,10 @@ pub fn canonical_json(archive: &KgArchive) -> Result<String, VcsError> {
     });
 
     let entity_values: Vec<Value> = entities.iter().map(entity_to_canonical_value).collect();
-    let edge_values: Vec<Value> = edges.iter().map(edge_to_canonical_value).collect();
+    let edge_values: Vec<Value> = edges
+        .iter()
+        .map(edge_to_canonical_value)
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut root = Map::new();
     root.insert("entities".to_string(), Value::Array(entity_values));
@@ -93,7 +96,7 @@ fn entity_to_canonical_value(e: &ExportedEntity) -> Value {
 }
 
 /// Serialize a single edge with fixed key order.
-fn edge_to_canonical_value(e: &ExportedEdge) -> Value {
+fn edge_to_canonical_value(e: &ExportedEdge) -> Result<Value, VcsError> {
     let mut obj = Map::new();
     obj.insert("source".to_string(), Value::String(e.source.to_string()));
     obj.insert("target".to_string(), Value::String(e.target.to_string()));
@@ -101,10 +104,14 @@ fn edge_to_canonical_value(e: &ExportedEdge) -> Value {
         "relation".to_string(),
         Value::String(e.relation.to_string()),
     );
-    let weight_num = serde_json::Number::from_f64(e.weight)
-        .expect("edge weight must be finite (not NaN or Infinity)");
+    let weight_num = serde_json::Number::from_f64(e.weight).ok_or_else(|| {
+        VcsError::Internal(format!(
+            "edge weight is not finite (NaN or Infinity): {}",
+            e.weight
+        ))
+    })?;
     obj.insert("weight".to_string(), Value::Number(weight_num));
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 /// Recursively sort the keys of a JSON value so the hash is key-order-independent.

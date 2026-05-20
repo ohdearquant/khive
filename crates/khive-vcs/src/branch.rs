@@ -21,6 +21,8 @@ pub async fn create_branch(
     from_branch: Option<&str>,
     from_snapshot_id: Option<&SnapshotId>,
 ) -> Result<KgBranch, VcsError> {
+    validate_branch_name(name)?;
+
     let ns = runtime.ns(namespace).to_string();
     let created_at = Utc::now().timestamp_micros();
 
@@ -334,6 +336,19 @@ async fn wipe_namespace(runtime: &KhiveRuntime, namespace: &str) -> Result<(), V
             .delete_entity(Some(namespace), e.id, true)
             .await
             .map_err(|e| VcsError::Storage(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Validate that a branch name matches `^[a-zA-Z0-9_-]{1,64}$`.
+fn validate_branch_name(name: &str) -> Result<(), VcsError> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(VcsError::InvalidBranchName(name.to_string()));
     }
     Ok(())
 }

@@ -2,6 +2,8 @@
 //
 //! `log()` operation — list snapshot history for a branch (ADR-015 `log` tool).
 
+use std::collections::HashSet;
+
 use khive_runtime::KhiveRuntime;
 use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -58,10 +60,16 @@ pub async fn log(
     // Walk parent chain up to `limit` snapshots.
     let mut results = Vec::new();
     let mut current_id: Option<SnapshotId> = Some(head_id);
+    let mut visited: HashSet<SnapshotId> = HashSet::new();
 
     while let Some(id) = current_id {
         if results.len() as i64 >= limit {
             break;
+        }
+        if !visited.insert(id.clone()) {
+            return Err(VcsError::Internal(
+                "cycle in snapshot parent chain".to_string(),
+            ));
         }
 
         let row = reader
@@ -105,8 +113,15 @@ pub async fn ancestor_ids(
 
     let mut ids = Vec::new();
     let mut current: Option<SnapshotId> = Some(start_id.clone());
+    let mut visited: HashSet<SnapshotId> = HashSet::new();
 
     while let Some(id) = current {
+        if !visited.insert(id.clone()) {
+            return Err(VcsError::Internal(
+                "cycle in snapshot parent chain".to_string(),
+            ));
+        }
+
         let row = reader
             .query_row(SqlStatement {
                 sql: "SELECT parent_id FROM kg_snapshots WHERE id = ?".to_string(),

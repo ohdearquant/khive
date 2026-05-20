@@ -65,6 +65,10 @@ pub enum VcsError {
     #[error("invalid snapshot id: {0}")]
     InvalidSnapshotId(String),
 
+    /// A branch name failed validation (must match `^[a-zA-Z0-9_-]{1,64}$`).
+    #[error("invalid branch name: {0:?}")]
+    InvalidBranchName(String),
+
     /// An underlying storage operation failed.
     #[error("storage: {0}")]
     Storage(String),

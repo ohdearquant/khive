@@ -129,7 +129,7 @@ impl RemoteConfig {
 }
 
 /// Authentication credentials for a remote khive instance.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteAuth {
     /// No authentication (anonymous access).
@@ -138,6 +138,22 @@ pub enum RemoteAuth {
     Bearer { token: String },
     /// HTTP basic authentication.
     Basic { user: String, password: String },
+}
+
+impl std::fmt::Debug for RemoteAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "RemoteAuth::None"),
+            Self::Bearer { .. } => write!(f, "RemoteAuth::Bearer {{ token: \"[REDACTED]\" }}"),
+            Self::Basic { user, .. } => {
+                write!(
+                    f,
+                    "RemoteAuth::Basic {{ user: {:?}, password: \"[REDACTED]\" }}",
+                    user
+                )
+            }
+        }
+    }
 }
 
 // ── VcsState ─────────────────────────────────────────────────────────────────
