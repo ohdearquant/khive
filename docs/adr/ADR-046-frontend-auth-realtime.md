@@ -1,4 +1,4 @@
-# ADR-044: Frontend Authentication and Real-Time Event Delivery
+# ADR-046: Frontend Authentication and Real-Time Event Delivery
 
 **Status**: proposed\
 **Date**: 2026-05-20\
