@@ -81,7 +81,7 @@ fn three_way_merge_auto(
 pub struct ThreeWayMergeEngine;
 
 impl MergeEngine for ThreeWayMergeEngine {
-    fn merge(
+    fn merge_branch(
         &self,
         base: &KgArchive,
         ours: &KgArchive,
@@ -242,7 +242,7 @@ mod tests {
         let ours = empty("test");
         let theirs = empty("test");
         let result = engine
-            .merge(&base, &ours, &theirs, MergeStrategy::Auto)
+            .merge_branch(&base, &ours, &theirs, MergeStrategy::Auto)
             .unwrap();
         assert!(matches!(result, MergeResult::Clean { .. }));
     }
