@@ -988,10 +988,7 @@ mod tests {
 
     use std::sync::Mutex as StdMutex;
 
-    // Serialize tracing capture tests — with_default is thread-local, so
-    // parallel tests with different subscribers race on CI.
-    static TRACING_TEST_LOCK: std::sync::LazyLock<StdMutex<()>> =
-        std::sync::LazyLock::new(|| StdMutex::new(()));
+    use serial_test::serial;
     use tracing::field::{Field, Visit};
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Layer;
@@ -1055,7 +1052,6 @@ mod tests {
     where
         Fut: std::future::Future<Output = ()>,
     {
-        let _serial = TRACING_TEST_LOCK.lock().unwrap();
         let captured: Arc<StdMutex<Vec<CapturedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
 
@@ -1080,6 +1076,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn dispatch_tracing_emits_one_gate_check_event_on_allow() {
         let events = capture_dispatch_events(async {
             let mut builder = VerbRegistryBuilder::new();
@@ -1380,6 +1377,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn dispatch_tracing_emits_gate_check_event_with_deny_payload() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
