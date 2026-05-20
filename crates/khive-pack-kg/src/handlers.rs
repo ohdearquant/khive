@@ -305,7 +305,10 @@ async fn resolve_name_async(
         .query_entities(
             runtime.ns(namespace),
             filter,
-            khive_storage::types::PageRequest { offset: 0, limit: 10 },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
         )
         .await
         .map_err(RuntimeError::Storage)?;
@@ -318,7 +321,9 @@ async fn resolve_name_async(
         .collect();
 
     match exact.len() {
-        0 => Err(RuntimeError::NotFound(format!("entity not found: {name:?}"))),
+        0 => Err(RuntimeError::NotFound(format!(
+            "entity not found: {name:?}"
+        ))),
         1 => Ok(exact[0].id),
         n => {
             let ids: Vec<String> = exact

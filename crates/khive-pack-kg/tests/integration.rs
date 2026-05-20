@@ -1249,14 +1249,35 @@ async fn link_default_output_uses_short_ids() {
         .expect("link must succeed");
 
     // By default (no verbose param), IDs should be 8 characters.
-    let id = result.get("id").and_then(|v| v.as_str()).expect("id must be present");
-    assert_eq!(id.len(), 8, "default output must use 8-char short ID; got: {id:?}");
+    let id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id must be present");
+    assert_eq!(
+        id.len(),
+        8,
+        "default output must use 8-char short ID; got: {id:?}"
+    );
 
-    let src_id = result.get("source_id").and_then(|v| v.as_str()).expect("source_id must be present");
-    assert_eq!(src_id.len(), 8, "default output must use 8-char short source_id; got: {src_id:?}");
+    let src_id = result
+        .get("source_id")
+        .and_then(|v| v.as_str())
+        .expect("source_id must be present");
+    assert_eq!(
+        src_id.len(),
+        8,
+        "default output must use 8-char short source_id; got: {src_id:?}"
+    );
 
-    let tgt_id = result.get("target_id").and_then(|v| v.as_str()).expect("target_id must be present");
-    assert_eq!(tgt_id.len(), 8, "default output must use 8-char short target_id; got: {tgt_id:?}");
+    let tgt_id = result
+        .get("target_id")
+        .and_then(|v| v.as_str())
+        .expect("target_id must be present");
+    assert_eq!(
+        tgt_id.len(),
+        8,
+        "default output must use 8-char short target_id; got: {tgt_id:?}"
+    );
 }
 
 #[tokio::test]
@@ -1344,21 +1365,30 @@ async fn link_verbose_output_uses_full_uuids() {
         .expect("link with verbose=true must succeed");
 
     // With verbose=true, IDs should be full UUIDs (36 chars: 32 hex + 4 dashes).
-    let id = result.get("id").and_then(|v| v.as_str()).expect("id must be present");
+    let id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id must be present");
     assert_eq!(
         id.len(),
         36,
         "verbose output must use full UUID (36 chars); got: {id:?}"
     );
 
-    let src_id = result.get("source_id").and_then(|v| v.as_str()).expect("source_id must be present");
+    let src_id = result
+        .get("source_id")
+        .and_then(|v| v.as_str())
+        .expect("source_id must be present");
     assert_eq!(
         src_id.len(),
         36,
         "verbose source_id must be full UUID; got: {src_id:?}"
     );
 
-    let tgt_id = result.get("target_id").and_then(|v| v.as_str()).expect("target_id must be present");
+    let tgt_id = result
+        .get("target_id")
+        .and_then(|v| v.as_str())
+        .expect("target_id must be present");
     assert_eq!(
         tgt_id.len(),
         36,
