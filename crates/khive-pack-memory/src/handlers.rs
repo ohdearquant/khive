@@ -177,12 +177,11 @@ impl MemoryPack {
             ids
         };
         let mut notes_by_id: HashMap<Uuid, khive_storage::note::Note> = HashMap::new();
-        for id in &candidate_ids {
-            if let Some(note) = note_store.get_note(*id).await? {
-                if note.deleted_at.is_none() && note.kind == "memory" {
-                    memory_ids.insert(*id);
-                    notes_by_id.insert(*id, note);
-                }
+        let batch = note_store.get_notes_batch(&candidate_ids).await?;
+        for note in batch {
+            if note.deleted_at.is_none() && note.kind == "memory" {
+                memory_ids.insert(note.id);
+                notes_by_id.insert(note.id, note);
             }
         }
 

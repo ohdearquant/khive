@@ -325,18 +325,54 @@ async fn estimate_uncommitted_count(
 }
 
 /// Delete all entities and edges in a namespace to prepare for checkout restore.
+///
+/// Uses bulk SQL DELETEs instead of per-entity loop to avoid N+1 overhead.
 async fn wipe_namespace(runtime: &KhiveRuntime, namespace: &str) -> Result<(), VcsError> {
-    let entities = runtime
-        .list_entities(Some(namespace), None, u32::MAX)
+    let sql = runtime.sql();
+    let mut writer = sql
+        .writer()
         .await
         .map_err(|e| VcsError::Storage(e.to_string()))?;
 
-    for e in &entities {
-        runtime
-            .delete_entity(Some(namespace), e.id, true)
-            .await
-            .map_err(|e| VcsError::Storage(e.to_string()))?;
-    }
+    let ns_param = vec![SqlValue::Text(namespace.to_string())];
+
+    // Edges first (referential integrity), then FTS/vector indexes, then entities.
+    writer
+        .execute(SqlStatement {
+            sql: "DELETE FROM edges WHERE namespace = ?1".to_string(),
+            params: ns_param.clone(),
+            label: Some("wipe_edges".to_string()),
+        })
+        .await
+        .map_err(|e| VcsError::Storage(e.to_string()))?;
+
+    writer
+        .execute(SqlStatement {
+            sql: "DELETE FROM text_index WHERE namespace = ?1".to_string(),
+            params: ns_param.clone(),
+            label: Some("wipe_text_index".to_string()),
+        })
+        .await
+        .map_err(|e| VcsError::Storage(e.to_string()))?;
+
+    writer
+        .execute(SqlStatement {
+            sql: "DELETE FROM vectors WHERE namespace = ?1".to_string(),
+            params: ns_param.clone(),
+            label: Some("wipe_vectors".to_string()),
+        })
+        .await
+        .map_err(|e| VcsError::Storage(e.to_string()))?;
+
+    writer
+        .execute(SqlStatement {
+            sql: "DELETE FROM entities WHERE namespace = ?1".to_string(),
+            params: ns_param,
+            label: Some("wipe_entities".to_string()),
+        })
+        .await
+        .map_err(|e| VcsError::Storage(e.to_string()))?;
+
     Ok(())
 }
 
