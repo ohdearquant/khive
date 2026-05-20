@@ -1,6 +1,6 @@
 # ADR-037: Inter-pack Vocabulary Dependencies
 
-**Status**: proposed **Date**: 2026-05-19
+**Status**: accepted  **Date**: 2026-05-19
 **Authors**: khive maintainers
 
 ## Context

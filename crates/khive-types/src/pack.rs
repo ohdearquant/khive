@@ -85,6 +85,13 @@ pub trait Pack {
     /// Defaults to empty — packs that introduce no new endpoint pairs (or
     /// only rely on the ADR-002 base contract) can ignore this.
     const EDGE_RULES: &'static [EdgeEndpointRule] = &[];
+
+    /// Other pack names whose vocabulary this pack references (ADR-037).
+    ///
+    /// The runtime checks that every name in `REQUIRES` appears in the
+    /// loaded pack set before any pack is registered. Defaults to empty
+    /// so existing packs compile without changes.
+    const REQUIRES: &'static [&'static str] = &[];
 }
 
 #[cfg(test)]

@@ -37,7 +37,7 @@ fn pack() -> Fixture {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt));
     Fixture {
-        registry: builder.build(),
+        registry: builder.build().expect("registry builds"),
     }
 }
 
@@ -846,27 +846,22 @@ async fn create_note_non_kg_kind_rejected_by_pack_validation() {
 //
 // These tests prove that the `resolve_kind_spec` routing in `handle_search` is
 // driven entirely by `VerbRegistry.all_entity_kinds()` / `all_note_kinds()`,
-// with no hard-coded kind list. A fake MemoryPack registers `"semantic"` and
-// `"episodic"` as note kinds. Once registered, `search(kind="semantic")`
-// must route to note-search (not error), and `search(kind="bogus")` must list
-// `"semantic"` among the valid options.
-//
-// This is the prerequisite contract for Lane B (memory pack): when the real
-// memory pack lands, it only needs to declare `NOTE_KINDS = &["semantic",
-// "episodic"]` in its `Pack` impl — the verb routing requires no changes here.
+// with no hard-coded kind list. A fake MemoryPack registers `"memory"` as a
+// note kind (ADR-036: one kind, advisory memory_type property). Once registered,
+// `search(kind="memory")` must route to note-search (not error), and
+// `search(kind="bogus")` must list `"memory"` among the valid options.
 
-/// A minimal second pack that declares `"semantic"` and `"episodic"` as note
-/// kinds. It does not handle any verbs itself — dispatch falls through to the
-/// KG pack that owns `search`. This mirrors the real memory pack's shape where
-/// the memory-pack registers kinds and lifecycle verbs while KG provides the
-/// generic CRUD verbs.
+/// A minimal second pack that declares `"memory"` as a note kind (ADR-036).
+/// It does not handle any verbs itself — dispatch falls through to the KG pack
+/// that owns `search`. Requires "kg" per ADR-037 so topo sort puts kg first.
 struct FakeMemoryPack;
 
 impl Pack for FakeMemoryPack {
     const NAME: &'static str = "memory";
-    const NOTE_KINDS: &'static [&'static str] = &["semantic", "episodic"];
+    const NOTE_KINDS: &'static [&'static str] = &["memory"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const VERBS: &'static [VerbDef] = &[];
+    const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
 #[async_trait]
@@ -887,13 +882,16 @@ impl PackRuntime for FakeMemoryPack {
         FakeMemoryPack::VERBS
     }
 
+    fn requires(&self) -> &'static [&'static str] {
+        FakeMemoryPack::REQUIRES
+    }
+
     async fn dispatch(
         &self,
         verb: &str,
         _params: Value,
         _registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        // FakeMemoryPack declares no verbs — callers should not dispatch to it.
         Err(RuntimeError::InvalidInput(format!(
             "FakeMemoryPack does not handle verb {verb:?}"
         )))
@@ -908,67 +906,60 @@ fn pack_with_memory() -> Fixture {
     builder.register(KgPack::new(rt));
     builder.register(FakeMemoryPack);
     Fixture {
-        registry: builder.build(),
+        registry: builder.build().expect("registry builds"),
     }
 }
 
 #[tokio::test]
-async fn registry_exposes_semantic_kind_once_memory_pack_registered() {
-    // When FakeMemoryPack is loaded, `all_note_kinds()` must include "semantic"
-    // and "episodic" — these are the kinds the real memory pack will advertise.
+async fn registry_exposes_memory_kind_once_memory_pack_registered() {
+    // When FakeMemoryPack is loaded, `all_note_kinds()` must include "memory"
+    // (ADR-036: one kind, advisory memory_type property).
     let fixture = pack_with_memory();
     let note_kinds = fixture.registry.all_note_kinds();
     assert!(
-        note_kinds.contains(&"semantic"),
-        "registry must advertise 'semantic' once memory pack is loaded; got: {note_kinds:?}"
+        note_kinds.contains(&"memory"),
+        "registry must advertise 'memory' once memory pack is loaded; got: {note_kinds:?}"
     );
     assert!(
-        note_kinds.contains(&"episodic"),
-        "registry must advertise 'episodic' once memory pack is loaded; got: {note_kinds:?}"
+        !note_kinds.contains(&"semantic") && !note_kinds.contains(&"episodic"),
+        "memory_type must not be exposed as separate note kinds; got: {note_kinds:?}"
     );
 }
 
 #[tokio::test]
-async fn search_kind_semantic_routes_to_note_substrate_via_registry() {
-    // `search(kind="semantic")` must resolve through the registry (not fail) and
-    // route to note-search with kind_filter="semantic". With no notes stored the
-    // result is an empty array, not an error.
+async fn search_kind_memory_routes_to_note_substrate_via_registry() {
     let fixture = pack_with_memory();
 
-    // First create a note with kind="semantic" so we have something to search.
-    // The kg `create` verb resolves `kind="semantic"` to the note substrate via
-    // `resolve_kind_spec` — this exercises the same registry path.
     let created = fixture
         .dispatch(
             "create",
             json!({
-                "kind": "semantic",
-                "content": "registry driven kind routing for semantic memories"
+                "kind": "memory",
+                "content": "registry driven kind routing for memory notes",
+                "properties": {"memory_type": "semantic"}
             }),
         )
         .await
-        .expect("create with kind=semantic must succeed when memory pack is loaded");
+        .expect("create with kind=memory must succeed when memory pack is loaded");
     assert_eq!(
         created.get("kind").and_then(Value::as_str),
-        Some("semantic"),
-        "note created with kind=semantic must be stored as kind=semantic; got: {created}"
+        Some("memory"),
+        "note created with kind=memory must be stored as kind=memory; got: {created}"
     );
 
-    // Now search with kind="semantic" — must route to note-search, not error.
     let result = fixture
         .dispatch(
             "search",
-            json!({"kind": "semantic", "query": "registry driven kind routing", "limit": 5}),
+            json!({"kind": "memory", "query": "registry driven kind routing", "limit": 5}),
         )
         .await
-        .expect("search(kind=\"semantic\") must succeed once memory pack registers the kind");
+        .expect("search(kind=\"memory\") must succeed once memory pack registers the kind");
 
     let hits = result.as_array().expect("search result must be array");
     assert!(
         !hits.is_empty(),
-        "search(kind=\"semantic\") must find the note we just created; got: {hits:?}"
+        "search(kind=\"memory\") must find the note we just created; got: {hits:?}"
     );
-    // Each hit must carry note_id (note-substrate response shape).
     for hit in hits {
         assert!(
             hit.get("note_id").is_some(),
@@ -1017,7 +1008,7 @@ async fn search_kind_entity_still_works_alongside_memory_pack() {
 }
 
 #[tokio::test]
-async fn search_bogus_kind_lists_semantic_and_episodic_in_error() {
+async fn search_bogus_kind_lists_memory_in_error() {
     // The error message for an unknown kind must list ALL registered kinds,
     // including those contributed by FakeMemoryPack. This proves the error
     // path walks the full merged registry, not a hard-coded list.
@@ -1034,23 +1025,20 @@ async fn search_bogus_kind_lists_semantic_and_episodic_in_error() {
     );
     let msg = invalid_input_message(&err);
     assert!(msg.contains("bogus"), "error must name the bad kind: {msg}");
-    // Substrate-level names.
     assert!(msg.contains("entity"), "error must list 'entity': {msg}");
     assert!(msg.contains("note"), "error must list 'note': {msg}");
-    // KG pack kinds.
     assert!(msg.contains("concept"), "error must list 'concept': {msg}");
     assert!(
         msg.contains("observation"),
         "error must list 'observation': {msg}"
     );
-    // FakeMemoryPack kinds — these prove the merged registry drives the error.
     assert!(
-        msg.contains("semantic"),
-        "error must list 'semantic' (contributed by memory pack): {msg}"
+        msg.contains("memory"),
+        "error must list 'memory' (contributed by memory pack): {msg}"
     );
     assert!(
-        msg.contains("episodic"),
-        "error must list 'episodic' (contributed by memory pack): {msg}"
+        !msg.contains("semantic") && !msg.contains("episodic"),
+        "memory_type values must not be listed as note kinds: {msg}"
     );
 }
 

@@ -451,6 +451,50 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
+        self.create_note_inner(
+            namespace, kind, name, content, salience, None, properties, annotates,
+        )
+        .await
+    }
+
+    /// Like [`create_note`] but also sets a non-zero decay factor on the note.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_decay(
+        &self,
+        namespace: Option<&str>,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        salience: f64,
+        decay_factor: f64,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<Note> {
+        self.create_note_inner(
+            namespace,
+            kind,
+            name,
+            content,
+            salience,
+            Some(decay_factor),
+            properties,
+            annotates,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_note_inner(
+        &self,
+        namespace: Option<&str>,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        salience: f64,
+        decay_factor: Option<f64>,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<Note> {
         let ns = self.ns(namespace);
 
         // Validate all annotates targets before any write (ADR-024:295 atomicity).
@@ -463,6 +507,9 @@ impl KhiveRuntime {
         }
 
         let mut note = Note::new(ns, kind, content).with_salience(salience);
+        if let Some(df) = decay_factor {
+            note = note.with_decay(df);
+        }
         if let Some(n) = name {
             note = note.with_name(n);
         }
@@ -476,7 +523,6 @@ impl KhiveRuntime {
             None => note.content.clone(),
         };
 
-        // Index into FTS5.
         self.text_for_notes(Some(ns))?
             .upsert_document(TextDocument {
                 subject_id: note.id,
@@ -490,7 +536,6 @@ impl KhiveRuntime {
             })
             .await?;
 
-        // Index into vector store if model is configured.
         if self.config().embedding_model.is_some() {
             let vector = self.embed(&note.content).await?;
             self.vectors(Some(ns))?
@@ -498,7 +543,6 @@ impl KhiveRuntime {
                 .await?;
         }
 
-        // Create annotates edges.
         for target_id in annotates {
             self.link(Some(ns), note.id, target_id, EdgeRelation::Annotates, 1.0)
                 .await?;
