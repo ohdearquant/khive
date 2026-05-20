@@ -8,11 +8,11 @@ use uuid::Uuid;
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::note::Note;
 use khive_storage::types::{
-    DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery,
+    DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page,
     PageRequest, SortOrder, SqlStatement, TextDocument, TextFilter, TextQueryMode,
     TextSearchRequest, TraversalRequest, VectorSearchRequest,
 };
-use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event};
+use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, SubstrateKind};
 
 use crate::error::{RuntimeError, RuntimeResult};
@@ -165,6 +165,28 @@ impl KhiveRuntime {
             .query_entities(self.ns(namespace), filter, PageRequest { offset: 0, limit })
             .await?;
         Ok(page.items)
+    }
+
+    /// List events in a namespace, optionally filtered.
+    pub async fn list_events(
+        &self,
+        namespace: Option<&str>,
+        filter: EventFilter,
+        limit: u32,
+        offset: u32,
+    ) -> RuntimeResult<Page<Event>> {
+        let limit = limit.clamp(1, 1000);
+        let page = self
+            .events(namespace)?
+            .query_events(
+                filter,
+                PageRequest {
+                    offset: offset.into(),
+                    limit,
+                },
+            )
+            .await?;
+        Ok(page)
     }
 
     // ---- Edge operations ----
@@ -690,7 +712,12 @@ impl KhiveRuntime {
         let ns = self.ns(namespace).to_string();
         let pattern = format!("{}%", prefix);
 
-        let tables = [("entities", true), ("notes", true), ("graph_edges", false)];
+        let tables = [
+            ("entities", true),
+            ("notes", true),
+            ("events", false),
+            ("graph_edges", false),
+        ];
 
         let mut matches: Vec<String> = Vec::new();
         let mut reader = self.sql().reader().await.map_err(RuntimeError::Storage)?;

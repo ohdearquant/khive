@@ -13,6 +13,7 @@ khive-types = { version = "0.1.3", path = "../khive-types", features = ["serde"]
 khive-runtime = { version = "0.1.3", path = "../khive-runtime" }
 khive-storage = { version = "0.1.3", path = "../khive-storage" }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

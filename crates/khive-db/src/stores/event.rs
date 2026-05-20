@@ -501,6 +501,7 @@ const EVENTS_DDL: &str = "\
     CREATE INDEX IF NOT EXISTS idx_events_verb ON events(verb);\
     CREATE INDEX IF NOT EXISTS idx_events_substrate ON events(substrate);\
     CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);\
+    CREATE INDEX IF NOT EXISTS idx_events_ns_created ON events(namespace, created_at DESC);\
 ";
 
 pub(crate) fn ensure_events_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
