@@ -59,11 +59,11 @@ export interface Entity {
   [key: string]: unknown;
 }
 
-/** A validated edge record. */
+/** A validated edge record (ADR-048 §2 field names). */
 export interface Edge {
-  id: string;
-  source_id: string;
-  target_id: string;
+  edge_id: string;
+  source: string;
+  target: string;
   relation: EdgeRelation;
   [key: string]: unknown;
 }
@@ -94,19 +94,21 @@ export function parseEntityLine(json: unknown): Entity | null {
 }
 
 /**
- * Attempt to parse a raw JSON value as an Edge.
- * Returns null if required fields are missing or invalid.
+ * Attempt to parse a raw JSON value as an Edge (ADR-048 §2 field names).
+ *
+ * Required fields: edge_id (UUID), source (UUID or remote ref), target (UUID or remote ref),
+ * relation (closed set from EDGE_RELATIONS).
  */
 export function parseEdgeLine(json: unknown): Edge | null {
   if (typeof json !== "object" || json === null || Array.isArray(json)) {
     return null;
   }
   const obj = json as Record<string, unknown>;
-  if (typeof obj["id"] !== "string" || !isUuid(obj["id"])) return null;
-  if (typeof obj["source_id"] !== "string" || obj["source_id"].length === 0) {
+  if (typeof obj["edge_id"] !== "string" || !isUuid(obj["edge_id"])) return null;
+  if (typeof obj["source"] !== "string" || obj["source"].length === 0) {
     return null;
   }
-  if (typeof obj["target_id"] !== "string" || obj["target_id"].length === 0) {
+  if (typeof obj["target"] !== "string" || obj["target"].length === 0) {
     return null;
   }
   if (!EDGE_RELATIONS.includes(obj["relation"] as EdgeRelation)) return null;

@@ -1,8 +1,10 @@
 /**
- * `khive kg status` — summarize KG state against last git commit (ADR-051 §3).
+ * `khive kg status` — file-level KG status (Phase C1).
  *
- * Shows entity/edge counts, modified-since-last-commit counts, and validation state.
- * No git writes occur.
+ * Phase C1 scope: shows entity/edge counts from NDJSON files, modified-since-last-commit
+ * counts via git diff, and validation state. No git writes occur.
+ * DB-vs-NDJSON diff (live DB state vs. committed NDJSON) is Phase C2 and is not yet
+ * integrated — that requires the Rust runtime to export DB state for comparison.
  */
 
 import { exec } from "../lib/git.ts";
@@ -103,7 +105,7 @@ async function computeStatus(
     const schema = await loadSchema(repoRoot);
     entityKindCount = schema.entity_kinds.length;
     edgeRelationCount = schema.edge_relations.length;
-    remoteCount = schema.remotes ? Object.keys(schema.remotes).length : 0;
+    remoteCount = schema.remotes ? schema.remotes.length : 0;
     schemaValid = entityKindCount > 0 && edgeRelationCount > 0;
   } catch {
     schemaValid = false;
@@ -226,48 +228,88 @@ function formatStatus(s: KgStatus): string {
   return lines.join("\n");
 }
 
+// ─── Namespace validation (ADR-051 §2) ───────────────────────────────────────
+
+/** ADR-051 namespace regex: lowercase alphanumeric, underscores, hyphens, 2-64 chars. */
+const NAMESPACE_RE = /^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$/;
+
+/**
+ * Validate a namespace string against ADR-051 constraints.
+ * Returns an error message if invalid, or null if valid.
+ */
+export function validateNamespace(ns: string): string | null {
+  if (!NAMESPACE_RE.test(ns)) {
+    return (
+      `Invalid namespace '${ns}'. Must match ^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$ ` +
+      `(lowercase alphanumeric with optional underscores/hyphens, 2-64 chars).`
+    );
+  }
+  return null;
+}
+
 // ─── Namespace resolution (ADR-051 §2) ───────────────────────────────────────
 
 /**
  * Resolve the KG namespace for the current repo.
  * Order: --namespace flag → .khive/settings.json actor.name → git remote → dir name.
+ * Validates the resolved namespace against ADR-051 and errors with guidance if invalid.
  */
 async function resolveNamespace(
   repoRoot: string,
   flagValue?: string,
 ): Promise<string> {
-  if (flagValue) return flagValue;
+  let candidate: string | undefined;
 
-  // Try .khive/settings.json
-  try {
-    const settingsPath = `${repoRoot}/.khive/settings.json`;
-    const text = await Deno.readTextFile(settingsPath);
-    const settings = JSON.parse(text) as Record<string, unknown>;
-    const actor = settings["actor"] as Record<string, unknown> | undefined;
-    if (typeof actor?.["name"] === "string" && actor["name"].length > 0) {
-      return actor["name"] as string;
+  if (flagValue) {
+    candidate = flagValue;
+  } else {
+    // Try .khive/settings.json
+    try {
+      const settingsPath = `${repoRoot}/.khive/settings.json`;
+      const text = await Deno.readTextFile(settingsPath);
+      const settings = JSON.parse(text) as Record<string, unknown>;
+      const actor = settings["actor"] as Record<string, unknown> | undefined;
+      if (typeof actor?.["name"] === "string" && actor["name"].length > 0) {
+        candidate = actor["name"] as string;
+      }
+    } catch {
+      // Not found or invalid JSON — continue
     }
-  } catch {
-    // Not found or invalid JSON — continue
   }
 
-  // Try git remote URL
-  try {
-    const { exec: gitExec } = await import("../lib/git.ts");
-    const result = await gitExec(["git", "remote", "get-url", "origin"]);
-    if (result.code === 0 && result.stdout) {
-      const url = result.stdout.trim();
-      // Extract repo name from ssh: git@github.com:owner/repo.git or https: .../repo.git
-      const match = url.match(/[:/]([^/]+?)(?:\.git)?$/);
-      if (match) return match[1];
+  if (!candidate) {
+    // Try git remote URL
+    try {
+      const result = await exec(["git", "remote", "get-url", "origin"]);
+      if (result.code === 0 && result.stdout) {
+        const url = result.stdout.trim();
+        // Extract repo name from ssh: git@github.com:owner/repo.git or https: .../repo.git
+        const match = url.match(/[:/]([^/]+?)(?:\.git)?$/);
+        if (match) candidate = match[1];
+      }
+    } catch {
+      // No remote — continue
     }
-  } catch {
-    // No remote — continue
   }
 
-  // Fall back to directory name
-  const parts = repoRoot.split("/");
-  return parts[parts.length - 1] ?? "unknown";
+  if (!candidate) {
+    // Fall back to directory name
+    const parts = repoRoot.split("/");
+    candidate = parts[parts.length - 1] ?? "unknown";
+  }
+
+  // Validate the resolved namespace
+  const nsError = validateNamespace(candidate);
+  if (nsError) {
+    console.error(`Error: ${nsError}`);
+    console.error(
+      `Set a valid namespace via --namespace, .khive/settings.json actor.name, ` +
+        `git remote origin name, or ensure the directory name is valid.`,
+    );
+    Deno.exit(1);
+  }
+
+  return candidate;
 }
 
 // ─── CLI entry point ──────────────────────────────────────────────────────────

@@ -24,15 +24,15 @@ Usage:
 
 KG subcommands:
   init          Initialise .khive/kg/ in the current git repo
-  export        Export live DB to .khive/kg/entities.ndjson + edges.ndjson
-  import        Import .khive/kg/ NDJSON files into working.db
-  validate      Check NDJSON files against schema (no DB writes)
-  commit        Export + validate + git commit in one step
-  sync          Rebuild working.db from committed NDJSON files
-  status        Show entity/edge counts and uncommitted changes
-  diff          Entity-aware diff between two NDJSON states
-  embed         Embed entities into working.db (for vector search)
-  update        Advance a remote pin in schema.yaml
+  validate      Validate NDJSON files against schema (no DB writes)
+  commit        Validate NDJSON files + git commit (Phase C1; DB export is Phase C2)
+  sync          Validate NDJSON + create working.db placeholder (Phase C1; DB rebuild is Phase C2)
+  status        Show entity/edge counts and uncommitted changes (file-level; DB diff is Phase C2)
+  export        Export live DB to NDJSON files (Phase C2 — not yet implemented)
+  import        Import NDJSON files into working.db (Phase C2 — not yet implemented)
+  diff          Entity-aware diff between two NDJSON states (Phase C2 — not yet implemented)
+  embed         Embed entities into working.db (Phase C2 — not yet implemented)
+  update        Advance a remote pin in schema.yaml (Phase C2 — not yet implemented)
 
 Auth subcommands:
   login         Sign in to khive.ai via GitHub OAuth

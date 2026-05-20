@@ -38,9 +38,12 @@ export interface EdgeRelationDef {
   description?: string;
 }
 
+/** A remote KG reference as defined in ADR-048 §3. */
 export interface RemoteDef {
-  url: string;
-  ref?: string;
+  name: string;
+  repo: string;
+  path: string;
+  commit: string;
 }
 
 export interface PackRef {
@@ -53,7 +56,8 @@ export interface Schema {
   entity_kinds: string[];
   edge_relations: EdgeRelationDef[];
   note_kinds?: string[];
-  remotes?: Record<string, RemoteDef>;
+  /** Remotes are a list of {name, repo, path, commit} entries (ADR-048 §3). */
+  remotes?: RemoteDef[];
   packs?: PackRef[];
 }
 
@@ -95,9 +99,9 @@ function parseSchemaYaml(text: string): Schema {
     | "packs_entry";
 
   let state: ParseState = "root";
-  let currentRemoteName = "";
   let currentEdge: Partial<EdgeRelationDef> | null = null;
   let currentPack: Partial<PackRef> | null = null;
+  let currentRemote: Partial<RemoteDef> | null = null;
 
   function flushEdge() {
     if (currentEdge?.relation) {
@@ -114,6 +118,14 @@ function parseSchemaYaml(text: string): Schema {
     currentPack = null;
   }
 
+  function flushRemote() {
+    if (currentRemote?.name) {
+      schema.remotes ??= [];
+      schema.remotes.push(currentRemote as RemoteDef);
+    }
+    currentRemote = null;
+  }
+
   for (const rawLine of lines) {
     const line = rawLine.trimEnd();
     if (line.trim() === "" || line.trim().startsWith("#")) continue;
@@ -125,6 +137,7 @@ function parseSchemaYaml(text: string): Schema {
     if (indent === 0) {
       flushEdge();
       flushPack();
+      flushRemote();
 
       // scalar: `key: value`
       const scalarMatch = trimmed.match(/^(\w+):\s+(.+)$/);
@@ -154,7 +167,7 @@ function parseSchemaYaml(text: string): Schema {
             state = "note_kinds";
             break;
           case "remotes":
-            schema.remotes ??= {};
+            schema.remotes ??= [];
             state = "remotes";
             break;
           case "packs":
@@ -207,11 +220,17 @@ function parseSchemaYaml(text: string): Schema {
       }
     }
 
-    // ── remotes ───────────────────────────────────────────────────────────
+    // ── remotes (ADR-048 §3: list of {name, repo, path, commit}) ─────────
     if (state === "remotes") {
-      if (indent === 2 && trimmed.endsWith(":")) {
-        currentRemoteName = trimmed.slice(0, -1).trim();
-        schema.remotes![currentRemoteName] = { url: "" };
+      // New list entry: `  - name: lattice`
+      if (indent === 2 && trimmed.startsWith("- name:")) {
+        flushRemote();
+        currentRemote = {
+          name: trimmed.replace(/^- name:\s*/, "").replace(/^["']|["']$/g, "").trim(),
+          repo: "",
+          path: "",
+          commit: "",
+        };
         state = "remotes_entry";
         continue;
       }
@@ -219,24 +238,28 @@ function parseSchemaYaml(text: string): Schema {
     if (state === "remotes_entry") {
       if (indent === 4) {
         const kvMatch = trimmed.match(/^(\w+):\s+(.+)$/);
-        if (kvMatch && currentRemoteName) {
+        if (kvMatch && currentRemote) {
           const key = kvMatch[1];
           const val = kvMatch[2].replace(/^["']|["']$/g, "").trim();
-          const remote = schema.remotes![currentRemoteName];
-          if (key === "url") remote.url = val;
-          if (key === "ref") remote.ref = val;
+          if (key === "repo") currentRemote.repo = val;
+          if (key === "path") currentRemote.path = val;
+          if (key === "commit") currentRemote.commit = val;
         }
         continue;
       }
-      if (indent === 2) {
-        // Could be another remote entry
-        if (trimmed.endsWith(":")) {
-          currentRemoteName = trimmed.slice(0, -1).trim();
-          schema.remotes![currentRemoteName] = { url: "" };
-          continue;
-        }
+      // Next remote list entry
+      if (indent === 2 && trimmed.startsWith("- name:")) {
+        flushRemote();
+        currentRemote = {
+          name: trimmed.replace(/^- name:\s*/, "").replace(/^["']|["']$/g, "").trim(),
+          repo: "",
+          path: "",
+          commit: "",
+        };
+        continue;
       }
       if (indent === 0) {
+        flushRemote();
         state = "root";
       }
     }
@@ -270,6 +293,7 @@ function parseSchemaYaml(text: string): Schema {
 
   flushEdge();
   flushPack();
+  flushRemote();
 
   return schema;
 }

@@ -45,11 +45,16 @@ export interface ValidationResult {
  * Checks:
  *   1. Each entity line parses as JSON with id/name/kind fields.
  *   2. Entity kind is in the closed set.
- *   3. Each edge line parses as JSON with id/source_id/target_id/relation.
- *   4. Edge relation is in the closed set.
- *   5. schema.yaml structural validity.
- *   6. Entity kinds in data are a subset of schema.yaml entity_kinds.
- *   7. Edge relations in data are a subset of schema.yaml edge_relations.
+ *   3. Entity kind is declared in schema.yaml entity_kinds (error, not warning).
+ *   4. Duplicate entity id check.
+ *   5. Entity sort order: UUID-ascending.
+ *   6. Each edge line parses as JSON with edge_id/source/target/relation (ADR-048 field names).
+ *   7. Edge relation is in the closed set.
+ *   8. Edge relation is declared in schema.yaml edge_relations (error, not warning).
+ *   9. Referential integrity: source and target must be known entity IDs (skip remote refs).
+ *  10. Composite key duplicate check: (source, target, relation) must be unique.
+ *  11. Edge sort order: composite-key-ascending (source + target + relation).
+ *  12. schema.yaml structural validity.
  */
 export async function validate(repoRoot: string): Promise<ValidationResult> {
   const errors: ValidationError[] = [];
@@ -85,6 +90,7 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
   // ── 2. Validate entities.ndjson ───────────────────────────────────────────
   const entitiesPath = `${repoRoot}/${ENTITIES_FILE}`;
   const seenEntityIds = new Set<string>();
+  let prevEntityId = "";
 
   try {
     for await (const entry of readNdjson(entitiesPath)) {
@@ -108,9 +114,9 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
         continue;
       }
 
-      // Cross-check kind against schema
+      // Cross-check kind against schema (error, not warning — codex finding)
       if (!schemaEntityKinds.has(entity.kind)) {
-        warnings.push({
+        errors.push({
           file: ENTITIES_FILE,
           line,
           message: `Entity kind '${entity.kind}' not declared in schema.yaml entity_kinds`,
@@ -126,6 +132,16 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
         });
       }
       seenEntityIds.add(entity.id);
+
+      // Sort order: UUID-ascending
+      if (prevEntityId !== "" && entity.id < prevEntityId) {
+        errors.push({
+          file: ENTITIES_FILE,
+          line,
+          message: `Entity out of sort order: '${entity.id}' must come after '${prevEntityId}' (entities.ndjson must be UUID-ascending)`,
+        });
+      }
+      prevEntityId = entity.id;
     }
   } catch (err) {
     if (!(err instanceof Deno.errors.NotFound)) {
@@ -140,6 +156,8 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
   // ── 3. Validate edges.ndjson ──────────────────────────────────────────────
   const edgesPath = `${repoRoot}/${EDGES_FILE}`;
   const seenEdgeIds = new Set<string>();
+  const seenCompositeKeys = new Set<string>();
+  let prevCompositeKey = "";
 
   try {
     for await (const entry of readNdjson(edgesPath)) {
@@ -157,31 +175,72 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
           file: EDGES_FILE,
           line,
           message:
-            `Invalid edge: must have id (string), source_id (string), target_id (string), relation (one of: ${
+            `Invalid edge: must have edge_id (UUID), source (string), target (string), relation (one of: ${
               EDGE_RELATIONS.join(", ")
             })`,
         });
         continue;
       }
 
-      // Cross-check relation against schema
+      // Cross-check relation against schema (error, not warning — codex finding)
       if (!schemaRelations.has(edge.relation)) {
-        warnings.push({
+        errors.push({
           file: EDGES_FILE,
           line,
           message: `Edge relation '${edge.relation}' not declared in schema.yaml edge_relations`,
         });
       }
 
-      // Duplicate ID check
-      if (seenEdgeIds.has(edge.id)) {
+      // Referential integrity: local UUIDs must exist in entities.ndjson.
+      // Remote references (starting with a non-UUID prefix) are allowed through.
+      const isRemoteRef = (v: string) =>
+        !(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v));
+
+      if (!isRemoteRef(edge.source) && !seenEntityIds.has(edge.source)) {
         errors.push({
           file: EDGES_FILE,
           line,
-          message: `Duplicate edge id: ${edge.id}`,
+          message: `Edge source '${edge.source}' does not reference a known entity id`,
         });
       }
-      seenEdgeIds.add(edge.id);
+      if (!isRemoteRef(edge.target) && !seenEntityIds.has(edge.target)) {
+        errors.push({
+          file: EDGES_FILE,
+          line,
+          message: `Edge target '${edge.target}' does not reference a known entity id`,
+        });
+      }
+
+      // Duplicate edge_id check
+      if (seenEdgeIds.has(edge.edge_id)) {
+        errors.push({
+          file: EDGES_FILE,
+          line,
+          message: `Duplicate edge_id: ${edge.edge_id}`,
+        });
+      }
+      seenEdgeIds.add(edge.edge_id);
+
+      // Composite key duplicate check: (source, target, relation) must be unique
+      const compositeKey = `${edge.source}\x00${edge.target}\x00${edge.relation}`;
+      if (seenCompositeKeys.has(compositeKey)) {
+        errors.push({
+          file: EDGES_FILE,
+          line,
+          message: `Duplicate edge composite key (source, target, relation): (${edge.source}, ${edge.target}, ${edge.relation})`,
+        });
+      }
+      seenCompositeKeys.add(compositeKey);
+
+      // Sort order: composite-key-ascending (source + target + relation)
+      if (prevCompositeKey !== "" && compositeKey < prevCompositeKey) {
+        errors.push({
+          file: EDGES_FILE,
+          line,
+          message: `Edge out of sort order at composite key '${edge.source}+${edge.target}+${edge.relation}' (edges.ndjson must be composite-key-ascending)`,
+        });
+      }
+      prevCompositeKey = compositeKey;
     }
   } catch (err) {
     if (!(err instanceof Deno.errors.NotFound)) {

@@ -1,9 +1,9 @@
 /**
- * `khive kg sync` — rebuild working.db from NDJSON files (ADR-051 §5).
+ * `khive kg sync` — validate NDJSON + create working.db placeholder (Phase C1).
  *
- * Phase C1: since the Rust DB layer is not yet integrated, sync is a
- * validation pass + mtime-based up-to-date check.  The atomic DB rebuild
- * (ADR-052 §5) will be wired in when the Rust runtime is available.
+ * Phase C1 scope: validate the NDJSON files and touch `.khive/state/working.db` to record
+ * the sync timestamp. Full DB rebuild from NDJSON (the atomic import defined in ADR-052 §5)
+ * is Phase C2 and is not yet integrated — that requires the Rust runtime to be available.
  *
  * The actual DB path is `.khive/state/working.db` (gitignored).
  */

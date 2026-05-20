@@ -3,6 +3,10 @@
  *
  * Resolution order: CLI flag > project config > global config > built-in default.
  * Project config (.khive/config.toml) beats global (~/.khive/config.toml).
+ *
+ * Phase C1 scope: this module defines and loads the config schema (correct scaffolding).
+ * Config validation and `embed.auto_embed` behaviour are wired in Phase C2 when the
+ * Rust embedding runtime is integrated.
  */
 
 import { parse as parseTOML } from "@std/toml";

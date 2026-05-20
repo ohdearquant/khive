@@ -4,12 +4,12 @@
   "description": "khive — research knowledge graph CLI",
   "license": "Apache-2.0",
   "tasks": {
-    "dev": "deno run --allow-all cli/main.ts",
-    "test": "deno test --allow-all cli/",
-    "check": "deno check cli/main.ts",
-    "fmt": "deno fmt cli/",
-    "lint": "deno lint cli/",
-    "compile": "deno compile --allow-all --output dist/khive cli/main.ts"
+    "dev": "deno run --allow-all main.ts",
+    "test": "deno test --allow-all .",
+    "check": "deno check main.ts",
+    "fmt": "deno fmt .",
+    "lint": "deno lint .",
+    "compile": "deno compile --allow-all --output ../dist/khive main.ts"
   },
   "imports": {
     "@std/path": "jsr:@std/path@^1.1.4",

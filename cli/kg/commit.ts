@@ -1,9 +1,10 @@
 /**
- * `khive kg commit` — export → validate → git-add → git-commit (ADR-051 §4).
+ * `khive kg commit` — validate + git commit (Phase C1).
  *
- * Phase C1: since the Rust DB layer is not yet integrated, the "export" step
- * is a validation-only pass on the existing NDJSON files.  The actual DB →
- * NDJSON export will be wired in when `khive kg export` is available.
+ * Phase C1 scope: validate the existing NDJSON files, stage them, and create a git commit.
+ * Export from a live DB (the `khive kg export` step) is Phase C2 and is not yet integrated.
+ * Until Phase C2, this command operates on NDJSON files that are managed directly by the
+ * author (not generated from a Rust DB).
  */
 
 import { exec, getCurrentBranch, gitAdd, gitCommit } from "../lib/git.ts";
