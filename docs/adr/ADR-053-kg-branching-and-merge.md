@@ -69,14 +69,14 @@ The sorted NDJSON format (ADR-048 §2) is specifically designed for clean git me
 entity is one line at a deterministic UUID-sorted position and each edge is one line at a
 deterministic composite-key position, git's three-way line merge handles the common cases:
 
-| Scenario | Git result |
-|---|---|
-| Two branches add different entities | Clean merge — different lines inserted at different UUID positions |
-| Two branches add different edges | Clean merge — different lines inserted at different composite-key positions |
-| Two branches edit different entities | Clean merge — different lines modified |
-| Two branches edit the same entity | Conflict — same line modified in both |
-| One branch deletes an entity, the other edits it | Conflict — delete vs. modify on the same line |
-| Two branches add the same entity (same UUID) with different content | Conflict — same line inserted at same position |
+| Scenario                                                            | Git result                                                                  |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Two branches add different entities                                 | Clean merge — different lines inserted at different UUID positions          |
+| Two branches add different edges                                    | Clean merge — different lines inserted at different composite-key positions |
+| Two branches edit different entities                                | Clean merge — different lines modified                                      |
+| Two branches edit the same entity                                   | Conflict — same line modified in both                                       |
+| One branch deletes an entity, the other edits it                    | Conflict — delete vs. modify on the same line                               |
+| Two branches add the same entity (same UUID) with different content | Conflict — same line inserted at same position                              |
 
 Most KG work is additive (new entities, new edges). The conflict-free cases dominate in practice,
 so most merges auto-complete without human intervention.
@@ -87,11 +87,11 @@ When `git merge` produces conflicts in NDJSON files, the conflict markers appear
 file:
 
 ```
- <<<<<<< HEAD
- {"id":"abc123","kind":"concept","name":"LoRA","description":"Low-rank adaptation method","properties":{},"tags":[]}
- =======
- {"id":"abc123","kind":"concept","name":"LoRA","description":"Parameter-efficient fine-tuning via low-rank matrices","properties":{},"tags":[]}
- >>>>>>> experiments
+<<<<<<< HEAD
+{"id":"abc123","kind":"concept","name":"LoRA","description":"Low-rank adaptation method","properties":{},"tags":[]}
+=======
+{"id":"abc123","kind":"concept","name":"LoRA","description":"Parameter-efficient fine-tuning via low-rank matrices","properties":{},"tags":[]}
+>>>>>>> experiments
 ```
 
 `khive kg resolve` handles these:
@@ -124,11 +124,11 @@ Edges can conflict under the same conditions as entities. The conflict key for a
 composite `(source, target, relation)` triple — this is the semantic identity of an edge, not the
 internal UUID.
 
-| Scenario | Resolution |
-|---|---|
-| Weight change on same edge | `--ours` / `--theirs` apply to the conflicting edge line |
-| Property change on same edge | `--merge-properties` merges non-overlapping property changes; overlapping changes use `--ours` with a warning |
-| Delete vs. edit on same edge | Treated as a conflict; requires explicit `--ours` or `--theirs` |
+| Scenario                                 | Resolution                                                                                                                                                                                                                                                                                                               |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Weight change on same edge               | `--ours` / `--theirs` apply to the conflicting edge line                                                                                                                                                                                                                                                                 |
+| Property change on same edge             | `--merge-properties` merges non-overlapping property changes; overlapping changes use `--ours` with a warning                                                                                                                                                                                                            |
+| Delete vs. edit on same edge             | Treated as a conflict; requires explicit `--ours` or `--theirs`                                                                                                                                                                                                                                                          |
 | Same composite key, different edge UUIDs | Strategy determines the winning line: `--ours` keeps our edge UUID (the full line from the current branch), `--theirs` keeps their edge UUID (the full line from the incoming branch). The `(source, target, relation)` composite key is the conflict trigger; the strategy determines which edge_id and properties win. |
 
 `--ours` applies the current branch's full edge line for all conflicting edges. `--theirs`
@@ -159,14 +159,14 @@ Not all schema conflicts carry the same weight. Three categories:
 3. **Property schema changes** — changes to property type definitions or validation rules. These
    also defer to ADR-054's merge rules.
 
-| Scenario | Strategy |
-|---|---|
-| Two branches add different entity kinds | Additive — auto-merge per ADR-054 |
-| Two branches add the same entity kind | Conflict — manual resolution |
-| Two branches add different edge relations (base ontology) | NOT automatically mergeable — always manual review (ADR-002) |
-| Two branches add pack-scoped edge endpoint rules | Additive — auto-merge per ADR-054 |
-| Two branches change the same property definition | Conflict — manual resolution per ADR-054 |
-| Two branches change the same remote pin | Manual resolution required — the correct SHA is determined by which branch's remote state is intended |
+| Scenario                                                  | Strategy                                                                                              |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Two branches add different entity kinds                   | Additive — auto-merge per ADR-054                                                                     |
+| Two branches add the same entity kind                     | Conflict — manual resolution                                                                          |
+| Two branches add different edge relations (base ontology) | NOT automatically mergeable — always manual review (ADR-002)                                          |
+| Two branches add pack-scoped edge endpoint rules          | Additive — auto-merge per ADR-054                                                                     |
+| Two branches change the same property definition          | Conflict — manual resolution per ADR-054                                                              |
+| Two branches change the same remote pin                   | Manual resolution required — the correct SHA is determined by which branch's remote state is intended |
 
 `khive kg resolve` detects schema conflicts and, where no automated strategy applies, blocks the
 merge and prints:
@@ -301,12 +301,12 @@ defined by ADR-052 and requires no additions.
 
 ### Phasing
 
-| Phase | Scope | Target |
-|-------|-------|--------|
-| B1 | `khive kg resolve` — entity conflict resolution with `--ours`/`--theirs`/`--merge-properties` | v0.5 |
-| B2 | Edge conflict resolution (`--edge` overrides, composite-key identity) | v0.5 |
-| B3 | Schema conflict detection and category reporting | v0.5 |
-| B4 | `khive kg log --entity` (field-level history rendering, presentation only) | v0.6 |
+| Phase | Scope                                                                                         | Target |
+| ----- | --------------------------------------------------------------------------------------------- | ------ |
+| B1    | `khive kg resolve` — entity conflict resolution with `--ours`/`--theirs`/`--merge-properties` | v0.5   |
+| B2    | Edge conflict resolution (`--edge` overrides, composite-key identity)                         | v0.5   |
+| B3    | Schema conflict detection and category reporting                                              | v0.5   |
+| B4    | `khive kg log --entity` (field-level history rendering, presentation only)                    | v0.6   |
 
 B1 and B2 are the core merge conflict workflow. B3 is defensive (schema conflicts are rare but
 serious). B4 is a convenience feature that can be deferred indefinitely.

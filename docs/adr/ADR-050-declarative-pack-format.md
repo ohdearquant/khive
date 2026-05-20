@@ -164,7 +164,7 @@ ontology_version: "1.0.0"
 packs:
   - name: kg
     version: "1.0.0"
-    source: builtin          # "builtin" | "registry" | "local" | "git"
+    source: builtin # "builtin" | "registry" | "local" | "git"
   - name: gtd
     version: "1.0.0"
     source: builtin
@@ -180,9 +180,9 @@ entity_kinds:
   - project
   - person
   - org
-  - model          # contributed by ml-papers
-  - benchmark      # contributed by ml-papers
-  - training_run   # contributed by ml-papers
+  - model # contributed by ml-papers
+  - benchmark # contributed by ml-papers
+  - training_run # contributed by ml-papers
 
 note_kinds:
   - observation
@@ -190,7 +190,7 @@ note_kinds:
   - question
   - decision
   - reference
-  - task           # contributed by gtd
+  - task # contributed by gtd
   - experiment_log # contributed by ml-papers
 
 # edge endpoint triples and properties are similarly merged;
@@ -204,12 +204,12 @@ validation even in environments where packs cannot be fetched.
 
 #### Source values
 
-| Source | Meaning |
-|--------|---------|
-| `builtin` | A Rust pack compiled into the binary. Vocabulary is registered at binary start. No local file needed. |
-| `registry` | Fetched from the cloud registry (ADR-033) and cached at `~/.khive/packs/<name>/<version>/pack.yaml`. |
-| `local` | Loaded from a relative path. Used for development and monorepo packs. |
-| `git` | Loaded from a git repository at a pinned commit SHA. Same SHA-pin discipline as ADR-048 remotes. |
+| Source     | Meaning                                                                                               |
+| ---------- | ----------------------------------------------------------------------------------------------------- |
+| `builtin`  | A Rust pack compiled into the binary. Vocabulary is registered at binary start. No local file needed. |
+| `registry` | Fetched from the cloud registry (ADR-033) and cached at `~/.khive/packs/<name>/<version>/pack.yaml`.  |
+| `local`    | Loaded from a relative path. Used for development and monorepo packs.                                 |
+| `git`      | Loaded from a git repository at a pinned commit SHA. Same SHA-pin discipline as ADR-048 remotes.      |
 
 #### `local` source path
 
@@ -236,7 +236,7 @@ packs:
     version: "1.0.0"
     source: git
     repo: ocean/khive-pack-ml-papers
-    commit: a1b2c3d4e5f6789012345678901234567890abcd   # full 40-char SHA
+    commit: a1b2c3d4e5f6789012345678901234567890abcd # full 40-char SHA
 ```
 
 The same SHA-pin discipline as ADR-048 remotes applies: tags and branch names are accepted on
@@ -461,13 +461,13 @@ The workflow fails if any pack cannot be resolved or if vocabulary conflicts exi
 
 ### 8. Phasing
 
-| Phase | What | Target version |
-|-------|------|----------------|
-| P1 | `pack.yaml` manifest format specification + `khive pack check` validator | v0.3 |
-| P2 | `schema.yaml#packs` section + vocabulary merging in `khive pack validate` | v0.3 |
-| P3 | `khive pack init` + `khive pack install` (local path only, no registry) | v0.4 |
-| P4 | Pack cache + `khive pack install` from registry and git (requires cloud ADR-033 for registry) | v0.5 |
-| P5 | `khive pack publish` (requires cloud ADR-033 authentication) | v0.5 |
+| Phase | What                                                                                          | Target version |
+| ----- | --------------------------------------------------------------------------------------------- | -------------- |
+| P1    | `pack.yaml` manifest format specification + `khive pack check` validator                      | v0.3           |
+| P2    | `schema.yaml#packs` section + vocabulary merging in `khive pack validate`                     | v0.3           |
+| P3    | `khive pack init` + `khive pack install` (local path only, no registry)                       | v0.4           |
+| P4    | Pack cache + `khive pack install` from registry and git (requires cloud ADR-033 for registry) | v0.5           |
+| P5    | `khive pack publish` (requires cloud ADR-033 authentication)                                  | v0.5           |
 
 P1 and P2 are independently shippable and establish the format contract. Third-party tools can
 validate and author `pack.yaml` files before `khive pack install` exists. P3 enables the local
@@ -532,14 +532,14 @@ pointing to the cloud registry documentation.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-|-------------|------|------|--------------|
-| TOML manifest (pack.toml) | Familiar to Rust authors; no ambiguous YAML indentation | Inconsistent with existing schema.yaml convention; TOML's nested array syntax is more verbose for endpoint pairs | Convention consistency with ADR-048 wins |
-| Allow packs to contain WASM verb handlers | Full extensibility without recompilation | Security surface; WASM sandboxing complexity; binary distribution of user-compiled modules | Security model does not support arbitrary code in downloaded packs |
-| Allow packs to declare new relation names (as strings) | Domain-specific edge semantics without ADR amendment | Fragments traversal semantics; two packs may express the same semantic with different names; tooling cannot reason generically about pack-specific relations | The 13-relation closed set is the traversal backbone; packs extend endpoint pairs, not the relation namespace |
-| Store merged vocabulary only in memory, not in schema.yaml | Avoids schema.yaml churn during pack changes | schema.yaml loses self-containment for offline validation; CI must always fetch all packs | ADR-048 self-containment principle is worth the churn cost |
-| Per-project pack cache (inside `.khive/`) | Fully isolated per project; committed alongside the project | Bloats the git repo with downloaded manifests; version-identical packs duplicated across projects | Pack manifests are small but the principle of committing derived artifacts is wrong |
-| Registry-first design (no local install) | Simpler architecture; one install path | Blocks offline development and monorepo workflows; cloud dependency for local validation | OSS must be usable without cloud infrastructure |
+| Alternative                                                | Pros                                                        | Cons                                                                                                                                                         | Why rejected                                                                                                  |
+| ---------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| TOML manifest (pack.toml)                                  | Familiar to Rust authors; no ambiguous YAML indentation     | Inconsistent with existing schema.yaml convention; TOML's nested array syntax is more verbose for endpoint pairs                                             | Convention consistency with ADR-048 wins                                                                      |
+| Allow packs to contain WASM verb handlers                  | Full extensibility without recompilation                    | Security surface; WASM sandboxing complexity; binary distribution of user-compiled modules                                                                   | Security model does not support arbitrary code in downloaded packs                                            |
+| Allow packs to declare new relation names (as strings)     | Domain-specific edge semantics without ADR amendment        | Fragments traversal semantics; two packs may express the same semantic with different names; tooling cannot reason generically about pack-specific relations | The 13-relation closed set is the traversal backbone; packs extend endpoint pairs, not the relation namespace |
+| Store merged vocabulary only in memory, not in schema.yaml | Avoids schema.yaml churn during pack changes                | schema.yaml loses self-containment for offline validation; CI must always fetch all packs                                                                    | ADR-048 self-containment principle is worth the churn cost                                                    |
+| Per-project pack cache (inside `.khive/`)                  | Fully isolated per project; committed alongside the project | Bloats the git repo with downloaded manifests; version-identical packs duplicated across projects                                                            | Pack manifests are small but the principle of committing derived artifacts is wrong                           |
+| Registry-first design (no local install)                   | Simpler architecture; one install path                      | Blocks offline development and monorepo workflows; cloud dependency for local validation                                                                     | OSS must be usable without cloud infrastructure                                                               |
 
 ## Consequences
 
@@ -662,13 +662,13 @@ files with `# yaml-language-server: $schema=https://khive.ai/schemas/pack/v1.jso
 
 ### Phasing detail
 
-| Phase | Deliverables |
-|-------|-------------|
-| P1 | `deno/src/pack/schema.ts` (PackManifest type + validator), `khive pack check`, `pack-schema.json`, `crates/khive-pack-format/` crate (PackManifest struct + serde) |
-| P2 | `schema.yaml` v1.1.0 format with `packs` section, `khive pack validate`, `deno/src/pack/merge.ts`, `crates/khive-vcs/src/schema/v1.1.json`, vocabulary drift detection |
-| P3 | `khive pack init`, `khive pack install ./local-path`, `deno/src/pack/install.ts` (local source only), `deno/src/pack/remove.ts`, `schema.yaml` write-back after install/remove |
-| P4 | `deno/src/pack/cache.ts` (`~/.khive/packs/` read/write), `khive pack install <name>@<ver>` (registry source, requires ADR-033 registry API), git source install |
-| P5 | `khive pack publish`, registry authentication (ADR-033) |
+| Phase | Deliverables                                                                                                                                                                   |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| P1    | `deno/src/pack/schema.ts` (PackManifest type + validator), `khive pack check`, `pack-schema.json`, `crates/khive-pack-format/` crate (PackManifest struct + serde)             |
+| P2    | `schema.yaml` v1.1.0 format with `packs` section, `khive pack validate`, `deno/src/pack/merge.ts`, `crates/khive-vcs/src/schema/v1.1.json`, vocabulary drift detection         |
+| P3    | `khive pack init`, `khive pack install ./local-path`, `deno/src/pack/install.ts` (local source only), `deno/src/pack/remove.ts`, `schema.yaml` write-back after install/remove |
+| P4    | `deno/src/pack/cache.ts` (`~/.khive/packs/` read/write), `khive pack install <name>@<ver>` (registry source, requires ADR-033 registry API), git source install                |
+| P5    | `khive pack publish`, registry authentication (ADR-033)                                                                                                                        |
 
 ## References
 

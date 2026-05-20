@@ -69,11 +69,11 @@ This ADR defines:
 
 `ontology_version` uses semver (`MAJOR.MINOR.PATCH`) with the following semantics:
 
-| Change type | Version bump | Examples |
-|---|---|---|
-| Breaking | Major | Removing an entity kind, removing an edge relation, changing a required property type, renaming a kind or relation |
-| Additive | Minor | Adding a new entity kind, adding an optional property, adding a new pack, relaxing an endpoint rule |
-| Non-functional | Patch | Updating descriptions, adding documentation comments, bumping a remote commit SHA |
+| Change type    | Version bump | Examples                                                                                                           |
+| -------------- | ------------ | ------------------------------------------------------------------------------------------------------------------ |
+| Breaking       | Major        | Removing an entity kind, removing an edge relation, changing a required property type, renaming a kind or relation |
+| Additive       | Minor        | Adding a new entity kind, adding an optional property, adding a new pack, relaxing an endpoint rule                |
+| Non-functional | Patch        | Updating descriptions, adding documentation comments, bumping a remote commit SHA                                  |
 
 **Breaking changes require a migration file** (see §2) before `khive kg validate` will accept the
 new schema against the existing NDJSON corpus. The CLI enforces this: if the `ontology_version`
@@ -95,9 +95,9 @@ The `ontology_version` field in a freshly initialized schema (from `khive kg ini
 The khive CLI that wrote the schema is recorded in a `khive_version` field:
 
 ```yaml
-format_version: "1.1.0"      # file format compatibility (ADR-048)
-ontology_version: "1.2.0"    # schema evolution semver (this ADR)
-khive_version: "0.4.1"       # khive CLI version that last wrote this file
+format_version: "1.1.0" # file format compatibility (ADR-048)
+ontology_version: "1.2.0" # schema evolution semver (this ADR)
+khive_version: "0.4.1" # khive CLI version that last wrote this file
 ```
 
 `format_version` is used by parsers to determine whether they understand the file structure.
@@ -150,22 +150,22 @@ operations:
 
   - remove_kind:
       name: experiment
-      on_existing: error    # "error" | "migrate_to" + target
+      on_existing: error # "error" | "migrate_to" + target
 ```
 
 #### Supported operations
 
-| Operation | Arguments | Effect on NDJSON |
-|---|---|---|
-| `add_kind` | `name`, `description?` | None (NDJSON already valid; new kind becomes accepted) |
-| `remove_kind` | `name`, `on_existing: error\|migrate_to` | If `migrate_to`: rewrites matching entity lines to target kind. If `error`: aborts if any entities of this kind exist |
-| `rename_kind` | `from`, `to` | Rewrites all matching `"kind": "<from>"` lines in `entities.ndjson` |
-| `add_property` | `kind`, `name`, `type`, `required`, `description?` | None if `required: false`. If `required: true`, aborts unless all entities of that kind already have the property |
-| `remove_property` | `kind`, `name` | No rewrite required; previously set values are retained in NDJSON but no longer schema-validated |
-| `rename_property` | `kind`, `from`, `to` | Rewrites `properties.<from>` to `properties.<to>` in matching entity lines |
-| `change_property_type` | `kind`, `name`, `from_type`, `to_type`, `coerce?` | If `coerce: true` and type coercion is defined: rewrites property values. If `coerce: false` (default): aborts if any entity has this property set |
-| `add_relation_endpoint` | `relation`, `source_kind`, `target_kind` | None (NDJSON already valid; new endpoint pair becomes accepted) |
-| `remove_relation_endpoint` | `relation`, `source_kind`, `target_kind`, `on_existing: error\|drop` | If `drop`: removes matching edges from `edges.ndjson`. If `error`: aborts if any such edges exist |
+| Operation                  | Arguments                                                            | Effect on NDJSON                                                                                                                                   |
+| -------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `add_kind`                 | `name`, `description?`                                               | None (NDJSON already valid; new kind becomes accepted)                                                                                             |
+| `remove_kind`              | `name`, `on_existing: error\|migrate_to`                             | If `migrate_to`: rewrites matching entity lines to target kind. If `error`: aborts if any entities of this kind exist                              |
+| `rename_kind`              | `from`, `to`                                                         | Rewrites all matching `"kind": "<from>"` lines in `entities.ndjson`                                                                                |
+| `add_property`             | `kind`, `name`, `type`, `required`, `description?`                   | None if `required: false`. If `required: true`, aborts unless all entities of that kind already have the property                                  |
+| `remove_property`          | `kind`, `name`                                                       | No rewrite required; previously set values are retained in NDJSON but no longer schema-validated                                                   |
+| `rename_property`          | `kind`, `from`, `to`                                                 | Rewrites `properties.<from>` to `properties.<to>` in matching entity lines                                                                         |
+| `change_property_type`     | `kind`, `name`, `from_type`, `to_type`, `coerce?`                    | If `coerce: true` and type coercion is defined: rewrites property values. If `coerce: false` (default): aborts if any entity has this property set |
+| `add_relation_endpoint`    | `relation`, `source_kind`, `target_kind`                             | None (NDJSON already valid; new endpoint pair becomes accepted)                                                                                    |
+| `remove_relation_endpoint` | `relation`, `source_kind`, `target_kind`, `on_existing: error\|drop` | If `drop`: removes matching edges from `edges.ndjson`. If `error`: aborts if any such edges exist                                                  |
 
 All operations are applied in order within a migration file. A migration is atomic: if any
 operation fails, no NDJSON changes are written and `schema.yaml`'s `ontology_version` is not updated.
@@ -505,15 +505,15 @@ silent drop. `migrate_to` is the safe path; `error` is the safe default.
 
 ## Alternatives Considered
 
-| Alternative | Reason rejected |
-|---|---|
-| No migrations, validate-only | Leaves users with invalid entities and no automated path forward; requires manual NDJSON surgery |
-| Auto-migrate on pull or checkout | Violates git-native principle; causes silent data rewrites not tracked as commits |
-| Auto-generate migrations from diffs | Schema diffs are ambiguous; cannot distinguish rename from remove+add; unsafe as default |
+| Alternative                                        | Reason rejected                                                                                                                                         |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No migrations, validate-only                       | Leaves users with invalid entities and no automated path forward; requires manual NDJSON surgery                                                        |
+| Auto-migrate on pull or checkout                   | Violates git-native principle; causes silent data rewrites not tracked as commits                                                                       |
+| Auto-generate migrations from diffs                | Schema diffs are ambiguous; cannot distinguish rename from remove+add; unsafe as default                                                                |
 | SQL-style migrations (numbered imperative scripts) | YAML declarative operations are more auditable, tool-parseable, and reversible; SQL approach is for the storage layer (ADR-022), not the ontology layer |
-| Schema-less (no validation) | Defeats the purpose of a typed KG; errors surface as query failures, not validation failures |
-| Integer sequence version (v1, v2) | Loses breaking/additive distinction; forces consumers to parse full diff to understand impact |
-| Pack removal always forbidden if entities exist | Too restrictive; blocks legitimate cleanup; `--migrate-to` provides a safe path |
+| Schema-less (no validation)                        | Defeats the purpose of a typed KG; errors surface as query failures, not validation failures                                                            |
+| Integer sequence version (v1, v2)                  | Loses breaking/additive distinction; forces consumers to parse full diff to understand impact                                                           |
+| Pack removal always forbidden if entities exist    | Too restrictive; blocks legitimate cleanup; `--migrate-to` provides a safe path                                                                         |
 
 ## Consequences
 
@@ -590,11 +590,11 @@ is the only structural addition to `schema.yaml`. No other top-level keys are ad
 A fully annotated `schema.yaml` header after this ADR:
 
 ```yaml
-format_version: "1.1.0"      # file format version (ADR-048) — bumped when the schema.yaml
-                              #   structure itself gains new top-level keys
-ontology_version: "2.0.0"    # ontology evolution version (this ADR) — bumped when kinds,
-                              #   relations, or properties change
-khive_version: "0.4.1"       # CLI version that last wrote this file (informational)
+format_version: "1.1.0" # file format version (ADR-048) — bumped when the schema.yaml
+#   structure itself gains new top-level keys
+ontology_version: "2.0.0" # ontology evolution version (this ADR) — bumped when kinds,
+#   relations, or properties change
+khive_version: "0.4.1" # CLI version that last wrote this file (informational)
 ```
 
 ### Migration directory
@@ -605,14 +605,14 @@ integrity (no gaps, no duplicate sequence numbers).
 
 ### Phasing
 
-| Phase | Scope | Target |
-|---|---|---|
-| 1 | `MigrationFile` parser + `add_kind` / `rename_kind` / `remove_kind` operations; `khive kg migrate` | v0.5 |
-| 2 | `add_property` / `remove_property` / `rename_property` operations | v0.5 |
-| 3 | `schema_diff()` + `khive kg schema diff` command | v0.5 |
-| 4 | `validate --schema-compat` + `schema merge-resolve` | v0.6 |
-| 5 | `change_property_type` with coerce support; pack upgrade migration pipeline | v0.6 |
-| 6 | CI workflow extension (schema diff annotations, migration dry-run gate) | v0.6 |
+| Phase | Scope                                                                                              | Target |
+| ----- | -------------------------------------------------------------------------------------------------- | ------ |
+| 1     | `MigrationFile` parser + `add_kind` / `rename_kind` / `remove_kind` operations; `khive kg migrate` | v0.5   |
+| 2     | `add_property` / `remove_property` / `rename_property` operations                                  | v0.5   |
+| 3     | `schema_diff()` + `khive kg schema diff` command                                                   | v0.5   |
+| 4     | `validate --schema-compat` + `schema merge-resolve`                                                | v0.6   |
+| 5     | `change_property_type` with coerce support; pack upgrade migration pipeline                        | v0.6   |
+| 6     | CI workflow extension (schema diff annotations, migration dry-run gate)                            | v0.6   |
 
 Phase 1 covers the primary use case (adding and renaming kinds) and is independently shippable.
 Phases 4-6 are quality-of-life features that improve the collaborative workflow but are not

@@ -129,8 +129,8 @@ The `target` field may be either a local UUID or a remote reference (see §5 on 
 are in use, what cross-repo references exist, and pins the schema version.
 
 ```yaml
-format_version: "1.0.0"   # semver; file format compatibility version (what fields are valid here)
-khive_version: "0.1.0"    # CLI version that wrote this file (informational)
+format_version: "1.0.0" # semver; file format compatibility version (what fields are valid here)
+khive_version: "0.1.0" # CLI version that wrote this file (informational)
 
 entity_kinds:
   - concept
@@ -167,7 +167,7 @@ remotes:
   - name: lattice
     repo: ohdearquant/lattice
     path: .khive/kg
-    commit: a1b2c3d4e5f6789012345678901234567890abcd   # full 40-char SHA — immutable
+    commit: a1b2c3d4e5f6789012345678901234567890abcd # full 40-char SHA — immutable
   - name: atlas
     repo: ohdearquant/atlas
     path: .khive/kg
@@ -308,7 +308,12 @@ Edges can reference entities in remote repositories. The `target` field in an ed
 `<remote>:<uuid>` prefix to indicate a cross-repo entity:
 
 ```json
-{"source":"671b882a-...","target":"lattice:c9e4b3f2-...","relation":"implements","weight":1.0}
+{
+  "source": "671b882a-...",
+  "target": "lattice:c9e4b3f2-...",
+  "relation": "implements",
+  "weight": 1.0
+}
 ```
 
 The `lattice` prefix maps to a remote defined in `schema.yaml#remotes`:
@@ -318,7 +323,7 @@ remotes:
   - name: lattice
     repo: ohdearquant/lattice
     path: .khive/kg
-    commit: a1b2c3d4e5f6789012345678901234567890abcd   # full SHA — immutable
+    commit: a1b2c3d4e5f6789012345678901234567890abcd # full SHA — immutable
 ```
 
 #### Remote entity resolution
@@ -407,19 +412,19 @@ ADR-043.
 
 #### ADR-042 supersession
 
-| ADR-042 component                            | Disposition in ADR-048                              |
-| -------------------------------------------- | --------------------------------------------------- |
-| `kg_snapshots` + `kg_snapshot_archives` SQL  | Deleted. Git provides the commit history.           |
-| `kg_branches` SQL table                      | Deleted. Git branches replace this.                 |
-| `kg_vcs_state` dirty-flag table              | Deleted. Status is computed via DB-vs-NDJSON diff (ADR-052 §6–§7). |
-| SHA-256 canonical hash algorithm             | Retained. Export determinism ensures stable hashes. |
-| `khive-sync` HTTP server + push/pull API     | Deleted. `git push` / `git pull` replace this.      |
-| `commit`, `branch`, `checkout`, `log` tools  | Deleted. `git commit`, `git branch`, etc., replace. |
-| `push`, `pull` MCP tools                     | Deleted. `git push` / `git pull` replace these.     |
-| `MergeEngine` trait + `NoOpMergeEngine`      | Deleted. Git merge replaces for NDJSON conflicts.   |
-| `khive-vcs` crate                            | Reduced to `export`, `import`, `validate`, `diff`.  |
-| `KgArchive` in `portability.rs`              | Preserved as the in-memory representation.          |
-| `RemoteConfig` + `.khive/remotes.toml`       | Replaced by `schema.yaml#remotes`.                  |
+| ADR-042 component                           | Disposition in ADR-048                                             |
+| ------------------------------------------- | ------------------------------------------------------------------ |
+| `kg_snapshots` + `kg_snapshot_archives` SQL | Deleted. Git provides the commit history.                          |
+| `kg_branches` SQL table                     | Deleted. Git branches replace this.                                |
+| `kg_vcs_state` dirty-flag table             | Deleted. Status is computed via DB-vs-NDJSON diff (ADR-052 §6–§7). |
+| SHA-256 canonical hash algorithm            | Retained. Export determinism ensures stable hashes.                |
+| `khive-sync` HTTP server + push/pull API    | Deleted. `git push` / `git pull` replace this.                     |
+| `commit`, `branch`, `checkout`, `log` tools | Deleted. `git commit`, `git branch`, etc., replace.                |
+| `push`, `pull` MCP tools                    | Deleted. `git push` / `git pull` replace these.                    |
+| `MergeEngine` trait + `NoOpMergeEngine`     | Deleted. Git merge replaces for NDJSON conflicts.                  |
+| `khive-vcs` crate                           | Reduced to `export`, `import`, `validate`, `diff`.                 |
+| `KgArchive` in `portability.rs`             | Preserved as the in-memory representation.                         |
+| `RemoteConfig` + `.khive/remotes.toml`      | Replaced by `schema.yaml#remotes`.                                 |
 
 #### ADR-043 scope reduction
 
@@ -456,14 +461,14 @@ case, delegated entirely to git.
 
 ### Why NDJSON over alternative serialization formats
 
-| Format         | Diff quality         | Merge quality           | Human readability | Why not chosen                           |
-| -------------- | -------------------- | ----------------------- | ----------------- | ---------------------------------------- |
-| NDJSON sorted  | Line-per-entity, clean | Non-overlapping = clean | Good              | **Chosen**                               |
-| JSON (one blob)| Entire file changes  | Always conflict         | Good              | Merge unusable; one change = full diff   |
-| RDF/Turtle     | Semantic, line-level | Clean for additions     | Poor              | Complex parser; non-standard tooling     |
-| Parquet/binary | Not diffable         | Not mergeable           | None              | Entirely wrong abstraction               |
-| SQLite file    | Not diffable by git  | Binary merge always fails | None             | The current status quo — what we escape  |
-| CSV            | Line-per-row         | Same as NDJSON          | Limited           | No type system; properties not expressible |
+| Format          | Diff quality           | Merge quality             | Human readability | Why not chosen                             |
+| --------------- | ---------------------- | ------------------------- | ----------------- | ------------------------------------------ |
+| NDJSON sorted   | Line-per-entity, clean | Non-overlapping = clean   | Good              | **Chosen**                                 |
+| JSON (one blob) | Entire file changes    | Always conflict           | Good              | Merge unusable; one change = full diff     |
+| RDF/Turtle      | Semantic, line-level   | Clean for additions       | Poor              | Complex parser; non-standard tooling       |
+| Parquet/binary  | Not diffable           | Not mergeable             | None              | Entirely wrong abstraction                 |
+| SQLite file     | Not diffable by git    | Binary merge always fails | None              | The current status quo — what we escape    |
+| CSV             | Line-per-row           | Same as NDJSON            | Limited           | No type system; properties not expressible |
 
 ### Why sorted by UUID rather than by name or creation time
 
@@ -512,15 +517,15 @@ Both approaches are bounded in bandwidth regardless of the size of the remote re
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-| --- | --- | --- | --- |
-| Keep ADR-042 custom VCS (snapshots + `khive-sync`) | Full control; works offline without git installed | Months of work to reach git parity; closed ecosystem; foreign UX for researchers | Duplicates solved problems; wrong abstraction level |
-| JSON blob (one file for all entities) | Single file to commit | Every entity change diffs as a full-file rewrite; merge always conflicts | Merge unusable |
-| RDF serialization (Turtle, N-Triples) | Semantic web interop; line-addressable | Non-standard tooling; complex parser; no typed property model | Complexity without benefit for the target use case |
-| Dolt (MySQL-compatible versioned relational DB) | Versioned SQL tables; git-like CLI | Binary storage; no NDJSON; no GitHub PR review without DoltHub; adds a runtime dependency | Not git-native; additional infrastructure dependency |
-| TerminusDB / TDB2 | Specialized graph VCS | Heavy infrastructure; not embeddable; foreign data model | Wrong abstraction for an embeddable Rust KG library |
-| CRDT-based automatic merge | No conflicts; always produces a result | Semantic contradictions silently accepted; ADR-010 explicitly rejected CRDTs | Safety requirement: silent corruption is worse than a paused merge |
-| Store snapshot archives in git LFS | Full-fidelity snapshots; git history | LFS is not universally available; binary blobs; same diff problem as JSON blob | NDJSON file is better diffable and does not require LFS |
+| Alternative                                        | Pros                                              | Cons                                                                                      | Why rejected                                                       |
+| -------------------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Keep ADR-042 custom VCS (snapshots + `khive-sync`) | Full control; works offline without git installed | Months of work to reach git parity; closed ecosystem; foreign UX for researchers          | Duplicates solved problems; wrong abstraction level                |
+| JSON blob (one file for all entities)              | Single file to commit                             | Every entity change diffs as a full-file rewrite; merge always conflicts                  | Merge unusable                                                     |
+| RDF serialization (Turtle, N-Triples)              | Semantic web interop; line-addressable            | Non-standard tooling; complex parser; no typed property model                             | Complexity without benefit for the target use case                 |
+| Dolt (MySQL-compatible versioned relational DB)    | Versioned SQL tables; git-like CLI                | Binary storage; no NDJSON; no GitHub PR review without DoltHub; adds a runtime dependency | Not git-native; additional infrastructure dependency               |
+| TerminusDB / TDB2                                  | Specialized graph VCS                             | Heavy infrastructure; not embeddable; foreign data model                                  | Wrong abstraction for an embeddable Rust KG library                |
+| CRDT-based automatic merge                         | No conflicts; always produces a result            | Semantic contradictions silently accepted; ADR-010 explicitly rejected CRDTs              | Safety requirement: silent corruption is worse than a paused merge |
+| Store snapshot archives in git LFS                 | Full-fidelity snapshots; git history              | LFS is not universally available; binary blobs; same diff problem as JSON blob            | NDJSON file is better diffable and does not require LFS            |
 
 ### Comparison to Existing Tools
 
@@ -670,13 +675,13 @@ and do not require expiration logic.
 
 ### Phasing
 
-| Phase | Scope | Target |
-| ----- | ----- | ------ |
-| 1 | `schema.rs` + `export.rs` + `import.rs` (no remote resolution, no CI workflow) | v0.4 |
-| 2 | `validate.rs` (schema compliance + referential integrity + sort check) | v0.4 |
-| 3 | `remote.rs` (sparse checkout + GitHub API + cache) + cross-repo reference support | v0.5 |
-| 4 | `diff.rs` (entity-aware diff rendering) + `update.rs` (remote ref bump) | v0.5 |
-| 5 | CI workflow generation in `khive kg init` | v0.5 |
+| Phase | Scope                                                                             | Target |
+| ----- | --------------------------------------------------------------------------------- | ------ |
+| 1     | `schema.rs` + `export.rs` + `import.rs` (no remote resolution, no CI workflow)    | v0.4   |
+| 2     | `validate.rs` (schema compliance + referential integrity + sort check)            | v0.4   |
+| 3     | `remote.rs` (sparse checkout + GitHub API + cache) + cross-repo reference support | v0.5   |
+| 4     | `diff.rs` (entity-aware diff rendering) + `update.rs` (remote ref bump)           | v0.5   |
+| 5     | CI workflow generation in `khive kg init`                                         | v0.5   |
 
 Phase 1 and 2 are independently shippable and cover the core use case: export from SQLite, commit
 to git, import from git on another machine.
@@ -750,13 +755,13 @@ passes the selected namespace on every API call. Default is `local` (the current
 
 #### Phasing (frontend)
 
-| Phase | Scope |
-| ----- | ----- |
-| F1 | Namespace picker + per-namespace entity list filter (requires `namespace` param on gateway) |
-| F2 | Per-namespace graph view with dashed-line remote refs |
-| F3 | Cross-namespace cluster map ("world view") |
-| F4 | Schema tab rendering `schema.yaml` |
-| F5 | "View on GitHub" links for remote entities + namespace provenance badges |
+| Phase | Scope                                                                                       |
+| ----- | ------------------------------------------------------------------------------------------- |
+| F1    | Namespace picker + per-namespace entity list filter (requires `namespace` param on gateway) |
+| F2    | Per-namespace graph view with dashed-line remote refs                                       |
+| F3    | Cross-namespace cluster map ("world view")                                                  |
+| F4    | Schema tab rendering `schema.yaml`                                                          |
+| F5    | "View on GitHub" links for remote entities + namespace provenance badges                    |
 
 F1 can ship as soon as the `namespace` field is exposed on the gateway and `khive kg import` writes
 namespaced entities. F2-F5 are incremental improvements.

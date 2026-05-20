@@ -98,14 +98,14 @@ set; the token is treated as long-lived (no expiry check). Tokens are generated 
 
 ```json
 {
-    "api_url": "https://api.khive.ai",
-    "access_token": "eyJ...",
-    "refresh_token": "...",
-    "expires_at": "2026-05-20T15:00:00Z",
-    "user": {
-        "namespace": "ocean",
-        "email": "ocean@example.com"
-    }
+  "api_url": "https://api.khive.ai",
+  "access_token": "eyJ...",
+  "refresh_token": "...",
+  "expires_at": "2026-05-20T15:00:00Z",
+  "user": {
+    "namespace": "ocean",
+    "email": "ocean@example.com"
+  }
 }
 ```
 
@@ -288,11 +288,11 @@ DB sync without knowing about `khive kg`.
 
 ### 7. Phasing
 
-| Phase | What | Target version |
-|-------|------|----------------|
-| C1 | `khive kg commit` + `khive kg sync` + `khive kg status` + git hooks | v0.3 |
-| C2 | `khive auth login/status/logout` + `~/.khive/auth.json` (optional) | v0.4 |
-| C3 | `khive kg resolve` (entity-level conflict resolution, see ADR-053) | v0.5 |
+| Phase | What                                                                | Target version |
+| ----- | ------------------------------------------------------------------- | -------------- |
+| C1    | `khive kg commit` + `khive kg sync` + `khive kg status` + git hooks | v0.3           |
+| C2    | `khive auth login/status/logout` + `~/.khive/auth.json` (optional)  | v0.4           |
+| C3    | `khive kg resolve` (entity-level conflict resolution, see ADR-053)  | v0.5           |
 
 C1 is the complete local workflow: commit, sync, and status. This covers 100% of the solo-user
 use case and 90% of the multi-user workflow (sync handles pull/checkout; only merge conflicts
@@ -363,14 +363,14 @@ configure the namespace.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-|---|---|---|---|
-| Full git wrapper (`khive kg push/pull/branch/checkout/merge/stash/log`) | Familiar "all-in-one" surface | Massive maintenance cost; wrapping git introduces behavioral surprises; users already know git; git hooks achieve the same automatic sync | The wrapper adds no KG-specific value for transport/branching; git hooks + `sync` is simpler and works with all git interfaces |
-| Device-flow OAuth (no local HTTP server) | Works in headless environments without a port | Requires khive.ai to implement the device authorization endpoint; longer user flow (poll loop) | Browser flow is simpler for the common case; `--token` covers the headless case |
-| Store tokens in system keychain | Stronger isolation than file permissions | Platform-specific code; unavailable in Docker/CI; not portable for `api_url` config field | File with `0600` is portable and auditable; keychain can be layered on top |
-| `khive kg commit` without automatic export | User controls export timing | Developer forgets to export after last edit; commits stale NDJSON | Correctness invariant: commit ≡ export + validate + git commit. Auto-export is the right default. |
-| Advisory sync POST on push | khive.ai updates immediately without webhook | Couples CLI to khive.ai availability; breaks offline workflow; redundant when webhooks exist | GitHub App webhooks handle push notification without any CLI-side code |
-| Pre-commit hook instead of `khive kg commit` | Transparent: `git commit` auto-exports | Complex hook logic; silent failures confuse users; `git commit --no-verify` skips it | Explicit `khive kg commit` is more predictable and its failures are visible |
+| Alternative                                                             | Pros                                          | Cons                                                                                                                                      | Why rejected                                                                                                                   |
+| ----------------------------------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Full git wrapper (`khive kg push/pull/branch/checkout/merge/stash/log`) | Familiar "all-in-one" surface                 | Massive maintenance cost; wrapping git introduces behavioral surprises; users already know git; git hooks achieve the same automatic sync | The wrapper adds no KG-specific value for transport/branching; git hooks + `sync` is simpler and works with all git interfaces |
+| Device-flow OAuth (no local HTTP server)                                | Works in headless environments without a port | Requires khive.ai to implement the device authorization endpoint; longer user flow (poll loop)                                            | Browser flow is simpler for the common case; `--token` covers the headless case                                                |
+| Store tokens in system keychain                                         | Stronger isolation than file permissions      | Platform-specific code; unavailable in Docker/CI; not portable for `api_url` config field                                                 | File with `0600` is portable and auditable; keychain can be layered on top                                                     |
+| `khive kg commit` without automatic export                              | User controls export timing                   | Developer forgets to export after last edit; commits stale NDJSON                                                                         | Correctness invariant: commit ≡ export + validate + git commit. Auto-export is the right default.                              |
+| Advisory sync POST on push                                              | khive.ai updates immediately without webhook  | Couples CLI to khive.ai availability; breaks offline workflow; redundant when webhooks exist                                              | GitHub App webhooks handle push notification without any CLI-side code                                                         |
+| Pre-commit hook instead of `khive kg commit`                            | Transparent: `git commit` auto-exports        | Complex hook logic; silent failures confuse users; `git commit --no-verify` skips it                                                      | Explicit `khive kg commit` is more predictable and its failures are visible                                                    |
 
 ## Consequences
 

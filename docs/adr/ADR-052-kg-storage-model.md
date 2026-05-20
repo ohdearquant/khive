@@ -23,13 +23,13 @@ reconciliation protocol that binds the two layers.
 
 The design is structurally identical to git's own storage model:
 
-| git | khive KG |
-|-----|---------|
-| Working tree | `working.db` — live, editable via `khive create/link/update` |
-| Object store / committed snapshot | `entities.ndjson`, `edges.ndjson` — committed, git-tracked |
-| `git add && git commit` | `khive kg commit` (exports DB → files → `git commit`) |
-| `git checkout` / `git pull` | `khive kg pull` (files → DB rebuild) |
-| `.git/` | `.khive/kg/.state/` (gitignored, ephemeral) |
+| git                               | khive KG                                                     |
+| --------------------------------- | ------------------------------------------------------------ |
+| Working tree                      | `working.db` — live, editable via `khive create/link/update` |
+| Object store / committed snapshot | `entities.ndjson`, `edges.ndjson` — committed, git-tracked   |
+| `git add && git commit`           | `khive kg commit` (exports DB → files → `git commit`)        |
+| `git checkout` / `git pull`       | `khive kg pull` (files → DB rebuild)                         |
+| `.git/`                           | `.khive/kg/.state/` (gitignored, ephemeral)                  |
 
 The DB is git's working tree: where active edits happen. The NDJSON files are the committed
 snapshot: what git tracks, diffs, and merges. The `.state/` directory is the internal
@@ -78,12 +78,12 @@ multi-project case without requiring multiple KGs in one repo.
 Neither layer is unconditionally "the" source of truth. Each is authoritative at a
 different phase of the lifecycle:
 
-| Phase | Authoritative layer | Operation |
-|-------|---------------------|-----------|
-| Active work (between commits) | `working.db` | Reads and writes go to DB |
-| Committed state | `entities.ndjson`, `edges.ndjson` | Files are what git tracks |
-| Committing | DB wins | `commit` exports DB → files |
-| Checking out / pulling | Files win | Files → DB rebuild |
+| Phase                         | Authoritative layer               | Operation                   |
+| ----------------------------- | --------------------------------- | --------------------------- |
+| Active work (between commits) | `working.db`                      | Reads and writes go to DB   |
+| Committed state               | `entities.ndjson`, `edges.ndjson` | Files are what git tracks   |
+| Committing                    | DB wins                           | `commit` exports DB → files |
+| Checking out / pulling        | Files win                         | Files → DB rebuild          |
 
 The transition is always one-directional at a time. There is no bidirectional sync.
 Bidirectional sync requires conflict resolution at the record level, which collapses
@@ -484,13 +484,13 @@ detection code resolves; the verb surface itself is unchanged.
 
 ### Phasing
 
-| Phase | Scope | Target |
-|-------|-------|--------|
-| S1 | `storage.rs` + `init.rs` — DB DDL, init command | v0.4 |
-| S2 | `commit.rs` + `checkout.rs` — commit and pull flows | v0.4 |
-| S3 | `status.rs` — DB-vs-NDJSON diff computation | v0.4 |
-| S4 | `reset.rs` + mode detection in pack handlers | v0.4 |
-| S5 | Performance: row-level change log for large graphs | v0.6 (deferred) |
+| Phase | Scope                                               | Target          |
+| ----- | --------------------------------------------------- | --------------- |
+| S1    | `storage.rs` + `init.rs` — DB DDL, init command     | v0.4            |
+| S2    | `commit.rs` + `checkout.rs` — commit and pull flows | v0.4            |
+| S3    | `status.rs` — DB-vs-NDJSON diff computation         | v0.4            |
+| S4    | `reset.rs` + mode detection in pack handlers        | v0.4            |
+| S5    | Performance: row-level change log for large graphs  | v0.6 (deferred) |
 
 S1–S4 form a complete v0.4 implementation. The core workflow (`init` → `create/link` →
 `status` → `commit` → `pull`) is covered by S1–S3. Mode detection (S4) enables the verb

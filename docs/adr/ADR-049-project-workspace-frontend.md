@@ -155,15 +155,15 @@ data flows are inherited from ADR-047, with the following additions:
 
 **URL params for the KG tab:**
 
-| Param          | Values                                     | Sub-view       |
-| -------------- | ------------------------------------------ | -------------- |
-| `?kind=...`    | Comma-separated entity kind filter         | EntityBrowser  |
-| `?q=...`       | Free-text search query                     | EntityBrowser  |
-| `?entity=<id>` | Open PropertyInspector for this entity     | EntityBrowser  |
-| `?center=<id>` | Selected center entity                     | NeighborhoodGraph |
-| `?depth=1\|2`  | Hop depth                                  | NeighborhoodGraph |
-| `?from=<id>`   | Source entity                              | PathFinder     |
-| `?to=<id>`     | Target entity                              | PathFinder     |
+| Param          | Values                                 | Sub-view          |
+| -------------- | -------------------------------------- | ----------------- |
+| `?kind=...`    | Comma-separated entity kind filter     | EntityBrowser     |
+| `?q=...`       | Free-text search query                 | EntityBrowser     |
+| `?entity=<id>` | Open PropertyInspector for this entity | EntityBrowser     |
+| `?center=<id>` | Selected center entity                 | NeighborhoodGraph |
+| `?depth=1\|2`  | Hop depth                              | NeighborhoodGraph |
+| `?from=<id>`   | Source entity                          | PathFinder        |
+| `?to=<id>`     | Target entity                          | PathFinder        |
 
 ### D4: Tasks tab (`/projects/:namespace/tasks`)
 
@@ -191,10 +191,10 @@ The component APIs and data flows are inherited verbatim from ADR-047. The only 
 
 **URL params for the Tasks tab:**
 
-| Param            | Values                          |
-| ---------------- | ------------------------------- |
-| `?assignee=<n>`  | Active assignee filter          |
-| `?task=<id>`     | Open TaskDetailPanel            |
+| Param             | Values                          |
+| ----------------- | ------------------------------- |
+| `?assignee=<n>`   | Active assignee filter          |
+| `?task=<id>`      | Open TaskDetailPanel            |
 | `?priority=p0,p1` | Comma-separated priority filter |
 
 ### D5: Swarm tab (`/projects/:namespace/swarm`)
@@ -338,6 +338,7 @@ SchemaTab
 ```
 
 **RemotesSection** renders each remote with:
+
 - Name (the key in `schema.yaml#remotes`)
 - Repo link: `https://github.com/<repo>` (opens in new tab)
 - Commit: first 7 chars, linked to `https://github.com/<repo>/commit/<full-sha>`
@@ -402,9 +403,9 @@ nodes to reposition them (React Flow's built-in node drag).
 
 **URL params:**
 
-| Param              | Values                              |
-| ------------------ | ----------------------------------- |
-| `?highlight=<ns>`  | Highlight edges incident to this namespace |
+| Param             | Values                                     |
+| ----------------- | ------------------------------------------ |
+| `?highlight=<ns>` | Highlight edges incident to this namespace |
 
 ### D9: Gateway route additions (extends ADR-044)
 
@@ -414,14 +415,14 @@ query parameter that is passed through to the `khive-mcp` DSL call.
 
 #### Project routes (new)
 
-| Method  | Path                                          | DSL / behavior                                                                                                            |
-| ------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `GET`   | `/api/projects`                               | Derives namespace list from `list(kind="entity", limit=1)` distinct-namespace aggregation; returns `ProjectSummary[]`     |
-| `GET`   | `/api/projects/:namespace/stats`              | `[list(kind="entity", namespace=<ns>, limit=1), tasks(namespace=<ns>, status="active", limit=1)]` → entity/task counts   |
-| `GET`   | `/api/projects/:namespace/schema`             | Reads `.khive/kg/schema.yaml` from the project directory; returns parsed `ProjectSchema` JSON                             |
-| `PUT`   | `/api/projects/:namespace/schema`             | Writes body to `.khive/kg/schema.yaml`; runs `khive kg validate`; returns 204 on success, 422 on validation error        |
-| `GET`   | `/api/projects/:namespace/packs`              | Introspects `VerbRegistry.all_packs()` (via DSL or gateway config); returns `PackInfo[]`                                  |
-| `POST`  | `/api/projects/:namespace/packs/:name/toggle` | Phase 6: enable/disable a pack in the running `khive-mcp` instance; returns updated `PackInfo`                            |
+| Method | Path                                          | DSL / behavior                                                                                                         |
+| ------ | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/projects`                               | Derives namespace list from `list(kind="entity", limit=1)` distinct-namespace aggregation; returns `ProjectSummary[]`  |
+| `GET`  | `/api/projects/:namespace/stats`              | `[list(kind="entity", namespace=<ns>, limit=1), tasks(namespace=<ns>, status="active", limit=1)]` → entity/task counts |
+| `GET`  | `/api/projects/:namespace/schema`             | Reads `.khive/kg/schema.yaml` from the project directory; returns parsed `ProjectSchema` JSON                          |
+| `PUT`  | `/api/projects/:namespace/schema`             | Writes body to `.khive/kg/schema.yaml`; runs `khive kg validate`; returns 204 on success, 422 on validation error      |
+| `GET`  | `/api/projects/:namespace/packs`              | Introspects `VerbRegistry.all_packs()` (via DSL or gateway config); returns `PackInfo[]`                               |
+| `POST` | `/api/projects/:namespace/packs/:name/toggle` | Phase 6: enable/disable a pack in the running `khive-mcp` instance; returns updated `PackInfo`                         |
 
 #### Namespace parameter on existing routes (extends ADR-044 D2)
 
@@ -429,20 +430,20 @@ All existing routes accept `?namespace=<ns>` as a query parameter. When present,
 includes `namespace=<ns>` as a named argument. When absent, the gateway passes no namespace
 argument, and `khive-mcp` uses the session-default namespace (the actor's own).
 
-| Existing route     | Namespace parameter behavior                                             |
-| ------------------ | ------------------------------------------------------------------------ |
-| `GET /api/entities`       | `list(kind="entity", namespace=<ns>, ...)`                        |
-| `GET /api/entities/:id`   | `get(id=":id")` — namespace enforcement is internal to the runtime |
-| `POST /api/entities`      | `create(kind="entity", namespace=<ns>, ...)`                       |
-| `PATCH /api/entities/:id` | `update(id=":id", ...)` — runtime enforces namespace              |
-| `DELETE /api/entities/:id`| `delete(id=":id")` — runtime enforces namespace                   |
-| `GET /api/edges`          | `list(kind="edge", namespace=<ns>, ...)`                           |
-| `POST /api/edges`         | `link(source_id=..., target_id=..., namespace=<ns>, ...)`          |
-| `GET /api/tasks`          | `tasks(namespace=<ns>, ...)`                                       |
-| `POST /api/tasks`         | `assign(namespace=<ns>, ...)`                                      |
-| `POST /api/tasks/:id/...` | Transition/complete — runtime enforces namespace                   |
-| `GET /api/search`         | `search(namespace=<ns>, ...)`                                      |
-| `GET /api/traverse`       | `traverse(namespace=<ns>, ...)`                                    |
+| Existing route             | Namespace parameter behavior                                       |
+| -------------------------- | ------------------------------------------------------------------ |
+| `GET /api/entities`        | `list(kind="entity", namespace=<ns>, ...)`                         |
+| `GET /api/entities/:id`    | `get(id=":id")` — namespace enforcement is internal to the runtime |
+| `POST /api/entities`       | `create(kind="entity", namespace=<ns>, ...)`                       |
+| `PATCH /api/entities/:id`  | `update(id=":id", ...)` — runtime enforces namespace               |
+| `DELETE /api/entities/:id` | `delete(id=":id")` — runtime enforces namespace                    |
+| `GET /api/edges`           | `list(kind="edge", namespace=<ns>, ...)`                           |
+| `POST /api/edges`          | `link(source_id=..., target_id=..., namespace=<ns>, ...)`          |
+| `GET /api/tasks`           | `tasks(namespace=<ns>, ...)`                                       |
+| `POST /api/tasks`          | `assign(namespace=<ns>, ...)`                                      |
+| `POST /api/tasks/:id/...`  | Transition/complete — runtime enforces namespace                   |
+| `GET /api/search`          | `search(namespace=<ns>, ...)`                                      |
+| `GET /api/traverse`        | `traverse(namespace=<ns>, ...)`                                    |
 
 #### MCP verb namespace passthrough (verb surface change)
 
@@ -581,11 +582,11 @@ type ViewState<T> =
 keys include the namespace:
 
 ```ts
-queryKey: ["entities", namespace, filters]
-queryKey: ["tasks", namespace, status, assignee]
-queryKey: ["schema", namespace]
-queryKey: ["packs", namespace]
-queryKey: ["projects"]
+queryKey: ["entities", namespace, filters];
+queryKey: ["tasks", namespace, status, assignee];
+queryKey: ["schema", namespace];
+queryKey: ["packs", namespace];
+queryKey: ["projects"];
 ```
 
 Stale time: 60 seconds for entities and schema; 5 seconds for tasks and swarm state (active swarm
@@ -601,15 +602,15 @@ unchanged; only the data-fetching library changes.
 
 ## Phasing
 
-| Phase | Scope | Target |
-| ----- | ----- | ------ |
-| F1 | Project picker + `GET /api/projects` + `namespace` param on existing gateway routes + per-namespace EntityBrowser | v0.3 |
-| F2 | Per-namespace Tasks kanban + Swarm telemetry tab (inherit ADR-047 + ADR-045 components, add namespace scoping) | v0.3 |
-| F3 | Packs tab (read-only introspection via `GET /api/projects/:namespace/packs`) | v0.3 |
-| F4 | Schema tab: render `schema.yaml` via `GET /api/projects/:namespace/schema` + RemotesSection with GitHub links | v0.4 |
-| F5 | World view cluster map (`/projects`) with inter-namespace edge aggregation | v0.4 |
-| F6 | Schema tab editing (`PUT /api/projects/:namespace/schema` + validation feedback) | v0.4 |
-| F7 | Pack toggle (`POST /api/projects/:namespace/packs/:name/toggle`) | v0.5 |
+| Phase | Scope                                                                                                             | Target |
+| ----- | ----------------------------------------------------------------------------------------------------------------- | ------ |
+| F1    | Project picker + `GET /api/projects` + `namespace` param on existing gateway routes + per-namespace EntityBrowser | v0.3   |
+| F2    | Per-namespace Tasks kanban + Swarm telemetry tab (inherit ADR-047 + ADR-045 components, add namespace scoping)    | v0.3   |
+| F3    | Packs tab (read-only introspection via `GET /api/projects/:namespace/packs`)                                      | v0.3   |
+| F4    | Schema tab: render `schema.yaml` via `GET /api/projects/:namespace/schema` + RemotesSection with GitHub links     | v0.4   |
+| F5    | World view cluster map (`/projects`) with inter-namespace edge aggregation                                        | v0.4   |
+| F6    | Schema tab editing (`PUT /api/projects/:namespace/schema` + validation feedback)                                  | v0.4   |
+| F7    | Pack toggle (`POST /api/projects/:namespace/packs/:name/toggle`)                                                  | v0.5   |
 
 F1 and F2 unblock the primary use case: a user working in one project sees only that project's
 entities, tasks, and agent activity without cross-project noise. F1 requires the `namespace` param
@@ -672,14 +673,14 @@ gateway route switches to calling it without any frontend change.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-| --- | --- | --- | --- |
-| Namespace filter on existing flat routes (`/kg?namespace=X`) | Minimal URL change; no route restructuring | Filter is optional → accidental cross-namespace views; no structural scope enforcement | Project-first scope is required to eliminate cross-namespace noise |
-| Separate tab set per page (ADR-047 + ADR-045 as standalone) | Preserves existing route structure | No unifying workspace concept; duplicates namespace state across three separate pages | Single workspace with shared namespace context is architecturally cleaner |
-| One `khive-mcp` process per namespace (Option A) | Clean namespace isolation in the server | N processes, N connections, N WAL files; does not scale beyond a handful of projects | Resource cost grows linearly; Option B is stateless and scales better |
-| `set_namespace` handshake per session (Option C) | No per-call overhead | Stateful protocol; race condition risk in concurrent batch calls; complex error recovery | Stateful sessions are fragile; per-call namespace is simpler and safer |
-| SWR (continue from ADR-047/045) | Consistent with prior ADRs | Cannot cleanly express per-query stale times at 5-tab heterogeneous cadences | TanStack Query's structured query key and per-query staleTime are better fits |
-| World view as a tab inside a project (not a separate route) | Simpler navigation model | World view is inherently cross-namespace; nesting it inside a namespace-scoped workspace is a conceptual contradiction | `/projects` as a top-level route makes the cross-namespace scope unambiguous |
+| Alternative                                                  | Pros                                       | Cons                                                                                                                   | Why rejected                                                                  |
+| ------------------------------------------------------------ | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Namespace filter on existing flat routes (`/kg?namespace=X`) | Minimal URL change; no route restructuring | Filter is optional → accidental cross-namespace views; no structural scope enforcement                                 | Project-first scope is required to eliminate cross-namespace noise            |
+| Separate tab set per page (ADR-047 + ADR-045 as standalone)  | Preserves existing route structure         | No unifying workspace concept; duplicates namespace state across three separate pages                                  | Single workspace with shared namespace context is architecturally cleaner     |
+| One `khive-mcp` process per namespace (Option A)             | Clean namespace isolation in the server    | N processes, N connections, N WAL files; does not scale beyond a handful of projects                                   | Resource cost grows linearly; Option B is stateless and scales better         |
+| `set_namespace` handshake per session (Option C)             | No per-call overhead                       | Stateful protocol; race condition risk in concurrent batch calls; complex error recovery                               | Stateful sessions are fragile; per-call namespace is simpler and safer        |
+| SWR (continue from ADR-047/045)                              | Consistent with prior ADRs                 | Cannot cleanly express per-query stale times at 5-tab heterogeneous cadences                                           | TanStack Query's structured query key and per-query staleTime are better fits |
+| World view as a tab inside a project (not a separate route)  | Simpler navigation model                   | World view is inherently cross-namespace; nesting it inside a namespace-scoped workspace is a conceptual contradiction | `/projects` as a top-level route makes the cross-namespace scope unambiguous  |
 
 ## Consequences
 
@@ -732,54 +733,54 @@ gateway route switches to calling it without any frontend change.
 
 ### Phase 1 (F1) — Project picker + namespace-aware entity list
 
-| Step | File | Change |
-| ---- | ---- | ------ |
-| 1 | `deno/src/api/projects.ts` | `GET /api/projects` (reads `~/.khive/projects.json`); `GET /api/projects/:ns/stats` |
-| 2 | `deno/src/api/entities.ts` + all other routes | Add `namespace` query param forwarding to all existing DSL calls |
-| 3 | `deno/src/types/api.ts` | `ProjectSummary` type |
-| 4 | `frontend/lib/api/projects.ts` | `fetchProjects()`, `fetchProjectStats()` |
-| 5 | `frontend/app/_components/ProjectPicker.tsx` | Namespace dropdown + localStorage persistence |
-| 6 | `frontend/app/projects/[namespace]/layout.tsx` | `ProjectLayout` with tab bar (KG / Tasks / Swarm / Packs / Schema) |
-| 7 | `frontend/app/projects/[namespace]/kg/page.tsx` | `KgTab` wrapping existing `EntityBrowser` + namespace-aware queries |
-| 8 | `frontend/app/projects/page.tsx` | Placeholder world view (entity count per project, no cluster map) |
+| Step | File                                            | Change                                                                              |
+| ---- | ----------------------------------------------- | ----------------------------------------------------------------------------------- |
+| 1    | `deno/src/api/projects.ts`                      | `GET /api/projects` (reads `~/.khive/projects.json`); `GET /api/projects/:ns/stats` |
+| 2    | `deno/src/api/entities.ts` + all other routes   | Add `namespace` query param forwarding to all existing DSL calls                    |
+| 3    | `deno/src/types/api.ts`                         | `ProjectSummary` type                                                               |
+| 4    | `frontend/lib/api/projects.ts`                  | `fetchProjects()`, `fetchProjectStats()`                                            |
+| 5    | `frontend/app/_components/ProjectPicker.tsx`    | Namespace dropdown + localStorage persistence                                       |
+| 6    | `frontend/app/projects/[namespace]/layout.tsx`  | `ProjectLayout` with tab bar (KG / Tasks / Swarm / Packs / Schema)                  |
+| 7    | `frontend/app/projects/[namespace]/kg/page.tsx` | `KgTab` wrapping existing `EntityBrowser` + namespace-aware queries                 |
+| 8    | `frontend/app/projects/page.tsx`                | Placeholder world view (entity count per project, no cluster map)                   |
 
 ### Phase 2 (F2) — Namespace-scoped Tasks + Swarm
 
-| Step | File | Change |
-| ---- | ---- | ------ |
-| 9 | `frontend/app/projects/[namespace]/tasks/page.tsx` | `TasksTab` wrapping `KanbanBoard` + namespace param on all task queries |
-| 10 | `frontend/app/projects/[namespace]/swarm/page.tsx` | `SwarmTab` wrapping `SwarmOverview` + namespace param on all swarm queries |
-| 11 | `frontend/app/projects/[namespace]/swarm/[agent]/page.tsx` | `AgentDrilldownPage` scoped to namespace |
+| Step | File                                                       | Change                                                                     |
+| ---- | ---------------------------------------------------------- | -------------------------------------------------------------------------- |
+| 9    | `frontend/app/projects/[namespace]/tasks/page.tsx`         | `TasksTab` wrapping `KanbanBoard` + namespace param on all task queries    |
+| 10   | `frontend/app/projects/[namespace]/swarm/page.tsx`         | `SwarmTab` wrapping `SwarmOverview` + namespace param on all swarm queries |
+| 11   | `frontend/app/projects/[namespace]/swarm/[agent]/page.tsx` | `AgentDrilldownPage` scoped to namespace                                   |
 
 ### Phase 3 (F3) — Packs tab
 
-| Step | File | Change |
-| ---- | ---- | ------ |
-| 12 | `deno/src/api/projects.ts` | `GET /api/projects/:ns/packs` — reads `VerbRegistry` state |
-| 13 | `frontend/lib/packs/PackCard.tsx` | Pack card with verb list, kind pills, edge rules |
-| 14 | `frontend/app/projects/[namespace]/packs/page.tsx` | `PacksTab` |
+| Step | File                                               | Change                                                     |
+| ---- | -------------------------------------------------- | ---------------------------------------------------------- |
+| 12   | `deno/src/api/projects.ts`                         | `GET /api/projects/:ns/packs` — reads `VerbRegistry` state |
+| 13   | `frontend/lib/packs/PackCard.tsx`                  | Pack card with verb list, kind pills, edge rules           |
+| 14   | `frontend/app/projects/[namespace]/packs/page.tsx` | `PacksTab`                                                 |
 
 ### Phase 4 (F4) — Schema tab + remote linking
 
-| Step | File | Change |
-| ---- | ---- | ------ |
-| 15 | `deno/src/api/projects.ts` | `GET /api/projects/:ns/schema` — parse and return `schema.yaml` |
-| 16 | `frontend/lib/schema/` | `EntityKindsSection`, `EdgeRelationsTable`, `PropertiesSection`, `RemotesSection` |
-| 17 | `frontend/app/projects/[namespace]/schema/page.tsx` | `SchemaTab` (read-only) |
+| Step | File                                                | Change                                                                            |
+| ---- | --------------------------------------------------- | --------------------------------------------------------------------------------- |
+| 15   | `deno/src/api/projects.ts`                          | `GET /api/projects/:ns/schema` — parse and return `schema.yaml`                   |
+| 16   | `frontend/lib/schema/`                              | `EntityKindsSection`, `EdgeRelationsTable`, `PropertiesSection`, `RemotesSection` |
+| 17   | `frontend/app/projects/[namespace]/schema/page.tsx` | `SchemaTab` (read-only)                                                           |
 
 ### Phase 5 (F5) — World view cluster map
 
-| Step | File | Change |
-| ---- | ---- | ------ |
-| 18 | `frontend/lib/world/` | `WorldView`, `ProjectClusterNode`, `CrossRepoEdge` |
-| 19 | `frontend/app/projects/page.tsx` | Replace placeholder with full React Flow cluster map |
+| Step | File                             | Change                                               |
+| ---- | -------------------------------- | ---------------------------------------------------- |
+| 18   | `frontend/lib/world/`            | `WorldView`, `ProjectClusterNode`, `CrossRepoEdge`   |
+| 19   | `frontend/app/projects/page.tsx` | Replace placeholder with full React Flow cluster map |
 
 ### Phase 6 (F6) — Schema editing
 
-| Step | File | Change |
-| ---- | ---- | ------ |
-| 20 | `deno/src/api/projects.ts` | `PUT /api/projects/:ns/schema` — write + validate |
-| 21 | `frontend/lib/schema/SchemaEditor.tsx` | YAML/JSON modal editor + 422 error display |
+| Step | File                                   | Change                                            |
+| ---- | -------------------------------------- | ------------------------------------------------- |
+| 20   | `deno/src/api/projects.ts`             | `PUT /api/projects/:ns/schema` — write + validate |
+| 21   | `frontend/lib/schema/SchemaEditor.tsx` | YAML/JSON modal editor + 422 error display        |
 
 ## Open Questions
 

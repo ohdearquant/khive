@@ -68,14 +68,14 @@ rules:
 
   remote-resolution:
     severity: error
-    enabled: true        # set false to skip network calls in offline environments
-    resolve_remotes: false  # matches ADR-048 --resolve-remotes default
+    enabled: true # set false to skip network calls in offline environments
+    resolve_remotes: false # matches ADR-048 --resolve-remotes default
 
   # ── Structural rules ───────────────────────────────────────────────────────
   no-orphan-entities:
     severity: warning
     config:
-      min_edges: 1       # every entity must have at least this many edges
+      min_edges: 1 # every entity must have at least this many edges
 
   no-self-loops:
     severity: error
@@ -85,7 +85,7 @@ rules:
     severity: warning
     config:
       min_edges_per_entity: 3
-      exclude_kinds: [person]   # entity kinds exempt from the density check
+      exclude_kinds: [person] # entity kinds exempt from the density check
 
   # ── Property rules ─────────────────────────────────────────────────────────
   required-properties:
@@ -103,8 +103,8 @@ rules:
   naming-convention:
     severity: warning
     config:
-      entity_names: title-case   # "Flash Attention" not "flash attention"
-      kind_names: lowercase      # "concept" not "Concept"
+      entity_names: title-case # "Flash Attention" not "flash attention"
+      kind_names: lowercase # "concept" not "Concept"
 
   # ── Graph size ─────────────────────────────────────────────────────────────
   max-entity-count:
@@ -148,7 +148,7 @@ export interface Entity {
 export interface Edge {
   edge_id: string;
   source: string;
-  target: string;   // local UUID or "<remote>:<uuid>"
+  target: string; // local UUID or "<remote>:<uuid>"
   relation: string;
   weight: number;
 }
@@ -163,12 +163,12 @@ export interface Schema {
 }
 
 export interface Violation {
-  entity_id: string | null;  // null for graph-level violations
+  entity_id: string | null; // null for graph-level violations
   edge_id?: string | null;
   rule_id: string;
   severity: "error" | "warning" | "info";
   message: string;
-  fixable?: boolean;  // true if --fix can correct this violation
+  fixable?: boolean; // true if --fix can correct this violation
 }
 
 export function validate(
@@ -207,7 +207,7 @@ rules:
   no-dangling-citations:
     severity: error
     enabled: true
-    module: rules/no-dangling-citations.ts   # path relative to .khive/kg/
+    module: rules/no-dangling-citations.ts # path relative to .khive/kg/
 ```
 
 The `module` key is what distinguishes a custom rule from a built-in rule. Built-in rules have
@@ -303,10 +303,10 @@ jobs:
       - name: Validate KG
         uses: khive/kg-validate-action@v1
         with:
-          rules: .khive/kg/rules.yaml    # default; override to point elsewhere
-          fail-on: error                 # "error" | "warning" | "never"
-          format: github                 # "github" | "json" | "text"
-          resolve-remotes: "true"        # enables full cross-repo resolution in CI
+          rules: .khive/kg/rules.yaml # default; override to point elsewhere
+          fail-on: error # "error" | "warning" | "never"
+          format: github # "github" | "json" | "text"
+          resolve-remotes: "true" # enables full cross-repo resolution in CI
 ```
 
 The `format: github` output mode uses GitHub Actions annotations
@@ -409,18 +409,18 @@ least one fixable violation was found; no spurious writes occur. The pre-commit 
 
 Built-in fixable rules:
 
-| Rule | Fix behavior |
-|------|-------------|
-| `sort-order` | Re-sorts both NDJSON files in the canonical sort order |
-| `naming-convention` (entity_names) | Normalizes entity names to title-case per config |
+| Rule                               | Fix behavior                                           |
+| ---------------------------------- | ------------------------------------------------------ |
+| `sort-order`                       | Re-sorts both NDJSON files in the canonical sort order |
+| `naming-convention` (entity_names) | Normalizes entity names to title-case per config       |
 
 Built-in unfixable rules (require human judgment):
 
-| Rule | Why unfixable |
-|------|--------------|
-| `required-properties` | The value must come from the contributor |
-| `min-edge-density` | Which edges to add is a semantic decision |
-| `no-orphan-entities` | Whether to add edges or delete the entity is context-dependent |
+| Rule                  | Why unfixable                                                  |
+| --------------------- | -------------------------------------------------------------- |
+| `required-properties` | The value must come from the contributor                       |
+| `min-edge-density`    | Which edges to add is a semantic decision                      |
+| `no-orphan-entities`  | Whether to add edges or delete the entity is context-dependent |
 
 Custom rules may declare their violations fixable and provide a `fix` export alongside `validate`:
 
@@ -477,7 +477,7 @@ override a pack rule's severity or disable it in their `rules.yaml`:
 ```yaml
 rules:
   biology/required-taxa-rank:
-    severity: error    # escalate from pack default of warning
+    severity: error # escalate from pack default of warning
     enabled: true
 ```
 
@@ -554,14 +554,14 @@ codes allow pipeline steps to route these cases to different notifications or re
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-|---|---|---|---|
-| No custom rules, only built-in | Simple, zero config | Teams have domain constraints that built-ins cannot express | Rejected: the biology example alone shows built-ins are insufficient |
-| JSON Schema for entity property validation | Widely known, good tooling | Cannot express structural rules (edge density, orphan detection, graph topology) | Partial — JSON Schema is incorporated implicitly via required-properties rule, but is insufficient as the sole validation mechanism |
-| WASM plugins for custom rules | Performance, language-agnostic | Complex build chain for contributors; no shared Deno runtime benefit | Deferred: add as a second module format if TypeScript performance is insufficient |
-| Server-side validation only (cloud API call) | No local tooling required | Breaks local-first, offline, and CI reproducibility guarantees from ADR-048 | Rejected: local-first is a hard requirement |
-| Per-entity inline rule annotations (NDJSON field) | Colocation of data and policy | Couples validation policy to data format; breaks interchange | Rejected: separating policy and data layers is explicit design intent |
-| Global `~/.khive/kg/rules.yaml` rather than per-project | One file for all projects | Projects have different ontologies and constraints; team-level rules should travel with the repo | Rejected: per-project `rules.yaml` is git-tracked and reviewable in PRs |
+| Alternative                                             | Pros                           | Cons                                                                                             | Why rejected                                                                                                                        |
+| ------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| No custom rules, only built-in                          | Simple, zero config            | Teams have domain constraints that built-ins cannot express                                      | Rejected: the biology example alone shows built-ins are insufficient                                                                |
+| JSON Schema for entity property validation              | Widely known, good tooling     | Cannot express structural rules (edge density, orphan detection, graph topology)                 | Partial — JSON Schema is incorporated implicitly via required-properties rule, but is insufficient as the sole validation mechanism |
+| WASM plugins for custom rules                           | Performance, language-agnostic | Complex build chain for contributors; no shared Deno runtime benefit                             | Deferred: add as a second module format if TypeScript performance is insufficient                                                   |
+| Server-side validation only (cloud API call)            | No local tooling required      | Breaks local-first, offline, and CI reproducibility guarantees from ADR-048                      | Rejected: local-first is a hard requirement                                                                                         |
+| Per-entity inline rule annotations (NDJSON field)       | Colocation of data and policy  | Couples validation policy to data format; breaks interchange                                     | Rejected: separating policy and data layers is explicit design intent                                                               |
+| Global `~/.khive/kg/rules.yaml` rather than per-project | One file for all projects      | Projects have different ontologies and constraints; team-level rules should travel with the repo | Rejected: per-project `rules.yaml` is git-tracked and reviewable in PRs                                                             |
 
 ## Consequences
 
@@ -634,34 +634,34 @@ cli/
 
 New CLI subcommands added to `commands/kg/hook.ts`:
 
-| Subcommand | Behavior |
-|---|---|
-| `khive kg hook install` | Installs pre-commit hook symlink |
-| `khive kg hook uninstall` | Removes symlink; leaves hook script |
-| `khive kg hook status` | Prints whether hook is installed and symlink is valid |
+| Subcommand                | Behavior                                              |
+| ------------------------- | ----------------------------------------------------- |
+| `khive kg hook install`   | Installs pre-commit hook symlink                      |
+| `khive kg hook uninstall` | Removes symlink; leaves hook script                   |
+| `khive kg hook status`    | Prints whether hook is installed and symlink is valid |
 
 `khive kg validate` gains flags:
 
-| Flag | Behavior |
-|---|---|
-| `--fix` | Apply fixable rules and report changes |
-| `--strict` | Treat warnings as errors (non-zero exit) |
-| `--format text\|json\|github` | Output format (default: text) |
-| `--verbose` | Expand all violation lists |
-| `--quiet` | Show summary line only |
-| `--rules <path>` | Override default rules.yaml path |
-| `--no-rules` | Run built-in structural checks only, skip rules.yaml |
+| Flag                          | Behavior                                             |
+| ----------------------------- | ---------------------------------------------------- |
+| `--fix`                       | Apply fixable rules and report changes               |
+| `--strict`                    | Treat warnings as errors (non-zero exit)             |
+| `--format text\|json\|github` | Output format (default: text)                        |
+| `--verbose`                   | Expand all violation lists                           |
+| `--quiet`                     | Show summary line only                               |
+| `--rules <path>`              | Override default rules.yaml path                     |
+| `--no-rules`                  | Run built-in structural checks only, skip rules.yaml |
 
 ### Phasing
 
-| Phase | Scope | Target |
-|---|---|---|
-| 1 | `rules.yaml` loader + schema validation + built-in configurable rules (density, orphans, self-loops, required-properties, naming, max-count) | v0.5 |
-| 2 | `--format json` + text report upgrade + `--fix` for sort-order and naming-convention | v0.5 |
-| 3 | Deno custom rule API + sandbox + `module:` loading | v0.5 |
-| 4 | `khive kg hook install/uninstall/status` + pre-commit hook generation in `init` | v0.5 |
-| 5 | `khive/kg-validate-action@v1` GitHub Action + `--format github` | v0.6 |
-| 6 | Pack-provided rules (`validation/` directory in pack) | v0.6 |
+| Phase | Scope                                                                                                                                        | Target |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| 1     | `rules.yaml` loader + schema validation + built-in configurable rules (density, orphans, self-loops, required-properties, naming, max-count) | v0.5   |
+| 2     | `--format json` + text report upgrade + `--fix` for sort-order and naming-convention                                                         | v0.5   |
+| 3     | Deno custom rule API + sandbox + `module:` loading                                                                                           | v0.5   |
+| 4     | `khive kg hook install/uninstall/status` + pre-commit hook generation in `init`                                                              | v0.5   |
+| 5     | `khive/kg-validate-action@v1` GitHub Action + `--format github`                                                                              | v0.6   |
+| 6     | Pack-provided rules (`validation/` directory in pack)                                                                                        | v0.6   |
 
 Phases 1 and 2 deliver the highest immediate value (configurable built-in rules + CI-readable
 output) and are independently shippable. Phase 3 (custom rules) requires the Deno sandbox.

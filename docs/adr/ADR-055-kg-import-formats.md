@@ -105,25 +105,25 @@ With a mapping file (`--mapping import-mapping.yaml`), the file controls column-
 ```yaml
 format: csv
 entities:
-  id: uuid              # CSV column "uuid" → entity id (auto-generate if column absent)
-  name: title           # CSV column "title" → entity name
-  kind: type            # CSV column "type" → entity kind (requires kind_mapping or --schema-mode infer)
+  id: uuid # CSV column "uuid" → entity id (auto-generate if column absent)
+  name: title # CSV column "title" → entity name
+  kind: type # CSV column "type" → entity kind (requires kind_mapping or --schema-mode infer)
   description: abstract # CSV column "abstract" → entity description (optional)
-  properties:           # additional columns → entity properties
+  properties: # additional columns → entity properties
     year: year
     authors: authors
     doi: doi
 edges:
-  source: from_id       # CSV column "from_id" → edge source
-  target: to_id         # CSV column "to_id" → edge target
-  relation: rel_type    # CSV column "rel_type" → EdgeRelation
-  weight: confidence    # CSV column "confidence" → weight (optional, default 0.7)
-kind_mapping:           # normalize CSV values to canonical entity kinds
+  source: from_id # CSV column "from_id" → edge source
+  target: to_id # CSV column "to_id" → edge target
+  relation: rel_type # CSV column "rel_type" → EdgeRelation
+  weight: confidence # CSV column "confidence" → weight (optional, default 0.7)
+kind_mapping: # normalize CSV values to canonical entity kinds
   "paper": concept
   "tool": project
   "author": person
   "organization": org
-relation_mapping:       # normalize CSV values to canonical EdgeRelation strings
+relation_mapping: # normalize CSV values to canonical EdgeRelation strings
   "wrote": "introduced_by"
   "cites": "depends_on"
 ```
@@ -152,16 +152,16 @@ and edges in the same file) are supported.
 Each BibTeX entry becomes one entity with `kind: concept` and `properties.type: "paper"`. The
 mapping from BibTeX fields to entity fields is fixed and not configurable:
 
-| BibTeX field | Entity field |
-|---|---|
-| citation key | `name` (if no `title`) |
-| `title` | `name` |
-| `abstract` | `description` |
-| `author` | `properties.authors` |
-| `year` | `properties.year` |
-| `journal` / `booktitle` | `properties.venue` |
-| `doi` | `properties.doi` |
-| `url` | `properties.source` (prefixed `url:`) |
+| BibTeX field                          | Entity field                            |
+| ------------------------------------- | --------------------------------------- |
+| citation key                          | `name` (if no `title`)                  |
+| `title`                               | `name`                                  |
+| `abstract`                            | `description`                           |
+| `author`                              | `properties.authors`                    |
+| `year`                                | `properties.year`                       |
+| `journal` / `booktitle`               | `properties.venue`                      |
+| `doi`                                 | `properties.doi`                        |
+| `url`                                 | `properties.source` (prefixed `url:`)   |
 | `eprint` (with `archivePrefix=arXiv`) | `properties.source` (prefixed `arxiv:`) |
 
 Cross-references (`crossref` field) generate `depends_on` edges between entries. `@string`
@@ -220,14 +220,14 @@ Each `.md` file becomes one entity. The filename (without extension) becomes the
 entity properties. `[[wikilinks]]` in the document body become edges. The relation is inferred from
 the section heading containing the wikilink:
 
-| Section heading pattern | Edge relation |
-|---|---|
-| `## References`, `## Bibliography` | `depends_on` |
-| `## See Also`, `## Related` | `competes_with` |
-| `## Implements`, `## Implementation` | `implements` |
-| `## Extends`, `## Based On` | `extends` |
-| `## Part Of`, `## Components` | `part_of` |
-| (no matching section) | `annotates` |
+| Section heading pattern              | Edge relation   |
+| ------------------------------------ | --------------- |
+| `## References`, `## Bibliography`   | `depends_on`    |
+| `## See Also`, `## Related`          | `competes_with` |
+| `## Implements`, `## Implementation` | `implements`    |
+| `## Extends`, `## Based On`          | `extends`       |
+| `## Part Of`, `## Components`        | `part_of`       |
+| (no matching section)                | `annotates`     |
 
 A `--vault` flag points to an Obsidian vault directory; all `.md` files in the vault are imported
 as a batch. Wikilinks are resolved relative to the vault root. Unresolved wikilinks (no matching
@@ -289,19 +289,19 @@ expansion is a deliberate act separate from whether the data load succeeded.
 
 Not all flag combinations are valid. The following matrix defines the behavior:
 
-| `--schema-mode` | `--on-conflict error` | `--on-conflict skip` | `--on-conflict update` | `--continue` | `--mapping` |
-|---|---|---|---|---|---|
-| `strict` (default) | default | ok | ok | ok (implies skip) | ok (mapping applied before validation) |
-| `infer` | ok | ok | ok | ok (implies skip) | ok (mapping applied before infer) |
-| `force` | ok | ok | ok | ok (implies skip) | ok (mapping applied before bypass) |
+| `--schema-mode`    | `--on-conflict error` | `--on-conflict skip` | `--on-conflict update` | `--continue`      | `--mapping`                            |
+| ------------------ | --------------------- | -------------------- | ---------------------- | ----------------- | -------------------------------------- |
+| `strict` (default) | default               | ok                   | ok                     | ok (implies skip) | ok (mapping applied before validation) |
+| `infer`            | ok                    | ok                   | ok                     | ok (implies skip) | ok (mapping applied before infer)      |
+| `force`            | ok                    | ok                   | ok                     | ok (implies skip) | ok (mapping applied before bypass)     |
 
 **Rejected combinations:**
 
-| Combination | Error |
-|---|---|
-| `--continue --on-conflict error` | rejected: contradictory (skip-existing vs error-on-existing) |
-| `--continue --on-conflict update` | rejected: ambiguous (skip-existing vs update-existing) |
-| `--continue --on-conflict skip` | rejected: redundant (`--continue` already implies skip; use `--continue` alone) |
+| Combination                       | Error                                                                           |
+| --------------------------------- | ------------------------------------------------------------------------------- |
+| `--continue --on-conflict error`  | rejected: contradictory (skip-existing vs error-on-existing)                    |
+| `--continue --on-conflict update` | rejected: ambiguous (skip-existing vs update-existing)                          |
+| `--continue --on-conflict skip`   | rejected: redundant (`--continue` already implies skip; use `--continue` alone) |
 
 `--continue` is syntactic sugar for `--on-conflict skip`. It cannot be combined with any explicit
 `--on-conflict` value to avoid ambiguity. The flags are mutually exclusive: use one or the other.
@@ -357,18 +357,18 @@ The `--format ndjson` (default) is unchanged (ADR-048). All other formats are ad
 
 Export format coverage:
 
-| Format | Import | Export | Notes |
-|---|---|---|---|
-| NDJSON | yes (ADR-048) | yes (ADR-048) | Canonical; lossless |
-| CSV | yes | yes | Entities and edges as separate files |
-| JSON | yes | yes | Array-of-objects |
-| BibTeX | yes | yes | Only `kind: concept` entities with `properties.type: "paper"` |
-| Turtle | yes | yes | All entities and edges as RDF triples |
-| N-Triples | yes | yes | Flat RDF, no prefix declarations |
-| JSON-LD | yes | yes | `@context` generated from `schema.yaml` |
-| GraphML | yes | yes | All entities and edges |
-| GEXF | yes | yes | Static (no dynamic timeslicing on export) |
-| Markdown | yes | yes | One `.md` file per entity; wikilinks for edges |
+| Format    | Import        | Export        | Notes                                                         |
+| --------- | ------------- | ------------- | ------------------------------------------------------------- |
+| NDJSON    | yes (ADR-048) | yes (ADR-048) | Canonical; lossless                                           |
+| CSV       | yes           | yes           | Entities and edges as separate files                          |
+| JSON      | yes           | yes           | Array-of-objects                                              |
+| BibTeX    | yes           | yes           | Only `kind: concept` entities with `properties.type: "paper"` |
+| Turtle    | yes           | yes           | All entities and edges as RDF triples                         |
+| N-Triples | yes           | yes           | Flat RDF, no prefix declarations                              |
+| JSON-LD   | yes           | yes           | `@context` generated from `schema.yaml`                       |
+| GraphML   | yes           | yes           | All entities and edges                                        |
+| GEXF      | yes           | yes           | Static (no dynamic timeslicing on export)                     |
+| Markdown  | yes           | yes           | One `.md` file per entity; wikilinks for edges                |
 
 Export with `--format markdown` generates a static, browsable representation of the KG. Combined
 with a static site generator, this produces human-readable KG documentation from a single command.
@@ -407,23 +407,23 @@ Transaction model:
 
 New flags on `khive kg import`:
 
-| Flag | Values | Default | Description |
-|---|---|---|---|
-| `--format` | See §2 | inferred from extension | Source format |
-| `--mapping` | file path | `.khive/kg/import-mapping.yaml` | Path to column/field mapping file |
-| `--schema-mode` | `strict` \| `infer` \| `force` | `strict` | Schema validation behavior (see §4) |
-| `--default-kind` | entity kind | — | Kind for entities with no kind column |
-| `--timeslice` | datetime | latest | GEXF dynamic: which timeslice to import |
-| `--vault` | directory | — | Markdown: Obsidian vault root |
-| `--verbose` | — | — | Print detailed warning/error list |
-| `--continue` | — | — | Skip already-imported UUIDs (dedup, not crash-resume; see §7) |
+| Flag             | Values                         | Default                         | Description                                                   |
+| ---------------- | ------------------------------ | ------------------------------- | ------------------------------------------------------------- |
+| `--format`       | See §2                         | inferred from extension         | Source format                                                 |
+| `--mapping`      | file path                      | `.khive/kg/import-mapping.yaml` | Path to column/field mapping file                             |
+| `--schema-mode`  | `strict` \| `infer` \| `force` | `strict`                        | Schema validation behavior (see §4)                           |
+| `--default-kind` | entity kind                    | —                               | Kind for entities with no kind column                         |
+| `--timeslice`    | datetime                       | latest                          | GEXF dynamic: which timeslice to import                       |
+| `--vault`        | directory                      | —                               | Markdown: Obsidian vault root                                 |
+| `--verbose`      | —                              | —                               | Print detailed warning/error list                             |
+| `--continue`     | —                              | —                               | Skip already-imported UUIDs (dedup, not crash-resume; see §7) |
 
 New flags on `khive kg export`:
 
-| Flag | Values | Default | Description |
-|---|---|---|---|
-| `--format` | See §6 | ndjson | Output format |
-| `--output-dir` | directory | — | Required for markdown format (one file per entity) |
+| Flag           | Values    | Default | Description                                        |
+| -------------- | --------- | ------- | -------------------------------------------------- |
+| `--format`     | See §6    | ndjson  | Output format                                      |
+| `--output-dir` | directory | —       | Required for markdown format (one file per entity) |
 
 ## Rationale
 
@@ -476,13 +476,13 @@ export for every import format avoids khive becoming a data sink.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-|---|---|---|---|
-| NDJSON only — require users to convert externally | Zero adapter maintenance burden | Adoption barrier; researchers won't hand-author NDJSON | Contradicts "GitHub for knowledge graphs" positioning |
-| Universal import via LLM ("paste your data, AI maps it") | Zero configuration; works for any format | Non-deterministic; slow; cloud dependency for basic import; hard to audit | Deferred as a cloud feature; deterministic adapters ship first |
-| Plugin-based adapters (user-installable format plugins) | Extensible; community can add formats | Plugin API surface maintenance; version compatibility overhead | Deferred; start with built-in adapters, plugin system later if needed |
-| Always require a mapping file | Explicit, no ambiguity | High friction for common cases; users abandon onboarding | Auto-detection handles common cases; mapping file is progressive disclosure |
-| Format-specific importers (CSV → DB, BibTeX → DB) | Fewer indirections | Duplicates validation logic; harder to test | Pipeline to NDJSON concentrates validation in one place |
+| Alternative                                              | Pros                                     | Cons                                                                      | Why rejected                                                                |
+| -------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| NDJSON only — require users to convert externally        | Zero adapter maintenance burden          | Adoption barrier; researchers won't hand-author NDJSON                    | Contradicts "GitHub for knowledge graphs" positioning                       |
+| Universal import via LLM ("paste your data, AI maps it") | Zero configuration; works for any format | Non-deterministic; slow; cloud dependency for basic import; hard to audit | Deferred as a cloud feature; deterministic adapters ship first              |
+| Plugin-based adapters (user-installable format plugins)  | Extensible; community can add formats    | Plugin API surface maintenance; version compatibility overhead            | Deferred; start with built-in adapters, plugin system later if needed       |
+| Always require a mapping file                            | Explicit, no ambiguity                   | High friction for common cases; users abandon onboarding                  | Auto-detection handles common cases; mapping file is progressive disclosure |
+| Format-specific importers (CSV → DB, BibTeX → DB)        | Fewer indirections                       | Duplicates validation logic; harder to test                               | Pipeline to NDJSON concentrates validation in one place                     |
 
 ## Consequences
 
@@ -582,13 +582,13 @@ additions were made.
 
 ### Phasing
 
-| Phase | Scope | Target |
-|---|---|---|
-| 1 | `lib/fmt/` skeleton + `FormatAdapter` interface + `mapping.ts` + `csv.ts` + `json.ts` | v0.5 |
-| 2 | `bibtex.ts` + `turtle.ts` (N-Triples subset first, full Turtle second) + export/csv + export/bibtex | v0.5 |
-| 3 | `graphml.ts` + `gexf.ts` + `jsonld.ts` + corresponding exports | v0.6 |
-| 4 | `markdown.ts` + export/markdown (static site output) + `--vault` flag | v0.6 |
-| 5 | Interactive mapping generation (TTY auto-detect + save prompt) | v0.6 |
+| Phase | Scope                                                                                               | Target |
+| ----- | --------------------------------------------------------------------------------------------------- | ------ |
+| 1     | `lib/fmt/` skeleton + `FormatAdapter` interface + `mapping.ts` + `csv.ts` + `json.ts`               | v0.5   |
+| 2     | `bibtex.ts` + `turtle.ts` (N-Triples subset first, full Turtle second) + export/csv + export/bibtex | v0.5   |
+| 3     | `graphml.ts` + `gexf.ts` + `jsonld.ts` + corresponding exports                                      | v0.6   |
+| 4     | `markdown.ts` + export/markdown (static site output) + `--vault` flag                               | v0.6   |
+| 5     | Interactive mapping generation (TTY auto-detect + save prompt)                                      | v0.6   |
 
 Phases 1 and 2 cover the primary research audience (CSV, JSON, BibTeX, basic RDF). Phases 3–5
 are independent and can ship in either order based on user demand signals.

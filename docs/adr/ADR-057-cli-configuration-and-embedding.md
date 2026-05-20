@@ -38,7 +38,7 @@ This means:
 ### What changes and what does not
 
 - ADR-048 (`export`, `import`, `validate`) and ADR-051 (`commit`, `sync`): unchanged in
-  their external behavior. This ADR specifies *when* embedding runs within those operations,
+  their external behavior. This ADR specifies _when_ embedding runs within those operations,
   not how they work.
 - ADR-052 (`working.db` schema, `.state/` layout): unchanged. Embeddings are stored in
   `working.db` via the sqlite-vec extension already present in the schema (ADR-009).
@@ -107,16 +107,16 @@ Only keys that diverge from the built-in defaults need to be present in either f
 
 **Built-in defaults** (if no config file is present):
 
-| Key | Default |
-|-----|---------|
-| `embed.model` | `mE5-small` |
-| `embed.dimensions` | `384` |
-| `embed.auto_embed` | `true` |
-| `embed.batch_size` | `64` |
+| Key                    | Default                   |
+| ---------------------- | ------------------------- |
+| `embed.model`          | `mE5-small`               |
+| `embed.dimensions`     | `384`                     |
+| `embed.auto_embed`     | `true`                    |
+| `embed.batch_size`     | `64`                      |
 | `embed.fields.include` | `["name", "description"]` |
-| `schema.strict` | `true` |
-| `embed.device` | `cpu` |
-| `auth.api_url` | `https://api.khive.ai` |
+| `schema.strict`        | `true`                    |
+| `embed.device`         | `cpu`                     |
+| `auth.api_url`         | `https://api.khive.ai`    |
 
 ### 3. Why TOML
 
@@ -326,15 +326,15 @@ of source files from build artifacts.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-|---|---|---|---|
-| Single flat config (no two-level merge) | Simpler mental model | Cannot separate device preferences (user-level) from model selection (project-level) | Model consistency across collaborators requires project-level config |
-| YAML config | Familiar to many developers | Ambiguous parsing; significant indentation-based errors in practice | TOML is unambiguous and already used in this ecosystem |
-| JSON config | Machine-writable | No comments; annoying to hand-edit; trailing-comma errors | TOML is better for human-edited config |
-| Store vectors in NDJSON (committed) | Single source of truth for all data | 15MB+ of non-diffable binary per 10K-entity KG; breaks git diff/merge guarantees; recomputable from text | ADR-048's diff/merge value requires human-readable NDJSON |
-| Dedicated vector storage file (committed) | Separates vectors from entity data | Same merge problem as vectors in NDJSON; still grows quadratically with entity count | Recomputable state should not be committed |
-| Manual embed only (no auto-embed) | Explicit control | Silent quality degradation when users forget; no visible error | Auto-embed on true prevents failure mode at negligible cost |
-| Embed on every verb write (real-time) | Vectors always current | Embed latency per create/update blocks interactive use | Batch on commit/sync is the right cadence for a git-workflow tool |
+| Alternative                               | Pros                                | Cons                                                                                                     | Why rejected                                                         |
+| ----------------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Single flat config (no two-level merge)   | Simpler mental model                | Cannot separate device preferences (user-level) from model selection (project-level)                     | Model consistency across collaborators requires project-level config |
+| YAML config                               | Familiar to many developers         | Ambiguous parsing; significant indentation-based errors in practice                                      | TOML is unambiguous and already used in this ecosystem               |
+| JSON config                               | Machine-writable                    | No comments; annoying to hand-edit; trailing-comma errors                                                | TOML is better for human-edited config                               |
+| Store vectors in NDJSON (committed)       | Single source of truth for all data | 15MB+ of non-diffable binary per 10K-entity KG; breaks git diff/merge guarantees; recomputable from text | ADR-048's diff/merge value requires human-readable NDJSON            |
+| Dedicated vector storage file (committed) | Separates vectors from entity data  | Same merge problem as vectors in NDJSON; still grows quadratically with entity count                     | Recomputable state should not be committed                           |
+| Manual embed only (no auto-embed)         | Explicit control                    | Silent quality degradation when users forget; no visible error                                           | Auto-embed on true prevents failure mode at negligible cost          |
+| Embed on every verb write (real-time)     | Vectors always current              | Embed latency per create/update blocks interactive use                                                   | Batch on commit/sync is the right cadence for a git-workflow tool    |
 
 ## Consequences
 
@@ -389,7 +389,7 @@ export interface EmbedConfig {
   dimensions: number;
   auto_embed: boolean;
   batch_size: number;
-  device: string;          // from global config only
+  device: string; // from global config only
   fields: { include: string[] };
 }
 
@@ -472,13 +472,13 @@ cli/
 
 ### Phasing
 
-| Phase | Scope | Target |
-|-------|-------|--------|
-| E1 | `lib/config.ts` — TOML loader, two-level merge, validation | v0.5 |
-| E2 | `khive kg init` — write default `.khive/config.toml` | v0.5 |
-| E3 | `lib/embed.ts` — `embed_missing` subroutine; embed step in `commit` and `sync` | v0.5 |
-| E4 | `khive kg embed` command — `--all`, `--ids`, `--dry-run` flags | v0.5 |
-| E5 | Config validation error messages with file + line | v0.5 |
+| Phase | Scope                                                                          | Target |
+| ----- | ------------------------------------------------------------------------------ | ------ |
+| E1    | `lib/config.ts` — TOML loader, two-level merge, validation                     | v0.5   |
+| E2    | `khive kg init` — write default `.khive/config.toml`                           | v0.5   |
+| E3    | `lib/embed.ts` — `embed_missing` subroutine; embed step in `commit` and `sync` | v0.5   |
+| E4    | `khive kg embed` command — `--all`, `--ids`, `--dry-run` flags                 | v0.5   |
+| E5    | Config validation error messages with file + line                              | v0.5   |
 
 E1 and E2 are independently shippable and deliver the config model without any embedding
 changes. E3 and E4 deliver the automatic embedding pipeline. E5 improves error messaging.
