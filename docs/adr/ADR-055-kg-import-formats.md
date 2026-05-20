@@ -74,7 +74,7 @@ This separation has three benefits:
 The command form is:
 
 ```
-khive kg import --format <fmt> [--mapping <file>] [--infer|--strict|--map] [--on-conflict <mode>] <source>
+khive kg import --format <fmt> [--mapping <path>] [--schema-mode strict|infer|force] [--on-conflict <mode>] <source>
 ```
 
 When `--format` is omitted, `import` infers the format from the file extension (`.ndjson` → native;
@@ -107,7 +107,7 @@ format: csv
 entities:
   id: uuid              # CSV column "uuid" → entity id (auto-generate if column absent)
   name: title           # CSV column "title" → entity name
-  kind: type            # CSV column "type" → entity kind (requires kind_mapping or --infer)
+  kind: type            # CSV column "type" → entity kind (requires kind_mapping or --schema-mode infer)
   description: abstract # CSV column "abstract" → entity description (optional)
   properties:           # additional columns → entity properties
     year: year
@@ -177,7 +177,7 @@ RDF triples are mapped to entities and edges as follows:
 
 - **Subjects** (`rdf:type` declarations): each subject with an `rdf:type` triple becomes an entity.
   The RDF class maps to entity `kind` via the `kind_mapping` section in the mapping file, or via
-  `--infer` if no mapping is provided.
+  `--schema-mode infer` if no mapping is provided.
 - **Object properties** (relations to other subjects): become edges. The RDF predicate maps to
   `EdgeRelation` via the `relation_mapping` section in the mapping file.
 - **Datatype properties** (literal values): become entity `properties` entries.
@@ -187,8 +187,10 @@ RDF triples are mapped to entities and edges as follows:
   common namespaces: `schema: http://schema.org/`.
 
 Without a mapping file, the adapter produces entities of `kind: concept` and emits a warning for
-every unmapped predicate. The `--infer` flag adds unmapped classes to `schema.yaml` as new entity
-kinds (minor version bump).
+every unmapped predicate. The `--schema-mode infer` flag adds unmapped RDF classes to
+`schema.yaml` as new entity kinds (minor version bump). Unknown RDF predicates used as edge
+relations are rejected unless `--schema-mode force` is used (edge relations are a closed set per
+ADR-002).
 
 **JSON-LD** (`--format jsonld`)
 
@@ -254,23 +256,30 @@ auto-detection heuristics run silently.
 ### 4. Schema handling
 
 When adapter output references entity kinds or edge relations not in the current `schema.yaml`,
-behavior is controlled by three flags:
+behavior is controlled by the `--schema-mode` flag:
 
-- `--strict` (default): reject records with unknown kinds or relations. The import fails with a
-  structured error listing every violation. This is the correct mode for maintaining a curated KG.
-- `--infer`: accept unknown kinds and relations. Add new entity kinds to `schema.yaml#entity_kinds`
-  and new relations to `schema.yaml#edge_relations`. The schema version minor component is
-  incremented. The import summary reports every schema addition made.
-- `--map <mapping-file>`: translate source types/relations to existing schema values using the
-  `kind_mapping` and `relation_mapping` sections of the mapping file. Unknown values that have no
-  mapping entry are still rejected. This is the mode for importing data from a different ontology
-  into an existing curated schema.
+- `--schema-mode strict` (default): reject records with unknown entity kinds or edge relations.
+  The import fails with a structured error listing every violation. This is the correct mode for
+  maintaining a curated KG.
+- `--schema-mode infer`: accept unknown entity kinds and unknown entity properties. Add new entity
+  kinds to `schema.yaml#entity_kinds`. The schema version minor component is incremented. The
+  import summary reports every schema addition made.
+  **Edge relations are a closed set (ADR-002). `--schema-mode infer` does not add new relations;
+  unknown edge relations are always rejected in `strict` and `infer` modes.** Only
+  `--schema-mode force` bypasses edge relation validation (see below).
+- `--schema-mode force`: skip schema validation entirely. Records with unknown kinds and unknown
+  edge relations are accepted without error. This is an escape hatch from ADR-048's validation
+  guarantees and should be used only for exploratory imports from external ontologies. The
+  resulting graph may not pass `khive kg validate`.
 
-Only one of `--infer` and `--map` may be specified. `--strict` is implied when neither is present.
+`--mapping <path>` specifies the path to the mapping file. When `--mapping` is provided, its
+`kind_mapping` and `relation_mapping` sections are applied regardless of `--schema-mode`. Mapping
+translates source types/relations to canonical schema values before schema validation runs; unknown
+values that have no mapping entry are still subject to the active `--schema-mode` behavior.
 
-Schema additions made by `--infer` are written to `schema.yaml` before the import proceeds. If the
-import subsequently fails (validation error, referential integrity failure), the `schema.yaml`
-changes are not rolled back — the added kinds/relations remain. This is intentional: the schema
+Schema additions made by `--schema-mode infer` are written to `schema.yaml` before the import
+proceeds. If the import subsequently fails (validation error, referential integrity failure), the
+`schema.yaml` changes are not rolled back — the added kinds remain. This is intentional: the schema
 expansion is a deliberate act separate from whether the data load succeeded.
 
 ### 5. Validation on import
@@ -298,7 +307,7 @@ khive kg import: CSV → NDJSON → SQLite
   source:    papers.csv (1,247 rows)
   entities:  1,203 imported, 0 skipped, 2 errors
   edges:     389 imported, 12 skipped (unknown relation), 0 errors
-  schema:    2 kinds inferred (added to schema.yaml) [--infer]
+  schema:    2 kinds inferred (added to schema.yaml) [--schema-mode infer]
   warnings:  14 (see --verbose for details)
   time:      1.2s
 ```
@@ -351,13 +360,18 @@ Large file handling:
 - Progress is reported to stderr for any import that takes more than 2 seconds (entity count, edges
   count, elapsed time, estimated remaining time).
 
-Resume support:
+Transaction model:
 
-- `--continue` skips entities and edges whose UUID already exists in the database (equivalent to
-  `--on-conflict skip` from ADR-039). This allows a large import to be interrupted and resumed
-  without re-importing already-loaded records.
-- `--continue` is meaningful only with `--on-conflict skip` (implied) or `--on-conflict update`.
-  With `--on-conflict error`, `--continue` is rejected as contradictory.
+- Import runs in a single database transaction. If validation fails for any record, the entire
+  import rolls back — no records are written. This is the all-or-nothing guarantee that ensures
+  the database is never left in a partially-imported state.
+- `--continue` is a deduplication flag, not a crash-resume mechanism. It skips entities and edges
+  whose UUID already exists in the database (equivalent to `--on-conflict skip` from ADR-039).
+  This is useful for importing into a non-empty database, not for recovering from an interrupted
+  import. The transaction for the new records being imported is still atomic: if any new record
+  fails validation, all new records roll back (existing records already in the DB are unaffected).
+- `--continue` is rejected when combined with `--on-conflict error`, since the semantics are
+  contradictory (error on any conflict vs. silently skip conflicts).
 
 ### 8. CLI summary
 
@@ -366,15 +380,13 @@ New flags on `khive kg import`:
 | Flag | Values | Default | Description |
 |---|---|---|---|
 | `--format` | See §2 | inferred from extension | Source format |
-| `--mapping` | file path | `.khive/kg/import-mapping.yaml` | Column/field mapping file |
-| `--strict` | — | — | Reject unknown kinds/relations (default behavior) |
-| `--infer` | — | — | Add unknown kinds/relations to schema.yaml |
-| `--map` | — | — | Use mapping file kind_mapping/relation_mapping |
+| `--mapping` | file path | `.khive/kg/import-mapping.yaml` | Path to column/field mapping file |
+| `--schema-mode` | `strict` \| `infer` \| `force` | `strict` | Schema validation behavior (see §4) |
 | `--default-kind` | entity kind | — | Kind for entities with no kind column |
 | `--timeslice` | datetime | latest | GEXF dynamic: which timeslice to import |
 | `--vault` | directory | — | Markdown: Obsidian vault root |
 | `--verbose` | — | — | Print detailed warning/error list |
-| `--continue` | — | — | Skip already-imported UUIDs (resume) |
+| `--continue` | — | — | Skip already-imported UUIDs (dedup, not crash-resume; see §7) |
 
 New flags on `khive kg export`:
 
@@ -408,13 +420,15 @@ exporter (Zotero, Mendeley, Google Scholar, arXiv) produces `title`, `author`, `
 configuration. The cases where a researcher would want to remap BibTeX fields are rare enough to
 defer to a later ADR.
 
-### Why `--infer` does not roll back schema additions on import failure
+### Why `--schema-mode infer` does not roll back schema additions on import failure
 
-Schema expansion is a deliberate act: the user chose `--infer` knowing that new kinds or relations
-would be added. The failure of the subsequent data load is a separate concern. Rolling back schema
-additions would create a confusing situation where the user reruns the import, `--infer` expands
-the schema again, and the cycle repeats. It is cleaner to let the schema expansion stand and let
-the user fix the data validation error independently.
+Schema expansion is a deliberate act: the user chose `--schema-mode infer` knowing that new entity
+kinds would be added to `schema.yaml`. The failure of the subsequent data load is a separate
+concern. Rolling back schema additions would create a confusing situation where the user reruns the
+import, `infer` mode expands the schema again, and the cycle repeats. It is cleaner to let the
+schema expansion stand and let the user fix the data validation error independently. Note that edge
+relations are never added, even in `infer` mode — the schema addition is always for entity kinds
+only.
 
 ### Why Markdown/wikilinks is P2 rather than P1
 
@@ -452,9 +466,9 @@ export for every import format avoids khive becoming a data sink.
   database. Input file + expected NDJSON output is a complete test case.
 - Export symmetry allows khive to participate in existing research workflows rather than requiring
   them to change.
-- The `--infer` flag makes it practical to import from richer-than-expected sources (ontologies
-  with more types than khive's 6 entity kinds) without losing data or requiring schema ADRs for
-  every import.
+- `--schema-mode infer` makes it practical to import from richer-than-expected sources (ontologies
+  with more entity kinds than khive's 6 canonical kinds) without losing data or requiring schema
+  ADRs for every exploratory import.
 
 ### Negative
 
@@ -466,9 +480,9 @@ export for every import format avoids khive becoming a data sink.
 - Streaming parsers for some formats (JSON-LD with remote `@context` fetching; RDF with blank node
   expansion) require buffering expanded triples before they can be sorted into UUID order for NDJSON
   output. For large RDF graphs, this buffer can be significant.
-- The `--infer` flag can pollute `schema.yaml` with source-specific types if used carelessly on
-  heterogeneous imports. Users who want a curated schema should use `--map` with an explicit
-  `kind_mapping` instead.
+- `--schema-mode infer` can pollute `schema.yaml` with source-specific entity kinds if used
+  carelessly on heterogeneous imports. Users who want a curated schema should use `--schema-mode
+  strict` with an explicit `kind_mapping` in the `--mapping` file instead.
 
 ### Neutral
 
@@ -482,69 +496,68 @@ export for every import format avoids khive becoming a data sink.
 
 ## Implementation
 
-### Crate changes
+### Deno CLI changes
 
-A new crate `crates/khive-fmt/` provides the format adapters:
+Format adapters are implemented as TypeScript modules in the `khive` Deno CLI (ADR-003). A new
+`lib/fmt/` directory provides the adapter layer:
 
 ```
-crates/khive-fmt/
-├── Cargo.toml
-└── src/
-    ├── lib.rs           — re-exports; FormatAdapter trait
-    ├── mapping.rs       — MappingFile: parse import-mapping.yaml, kind_mapping, relation_mapping
-    ├── csv.rs           — CsvAdapter: streaming row parser → (EntityRecord, EdgeRecord) streams
-    ├── json.rs          — JsonAdapter: streaming object parser → same streams
-    ├── bibtex.rs        — BibtexAdapter: lenient entry parser → entity + crossref edges
-    ├── turtle.rs        — TurtleAdapter: Turtle/N-Triples → entities + edges via blank node expansion
-    ├── jsonld.rs        — JsonLdAdapter: expand → TurtleAdapter pipeline
-    ├── graphml.rs       — GraphmlAdapter: SAX-style XML parser → entities + edges
-    ├── gexf.rs          — GexfAdapter: SAX-style XML parser → entities + edges
-    ├── markdown.rs      — MarkdownAdapter: frontmatter + wikilink extractor
-    └── export/
-        ├── mod.rs       — export dispatch by format
-        ├── csv.rs       — entity/edge → CSV rows
-        ├── bibtex.rs    — concept entities → BibTeX entries
-        ├── turtle.rs    — entities + edges → RDF Turtle
-        ├── jsonld.rs    — entities + edges → JSON-LD (context from schema.yaml)
-        ├── graphml.rs   — entities + edges → GraphML
-        ├── gexf.rs      — entities + edges → GEXF
-        └── markdown.rs  — entities + edges → .md files with wikilinks
+cli/
+  lib/
+    fmt/
+      mod.ts           — re-exports; FormatAdapter interface
+      mapping.ts       — MappingFile: parse import-mapping.yaml, kind_mapping, relation_mapping
+      csv.ts           — CsvAdapter: streaming row parser → (EntityRecord, EdgeRecord) streams
+      json.ts          — JsonAdapter: streaming object parser → same streams
+      bibtex.ts        — BibtexAdapter: lenient entry parser → entity + crossref edges
+      turtle.ts        — TurtleAdapter: Turtle/N-Triples → entities + edges via blank node expansion
+      jsonld.ts        — JsonLdAdapter: expand → TurtleAdapter pipeline
+      graphml.ts       — GraphmlAdapter: streaming XML parser → entities + edges
+      gexf.ts          — GexfAdapter: streaming XML parser → entities + edges
+      markdown.ts      — MarkdownAdapter: frontmatter + wikilink extractor
+      export/
+        mod.ts         — export dispatch by format
+        csv.ts         — entity/edge → CSV rows
+        bibtex.ts      — concept entities → BibTeX entries
+        turtle.ts      — entities + edges → RDF Turtle
+        jsonld.ts      — entities + edges → JSON-LD (context from schema.yaml)
+        graphml.ts     — entities + edges → GraphML
+        gexf.ts        — entities + edges → GEXF
+        markdown.ts    — entities + edges → .md files with wikilinks
 ```
 
-`khive-fmt` depends on `khive-types` for `EntityRecord`, `EdgeRecord`, and `EdgeRelation`. It does
-not depend on `khive-db` or `khive-runtime`. The database write path remains in `khive-vcs`
-(import.rs) which calls `khive-fmt` for the source-to-NDJSON transform.
+The `FormatAdapter` interface:
 
-The `FormatAdapter` trait:
-
-```rust
-pub trait FormatAdapter: Send {
-    fn name(&self) -> &'static str;
-    fn entities(&mut self) -> impl Iterator<Item = Result<EntityRecord, AdapterError>>;
-    fn edges(&mut self) -> impl Iterator<Item = Result<EdgeRecord, AdapterError>>;
+```typescript
+export interface FormatAdapter {
+  name(): string;
+  entities(): AsyncIterable<EntityRecord | AdapterError>;
+  edges(): AsyncIterable<EdgeRecord | AdapterError>;
 }
 ```
 
-Adapters are stateful (they hold the streaming parser state) but produce immutable record types
-from `khive-types`. The callers in `import.rs` drive the iterators, batch-insert records, and
-handle `AdapterError` by collecting warnings (non-fatal) or aborting (fatal).
+Adapters are stateful (they hold the streaming parser state) but produce plain record objects
+following the ADR-048 NDJSON field shape. The `commands/kg/import.ts` driver consumes the
+iterators, batch-writes records to the intermediate NDJSON temp file, and handles `AdapterError`
+by collecting warnings (non-fatal) or aborting (fatal).
 
 ### Schema inference integration
 
-When `--infer` is active, `import.rs` passes unknown kind and relation strings to a
+When `--schema-mode infer` is active, the import driver passes unknown entity kind strings to a
 `SchemaInferrer` that accumulates additions and flushes them to `schema.yaml` before the first
-database write. The `SchemaYaml` type in `khive-vcs/src/schema.rs` gains `add_entity_kind` and
-`add_edge_relation` methods that mutate in memory and mark the struct dirty; `flush_to_disk` writes
-only if dirty.
+database write. Unknown edge relation strings are not accumulated — they are always rejected in
+`infer` mode (edge relations are a closed set per ADR-002). The `SchemaYaml` helper in
+`lib/schema.ts` gains `addEntityKind` and `markDirty` / `flushToDisk` methods that write only if
+additions were made.
 
 ### Phasing
 
 | Phase | Scope | Target |
 |---|---|---|
-| 1 | `khive-fmt` crate skeleton + `FormatAdapter` trait + `mapping.rs` + `csv.rs` + `json.rs` | v0.5 |
-| 2 | `bibtex.rs` + `turtle.rs` (N-Triples subset first, full Turtle second) + export/csv + export/bibtex | v0.5 |
-| 3 | `graphml.rs` + `gexf.rs` + `jsonld.rs` + corresponding exports | v0.6 |
-| 4 | `markdown.rs` + export/markdown (static site output) + `--vault` flag | v0.6 |
+| 1 | `lib/fmt/` skeleton + `FormatAdapter` interface + `mapping.ts` + `csv.ts` + `json.ts` | v0.5 |
+| 2 | `bibtex.ts` + `turtle.ts` (N-Triples subset first, full Turtle second) + export/csv + export/bibtex | v0.5 |
+| 3 | `graphml.ts` + `gexf.ts` + `jsonld.ts` + corresponding exports | v0.6 |
+| 4 | `markdown.ts` + export/markdown (static site output) + `--vault` flag | v0.6 |
 | 5 | Interactive mapping generation (TTY auto-detect + save prompt) | v0.6 |
 
 Phases 1 and 2 cover the primary research audience (CSV, JSON, BibTeX, basic RDF). Phases 3–5

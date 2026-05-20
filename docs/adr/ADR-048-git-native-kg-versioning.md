@@ -4,6 +4,16 @@
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
+## Scope
+
+This ADR covers entity and edge versioning for the git-native KG format. Notes, tasks, and events
+are pack-specific data managed by their respective packs (GTD, memory) and are NOT included in the
+git-native KG format. The `.khive/kg/` directory contains the knowledge graph structure only.
+Pack-specific persistence is deferred to pack-level ADRs.
+
+The authoritative definition of entity-level status output (dirty tracking, DB-vs-NDJSON diff) is
+ADR-052. This ADR defines the serialization format; ADR-052 defines the reconciliation protocol.
+
 ## Context
 
 ADR-042 designed a custom VCS layer for knowledge graph versioning: content-addressed snapshots
@@ -84,14 +94,16 @@ Sorting is the key design choice. It ensures that:
 #### Entity record shape
 
 ```json
-{"id":"<uuid>","kind":"<EntityKind>","name":"<string>","description":"<string|null>","properties":{...},"tags":["..."]}
+{"id":"<uuid>","kind":"<EntityKind>","name":"<string>","description":"<string|null>","properties":{...},"tags":["..."],"created_at":"<ISO8601|omit>","updated_at":"<ISO8601|omit>"}
 ```
 
 Field ordering within the JSON object is fixed to: `id`, `kind`, `name`, `description`,
-`properties`, `tags`. Within `properties`, keys are sorted alphabetically. Within `tags`, values
-are sorted lexicographically. This fixed ordering ensures that re-exporting the same logical entity
-always produces the same bytes, making the file diff meaningful (changed fields are visible) and
-the SHA-256 of the file stable.
+`properties`, `tags`, `created_at`, `updated_at`. The timestamp fields are **optional**: they
+appear when present in the database and are omitted when absent (for compatibility with NDJSON
+files produced before timestamps were recorded). Within `properties`, keys are sorted
+alphabetically. Within `tags`, values are sorted lexicographically. This fixed ordering ensures
+that re-exporting the same logical entity always produces the same bytes, making the file diff
+meaningful (changed fields are visible) and the SHA-256 of the file stable.
 
 Soft-deleted entities are excluded from the export. The NDJSON files represent live graph state,
 consistent with ADR-042 §1's canonical hash algorithm.
@@ -99,11 +111,15 @@ consistent with ADR-042 §1's canonical hash algorithm.
 #### Edge record shape
 
 ```json
-{"edge_id":"<uuid>","source":"<uuid>","target":"<uuid|remote_ref>","relation":"<EdgeRelation>","weight":<float>}
+{"edge_id":"<uuid>","source":"<uuid>","target":"<uuid|remote_ref>","relation":"<EdgeRelation>","weight":<float>,"properties":{...},"created_at":"<ISO8601|omit>","updated_at":"<ISO8601|omit>"}
 ```
 
 Field ordering within the JSON object is fixed to: `edge_id`, `source`, `target`, `relation`,
-`weight`. The `edge_id` preserves edge identity across export/import cycles (see D1).
+`weight`, `properties`, `created_at`, `updated_at`. The `properties` field is always present (an
+empty object `{}` when no properties are set). The timestamp fields are **optional**: they appear
+when present in the database and are omitted when absent (for compatibility with NDJSON files
+produced before timestamps were recorded). The `edge_id` preserves edge identity across
+export/import cycles (see D1).
 
 The `target` field may be either a local UUID or a remote reference (see §5 on cross-repo edges).
 
@@ -113,7 +129,7 @@ The `target` field may be either a local UUID or a remote reference (see §5 on 
 are in use, what cross-repo references exist, and pins the schema version.
 
 ```yaml
-version: "1.0.0"          # semver; schema format version, not graph data version
+format_version: "1.0.0"   # semver; file format compatibility version (what fields are valid here)
 
 entity_kinds:
   - concept
@@ -161,8 +177,10 @@ remotes:
 amendment is made. This makes ontology changes reviewable in PRs as a single-file diff against the
 previous version, independent of entity and edge data.
 
-The `version` field is the schema format version (what fields are valid in this `schema.yaml`),
-not a version counter for the graph data itself. Data versioning is git's job.
+The `format_version` field is the file format compatibility version (what fields are valid in this
+`schema.yaml`), not a version counter for the graph data itself or the ontology. Data versioning
+is git's job. Ontology versioning (entity kinds, relations, property schemas) is tracked separately
+via `ontology_version` defined in ADR-054.
 
 The `commit` field in each remote entry must be a full 40-character git commit SHA. This is the
 only field that unambiguously identifies a point in a remote repository's history:
@@ -229,6 +247,13 @@ Checks the NDJSON files against the schema without touching the database:
 
 `validate` exits with a non-zero code and a structured error report on any violation. It exits
 with 0 and no output on a clean graph.
+
+#### `khive kg status`
+
+Detailed entity-level status — computing which entities and edges are uncommitted relative to the
+NDJSON files — is defined in ADR-052 §6 and §7. ADR-052 is the canonical definition of the status
+contract. The DB-vs-NDJSON diff approach (comparing a live DB export against committed files) is
+the authoritative mechanism; it catches uncommitted DB changes that `git status` cannot see.
 
 #### `khive kg diff`
 
@@ -384,7 +409,7 @@ ADR-043.
 | -------------------------------------------- | --------------------------------------------------- |
 | `kg_snapshots` + `kg_snapshot_archives` SQL  | Deleted. Git provides the commit history.           |
 | `kg_branches` SQL table                      | Deleted. Git branches replace this.                 |
-| `kg_vcs_state` dirty-flag table              | Deleted. `git status .khive/kg/` is equivalent.     |
+| `kg_vcs_state` dirty-flag table              | Deleted. Status is computed via DB-vs-NDJSON diff (ADR-052 §6–§7). |
 | SHA-256 canonical hash algorithm             | Retained. Export determinism ensures stable hashes. |
 | `khive-sync` HTTP server + push/pull API     | Deleted. `git push` / `git pull` replace this.      |
 | `commit`, `branch`, `checkout`, `log` tools  | Deleted. `git commit`, `git branch`, etc., replace. |
@@ -495,6 +520,30 @@ Both approaches are bounded in bandwidth regardless of the size of the remote re
 | CRDT-based automatic merge | No conflicts; always produces a result | Semantic contradictions silently accepted; ADR-010 explicitly rejected CRDTs | Safety requirement: silent corruption is worse than a paused merge |
 | Store snapshot archives in git LFS | Full-fidelity snapshots; git history | LFS is not universally available; binary blobs; same diff problem as JSON blob | NDJSON file is better diffable and does not require LFS |
 
+### Comparison to Existing Tools
+
+**Neo4j**: A mature property graph database with Cypher query language and APOC procedures. Not
+git-native — state lives in a binary data directory that is not diffable or mergeable. Requires a
+running server; no offline-first use. Sharing a graph requires replication tooling or dump/restore
+workflows. No text-diff collaboration or GitHub PR review of graph changes.
+
+**Wikidata**: A centralized, publicly editable knowledge base using RDF and the SPARQL/Wikidata
+Query Service. Operates as a global singleton — not per-project or per-repository. Data is
+RDF-triples, not typed entities with property schemas. No offline mode, no per-project ontology,
+no git-native history. Collaboration is centralized editorial rather than git-forking.
+
+**git-annex / DVC**: Tools for tracking large files in git using content-addressed pointers.
+Designed for binary blobs (datasets, model weights) rather than structured records. Cannot
+diff or merge individual entities; a changed entity file is a changed blob. Not applicable to
+structured KG data that requires entity-level diff and merge.
+
+**Dolt / TerminusDB**: Versioned relational databases with git-like branch/merge semantics. Dolt
+uses a MySQL-compatible interface over a versioned B-tree; TerminusDB uses a graph-oriented
+model. Neither produces human-readable text diffs in GitHub PRs — branches and commits are
+database-internal, not file-based. Both add a significant runtime dependency (Dolt server,
+TerminusDB server). The NDJSON approach requires only git, which is already universally installed
+in development environments.
+
 ## Consequences
 
 ### Positive
@@ -538,10 +587,11 @@ Both approaches are bounded in bandwidth regardless of the size of the remote re
 
 - The `KgArchive` type in `portability.rs` is unchanged. Export serializes it to NDJSON;
   import deserializes from NDJSON. The in-memory representation is stable.
-- `schema.yaml` format versioning uses semver. The current format is `1.0.0`. Schema format
-  upgrades (adding top-level keys) increment the minor version; breaking changes increment the
-  major version. The khive CLI checks the `version` field and rejects schemas with a major version
-  it does not understand.
+- `schema.yaml` format versioning uses semver via the `format_version` field. The current format
+  is `1.0.0`. Format upgrades (adding top-level keys) increment the minor version; breaking changes
+  increment the major version. The khive CLI checks `format_version` and rejects schemas with a
+  major version it does not understand. Ontology evolution (entity kinds, relations, property
+  schemas) is tracked via `ontology_version` defined in ADR-054.
 - Existing khive instances with SQLite-only state are not affected by this ADR. The NDJSON export
   is an additive workflow, not a database replacement.
 

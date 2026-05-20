@@ -1,6 +1,6 @@
 # ADR-049: Project-First Workspace Frontend
 
-**Status**: moved to khive-cloud ADR-030\
+**Status**: moved — see khive-cloud ADR-030; supersedes ADR-045 and ADR-047\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 

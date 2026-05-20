@@ -24,11 +24,10 @@ entity level, and how remotes (GitHub and khive.ai cloud) interact with the bran
 
 ### Relationship to ADR-052
 
-ADR-052 defines the `.state/` directory under `.khive/kg/`: `working.db` (the live DB),
-`base.ndjson` snapshots (the committed base), and `dirty` flag tracking. This ADR sits on top
-of that model: every branch operation must maintain the ADR-052 invariant that `working.db`
-reflects the state of the current branch's committed snapshot plus any uncommitted working
-changes.
+ADR-052 defines the `.state/` directory under `.khive/kg/`: `working.db` (the live DB) and
+`dirty` flag tracking. This ADR sits on top of that model: every branch operation must maintain
+the ADR-052 invariant that `working.db` reflects the state of the current branch's committed
+snapshot plus any uncommitted working changes.
 
 ## Decision
 
@@ -88,10 +87,6 @@ from the new files. The sequence is:
 
 4. **Update `.state/HEAD`**: write the new branch name.
 
-5. **Update `.state/base.ndjson`**: copy the current `entities.ndjson` and `edges.ndjson` as
-   the new base snapshot so that `khive kg status` computes diffs against the correct committed
-   state.
-
 ### 3. Branch Create — No Immediate Rebuild
 
 `khive kg branch create <name>` only runs `git checkout -b <name>`. It does NOT rebuild
@@ -127,11 +122,11 @@ When `git merge` produces conflicts in NDJSON files, the conflict markers appear
 file:
 
 ```
-<<<<<<< HEAD
-{"id":"abc123","kind":"concept","name":"LoRA","description":"Low-rank adaptation method","properties":{},"tags":[]}
-=======
-{"id":"abc123","kind":"concept","name":"LoRA","description":"Parameter-efficient fine-tuning via low-rank matrices","properties":{},"tags":[]}
->>>>>>> experiments
+ <<<<<<< HEAD
+ {"id":"abc123","kind":"concept","name":"LoRA","description":"Low-rank adaptation method","properties":{},"tags":[]}
+ =======
+ {"id":"abc123","kind":"concept","name":"LoRA","description":"Parameter-efficient fine-tuning via low-rank matrices","properties":{},"tags":[]}
+ >>>>>>> experiments
 ```
 
 `khive kg resolve` handles these:
@@ -157,19 +152,59 @@ legitimately extended the same entity's properties in non-overlapping ways. It f
 any property key that appears in both versions with different values, requiring explicit
 `--ours`/`--theirs` override for those keys.
 
+### 5b. Edge Conflict Resolution
+
+Edges can conflict under the same conditions as entities. The conflict key for an edge is the
+composite `(source, target, relation)` triple — this is the semantic identity of an edge, not the
+internal UUID.
+
+| Scenario | Resolution |
+|---|---|
+| Weight change on same edge | `--ours` / `--theirs` apply to the conflicting edge line |
+| Property change on same edge | `--merge-properties` merges non-overlapping property changes; overlapping changes use `--ours` with a warning |
+| Delete vs. edit on same edge | Treated as a conflict; requires explicit `--ours` or `--theirs` |
+| Same composite key, different edge UUIDs | Keep the UUID from the branch being merged into (`--ours` UUID wins); the `(source, target, relation)` identity is preserved |
+
+The `--ours`, `--theirs`, and `--merge-properties` flags apply identically to edge conflict lines
+as to entity conflict lines. `--entity <id>` has a corresponding `--edge <source> <target> <relation>` for
+per-edge overrides when a global strategy is in use.
+
+After edge conflict resolution, `edges.ndjson` is re-sorted by the composite key (same sort
+invariant as `entities.ndjson` by UUID).
+
 ### 6. Schema Conflict Resolution
 
 `schema.yaml` conflicts are less frequent than entity conflicts but structurally more serious.
 
+Not all schema conflicts carry the same weight. ADR-053 distinguishes three categories:
+
+1. **Base ontology changes** — changes to the 13 closed edge relations from ADR-002 (compile-time
+   Rust enums). These always require manual review. There is no automated strategy. Adding,
+   renaming, or removing a base relation is an architectural decision.
+
+2. **Pack-scoped and additive changes** — new entity kinds, new optional properties, new pack
+   additions, new edge endpoint rules declared in a pack's `EDGE_RULES`. These follow ADR-054's
+   schema merge rules: additive changes auto-merge; conflicting changes require manual resolution.
+   ADR-053 defers to ADR-054 for this category.
+
+3. **Property schema changes** — changes to property type definitions or validation rules. These
+   also defer to ADR-054's merge rules.
+
 | Scenario | Strategy |
 |---|---|
-| Two branches add different entity kinds | Mergeable — append both to `entity_kinds` list; validate no duplicates |
-| Two branches add different edge relations | NOT automatically mergeable — the edge relation ontology is closed (ADR-002); adding a relation is an architectural decision that requires deliberate review |
-| Two branches change the same property definition | Manual resolution required |
+| Two branches add different entity kinds | Additive — auto-merge per ADR-054 |
+| Two branches add the same entity kind | Conflict — manual resolution |
+| Two branches add different edge relations (base ontology) | NOT automatically mergeable — always manual review (ADR-002) |
+| Two branches add pack-scoped edge endpoint rules | Additive — auto-merge per ADR-054 |
+| Two branches change the same property definition | Conflict — manual resolution per ADR-054 |
 | Two branches change the same remote pin | Manual resolution required — the correct SHA is determined by which branch's remote state is intended |
 
-Schema conflicts always surface as blocked merges requiring human review. `khive kg resolve`
-detects schema conflicts and refuses to apply any automated strategy, printing:
+For additive schema changes (new kinds, new optional properties, pack additions), ADR-054 defines
+the merge resolution. ADR-053 reserves manual review only for base ontology changes (the 13 closed
+edge relations from ADR-002) and incompatible property type changes.
+
+`khive kg resolve` detects schema conflicts and, where no automated strategy applies, blocks the
+merge and prints:
 
 ```
 error: schema.yaml has merge conflicts that require manual resolution
@@ -360,10 +395,10 @@ conflicts are rare (additive KG work), not for the case where conflicts are expe
 - Merge conflicts in NDJSON are raw JSON lines in the conflict markers. `khive kg resolve`
   renders them in entity-aware terms, but users who open the file directly see raw JSON. This is
   a UX gap compared to purpose-built merge tools.
-- Schema conflicts always require manual resolution. There is no automated strategy for
-  `schema.yaml` conflicts. This is intentional (the edge ontology is closed and changes are
-  architectural decisions), but it means schema-touching branches require human review before
-  they can merge.
+- Base-ontology schema conflicts always require manual resolution. There is no automated strategy
+  for changes to the 13 closed edge relations (ADR-002). Additive changes (new entity kinds, new
+  pack additions) auto-merge per ADR-054, but any branch that touches the base edge ontology
+  requires human review before it can merge.
 
 ### Neutral
 
@@ -374,7 +409,7 @@ conflicts are rare (additive KG work), not for the case where conflicts are expe
 
 ## Implementation
 
-### CLI command additions to `crates/khive-cli/`
+### CLI command additions to the Deno CLI (`deno/src/kg/`)
 
 ```
 khive kg branch create <name>        — git checkout -b + update .state/HEAD
@@ -391,9 +426,9 @@ khive kg push [--remote <r>] [--cloud]
 khive kg pull [--remote <r>] [--cloud]
 ```
 
-All commands are in `crates/khive-cli/` and use the `khive-vcs` crate for the DB rebuild step.
-Git operations are invoked via `std::process::Command`. No git library dependency is added —
-git is already a required runtime dependency (ADR-048 §Consequences).
+All commands are in the `khive kg` CLI (`deno/src/kg/`) and use the `khive-vcs` crate for the
+DB rebuild step via the MCP server. Git operations are invoked as subprocess calls. No git library
+dependency is added — git is already a required runtime dependency (ADR-048 §Consequences).
 
 ### `khive-vcs` additions
 

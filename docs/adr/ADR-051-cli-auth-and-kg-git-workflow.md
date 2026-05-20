@@ -26,15 +26,15 @@ the cloud-connected workflow (auth, PR creation, repo management). For khive:
 
 ADR-044 specified a Deno HTTP API layer. ADR-049 specified the frontend workspace. This ADR
 specifies the CLI layer that bridges the git-native KG workflow (ADR-048) with the khive.ai cloud
-(ADR-027 API surface).
+(ADR-044 REST/gateway surface).
 
 ### What changes and what does not
 
 - ADR-048 (`export`, `import`, `validate`, `diff`, `update`): unchanged. This ADR adds commands
   that call these; it does not modify them.
-- ADR-027 (HTTP API layer): extended with one new sync endpoint (`POST /v1/projects/:ns/sync`).
+- ADR-044 (HTTP API layer): extended with one new sync endpoint (`POST /v1/projects/:ns/sync`).
   All other API surface is unchanged.
-- ADR-044 (HTTP API layer): unaffected. The Deno gateway is unchanged.
+- ADR-027 (Single Tool MCP Surface): unaffected. KG workflow commands are CLI-only, not MCP tools.
 - ADR-003 (four-layer architecture): the CLI is a new binary in the Deno layer. No new layers.
 
 ## Decision
@@ -167,9 +167,11 @@ KG Status (namespace: khive)
   Validation: pass
 ```
 
-The counts "modified since last commit" and "new since last commit" come from parsing the output of
-`git diff HEAD -- .khive/kg/entities.ndjson` and `git diff HEAD -- .khive/kg/edges.ndjson` — the
-CLI counts `+` and `-` lines per entity/edge UUID, not raw line diffs.
+The counts "modified since last commit" and "new since last commit" are computed by exporting the
+current working DB to a temporary NDJSON snapshot and comparing it against the committed NDJSON
+files using the diff algorithm defined in ADR-052. This catches changes made through
+`khive create/update/delete` that have not been exported yet, and does not rely on the git working
+tree being dirty. The comparison is a content diff on UUID-keyed records, not a raw line count.
 
 If `.khive/kg/` does not exist: prints `KG not initialized. Run 'khive kg init' to start.`
 
@@ -200,7 +202,7 @@ khive kg commit              # prompts for message if -m is omitted
   472 entities, 1,111 edges (12 changed, 3 added)
 ```
 
-The counts come from the same `git diff` analysis as `khive kg status`.
+The counts come from the same DB-vs-NDJSON comparison as `khive kg status` (see ADR-052 for the diff algorithm).
 
 If there are no changes to `.khive/kg/` since the last commit, the command prints
 `Nothing to commit (KG is clean)` and exits with 0.
@@ -469,8 +471,8 @@ configure the namespace.
 
 - The `khive auth` commands have no Rust component. They are Deno (TypeScript) commands in the same
   Deno CLI binary as the existing `khive kg` commands.
-- The sync endpoint (`POST /v1/projects/:ns/sync`) is the only new server-side surface. All other
-  HTTP API surface (ADR-044) is unchanged.
+- The sync endpoint (`POST /v1/projects/:ns/sync`) is the only new server-side surface added to the
+  ADR-044 REST/gateway layer. All other HTTP API surface (ADR-044) is unchanged.
 - `khive kg branch` and `khive kg log` (Phase C5) are thin wrappers around `git branch` and
   `git log`. They add no new state.
 
@@ -571,7 +573,7 @@ C2 → C3 → C1 → C4 → C5, delivering the most-used local workflow first.
 
 - ADR-048: Git-Native KG Versioning — file format, `export`/`import`/`validate` commands, and
   namespace detection that this ADR builds on
-- ADR-044: HTTP API Layer — Deno + Hono REST layer extended with the sync endpoint
+- ADR-044: HTTP API Layer — Deno + Hono REST layer; extended with the new sync endpoint
 - ADR-027: Single Tool MCP Surface — unchanged; KG workflow commands are CLI-only, not MCP tools
 - ADR-003: Four-Layer Architecture — CLI is in the Deno layer; no new architecture layers introduced
 - ADR-029: Authorization Gate — access token validation for the sync endpoint uses the Gate trait

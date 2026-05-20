@@ -295,8 +295,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall khive-cli --no-confirm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno install --allow-all jsr:@khive/cli@latest
       - name: Validate KG
         uses: khive/kg-validate-action@v1
         with:
@@ -601,31 +603,35 @@ codes allow pipeline steps to route these cases to different notifications or re
 
 ## Implementation
 
-### CLI extensions
+### Deno CLI extensions
 
-`crates/khive-vcs/src/validate.rs` gains a second `RulePass` that runs after the built-in
-`StructuralPass`. The `RulePass`:
+The `khive` Deno CLI (ADR-003) gains a second validation pass in `commands/kg/validate.ts`. A new
+`lib/validation/` module implements the `RulePass` that runs after the built-in `StructuralPass`.
+The `RulePass`:
 
 1. Reads and parses `.khive/kg/rules.yaml` (absent = no-op).
 2. Loads built-in configurable rules keyed by the rule IDs in §1.
-3. Loads custom rule modules from `module:` paths using the embedded Deno runtime.
+3. Loads custom rule modules from `module:` paths using the embedded Deno sandbox.
 4. Loads pack-provided rules from all installed packs.
 5. Runs each enabled rule against the in-memory parsed NDJSON content.
 6. Merges violations into the structured `ValidationReport` already produced by the structural pass.
 
 ```
-crates/khive-vcs/src/
-  validate.rs          — extended: StructuralPass + RulePass merged into ValidationReport
-  rules/
-    loader.rs          — rules.yaml parse + schema validation
-    builtin.rs         — built-in configurable rules (density, orphans, naming, etc.)
-    custom.rs          — Deno module invocation sandbox
-    pack.rs            — pack-provided rule loading
-  fix.rs               — --fix support: applies fixable violations, writes NDJSON
-  report.rs            — ValidationReport → text / json / github-actions formatter
+cli/
+  commands/kg/
+    validate.ts          — extended: StructuralPass + RulePass merged into ValidationReport
+    hook.ts              — hook install/uninstall/status subcommands
+  lib/
+    validation/
+      loader.ts          — rules.yaml parse + schema validation
+      builtin.ts         — built-in configurable rules (density, orphans, naming, etc.)
+      sandbox.ts         — Deno module invocation sandbox for custom rules
+      pack.ts            — pack-provided rule loading
+    fix.ts               — --fix support: applies fixable violations, writes NDJSON
+    report.ts            — ValidationReport → text / json / github-actions formatter
 ```
 
-New CLI subcommands added to `crates/khive-cli/src/kg.rs`:
+New CLI subcommands added to `commands/kg/hook.ts`:
 
 | Subcommand | Behavior |
 |---|---|

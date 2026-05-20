@@ -13,8 +13,8 @@ ADR-051 defined the CLI commands for the KG git workflow (`khive kg commit`, `pu
 Neither ADR specified the mechanics of how the SQLite working database and the NDJSON
 files stay in sync: what the directory layout is, which layer is authoritative at which
 point in the lifecycle, how a diff is computed for `khive kg status`, how rebuilding
-the DB from files works, and how dirty state is tracked without a `git status` round-trip
-on every write.
+the DB from files works, and how `khive kg status` computes entity-level diff output without
+requiring a `git status` round-trip.
 
 This ADR fills that gap. It defines the storage model for the KG working state and the
 reconciliation protocol that binds the two layers.
@@ -47,7 +47,6 @@ bookkeeping that makes transitions between them efficient.
   .state/                  # gitignored — working state (ephemeral)
     working.db             # SQLite with FTS5 + vector indexes
     HEAD                   # current branch name (plain text, mirrors git HEAD)
-    dirty                  # flag file: exists when DB has uncommitted changes
 ```
 
 `khive kg init` creates the full structure and appends `.khive/kg/.state/` to
@@ -95,8 +94,8 @@ The DB is a materialized view of the files, rebuilt deterministically when neede
 ### 4. Working database schema
 
 `working.db` is a SQLite database with FTS5 and vector extensions (same as the main
-khive database per ADR-009). Its schema mirrors the NDJSON field set with search
-indexes added:
+khive database per ADR-009). Its schema mirrors the NDJSON fields, plus derived metadata
+columns for timestamps that are not present in every NDJSON record (older exports omit them):
 
 #### `entities` table
 
@@ -108,8 +107,8 @@ CREATE TABLE entities (
     description TEXT,
     properties  TEXT NOT NULL DEFAULT '{}',  -- JSON object
     tags        TEXT NOT NULL DEFAULT '[]',  -- JSON array
-    created_at  TEXT NOT NULL,         -- ISO 8601
-    updated_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX idx_entities_kind ON entities(kind);
@@ -133,8 +132,8 @@ CREATE TABLE edges (
     relation    TEXT NOT NULL,
     weight      REAL NOT NULL DEFAULT 1.0,
     properties  TEXT NOT NULL DEFAULT '{}',  -- JSON object
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (source, target, relation)   -- composite, mirrors NDJSON sort key
 );
 
@@ -154,44 +153,54 @@ export/import cycles (ADR-048 D1) but is not the primary key — the composite k
 Triggered by `khive kg commit`. Produces bit-identical output for identical logical state
 (idempotent over the same DB content).
 
-1. Open `working.db`. If `.state/dirty` does not exist, report "nothing to commit" and exit.
+1. Open `working.db`. Run the §7 diff against committed NDJSON. If the diff is empty, report
+   "nothing to commit, working KG clean" and exit.
 2. Export all entities: `SELECT * FROM entities ORDER BY id ASC`.
 3. For each entity row, serialize to a JSON object with fixed key ordering:
-   `id`, `kind`, `name`, `description`, `properties`, `tags`. Within `properties`, keys
-   sorted alphabetically. Within `tags`, values sorted lexicographically.
+   `id`, `kind`, `name`, `description`, `properties`, `tags`, followed by `created_at` and
+   `updated_at` when non-null. Within `properties`, keys sorted alphabetically. Within `tags`,
+   values sorted lexicographically.
 4. Write one serialized entity per line to `entities.ndjson`, with a trailing `\n` after
    the last record.
 5. Export all edges: `SELECT * FROM edges ORDER BY source ASC, target ASC, relation ASC`.
 6. For each edge row, serialize with fixed key ordering:
-   `edge_id`, `source`, `target`, `relation`, `weight`.
+   `edge_id`, `source`, `target`, `relation`, `weight`, `properties`, followed by `created_at`
+   and `updated_at` when non-null.
 7. Write one serialized edge per line to `edges.ndjson`, with a trailing `\n`.
 8. Stage the three KG files: `git add .khive/kg/entities.ndjson .khive/kg/edges.ndjson .khive/kg/schema.yaml`.
 9. `git commit -m "<message>"` (message from CLI arg or interactive prompt).
-10. Remove `.state/dirty`.
 
 The export is a full snapshot — there is no delta or incremental export. Given that
 NDJSON files are small relative to a code repository, and that the files are git-tracked
 so unchanged lines produce zero delta in the git object store, full-snapshot export is
 simpler and more correct than tracking a change log.
 
-#### Checkout/pull flow: files → DB
+#### Checkout/pull flow: files → DB (atomic)
 
 Triggered by `khive kg pull` or `khive kg checkout`. Also triggered automatically by
 `khive kg init` if the repo already contains committed NDJSON files.
 
-1. If `.state/dirty` exists, refuse with: "Uncommitted changes in working.db. Run
-   `khive kg commit` or `khive kg reset` first."
-2. Drop and recreate `working.db` tables (DDL above).
-3. Parse `entities.ndjson` line by line. For each line, `INSERT INTO entities`.
-   Lines that fail JSON parsing are collected and reported as a structured error after
-   the full pass; the transaction is not rolled back on parse error — partial imports are
-   acceptable here because the source files are git-managed and `validate` would catch
-   corruption before commit.
-4. Parse `edges.ndjson` line by line. `INSERT INTO edges`.
-5. Rebuild FTS5 index: `INSERT INTO entities_fts(entities_fts) VALUES('rebuild')`.
-6. Write current git branch name to `.state/HEAD`:
-   `git rev-parse --abbrev-ref HEAD`.
-7. Remove `.state/dirty` if it exists.
+1. Run the §7 diff against committed NDJSON. If the diff is non-empty, refuse with:
+   "Uncommitted changes in working.db. Run `khive kg commit` or `khive kg reset` first."
+2. **Validate first**: run `khive kg validate` against the NDJSON files before touching
+   the database. If validation fails, abort with a structured error report. No DB changes
+   are made on validation failure.
+3. Create a temporary SQLite file at `.state/working.db.tmp` with the §4 DDL.
+4. Open a single write transaction on `.state/working.db.tmp`.
+5. Parse `entities.ndjson` line by line. For each line, `INSERT INTO entities`. Any
+   JSON parse error aborts the transaction and removes `.state/working.db.tmp`.
+6. Parse `edges.ndjson` line by line. `INSERT INTO edges`. Any error aborts the
+   transaction and removes `.state/working.db.tmp`.
+7. Rebuild FTS5 index: `INSERT INTO entities_fts(entities_fts) VALUES('rebuild')`.
+8. Commit the transaction on `.state/working.db.tmp`.
+9. Atomically rename `.state/working.db.tmp` → `.state/working.db` (replaces old DB).
+10. Write current git branch name to `.state/HEAD`:
+    `git rev-parse --abbrev-ref HEAD`.
+11. (No dirty file to remove — status is computed from DB-vs-NDJSON diff, not a flag.)
+
+The rename in step 9 is the only instant at which the DB transitions — either the old DB
+survives intact (on any failure before step 9) or the new DB is fully populated (after step 9).
+There is no partially-imported state observable by other processes.
 
 The rebuild is idempotent. Running checkout twice on the same files produces the same DB.
 This is the invariant that makes the DB a true materialized view of the NDJSON.
@@ -200,34 +209,39 @@ This is the invariant that makes the DB a true materialized view of the NDJSON.
 
 `khive kg reset` discards uncommitted changes in the DB and rebuilds from the committed files:
 
-1. Verify `.state/dirty` exists (nothing to reset if clean).
-2. Run the checkout flow (steps 2–7 above), which drops and rebuilds `working.db` from files.
+1. Run the §7 diff to check whether there are uncommitted changes. If no changes, report
+   "nothing to reset, working KG clean" and exit.
+2. Run the checkout flow (atomic, steps 2–11 above), which validates and rebuilds `working.db`
+   from the committed NDJSON files.
 3. This effectively discards all changes made since the last commit.
 
-### 6. Dirty tracking
+### 6. Status tracking
 
-When `working.db` is modified by any of the khive CLI verbs (`create`, `update`, `delete`,
-`link`):
-
-1. Touch `.state/dirty` (create if absent, update mtime if present).
+`khive kg status` always computes status by comparing the current DB export against the committed
+NDJSON files. There is no `.state/dirty` flag. This approach is canonical: it catches uncommitted
+DB changes that `git status .khive/kg/` cannot see (because the DB is gitignored), while
+remaining correct across crash recovery, concurrent writes, and process restarts.
 
 When `khive kg status` runs:
 
-1. Check whether `.state/dirty` exists.
-2. If absent: report "On branch <HEAD> — nothing to commit, working KG clean." Exit 0.
-3. If present: proceed to diff computation (§7).
+1. Export the current DB to an in-memory sorted NDJSON representation (same serialization
+   as commit flow, but no file write).
+2. Parse the committed `entities.ndjson` and `edges.ndjson` into in-memory maps.
+3. Diff and render output (see §7 for the diff algorithm).
+4. If the diff is empty: report "On branch <HEAD> — nothing to commit, working KG clean." Exit 0.
+5. If the diff is non-empty: render the entity-level diff and exit non-zero.
 
-When `khive kg commit` completes:
+The full-comparison cost is bounded: for graphs up to ~100K entities the in-memory diff is
+sub-second on modern hardware (§7). At larger scales, a row-level change log table in
+`working.db` is an optimization path deferred to a later version.
 
-1. Remove `.state/dirty`.
-
-The dirty flag avoids reading and hashing the DB on every `khive kg status` invocation.
-Status checks are frequent (CI runs, agent loops); the flag makes them O(1) for the clean case.
+The `.state/` directory layout shown in §1 no longer includes a `dirty` file. The directory
+contains only `working.db` and `HEAD`.
 
 ### 7. Status and diff computation
 
-`khive kg status` computes an entity-level diff between the committed NDJSON and the
-current DB state. Triggered only when `.state/dirty` exists (§6).
+`khive kg status` computes an entity-level diff between the committed NDJSON and the current DB
+state. This is always computed on every `khive kg status` invocation (see §6 for rationale).
 
 Algorithm:
 
@@ -253,10 +267,10 @@ KG status (3 uncommitted changes):
     + LoRA --[extends]--> QLoRA
 ```
 
-The diff runs in memory; no temporary files are written. For graphs up to ~100K entities
-the full-snapshot comparison is fast enough (sub-second on modern hardware). If performance
-becomes a concern at larger scale, a row-level change log table in `working.db` can replace
-the full comparison — this is a later optimization, not a v0.4 requirement.
+The diff runs in memory; no temporary files are written. For graphs up to ~100K entities the
+full-snapshot comparison is sub-second on modern hardware. If performance becomes a concern at
+larger scale, a row-level change log table in `working.db` can replace the full comparison — this
+is a deferred optimization, not a v0.4 requirement.
 
 ### 8. Standalone vs. git-native mode
 
@@ -286,7 +300,7 @@ standalone mode is used. The search stops at the filesystem root.
 2. If the current directory is not a git repository: run `git init`.
 3. Create `.khive/kg/` and `.khive/kg/.state/`.
 4. Write default `schema.yaml` (full ADR-001 entity kinds + ADR-002 edge relations,
-   `version: "1.0.0"`, empty `remotes: []`).
+   `format_version: "1.0.0"`, `ontology_version: "1.0.0"`, empty `remotes: []`).
 5. Write empty `entities.ndjson` (single `\n`) and `edges.ndjson` (single `\n`).
 6. Create empty `working.db` with the §4 schema.
 7. Write current git branch to `.state/HEAD`.
@@ -360,13 +374,15 @@ limitation of the implementation.
 
 - The DB is always reconstructable from the NDJSON files. No backup strategy is needed
   for `.state/working.db` — if it is lost or corrupted, `khive kg pull` rebuilds it.
-- `khive kg status` is O(1) for the clean case (flag file check only). Agents that check
-  status frequently do not pay a diff computation cost when nothing has changed.
+- `khive kg status` is always computed from a DB-vs-NDJSON diff, which catches DB changes
+  that `git status` cannot see (the DB is gitignored). The diff is bounded by graph size
+  and is sub-second for graphs up to ~100K entities.
 - The serialization is deterministic: the same logical graph state always produces
   bit-identical NDJSON files. This means `git diff` on the NDJSON files is a reliable
   signal — if `git diff` shows no changes, the DB and files are in sync.
-- The DB schema is minimal and matches the NDJSON field set exactly. Import and export
-  are mechanical field mappings with no transformation logic.
+- The DB schema mirrors the NDJSON fields with timestamp defaults added. Import and export
+  are mechanical field mappings; the only transformation is that optional NDJSON timestamps
+  become DB column values (defaulting to insertion time when absent).
 - Mode detection is implicit and consistent with git's own heuristic. Users do not need
   to configure which mode they are in — the presence of `working.db` in the directory
   tree is sufficient.
@@ -374,19 +390,20 @@ limitation of the implementation.
 ### Negative
 
 - `khive kg pull` is destructive: it drops and rebuilds `working.db`. Uncommitted changes
-  are lost. The dirty flag guard mitigates accidental data loss, but the user must
-  explicitly run `khive kg reset` or `khive kg commit` before pulling.
+  are lost. The guard in step 1 of the checkout flow (refuse if DB-vs-NDJSON diff is
+  non-empty) mitigates accidental data loss, but the user must explicitly run
+  `khive kg reset` or `khive kg commit` before pulling.
 - The full-snapshot diff in `khive kg status` reads the entire DB and both NDJSON files.
   For large graphs (100K+ entities), this may be slow. Mitigation: a row-level change log
   table is an optimization path, deferred to a later version.
 - Git must be installed and on `$PATH` for git-native mode to function. Standalone mode
   has no such dependency, but git-native mode's value proposition requires git.
 - Two processes writing to `working.db` concurrently (two agent sessions in the same
-  repo) can produce conflicting dirty states. SQLite's WAL mode handles concurrent readers
-  and single writers safely. The dirty flag is a hint, not a transaction — concurrent
-  writers touching the flag file simultaneously will both succeed (filesystem atomicity).
-  This is an edge case that does not require resolution in v0.4; the worktree model
-  (ADR-027) means each agent session typically has its own working directory.
+  repo) may interleave writes. SQLite's WAL mode handles concurrent readers and single
+  writers safely. `khive kg status` computing a full diff on each invocation means each
+  call sees a consistent snapshot of the DB at that moment. This is an edge case that
+  does not require resolution in v0.4; the worktree model (ADR-027) means each agent
+  session typically has its own working directory.
 
 ### Neutral
 
@@ -411,8 +428,7 @@ crates/khive-vcs/src/
   commit.rs       — commit flow (§5 commit protocol)
   checkout.rs     — checkout/pull flow (§5 checkout protocol)
   reset.rs        — reset flow (§5 reset protocol)
-  status.rs       — dirty flag check + diff computation (§6, §7)
-  dirty.rs        — touch/exists/remove for .state/dirty
+  status.rs       — DB-vs-NDJSON diff computation (§6, §7)
   init.rs         — khive kg init (§9)
   schema.rs       — SchemaYaml type (from ADR-048)
   export.rs       — export() (from ADR-048)
@@ -425,7 +441,7 @@ crates/khive-vcs/src/
 
 `storage.rs` is new in this ADR. The other modules (`schema.rs`, `export.rs`, `import.rs`,
 `validate.rs`, `diff.rs`, `remote.rs`, `update.rs`) were defined in ADR-048; this ADR
-adds `commit.rs`, `checkout.rs`, `reset.rs`, `status.rs`, `dirty.rs`, and `init.rs`.
+adds `commit.rs`, `checkout.rs`, `reset.rs`, `status.rs`, and `init.rs`.
 
 ### Mode detection integration
 
@@ -439,9 +455,9 @@ detection code resolves; the verb surface itself is unchanged.
 
 | Phase | Scope | Target |
 |-------|-------|--------|
-| S1 | `storage.rs` + `init.rs` + `dirty.rs` — DB DDL, init command, dirty flag | v0.4 |
+| S1 | `storage.rs` + `init.rs` — DB DDL, init command | v0.4 |
 | S2 | `commit.rs` + `checkout.rs` — commit and pull flows | v0.4 |
-| S3 | `status.rs` — dirty flag check + diff computation | v0.4 |
+| S3 | `status.rs` — DB-vs-NDJSON diff computation | v0.4 |
 | S4 | `reset.rs` + mode detection in pack handlers | v0.4 |
 | S5 | Performance: row-level change log for large graphs | v0.6 (deferred) |
 

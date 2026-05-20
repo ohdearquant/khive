@@ -72,13 +72,9 @@ note_kinds:
   - experiment_log
 
 edge_endpoints:
-  - relation: trained_on
-    category: dependency
+  - relation: depends_on
     endpoints:
       - [model, dataset]
-  - relation: evaluated_on
-    category: dependency
-    endpoints:
       - [model, benchmark]
 
 properties:
@@ -120,22 +116,23 @@ These are additive to the base vocabulary defined by loaded Rust packs. The rule
 
 #### `edge_endpoints`
 
-The `edge_endpoints` section can only extend the endpoint contract for:
+The `edge_endpoints` section declares new `(source_kind, target_kind)` endpoint pairs for
+**existing** base relations from [ADR-002](ADR-002-edge-ontology.md). Packs extend which
+kinds may participate in a relation — they do not introduce new relation names.
 
-1. **Existing base relations** (the 13 from [ADR-002](ADR-002-edge-ontology.md)) by adding new
-   `(source_kind, target_kind)` pairs to an existing relation, consistent with
-   [ADR-031](ADR-031-pack-extensible-edge-endpoints.md).
-2. **New relations introduced by this pack** — a pack may declare a new edge relation if it also
-   provides a `category` from the closed set: `structure`, `derivation`, `dependency`,
-   `implementation`, `lateral`, `annotation`.
+Each entry specifies:
 
-New relations introduced by a declarative pack are **pack-scoped names** (`<pack>.<relation>`,
-e.g., `ml-papers.trained_on`). The base 13 relations of ADR-002 remain a closed Rust enum;
-declarative packs cannot add to that enum. Pack-scoped relations are registered in the runtime
-vocabulary as strings and validated at the runtime boundary, not at compile time.
+- `relation`: one of the 13 base relation names from ADR-002 (e.g., `depends_on`, `implements`,
+  `instance_of`). This field is a **lookup into the closed relation set** — it is not a
+  declaration of a new relation.
+- `endpoints`: a list of `[source_kind, target_kind]` pairs that become valid for this relation.
+  The source and target kinds must be registered in the merged vocabulary (either as base kinds
+  or as kinds declared by this pack or a previously loaded pack).
 
-Pack-scoped relation names use dot-notation on the wire: `ml-papers.trained_on`. The `relation`
-field in `pack.yaml` is the bare name; the pack prefix is applied by the runtime at load time.
+Declarative packs **cannot** introduce new relation names. The 13-relation closed enum in ADR-002
+is the complete and immutable set of relation types. If a domain requires a semantic distinction
+that the 13 relations do not cover, that is a request for an ADR-002 amendment — not something
+a pack author can resolve unilaterally.
 
 Rules are additive only. A declarative pack cannot tighten or remove any endpoint pair accepted
 by a base relation or a previously loaded pack.
@@ -195,7 +192,8 @@ note_kinds:
   - task           # contributed by gtd
   - experiment_log # contributed by ml-papers
 
-# edge_relations and properties are similarly merged
+# edge endpoint triples and properties are similarly merged;
+# edge_relations itself does not gain new names — only new (relation, source_kind, target_kind) triples
 ```
 
 The `packs` section is the **source of truth** for which vocabularies are active. The
@@ -257,21 +255,16 @@ Merging rules:
 - **Note kinds**: union across all packs. Duplicate kind strings are idempotent.
 - **Edge endpoint rules**: additive union. New `(relation, source_kind, target_kind)` triples are
   added to the runtime's edge rule set (consistent with ADR-031). Duplicates are idempotent.
-- **Pack-scoped edge relations**: accumulated in a string-keyed map. Each `<pack>.<relation>` is
-  a distinct key; the category is stored alongside for validation in `khive pack validate`.
+  The `relation` in each triple must be one of the 13 base relations from ADR-002; the runtime
+  rejects any `edge_endpoints` entry whose `relation` field does not match a known base relation.
 - **Properties**: per-kind key merge. Duplicate property keys have their `values` sets unioned.
   A pack cannot restrict a previously declared value set.
 
 Conflict conditions that are hard errors:
 
-- Two packs declare the same **new** pack-scoped edge relation name (`<pack>.<relation>`) with
-  **different categories**. A `trained_on` relation that one pack declares as `dependency` and
-  another declares as `annotation` is an irreconcilable conflict — the category determines how the
-  relation is used in traversal.
-- A declarative pack declares a new edge relation whose name collides with one of the 13 base
-  relations from ADR-002 after stripping the pack prefix (e.g., a pack named `base` declaring a
-  `trained_on` relation that conflicts with an existing `base.trained_on` from a different pack is
-  a hard error if the categories differ).
+- A declarative pack's `edge_endpoints` entry references a `relation` name that is not one of the
+  13 base relations from ADR-002. Declarative packs may only extend which kind-pairs participate
+  in existing relations — they cannot introduce new relation names.
 
 Non-error situations:
 
@@ -311,8 +304,8 @@ Validates a pack manifest without installing it. Checks:
 
 1. Name and version format constraints
 2. Kind name format constraints
-3. `edge_endpoints` entries reference either an existing base relation (ADR-002) or declare a new
-   relation with a valid `category`
+3. `edge_endpoints` entries reference only existing base relations from ADR-002 (no new relation
+   names permitted)
 4. Property key format constraints
 5. No `values` list contains duplicate strings
 
@@ -493,18 +486,19 @@ worst a malicious pack can do is pollute the vocabulary — a recoverable, audit
 `khive pack remove` reverses. Code extension remains gated behind the Rust pack mechanism, which
 requires compilation and intentional binary distribution.
 
-### Why pack-scoped new edge relations rather than global new relations
+### Why edge endpoint extension rather than new relation names
 
 The 13-relation closed enum (ADR-002) is the semantic backbone of khive. Its stability allows
 traversal, query compilation, and tooling to reason about graph structure without inspecting
-pack configuration. Opening the enum to arbitrary new relations would fragment the traversal
+pack configuration. Opening the enum to arbitrary new relation names would fragment the traversal
 semantics — two packs might declare `trained_on` and `fine-tuned-from` as separate relations
-when both express a `dependency` that could be unified.
+when both express a `depends_on` that could be unified.
 
-Pack-scoped new relations (`ml-papers.trained_on`) are a pragmatic escape valve for domain
-vocabularies while preserving the invariant that the 13 base relations are universal. Tooling
-that does not understand a pack-scoped relation can treat it as an opaque edge; tooling that
-does (the `ml-papers`-aware explorer) can render it meaningfully.
+The correct extension point is the endpoint contract: a pack that adds `model` and `dataset` kinds
+declares that `depends_on(model, dataset)` is a valid triple. The traversal engine already knows
+how to follow `depends_on` edges — it does not need to learn anything new. The pack contributes
+domain meaning (what it means for a model to depend on a dataset) without fragmenting the relation
+namespace. This is consistent with the extension mechanism in ADR-031.
 
 ### Why write the merged vocabulary back to `schema.yaml`
 
@@ -536,7 +530,7 @@ pointing to the cloud registry documentation.
 |-------------|------|------|--------------|
 | TOML manifest (pack.toml) | Familiar to Rust authors; no ambiguous YAML indentation | Inconsistent with existing schema.yaml convention; TOML's nested array syntax is more verbose for endpoint pairs | Convention consistency with ADR-048 wins |
 | Allow packs to contain WASM verb handlers | Full extensibility without recompilation | Security surface; WASM sandboxing complexity; binary distribution of user-compiled modules | Security model does not support arbitrary code in downloaded packs |
-| Extend the closed EdgeRelation enum for declarative packs | Uniform naming across packs | Breaks the compile-time closed enum invariant; requires ADR-002 amendment for every new relation; versioning nightmare across pack authors | Closed enum is a core invariant; pack-scoped names preserve it |
+| Allow packs to declare new relation names (as strings) | Domain-specific edge semantics without ADR amendment | Fragments traversal semantics; two packs may express the same semantic with different names; tooling cannot reason generically about pack-specific relations | The 13-relation closed set is the traversal backbone; packs extend endpoint pairs, not the relation namespace |
 | Store merged vocabulary only in memory, not in schema.yaml | Avoids schema.yaml churn during pack changes | schema.yaml loses self-containment for offline validation; CI must always fetch all packs | ADR-048 self-containment principle is worth the churn cost |
 | Per-project pack cache (inside `.khive/`) | Fully isolated per project; committed alongside the project | Bloats the git repo with downloaded manifests; version-identical packs duplicated across projects | Pack manifests are small but the principle of committing derived artifacts is wrong |
 | Registry-first design (no local install) | Simpler architecture; one install path | Blocks offline development and monorepo workflows; cloud dependency for local validation | OSS must be usable without cloud infrastructure |
@@ -562,8 +556,9 @@ pointing to the cloud registry documentation.
 - Declarative packs cannot register verb handlers. A domain that needs custom verb logic (not
   just vocabulary) still requires a Rust pack. The boundary between "vocabulary extension" and
   "behavior extension" may frustrate some users.
-- The pack-scoped relation naming (`ml-papers.trained_on`) is less ergonomic than a flat name.
-  Users must know which pack introduced a relation to use the qualified name.
+- Declarative packs cannot introduce new relation names. Domain authors who need a semantic
+  distinction not covered by the 13 base relations must file an ADR-002 amendment rather than
+  solving it in a pack.
 - Writing merged vocabulary back to `schema.yaml` means pack operations produce a git-visible
   diff. Teams must understand that `git diff .khive/kg/schema.yaml` after `khive pack install`
   is expected and should be committed.

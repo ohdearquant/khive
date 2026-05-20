@@ -1,6 +1,6 @@
 # ADR-046: Frontend Authentication and Real-Time Event Delivery
 
-**Status**: moved to khive ADR-031\
+**Status**: moved — see khive-cloud ADR-031\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 

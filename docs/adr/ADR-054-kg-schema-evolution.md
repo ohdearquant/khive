@@ -7,9 +7,9 @@
 ## Context
 
 ADR-048 introduced `schema.yaml` as the ontology manifest for a project's KG: it declares the
-entity kinds, edge relations, property schemas, and remote references in use. The `version` field
-in that ADR was defined as "the schema format version (what fields are valid in this `schema.yaml`),
-not a version counter for the graph data itself."
+entity kinds, edge relations, property schemas, and remote references in use. The `format_version`
+field in that ADR tracks which version of the `schema.yaml` file format is in use (what top-level
+keys are valid), not a version counter for the graph data itself.
 
 That definition was correct for v1.0.0 of the format but left a gap: schemas evolve. A team that
 started with `concept`, `document`, `project`, `person`, `org` may add a `benchmark` kind six months
@@ -29,12 +29,12 @@ When this happens, three problems arise that ADR-048 did not address:
    or auto-merge schema differences.
 
 3. **Pack lifecycle touches schema.** ADR-050 defines `khive pack install` and `khive pack remove`
-   but does not specify what happens to `schema.yaml`'s `version` field, whether a migration is
-   required before removal, or how pack-added kinds interact with the entity corpus.
+   but does not specify what happens to the ontology version, whether a migration is required
+   before removal, or how pack-added kinds interact with the entity corpus.
 
 This ADR defines:
 
-1. How `schema.yaml`'s `version` field evolves under schema changes (semver semantics)
+1. `ontology_version`: a new `schema.yaml` field that evolves under schema changes (semver semantics)
 2. A migration system: declarative YAML operations in `.khive/kg/migrations/`
 3. Compatibility rules for pull and merge operations that encounter schema differences
 4. How pack installation and removal interact with schema versioning
@@ -43,10 +43,12 @@ This ADR defines:
 
 ### Relationship to other ADRs
 
-- **ADR-048**: Defines `schema.yaml` format and the `version` field. This ADR amends the semantics
-  of `version` to cover ontology changes, not only format changes.
+- **ADR-048**: Defines `schema.yaml` format and introduces the `format_version` field (file format
+  compatibility). This ADR introduces `ontology_version` as a separate field tracking schema
+  evolution. The two fields coexist: `format_version` signals parser compatibility,
+  `ontology_version` signals entity-level compatibility.
 - **ADR-050**: Defines declarative packs and their `pack.yaml` format. This ADR defines how pack
-  installation and removal bump `schema.yaml`'s version and require or produce migrations.
+  installation and removal bump `schema.yaml`'s `ontology_version` and require or produce migrations.
 - **ADR-053**: Defines KG branching. Migrations are git-tracked and must be applied on branch
   checkout when the target branch has migrations the current branch does not.
 - **ADR-022**: Defines the SQLite migration system (`VersionedMigration` in `khive-db`). This ADR
@@ -56,7 +58,16 @@ This ADR defines:
 
 ### 1. Schema Versioning Semantics
 
-`schema.yaml`'s `version` field uses semver (`MAJOR.MINOR.PATCH`) with the following semantics:
+`schema.yaml` uses two distinct version fields:
+
+- **`format_version`** (introduced by ADR-048): the file format compatibility version. Consumers
+  use this to determine whether they can parse the file. The Deno CLI and Rust runtime reject
+  `schema.yaml` files whose `format_version` they do not understand.
+- **`ontology_version`** (introduced by this ADR): the schema evolution version — what entity
+  kinds, edge endpoint rules, and property schemas are declared. `khive kg validate` uses this
+  to determine whether pending migrations exist.
+
+`ontology_version` uses semver (`MAJOR.MINOR.PATCH`) with the following semantics:
 
 | Change type | Version bump | Examples |
 |---|---|---|
@@ -65,32 +76,35 @@ This ADR defines:
 | Non-functional | Patch | Updating descriptions, adding documentation comments, bumping a remote commit SHA |
 
 **Breaking changes require a migration file** (see §2) before `khive kg validate` will accept the
-new schema against the existing NDJSON corpus. The CLI enforces this: if the schema version
+new schema against the existing NDJSON corpus. The CLI enforces this: if the `ontology_version`
 increases by a major version and no migration file covers the transition, `validate` exits with:
 
 ```
-ERROR: schema major version bump from 1.0.0 to 2.0.0 with no migration for this transition.
+ERROR: ontology_version major bump from 1.0.0 to 2.0.0 with no migration for this transition.
   Add a migration to .khive/kg/migrations/ or run 'khive kg schema migrate --dry-run' to preview
   the generated migration for common operations.
 ```
 
-**Additive changes do not require a migration.** An entity created under schema v1.0 whose `kind`
-is still present in v1.1 remains valid. The `khive kg validate` command accepts entities created
-under any minor version within the current major series.
+**Additive changes do not require a migration.** An entity created under `ontology_version` v1.0
+whose `kind` is still present in v1.1 remains valid. The `khive kg validate` command accepts
+entities created under any minor version within the current major series.
 
 **Patch bumps are transparent.** No validation behavior changes.
 
-The `version` field in a freshly initialized schema (from `khive kg init`) is `"1.0.0"`. The
-khive CLI that wrote the schema version is recorded in a `khive_version` field alongside `version`:
+The `ontology_version` field in a freshly initialized schema (from `khive kg init`) is `"1.0.0"`.
+The khive CLI that wrote the schema is recorded in a `khive_version` field:
 
 ```yaml
-version: "1.2.0"          # ontology semver
-khive_version: "0.4.1"    # khive CLI version that last wrote this file
+format_version: "1.1.0"      # file format compatibility (ADR-048)
+ontology_version: "1.2.0"    # schema evolution semver (this ADR)
+khive_version: "0.4.1"       # khive CLI version that last wrote this file
 ```
 
+`format_version` is used by parsers to determine whether they understand the file structure.
+`ontology_version` is used by `khive kg validate` and `khive kg migrate` to determine entity
+compatibility and pending migrations.
 `khive_version` is informational — it is not used for validation. It helps debugging when a
-schema file was written by an older CLI that may not support features present in the current
-schema.
+schema file was written by an older CLI.
 
 ### 2. Migration System
 
@@ -154,7 +168,7 @@ operations:
 | `remove_relation_endpoint` | `relation`, `source_kind`, `target_kind`, `on_existing: error\|drop` | If `drop`: removes matching edges from `edges.ndjson`. If `error`: aborts if any such edges exist |
 
 All operations are applied in order within a migration file. A migration is atomic: if any
-operation fails, no NDJSON changes are written and `schema.yaml`'s version is not updated.
+operation fails, no NDJSON changes are written and `schema.yaml`'s `ontology_version` is not updated.
 
 #### Applying migrations
 
@@ -164,14 +178,15 @@ khive kg migrate --dry-run  # show what would change without writing
 khive kg migrate --to 1.2.0  # apply migrations up to a specific version
 ```
 
-`khive kg migrate` determines pending migrations by comparing `schema.yaml`'s current `version`
-against the `version_from` of each migration file. Migrations whose `version_from` is less than
-the current version have already been applied and are skipped. The command applies migrations in
-filename order until all migrations have been processed or until the target version is reached.
+`khive kg migrate` determines pending migrations by comparing `schema.yaml`'s current
+`ontology_version` against the `version_from` of each migration file. Migrations whose
+`version_from` is less than the current `ontology_version` have already been applied and are
+skipped. The command applies migrations in filename order until all migrations have been processed
+or until the target version is reached.
 
-After a successful migration, `schema.yaml`'s `version` is updated to the final `version_to` and
-the file is written. The NDJSON files are also written if any operations rewrote entity or edge
-lines. These changes should be committed:
+After a successful migration, `schema.yaml`'s `ontology_version` is updated to the final
+`version_to` and the file is written. The NDJSON files are also written if any operations rewrote
+entity or edge lines. These changes should be committed:
 
 ```bash
 khive kg migrate
@@ -186,18 +201,18 @@ project passed through and what changes each migration made — is visible in `g
 ### 3. Schema Compatibility on Pull and Merge
 
 When pulling or merging a branch that has a different `schema.yaml` than the current branch,
-`khive kg` compares the versions and selects one of three outcomes:
+`khive kg` compares the `ontology_version` fields and selects one of three outcomes:
 
 #### Patch or minor version difference (additive merge)
 
-If the incoming `schema.yaml` version is a minor or patch bump relative to the current version
-(i.e., only additive changes), git merges `schema.yaml` automatically. After the git merge,
-`khive kg validate` confirms no integrity violations were introduced. No manual intervention is
-required.
+If the incoming `schema.yaml`'s `ontology_version` is a minor or patch bump relative to the
+current (i.e., only additive changes), git merges `schema.yaml` automatically. After the git
+merge, `khive kg validate` confirms no integrity violations were introduced. No manual
+intervention is required.
 
-If both branches incremented the minor version independently (e.g., current has `1.1.0` from
-adding `benchmark`, incoming has `1.1.0` from adding `training_run`), git may conflict on the
-`version` field. In this case:
+If both branches incremented the minor `ontology_version` independently (e.g., current has
+`1.1.0` from adding `benchmark`, incoming has `1.1.0` from adding `training_run`), git may
+conflict on the `ontology_version` field. In this case:
 
 ```bash
 khive kg schema merge-resolve
@@ -207,23 +222,24 @@ resolves the conflict by computing a new minor version that includes both additi
 
 1. Takes the union of `entity_kinds`, `edge_relations`, `properties`, and `packs` from both
    versions.
-2. Increments the minor version to the next unused value.
+2. Increments the minor `ontology_version` to the next unused value.
 3. Writes the merged `schema.yaml`.
 4. The user commits the resolved file.
 
 #### Major version difference (explicit migration required)
 
-If the incoming schema has a higher major version than the current branch, the merge is refused:
+If the incoming schema has a higher major `ontology_version` than the current branch, the merge
+is refused:
 
 ```
-ERROR: cannot auto-merge schema 2.0.0 (incoming) with 1.3.0 (current).
+ERROR: cannot auto-merge ontology_version 2.0.0 (incoming) with 1.3.0 (current).
   Major version bump requires explicit migration.
   Run 'khive kg migrate' on the current branch to reach 2.0.0, then retry the merge.
 ```
 
-The user must apply the migrations on their branch first, advancing their `schema.yaml` to the
-same major version as the incoming branch, before the merge proceeds. This prevents silent data
-loss from entities that would become invalid under the new major schema.
+The user must apply the migrations on their branch first, advancing their `schema.yaml`'s
+`ontology_version` to the same major version as the incoming branch, before the merge proceeds.
+This prevents silent data loss from entities that would become invalid under the new major schema.
 
 #### Incompatible schemas with no migration path (diverged)
 
@@ -258,7 +274,7 @@ resolution is required.
 ### 4. Pack Integration with Schema Evolution
 
 Pack installation and removal are schema-changing operations. They interact with the migration
-system and the version field.
+system and the `ontology_version` field.
 
 #### Installing a pack
 
@@ -273,7 +289,7 @@ system and the version field.
        version: "1.0.0"
        source: ohdearquant/khive-pack-ml-papers
    ```
-3. Increments the minor version (additive change).
+3. Increments the minor `ontology_version` (additive change).
 
 No migration file is required — pack installation is always additive. The new kinds and endpoints
 become accepted by `khive kg validate` immediately after install.
@@ -299,11 +315,34 @@ ERROR: cannot remove pack 'ml-papers' — 42 entities of kind 'model' exist.
 
 If `--migrate-to <kind>` is given, the CLI generates a migration file that renames all matching
 entity kinds to the target kind, and adds it to `.khive/kg/migrations/`. It then increments the
-major version (because kinds are being removed from the schema). The user applies the migration
-and commits.
+major `ontology_version` (because kinds are being removed from the schema). The user applies the
+migration and commits.
 
 Pack removal without `--migrate-to` and without `--force` always fails when affected entities
 exist, enforcing the backward compatibility rule that data is never silently dropped.
+
+#### Atomic `remove_pack` operation
+
+`khive pack remove` alone is **insufficient** for pack-owned kinds when entities of those kinds
+exist. The correct procedure is the `remove_pack` atomic operation sequence, which ensures
+`schema.yaml` and the NDJSON corpus remain in a consistent state:
+
+1. **Data migration**: apply a migration that renames all entities of pack-owned kinds to a
+   surviving kind (using `rename_kind` or `remove_kind` with `on_existing: migrate_to`).
+2. **Remove pack entry**: remove the pack from `schema.yaml#packs`.
+3. **Recompute merged vocabulary**: update `entity_kinds`, `note_kinds`, and edge endpoint
+   sections to reflect the removal.
+4. **Version bump**: increment the major `ontology_version` (kind removal is a breaking change).
+
+These four steps are executed atomically by `khive pack remove --migrate-to <kind>`. If any step
+fails, none of the `schema.yaml` changes are written. Running `khive pack remove` without
+`--migrate-to` (when entities of pack kinds exist) only performs the check and error reporting
+— it does not modify any files.
+
+The `remove_kind` migration operation alone is **not sufficient** for pack-owned kinds: if the
+pack entry remains in `schema.yaml#packs`, the next `khive pack validate` or pack vocabulary
+recompute will re-add the kind. The pack entry must be removed in the same operation that removes
+the kind from the corpus.
 
 #### Pack upgrades
 
@@ -343,9 +382,12 @@ The following guarantees hold across schema versions:
    required property, referential integrity failure) to help the user understand the scope of
    migration needed.
 
-6. **Entities without a `schema_version` field are treated as created under v1.0.0.** This
-   covers entities exported before this ADR was implemented. They are validated against v1.0.0
-   compatibility rules.
+6. **Entity compatibility is determined by `ontology_version` in `schema.yaml` and the applied
+   migration sequence.** NDJSON entity records do not carry a per-entity version field.
+   Compatibility is a property of the corpus as a whole: if the current `ontology_version` accepts
+   a kind, all entities of that kind are valid. Entities whose kind was valid under a prior
+   `ontology_version` but has since been removed or renamed are flagged by `khive kg validate`
+   as unknown-kind violations — the resolution is to run the pending migrations.
 
 ### 6. Schema Diffing
 
@@ -500,10 +542,11 @@ silent drop. `migrate_to` is the safe path; `error` is the safe default.
 
 ### Neutral
 
-- The `version` field in `schema.yaml` now carries ontology semantics in addition to format
-  semantics. The original ADR-048 definition (format version only) is superseded by this ADR.
-  Existing `schema.yaml` files with `version: "1.0.0"` remain valid; the field's new semantics
-  are backward compatible with v1.0.0 as the initial baseline.
+- `schema.yaml` gains a new `ontology_version` field alongside the existing `format_version` and
+  `khive_version` fields. The two version fields serve distinct purposes: `format_version` signals
+  to parsers whether they can read the file; `ontology_version` signals to validators whether
+  migrations are pending. Existing `schema.yaml` files without `ontology_version` treat that field
+  as `"1.0.0"` (the initial baseline, consistent with no migrations applied).
 - `khive-vcs` gains a `migrate.rs` module alongside `schema.rs`, `export.rs`, `import.rs`, and
   `validate.rs`. Migration execution is part of the VCS crate, not a separate crate.
 - ADR-022's SQLite migration system is unchanged. The two systems are parallel and independent:
@@ -520,7 +563,7 @@ silent drop. `migrate_to` is the safe path; `error` is the safe default.
 crates/khive-vcs/
 └── src/
     ├── migrate.rs     — MigrationFile, MigrationOp enum, apply_migration(), pending_migrations()
-    ├── schema.rs      — SchemaYaml extended with packs section; version bump helpers
+    ├── schema.rs      — SchemaYaml extended with packs section; ontology_version bump helpers
     └── diff.rs        — schema_diff(): SchemaYaml × SchemaYaml → SchemaDiff struct
 ```
 
@@ -537,12 +580,23 @@ khive kg schema merge-resolve
 ```
 
 These commands join the existing `init`, `export`, `import`, `validate`, `diff`, `update`
-commands in `crates/khive-cli/`.
+commands in the Deno CLI (`deno/src/kg/`).
 
 ### `schema.yaml` additions
 
-The `packs` section from ADR-050 is the only structural addition to `schema.yaml`. The `version`
-and `khive_version` fields are already present. No other top-level keys are added.
+This ADR adds the `ontology_version` field to `schema.yaml`. The `format_version` and
+`khive_version` fields are from ADR-048 and remain unchanged. The `packs` section from ADR-050
+is the only structural addition to `schema.yaml`. No other top-level keys are added.
+
+A fully annotated `schema.yaml` header after this ADR:
+
+```yaml
+format_version: "1.1.0"      # file format version (ADR-048) — bumped when the schema.yaml
+                              #   structure itself gains new top-level keys
+ontology_version: "2.0.0"    # ontology evolution version (this ADR) — bumped when kinds,
+                              #   relations, or properties change
+khive_version: "0.4.1"       # CLI version that last wrote this file (informational)
+```
 
 ### Migration directory
 
@@ -568,7 +622,7 @@ required for solo use.
 ## References
 
 - ADR-022: Schema Migrations (SQLite storage layer migrations; parallel and independent)
-- ADR-048: Git-Native KG Versioning (defines `schema.yaml` format and `version` field)
+- ADR-048: Git-Native KG Versioning (defines `schema.yaml` format and `format_version` field)
 - ADR-050: Declarative Pack Format and Local Pack Management (pack install/remove lifecycle)
 - ADR-052: KG Storage Model (working.db and NDJSON committed snapshot; migration applies to both)
 - ADR-053: KG Branching and Merge (branch checkout must handle pending migrations; see §3)
