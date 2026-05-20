@@ -12,7 +12,7 @@ use khive_runtime::{
     EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
-use khive_storage::EdgeRelation;
+use khive_storage::{EdgeRelation, EventFilter, EventOutcome, SubstrateKind};
 
 use crate::vocab::{EntityKind, NoteKind};
 use crate::KgPack;
@@ -78,6 +78,8 @@ pub(crate) enum KindSpec {
     Note { specific: Option<String> },
     /// `kind="edge"` — only valid for `list`.
     Edge,
+    /// `kind="event"` — only valid for `list`; `get` resolves events by UUID.
+    Event,
 }
 
 impl KindSpec {
@@ -86,6 +88,7 @@ impl KindSpec {
             KindSpec::Entity { .. } => "entity",
             KindSpec::Note { .. } => "note",
             KindSpec::Edge => "edge",
+            KindSpec::Event => "event",
         }
     }
 }
@@ -108,6 +111,7 @@ pub(crate) fn resolve_kind_spec(
         "entity" => return Ok(KindSpec::Entity { specific: None }),
         "note" => return Ok(KindSpec::Note { specific: None }),
         "edge" => return Ok(KindSpec::Edge),
+        "event" => return Ok(KindSpec::Event),
         _ => {}
     }
 
@@ -135,7 +139,12 @@ pub(crate) fn resolve_kind_spec(
         });
     }
 
-    let mut all: Vec<String> = vec!["entity".into(), "note".into(), "edge".into()];
+    let mut all: Vec<String> = vec![
+        "entity".into(),
+        "note".into(),
+        "edge".into(),
+        "event".into(),
+    ];
     all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
     all.extend(registry.all_note_kinds().iter().map(|s| (*s).to_string()));
     all.sort();
@@ -193,6 +202,7 @@ struct ListParams {
     kind: String,
     namespace: Option<String>,
     limit: Option<u32>,
+    offset: Option<u32>,
     entity_kind: Option<String>,
     source_id: Option<String>,
     target_id: Option<String>,
@@ -200,6 +210,14 @@ struct ListParams {
     min_weight: Option<f64>,
     max_weight: Option<f64>,
     note_kind: Option<String>,
+    // event-specific filters
+    verb: Option<String>,
+    verbs: Option<Vec<String>>,
+    outcome: Option<String>,
+    actor: Option<String>,
+    substrate: Option<String>,
+    since: Option<i64>,
+    until: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -317,6 +335,65 @@ fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
     })
 }
 
+const IMMUTABLE_EVENT_MSG: &str = "events are immutable — create/update/delete are not permitted";
+
+fn immutable_event_error() -> RuntimeError {
+    RuntimeError::InvalidInput(IMMUTABLE_EVENT_MSG.into())
+}
+
+fn parse_event_outcome(raw: &str) -> Result<EventOutcome, RuntimeError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "success" => Ok(EventOutcome::Success),
+        "denied" => Ok(EventOutcome::Denied),
+        "error" => Ok(EventOutcome::Error),
+        _ => Err(RuntimeError::InvalidInput(format!(
+            "unknown outcome {raw:?}; valid: success | denied | error"
+        ))),
+    }
+}
+
+fn parse_event_substrate(raw: &str) -> Result<SubstrateKind, RuntimeError> {
+    raw.trim()
+        .to_ascii_lowercase()
+        .parse::<SubstrateKind>()
+        .map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "unknown substrate {raw:?}; valid: note | entity | event"
+            ))
+        })
+}
+
+fn event_filter_from_params(
+    p: &ListParams,
+) -> Result<(EventFilter, Option<EventOutcome>), RuntimeError> {
+    let mut verbs = Vec::new();
+    if let Some(verb) = &p.verb {
+        verbs.push(verb.clone());
+    }
+    if let Some(more) = &p.verbs {
+        verbs.extend(more.clone());
+    }
+
+    let substrates = match p.substrate.as_deref() {
+        Some(raw) => vec![parse_event_substrate(raw)?],
+        None => Vec::new(),
+    };
+
+    let outcome = p.outcome.as_deref().map(parse_event_outcome).transpose()?;
+
+    Ok((
+        EventFilter {
+            verbs,
+            substrates,
+            actors: p.actor.clone().into_iter().collect(),
+            after: p.since,
+            before: p.until,
+            ..EventFilter::default()
+        },
+        outcome,
+    ))
+}
+
 fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError> {
     serde_json::to_value(v).map_err(|e| RuntimeError::Internal(format!("serialize: {e}")))
 }
@@ -384,6 +461,9 @@ impl KgPack {
                 let hook = registry.find_kind_hook(&canonical);
                 (Some(canonical), hook)
             }
+            KindSpec::Event => {
+                return Err(immutable_event_error());
+            }
             KindSpec::Edge => {
                 return Err(RuntimeError::InvalidInput(
                     "kind=edge is not creatable via `create` — use `link` for edges".into(),
@@ -405,7 +485,7 @@ impl KgPack {
                     KindSpec::Note { .. } => {
                         obj.insert("note_kind".into(), json!(canonical));
                     }
-                    KindSpec::Edge => {}
+                    KindSpec::Edge | KindSpec::Event => {}
                 }
             }
         }
@@ -511,6 +591,18 @@ impl KgPack {
             return to_json(&serde_json::json!({"kind": "edge", "data": edge}));
         }
 
+        if let Some(event) = self
+            .runtime
+            .events(ns)?
+            .get_event(id)
+            .await
+            .map_err(RuntimeError::Storage)?
+        {
+            if event.namespace == self.runtime.ns(ns) {
+                return to_json(&serde_json::json!({"kind": "event", "data": event}));
+            }
+        }
+
         Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
     }
 
@@ -583,6 +675,66 @@ impl KgPack {
                     .await?;
                 to_json(&notes)
             }
+            KindSpec::Event => {
+                let limit = p.limit.unwrap_or(100).clamp(1, 1000);
+                let offset = p.offset.unwrap_or(0);
+                let (filter, outcome) = event_filter_from_params(&p)?;
+
+                if let Some(wanted_outcome) = outcome {
+                    let mut items = Vec::new();
+                    let mut skipped = 0u32;
+                    let mut raw_offset = 0u32;
+                    let scan_ceiling = offset.saturating_add(limit).saturating_mul(20);
+
+                    while (items.len() as u32) < limit {
+                        let remaining = scan_ceiling.saturating_sub(raw_offset);
+                        if remaining == 0 {
+                            break;
+                        }
+                        let batch_size = 100u32.min(remaining);
+                        let page = self
+                            .runtime
+                            .list_events(
+                                p.namespace.as_deref(),
+                                filter.clone(),
+                                batch_size,
+                                raw_offset,
+                            )
+                            .await?;
+                        let batch_len = page.items.len() as u32;
+                        if batch_len == 0 {
+                            break;
+                        }
+                        raw_offset = raw_offset.saturating_add(batch_len);
+                        let eof = batch_len < batch_size;
+
+                        for event in page.items {
+                            if event.outcome != wanted_outcome {
+                                continue;
+                            }
+                            if skipped < offset {
+                                skipped += 1;
+                                continue;
+                            }
+                            items.push(event);
+                            if (items.len() as u32) >= limit {
+                                break;
+                            }
+                        }
+
+                        if eof {
+                            break;
+                        }
+                    }
+                    to_json(&items)
+                } else {
+                    let page = self
+                        .runtime
+                        .list_events(p.namespace.as_deref(), filter, limit, offset)
+                        .await?;
+                    to_json(&page.items)
+                }
+            }
         }
     }
 
@@ -590,6 +742,17 @@ impl KgPack {
         let p: UpdateParams = deser(params)?;
         let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
         let ns = p.namespace.as_deref();
+
+        if self
+            .runtime
+            .events(ns)?
+            .get_event(id)
+            .await
+            .map_err(RuntimeError::Storage)?
+            .is_some()
+        {
+            return Err(immutable_event_error());
+        }
 
         if self.runtime.get_entity(ns, id).await?.is_some() {
             let description = match p.description {
@@ -625,6 +788,17 @@ impl KgPack {
         let p: DeleteParams = deser(params)?;
         let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
         let ns = p.namespace.as_deref();
+
+        if self
+            .runtime
+            .events(ns)?
+            .get_event(id)
+            .await
+            .map_err(RuntimeError::Storage)?
+            .is_some()
+        {
+            return Err(immutable_event_error());
+        }
 
         if self.runtime.get_entity(ns, id).await?.is_some() {
             let deleted = self
@@ -750,6 +924,9 @@ impl KgPack {
             }
             KindSpec::Edge => Err(RuntimeError::InvalidInput(
                 "search does not support kind=edge — use `list(kind=\"edge\", ...)` for edge browsing".into(),
+            )),
+            KindSpec::Event => Err(RuntimeError::InvalidInput(
+                "search does not support kind=event — use `list(kind=\"event\", ...)` for event browsing".into(),
             )),
         }
     }

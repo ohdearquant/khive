@@ -1,6 +1,6 @@
 # ADR-038: Events Surface — Runtime Operations and MCP Verbs over EventStore
 
-**Status**: proposed
+**Status**: accepted
 **Date**: 2026-05-19
 **Authors**: khive maintainers
 
