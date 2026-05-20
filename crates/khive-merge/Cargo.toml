@@ -1,0 +1,22 @@
+[package]
+name = "khive-merge"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "KG three-way merge with conflict detection (ADR-043)"
+
+[dependencies]
+khive-runtime = { path = "../khive-runtime" }
+khive-storage = { path = "../khive-storage" }
+khive-vcs = { path = "../khive-vcs" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
