@@ -7,58 +7,67 @@
 ## Context
 
 ADR-048 defines the `.khive/kg/` file format (sorted NDJSON + `schema.yaml`) and establishes git as
-the versioning layer for knowledge graphs. It specifies four CLI commands — `init`, `export`,
+the versioning layer for knowledge graphs. It specifies low-level CLI commands — `init`, `export`,
 `import`, `validate` — that handle the SQLite-to-file round trip. What ADR-048 deliberately defers
-is the **git workflow layer**: the commands that wrap git operations with KG-aware semantics, and
-the **authentication layer** that connects the CLI to khive.ai's cloud services.
+is the **git workflow layer**: a small set of commands that automate the KG-specific parts of the
+git workflow that users cannot do with raw git alone.
 
-Without this layer, users must manually run `git add .khive/kg/ && git commit` after every export,
-call `git push` separately, remember to import after pulling, and have no way to notify khive.ai
-that a push happened. This is workable for developers who already know git, but it defeats the goal
-of making khive.ai "GitHub for knowledge graphs" — a surface that is recognizable and natural to
-researchers who have never opened a terminal.
+The key insight: most git operations (push, pull, branch, checkout, merge, log) work correctly on
+NDJSON files without any KG awareness. The only KG-specific operations are:
 
-The reference model is the `git` + `gh` pairing. `git` provides the VCS primitives; `gh` provides
-the cloud-connected workflow (auth, PR creation, repo management). For khive:
+1. **Commit**: exporting the DB to NDJSON and validating before committing (users forget this).
+2. **Sync**: rebuilding the DB from NDJSON after any git operation that changes the files.
+3. **Status**: showing entity/edge counts, not just file-level changes.
+4. **Resolve**: entity-level conflict resolution when git merge produces NDJSON conflicts.
 
-- `khive kg commit/push/pull/status/branch/log` — VCS workflow primitives wrapping git
-- `khive auth login/status/logout` — cloud authentication wrapping OAuth/API-key flows
+Everything else — push, pull, branch, checkout, merge, stash, log — is standard git. The CLI
+should not wrap these; users already know git, and wrapping it adds maintenance cost, behavioral
+surprises, and documentation burden for zero value.
 
-ADR-044 specified a Deno HTTP API layer. ADR-049 specified the frontend workspace. This ADR
-specifies the CLI layer that bridges the git-native KG workflow (ADR-048) with the khive.ai cloud
-(ADR-044 REST/gateway surface).
+**Platform model**: khive.ai is a KG intelligence layer over GitHub-hosted repos, not a git host.
+KG repos live on GitHub (or any git host). khive.ai connects via a GitHub App: it receives push
+webhooks, imports NDJSON into its cloud KG index, enriches PRs with entity-level diffs, and
+provides cross-project entity resolution and global search. The OSS CLI (`khive kg`) works fully
+without a khive.ai account — it is a pure git wrapper with KG-aware semantics. Authentication is
+optional, for platform features only (global entity search, project dashboard).
 
 ### What changes and what does not
 
-- ADR-048 (`export`, `import`, `validate`, `diff`, `update`): unchanged. This ADR adds commands
-  that call these; it does not modify them.
-- ADR-044 (HTTP API layer): extended with one new sync endpoint (`POST /v1/projects/:ns/sync`).
-  All other API surface is unchanged.
+- ADR-048 (`init`, `export`, `import`, `validate`, `diff`, `update`): unchanged. This ADR adds
+  `commit`, `sync`, and `resolve` that compose these; it does not modify them.
+- ADR-044 (HTTP API layer): unchanged. khive.ai receives events via GitHub App webhooks, not CLI
+  HTTP calls. No new API endpoints are added by this ADR.
 - ADR-027 (Single Tool MCP Surface): unaffected. KG workflow commands are CLI-only, not MCP tools.
-- ADR-003 (four-layer architecture): the CLI is a new binary in the Deno layer. No new layers.
+- ADR-003 (four-layer architecture): the CLI is in the Deno layer. No new layers.
 
 ## Decision
 
-### 1. CLI authentication (`khive auth`)
+### 1. CLI authentication (`khive auth`) — optional
+
+Authentication is **not required** for any `khive kg` command. All local operations work without
+a khive.ai account. Auth enables optional platform features: global entity search from the CLI,
+project dashboard queries, and verifying that the GitHub App is connected to a repo.
 
 #### Commands
 
 ```
-khive auth login              # browser OAuth → stores token
-khive auth login --token PAT  # personal access token / API key
-khive auth status             # show current authentication state
+khive auth login              # GitHub OAuth → khive.ai API token
+khive auth login --token PAT  # khive.ai API token for CI/automation
+khive auth status             # show current authentication state + connected repos
 khive auth logout             # clear stored credentials
 ```
 
-#### Browser OAuth flow
+#### GitHub OAuth flow
 
-The browser flow is the primary authentication path. It mirrors `gh auth login`:
+The browser flow is the primary authentication path. It mirrors `gh auth login`, using GitHub
+as the identity provider:
 
 1. The CLI generates a random local port in the range 9000–9999 and starts a minimal HTTP server
    that listens for exactly one request on that port.
 2. The CLI opens `https://khive.ai/auth/cli?port=<port>` in the system browser (via
    `Deno.run(["open", url])` on macOS, `xdg-open` on Linux, `start` on Windows).
-3. The user authenticates via Google or GitHub on khive.ai.
+3. The user authenticates via GitHub OAuth on khive.ai. khive.ai uses GitHub as the sole identity
+   provider (support for additional providers may be added later based on demand).
 4. khive.ai redirects to `http://localhost:<port>/callback?token=<access_token>&refresh=<refresh_token>`.
 5. The CLI receives the tokens, writes `~/.khive/auth.json`, stops the local server, and prints a
    confirmation.
@@ -66,15 +75,20 @@ The browser flow is the primary authentication path. It mirrors `gh auth login`:
 If the browser does not open within 30 seconds (headless environment, SSH session), the CLI prints
 the full URL for manual opening and waits up to 5 minutes for the callback.
 
-#### Personal access token flow
+The GitHub OAuth scope includes `read:user` (identity) and `repo` (so khive.ai can install its
+GitHub App on the user's repos during the onboarding flow). The GitHub App installation is a
+separate step on khive.ai: after login, `khive auth status` shows which repos are connected and
+prompts to install the App if none are.
+
+#### API token flow (CI)
 
 ```
 khive auth login --token <token>
 ```
 
 Writes `~/.khive/auth.json` with the token as the `access_token` value. No `refresh_token` is
-set; the token is treated as long-lived (no expiry check). This is the primary path for CI
-environments and automation.
+set; the token is treated as long-lived (no expiry check). Tokens are generated on
+`khive.ai/settings/tokens`. This is the primary path for CI environments and automation.
 
 #### Token storage
 
@@ -118,16 +132,17 @@ instructs the user to run `khive auth login` again.
 
 ```
 Authenticated to khive.ai
-  API URL:   https://api.khive.ai
-  User:      ocean (ocean@example.com)
-  Token:     eyJ... (expires in 6 days)
-  Namespace: ocean
+  API URL:      https://api.khive.ai
+  User:         ocean (ocean@example.com)
+  Token:        eyJ... (expires in 6 days)
+  GitHub App:   installed on 3 repos (ocean/khive, ocean/lattice, ocean/styx)
 ```
 
 Or, if not authenticated:
 
 ```
 Not authenticated. Run 'khive auth login' to sign in.
+All 'khive kg' commands work without authentication.
 ```
 
 ### 2. Namespace detection
@@ -202,168 +217,129 @@ khive kg commit              # prompts for message if -m is omitted
   472 entities, 1,111 edges (12 changed, 3 added)
 ```
 
-The counts come from the same DB-vs-NDJSON comparison as `khive kg status` (see ADR-052 for the diff algorithm).
+The counts come from the same DB-vs-NDJSON comparison as `khive kg status` (see ADR-052 for the
+diff algorithm).
 
 If there are no changes to `.khive/kg/` since the last commit, the command prints
 `Nothing to commit (KG is clean)` and exits with 0.
 
-### 5. `khive kg push`
+### 5. `khive kg sync`
 
-Pushes the current branch to the git remote and optionally notifies khive.ai.
-
-```
-khive kg push
-```
-
-**Execution sequence:**
-
-1. `git push origin <current-branch>` (standard git push; respects upstream tracking).
-2. Resolve the current commit SHA: `git rev-parse HEAD`.
-3. If authenticated to khive.ai:
-   ```
-   POST <api_url>/v1/projects/<namespace>/sync
-   {
-     "ref": "<branch-name>",
-     "commit": "<full-sha>",
-     "repo": "<git-remote-url>"
-   }
-   ```
-4. Print push result. If sync succeeds: `Synced to khive.ai (namespace: <ns>)`.
-   If sync fails: print a warning, but do not fail the command — the git push already succeeded.
-
-The sync call is advisory: khive.ai uses it to trigger an import of the pushed NDJSON files into
-the cloud-hosted KG. If the call fails (network, not authenticated, or cloud error), the local git
-push is still complete and the user's data is safe. The next `khive kg push` or a manual
-`khive kg sync` can retry.
-
-### 6. `khive kg pull`
-
-Fetches from the git remote, fast-forwards the working branch, and imports any KG changes into the
-local SQLite database.
+Rebuilds `working.db` from the current NDJSON files. This is the KG-aware operation that must
+run after any git command that changes `.khive/kg/` files (pull, checkout, merge, rebase, stash
+pop, cherry-pick).
 
 ```
-khive kg pull
+khive kg sync
+khive kg sync --quiet        # suppress output (for git hooks)
 ```
 
 **Execution sequence:**
 
-1. Run the ADR-052 dirty check (DB-vs-NDJSON diff). If the diff is non-empty, refuse with:
-   "Uncommitted changes in working.db. Run `khive kg commit` or `khive kg reset` first."
-   This matches the behavior of `git pull` when there are uncommitted local file changes — the
-   pull is blocked until the working state is clean or explicitly discarded.
-2. `git pull origin <current-branch>` (standard git pull; fast-forward only by default).
-3. Check whether `.khive/kg/` files changed in the pull:
-   `git diff HEAD@{1} HEAD -- .khive/kg/` (non-empty output → files changed).
-4. If `.khive/kg/` files changed: run the ADR-052 atomic rebuild (validate → temp DB → swap).
-   This is identical to the checkout/pull flow defined in ADR-052 §5. The DB is fully rebuilt
-   from the post-pull NDJSON files; no `--on-conflict` logic is needed.
-5. Print a summary of what changed:
-   ```
-   Pulled main from origin (a1b2c3d → f9e8d7c)
-   KG updated: +3 entities, +7 edges, 0 conflicts
-   ```
+1. Check whether `.khive/kg/entities.ndjson` or `.khive/kg/edges.ndjson` have changed relative to
+   the current `working.db` state (same diff as ADR-052 §6, but in the opposite direction: files
+   are the source of truth, DB is the target).
+2. If no changes: print `DB is up to date` and exit.
+3. Run the ADR-052 atomic rebuild: validate NDJSON → import into temp DB → atomic rename into
+   `.state/working.db`.
+4. Print a summary: `Synced: 472 entities, 1,111 edges`.
 
-If `git pull` produces a merge conflict, the command aborts after step 2 with the standard
-git merge-conflict message. The user must resolve the conflict, run `khive kg validate`, and
-re-commit before the rebuild step can proceed. No partial DB change is made.
+`khive kg sync` is idempotent: running it twice produces the same result. It is safe to run at any
+time — if the DB already matches the NDJSON files, it is a no-op.
 
-If `.khive/kg/` was not modified by the pull, no DB rebuild is run.
+**Error handling**: If NDJSON validation fails (corrupt file, schema violation), `sync` prints the
+errors and exits non-zero without modifying `working.db`. The user must fix the NDJSON files
+(manually or via `khive kg resolve` for merge conflicts) before sync will succeed.
 
-### 7. `khive kg branch`
+### 6. Git hooks — automatic sync
 
-Creates or lists KG-aware git branches.
+`khive kg init` installs git hooks that run `khive kg sync --quiet` automatically after operations
+that may change NDJSON files:
 
-```
-khive kg branch <name>        # create a new branch
-khive kg branch               # list local branches (highlights current)
-khive kg branch -d <name>     # delete a branch
-```
+```bash
+# .git/hooks/post-checkout
+#!/bin/sh
+# Rebuild working.db after branch switch or file checkout
+khive kg sync --quiet 2>/dev/null || true
 
-This is a thin wrapper around `git branch`. The only KG-specific behavior is:
+# .git/hooks/post-merge
+#!/bin/sh
+# Rebuild working.db after pull (with merge) or explicit merge
+khive kg sync --quiet 2>/dev/null || true
 
-- On branch creation: run `khive kg status` and print a summary so the developer knows what state
-  they are branching from.
-- On branch listing: annotate each branch with its last KG commit message if the last commit
-  touched `.khive/kg/`.
-
-### 8. `khive kg log`
-
-Shows git log filtered to KG-relevant commits.
-
-```
-khive kg log
-khive kg log --limit 20
+# .git/hooks/post-rewrite
+#!/bin/sh
+# Rebuild working.db after rebase or amend
+khive kg sync --quiet 2>/dev/null || true
 ```
 
-This is equivalent to `git log --oneline -- .khive/kg/` with KG-aware annotation:
+The hooks are installed in `.git/hooks/` (not committed to the repo). `khive kg init` writes them
+only if the hook file does not already exist — it does not overwrite user-customized hooks. If a
+hook already exists, `khive kg init` prints a message instructing the user to add
+`khive kg sync --quiet` to their existing hook.
 
-```
-f9e8d7c add LoRA and QLoRA concepts (+2 entities, +3 edges)
-a1b2c3d initial KG import (472 entities, 1,111 edges)
-```
+The `|| true` ensures that a sync failure (e.g., NDJSON has merge conflicts) does not block the
+git operation. The user resolves conflicts, then runs `khive kg sync` explicitly.
 
-The entity/edge counts per commit are parsed from the NDJSON line-count delta in the diff for that
-commit. If the counts cannot be parsed (e.g., for a commit that modified `schema.yaml` only), the
-annotation is omitted.
+**Why hooks instead of wrapping git**: Git hooks are the standard mechanism for extending git with
+project-specific behavior. They work with all git interfaces (CLI, IDE, GUI clients), not just
+`khive kg` commands. A developer using `git pull` in VS Code's Source Control panel gets automatic
+DB sync without knowing about `khive kg`.
 
-### 9. Cloud sync endpoint (new API surface)
-
-One new endpoint is added to the khive.ai HTTP API:
-
-```
-POST /v1/projects/:namespace/sync
-Authorization: Bearer <access_token>
-
-{
-  "ref": "main",
-  "commit": "f9e8d7c6b5a4321098765432109876543210fedc",
-  "repo": "https://github.com/ocean/khive"
-}
-
-Response 202 Accepted
-{
-  "job_id": "sync-a1b2c3d4",
-  "status": "queued"
-}
-```
-
-The sync job pulls the NDJSON files from the git repository at the specified commit and imports
-them into the cloud namespace. The job runs asynchronously; completion is visible in the khive.ai
-dashboard.
-
-Job status polling (optional, phase C4):
-
-```
-GET /v1/projects/:namespace/sync/:job_id
-Response 200
-{ "status": "complete|running|failed", "imported": N, "errors": [] }
-```
-
-### 10. Phasing
+### 7. Phasing
 
 | Phase | What | Target version |
 |-------|------|----------------|
-| C1 | `khive auth login/status/logout` + `~/.khive/auth.json` with `0600` permissions + token refresh | v0.3 |
-| C2 | `khive kg status` + `khive kg commit` | v0.3 |
-| C3 | `khive kg push` (git push only, no cloud sync) + `khive kg pull` (git pull + import) | v0.4 |
-| C4 | Cloud sync on push (`POST /v1/projects/:ns/sync`) + job status polling | v0.5 |
-| C5 | `khive kg branch` + `khive kg log` | v0.5 |
+| C1 | `khive kg commit` + `khive kg sync` + `khive kg status` + git hooks | v0.3 |
+| C2 | `khive auth login/status/logout` + `~/.khive/auth.json` (optional) | v0.4 |
+| C3 | `khive kg resolve` (entity-level conflict resolution, see ADR-053) | v0.5 |
 
-Phases C1 and C2 are independently shippable and cover the primary daily workflow: authenticate
-once, then `khive kg commit` instead of the manual export-validate-add-commit sequence.
+C1 is the complete local workflow: commit, sync, and status. This covers 100% of the solo-user
+use case and 90% of the multi-user workflow (sync handles pull/checkout; only merge conflicts
+need `resolve`). C2 adds optional platform features. C3 adds the KG-aware merge tool.
 
 ## Rationale
 
-### Why `khive auth` mirrors `gh auth` rather than inventing a new model
+### Why `khive kg commit` but not `khive kg push/pull`
 
-`gh auth login` is the reference implementation that millions of developers have used. The browser
-OAuth flow (CLI starts local server → opens browser → receives callback) is well-understood,
-security-reviewed, and does not require the user to copy-paste tokens from a web UI. Implementing
-the same UX means developers can transfer their `gh` mental model directly to `khive`.
+`khive kg commit` adds value that raw git cannot provide: it automates the export → validate →
+stage → commit pipeline and enforces the invariant that committed NDJSON is always consistent with
+the live DB. Forgetting to export before committing is the #1 user error in the manual workflow.
 
-The `--token` flag provides an escape hatch for CI and environments without a browser. This matches
-`gh auth login --with-token`, and covers the same use cases (GitHub Actions, Docker containers,
-automated pipelines).
+`khive kg push` would be `git push` with zero KG-specific logic. khive.ai receives push events
+via GitHub App webhooks, not CLI HTTP calls — there is nothing for the CLI to do beyond what
+`git push` already does. Wrapping it adds maintenance cost, behavioral surprises (does it push
+all branches? does it set upstream?), and forces users to learn a khive-specific command for a
+universal git operation.
+
+`khive kg pull` would be `git pull` + `khive kg sync`. With git hooks installed, `git pull`
+triggers `post-merge`, which runs `khive kg sync` automatically. The user gets the same result
+with standard git.
+
+The design principle: wrap git only where the wrapper adds KG-specific intelligence. Transport
+(push/pull) and branching (branch/checkout/merge) are not KG-specific.
+
+### Why git hooks instead of wrapper commands
+
+Git hooks work with every git interface: CLI, VS Code, JetBrains, GitHub Desktop, `tig`,
+`lazygit`. Wrapper commands only work when the user remembers to use them. A developer who runs
+`git pull` in VS Code and forgets to run `khive kg sync` afterward has a stale DB — silent and
+hard to diagnose. A hook makes sync automatic regardless of how the user invokes git.
+
+The tradeoff: hooks are per-clone (not committed), so each new clone must run `khive kg init` to
+install them. This is acceptable because `khive kg init` is already the required first step after
+cloning a KG repo (to bootstrap `.state/working.db` from the committed NDJSON files).
+
+### Why `khive auth` uses GitHub OAuth
+
+khive.ai's value proposition is being a platform layer over GitHub repos. GitHub OAuth provides:
+
+1. **Identity**: the user's GitHub username becomes their khive.ai namespace.
+2. **Repo access**: the OAuth scope allows installing the khive.ai GitHub App on repos.
+3. **Zero new accounts**: researchers already have GitHub accounts. No new signup flow.
+
+The `--token` flag covers CI and headless environments. Additional OAuth providers (GitLab,
+Bitbucket) can be added later based on demand — the auth.json format is provider-agnostic.
 
 ### Why `~/.khive/auth.json` rather than system keychain
 
@@ -377,50 +353,11 @@ who want keychain integration can configure credential helpers at the OS level. 
 in `auth.json` also makes the file useful as a configuration file (not just a secret store), which
 keychain entries are not designed for.
 
-### Why `khive kg commit` runs export and validate before `git commit`
-
-The invariant this enforces: git never contains a NDJSON file that is out of sync with the local
-SQLite database, and never contains a NDJSON file that fails schema validation. Both conditions
-would make `khive kg import` on another machine produce an inconsistent database.
-
-The alternative — let the user run `khive kg export` and `git commit` separately — is correct but
-fragile. A developer who forgets to re-export after a late entity edit commits stale NDJSON. A
-developer who forgets to validate before committing may push a graph that fails CI. `khive kg
-commit` makes the right path the easy path.
-
-### Why `khive kg push` does not fail if the cloud sync call fails
-
-The git push is the durable operation. If the push to the remote succeeds, the user's data is safe
-and replicated to GitHub. The cloud sync is an advisory notification that allows khive.ai to
-proactively import the new state into its hosted KG. If the sync fails (transient network error,
-khive.ai downtime), the user can re-trigger it later or let khive.ai pick it up via a webhook on
-the next push event.
-
-Treating the sync as a hard dependency would make `khive kg push` fail in environments without
-internet access to khive.ai (air-gapped labs, offline development), which is contrary to the
-OSS-first philosophy: the CLI should work fully locally without a cloud account.
-
-### Why `khive kg pull` delegates to ADR-052's atomic rebuild
-
-After a pull, the NDJSON files represent the definitive agreed state of the KG (the state that
-other contributors committed and pushed). The DB must be fully consistent with those files.
-
-The ADR-052 atomic rebuild (validate → temp DB → swap) is the correct mechanism: it validates the
-NDJSON before touching the DB, builds the new DB in a temp file, and atomically renames it into
-place. The result is a DB that is a guaranteed materialized view of the post-pull NDJSON. There is
-no partial state, no conflict-mode guessing, and no risk of a partially-applied update leaving the
-DB inconsistent.
-
-The dirty-check guard in step 1 prevents silently discarding uncommitted local work. This is the
-same gate `git pull` uses for uncommitted file changes — the pull is blocked until the working
-state is clean. Developers who want to abandon uncommitted DB changes can run `khive kg reset`
-explicitly; this is a deliberate action, not an implicit side-effect of pull.
-
 ### Why namespace detection falls back to git remote URL
 
 The namespace identifies which khive.ai project the local repo maps to. In the common case, the
 namespace matches the git repository name, because repositories and projects have a 1:1 mapping on
-khive.ai. The fallback chain allows `khive kg push` to work correctly in a freshly cloned repo
+khive.ai. The fallback chain allows `khive kg` commands to work correctly in a freshly cloned repo
 where `.khive/settings.json` has not yet been created, without requiring the developer to manually
 configure the namespace.
 
@@ -428,13 +365,12 @@ configure the namespace.
 
 | Alternative | Pros | Cons | Why rejected |
 |---|---|---|---|
+| Full git wrapper (`khive kg push/pull/branch/checkout/merge/stash/log`) | Familiar "all-in-one" surface | Massive maintenance cost; wrapping git introduces behavioral surprises; users already know git; git hooks achieve the same automatic sync | The wrapper adds no KG-specific value for transport/branching; git hooks + `sync` is simpler and works with all git interfaces |
 | Device-flow OAuth (no local HTTP server) | Works in headless environments without a port | Requires khive.ai to implement the device authorization endpoint; longer user flow (poll loop) | Browser flow is simpler for the common case; `--token` covers the headless case |
 | Store tokens in system keychain | Stronger isolation than file permissions | Platform-specific code; unavailable in Docker/CI; not portable for `api_url` config field | File with `0600` is portable and auditable; keychain can be layered on top |
 | `khive kg commit` without automatic export | User controls export timing | Developer forgets to export after last edit; commits stale NDJSON | Correctness invariant: commit ≡ export + validate + git commit. Auto-export is the right default. |
-| `khive kg push` fails on cloud sync error | Stricter guarantee that khive.ai is in sync | Breaks offline workflow; couples git operation to cloud availability | OSS-first: CLI must work without cloud. Sync is advisory. |
-| `khive kg pull` with `--on-conflict update` import | Simple import; no full rebuild | Leaves DB schema inconsistent if import adds columns it doesn't know about; no atomic swap guarantee | ADR-052 atomic rebuild is cleaner and idempotent; no conflict-mode needed |
-| Separate `khive sync` command instead of integrating into push/pull | Explicit: user controls when to sync | Adds friction; developers forget to sync; status diverges | Integrating sync into push/pull matches the `git push` UX expectation |
-| Reuse `gh` for auth | No additional auth code | Couples khive to GitHub specifically; excludes Google-auth users; khive.ai is its own identity provider | khive.ai is a platform, not a GitHub wrapper; must support its own OAuth |
+| Advisory sync POST on push | khive.ai updates immediately without webhook | Couples CLI to khive.ai availability; breaks offline workflow; redundant when webhooks exist | GitHub App webhooks handle push notification without any CLI-side code |
+| Pre-commit hook instead of `khive kg commit` | Transparent: `git commit` auto-exports | Complex hook logic; silent failures confuse users; `git commit --no-verify` skips it | Explicit `khive kg commit` is more predictable and its failures are visible |
 
 ## Consequences
 
@@ -442,15 +378,14 @@ configure the namespace.
 
 - `khive kg commit -m "message"` replaces the manual export → validate → git-add → git-commit
   sequence. Four commands become one with the same correctness guarantees.
-- `khive kg push` and `khive kg pull` give developers a workflow that is structurally identical to
-  `git push` / `git pull`, with the KG import automatically handled.
-- `khive auth login` follows the `gh auth login` precedent that millions of developers recognize.
-  Authentication is a one-time setup, not a per-command burden.
-- The cloud sync call (`POST /v1/projects/:ns/sync`) enables khive.ai to maintain an up-to-date
-  hosted mirror of every project's KG without requiring webhook configuration on the git host.
-- All commands degrade gracefully without a cloud account: `khive kg commit/push/pull/status` work
-  fully locally. Authentication adds the cloud sync step but is not required for any local
-  workflow.
+- `khive kg sync` + git hooks give automatic DB rebuild after any git operation, regardless of
+  which git interface the user prefers (CLI, IDE, GUI).
+- The CLI surface is small: `init`, `commit`, `sync`, `status` are the only KG-specific commands.
+  Users use standard git for everything else. No new mental model for transport or branching.
+- `khive auth login` follows the `gh auth login` precedent, but is entirely optional. The local
+  workflow is complete without a khive.ai account.
+- khive.ai receives push events via GitHub App webhooks. No CLI-side cloud sync code is needed,
+  eliminating a failure mode and a network dependency from the CLI.
 
 ### Negative
 
@@ -458,6 +393,9 @@ configure the namespace.
   changed since the last export. This is a minor inefficiency for a no-op export (milliseconds
   for typical graph sizes), but it is simpler than maintaining a dirty flag across command
   invocations.
+- Git hooks are per-clone, not committed to the repo. Each new clone must run `khive kg init`
+  to install hooks and bootstrap `working.db`. This is the expected onboarding path, but
+  developers who forget `khive kg init` will have a stale or missing DB.
 - The browser OAuth flow requires the CLI to open a browser, which fails silently in some
   environments (e.g., remote SSH sessions without X11 forwarding). The CLI must detect this case
   and print the URL for manual opening.
@@ -465,21 +403,16 @@ configure the namespace.
   the home directory can read the access token. This is the same exposure as `~/.config/gh/hosts.yml`
   (the `gh` credentials file). The `0600` permissions prevent access by other OS users but do not
   protect against the current user's own processes or physical access.
-- `khive kg pull` runs the ADR-052 atomic rebuild after the git pull, which fully replaces
-  `working.db` with the pulled state. The dirty-check guard in step 1 prevents this from
-  silently discarding uncommitted local work — pull is refused if the DB-vs-NDJSON diff is
-  non-empty. Developers must explicitly run `khive kg commit` or `khive kg reset` first.
-  This is the correct behavior, but developers who are not aware of the dirty-check gate may
-  be surprised that pull blocks instead of overwriting.
+- Requires a GitHub account for khive.ai platform features (authentication, GitHub App
+  installation). Users on GitLab or other hosts can use the local CLI fully but cannot connect
+  to khive.ai until additional OAuth providers are supported.
 
 ### Neutral
 
 - The `khive auth` commands have no Rust component. They are Deno (TypeScript) commands in the same
   Deno CLI binary as the existing `khive kg` commands.
-- The sync endpoint (`POST /v1/projects/:ns/sync`) is the only new server-side surface added to the
-  ADR-044 REST/gateway layer. All other HTTP API surface (ADR-044) is unchanged.
-- `khive kg branch` and `khive kg log` (Phase C5) are thin wrappers around `git branch` and
-  `git log`. They add no new state.
+- Standard git commands (`push`, `pull`, `branch`, `checkout`, `merge`, `log`) are not wrapped.
+  Users use git directly. This is a deliberate design choice, not a missing feature.
 
 ## Implementation
 
@@ -491,25 +424,19 @@ The existing Deno CLI binary gains two new command trees:
 cli/
   commands/
     auth/
-      login.ts        — browser OAuth + --token PAT path
-      status.ts       — read and display auth.json
+      login.ts        — GitHub OAuth + --token PAT path
+      status.ts       — read and display auth.json + connected repos
       logout.ts       — delete auth.json
     kg/
-      status.ts       — git diff analysis + validation summary (existing: validate)
+      status.ts       — entity/edge diff analysis + validation summary
       commit.ts       — export → validate → git-add → git-commit
-      push.ts         — git push + optional cloud sync
-      pull.ts         — git pull + conditional import
-      branch.ts       — git branch wrapper with KG annotation
-      log.ts          — git log --oneline -- .khive/kg/ with count annotation
+      sync.ts         — atomic DB rebuild from NDJSON (ADR-052 §5)
   lib/
-    auth.ts           — read/write/refresh auth.json; HttpAuthClient
+    auth.ts           — read/write/refresh auth.json
     git.ts            — thin wrappers: exec git commands, parse output
     namespace.ts      — namespace resolution chain
-    sync.ts           — POST /v1/projects/:ns/sync; job polling
+    hooks.ts          — install/check git hooks
 ```
-
-The `lib/auth.ts` module is shared between `auth/` and `kg/` commands (push uses `auth.ts` to get
-the bearer token; status uses it to display the current user).
 
 ### Token security implementation
 
@@ -539,49 +466,35 @@ async function writeAuth(auth: AuthFile): Promise<void> {
 }
 ```
 
-### Cloud sync implementation
+### Hook installation
 
 ```typescript
-// lib/sync.ts
-export async function notifySync(
-  auth: AuthFile,
-  namespace: string,
-  ref: string,
-  commit: string,
-  repo: string,
-): Promise<void> {
-  const resp = await fetch(
-    `${auth.api_url}/v1/projects/${namespace}/sync`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${auth.access_token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ ref, commit, repo }),
-    },
-  );
-  if (!resp.ok) {
-    // Non-fatal: print warning, do not throw
-    console.warn(`Warning: cloud sync failed (${resp.status}). Run 'khive kg push' again to retry.`);
+// lib/hooks.ts
+const HOOKS = {
+  "post-checkout": "khive kg sync --quiet 2>/dev/null || true",
+  "post-merge": "khive kg sync --quiet 2>/dev/null || true",
+  "post-rewrite": "khive kg sync --quiet 2>/dev/null || true",
+};
+
+async function installHooks(gitDir: string): Promise<void> {
+  const hooksDir = `${gitDir}/hooks`;
+  for (const [name, command] of Object.entries(HOOKS)) {
+    const path = `${hooksDir}/${name}`;
+    try {
+      await Deno.stat(path);
+      console.log(`Hook ${name} already exists — add 'khive kg sync --quiet' manually.`);
+    } catch {
+      await Deno.writeTextFile(path, `#!/bin/sh\n${command}\n`);
+      await Deno.chmod(path, 0o755);
+      console.log(`Installed ${name} hook.`);
+    }
   }
 }
 ```
 
-### Phasing (implementation order)
-
-Phase C1 (auth) is a prerequisite for Phase C4 (cloud sync) but not for C2 or C3. Phases C2 and
-C3 can be implemented without any authentication code. The recommended implementation sequence is
-C2 → C3 → C1 → C4 → C5, delivering the most-used local workflow first.
-
 ## References
 
-- ADR-048: Git-Native KG Versioning — file format, `export`/`import`/`validate` commands, and
-  namespace detection that this ADR builds on
-- ADR-044: HTTP API Layer — Deno + Hono REST layer; extended with the new sync endpoint
-- ADR-027: Single Tool MCP Surface — unchanged; KG workflow commands are CLI-only, not MCP tools
-- ADR-003: Four-Layer Architecture — CLI is in the Deno layer; no new architecture layers introduced
-- ADR-029: Authorization Gate — access token validation for the sync endpoint uses the Gate trait
-- ADR-007: Namespace as Open String — namespace regex `^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$`
-- `gh auth login` — reference implementation for browser OAuth CLI flow
-- OAuth 2.0 Authorization Code Flow: https://datatracker.ietf.org/doc/html/rfc6749#section-4.1
+- [ADR-048](ADR-048-git-native-kg-versioning.md) — NDJSON format, `init`/`export`/`import`/`validate`
+- [ADR-052](ADR-052-kg-storage-model.md) — DB/file reconciliation, atomic rebuild, status diff
+- [ADR-053](ADR-053-kg-branching-and-merge.md) — `khive kg resolve` (entity-level merge conflicts)
+- [ADR-044](ADR-044-http-api-layer.md) — HTTP API layer (unchanged by this ADR)

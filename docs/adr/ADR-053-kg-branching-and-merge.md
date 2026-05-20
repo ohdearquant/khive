@@ -8,28 +8,38 @@
 
 ADR-048 established that KG state is serialized as sorted NDJSON files in `.khive/kg/` and that
 git provides the versioning layer. ADR-052 defined the storage model: `working.db` is the live
-working tree; `entities.ndjson` + `edges.ndjson` are the committed snapshot; `khive kg commit`
-is the bridge that exports DB state to files and invokes `git commit`.
+working tree; `entities.ndjson` + `edges.ndjson` are the committed snapshot. ADR-051 defined the
+CLI workflow: `khive kg commit` bridges DB to git, `khive kg sync` rebuilds the DB from NDJSON,
+and git hooks automate sync after pull/checkout/merge.
 
-Neither ADR addressed how branching and merging work. KGs need branches for the same reasons
-code does: experiments that may not land, parallel development by separate agents, feature work
-that needs review before it reaches main. Without a defined branching model, users either avoid
-branches (losing the primary benefit of the git foundation) or treat `git checkout` as a plain
-file operation and discover that the `working.db` is now out of sync with the NDJSON files they
-just checked out.
+Neither ADR addressed how KG-specific merge conflicts are resolved. When two branches modify the
+same entity, git produces NDJSON conflict markers that contain raw JSON lines. Raw conflict markers
+are workable for developers but hostile to researchers — the conflict is at the entity field level
+(e.g., one branch changed a description, the other changed properties), but git presents it as
+two competing JSON lines.
 
-This ADR defines how `khive kg branch`, `checkout`, and `merge` map to git operations, what
-happens to `working.db` on a branch switch, how NDJSON merge conflicts are resolved at the
-entity level, and how remotes (GitHub and khive.ai cloud) interact with the branching model.
+This ADR defines:
+
+1. Why sorted NDJSON gives most merges for free (no conflicts).
+2. How `khive kg resolve` handles the remaining cases at the entity/edge level.
+3. How schema conflicts in `schema.yaml` are categorized and resolved.
+4. How cross-repo references interact with merge.
+
+### Design principle: don't wrap git
+
+Branching, checkout, push, pull, stash, and log are standard git operations. The sorted NDJSON
+format is designed so that git's three-way merge handles them correctly. The only KG-specific
+operation is **conflict resolution** — understanding the entity structure inside NDJSON conflict
+markers. Everything else is git, and the user uses git directly (with `khive kg sync` running
+automatically via git hooks per ADR-051 §6).
 
 ### Relationship to ADR-052
 
-ADR-052 defines the `.state/` directory under `.khive/kg/`: `working.db` (the live DB) and
-`HEAD` (the committed snapshot reference). Status — whether the working tree is dirty — is
-computed via a DB-vs-committed-NDJSON diff as specified in ADR-052. This ADR sits on top of
-that model: every branch operation must maintain the ADR-052 invariant that `working.db`
-reflects the state of the current branch's committed snapshot plus any uncommitted working
-changes.
+ADR-052 defines the `.state/` directory: `working.db` and `HEAD`. Status — whether the working
+tree is dirty — is computed via a DB-vs-committed-NDJSON diff. Every branch operation must
+maintain the ADR-052 invariant that `working.db` reflects the current branch's committed NDJSON
+plus any uncommitted working changes. The `khive kg sync` command (ADR-051 §5) enforces this
+invariant after any git operation that changes NDJSON files.
 
 ## Decision
 
@@ -40,69 +50,20 @@ table, no custom ref store. A KG branch is exactly the git branch that contains 
 files.
 
 ```
-khive kg branch create experiments   →  git checkout -b experiments
-                                        (working.db unchanged — see §2)
-khive kg branch list                 →  git branch --list
-khive kg branch delete experiments   →  git branch -d experiments
-khive kg checkout main               →  git checkout main
-                                        + rebuild working.db from NDJSON
-khive kg merge experiments           →  git merge experiments
-                                        + rebuild working.db from merged NDJSON
+git checkout -b experiments          standard git — create branch
+git checkout main                    standard git — switch branch
+                                     (post-checkout hook runs khive kg sync)
+git merge experiments                standard git — merge
+                                     (post-merge hook runs khive kg sync)
+git push origin main                 standard git — push
+git pull                             standard git — pull
+                                     (post-merge hook runs khive kg sync)
 ```
 
-**Rationale**: git already solves branch management, ref storage, and remote tracking.
-Reinventing any of this in Rust atop SQLite is months of work that delivers a worse UX on a
-private API. Our only value-add is the DB rebuild step that makes the branch switch transparent
-to callers using the verb surface.
+The only KG-specific command in the branching workflow is `khive kg resolve`, invoked when
+`git merge` produces NDJSON conflicts that need entity-level resolution.
 
-The `.khive/kg/.state/HEAD` file (defined in ADR-052) is kept in sync with the git branch: it
-holds the current branch name and is updated by `khive kg checkout` and `khive kg branch create`.
-It is not authoritative — `git rev-parse --abbrev-ref HEAD` is always ground truth. It exists
-as a cheap local read for the khive CLI to avoid a subprocess call on every verb dispatch.
-
-### 2. Checkout — Git Checkout + DB Rebuild
-
-Switching branches changes which NDJSON files are present on disk. `working.db` must be rebuilt
-from the new files. The sequence is:
-
-1. **Dirty check**: run the ADR-052 DB-vs-committed-NDJSON diff (same operation as
-   `khive kg status`). If the working tree is dirty (uncommitted changes present), refuse
-   the checkout and print:
-
-   ```
-   error: cannot checkout 'experiments' — uncommitted KG changes present
-     (use 'khive kg commit' to commit, or 'khive kg stash' to stash)
-   ```
-
-   This mirrors `git checkout`'s behavior when there are uncommitted file changes. The user
-   must resolve their working state before switching context.
-
-2. **`git checkout <branch>`**: switches the NDJSON files to the target branch's committed state.
-   The `--no-verify` flag is NOT passed — git hooks run normally.
-
-3. **Rebuild `working.db`**: rebuild from the new NDJSON files using the ADR-052 atomic rebuild
-   path: validate NDJSON, import into a temporary database in one write transaction, then
-   atomically rename into `.state/working.db`. No `--on-conflict` logic is needed — this is
-   a full materialized-view rebuild from committed files, not an incremental import.
-
-   Performance estimate: 10K entities + 50K edges takes approximately 2–3 seconds on modern
-   hardware with batch INSERT. For large KGs (100K+ entities), an incremental rebuild is
-   preferable — see §9 on deferred optimizations.
-
-4. **Update `.state/HEAD`**: write the new branch name.
-
-### 3. Branch Create — No Immediate Rebuild
-
-`khive kg branch create <name>` only runs `git checkout -b <name>`. It does NOT rebuild
-`working.db` because no files changed — the new branch starts at the same commit as the current
-branch. The `working.db` state, including any uncommitted changes, carries over to the new branch
-(exactly as unstaged edits carry over in `git checkout -b` when there are no conflicts).
-
-This matches the expected mental model: "I'm starting a new experiment branch from where I am
-now. Everything I've done so far is still here; I just haven't committed it to the new branch
-yet."
-
-### 4. NDJSON Merge Properties
+### 2. NDJSON Merge Properties
 
 The sorted NDJSON format (ADR-048 §2) is specifically designed for clean git merges. Because each
 entity is one line at a deterministic UUID-sorted position and each edge is one line at a
@@ -118,9 +79,9 @@ deterministic composite-key position, git's three-way line merge handles the com
 | Two branches add the same entity (same UUID) with different content | Conflict — same line inserted at same position |
 
 Most KG work is additive (new entities, new edges). The conflict-free cases dominate in practice,
-so most merges will auto-complete without human intervention.
+so most merges auto-complete without human intervention.
 
-### 5. Entity-Level Conflict Resolution
+### 3. Entity-Level Conflict Resolution (`khive kg resolve`)
 
 When `git merge` produces conflicts in NDJSON files, the conflict markers appear inline in the
 file:
@@ -149,14 +110,15 @@ file:
    order intact, but an explicit sort guarantees it).
 5. Runs `khive kg validate` on the resolved files to confirm no referential integrity
    violations were introduced.
-6. Instructs the user to run `khive kg commit` to finalize the merge.
+6. Prints: `Resolved N entity conflicts, M edge conflicts. Run 'git add' and 'git commit'
+   to finalize the merge.`
 
 `--merge-properties` is the recommended strategy for agent-driven merges where both branches
 legitimately extended the same entity's properties in non-overlapping ways. It fails loudly on
 any property key that appears in both versions with different values, requiring explicit
 `--ours`/`--theirs` override for those keys.
 
-### 5b. Edge Conflict Resolution
+### 4. Edge Conflict Resolution
 
 Edges can conflict under the same conditions as entities. The conflict key for an edge is the
 composite `(source, target, relation)` triple — this is the semantic identity of an edge, not the
@@ -180,11 +142,11 @@ overrides when a global strategy is in use.
 After edge conflict resolution, `edges.ndjson` is re-sorted by the composite key (same sort
 invariant as `entities.ndjson` by UUID).
 
-### 6. Schema Conflict Resolution
+### 5. Schema Conflict Resolution
 
 `schema.yaml` conflicts are less frequent than entity conflicts but structurally more serious.
 
-Not all schema conflicts carry the same weight. ADR-053 distinguishes three categories:
+Not all schema conflicts carry the same weight. Three categories:
 
 1. **Base ontology changes** — changes to the 13 closed edge relations from ADR-002 (compile-time
    Rust enums). These always require manual review. There is no automated strategy. Adding,
@@ -193,7 +155,6 @@ Not all schema conflicts carry the same weight. ADR-053 distinguishes three cate
 2. **Pack-scoped and additive changes** — new entity kinds, new optional properties, new pack
    additions, new edge endpoint rules declared in a pack's `EDGE_RULES`. These follow ADR-054's
    schema merge rules: additive changes auto-merge; conflicting changes require manual resolution.
-   ADR-053 defers to ADR-054 for this category.
 
 3. **Property schema changes** — changes to property type definitions or validation rules. These
    also defer to ADR-054's merge rules.
@@ -207,10 +168,6 @@ Not all schema conflicts carry the same weight. ADR-053 distinguishes three cate
 | Two branches change the same property definition | Conflict — manual resolution per ADR-054 |
 | Two branches change the same remote pin | Manual resolution required — the correct SHA is determined by which branch's remote state is intended |
 
-For additive schema changes (new kinds, new optional properties, pack additions), ADR-054 defines
-the merge resolution. ADR-053 reserves manual review only for base ontology changes (the 13 closed
-edge relations from ADR-002) and incompatible property type changes.
-
 `khive kg resolve` detects schema conflicts and, where no automated strategy applies, blocks the
 merge and prints:
 
@@ -220,97 +177,7 @@ error: schema.yaml has merge conflicts that require manual resolution
   Edit .khive/kg/schema.yaml to resolve, then run 'khive kg validate' before committing.
 ```
 
-### 7. Remote Operations
-
-The remote model delegates entirely to git for transport. This follows the `git` / `gh` design
-split: `khive kg push/pull` wraps git push/pull (transport to any remote — GitHub, GitLab,
-khive.ai, self-hosted), while platform-specific operations (forking, pull requests, collaborator
-management) belong in the khive.ai cloud CLI or web UI (see khive-cloud ADRs).
-
-khive.ai is a git remote, not a separate transport. Users who want khive.ai hosting configure it
-as their git remote (`git remote add origin https://khive.ai/<user>/<project>.git`), and
-`khive kg push/pull` works without any special flags.
-
-**Push:**
-
-```
-khive kg push                        →  git push (current branch to configured remote)
-                                        + advisory sync notification if authenticated to khive.ai
-khive kg push --remote origin        →  git push origin <current-branch>
-```
-
-When authenticated to khive.ai (via `khive auth login`, see ADR-051), a successful git push
-triggers an advisory sync notification (`POST /v1/projects/:ns/sync`) that tells khive.ai to
-import the updated NDJSON into its hosted KG index. This notification is automatic and
-non-blocking — if it fails (network error, not authenticated, khive.ai downtime), the git push
-still succeeds and the user's data is safe. See ADR-051 §5 for the full push execution sequence.
-
-**Pull:**
-
-```
-khive kg pull                        →  git pull --ff-only (fast-forward by default)
-                                        + rebuild working.db from updated NDJSON
-khive kg pull --remote origin        →  git pull origin <current-branch>
-                                        + rebuild working.db
-```
-
-After any pull that changes the NDJSON files, `working.db` is rebuilt via the ADR-052 atomic
-rebuild path. If the pull cannot fast-forward, it fails with an error directing the user to
-`khive kg merge` for explicit merge handling (see §5).
-
-**Local-only mode (no remote configured):**
-
-`khive kg push` and `khive kg pull` require a configured git remote. If no remote exists, they
-print an error. All branching and merging continue to work locally via git.
-
-### 8. Stash Support
-
-```
-khive kg stash                       →  export working.db to temp NDJSON patch
-                                        git stash (stashes any modified .khive/kg/ files)
-                                        rebuild working.db from clean NDJSON (base state)
-khive kg stash pop                   →  git stash pop
-                                        rebuild working.db from popped NDJSON state
-khive kg stash list                  →  git stash list (filtered to KG stash entries)
-```
-
-`git stash` operates on file changes, not on the DB. Before stashing, `khive kg stash` runs
-`khive kg export` to ensure the working DB state is captured in the NDJSON files (without
-committing), then invokes `git stash` on those files, then rebuilds `working.db` from the
-committed base.
-
-This means stash captures exactly the changes that `khive kg status` would show as uncommitted —
-the same state that `khive kg commit` would commit. Stash pop reverses the process.
-
-### 9. Log and History
-
-```
-khive kg log                         →  git log --oneline -- .khive/kg/
-                                        (KG-touching commits only)
-khive kg log --entity <id>           →  git log -p -- .khive/kg/entities.ndjson
-                                        (diffs filtered to lines matching the entity UUID)
-khive kg log --since <date>          →  git log --since=<date> -- .khive/kg/
-```
-
-Entity-level history is derived from git's line-level history. Because each entity occupies one
-line, `git log -p` on `entities.ndjson` followed by filtering for the entity's UUID shows every
-commit that created, modified, or deleted that entity. `khive kg log --entity` parses the
-filtered diff output and renders field-level changes per commit:
-
-```
-a3b4c5d (2026-05-18) feat: research LoRA fine-tuning approach
-  ~ concept "LoRA" (abc123)
-    properties.status: "researched" → "implemented"
-
-f1e2d3c (2026-05-15) feat: add LoRA entity
-  + concept "LoRA" (abc123)
-    kind: concept
-    properties.type: technique
-```
-
-This is a presentation layer over `git log -p`, not a custom history engine.
-
-### 10. Cross-Repo References During Merge
+### 6. Cross-Repo References During Merge
 
 From ADR-048 §5, edges can reference entities in other repos via `<remote>:<uuid>` syntax in
 the `target` field. During merge:
@@ -343,40 +210,33 @@ custom branch state in sync with git state adds maintenance cost without benefit
 `.khive/kg/.state/<branch>.db` — one SQLite file per branch. Rejected: disk space accumulates
 with every branch and is never reclaimed when branches are deleted (git branch delete does not
 know about the DB files). A 10K-entity KG at ~20MB per DB file would consume 200MB for ten
-active branches. The lifecycle management (create on checkout, delete on branch delete) requires
-hooking into git operations or periodic garbage collection. Clean rebuild from NDJSON is simpler,
-has no accumulation problem, and is fast enough for the expected KG sizes.
-
-### Incremental DB patching on checkout
-
-Instead of dropping and reimporting `working.db` on branch switch, compute the NDJSON diff
-between the old and new committed states and apply only the changed entities and edges. Deferred
-to a later optimization pass, not rejected. For MVP, the clean rebuild is correct by construction
-and fast enough (2–3 seconds for 10K entities). Incremental rebuild is the right optimization
-for large KGs (100K+ entities) where rebuild time becomes noticeable, but implementing it before
-measuring the actual bottleneck violates the no-premature-optimization principle. The interface
-is identical — the optimization is internal to `khive kg checkout`.
+active branches. Clean rebuild from NDJSON via `khive kg sync` is simpler, has no accumulation
+problem, and is fast enough for the expected KG sizes.
 
 ### Three-way merge at the entity level (not git line merge)
 
 A custom merge algorithm that operates on the entity/edge level rather than the NDJSON line
-level: loads all three versions of the KG (base, ours, theirs) into memory, computes a
-structured three-way merge at the field level, and writes the result directly. Deferred: git's
-line-level merge handles 90%+ of cases correctly because of the sorted NDJSON invariant. Entity-
-level three-way merge would eliminate the residual 10% of cases where line-level merge produces
-a false conflict (two branches modifying different fields of the same entity), but implementing
-this before the conflict pattern is validated on real workloads would be premature. The
-`--merge-properties` strategy in `khive kg resolve` (§5) handles this class of conflict
-interactively.
+level. Deferred: git's line-level merge handles 90%+ of cases correctly because of the sorted
+NDJSON invariant. Entity-level three-way merge would eliminate the residual 10% of cases where
+line-level merge produces a false conflict (two branches modifying different fields of the same
+entity), but implementing this before the conflict pattern is validated on real workloads would
+be premature. The `--merge-properties` strategy in `khive kg resolve` handles this class of
+conflict interactively.
 
 ### CRDT-based merge
 
-Using a Conflict-free Replicated Data Type for graph state, eliminating conflicts entirely by
-construction. Rejected: CRDTs silently accept all writes, including semantically contradictory
-ones (two branches establishing mutually exclusive property values, two branches each believing
-they are "the canonical" definition of a concept). ADR-010 explicitly rejected CRDTs for KG
-merge. Silent corruption is worse than a paused merge. The design optimizes for the case where
-conflicts are rare (additive KG work), not for the case where conflicts are expected.
+Using a Conflict-free Replicated Data Type for graph state. Rejected: CRDTs silently accept all
+writes, including semantically contradictory ones. ADR-010 explicitly rejected CRDTs for KG merge.
+Silent corruption is worse than a paused merge.
+
+### Wrapping all git operations (push/pull/branch/checkout/stash/log)
+
+Wrapping every git command with `khive kg` equivalents. Rejected: the only KG-specific operation
+is DB rebuild (handled by `khive kg sync` via git hooks, ADR-051 §6) and conflict resolution
+(this ADR). Wrapping push, pull, branch, checkout, stash, and log adds maintenance cost, forces
+users to learn khive-specific commands for universal git operations, and only works in the CLI
+(not IDE/GUI git clients). Git hooks + `khive kg sync` + `khive kg resolve` achieve the same
+result with less code and broader compatibility.
 
 ## Consequences
 
@@ -386,35 +246,31 @@ conflicts are rare (additive KG work), not for the case where conflicts are expe
   CI (ADR-048 §6) runs on any PR that touches `.khive/kg/`. Code review tools show entity-aware
   diffs via `khive kg diff` as a git diff driver.
 - No new state to manage. Branches live in git refs; the only khive-specific state is
-  `working.db` (rebuilt on checkout) and `.state/HEAD` (a cheap local cache of the current
-  branch name).
-- Stash, log, and history commands delegate to git, inheriting all of git's guarantees
-  (e.g., stash stack is preserved across machine restarts).
-- Cross-repo references are merge-transparent. Edges referencing remote entities pass through
-  merge without requiring network access.
+  `working.db` (rebuilt by `khive kg sync` via hooks) and `.state/HEAD` (a cheap local cache).
+- `khive kg resolve` provides entity-level conflict resolution that understands field-level diffs,
+  not just competing JSON lines. The `--merge-properties` strategy handles the most common agent
+  conflict pattern (two branches extending the same entity's properties).
+- Cross-repo references are merge-transparent. No network access during merge.
+- Users use standard git for branching, checkout, push, pull, stash, and log. No new commands
+  to learn for git operations.
 
 ### Negative
 
-- Every branch switch requires a DB rebuild. At 10K entities, this is 2–3 seconds — noticeable
-  but acceptable. At 100K entities, this becomes 20–30 seconds — unacceptable for interactive
-  use. Mitigation: incremental rebuild (§ Alternatives Considered) addresses this when the scale
-  warrants it.
-- Uncommitted changes block checkout. Users who work in long-running sessions with uncommitted
-  DB changes must stash or commit before switching branches. This is the same friction as git
-  itself, but it may surprise users accustomed to switching branches freely in a database
-  context.
+- Every branch switch triggers a DB rebuild (via `khive kg sync` in the post-checkout hook). At
+  10K entities, this is 2–3 seconds. At 100K entities, this becomes 20–30 seconds. Mitigation:
+  incremental rebuild (see Alternatives) addresses this when the scale warrants it.
 - Merge conflicts in NDJSON are raw JSON lines in the conflict markers. `khive kg resolve`
-  renders them in entity-aware terms, but users who open the file directly see raw JSON. This is
-  a UX gap compared to purpose-built merge tools.
+  renders them in entity-aware terms, but users who open the file directly see raw JSON.
 - Base-ontology schema conflicts always require manual resolution. There is no automated strategy
-  for changes to the 13 closed edge relations (ADR-002). Additive changes (new entity kinds, new
-  pack additions) auto-merge per ADR-054, but any branch that touches the base edge ontology
-  requires human review before it can merge.
+  for changes to the 13 closed edge relations (ADR-002).
+- Git hooks must be installed via `khive kg init`. Developers who clone a KG repo and forget to
+  run `khive kg init` will not get automatic sync. This is mitigated by `khive kg init` being the
+  required first step (it also bootstraps `working.db`).
 
 ### Neutral
 
 - The branch model is additive over ADR-048 and ADR-052. No existing operations change meaning.
-  `khive kg commit`, `status`, `export`, and `import` behave identically on any branch.
+  `khive kg commit`, `status`, `export`, `import`, and `sync` behave identically on any branch.
 - The `working.db` rebuild delegates to the ADR-052 atomic rebuild path (validate → temp DB →
   atomic rename). No new import logic is needed.
 
@@ -423,37 +279,20 @@ conflicts are rare (additive KG work), not for the case where conflicts are expe
 ### CLI command additions to the Deno CLI (`deno/src/kg/`)
 
 ```
-khive kg branch create <name>        — git checkout -b + update .state/HEAD
-khive kg branch list                 — git branch --list
-khive kg branch delete <name>        — git branch -d
-khive kg checkout <branch>           — dirty check + git checkout + rebuild DB + update .state/
-khive kg merge <branch>              — dirty check + git merge + conflict check + rebuild DB
-khive kg resolve [--ours|--theirs|--merge-properties] [--entity <id> ...]
-                                     — parse conflict markers, apply strategy, re-sort, validate
-khive kg stash                       — export + git stash + rebuild DB
-khive kg stash pop                   — git stash pop + rebuild DB
-khive kg stash list                  — git stash list (filtered)
-khive kg push [--remote <r>]
-khive kg pull [--remote <r>]
+khive kg resolve [--ours|--theirs|--merge-properties] [--entity <id> ...] [--edge <s> <t> <r> ...]
 ```
 
-All commands are in the `khive kg` CLI (`deno/src/kg/`) and use the `khive-vcs` crate for the
-DB rebuild step via the MCP server. Git operations are invoked as subprocess calls. No git library
-dependency is added — git is already a required runtime dependency (ADR-048 §Consequences).
+This is the only new CLI command introduced by this ADR. Branching, checkout, push, pull, stash,
+and log use standard git commands, with `khive kg sync` (ADR-051) running automatically via hooks.
 
 ### `khive-vcs` additions
 
-- `branch.rs`: `create_branch()`, `list_branches()`, `delete_branch()` — thin wrappers over
-  git subprocess calls. Returns structured errors on git failure.
-- `checkout.rs`: `checkout_branch()` — dirty check via `status.rs` (ADR-052), git checkout,
-  DB rebuild via `import.rs`, state file update.
-- `merge.rs`: `merge_branch()` — git merge, conflict detection in NDJSON files, DB rebuild
-  on clean merge, block on conflict pending `khive kg resolve`.
-- `resolve.rs`: `resolve_conflicts()` — conflict marker parser, strategy application, NDJSON
-  re-sort, validate call.
-- `stash.rs`: `stash()`, `stash_pop()` — export, git stash, rebuild.
-- `remote.rs` (extends ADR-048 §Remote cache): `push()`, `pull()` — git push/pull wrappers
-  with advisory cloud sync notification when authenticated (ADR-051).
+- `resolve.rs`: `resolve_conflicts()` — conflict marker parser, entity/edge-level strategy
+  application, NDJSON re-sort, validate call. This is the only new Rust code introduced by this
+  ADR.
+- `merge.rs`: `detect_ndjson_conflicts()` — utility that scans `entities.ndjson` and
+  `edges.ndjson` for conflict markers and returns structured conflict descriptions. Used by
+  `resolve.rs` and optionally by `khive kg sync` to detect unresolved conflicts before rebuild.
 
 ### No new DB schema changes
 
@@ -464,23 +303,20 @@ defined by ADR-052 and requires no additions.
 
 | Phase | Scope | Target |
 |-------|-------|--------|
-| B1 | `branch create/list/delete`, `checkout`, `merge` (clean merge only) | v0.5 |
-| B2 | `resolve` command (conflict resolution) | v0.5 |
-| B3 | `stash` / `stash pop` / `stash list` | v0.5 |
-| B4 | `push` / `pull` (git remote) | v0.5 |
-| B5 | Advisory cloud sync notification on push (automatic when authenticated) | v0.6 |
-| B6 | `khive kg log --entity` (field-level history rendering) | v0.6 |
+| B1 | `khive kg resolve` — entity conflict resolution with `--ours`/`--theirs`/`--merge-properties` | v0.5 |
+| B2 | Edge conflict resolution (`--edge` overrides, composite-key identity) | v0.5 |
+| B3 | Schema conflict detection and category reporting | v0.5 |
+| B4 | `khive kg log --entity` (field-level history rendering, presentation only) | v0.6 |
 
-B1 and B2 are the core branching and merge workflow. B3–B6 are supporting operations that
-improve the experience but are not blockers for using branches.
+B1 and B2 are the core merge conflict workflow. B3 is defensive (schema conflicts are rare but
+serious). B4 is a convenience feature that can be deferred indefinitely.
 
 ## References
 
-- ADR-010: KG Versioning Direction — "GitHub for knowledge graphs" positioning
-- ADR-048: Git-Native KG Versioning — NDJSON format, cross-repo references, CLI commands
-- ADR-051: CLI Authentication and KG Git Workflow Commands — `khive kg commit/push/pull/status/branch/log` interface
-- ADR-052: KG Storage Model — working.db, HEAD, DB-vs-NDJSON diff status, `.state/` layout
-- ADR-043: KG Merge Algorithm — original three-way merge design (substantially reduced in scope by ADR-048; further narrowed by this ADR to the conflict-resolution pass only)
 - ADR-002: Closed Edge Ontology — why schema conflicts require manual review
+- ADR-010: KG Versioning Direction — "GitHub for knowledge graphs" positioning
+- ADR-048: Git-Native KG Versioning — NDJSON format, cross-repo references
+- ADR-051: CLI Workflow — `khive kg commit`, `khive kg sync`, git hooks
+- ADR-052: KG Storage Model — working.db, atomic rebuild, status diff
+- ADR-054: Schema Evolution — additive merge rules for packs and properties
 - git merge documentation: https://git-scm.com/docs/git-merge
-- git stash documentation: https://git-scm.com/docs/git-stash
