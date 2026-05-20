@@ -265,3 +265,29 @@ impl MemoryPack {
         to_json(&results)
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_memory_type_rejects_invalid() {
+        let err = validate_memory_type("bogus").unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "expected InvalidInput for unknown memory_type, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_memory_type_accepts_episodic() {
+        assert!(validate_memory_type("episodic").is_ok());
+    }
+
+    #[test]
+    fn validate_memory_type_accepts_semantic() {
+        assert!(validate_memory_type("semantic").is_ok());
+    }
+}

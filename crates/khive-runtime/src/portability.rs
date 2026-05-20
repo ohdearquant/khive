@@ -444,7 +444,32 @@ mod tests {
         assert!(matches!(err, RuntimeError::InvalidInput(_)));
     }
 
-    /// 5. Invalid relation in archive → InvalidInput.
+    /// 5. Unsupported archive version → InvalidInput.
+    #[tokio::test]
+    async fn import_unsupported_archive_version_returns_error() {
+        let rt = make_rt().await;
+        let bad = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "999.0".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![],
+            edges: vec![],
+        };
+        let err = rt.import_kg(&bad, None).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+        if let RuntimeError::InvalidInput(msg) = err {
+            assert!(
+                msg.contains("999.0"),
+                "error message should mention the unsupported version, got: {msg:?}"
+            );
+        }
+    }
+
+    /// 6. Invalid relation in archive → InvalidInput.
     #[test]
     fn invalid_relation_rejected_at_deserialize() {
         let json = r#"{

@@ -246,4 +246,65 @@ mod tests {
             .unwrap();
         assert!(matches!(result, MergeResult::Clean { .. }));
     }
+
+    #[test]
+    fn theirs_strategy_always_clean() {
+        let id = Uuid::new_v4();
+        let base = {
+            let mut a = empty("test");
+            a.entities = vec![entity(id, "Original")];
+            a
+        };
+        let ours = {
+            let mut a = empty("test");
+            a.entities = vec![entity(id, "NameA")];
+            a
+        };
+        let theirs = {
+            let mut a = empty("test");
+            a.entities = vec![entity(id, "NameB")];
+            a
+        };
+
+        let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Theirs).unwrap();
+        assert!(matches!(result, MergeResult::Clean { .. }));
+        if let MergeResult::Clean { merged } = result {
+            assert_eq!(merged.entities[0].name, "NameB");
+        }
+    }
+
+    #[test]
+    fn kind_conflict_detected() {
+        let id = Uuid::new_v4();
+        let base = {
+            let mut a = empty("test");
+            a.entities = vec![entity(id, "E")]; // kind = "concept"
+            a
+        };
+        let ours = {
+            let mut a = empty("test");
+            let mut e = entity(id, "E");
+            e.kind = "document".into();
+            a.entities = vec![e];
+            a
+        };
+        let theirs = {
+            let mut a = empty("test");
+            let mut e = entity(id, "E");
+            e.kind = "dataset".into();
+            a.entities = vec![e];
+            a
+        };
+
+        let result = three_way_merge(&base, &ours, &theirs, MergeStrategy::Auto).unwrap();
+        assert!(matches!(result, MergeResult::Conflicts { .. }));
+        if let MergeResult::Conflicts { conflicts } = result {
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|c| matches!(c, MergeConflict::KindConflict { .. })),
+                "expected at least one KindConflict, got: {conflicts:?}"
+            );
+        }
+    }
 }
