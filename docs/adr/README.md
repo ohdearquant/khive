@@ -62,6 +62,7 @@ alternatives. New decisions should be added as ADR-NNN-kebab-case-title.md using
 | [054](ADR-054-kg-schema-evolution.md)                    | KG Schema Evolution                                  | proposed                                                           | Schema evolution strategies for the git-native KG format; backward and forward compatibility; migration tooling for `schema.yaml` changes across repository clones                                                    |
 | [055](ADR-055-kg-import-formats.md)                      | KG Import/Export Format Adapters                     | proposed                                                           | Format adapters for importing and exporting KG data (RDF/Turtle, JSON-LD, CSV, GEXF); bidirectional conversion with the canonical NDJSON format; adapter registration pattern                                          |
 | [056](ADR-056-kg-validation-pipelines.md)                | KG Validation Pipelines                              | proposed                                                           | CI/CD validation pipelines for the git-native KG; schema conformance checks, edge endpoint validation, cross-repo reference integrity; `khive kg validate` CLI command and GitHub Actions integration                  |
+| [057](ADR-057-cli-configuration-and-embedding.md)        | CLI Configuration and Automatic Embedding            | proposed                                                           | Two-level TOML config (project `.khive/config.toml` committed + global `~/.khive/config.toml` machine-local); project config sets embedding model (consistency across collaborators), global config sets device; automatic embedding on `khive kg commit` (before validate) and `khive kg sync` (after rebuild); `khive kg embed` for explicit re-embedding; vectors stored in `working.db` only — not in NDJSON |
 
 ## Reading Order
 
@@ -89,7 +90,7 @@ For new contributors:
 ADR-048 (NDJSON format) → ADR-052 (storage model) → ADR-051 (CLI workflow) → ADR-053 (branching, if needed)
 
 ### Schema and Packs
-ADR-050 (pack format) → ADR-054 (schema evolution) → ADR-055 (import formats) → ADR-056 (validation)
+ADR-050 (pack format) → ADR-054 (schema evolution) → ADR-055 (import formats) → ADR-056 (validation) → ADR-057 (config and embedding)
 
 ### Frontend and Cloud (in khive-cloud repo)
 ADR-049 (moved) → khive-cloud ADR-030 through ADR-038
