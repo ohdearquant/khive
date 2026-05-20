@@ -1466,123 +1466,8 @@ async fn link_by_name_ambiguous_returns_ambiguous_error() {
 
 // ── Issue #66: MCP display formatting ────────────────────────────────────────
 //
-// By default, link output uses 8-char short IDs and YYYY/MM/DD dates.
-// With verbose=true, full UUIDs and ISO 8601 timestamps are shown.
-
-#[tokio::test]
-async fn link_default_output_uses_short_ids() {
-    let pack = pack();
-
-    pack.dispatch(
-        "create",
-        json!({"kind": "entity", "name": "ShortSrc", "entity_kind": "concept"}),
-    )
-    .await
-    .expect("create ShortSrc must succeed");
-
-    pack.dispatch(
-        "create",
-        json!({"kind": "entity", "name": "ShortTgt", "entity_kind": "concept"}),
-    )
-    .await
-    .expect("create ShortTgt must succeed");
-
-    let result = pack
-        .dispatch(
-            "link",
-            json!({
-                "source_id": "ShortSrc",
-                "target_id": "ShortTgt",
-                "relation": "extends"
-            }),
-        )
-        .await
-        .expect("link must succeed");
-
-    // By default (no verbose param), IDs should be 8 characters.
-    let id = result
-        .get("id")
-        .and_then(|v| v.as_str())
-        .expect("id must be present");
-    assert_eq!(
-        id.len(),
-        8,
-        "default output must use 8-char short ID; got: {id:?}"
-    );
-
-    let src_id = result
-        .get("source_id")
-        .and_then(|v| v.as_str())
-        .expect("source_id must be present");
-    assert_eq!(
-        src_id.len(),
-        8,
-        "default output must use 8-char short source_id; got: {src_id:?}"
-    );
-
-    let tgt_id = result
-        .get("target_id")
-        .and_then(|v| v.as_str())
-        .expect("target_id must be present");
-    assert_eq!(
-        tgt_id.len(),
-        8,
-        "default output must use 8-char short target_id; got: {tgt_id:?}"
-    );
-}
-
-#[tokio::test]
-async fn link_default_output_formats_date_as_yyyy_mm_dd() {
-    let pack = pack();
-
-    pack.dispatch(
-        "create",
-        json!({"kind": "entity", "name": "DateSrc", "entity_kind": "concept"}),
-    )
-    .await
-    .expect("create DateSrc must succeed");
-
-    pack.dispatch(
-        "create",
-        json!({"kind": "entity", "name": "DateTgt", "entity_kind": "concept"}),
-    )
-    .await
-    .expect("create DateTgt must succeed");
-
-    let result = pack
-        .dispatch(
-            "link",
-            json!({
-                "source_id": "DateSrc",
-                "target_id": "DateTgt",
-                "relation": "extends"
-            }),
-        )
-        .await
-        .expect("link must succeed");
-
-    let created_at = result
-        .get("created_at")
-        .and_then(|v| v.as_str())
-        .expect("created_at must be a string");
-
-    // YYYY/MM/DD format: exactly 10 chars, two slashes at positions 4 and 7.
-    assert_eq!(
-        created_at.len(),
-        10,
-        "default created_at must be 10 chars (YYYY/MM/DD); got: {created_at:?}"
-    );
-    assert_eq!(
-        &created_at[4..5],
-        "/",
-        "first separator must be '/' at index 4; got: {created_at:?}"
-    );
-    assert_eq!(
-        &created_at[7..8],
-        "/",
-        "second separator must be '/' at index 7; got: {created_at:?}"
-    );
-}
+// MCP responses always return full UUIDs and ISO 8601 timestamps.
+// Display formatting (short IDs, compact dates) belongs in the CLI/UI layer.
 
 #[tokio::test]
 async fn search_event_kind_returns_invalid_input() {
@@ -1598,37 +1483,35 @@ async fn search_event_kind_returns_invalid_input() {
 }
 
 #[tokio::test]
-async fn link_verbose_output_uses_full_uuids() {
+async fn link_output_returns_full_uuids_and_iso_dates() {
     let pack = pack();
 
     pack.dispatch(
         "create",
-        json!({"kind": "entity", "name": "VerboseSrc", "entity_kind": "concept"}),
+        json!({"kind": "entity", "name": "FullSrc", "entity_kind": "concept"}),
     )
     .await
-    .expect("create VerboseSrc must succeed");
+    .expect("create FullSrc must succeed");
 
     pack.dispatch(
         "create",
-        json!({"kind": "entity", "name": "VerboseTgt", "entity_kind": "concept"}),
+        json!({"kind": "entity", "name": "FullTgt", "entity_kind": "concept"}),
     )
     .await
-    .expect("create VerboseTgt must succeed");
+    .expect("create FullTgt must succeed");
 
     let result = pack
         .dispatch(
             "link",
             json!({
-                "source_id": "VerboseSrc",
-                "target_id": "VerboseTgt",
-                "relation": "extends",
-                "verbose": true
+                "source_id": "FullSrc",
+                "target_id": "FullTgt",
+                "relation": "extends"
             }),
         )
         .await
-        .expect("link with verbose=true must succeed");
+        .expect("link must succeed");
 
-    // With verbose=true, IDs should be full UUIDs (36 chars: 32 hex + 4 dashes).
     let id = result
         .get("id")
         .and_then(|v| v.as_str())
@@ -1636,7 +1519,7 @@ async fn link_verbose_output_uses_full_uuids() {
     assert_eq!(
         id.len(),
         36,
-        "verbose output must use full UUID (36 chars); got: {id:?}"
+        "MCP response must return full UUID; got: {id:?}"
     );
 
     let src_id = result
@@ -1646,63 +1529,15 @@ async fn link_verbose_output_uses_full_uuids() {
     assert_eq!(
         src_id.len(),
         36,
-        "verbose source_id must be full UUID; got: {src_id:?}"
+        "source_id must be full UUID; got: {src_id:?}"
     );
 
-    let tgt_id = result
-        .get("target_id")
-        .and_then(|v| v.as_str())
-        .expect("target_id must be present");
-    assert_eq!(
-        tgt_id.len(),
-        36,
-        "verbose target_id must be full UUID; got: {tgt_id:?}"
-    );
-}
-
-#[tokio::test]
-async fn link_verbose_output_uses_iso_datetime() {
-    let pack = pack();
-
-    pack.dispatch(
-        "create",
-        json!({"kind": "entity", "name": "IsoSrc", "entity_kind": "concept"}),
-    )
-    .await
-    .expect("create IsoSrc must succeed");
-
-    pack.dispatch(
-        "create",
-        json!({"kind": "entity", "name": "IsoTgt", "entity_kind": "concept"}),
-    )
-    .await
-    .expect("create IsoTgt must succeed");
-
-    let result = pack
-        .dispatch(
-            "link",
-            json!({
-                "source_id": "IsoSrc",
-                "target_id": "IsoTgt",
-                "relation": "extends",
-                "verbose": true
-            }),
-        )
-        .await
-        .expect("link with verbose=true must succeed");
-
-    // With verbose=true, created_at is an ISO 8601 datetime (longer than 10 chars
-    // and contains 'T' as date/time separator).
     let created_at = result
         .get("created_at")
         .and_then(|v| v.as_str())
-        .expect("created_at must be a string in verbose mode");
+        .expect("created_at must be a string");
     assert!(
         created_at.contains('T'),
-        "verbose created_at must be ISO 8601 (contains 'T'); got: {created_at:?}"
-    );
-    assert!(
-        created_at.len() > 10,
-        "verbose created_at must be longer than YYYY/MM/DD; got: {created_at:?}"
+        "created_at must be ISO 8601; got: {created_at:?}"
     );
 }
