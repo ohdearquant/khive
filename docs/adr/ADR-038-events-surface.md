@@ -70,17 +70,17 @@ The `ListParams` struct in `crates/khive-pack-kg/src/handlers.rs` (line 192) gai
 branch. These parameters map directly to the existing `EventFilter` struct
 (`crates/khive-storage/src/event.rs`, line 71):
 
-| Wire parameter | Type | Maps to `EventFilter` field | Notes |
-|---|---|---|---|
-| `verb` | `string` | `verbs: Vec<String>` | Single verb string; stored as a one-element vec |
-| `verbs` | `[string]` | `verbs: Vec<String>` | Multi-value form; `verb` and `verbs` are merged |
-| `outcome` | `string` | not in `EventFilter` — post-filter | `"success"` \| `"denied"` \| `"error"` |
-| `actor` | `string` | `actors: Vec<String>` | Exact match; free-form actor string |
-| `substrate` | `string` | `substrates: Vec<SubstrateKind>` | `"note"` \| `"entity"` \| `"event"` |
-| `since` | `int` (microseconds UTC) | `after: Option<i64>` | Exclusive lower bound on `created_at` |
-| `until` | `int` (microseconds UTC) | `before: Option<i64>` | Exclusive upper bound on `created_at` |
-| `limit` | `u32` | `PageRequest::limit` | Default `100`, max `1000` |
-| `offset` | `u32` | `PageRequest::offset` | Default `0` |
+| Wire parameter | Type                     | Maps to `EventFilter` field        | Notes                                           |
+| -------------- | ------------------------ | ---------------------------------- | ----------------------------------------------- |
+| `verb`         | `string`                 | `verbs: Vec<String>`               | Single verb string; stored as a one-element vec |
+| `verbs`        | `[string]`               | `verbs: Vec<String>`               | Multi-value form; `verb` and `verbs` are merged |
+| `outcome`      | `string`                 | not in `EventFilter` — post-filter | `"success"` \| `"denied"` \| `"error"`          |
+| `actor`        | `string`                 | `actors: Vec<String>`              | Exact match; free-form actor string             |
+| `substrate`    | `string`                 | `substrates: Vec<SubstrateKind>`   | `"note"` \| `"entity"` \| `"event"`             |
+| `since`        | `int` (microseconds UTC) | `after: Option<i64>`               | Exclusive lower bound on `created_at`           |
+| `until`        | `int` (microseconds UTC) | `before: Option<i64>`              | Exclusive upper bound on `created_at`           |
+| `limit`        | `u32`                    | `PageRequest::limit`               | Default `100`, max `1000`                       |
+| `offset`       | `u32`                    | `PageRequest::offset`              | Default `0`                                     |
 
 **Outcome filter note.** `EventOutcome` is not in `EventFilter` — the existing SQL builder
 (`build_event_filter_sql` in `crates/khive-db/src/stores/event.rs`, line 213) does not filter by
@@ -218,15 +218,15 @@ delete succeeded (it would return not-found if the UUID-resolution path simply s
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-|---|---|---|---|
-| Dedicated verbs `list_events` / `get_event` | More explicit in docs; no `kind=` lookup | Contradicts ADR-023 verb consolidation; adds two verbs that duplicate existing structure | ADR-023 reserved `kind=event` exactly for this; dedicated verbs are net regression |
-| GQL/SPARQL over events via `query(...)` | Uniform query interface | Events are tabular with no edges; GQL graph patterns are meaningless; adds implementation burden for zero benefit | Wrong tool; filter-based listing is the correct abstraction for tabular data |
-| FTS (`search(kind="event", query=...)`) | Uniform with entity/note search | `data` field is JSON; no natural FTS column; useful queries are predicate-based, not similarity-based | Deferred — requires explicit text-extraction strategy; not needed for v0.1 use cases |
-| Expose `count(kind="event", group_by=...)` now | Dashboard convenience | Requires new GROUP BY path in `SqlEventStore`; disproportionate to OSS use case | Deferred to v0.2; client-side aggregation is sufficient at OSS event volumes |
-| Post-query outcome filter (this ADR's D2 choice) | No `EventFilter` semver bump | Full page scanned before filtering when outcome narrows significantly | Accepted for v0.1: deny volumes are small; a future semver bump can add index-backed filtering |
-| Index-backed outcome filter in `EventFilter` now | DB-level precision | Breaking change to `EventFilter`; semver event for all `khive-storage` consumers | Defer to v0.2 when volume justifies it |
-| Skip composite index until needed | Zero migration complexity | Predictable query degradation as event tables grow; prevents ADR-034 metering daemon from being efficient | One-line DDL addition now prevents all deployments from hitting the degradation |
+| Alternative                                      | Pros                                     | Cons                                                                                                              | Why rejected                                                                                   |
+| ------------------------------------------------ | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Dedicated verbs `list_events` / `get_event`      | More explicit in docs; no `kind=` lookup | Contradicts ADR-023 verb consolidation; adds two verbs that duplicate existing structure                          | ADR-023 reserved `kind=event` exactly for this; dedicated verbs are net regression             |
+| GQL/SPARQL over events via `query(...)`          | Uniform query interface                  | Events are tabular with no edges; GQL graph patterns are meaningless; adds implementation burden for zero benefit | Wrong tool; filter-based listing is the correct abstraction for tabular data                   |
+| FTS (`search(kind="event", query=...)`)          | Uniform with entity/note search          | `data` field is JSON; no natural FTS column; useful queries are predicate-based, not similarity-based             | Deferred — requires explicit text-extraction strategy; not needed for v0.1 use cases           |
+| Expose `count(kind="event", group_by=...)` now   | Dashboard convenience                    | Requires new GROUP BY path in `SqlEventStore`; disproportionate to OSS use case                                   | Deferred to v0.2; client-side aggregation is sufficient at OSS event volumes                   |
+| Post-query outcome filter (this ADR's D2 choice) | No `EventFilter` semver bump             | Full page scanned before filtering when outcome narrows significantly                                             | Accepted for v0.1: deny volumes are small; a future semver bump can add index-backed filtering |
+| Index-backed outcome filter in `EventFilter` now | DB-level precision                       | Breaking change to `EventFilter`; semver event for all `khive-storage` consumers                                  | Defer to v0.2 when volume justifies it                                                         |
+| Skip composite index until needed                | Zero migration complexity                | Predictable query degradation as event tables grow; prevents ADR-034 metering daemon from being efficient         | One-line DDL addition now prevents all deployments from hitting the degradation                |
 
 ## Consequences
 
@@ -267,15 +267,15 @@ delete succeeded (it would return not-found if the UUID-resolution path simply s
 No code is written as part of this ADR. The following table describes the changes that an
 implementation PR will make:
 
-| Step | File | Change |
-|---|---|---|
-| 1. Composite index migration | `crates/khive-db/src/migrations.rs` | Add `VersionedMigration { version: <next>, sql: "CREATE INDEX IF NOT EXISTS idx_events_ns_created ON events(namespace, created_at DESC)" }` |
-| 2. `list_events` runtime op | `crates/khive-runtime/src/operations.rs` | Add `KhiveRuntime::list_events(namespace, filter, limit, offset)` calling `self.events(namespace)?.query_events(...)` |
-| 3. `get` UUID resolution extension | `crates/khive-pack-kg/src/handlers.rs` | In `handle_get`, extend UUID resolution to check `EventStore::get_event` after entity/note/edge misses (no `kind` parameter — `get` auto-detects substrate from UUID). Alternatively, refactor `handle_get` to use `KhiveRuntime::resolve` (which already checks events at `operations.rs` line 706) and branch on `Resolved::Event`. |
-| 4. `ListParams` event branch | `crates/khive-pack-kg/src/handlers.rs` | Add event sub-struct to `ListParams`; add `KindSpec::Event` match arm in `handle_list`; construct `EventFilter` from wire params; apply post-query outcome filter |
-| 5. Immutability guards | `crates/khive-pack-kg/src/handlers.rs` | `handle_create`, `handle_update`, and `handle_delete`: return `ImmutableRecord { kind: "event" }` error when the target `kind` or resolved UUID identifies an event record. For `handle_update`, the check must occur after UUID resolution (to catch callers who pass an event UUID without an explicit `kind`) but before any patch is applied. |
-| 6. Vocab registration | `crates/khive-pack-kg/src/vocab.rs` | Register `"event"` as a valid `kind` for `list` in `KgVocab::valid_list_kinds()` (`get` does not use `kind` — it resolves UUID directly) |
-| 7. Smoke test | `tests/smoke_test.py` | After dispatching at least one verb that writes an audit event (a `create` call is sufficient — every verb dispatch produces an `Event` if the store is wired), call `list(kind="event", limit=5)` and assert the response contains at least one item with the expected `verb` and `outcome` fields |
+| Step                               | File                                     | Change                                                                                                                                                                                                                                                                                                                                            |
+| ---------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Composite index migration       | `crates/khive-db/src/migrations.rs`      | Add `VersionedMigration { version: <next>, sql: "CREATE INDEX IF NOT EXISTS idx_events_ns_created ON events(namespace, created_at DESC)" }`                                                                                                                                                                                                       |
+| 2. `list_events` runtime op        | `crates/khive-runtime/src/operations.rs` | Add `KhiveRuntime::list_events(namespace, filter, limit, offset)` calling `self.events(namespace)?.query_events(...)`                                                                                                                                                                                                                             |
+| 3. `get` UUID resolution extension | `crates/khive-pack-kg/src/handlers.rs`   | In `handle_get`, extend UUID resolution to check `EventStore::get_event` after entity/note/edge misses (no `kind` parameter — `get` auto-detects substrate from UUID). Alternatively, refactor `handle_get` to use `KhiveRuntime::resolve` (which already checks events at `operations.rs` line 706) and branch on `Resolved::Event`.             |
+| 4. `ListParams` event branch       | `crates/khive-pack-kg/src/handlers.rs`   | Add event sub-struct to `ListParams`; add `KindSpec::Event` match arm in `handle_list`; construct `EventFilter` from wire params; apply post-query outcome filter                                                                                                                                                                                 |
+| 5. Immutability guards             | `crates/khive-pack-kg/src/handlers.rs`   | `handle_create`, `handle_update`, and `handle_delete`: return `ImmutableRecord { kind: "event" }` error when the target `kind` or resolved UUID identifies an event record. For `handle_update`, the check must occur after UUID resolution (to catch callers who pass an event UUID without an explicit `kind`) but before any patch is applied. |
+| 6. Vocab registration              | `crates/khive-pack-kg/src/vocab.rs`      | Register `"event"` as a valid `kind` for `list` in `KgVocab::valid_list_kinds()` (`get` does not use `kind` — it resolves UUID directly)                                                                                                                                                                                                          |
+| 7. Smoke test                      | `tests/smoke_test.py`                    | After dispatching at least one verb that writes an audit event (a `create` call is sufficient — every verb dispatch produces an `Event` if the store is wired), call `list(kind="event", limit=5)` and assert the response contains at least one item with the expected `verb` and `outcome` fields                                               |
 
 **Prerequisite:** ADR-035 landed dispatch-time `EventStore` persistence (closing the item ADR-033
 originally deferred to v0.3). This ADR depends on that accepted surface and adds

@@ -177,19 +177,19 @@ replacement.
 
 ## Implementation Status
 
-| Step                                              | Where                                    | Status               |
-| ------------------------------------------------- | ---------------------------------------- | -------------------- |
-| `RuntimeError::PermissionDenied { verb, reason }` | `crates/khive-runtime/src/error.rs`      | done (this ADR)      |
+| Step                                              | Where                                    | Status                               |
+| ------------------------------------------------- | ---------------------------------------- | ------------------------------------ |
+| `RuntimeError::PermissionDenied { verb, reason }` | `crates/khive-runtime/src/error.rs`      | done (this ADR)                      |
 | `EventOutcome::Denied` variant                    | `crates/khive-types/src/lib.rs`          | pre-existing (not added by this ADR) |
-| `VerbRegistryBuilder::with_event_store`           | `crates/khive-runtime/src/pack.rs`       | done (this ADR)      |
-| `VerbRegistry::event_store` field                 | `crates/khive-runtime/src/pack.rs`       | done (this ADR)      |
-| Hard deny in `VerbRegistry::dispatch`             | `crates/khive-runtime/src/pack.rs`       | done (this ADR)      |
-| EventStore write in `VerbRegistry::dispatch`      | `crates/khive-runtime/src/pack.rs`       | done (this ADR)      |
-| `KhiveMcpServer::with_packs` wires `event_store`  | `crates/khive-mcp/src/server.rs`         | done (this ADR)      |
-| ADR-029 implementation status update              | `docs/adr/ADR-029-authorization-gate.md` | done (this ADR)      |
-| ADR-033 implementation status update              | `docs/adr/ADR-033-audit-envelope.md`     | done (this ADR)      |
-| `EventFilter` + query surface for audit events    | `crates/khive-runtime/src/operations.rs` | deferred (post v0.3) |
-| Alert / SLO on deny counts                        | TBD                                      | deferred             |
+| `VerbRegistryBuilder::with_event_store`           | `crates/khive-runtime/src/pack.rs`       | done (this ADR)                      |
+| `VerbRegistry::event_store` field                 | `crates/khive-runtime/src/pack.rs`       | done (this ADR)                      |
+| Hard deny in `VerbRegistry::dispatch`             | `crates/khive-runtime/src/pack.rs`       | done (this ADR)                      |
+| EventStore write in `VerbRegistry::dispatch`      | `crates/khive-runtime/src/pack.rs`       | done (this ADR)                      |
+| `KhiveMcpServer::with_packs` wires `event_store`  | `crates/khive-mcp/src/server.rs`         | done (this ADR)                      |
+| ADR-029 implementation status update              | `docs/adr/ADR-029-authorization-gate.md` | done (this ADR)                      |
+| ADR-033 implementation status update              | `docs/adr/ADR-033-audit-envelope.md`     | done (this ADR)                      |
+| `EventFilter` + query surface for audit events    | `crates/khive-runtime/src/operations.rs` | deferred (post v0.3)                 |
+| Alert / SLO on deny counts                        | TBD                                      | deferred                             |
 
 ## References
 

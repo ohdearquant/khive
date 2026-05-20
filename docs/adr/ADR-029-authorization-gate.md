@@ -214,8 +214,8 @@ today is the wrong default.
    transport-agnostic. Lean: dispatch-site. Resolve in the wiring PR.
 2. **Audit envelope schema.** ~~Resolved by ADR-033 (AuditEvent type) and ADR-035 (storage
    shape: `SubstrateKind::Event` with the full `AuditEvent` serialized into `Event.data`).~~
-   *Resolved: ADR-033 defines `AuditEvent`; ADR-035 specifies persistence as
-   `SubstrateKind::Event` with the full `AuditEvent` JSON in `Event.data`.*
+   _Resolved: ADR-033 defines `AuditEvent`; ADR-035 specifies persistence as
+   `SubstrateKind::Event` with the full `AuditEvent` JSON in `Event.data`._
 3. **Multi-gate composition.** Should `LionGate<G>` chain — wrap another gate, both consulted?
    Or is single wrapping enough? Defer until a real second stack emerges.
 4. **Anonymous actor semantics.** `AllowAllGate` accepts `ActorRef::anonymous()`. A real
