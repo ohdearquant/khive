@@ -8,6 +8,7 @@ use khive_runtime::portability::{ExportedEdge, KgArchive};
 use uuid::Uuid;
 
 use khive_vcs::merge_engine::{BranchSide, MergeConflict};
+use khive_vcs::VcsError;
 
 use crate::diff_local::{diff_edges, EdgeChange, EdgeKey};
 
@@ -23,9 +24,9 @@ pub fn merge_edges(
     base: &KgArchive,
     ours: &KgArchive,
     theirs: &KgArchive,
-) -> (Vec<ExportedEdge>, Vec<MergeConflict>) {
-    let ours_diff = diff_edges(base, ours);
-    let theirs_diff = diff_edges(base, theirs);
+) -> Result<(Vec<ExportedEdge>, Vec<MergeConflict>), VcsError> {
+    let ours_diff = diff_edges(base, ours)?;
+    let theirs_diff = diff_edges(base, theirs)?;
 
     let all_keys: HashSet<EdgeKey> = ours_diff
         .keys()
@@ -93,7 +94,7 @@ pub fn merge_edges(
                 Some(EdgeChange::Unchanged),
             )
             | (Some(EdgeChange::WeightModified { branch_weight, .. }), None) => {
-                let edge = build_edge(key, *branch_weight);
+                let edge = build_edge(key, *branch_weight)?;
                 merged.push(edge);
             }
 
@@ -103,7 +104,7 @@ pub fn merge_edges(
                 Some(EdgeChange::WeightModified { branch_weight, .. }),
             )
             | (None, Some(EdgeChange::WeightModified { branch_weight, .. })) => {
-                let edge = build_edge(key, *branch_weight);
+                let edge = build_edge(key, *branch_weight)?;
                 merged.push(edge);
             }
 
@@ -118,7 +119,7 @@ pub fn merge_edges(
                     ..
                 }),
             ) => {
-                let edge = build_edge(key, f64::max(*ours_w, *theirs_w));
+                let edge = build_edge(key, f64::max(*ours_w, *theirs_w))?;
                 merged.push(edge);
             }
 
@@ -148,7 +149,7 @@ pub fn merge_edges(
         }
     }
 
-    (merged, conflicts)
+    Ok((merged, conflicts))
 }
 
 /// Validate that no edge in `edges` has a missing endpoint in `entity_ids`.
@@ -180,16 +181,17 @@ pub fn validate_dangling_edges(
     conflicts
 }
 
-fn build_edge(key: &EdgeKey, weight: f64) -> ExportedEdge {
-    ExportedEdge {
+fn build_edge(key: &EdgeKey, weight: f64) -> Result<ExportedEdge, VcsError> {
+    let relation = key
+        .relation
+        .parse::<khive_storage::EdgeRelation>()
+        .map_err(|e| VcsError::Internal(e.to_string()))?;
+    Ok(ExportedEdge {
         source: key.source,
         target: key.target,
-        relation: key
-            .relation
-            .parse()
-            .expect("valid relation from existing edge"),
+        relation,
         weight,
-    }
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -230,7 +232,7 @@ mod tests {
         let base = archive(vec![]);
         let ours = archive(vec![edge(a, b, 1.0)]);
         let theirs = archive(vec![]);
-        let (merged, conflicts) = merge_edges(&base, &ours, &theirs);
+        let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
         assert!(conflicts.is_empty());
         assert_eq!(merged.len(), 1);
     }
@@ -242,7 +244,7 @@ mod tests {
         let base = archive(vec![edge(a, b, 1.0)]);
         let ours = archive(vec![]);
         let theirs = archive(vec![]);
-        let (merged, conflicts) = merge_edges(&base, &ours, &theirs);
+        let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
         assert!(conflicts.is_empty());
         assert_eq!(merged.len(), 0);
     }
@@ -254,7 +256,7 @@ mod tests {
         let base = archive(vec![]);
         let ours = archive(vec![edge(a, b, 0.6)]);
         let theirs = archive(vec![edge(a, b, 0.9)]);
-        let (merged, _) = merge_edges(&base, &ours, &theirs);
+        let (merged, _) = merge_edges(&base, &ours, &theirs).unwrap();
         assert_eq!(merged.len(), 1);
         assert!((merged[0].weight - 0.9).abs() < f64::EPSILON);
     }
@@ -281,7 +283,7 @@ mod tests {
         let ours = archive(vec![]); // deleted
         let theirs = archive(vec![edge(a, b, 1.0)]); // modified weight
 
-        let (_, conflicts) = merge_edges(&base, &ours, &theirs);
+        let (_, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
         assert_eq!(conflicts.len(), 1);
         assert!(matches!(
             conflicts[0],

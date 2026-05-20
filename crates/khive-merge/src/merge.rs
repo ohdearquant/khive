@@ -50,7 +50,7 @@ fn three_way_merge_auto(
     all_conflicts.extend(entity_conflicts);
 
     // Step 2: edge merge.
-    let (merged_edges, edge_conflicts) = merge_edges(base, ours, theirs);
+    let (merged_edges, edge_conflicts) = merge_edges(base, ours, theirs)?;
     all_conflicts.extend(edge_conflicts);
 
     // Step 3: dangling-edge validation.

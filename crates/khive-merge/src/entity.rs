@@ -192,23 +192,28 @@ fn field_level_merge(
         result.tags = tags;
     }
 
-    // Properties: per-key merge.
-    if let Some(prop_conflicts) = merge_properties(id, &ours.properties, &theirs.properties) {
-        conflicts.extend(prop_conflicts);
-    }
-    // result.properties already has ours value; conflicts carry both values for the agent.
+    // Properties: per-key merge (ADR-043 §9).
+    let (merged_props, prop_conflicts) = merge_properties(id, &ours.properties, &theirs.properties);
+    result.properties = merged_props;
+    conflicts.extend(prop_conflicts);
 
     (result, conflicts)
 }
 
-/// Merge entity properties from ours and theirs.
-/// Returns `None` if no conflicts, or `Some(conflicts)` if there are conflicts.
+/// Merge entity properties from ours and theirs (ADR-043 §9).
+///
+/// Returns the merged property map and any per-key conflicts.
+/// Merge rules:
+/// - Both set K, same value → keep.
+/// - Both set K, different values → conflict; keep ours in merged map.
+/// - Only ours sets K → take ours.
+/// - Only theirs sets K → take theirs.
 fn merge_properties(
     id: Uuid,
     ours_props: &Option<serde_json::Value>,
     theirs_props: &Option<serde_json::Value>,
-) -> Option<Vec<MergeConflict>> {
-    use serde_json::Value;
+) -> (Option<serde_json::Value>, Vec<MergeConflict>) {
+    use serde_json::{Map, Value};
 
     let ours_obj = match ours_props {
         Some(Value::Object(m)) => Some(m),
@@ -220,15 +225,19 @@ fn merge_properties(
     };
 
     match (ours_obj, theirs_obj) {
-        (None, None) => None,
-        (Some(_), None) | (None, Some(_)) => None, // One side has no props → no conflict.
+        (None, None) => (None, vec![]),
+        // One side has no props → take the side that has them, no conflict.
+        (Some(o), None) => (Some(Value::Object(o.clone())), vec![]),
+        (None, Some(t)) => (Some(Value::Object(t.clone())), vec![]),
         (Some(o), Some(t)) => {
+            let mut merged: Map<String, Value> = o.clone();
             let mut conflicts = Vec::new();
             let all_keys: HashSet<&String> = o.keys().chain(t.keys()).collect();
 
             for key in all_keys {
                 match (o.get(key), t.get(key)) {
                     (Some(ov), Some(tv)) if ov != tv => {
+                        // Conflict: keep ours in the merged map; report both values.
                         conflicts.push(MergeConflict::PropertyMismatch {
                             entity_id: id,
                             key: key.clone(),
@@ -236,15 +245,16 @@ fn merge_properties(
                             theirs: tv.clone(),
                         });
                     }
-                    _ => {} // Absent in one side, or equal → no conflict.
+                    // Only theirs has this key → take theirs (ADR-043 §9).
+                    (None, Some(tv)) => {
+                        merged.insert(key.clone(), tv.clone());
+                    }
+                    // Equal or only-ours: already in merged (started from ours).
+                    _ => {}
                 }
             }
 
-            if conflicts.is_empty() {
-                None
-            } else {
-                Some(conflicts)
-            }
+            (Some(Value::Object(merged)), conflicts)
         }
     }
 }
@@ -402,5 +412,32 @@ mod tests {
         assert!(tags.contains(&"a".to_string()));
         assert!(tags.contains(&"b".to_string()));
         assert!(tags.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn theirs_only_property_keys_preserved() {
+        let id = Uuid::new_v4();
+        let mut e_ours = entity(id, "E");
+        let mut e_theirs = entity(id, "E");
+        let base = archive_with(vec![entity(id, "E")]);
+        // ours has "year"; theirs has "author" (not in ours) and "year" (same value).
+        e_ours.properties = Some(serde_json::json!({"year": "2023"}));
+        e_theirs.properties = Some(serde_json::json!({"year": "2023", "author": "Smith"}));
+
+        let ours = archive_with(vec![e_ours]);
+        let theirs = archive_with(vec![e_theirs]);
+
+        let (merged, conflicts) = merge_entities(&base, &ours, &theirs);
+        assert!(conflicts.is_empty(), "no conflicts expected: {conflicts:?}");
+        let props = merged[0]
+            .properties
+            .as_ref()
+            .expect("merged has properties");
+        assert_eq!(props.get("year").and_then(|v| v.as_str()), Some("2023"));
+        assert_eq!(
+            props.get("author").and_then(|v| v.as_str()),
+            Some("Smith"),
+            "theirs-only key 'author' must be preserved in merged output"
+        );
     }
 }

@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
+use khive_vcs::VcsError;
 use uuid::Uuid;
 
 /// Snapshot reader trait for `find_lca` (so the algorithm can be tested independently).
@@ -101,7 +102,10 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
 }
 
 /// Compute edge changes between `base` and `branch`.
-pub fn diff_edges(base: &KgArchive, branch: &KgArchive) -> HashMap<EdgeKey, EdgeChange> {
+pub fn diff_edges(
+    base: &KgArchive,
+    branch: &KgArchive,
+) -> Result<HashMap<EdgeKey, EdgeChange>, VcsError> {
     let base_map: HashMap<EdgeKey, f64> = base
         .edges
         .iter()
@@ -121,7 +125,10 @@ pub fn diff_edges(base: &KgArchive, branch: &KgArchive) -> HashMap<EdgeKey, Edge
             (None, Some(&w)) => EdgeChange::Added(ExportedEdge {
                 source: key.source,
                 target: key.target,
-                relation: key.relation.parse().expect("valid relation"),
+                relation: key
+                    .relation
+                    .parse::<khive_storage::EdgeRelation>()
+                    .map_err(|e| VcsError::Internal(e.to_string()))?,
                 weight: w,
             }),
             (Some(_), None) => EdgeChange::Deleted,
@@ -140,7 +147,7 @@ pub fn diff_edges(base: &KgArchive, branch: &KgArchive) -> HashMap<EdgeKey, Edge
         result.insert(key, change);
     }
 
-    result
+    Ok(result)
 }
 
 /// Structural equality check for entities (excludes timestamps).
@@ -251,7 +258,7 @@ mod tests {
         let e = edge(a, b, 1.0);
         let base = make_archive(vec![], vec![e.clone()]);
         let branch = make_archive(vec![], vec![e]);
-        let diff = diff_edges(&base, &branch);
+        let diff = diff_edges(&base, &branch).unwrap();
         let key = EdgeKey {
             source: a,
             target: b,
@@ -266,7 +273,7 @@ mod tests {
         let b = Uuid::new_v4();
         let base = make_archive(vec![], vec![]);
         let branch = make_archive(vec![], vec![edge(a, b, 0.8)]);
-        let diff = diff_edges(&base, &branch);
+        let diff = diff_edges(&base, &branch).unwrap();
         let key = EdgeKey {
             source: a,
             target: b,
@@ -281,7 +288,7 @@ mod tests {
         let b = Uuid::new_v4();
         let base = make_archive(vec![], vec![edge(a, b, 0.5)]);
         let branch = make_archive(vec![], vec![edge(a, b, 1.0)]);
-        let diff = diff_edges(&base, &branch);
+        let diff = diff_edges(&base, &branch).unwrap();
         let key = EdgeKey {
             source: a,
             target: b,
