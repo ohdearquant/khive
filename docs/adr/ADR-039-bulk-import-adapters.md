@@ -60,39 +60,42 @@ import(
 JSON request form (equivalent):
 
 ```json
-{"tool": "import", "args": {
-  "namespace": "string (optional, default: caller's namespace)",
-  "records": [
-    {
-      "id": "local:paper-1",
-      "kind": "document",
-      "name": "FlashAttention: Fast and Memory-Efficient Exact Attention",
-      "description": "...",
-      "properties": {
-        "arxiv_id": "2205.14135",
-        "authors": "Tri Dao, Daniel Y. Fu, ...",
-        "year": 2022,
-        "doi": "10.48550/arXiv.2205.14135"
-      },
-      "tags": ["attention", "efficiency"]
-    }
-  ],
-  "edges": [
-    {
-      "source_ref": "local:concept-flash-tiling",
-      "target_ref": "local:paper-1",
-      "relation": "introduced_by",
-      "weight": 1.0
-    }
-  ],
-  "dry_run": false,
-  "on_conflict": "error"
-}}
+{
+  "tool": "import",
+  "args": {
+    "namespace": "string (optional, default: caller's namespace)",
+    "records": [
+      {
+        "id": "local:paper-1",
+        "kind": "document",
+        "name": "FlashAttention: Fast and Memory-Efficient Exact Attention",
+        "description": "...",
+        "properties": {
+          "arxiv_id": "2205.14135",
+          "authors": "Tri Dao, Daniel Y. Fu, ...",
+          "year": 2022,
+          "doi": "10.48550/arXiv.2205.14135"
+        },
+        "tags": ["attention", "efficiency"]
+      }
+    ],
+    "edges": [
+      {
+        "source_ref": "local:concept-flash-tiling",
+        "target_ref": "local:paper-1",
+        "relation": "introduced_by",
+        "weight": 1.0
+      }
+    ],
+    "dry_run": false,
+    "on_conflict": "error"
+  }
+}
 ```
 
 **Field semantics:**
 
-- `records`: array of entity descriptors. `id` is a *local ref* — a caller-assigned string valid
+- `records`: array of entity descriptors. `id` is a _local ref_ — a caller-assigned string valid
   only within this import payload (format: any string, used to resolve `source_ref` / `target_ref`
   in `edges`). It is **not** stored; the runtime assigns a fresh UUID on creation. Alternatively,
   `id` may be a full UUID; if a record with that UUID already exists in the namespace the
@@ -137,11 +140,11 @@ same validation pass in a follow-up patch before the next release.
 
 ### D4 — Idempotency properties
 
-| `on_conflict` | Re-running same payload | Notes |
-|---|---|---|
-| `error` (default) | Fails on second run — name collision detected | Intentionally non-idempotent |
-| `skip` | Idempotent — existing records are skipped, no errors | Safe for repeated seeding |
-| `update` | Idempotent only if content is unchanged; writes on change | Content-equality not checked; always patches |
+| `on_conflict`     | Re-running same payload                                   | Notes                                        |
+| ----------------- | --------------------------------------------------------- | -------------------------------------------- |
+| `error` (default) | Fails on second run — name collision detected             | Intentionally non-idempotent                 |
+| `skip`            | Idempotent — existing records are skipped, no errors      | Safe for repeated seeding                    |
+| `update`          | Idempotent only if content is unchanged; writes on change | Content-equality not checked; always patches |
 
 Agents building reproducible seeding pipelines should use `on_conflict=skip`.
 
@@ -182,7 +185,7 @@ the record match `Entity` field names from `khive-types`.
 
 ### D7 — Reference adapters (separate `khive-import` crate, separate PR)
 
-The `import` verb defines the *runtime contract*. External adapters transform source data into
+The `import` verb defines the _runtime contract_. External adapters transform source data into
 the `{records, edges}` envelope. Two reference adapters are specified here — implementation is a
 separate PR scope:
 
@@ -281,15 +284,15 @@ operators a stable token for "did this payload already land?" without storing ra
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why rejected |
-|---|---|---|---|
-| Built-in adapters inside `khive-pack-kg` | Single crate installation | Couples HTTP/network deps to storage layer; offline environments fail to compile; community adapters require core maintainer involvement | Wrong coupling |
-| Separate crate per adapter (`khive-import-arxiv`, `khive-import-bibtex`) | Maximum separation | Every new source = new crate; install burden multiplies | Prefer one `khive-import` crate with subcommands |
-| Out-of-tree only (community responsibility, no reference adapter) | Zero new code in repo | Leaves new users with an empty KG and no example | Poor onboarding; issue #3 explicitly asks for a built-in path |
-| Per-record atomicity (write successes, collect failures) | Partial progress on large imports | Ambiguous final state; caller must reconcile | All-or-nothing with clear errors is simpler |
-| `on_conflict=skip` as default | Re-running is always safe | Silent duplicate masking | Loudest default; caller must opt into skip |
-| Validate endpoints post-import (integrity sweep) | Decoupled from write path | Transient inconsistent state exists between write and sweep | Transient dangles violate CLAUDE.md invariant immediately |
-| Dedicated `_imports` audit table (new DB migration) | Queryable import history | ADR-033 tracing events already cover the audit requirement for v0.1; a table adds migration and query surface for marginal benefit at this stage | Defer; ADR-022 migration mechanism is available if needed in v0.2+ |
+| Alternative                                                              | Pros                              | Cons                                                                                                                                             | Why rejected                                                       |
+| ------------------------------------------------------------------------ | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Built-in adapters inside `khive-pack-kg`                                 | Single crate installation         | Couples HTTP/network deps to storage layer; offline environments fail to compile; community adapters require core maintainer involvement         | Wrong coupling                                                     |
+| Separate crate per adapter (`khive-import-arxiv`, `khive-import-bibtex`) | Maximum separation                | Every new source = new crate; install burden multiplies                                                                                          | Prefer one `khive-import` crate with subcommands                   |
+| Out-of-tree only (community responsibility, no reference adapter)        | Zero new code in repo             | Leaves new users with an empty KG and no example                                                                                                 | Poor onboarding; issue #3 explicitly asks for a built-in path      |
+| Per-record atomicity (write successes, collect failures)                 | Partial progress on large imports | Ambiguous final state; caller must reconcile                                                                                                     | All-or-nothing with clear errors is simpler                        |
+| `on_conflict=skip` as default                                            | Re-running is always safe         | Silent duplicate masking                                                                                                                         | Loudest default; caller must opt into skip                         |
+| Validate endpoints post-import (integrity sweep)                         | Decoupled from write path         | Transient inconsistent state exists between write and sweep                                                                                      | Transient dangles violate CLAUDE.md invariant immediately          |
+| Dedicated `_imports` audit table (new DB migration)                      | Queryable import history          | ADR-033 tracing events already cover the audit requirement for v0.1; a table adds migration and query surface for marginal benefit at this stage | Defer; ADR-022 migration mechanism is available if needed in v0.2+ |
 
 ## Consequences
 
@@ -326,12 +329,12 @@ operators a stable token for "did this payload already land?" without storing ra
 
 ### Files that change (this ADR's scope — no code in this PR)
 
-| File | Change |
-|---|---|
-| `crates/khive-pack-kg/src/handlers.rs` | Add `handle_import` handler following the `handle_create` / `handle_link` pattern (lines 332-769 are the model); deser `ImportParams`, validate records + edges, dispatch to `runtime.import_bulk(...)` |
-| `crates/khive-runtime/src/operations.rs` | Add `import_bulk(namespace, records, edges, on_conflict, dry_run) -> ImportResult`; orchestrates `create_entity` + `link` loops inside a single SQLite transaction |
-| `crates/khive-pack-kg/src/lib.rs` | Register `"import"` verb in `VERBS` const |
-| `crates/khive-types/src/lib.rs` (or new file) | Add `ImportRecord`, `ImportEdgeSpec`, `ImportResult`, `OnConflict` types |
+| File                                          | Change                                                                                                                                                                                                  |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/khive-pack-kg/src/handlers.rs`        | Add `handle_import` handler following the `handle_create` / `handle_link` pattern (lines 332-769 are the model); deser `ImportParams`, validate records + edges, dispatch to `runtime.import_bulk(...)` |
+| `crates/khive-runtime/src/operations.rs`      | Add `import_bulk(namespace, records, edges, on_conflict, dry_run) -> ImportResult`; orchestrates `create_entity` + `link` loops inside a single SQLite transaction                                      |
+| `crates/khive-pack-kg/src/lib.rs`             | Register `"import"` verb in `VERBS` const                                                                                                                                                               |
+| `crates/khive-types/src/lib.rs` (or new file) | Add `ImportRecord`, `ImportEdgeSpec`, `ImportResult`, `OnConflict` types                                                                                                                                |
 
 ### New crate (separate PR)
 

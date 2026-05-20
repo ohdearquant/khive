@@ -28,6 +28,17 @@ use crate::runtime::KhiveRuntime;
 /// - `None` (outer) — leave the current description as-is
 /// - `Some(None)` — clear the description (set to NULL)
 /// - `Some(Some(s))` — set the description to `s`
+///
+/// For `properties` (deep-merge semantics):
+/// - `None` — leave properties as-is
+/// - `Some(value)` — deep-merge `value` into existing properties. Keys present in
+///   the patch overwrite existing keys; keys absent from the patch are preserved.
+///   Removing a key requires explicit replacement of the parent object (or a future
+///   `unset`/`null-marker` extension).
+///
+/// For `tags` — replace semantics: `Some(vec)` sets tags to exactly `vec`. To add
+/// a tag without losing existing tags, read the entity first, push the new tag,
+/// and pass the full list back.
 #[derive(Clone, Debug, Default)]
 pub struct EntityPatch {
     pub name: Option<String>,
@@ -123,7 +134,9 @@ impl KhiveRuntime {
             entity.description = desc_patch;
         }
         if let Some(props) = patch.properties {
-            entity.properties = Some(props);
+            let (merged, _) =
+                merge_properties(&entity.properties, &Some(props), MergeStrategy::PreferFrom);
+            entity.properties = merged;
         }
         if let Some(tags) = patch.tags {
             entity.tags = tags;
@@ -613,6 +626,46 @@ mod tests {
         assert!(
             hits_new.contains(&entity.id),
             "new name should be findable after rename"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_entity_properties_merges_preserving_existing_keys() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(
+                None,
+                "concept",
+                "MergeProps",
+                None,
+                Some(serde_json::json!({
+                    "domain": "inference",
+                    "repo": "lattice",
+                    "status": "researched",
+                })),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let updated = rt
+            .update_entity(
+                None,
+                entity.id,
+                EntityPatch {
+                    properties: Some(serde_json::json!({"status": "implemented"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let props = updated.properties.expect("properties should remain set");
+        assert_eq!(props["domain"], "inference", "domain key must be preserved");
+        assert_eq!(props["repo"], "lattice", "repo key must be preserved");
+        assert_eq!(
+            props["status"], "implemented",
+            "status key must be updated by patch"
         );
     }
 
