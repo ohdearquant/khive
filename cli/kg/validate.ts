@@ -65,7 +65,7 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
   // ── 1. Load schema ────────────────────────────────────────────────────────
   let schemaEntityKinds: Set<string> = new Set(ENTITY_KINDS);
   let schemaRelations: Set<string> = new Set(EDGE_RELATIONS);
-  let schemaRemotes: Set<string> | null = null;
+  let schemaRemotes: Set<string> = new Set();
 
   try {
     const schema = await loadSchema(repoRoot);
@@ -80,7 +80,6 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
       schemaRelations = new Set(schema.edge_relations.map((r) => r.relation));
     }
     if (schema.remotes && schema.remotes.length > 0) {
-      schemaRemotes = new Set<string>();
       for (const r of schema.remotes) {
         if (!r.name || !r.repo || !r.path || !r.commit) {
           errors.push({
@@ -252,7 +251,7 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
           });
         } else {
           const remoteName = remoteMatch[1];
-          if (schemaRemotes && !schemaRemotes.has(remoteName)) {
+          if (!schemaRemotes.has(remoteName)) {
             errors.push({
               file: EDGES_FILE,
               line,

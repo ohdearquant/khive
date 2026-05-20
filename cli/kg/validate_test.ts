@@ -213,22 +213,18 @@ Deno.test("validate: rejects dangling edge target (referential integrity)", asyn
   }
 });
 
-Deno.test("validate: allows remote ref as edge target (no referential integrity check)", async () => {
+Deno.test("validate: rejects remote ref target when remote not in schema", async () => {
   const dir = await makeTempRepo();
   try {
     await writeEntities(dir, [
       '{"id":"00000000-0000-0000-0000-000000000001","name":"A","kind":"concept"}',
     ]);
-    // target is a remote ref (non-UUID string) — should pass referential integrity
     await writeEdges(dir, [
       '{"edge_id":"eeeeeeee-0000-0000-0000-000000000001","source":"00000000-0000-0000-0000-000000000001","target":"lattice:00000000-0000-0000-0000-000000000099","relation":"depends_on","weight":1.0,"properties":{}}',
     ]);
     const result = await validate(dir);
-    // The only potential error would be an unrecognised relation — depends_on is in schema
-    const hasRefError = result.errors.some((e) =>
-      e.message.includes("does not reference a known entity id")
-    );
-    assertEquals(hasRefError, false);
+    const hasRemoteError = result.errors.some((e) => e.message.includes("undeclared remote"));
+    assertEquals(hasRemoteError, true);
   } finally {
     await removeDir(dir);
   }
