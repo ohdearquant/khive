@@ -1,6 +1,6 @@
 # ADR-047: Frontend Views — KG Explorer and GTD Board
 
-**Status**: proposed\
+**Status**: superseded — absorbed into khive ADR-030 (project-first workspace frontend)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
