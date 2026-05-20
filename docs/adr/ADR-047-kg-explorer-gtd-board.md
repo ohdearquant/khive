@@ -1,4 +1,4 @@
-# ADR-046: Frontend Views — KG Explorer and GTD Board
+# ADR-047: Frontend Views — KG Explorer and GTD Board
 
 **Status**: proposed\
 **Date**: 2026-05-20\
