@@ -12,7 +12,8 @@ import { loadConfig } from "../lib/config.ts";
 import { planEmbed, printEmbedPlan } from "../lib/embed.ts";
 import { EDGES_FILE, ensureStateDir, ENTITIES_FILE, SCHEMA_FILE } from "../lib/paths.ts";
 import { countLines } from "../lib/ndjson.ts";
-import { printValidationResult, validate } from "./validate.ts";
+import { printRuleViolations, printValidationResult, validateWithRules } from "./validate.ts";
+import { RulesFileErrors } from "../lib/rules.ts";
 
 // ─── Prompt helper ────────────────────────────────────────────────────────────
 
@@ -83,10 +84,27 @@ export async function runCommit(repoRoot: string, args: string[]): Promise<void>
   // For now we validate the existing NDJSON files, which is the same
   // correctness guarantee for KG repos that manage NDJSON manually.
   console.log("Validating KG files...");
-  const validationResult = await validate(repoRoot);
+  let validationResult;
+  try {
+    validationResult = await validateWithRules(repoRoot);
+  } catch (err) {
+    if (err instanceof RulesFileErrors) {
+      console.error("Commit aborted: rules.yaml is malformed:");
+      for (const e of err.errors) {
+        console.error(`  ${e.message}`);
+      }
+      Deno.exit(2);
+    }
+    throw err;
+  }
 
-  if (!validationResult.valid) {
+  const ruleErrors = validationResult.ruleViolations.filter((v) => v.severity === "error");
+
+  if (!validationResult.valid || ruleErrors.length > 0) {
     printValidationResult(validationResult);
+    if (validationResult.ruleViolations.length > 0) {
+      printRuleViolations(validationResult.ruleViolations);
+    }
     console.error("\nCommit aborted: fix validation errors first.");
     Deno.exit(1);
   }

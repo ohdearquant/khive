@@ -11,6 +11,7 @@ import { runCommit } from "./kg/commit.ts";
 import { runConfig } from "./kg/config.ts";
 import { runEmbed } from "./kg/embed.ts";
 import { runExport } from "./kg/export.ts";
+import { runHook } from "./kg/hook.ts";
 import { recoverImportJournal, runImport } from "./kg/import.ts";
 import { runMigrate } from "./kg/migrate.ts";
 import { runPackCheck } from "./pack/check.ts";
@@ -33,7 +34,7 @@ Usage:
 
 KG subcommands:
   init          Initialise .khive/kg/ in the current git repo
-  validate      Validate NDJSON files against schema (no DB writes)
+  validate      Validate NDJSON files + rules.yaml (ADR-056)
   commit        Validate NDJSON files + git commit (Phase C1; DB export is Phase C2)
   sync          Validate NDJSON + create working.db placeholder (Phase C1; DB rebuild is Phase C2)
   status        Show entity/edge counts and uncommitted changes (file-level; DB diff is Phase C2)
@@ -42,6 +43,7 @@ KG subcommands:
   export        Re-write canonical .khive/kg/*.ndjson; --format archive emits a JSON bundle
   import        Import a KgArchive JSON file into NDJSON files
   resolve       Resolve NDJSON merge conflicts (ADR-053)
+  hook          Manage the pre-commit validation hook (install/uninstall/status)
   migrate       Apply schema migrations from .khive/kg/migrations/ (ADR-054)
   diff          Entity-aware diff between two NDJSON states (Phase C2 — not yet implemented)
   update        Advance a remote pin in schema.yaml (Phase C2 — not yet implemented)
@@ -65,7 +67,7 @@ function printKgUsage(): void {
 
 Subcommands (Phase C1 — file-level operations):
   init          Initialise .khive/kg/ in the current git repo
-  validate      Validate NDJSON files against schema
+  validate      Validate NDJSON files + rules.yaml (ADR-056; flags: --strict, --no-rules, --format, --quiet)
   commit        Validate + stage + git commit .khive/kg/ files
   sync          Validate NDJSON (DB rebuild: Phase C2)
   status        Show entity/edge counts and uncommitted changes
@@ -74,6 +76,7 @@ Subcommands (Phase C1 — file-level operations):
   export        Re-write canonical .khive/kg/*.ndjson; --format archive emits a JSON bundle
   import        Import a KgArchive JSON file into NDJSON files
   resolve       Resolve NDJSON merge conflicts after 'git merge'
+  hook          Manage pre-commit validation hook (install|uninstall|status)
   migrate       Apply schema migrations (ADR-054)
 
 Planned (Phase C2+):
@@ -121,9 +124,16 @@ async function dispatchKg(args: string[]): Promise<void> {
     case "status":
       await runStatus(await getRepoRoot(), rest);
       break;
-    case "validate":
-      await runValidate(await getRepoRoot());
+    case "validate": {
+      const code = await runValidate(await getRepoRoot(), rest);
+      if (code !== 0) Deno.exit(code);
       break;
+    }
+    case "hook": {
+      const code = await runHook(await getRepoRoot(), rest);
+      if (code !== 0) Deno.exit(code);
+      break;
+    }
 
     case "config":
       await runConfig(await getRepoRoot(), rest);

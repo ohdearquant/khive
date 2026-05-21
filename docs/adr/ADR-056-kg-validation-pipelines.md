@@ -1,6 +1,6 @@
 # ADR-056: KG Validation Pipelines
 
-**Status**: proposed\
+**Status**: accepted (Phase E1 — rules.yaml parser, RulePass with built-in rules: no-self-loops, no-orphan-entities, required-properties, max-entity-count, min-edge-density; `--strict`/`--no-rules`/`--format text|json|github`/`--quiet` flags; `khive kg hook install|uninstall|status`. Phase E2 — custom TS rule modules + ADR-050 pack-provided rules + `--fix` deferred)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
