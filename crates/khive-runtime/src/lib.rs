@@ -24,6 +24,7 @@ pub mod curation;
 pub mod error;
 pub mod fusion;
 pub mod graph_traversal;
+pub mod objectives;
 pub mod operations;
 pub mod pack;
 pub mod portability;
@@ -37,6 +38,10 @@ pub use graph_traversal::{PathNode, TraversalOptions};
 pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
     GateRef, GateRequest, Obligation,
+};
+pub use objectives::{
+    GraphProximityObjective, RetrievalCandidate, RrfFusionObjective, TextRelevanceObjective,
+    VectorSimilarityObjective,
 };
 pub use operations::Resolved;
 pub use pack::{
