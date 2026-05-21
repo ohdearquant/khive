@@ -1,6 +1,6 @@
 # ADR-055: KG Import/Export Format Adapters
 
-**Status**: proposed\
+**Status**: accepted (Phase P0a — adapter library shipped: CSV/TSV (`adaptCsv`) and JSON-array (`adaptJson`) as pure functions returning canonical `EntityRecord[]`/`EdgeRecord[]`. Phase P0b — CLI wiring `khive kg import --format csv|tsv|json` deferred until adapter-to-pipeline integration is designed against ADR-048's atomic-publish path. Phase P1 — RDF/Turtle, JSON-LD, GEXF, GraphML, BibTeX, Markdown deferred; mapping files deferred.)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
@@ -13,8 +13,7 @@ in whatever format their existing tools produce.
 
 The gap is onboarding friction. A researcher with a BibTeX export from Zotero, a CSV from a
 spreadsheet, or a Gephi GraphML network cannot use khive without first hand-authoring NDJSON. That
-is not a realistic expectation. The "GitHub for knowledge graphs" positioning requires khive to meet
-researchers where their data already lives.
+is not a realistic expectation. khive needs to meet researchers where their data already lives.
 
 The formats that matter for the initial research audience are:
 
@@ -317,9 +316,13 @@ All adapter output passes through the full `khive kg validate` pipeline before d
 3. **Duplicate detection**: duplicate UUIDs (within the adapter output) are an error. Conflicts
    with existing database records are handled by `--on-conflict` (ADR-039: `error` / `skip` /
    `update`).
-4. **Endpoint validation**: every edge triple `(source_kind, relation, target_kind)` is checked
-   against the same `validate_edge_relation_endpoints` path used by the runtime `link` verb
-   (ADR-031, ADR-039). This closes the security hole documented in ADR-039 §context.
+4. **Endpoint validation** _(deferred to P1)_: checking every edge triple
+   `(source_kind, relation, target_kind)` against the ADR-031/ADR-002 endpoint rules is
+   deferred to Phase P1. The current file-layer `validate` command verifies that each
+   `relation` value is in the closed ADR-002 set but does not yet resolve entity kinds at
+   validation time to run the full endpoint check used by the runtime `link` verb. A P1
+   work item will wire endpoint validation into the NDJSON validate path once the kind-
+   resolution index is available at that layer.
 
 Import is all-or-nothing within a single adapter run: on validation failure, no records are written
 and the transaction is rolled back.
@@ -341,8 +344,16 @@ CSV/JSON, entry keys for BibTeX, subject IRIs for RDF).
 
 ### 6. Export formats
 
-`khive kg export` gains a `--format` flag that produces adapter-specific output from the local
-database. Export is the inverse of import where the format supports round-tripping:
+`khive kg export` currently supports only the default NDJSON format (ADR-048). The `--format` flag
+for non-NDJSON output is **deferred to Phase P1/P2** and is not yet implemented. The commands
+listed below are the planned interface but do not work in the current release:
+
+> **Note**: The examples in this section are the target design for Phase P1/P2. None of
+> `--format csv`, `--format bibtex`, `--format graphml`, `--format turtle`, `--format jsonld`,
+> or `--format markdown` are implemented. The current CLI only supports `khive kg export` without
+> any `--format` flag (which produces NDJSON per ADR-048).
+
+**Planned (P1/P2 — not yet implemented):**
 
 ```
 khive kg export --format csv > entities.csv
@@ -355,23 +366,23 @@ khive kg export --format markdown --output-dir ./notes/
 
 The `--format ndjson` (default) is unchanged (ADR-048). All other formats are additive.
 
-Export format coverage:
+Export format coverage (P0 = shipped; P1/P2 = deferred):
 
-| Format    | Import        | Export        | Notes                                                         |
-| --------- | ------------- | ------------- | ------------------------------------------------------------- |
-| NDJSON    | yes (ADR-048) | yes (ADR-048) | Canonical; lossless                                           |
-| CSV       | yes           | yes           | Entities and edges as separate files                          |
-| JSON      | yes           | yes           | Array-of-objects                                              |
-| BibTeX    | yes           | yes           | Only `kind: concept` entities with `properties.type: "paper"` |
-| Turtle    | yes           | yes           | All entities and edges as RDF triples                         |
-| N-Triples | yes           | yes           | Flat RDF, no prefix declarations                              |
-| JSON-LD   | yes           | yes           | `@context` generated from `schema.yaml`                       |
-| GraphML   | yes           | yes           | All entities and edges                                        |
-| GEXF      | yes           | yes           | Static (no dynamic timeslicing on export)                     |
-| Markdown  | yes           | yes           | One `.md` file per entity; wikilinks for edges                |
+| Format    | Import        | Export        | Phase | Notes                                                         |
+| --------- | ------------- | ------------- | ----- | ------------------------------------------------------------- |
+| NDJSON    | yes (ADR-048) | yes (ADR-048) | P0    | Canonical; lossless                                           |
+| CSV       | yes           | deferred (P1) | P0/P1 | Import shipped; export deferred                               |
+| JSON      | yes           | deferred (P1) | P0/P1 | Import shipped; export deferred                               |
+| BibTeX    | deferred (P1) | deferred (P1) | P1    | Only `kind: concept` entities with `properties.type: "paper"` |
+| Turtle    | deferred (P1) | deferred (P1) | P1    | All entities and edges as RDF triples                         |
+| N-Triples | deferred (P1) | deferred (P1) | P1    | Flat RDF, no prefix declarations                              |
+| JSON-LD   | deferred (P1) | deferred (P1) | P1    | `@context` generated from `schema.yaml`; `.jsonld` rejected   |
+| GraphML   | deferred (P2) | deferred (P2) | P2    | All entities and edges                                        |
+| GEXF      | deferred (P2) | deferred (P2) | P2    | Static (no dynamic timeslicing on export)                     |
+| Markdown  | deferred (P2) | deferred (P2) | P2    | One `.md` file per entity; wikilinks for edges                |
 
-Export with `--format markdown` generates a static, browsable representation of the KG. Combined
-with a static site generator, this produces human-readable KG documentation from a single command.
+Export with `--format markdown` (when implemented) will generate a static, browsable
+representation of the KG suitable for use with static site generators.
 
 ### 7. Performance requirements
 
@@ -405,25 +416,31 @@ Transaction model:
 
 ### 8. CLI summary
 
-New flags on `khive kg import`:
+New flags on `khive kg import` (P0 — shipped):
 
-| Flag             | Values                         | Default                         | Description                                                   |
-| ---------------- | ------------------------------ | ------------------------------- | ------------------------------------------------------------- |
-| `--format`       | See §2                         | inferred from extension         | Source format                                                 |
-| `--mapping`      | file path                      | `.khive/kg/import-mapping.yaml` | Path to column/field mapping file                             |
-| `--schema-mode`  | `strict` \| `infer` \| `force` | `strict`                        | Schema validation behavior (see §4)                           |
-| `--default-kind` | entity kind                    | —                               | Kind for entities with no kind column                         |
-| `--timeslice`    | datetime                       | latest                          | GEXF dynamic: which timeslice to import                       |
-| `--vault`        | directory                      | —                               | Markdown: Obsidian vault root                                 |
-| `--verbose`      | —                              | —                               | Print detailed warning/error list                             |
-| `--continue`     | —                              | —                               | Skip already-imported UUIDs (dedup, not crash-resume; see §7) |
+| Flag             | Values                  | Default                 | Description                           |
+| ---------------- | ----------------------- | ----------------------- | ------------------------------------- |
+| `--format`       | `khive\|csv\|tsv\|json` | inferred from extension | Source format                         |
+| `--default-kind` | entity kind             | —                       | Kind for entities with no kind column |
 
-New flags on `khive kg export`:
+Deferred flags (P1/P2 — not yet implemented; CLI rejects with an error if any of these are passed):
 
-| Flag           | Values    | Default | Description                                        |
-| -------------- | --------- | ------- | -------------------------------------------------- |
-| `--format`     | See §6    | ndjson  | Output format                                      |
-| `--output-dir` | directory | —       | Required for markdown format (one file per entity) |
+| Flag            | Values                         | Deferred to | Description                                 |
+| --------------- | ------------------------------ | ----------- | ------------------------------------------- |
+| `--mapping`     | file path                      | P1          | Column/field mapping file                   |
+| `--schema-mode` | `strict` \| `infer` \| `force` | P1          | Schema validation behavior (see §4)         |
+| `--on-conflict` | `error` \| `skip` \| `update`  | P1          | Conflict resolution mode (ADR-039)          |
+| `--continue`    | —                              | P1          | Skip already-imported UUIDs (dedup; see §7) |
+| `--verbose`     | —                              | P1          | Print detailed warning/error list           |
+| `--timeslice`   | datetime                       | P2          | GEXF dynamic: which timeslice to import     |
+| `--vault`       | directory                      | P2          | Markdown: Obsidian vault root               |
+
+New flags on `khive kg export` (P1/P2 — deferred; not yet implemented):
+
+| Flag           | Values    | Default | Description                                             |
+| -------------- | --------- | ------- | ------------------------------------------------------- |
+| `--format`     | See §6    | ndjson  | Output format (deferred; current CLI ignores this flag) |
+| `--output-dir` | directory | —       | Required for markdown format (one file per entity, P2)  |
 
 ## Rationale
 
@@ -476,13 +493,13 @@ export for every import format avoids khive becoming a data sink.
 
 ## Alternatives Considered
 
-| Alternative                                              | Pros                                     | Cons                                                                      | Why rejected                                                                |
-| -------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| NDJSON only — require users to convert externally        | Zero adapter maintenance burden          | Adoption barrier; researchers won't hand-author NDJSON                    | Contradicts "GitHub for knowledge graphs" positioning                       |
-| Universal import via LLM ("paste your data, AI maps it") | Zero configuration; works for any format | Non-deterministic; slow; cloud dependency for basic import; hard to audit | Deferred as a cloud feature; deterministic adapters ship first              |
-| Plugin-based adapters (user-installable format plugins)  | Extensible; community can add formats    | Plugin API surface maintenance; version compatibility overhead            | Deferred; start with built-in adapters, plugin system later if needed       |
-| Always require a mapping file                            | Explicit, no ambiguity                   | High friction for common cases; users abandon onboarding                  | Auto-detection handles common cases; mapping file is progressive disclosure |
-| Format-specific importers (CSV → DB, BibTeX → DB)        | Fewer indirections                       | Duplicates validation logic; harder to test                               | Pipeline to NDJSON concentrates validation in one place                     |
+| Alternative                                              | Pros                                     | Cons                                                           | Why rejected                                                                |
+| -------------------------------------------------------- | ---------------------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| NDJSON only — require users to convert externally        | Zero adapter maintenance burden          | Adoption barrier; researchers won't hand-author NDJSON         | Onboarding friction blocks the OSS use case                                 |
+| Universal import via LLM ("paste your data, AI maps it") | Zero configuration; works for any format | Non-deterministic; slow; hard to audit; external dependency    | Out of scope for OSS; deterministic adapters ship first                     |
+| Plugin-based adapters (user-installable format plugins)  | Extensible; community can add formats    | Plugin API surface maintenance; version compatibility overhead | Deferred; start with built-in adapters, plugin system later if needed       |
+| Always require a mapping file                            | Explicit, no ambiguity                   | High friction for common cases; users abandon onboarding       | Auto-detection handles common cases; mapping file is progressive disclosure |
+| Format-specific importers (CSV → DB, BibTeX → DB)        | Fewer indirections                       | Duplicates validation logic; harder to test                    | Pipeline to NDJSON concentrates validation in one place                     |
 
 ## Consequences
 
