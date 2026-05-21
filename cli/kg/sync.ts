@@ -8,6 +8,8 @@
  * The actual DB path is `.khive/state/working.db` (gitignored).
  */
 
+import { loadConfig } from "../lib/config.ts";
+import { planEmbed, printEmbedPlan } from "../lib/embed.ts";
 import { EDGES_FILE, ensureStateDir, ENTITIES_FILE, WORKING_DB } from "../lib/paths.ts";
 import { countLines } from "../lib/ndjson.ts";
 import { printValidationResult, validate } from "./validate.ts";
@@ -102,7 +104,19 @@ export async function runSync(repoRoot: string, args: string[]): Promise<void> {
   // ── 3. Rebuild working.db ─────────────────────────────────────────────────
   await rebuildDb(repoRoot);
 
-  // ── 4. Report ─────────────────────────────────────────────────────────────
+  // ── 4. Embed step (ADR-057 §E3, Phase C1: plan only) ──────────────────────
+  // Per ADR-057 §5, sync runs the embed step AFTER rebuild so the working DB
+  // sees vectors when Phase C2 runtime is wired. In Phase C1 we only print
+  // the plan when `embed.auto_embed = true` and there is anything pending.
+  const config = await loadConfig(repoRoot);
+  if (config.embed.auto_embed) {
+    const plan = await planEmbed(repoRoot, config.embed);
+    if (plan.pending.length > 0 && !quiet) {
+      printEmbedPlan(plan);
+    }
+  }
+
+  // ── 5. Report ─────────────────────────────────────────────────────────────
   if (!quiet) {
     const entityCount = await countLines(`${repoRoot}/${ENTITIES_FILE}`);
     const edgeCount = await countLines(`${repoRoot}/${EDGES_FILE}`);

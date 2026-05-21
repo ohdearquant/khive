@@ -8,6 +8,8 @@
  */
 
 import { exec, getCurrentBranch, gitAdd, gitCommit } from "../lib/git.ts";
+import { loadConfig } from "../lib/config.ts";
+import { planEmbed, printEmbedPlan } from "../lib/embed.ts";
 import { EDGES_FILE, ensureStateDir, ENTITIES_FILE, SCHEMA_FILE } from "../lib/paths.ts";
 import { countLines } from "../lib/ndjson.ts";
 import { printValidationResult, validate } from "./validate.ts";
@@ -87,6 +89,18 @@ export async function runCommit(repoRoot: string, args: string[]): Promise<void>
     printValidationResult(validationResult);
     console.error("\nCommit aborted: fix validation errors first.");
     Deno.exit(1);
+  }
+
+  // ── 2b. Embed step (ADR-057 §E3, Phase C1: plan only) ─────────────────────
+  // When `embed.auto_embed = true` (the default), print an embed plan so
+  // commits surface entities awaiting vectorization. Embedding execution is
+  // Phase C2 — wired when `lattice-embed` is available.
+  const config = await loadConfig(repoRoot);
+  if (config.embed.auto_embed) {
+    const plan = await planEmbed(repoRoot, config.embed);
+    if (plan.pending.length > 0) {
+      printEmbedPlan(plan);
+    }
   }
 
   // ── 3. Stage KG files ─────────────────────────────────────────────────────

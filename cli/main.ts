@@ -8,6 +8,8 @@
 
 import { kgInit } from "./kg/mod.ts";
 import { runCommit } from "./kg/commit.ts";
+import { runConfig } from "./kg/config.ts";
+import { runEmbed } from "./kg/embed.ts";
 import { runSync } from "./kg/sync.ts";
 import { runStatus } from "./kg/status.ts";
 import { runValidate } from "./kg/validate.ts";
@@ -28,10 +30,9 @@ KG subcommands:
   commit        Validate NDJSON files + git commit (Phase C1; DB export is Phase C2)
   sync          Validate NDJSON + create working.db placeholder (Phase C1; DB rebuild is Phase C2)
   status        Show entity/edge counts and uncommitted changes (file-level; DB diff is Phase C2)
-  export        Export live DB to NDJSON files (Phase C2 — not yet implemented)
-  import        Import NDJSON files into working.db (Phase C2 — not yet implemented)
+  config        Show or modify .khive/config.toml (ADR-057)
+  embed         Plan / run entity embedding (ADR-057; Phase C1 plans, Phase C2 runs)
   diff          Entity-aware diff between two NDJSON states (Phase C2 — not yet implemented)
-  embed         Embed entities into working.db (Phase C2 — not yet implemented)
   update        Advance a remote pin in schema.yaml (Phase C2 — not yet implemented)
 
 Auth subcommands:
@@ -53,12 +54,11 @@ Subcommands (Phase C1 — file-level operations):
   commit        Validate + stage + git commit .khive/kg/ files
   sync          Validate NDJSON (DB rebuild: Phase C2)
   status        Show entity/edge counts and uncommitted changes
+  config        Show or modify .khive/config.toml
+  embed         Plan embedding for entities awaiting vectors (run: Phase C2)
 
 Planned (Phase C2+):
-  export        Export live DB to NDJSON files
-  import        Import NDJSON files into working.db
   diff          Entity-aware diff
-  embed         Embed entities for vector search
   update        Advance a remote pin`);
 }
 
@@ -97,10 +97,16 @@ async function dispatchKg(args: string[]): Promise<void> {
       await runValidate(await getRepoRoot());
       break;
 
+    case "config":
+      await runConfig(await getRepoRoot(), rest);
+      break;
+    case "embed":
+      await runEmbed(await getRepoRoot(), rest);
+      break;
+
     case "export":
     case "import":
     case "diff":
-    case "embed":
     case "update":
       console.error(
         `'khive kg ${subcommand}' is not yet implemented (phase E3 — v0.4+).`,

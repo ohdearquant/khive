@@ -1,6 +1,6 @@
 # ADR-057: CLI Configuration and Automatic Embedding
 
-**Status**: proposed\
+**Status**: accepted (Phase C1 — `lib/config.ts`, `khive kg config`, `khive kg embed` plan, and commit/sync embed-plan banner implemented; Phase C2 — `lattice-embed` runtime wiring deferred until the Rust embedding binary is available)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
@@ -270,7 +270,12 @@ The CLI validates both config files on startup against a built-in schema. Valida
 - `embed.dimensions` is a positive integer.
 - `embed.batch_size` is a positive integer.
 - `embed.fields.include` is a non-empty array of strings. Each string must be a valid entity
-  field name (`name`, `description`, or a key in the entity `properties` map).
+  field name: `name` and `description` are canonical top-level fields; any other string is
+  treated as a key in the entity `properties` map (the runtime reads it from
+  `entity.properties` at embed time). The reserved discriminant `kind` is explicitly
+  forbidden — it is a closed-taxonomy tag (ADR-001), not an embeddable text field.
+  Note: `embed.fields.include` is an array and cannot be set via `khive kg config set`;
+  edit `.khive/config.toml` directly to change it.
 - `schema.strict` is a boolean.
 - `embed.device` (global config only) is one of `metal`, `cuda`, `cpu`.
 
