@@ -352,7 +352,11 @@ pub struct VectorStoreCapabilities {
     /// Maximum supported embedding dimension, or None if unbounded.
     pub max_dimensions: Option<u32>,
     /// Index algorithms available in this backend.
-    pub index_kinds: &'static [VectorIndexKind],
+    ///
+    /// Owned `Vec` (not `&'static [...]`) so the type is `Serialize + Deserialize`.
+    /// Backends that return `&'static VectorStoreCapabilities` initialise via
+    /// `OnceLock` and populate this field at first access (zero allocation per call).
+    pub index_kinds: Vec<VectorIndexKind>,
 }
 ```
 
@@ -360,8 +364,14 @@ Example backend declarations (illustrative — not binding on the implementation
 
 | Backend                | filter | batch | quant | max_dims | index_kinds    |
 | ---------------------- | ------ | ----- | ----- | -------- | -------------- |
-| `SqliteVecStore`       | false  | false | false | 4096     | `[SqliteVec]`  |
+| `SqliteVecStore`       | false  | false | false | 8192     | `[SqliteVec]`  |
 | `HnswStore` (in-house) | true   | true  | true  | None     | `[Hnsw, Flat]` |
+
+Note on `max_dims` for `SqliteVecStore`: sqlite-vec 0.1.9 enforces
+`SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192` (sqlite-vec.c:3488). Dimensions above this
+are rejected at table creation. The value 4096 that appeared in earlier drafts of this
+ADR was the `SQLITE_VEC_VEC0_K_MAX` constant (max neighbours per query), not the
+dimension limit — a mismatch corrected here.
 
 ## Q1: Expanded VectorStore Trait
 
@@ -425,15 +435,16 @@ pub trait VectorStore: Send + Sync + 'static {
     /// Default returns a baseline capabilities struct with all optional features disabled,
     /// preserving backward compatibility for existing implementations.
     fn capabilities(&self) -> &'static VectorStoreCapabilities {
-        static BASELINE: VectorStoreCapabilities = VectorStoreCapabilities {
+        static BASELINE: OnceLock<VectorStoreCapabilities> = OnceLock::new();
+        BASELINE.get_or_init(|| VectorStoreCapabilities {
             supports_filter: false,
             supports_batch_search: false,
             supports_quantization: false,
             supports_update: false,
-            max_dimensions: Some(4096),
-            index_kinds: &[VectorIndexKind::SqliteVec],
-        };
-        &BASELINE
+            // sqlite-vec 0.1.9: SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192.
+            max_dimensions: Some(8192),
+            index_kinds: vec![VectorIndexKind::SqliteVec],
+        })
     }
 }
 ```

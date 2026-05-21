@@ -108,6 +108,50 @@ pub enum VectorIndexKind {
     Flat,
 }
 
+/// Backend capability declaration for vector stores (ADR-041).
+///
+/// Returned by [`VectorStore::capabilities`]. Higher-level retrieval policy
+/// (hybrid search, HyDE fan-out, etc.) introspects this struct at construction
+/// time to select the optimal code path without relying on error-type matching.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VectorStoreCapabilities {
+    /// Supports metadata pre-filter pushdown into the index scan.
+    pub supports_filter: bool,
+    /// Supports batch search (multiple query vectors in one call).
+    pub supports_batch_search: bool,
+    /// Supports quantization (reduces memory; may trade recall).
+    pub supports_quantization: bool,
+    /// Supports in-place update without a delete+insert round-trip.
+    pub supports_update: bool,
+    /// Maximum supported embedding dimension, or `None` if unbounded.
+    pub max_dimensions: Option<u32>,
+    /// Index algorithms available in this backend.
+    pub index_kinds: Vec<VectorIndexKind>,
+}
+
+/// A typed predicate for backend-pushable metadata filtering (ADR-041).
+///
+/// Intentionally minimal: namespace isolation and kind scoping cover the v0.2
+/// hybrid-search cases. Range predicates and compound logic are deferred to a
+/// future retrieval ADR. Adding fields is non-breaking (serde defaults); removing
+/// fields is not.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VectorMetadataFilter {
+    /// Restrict to these namespaces.
+    pub namespaces: Vec<String>,
+    /// Restrict to these substrate kinds.
+    pub kinds: Vec<SubstrateKind>,
+    /// Arbitrary key=value metadata predicates (equality only).
+    pub properties: Vec<(String, serde_json::Value)>,
+}
+
+impl VectorMetadataFilter {
+    /// Returns `true` when no predicates are set (filter is a no-op).
+    pub fn is_empty(&self) -> bool {
+        self.namespaces.is_empty() && self.kinds.is_empty() && self.properties.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorRecord {
     pub subject_id: Uuid,

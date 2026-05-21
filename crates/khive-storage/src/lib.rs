@@ -38,8 +38,8 @@ pub use types::{
     IndexRebuildScope, LinkId, NeighborHit, NeighborQuery, Page, PageRequest, PathNode,
     SortDirection, SortOrder, SqlIsolation, SqlRow, SqlStatement, SqlTxOptions, SqlValue,
     TextDocument, TextFilter, TextIndexStats, TextQueryMode, TextSearchHit, TextSearchRequest,
-    TimeRange, TraversalOptions, TraversalRequest, VectorRecord, VectorSearchHit,
-    VectorSearchRequest, VectorStoreInfo,
+    TimeRange, TraversalOptions, TraversalRequest, VectorIndexKind, VectorMetadataFilter,
+    VectorRecord, VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
 };
 
 pub use khive_types::{EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind};
