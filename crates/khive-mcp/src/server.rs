@@ -27,9 +27,7 @@ use rmcp::{
 use serde_json::{json, Value};
 
 use khive_request::{parse_request, DslError, ParsedOp};
-use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
-
-use crate::pack::{DialectRegistrar, KgDialect};
+use khive_runtime::{KhiveRuntime, PackRegistry, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 
 use crate::tools::request::RequestParams;
 
@@ -70,7 +68,7 @@ impl std::fmt::Display for PackRegError {
                 f,
                 "unknown pack name {:?} — built-in packs: {}",
                 unknown,
-                BUILTIN_PACKS.join(", ")
+                builtin_pack_names().join(", ")
             ),
             PackRegFailure::Registry(source) => write!(f, "pack registry build failed: {source}"),
         }
@@ -81,9 +79,11 @@ impl std::error::Error for PackRegError {}
 
 /// Built-in pack names known to this binary.
 ///
-/// Sourced from the `KgDialect` registrar so this constant and the error
-/// messages in `with_packs` stay in sync without any manual bookkeeping.
-pub const BUILTIN_PACKS: &[&str] = KgDialect::pack_names();
+/// Sourced from `PackRegistry::discovered_names()` so the list always reflects
+/// whatever pack crates are linked into the binary (ADR-063).
+pub fn builtin_pack_names() -> Vec<&'static str> {
+    PackRegistry::discovered_names()
+}
 
 impl KhiveMcpServer {
     /// Build a server using the pack list from `runtime.config().packs`.
@@ -110,10 +110,14 @@ impl KhiveMcpServer {
             if let Ok(event_store) = recovered_runtime.events(None) {
                 builder.with_event_store(event_store);
             }
-            // Fallback: register the kg pack through the dialect registrar so
+            // Fallback: register the kg pack through the inventory registry so
             // this code path stays free of direct pack-type imports.
-            KgDialect::register("kg", recovered_runtime.clone(), &mut builder)
-                .expect("kg is a known pack name");
+            PackRegistry::register_packs(
+                &["kg".to_string()],
+                recovered_runtime.clone(),
+                &mut builder,
+            )
+            .expect("kg is a known pack name");
             let registry = builder.build().expect("fallback kg registry builds");
             recovered_runtime.install_edge_rules(registry.all_edge_rules());
             Self { registry }
@@ -135,17 +139,11 @@ impl KhiveMcpServer {
         if let Ok(event_store) = runtime.events(None) {
             builder.with_event_store(event_store);
         }
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for name in packs {
-            if !seen.insert(name.as_str()) {
-                continue;
-            }
-            if let Err(unknown) = KgDialect::register(name, runtime.clone(), &mut builder) {
-                return Err(PackRegError {
-                    failure: PackRegFailure::UnknownPack(unknown),
-                    runtime,
-                });
-            }
+        if let Err(unknown) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
+            return Err(PackRegError {
+                failure: PackRegFailure::UnknownPack(unknown),
+                runtime,
+            });
         }
         let registry = builder.build().map_err(|source| PackRegError {
             failure: PackRegFailure::Registry(source),
@@ -280,10 +278,11 @@ fn dsl_err_to_mcp(e: DslError) -> McpError {
 impl ServerHandler for KhiveMcpServer {
     fn get_info(&self) -> ServerInfo {
         let catalog = self.verb_catalog();
+        let builtins = builtin_pack_names().join(", ");
         let instructions = format!(
             "khive — request-only MCP surface (ADR-020 + ADR-027). One tool, `request`, \
              dispatches verbs through the loaded pack registry. Configure packs via \
-             KHIVE_PACKS or --pack (built-ins: kg, gtd). Verbs registered on this \
+             KHIVE_PACKS or --pack (built-ins: {builtins}). Verbs registered on this \
              server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
              plugin's SKILL.md files."
         );

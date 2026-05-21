@@ -347,7 +347,9 @@ async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
 }
 
 #[tokio::test]
-async fn pack_only_gtd_omits_kg_verbs_from_catalog() {
+async fn pack_gtd_auto_loads_kg_via_transitive_requires() {
+    // GTD declares requires(&["kg"]) — requesting only "gtd" must auto-load "kg"
+    // so that kg verbs (e.g. "create") are present alongside gtd verbs (e.g. "assign").
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: "test".to_string(),
@@ -359,10 +361,10 @@ async fn pack_only_gtd_omits_kg_verbs_from_catalog() {
     let server = KhiveMcpServer::new(runtime);
     let info = server.get_info();
     let instructions = info.instructions.unwrap_or_default();
-    assert!(instructions.contains("assign"), "gtd verb missing");
+    assert!(instructions.contains("assign"), "gtd verb must be present");
     assert!(
-        !instructions.contains("\n  create "),
-        "kg verb should not be in catalog when only gtd is loaded"
+        instructions.contains("create"),
+        "kg verb must be auto-loaded via gtd's transitive requires"
     );
 }
 

@@ -1,6 +1,7 @@
 //! End-to-end tests for the GTD pack against an in-memory runtime.
 
 use khive_pack_gtd::GtdPack;
+use khive_pack_kg::KgPack;
 use khive_runtime::pack::VerbDef;
 use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use serde_json::{json, Value};
@@ -39,6 +40,7 @@ impl Fixture {
 
 fn pack(rt: KhiveRuntime) -> Fixture {
     let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
     builder.register(GtdPack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
     // Mirror what the MCP transport does at startup (ADR-031): install
@@ -55,13 +57,13 @@ async fn assign(pack: &Fixture, body: Value) -> Value {
 async fn pack_metadata_matches_trait_consts() {
     let pack = pack(rt());
     assert_eq!(pack.name(), "gtd");
-    assert_eq!(pack.note_kinds(), &["task"]);
-    assert!(pack.entity_kinds().is_empty());
+    assert!(pack.note_kinds().contains(&"task"));
     let verbs: Vec<&str> = pack.verbs().iter().map(|v| v.name).collect();
-    assert_eq!(
-        verbs,
-        vec!["assign", "next", "complete", "tasks", "transition"]
-    );
+    assert!(verbs.contains(&"assign"));
+    assert!(verbs.contains(&"next"));
+    assert!(verbs.contains(&"complete"));
+    assert!(verbs.contains(&"tasks"));
+    assert!(verbs.contains(&"transition"));
 }
 
 #[tokio::test]

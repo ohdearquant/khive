@@ -161,6 +161,17 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// Register a boxed pack directly (ADR-063).
+    ///
+    /// Crate-private: only [`PackRegistry::register_packs`] should call this.
+    /// External callers must use the typed [`Self::register`] which enforces the
+    /// `Pack + PackRuntime` dual-impl contract at the call site.  Here the
+    /// contract is satisfied upstream at the [`PackFactory::create`] site.
+    pub(crate) fn register_boxed(&mut self, pack: Box<dyn PackRuntime>) -> &mut Self {
+        self.packs.push(pack);
+        self
+    }
+
     /// Set the authorization gate consulted on every dispatch (ADR-029).
     ///
     /// Defaults to `AllowAllGate` if not set. In v0.2 the gate is **advisory** —
@@ -564,6 +575,114 @@ impl VerbRegistry {
             .iter()
             .flat_map(|p| p.edge_rules().iter().copied())
             .collect()
+    }
+}
+
+// ── ADR-063: inventory-based dynamic pack loading ─────────────────────────────
+
+/// Factory for creating pack instances registered via `inventory` at link time
+/// (ADR-063). Each pack crate submits a `&'static dyn PackFactory` wrapped in a
+/// [`PackRegistration`]; the binary's linker collects them all into a single
+/// slice iterable at runtime.
+///
+/// Implementors must be `Send + Sync + 'static` because the registry is built
+/// once and shared across async tasks.
+pub trait PackFactory: Send + Sync + 'static {
+    /// Canonical lowercase name for this pack (e.g. `"kg"`, `"gtd"`).
+    fn name(&self) -> &'static str;
+
+    /// Names of packs that must be loaded before this one (ADR-037).
+    ///
+    /// Defaults to empty so pack crates that have no dependencies compile
+    /// without changes. [`PackRegistry::register_packs`] uses this to compute
+    /// the transitive closure of required packs before registering anything.
+    fn requires(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Create a new pack instance for the given runtime.
+    fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime>;
+}
+
+/// Newtype wrapper collected by `inventory` so pack crates can submit
+/// `&'static dyn PackFactory` references without the type-ascription syntax
+/// that `inventory::submit!` does not support for bare trait-object references
+/// (ADR-063).
+pub struct PackRegistration(pub &'static dyn PackFactory);
+
+inventory::collect!(PackRegistration);
+
+/// Registry of pack factories discovered via `inventory` at link time (ADR-063).
+///
+/// No instance is needed — all methods are associated functions that walk the
+/// globally-collected [`PackRegistration`] slice.
+pub struct PackRegistry;
+
+impl PackRegistry {
+    /// Names of all pack factories discovered via `inventory`.
+    pub fn discovered_names() -> Vec<&'static str> {
+        inventory::iter::<PackRegistration>
+            .into_iter()
+            .map(|r| r.0.name())
+            .collect()
+    }
+
+    /// Register the named packs into `builder` using the supplied `runtime`.
+    ///
+    /// Resolves transitive `requires()` dependencies declared on each
+    /// [`PackFactory`] before registering anything. A pack that declares
+    /// `requires = &["kg"]` will cause `"kg"` to be included even if the caller
+    /// only asked for `"gtd"`.  The [`VerbRegistryBuilder::build`] topo-sort
+    /// then ensures correct load order.
+    ///
+    /// Returns `Ok(())` when all names (including their transitive deps) are
+    /// recognised; returns `Err(name)` for the first unrecognised name so
+    /// callers can surface a clear error.
+    pub fn register_packs(
+        names: &[String],
+        runtime: KhiveRuntime,
+        builder: &mut VerbRegistryBuilder,
+    ) -> Result<(), String> {
+        // Build a name→factory index once.
+        let all: Vec<&'static dyn PackFactory> = inventory::iter::<PackRegistration>
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        let factory_for = |name: &str| -> Option<&'static dyn PackFactory> {
+            all.iter().copied().find(|f| f.name() == name)
+        };
+
+        // BFS transitive closure: start with the explicitly requested names,
+        // then walk each factory's requires() to pull in dependencies.
+        let mut full_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+
+        for name in names {
+            queue.push_back(name.as_str());
+        }
+
+        while let Some(name) = queue.pop_front() {
+            if !full_set.insert(name) {
+                continue; // already visited
+            }
+            let factory = factory_for(name).ok_or_else(|| name.to_string())?;
+            for &dep in factory.requires() {
+                if !full_set.contains(dep) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        // Register every pack in the resolved set; VerbRegistryBuilder::build()
+        // performs the topo-sort, so insertion order here does not matter.
+        for name in &full_set {
+            // factory_for cannot fail here: every name in full_set passed the
+            // lookup above without returning Err.
+            let factory = factory_for(name).unwrap();
+            builder.register_boxed(factory.create(runtime.clone()));
+        }
+
+        Ok(())
     }
 }
 

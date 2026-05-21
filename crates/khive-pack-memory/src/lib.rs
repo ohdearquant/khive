@@ -41,6 +41,26 @@ impl MemoryPack {
     }
 }
 
+// ── ADR-063: inventory self-registration ─────────────────────────────────────
+
+struct MemoryPackFactory;
+
+impl khive_runtime::PackFactory for MemoryPackFactory {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    fn requires(&self) -> &'static [&'static str] {
+        &["kg"]
+    }
+
+    fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
+        Box::new(MemoryPack::new(runtime))
+    }
+}
+
+inventory::submit! { khive_runtime::PackRegistration(&MemoryPackFactory) }
+
 #[async_trait]
 impl PackRuntime for MemoryPack {
     fn name(&self) -> &str {

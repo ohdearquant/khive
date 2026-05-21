@@ -39,7 +39,10 @@ pub use khive_gate::{
     GateRef, GateRequest, Obligation,
 };
 pub use operations::Resolved;
-pub use pack::{KindHook, PackRuntime, VerbRegistry, VerbRegistryBuilder};
+pub use pack::{
+    KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
+    VerbRegistryBuilder,
+};
 pub use portability::{ImportSummary, KgArchive};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{parse_pack_list, KhiveRuntime, RuntimeConfig};

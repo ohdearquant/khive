@@ -39,6 +39,7 @@ impl Pack for GtdPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const VERBS: &'static [VerbDef] = &GTD_VERBS;
     const EDGE_RULES: &'static [EdgeEndpointRule] = &GTD_EDGE_RULES;
+    const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
 /// ADR-031: GTD opts task notes into `depends_on` between tasks. The base
@@ -92,6 +93,26 @@ impl GtdPack {
     }
 }
 
+// ── ADR-063: inventory self-registration ─────────────────────────────────────
+
+struct GtdPackFactory;
+
+impl khive_runtime::PackFactory for GtdPackFactory {
+    fn name(&self) -> &'static str {
+        "gtd"
+    }
+
+    fn requires(&self) -> &'static [&'static str] {
+        &["kg"]
+    }
+
+    fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
+        Box::new(GtdPack::new(runtime))
+    }
+}
+
+inventory::submit! { khive_runtime::PackRegistration(&GtdPackFactory) }
+
 #[async_trait]
 impl PackRuntime for GtdPack {
     fn name(&self) -> &str {
@@ -112,6 +133,10 @@ impl PackRuntime for GtdPack {
 
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
         <GtdPack as Pack>::EDGE_RULES
+    }
+
+    fn requires(&self) -> &'static [&'static str] {
+        <GtdPack as Pack>::REQUIRES
     }
 
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {

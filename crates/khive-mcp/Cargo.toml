@@ -11,7 +11,10 @@ description = "khive stdio MCP server — the only user-facing Rust binary"
 [dependencies]
 khive-runtime = { version = "0.1.4", path = "../khive-runtime" }
 khive-request = { version = "0.1.4", path = "../khive-request" }
-khive-dialect-kg = { version = "0.1.4", path = "../khive-dialect-kg" }
+khive-pack-kg = { version = "0.1.4", path = "../khive-pack-kg" }
+khive-pack-gtd = { version = "0.1.4", path = "../khive-pack-gtd" }
+khive-pack-memory = { version = "0.1.4", path = "../khive-pack-memory" }
+inventory = { workspace = true }
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 tokio = { workspace = true }
 futures = "0.3"

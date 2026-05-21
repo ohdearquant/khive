@@ -103,6 +103,22 @@ impl KgPack {
     }
 }
 
+// ── ADR-063: inventory self-registration ─────────────────────────────────────
+
+struct KgPackFactory;
+
+impl khive_runtime::PackFactory for KgPackFactory {
+    fn name(&self) -> &'static str {
+        "kg"
+    }
+
+    fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
+        Box::new(KgPack::new(runtime))
+    }
+}
+
+inventory::submit! { khive_runtime::PackRegistration(&KgPackFactory) }
+
 #[async_trait]
 impl PackRuntime for KgPack {
     fn name(&self) -> &str {
