@@ -12,18 +12,14 @@ invoke any verb on any namespace. This is fine for a personal local server but i
 1. **Multi-tenant deployments** — a single khive process serving more than one user or agent.
 2. **Compliance-bound workloads** — SOC2, FedRAMP, financial — where "who did what" must be
    auditable and gated by policy.
-3. **Cloud product** (`khive-cloud`, BUSL-1.1) — already has a capability-based gate using
-   `lion-core` (formally verified microkernel, AGPL-3.0). Today that gate is fully internal;
-   lifting it into OSS verbatim drags either AGPL or BUSL into Apache-2.0 OSS.
 
-Two design forces apply:
+Design forces:
 
-- **License boundary.** khive-oss is Apache-2.0. Anything that depends on `lion-core` (AGPL) or
-  `khive-cloud-gate` (BUSL) cannot be Apache-licensed. We need a trait in OSS and impls
-  downstream, not impls in OSS.
+- **License boundary.** khive is Apache-2.0. Any downstream impl with a different license must
+  not be required by the OSS crate. We need a trait in OSS and impls downstream.
 - **Policy language.** Rego (Open Policy Agent) is the established cross-industry policy
   language; a Rust engine exists (`regorus`). Standardizing on Rego makes policies portable
-  across deployments and across tiers (OSS, cloud, on-prem).
+  across deployments.
 
 This ADR introduces a pluggable gate trait + permissive default, leaving impl bodies to
 downstream crates per their licensing.
@@ -81,19 +77,14 @@ logs deny reasons but does not yet block. v0.3 makes the gate authoritative (den
 
 ### Three impl paths (only the first ships in this ADR)
 
-| Impl                                                         | Crate              | License    | Status                                        |
-| ------------------------------------------------------------ | ------------------ | ---------- | --------------------------------------------- |
-| `AllowAllGate`                                               | `khive-gate`       | Apache-2.0 | shipped (this ADR)                            |
-| `RegoGate` (regorus-backed)                                  | `khive-gate-rego`  | Apache-2.0 | shipped (ADR-032)                             |
-| `LionGate<G: Gate>` (capability witnesses, wraps any `Gate`) | `khive-cloud-gate` | BUSL-1.1   | exists in khive-cloud; migrates to this trait |
+| Impl                        | Crate             | License    | Status             |
+| --------------------------- | ----------------- | ---------- | ------------------ |
+| `AllowAllGate`              | `khive-gate`      | Apache-2.0 | shipped (this ADR) |
+| `RegoGate` (regorus-backed) | `khive-gate-rego` | Apache-2.0 | shipped (ADR-032)  |
 
 Each impl ships as a sibling crate so consumers opt in by adding the dep rather than toggling a
-feature flag. Same shape as the `khive-pack-*` series.
-
-The composition story: `LionGate<RegoGate>` is the production cloud stack — Rego authors the
-policy, `lion-core` verifies the dispatch chain at the type level via `Authorized<Op>` witness
-types. The OSS user gets Rego enforcement standalone via `RegoGate`. Both consume the same
-policies.
+feature flag. Same shape as the `khive-pack-*` series. Downstream consumers can implement the
+trait against their own policy engine without modifying OSS.
 
 ### Obligations are advisory in v0.2
 
@@ -129,7 +120,7 @@ the shape in this ADR makes it explicit.
 Wiring the check is the change that touches every dispatch site. Making it advisory first lets
 us:
 
-- Verify the trait shape against the `khive-cloud-gate` migration.
+- Verify the trait shape against downstream consumers.
 - Generate audit data for policy authors to write against.
 - Reverse course in v0.3 without churning the trait shape.
 
@@ -146,23 +137,20 @@ today is the wrong default.
 
 ## Alternatives Considered
 
-| Alternative                             | Pros                                 | Cons                                                         | Why rejected                                |
-| --------------------------------------- | ------------------------------------ | ------------------------------------------------------------ | ------------------------------------------- |
-| Lift cloud-gate impl into OSS           | One implementation, less duplication | Forces AGPL (via lion-core) on khive-oss                     | One-way relicense; kills casual adoption    |
-| Relicense khive-oss to AGPL             | Allows lion-core in OSS              | Breaks Apache-2.0 dependents; deters Google/AWS internal use | Strategic loss for marginal gain            |
-| Build homegrown policy DSL              | Full control over shape              | Re-invents OPA; non-portable policies                        | Rego ecosystem too large to ignore          |
-| Bake auth into existing namespace check | Smallest change                      | Couples auth to storage; no policy authoring story           | Doesn't generalize beyond namespace scoping |
-| Skip auth entirely in OSS               | Smallest surface                     | Blocks production deployments; cloud has nothing to inherit  | Real users (hosted khive.ai) need this seam |
-| Async-only `Gate` trait                 | Future-proof for async backends      | Forces async-runtime onto sync callers (CLI, FFI)            | No known async impl; widen later if needed  |
+| Alternative                             | Pros                            | Cons                                               | Why rejected                                |
+| --------------------------------------- | ------------------------------- | -------------------------------------------------- | ------------------------------------------- |
+| Build homegrown policy DSL              | Full control over shape         | Re-invents OPA; non-portable policies              | Rego ecosystem too large to ignore          |
+| Bake auth into existing namespace check | Smallest change                 | Couples auth to storage; no policy authoring story | Doesn't generalize beyond namespace scoping |
+| Skip auth entirely in OSS               | Smallest surface                | Blocks production multi-tenant deployments         | Real users need this seam                   |
+| Async-only `Gate` trait                 | Future-proof for async backends | Forces async-runtime onto sync callers (CLI, FFI)  | No known async impl; widen later if needed  |
 
 ## Consequences
 
 ### Positive
 
-- khive-oss can grow real authorization without relicensing.
-- Cloud-gate (BUSL) and any future capability-witness impls (AGPL or otherwise) plug in via the
-  trait.
-- Rego compatibility means policies are portable — write once, run in OSS or cloud.
+- khive can grow real authorization without forcing a single impl.
+- Downstream consumers plug in their own gate impls via the trait.
+- Rego compatibility means policies are portable across deployments.
 - Audit obligations have a defined shape before the audit subsystem ships.
 - The single-tool surface ([ADR-027](ADR-027-single-tool-mcp-surface.md)) makes gate wiring
   trivial — one dispatch site to consult the gate.
@@ -202,7 +190,6 @@ today is the wrong default.
 | Re-export gate types from `khive-runtime`          | `crates/khive-runtime/src/lib.rs`             | done                 |
 | Dispatch-site gate consultation (advisory)         | `crates/khive-runtime/src/pack.rs` (registry) | done                 |
 | `khive-gate-rego` crate (`RegoGate`)               | `crates/khive-gate-rego/`                     | done (ADR-032)       |
-| `LionGate<G>` migration in khive-cloud             | `khive-cloud/crates/gate/`                    | planned (cloud-side) |
 | Audit envelope (`AuditEvent` via tracing)          | `crates/khive-gate/src/lib.rs` (type)         | accepted (ADR-033)   |
 | Hard enforcement (deny → dispatch error)           | `crates/khive-runtime/src/pack.rs`            | accepted (ADR-035)   |
 
@@ -230,4 +217,3 @@ today is the wrong default.
   lands)
 - Open Policy Agent / Rego: <https://www.openpolicyagent.org/docs/latest/policy-language/>
 - `regorus` Rust Rego engine: <https://github.com/microsoft/regorus>
-- `lion-core` (referenced for the cloud impl): <https://crates.io/crates/lion-core>

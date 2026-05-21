@@ -43,7 +43,7 @@ This ADR covers the **format and local lifecycle** of declarative packs: what a 
 how it is installed into a project, how the runtime loads it, and how the CLI manages it. It does
 not cover:
 
-- Registry authentication, publishing, or search (cloud ADR-033)
+- Registry authentication, publishing, or search (out of scope)
 - Pack versioning constraints between packs (inter-pack semver; future work)
 - Dynamic loading of pack code (packs are vocabulary, not arbitrary code; Rust packs remain
   the extension point for custom verb handlers)
@@ -466,12 +466,13 @@ The workflow fails if any pack cannot be resolved or if vocabulary conflicts exi
 | P1    | `pack.yaml` manifest format specification + `khive pack check` validator                      | v0.3           |
 | P2    | `schema.yaml#packs` section + vocabulary merging in `khive pack validate`                     | v0.3           |
 | P3    | `khive pack init` + `khive pack install` (local path only, no registry)                       | v0.4           |
-| P4    | Pack cache + `khive pack install` from registry and git (requires cloud ADR-033 for registry) | v0.5           |
-| P5    | `khive pack publish` (requires cloud ADR-033 authentication)                                  | v0.5           |
+| P4    | Pack cache + `khive pack install` from registry and git (registry out of scope here)          | v0.5           |
+| P5    | `khive pack publish` (registry out of scope here)                                             | v0.5           |
 
 P1 and P2 are independently shippable and establish the format contract. Third-party tools can
 validate and author `pack.yaml` files before `khive pack install` exists. P3 enables the local
-development workflow. P4 and P5 are cloud-dependent.
+development workflow. P4 and P5 depend on a separate registry surface that is not covered by
+this ADR.
 
 ## Rationale
 
@@ -656,9 +657,9 @@ The schema is committed at `deno/src/pack/pack-schema.json` and validates:
 - Format patterns for `name` and kind strings
 - Structural constraints on `edge_endpoints` entries
 
-The same JSON Schema is published at `https://khive.ai/schemas/pack/v1.json` (cloud ADR-033
-responsibility) so external editors (VS Code YAML extension, etc.) can validate `pack.yaml`
-files with `# yaml-language-server: $schema=https://khive.ai/schemas/pack/v1.json`.
+The same JSON Schema may be published to a public URL by downstream registries so external
+editors (VS Code YAML extension, etc.) can validate `pack.yaml` via
+`# yaml-language-server: $schema=...`. Registry hosting is out of scope for this ADR.
 
 ### Phasing detail
 

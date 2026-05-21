@@ -857,19 +857,14 @@ relation type.
 new entity, all its edges appear as a contiguous block of added lines. Sorting by `edge_id` (UUID)
 would scatter related edges randomly through the file.
 
-### D6: Remote fetch — GitHub API for cloud, sparse checkout for CLI
+### D6: Remote fetch — sparse checkout for CLI
 
-**Decision**: Two fetch backends, selected by environment:
+**Decision**: The CLI (`khive kg import --resolve-remotes`) uses `git sparse-checkout` to fetch
+only the `.khive/kg/` directory from the remote repo at the pinned commit. Requires git on PATH.
+Cached in `.khive/kg/.remote-cache/<remote>-<sha>/`.
 
-- **CLI (`khive kg import --resolve-remotes`)**: Uses `git sparse-checkout` to fetch only the
-  `.khive/kg/` directory from the remote repo at the pinned commit. Requires git on PATH. Cached
-  in `.khive/kg/.remote-cache/<remote>-<sha>/`.
-- **Cloud (khive.ai hosted)**: Uses GitHub Contents API (`GET /repos/:owner/:repo/contents/.khive/kg/entities.ndjson?ref=<sha>`)
-  with OAuth token. No git binary required on the server.
-
-Both backends produce the same output: a local copy of the remote's `entities.ndjson` +
-`edges.ndjson` + `schema.yaml` at the pinned commit. The `import.rs` code is backend-agnostic —
-it reads files from a path, regardless of how they got there.
+The `import.rs` code is backend-agnostic — it reads files from a path, regardless of how they
+got there.
 
 ### D7: Namespace as explicit verb parameter
 
@@ -881,13 +876,14 @@ query parameter through as this verb parameter.
 search(type="entity", kind="concept", query="LoRA", namespace="lattice")
 ```
 
-**Rationale**: Cloud serves multiple projects through a single gateway process. Per-process
-namespace isolation (one khive-mcp per namespace) is too heavy. Per-call namespace is stateless,
-composable with batch requests, and consistent with the existing `namespace` column in the DB.
+**Rationale**: A multi-project gateway serves multiple namespaces through a single process.
+Per-process namespace isolation (one `khive-mcp` per namespace) is too heavy. Per-call namespace
+is stateless, composable with batch requests, and consistent with the existing `namespace` column
+in the DB.
 
 The verb-level namespace param is enforced in `khive-runtime` — it validates that the caller has
-access to the requested namespace (in OSS: always allowed; in cloud: checked against API key
-scope from ADR-029's Gate trait).
+access to the requested namespace via ADR-029's Gate trait (the default `AllowAllGate` permits
+everything; downstream gates may scope by API key or actor).
 
 ## References
 

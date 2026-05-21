@@ -102,9 +102,6 @@ strict = true                   # --schema-mode strict on import (default: true)
 [embed]
 model = "mE5-small"             # default model for new projects
 device = "metal"                # inference device: metal | cuda | cpu
-
-[auth]
-api_url = "https://api.khive.ai"  # khive.ai API endpoint (overrides ADR-051 default)
 ```
 
 Only keys that diverge from the built-in defaults need to be present in either file.
@@ -120,7 +117,6 @@ Only keys that diverge from the built-in defaults need to be present in either f
 | `embed.fields.include` | `["name", "description"]` |
 | `schema.strict`        | `true`                    |
 | `embed.device`         | `cpu`                     |
-| `auth.api_url`         | `https://api.khive.ai`    |
 
 ### 3. Why TOML
 
@@ -138,7 +134,7 @@ defaults are explicit and reviewable in PRs:
 ```toml
 # .khive/config.toml — project KG configuration
 # Committed to git. All collaborators use these settings.
-# See: https://khive.ai/docs/adr/ADR-057
+# See: docs/adr/ADR-057-cli-configuration-and-embedding.md
 
 [embed]
 model = "mE5-small"
@@ -422,7 +418,6 @@ const DEFAULTS: KhiveConfig = {
     fields: { include: ["name", "description"] },
   },
   schema: { strict: true },
-  auth: { api_url: "https://api.khive.ai" },
 };
 
 export async function loadConfig(projectRoot: string): Promise<KhiveConfig> {

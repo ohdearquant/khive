@@ -181,10 +181,10 @@ Authorization: Bearer khive-sk-abc123
 → list(kind="entity", namespace="lambda:khive", ...)
 ```
 
-**Future — OAuth (multi-tenant):** When khive moves to multi-tenant SaaS, OAuth 2.0 access tokens
-replace API keys. The namespace resolution function becomes a DB lookup against the tenant store.
-The HTTP layer does not change; only `auth/keys.ts` is replaced. This is a cloud middleware
-concern (ADR-034 was rejected for OSS; identity management is a cloud middleware concern).
+**Future — OAuth (multi-tenant):** A multi-tenant deployment can replace API keys with OAuth 2.0
+access tokens. The namespace resolution function becomes a DB lookup against the tenant store.
+The HTTP layer does not change; only `auth/keys.ts` is replaced. Identity management is a
+downstream/middleware concern and is out of scope for this ADR.
 
 ### D4: CORS policy
 
@@ -340,9 +340,8 @@ Next.js frontend needs idiomatic REST for:
 
 OAuth requires a tenant store, a redirect flow, and session management — all absent in v0.1.
 API keys are a one-file config change and are sufficient for single-tenant and early multi-tenant
-use. The auth module is isolated in `auth/keys.ts` so the OAuth replacement (a cloud middleware
-concern — ADR-034 was rejected for OSS; identity/session handling is a cloud middleware concern) does not
-touch route handlers.
+use. The auth module is isolated in `auth/keys.ts` so a future OAuth replacement does not
+touch route handlers. Identity/session handling is out of scope for this ADR.
 
 ### Why WebSocket / SSE is deferred to phase 2
 
@@ -381,8 +380,8 @@ event feature.
 - Local dev auth (`KHIVE_AUTH_DISABLED=true`) is a footgun if accidentally enabled in
   production. Documentation and deployment tooling must make this configuration visible.
 - The `auth/keys.ts` file-based key store is a temporary solution. It does not support key
-  rotation, expiry, or per-key rate limiting without manual file edits. Replacement is a cloud
-  middleware concern (ADR-034 was rejected for OSS).
+  rotation, expiry, or per-key rate limiting without manual file edits. A persistent
+  key/identity store is out of scope for this ADR.
 
 ### Neutral
 
@@ -416,8 +415,7 @@ starts the server, issues one request per route group, and asserts `200 OK` or `
    spec standardizes an HTTP transport, the client module (`mcp/client.ts`) switches to it
    without touching route handlers.
 2. **Rate limiting.** `Obligation::RateLimit` from ADR-029 is not enforced at the HTTP layer
-   in v0.1. Enforcement is a cloud middleware concern (ADR-034 was rejected for OSS); when rate limiting
-   lands, the Hono middleware layer is the natural insertion point.
+   in v0.1. When rate limiting lands, the Hono middleware layer is the natural insertion point.
 3. **Request ID / tracing.** The server should propagate a request ID header
    (`X-Request-Id`) into `GateContext.session_id` for correlation with audit events. Not
    specified here; deferred to the audit observability work.
@@ -435,8 +433,6 @@ starts the server, issues one request per route group, and asserts `200 OK` or `
   site that HTTP calls route through
 - [ADR-029](ADR-029-authorization-gate.md): Authorization gate — gate evaluation (DENY → 403)
   happens inside `khive-mcp`, not in the HTTP layer
-- [ADR-034](ADR-034-identity-session-metering-hooks.md): Identity, session, metering —
-  rejected for OSS; OAuth/session/metering are cloud middleware concerns, not OSS gate traits
 - [ADR-038](ADR-038-events-surface.md): Events surface — prerequisite for the WebSocket/SSE
   event stream (phase 2)
 - Hono: <https://hono.dev>

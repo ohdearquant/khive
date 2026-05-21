@@ -18,9 +18,9 @@ through the verb surface**. The `list` verb's `kind` discriminator in `khive-pac
 (`crates/khive-pack-kg/src/handlers.rs`, `resolve_kind_spec`) handles `"entity"`, `"note"`, and
 `"edge"` — not `"event"`. As a result:
 
-- A downstream metering daemon (ADR-034 was rejected; metering is a cloud middleware concern)
-  that wants to poll `EventStore` for audit events has no MCP path — it must reach into the DB
-  directly, bypassing the namespace isolation contract (CLAUDE.md §"Namespace isolation").
+- A downstream audit consumer that wants to poll `EventStore` for audit events has no MCP
+  path — it must reach into the DB directly, bypassing the namespace isolation contract
+  (CLAUDE.md §"Namespace isolation").
 - An observability dashboard that wants to answer "how many deny events in the last hour?" has no
   verb to call.
 - Every consumer of audit data either duplicates access logic or couples to SQLite internals —
@@ -204,10 +204,10 @@ index-backed filtering, the `EventFilter` can be extended under a semver bump.
 
 The four single-column indexes that exist today cannot serve `WHERE namespace = ? ORDER BY
 created_at DESC` without a file sort. On a fresh deployment this is invisible. On a deployment
-that has accumulated thousands of events — the metering daemon ADR-034 anticipated (design was rejected; metering is cloud middleware) — it degrades
-to a full table scan with sort. The composite index is a one-line DDL addition with no schema
-risk; deferring it means every deployment that grows to non-trivial event counts hits the
-degradation before a migration is available.
+that has accumulated thousands of audit events, it degrades to a full table scan with sort.
+The composite index is a one-line DDL addition with no schema risk; deferring it means every
+deployment that grows to non-trivial event counts hits the degradation before a migration is
+available.
 
 ### Why `create/update/delete` over events return errors rather than silently no-op
 
@@ -226,7 +226,7 @@ delete succeeded (it would return not-found if the UUID-resolution path simply s
 | Expose `count(kind="event", group_by=...)` now   | Dashboard convenience                    | Requires new GROUP BY path in `SqlEventStore`; disproportionate to OSS use case                                                                                                   | Deferred to v0.2; client-side aggregation is sufficient at OSS event volumes                   |
 | Post-query outcome filter (this ADR's D2 choice) | No `EventFilter` semver bump             | Full page scanned before filtering when outcome narrows significantly                                                                                                             | Accepted for v0.1: deny volumes are small; a future semver bump can add index-backed filtering |
 | Index-backed outcome filter in `EventFilter` now | DB-level precision                       | Breaking change to `EventFilter`; semver event for all `khive-storage` consumers                                                                                                  | Defer to v0.2 when volume justifies it                                                         |
-| Skip composite index until needed                | Zero migration complexity                | Predictable query degradation as event tables grow; prevents audit/metering consumers from being efficient (ADR-034 rejected; audit polling is OSS, metering is cloud middleware) | One-line DDL addition now prevents all deployments from hitting the degradation                |
+| Skip composite index until needed                | Zero migration complexity                | Predictable query degradation as event tables grow; prevents audit consumers from being efficient                                                                                 | One-line DDL addition now prevents all deployments from hitting the degradation                |
 
 ## Consequences
 
@@ -234,9 +234,8 @@ delete succeeded (it would return not-found if the UUID-resolution path simply s
 
 - The Event substrate becomes fully first-class: created, queryable, and discoverable through
   the same verb surface as Notes and Entities.
-- Downstream audit consumers (ADR-034 rejected — metering is cloud middleware; audit events
-  remain in OSS) can poll `list(kind="event", verb="...", since=...)` via MCP without coupling
-  to SQLite internals.
+- Downstream audit consumers can poll `list(kind="event", verb="...", since=...)` via MCP
+  without coupling to SQLite internals.
 - The `Resolved::Event` variant in `operations.rs` (previously unreachable from `get`) becomes
   active — `get(id=<event_uuid>)` returns the event record.
 - The composite index on `(namespace, created_at DESC)` eliminates file sorts on the dominant
@@ -292,7 +291,6 @@ migration which touches `khive-db`). The `EventFilter` type is used as-is from
 - [ADR-023](ADR-023-verb-consolidated-mcp-surface.md): Verb-consolidated surface — §"Versioning tools" (anticipates `kind="event"`); `kind=` discriminant spec; `ListParams` shape
 - [ADR-027](ADR-027-single-tool-mcp-surface.md): Single tool MCP surface — single dispatch site invariant; dynamic verb catalog
 - [ADR-033](ADR-033-audit-envelope.md): Audit envelope — `AuditEvent` type; Implementation Status table rows "Query surface" and "EventStore wiring" (deferred to v0.3; this ADR delivers the query surface portion)
-- [ADR-034](ADR-034-identity-session-metering-hooks.md): Identity, session, and metering hooks — rejected; metering is a cloud middleware concern; this ADR delivers the audit event polling surface the rejected ADR-034 had anticipated for audit consumers
 - [ADR-022](ADR-022-schema-migrations.md): Schema migrations — migration system used for the composite index addition
 - `crates/khive-types/src/event.rs`: `Event`, `EventOutcome`, `EventBuilder` types
 - `crates/khive-storage/src/event.rs`: `EventStore` trait, `EventFilter`, storage-level `Event`

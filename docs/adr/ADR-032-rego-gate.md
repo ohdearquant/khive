@@ -32,9 +32,8 @@ This ADR resolves both.
   `Pack` trait. Gate impls follow the same shape: one trait crate, N sibling impl crates.
 - **No feature-flag tax.** Consumers add `khive-gate-rego` to deps or they don't. No `cargo
   tree` pollution, no docs gymnastics about which features expose which types.
-- **Symmetric with downstream impls.** `khive-cloud-gate` (BUSL) and any future capability-
-  witness backend live separately because of license. `RegoGate` living separately for compile
-  isolation completes the pattern.
+- **Symmetric with downstream impls.** Any future gate backend lives as its own crate.
+  `RegoGate` living separately for compile isolation completes the pattern.
 - **Independent versioning.** Breaking changes to the Rego contract (e.g., new entrypoint
   convention) only bump `khive-gate-rego`, not `khive-gate`.
 
@@ -142,7 +141,7 @@ matters.
 
 Already covered in [ADR-029](ADR-029-authorization-gate.md) §"Why Rego, not a homegrown policy
 DSL." Short version: OPA is the cross-industry standard, `regorus` is a maintained Rust engine,
-policies are portable across khive-oss, khive-cloud, and any other OPA consumer.
+policies are portable across any OPA consumer.
 
 ### Why expose `DEFAULT_ENTRYPOINT` as a `pub const`
 
@@ -183,10 +182,10 @@ is the documented best practice.
 
 ### Positive
 
-- OSS users get production-grade policy enforcement (advisory in v0.2, enforced in v0.3) via a
+- Users get production-grade policy enforcement (advisory in v0.2, enforced in v0.3) via a
   policy language with a well-documented ecosystem.
-- Policies authored against `khive-gate-rego` can be reused as-is by `khive-cloud-gate`
-  wrapping `RegoGate` inside `LionGate<RegoGate>`. One policy, two enforcement engines.
+- Policies authored against `khive-gate-rego` are portable to any downstream wrapper that
+  implements `Gate` on top of `RegoGate`.
 - No feature-flag complexity. Either `khive-gate-rego` is in `Cargo.toml` or it isn't.
 - The crate's public API is small: `RegoGate`, `DEFAULT_ENTRYPOINT`. Trait + types live
   upstream in `khive-gate`. Easy to audit.

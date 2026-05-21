@@ -1,6 +1,6 @@
-# ADR-051: CLI Authentication and KG Git Workflow Commands
+# ADR-051: CLI KG Git Workflow Commands
 
-**Status**: accepted (Phase C1 — commit/sync/status/git-hooks file-level implemented; Phase C2 — DB export integration, atomic rebuild, and auth login/status/logout deferred)\
+**Status**: accepted (Phase C1 — commit/sync/status/git-hooks file-level implemented; Phase C2 — DB export integration and atomic rebuild deferred)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
@@ -24,128 +24,16 @@ Everything else — push, pull, branch, checkout, merge, stash, log — is stand
 should not wrap these; users already know git, and wrapping it adds maintenance cost, behavioral
 surprises, and documentation burden for zero value.
 
-**Platform model**: khive.ai is a KG intelligence layer over GitHub-hosted repos, not a git host.
-KG repos live on GitHub (or any git host). khive.ai connects via a GitHub App: it receives push
-webhooks, imports NDJSON into its cloud KG index, enriches PRs with entity-level diffs, and
-provides cross-project entity resolution and global search. The OSS CLI (`khive kg`) works fully
-without a khive.ai account — it is a pure git wrapper with KG-aware semantics. Authentication is
-optional, for platform features only (global entity search, project dashboard).
-
 ### What changes and what does not
 
 - ADR-048 (`init`, `export`, `import`, `validate`, `diff`, `update`): unchanged. This ADR adds
   `commit`, `sync`, and `resolve` that compose these; it does not modify them.
-- ADR-044 (HTTP API layer): unchanged. khive.ai receives events via GitHub App webhooks, not CLI
-  HTTP calls. No new API endpoints are added by this ADR.
 - ADR-027 (Single Tool MCP Surface): unaffected. KG workflow commands are CLI-only, not MCP tools.
 - ADR-003 (four-layer architecture): the CLI is in the Deno layer. No new layers.
 
 ## Decision
 
-### 1. CLI authentication (`khive auth`) — optional
-
-Authentication is **not required** for any `khive kg` command. All local operations work without
-a khive.ai account. Auth enables optional platform features: global entity search from the CLI,
-project dashboard queries, and verifying that the GitHub App is connected to a repo.
-
-#### Commands
-
-```
-khive auth login              # GitHub OAuth → khive.ai API token
-khive auth login --token PAT  # khive.ai API token for CI/automation
-khive auth status             # show current authentication state + connected repos
-khive auth logout             # clear stored credentials
-```
-
-#### GitHub OAuth flow
-
-The browser flow is the primary authentication path. It mirrors `gh auth login`, using GitHub
-as the identity provider:
-
-1. The CLI generates a random local port in the range 9000–9999 and starts a minimal HTTP server
-   that listens for exactly one request on that port.
-2. The CLI opens `https://khive.ai/auth/cli?port=<port>` in the system browser (via
-   `Deno.run(["open", url])` on macOS, `xdg-open` on Linux, `start` on Windows).
-3. The user authenticates via GitHub OAuth on khive.ai. khive.ai uses GitHub as the sole identity
-   provider (support for additional providers may be added later based on demand).
-4. khive.ai redirects to `http://localhost:<port>/callback?token=<access_token>&refresh=<refresh_token>`.
-5. The CLI receives the tokens, writes `~/.khive/auth.json`, stops the local server, and prints a
-   confirmation.
-
-If the browser does not open within 30 seconds (headless environment, SSH session), the CLI prints
-the full URL for manual opening and waits up to 5 minutes for the callback.
-
-The GitHub OAuth scope includes `read:user` (identity) and `repo` (so khive.ai can install its
-GitHub App on the user's repos during the onboarding flow). The GitHub App installation is a
-separate step on khive.ai: after login, `khive auth status` shows which repos are connected and
-prompts to install the App if none are.
-
-#### API token flow (CI)
-
-```
-khive auth login --token <token>
-```
-
-Writes `~/.khive/auth.json` with the token as the `access_token` value. No `refresh_token` is
-set; the token is treated as long-lived (no expiry check). Tokens are generated on
-`khive.ai/settings/tokens`. This is the primary path for CI environments and automation.
-
-#### Token storage
-
-```
-~/.khive/auth.json
-```
-
-```json
-{
-  "api_url": "https://api.khive.ai",
-  "access_token": "eyJ...",
-  "refresh_token": "...",
-  "expires_at": "2026-05-20T15:00:00Z",
-  "user": {
-    "namespace": "ocean",
-    "email": "ocean@example.com"
-  }
-}
-```
-
-File permissions are set to `0600` (owner read/write only) on creation and verified on every read.
-If permissions are wider than `0600`, the CLI prints a warning and refuses to use the file.
-
-The `api_url` field allows pointing the CLI at a self-hosted khive.ai instance or a staging
-environment without recompilation. Default: `https://api.khive.ai`.
-
-#### Token refresh
-
-Before any API call that requires authentication, the CLI checks `expires_at`. If the current time
-is within 60 seconds of expiry or past expiry, and a `refresh_token` is present, the CLI:
-
-1. Calls `POST <api_url>/v1/auth/refresh` with `{"refresh_token": "..."}`.
-2. Receives `{"access_token": "...", "expires_at": "..."}`.
-3. Writes the new values to `auth.json` (preserving all other fields).
-4. Proceeds with the original API call.
-
-If refresh fails (network error, expired refresh token), the CLI prints an authentication error and
-instructs the user to run `khive auth login` again.
-
-#### `khive auth status` output
-
-```
-Authenticated to khive.ai
-  API URL:      https://api.khive.ai
-  User:         ocean (ocean@example.com)
-  Token:        eyJ... (expires in 6 days)
-  GitHub App:   installed on 3 repos (ocean/khive, ocean/lattice, ocean/styx)
-```
-
-Or, if not authenticated:
-
-```
-Not authenticated. Run 'khive auth login' to sign in.
-All 'khive kg' commands work without authentication.
-```
-
-### 2. Namespace detection
+### 1. Namespace detection
 
 KG workflow commands need to resolve the current project's namespace. The resolution order is:
 
@@ -306,11 +194,9 @@ need `resolve`). C2 adds optional platform features. C3 adds the KG-aware merge 
 stage → commit pipeline and enforces the invariant that committed NDJSON is always consistent with
 the live DB. Forgetting to export before committing is the #1 user error in the manual workflow.
 
-`khive kg push` would be `git push` with zero KG-specific logic. khive.ai receives push events
-via GitHub App webhooks, not CLI HTTP calls — there is nothing for the CLI to do beyond what
-`git push` already does. Wrapping it adds maintenance cost, behavioral surprises (does it push
-all branches? does it set upstream?), and forces users to learn a khive-specific command for a
-universal git operation.
+`khive kg push` would be `git push` with zero KG-specific logic. Wrapping it adds maintenance
+cost, behavioral surprises (does it push all branches? does it set upstream?), and forces users
+to learn a khive-specific command for a universal git operation.
 
 `khive kg pull` would be `git pull` + `khive kg sync`. With git hooks installed, `git pull`
 triggers `post-merge`, which runs `khive kg sync` automatically. The user gets the same result
@@ -331,47 +217,20 @@ populate `.khive/state/working.db` from the committed NDJSON files, and then ins
 `khive kg init` on initial project setup. On fresh clones of an existing KG repo, contributors
 run `khive kg sync` directly (since `.khive/kg/` already exists, `khive kg init` would error).
 
-### Why `khive auth` uses GitHub OAuth
-
-khive.ai's value proposition is being a platform layer over GitHub repos. GitHub OAuth provides:
-
-1. **Identity**: the user's GitHub username becomes their khive.ai namespace.
-2. **Repo access**: the OAuth scope allows installing the khive.ai GitHub App on repos.
-3. **Zero new accounts**: researchers already have GitHub accounts. No new signup flow.
-
-The `--token` flag covers CI and headless environments. Additional OAuth providers (GitLab,
-Bitbucket) can be added later based on demand — the auth.json format is provider-agnostic.
-
-### Why `~/.khive/auth.json` rather than system keychain
-
-The system keychain (macOS Keychain, GNOME Keyring, Windows Credential Manager) provides stronger
-isolation but introduces platform-specific code paths, failure modes, and dependencies. `gh` uses
-a custom credential helper abstraction for the same reason: the keychain is ideal but not always
-present (headless Linux, Docker containers, minimal VMs).
-
-A `0600` file at a predictable path is auditable, portable, and deletable with `rm`. Developers
-who want keychain integration can configure credential helpers at the OS level. The `api_url` field
-in `auth.json` also makes the file useful as a configuration file (not just a secret store), which
-keychain entries are not designed for.
-
 ### Why namespace detection falls back to git remote URL
 
-The namespace identifies which khive.ai project the local repo maps to. In the common case, the
-namespace matches the git repository name, because repositories and projects have a 1:1 mapping on
-khive.ai. The fallback chain allows `khive kg` commands to work correctly in a freshly cloned repo
-where `.khive/settings.json` has not yet been created, without requiring the developer to manually
-configure the namespace.
+The namespace identifies the local repo. In the common case, the namespace matches the git
+repository name. The fallback chain allows `khive kg` commands to work correctly in a freshly
+cloned repo where `.khive/settings.json` has not yet been created, without requiring the
+developer to manually configure the namespace.
 
 ## Alternatives Considered
 
-| Alternative                                                             | Pros                                          | Cons                                                                                                                                      | Why rejected                                                                                                                   |
-| ----------------------------------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Full git wrapper (`khive kg push/pull/branch/checkout/merge/stash/log`) | Familiar "all-in-one" surface                 | Massive maintenance cost; wrapping git introduces behavioral surprises; users already know git; git hooks achieve the same automatic sync | The wrapper adds no KG-specific value for transport/branching; git hooks + `sync` is simpler and works with all git interfaces |
-| Device-flow OAuth (no local HTTP server)                                | Works in headless environments without a port | Requires khive.ai to implement the device authorization endpoint; longer user flow (poll loop)                                            | Browser flow is simpler for the common case; `--token` covers the headless case                                                |
-| Store tokens in system keychain                                         | Stronger isolation than file permissions      | Platform-specific code; unavailable in Docker/CI; not portable for `api_url` config field                                                 | File with `0600` is portable and auditable; keychain can be layered on top                                                     |
-| `khive kg commit` without automatic export                              | User controls export timing                   | Developer forgets to export after last edit; commits stale NDJSON                                                                         | Correctness invariant: commit ≡ export + validate + git commit. Auto-export is the right default.                              |
-| Advisory sync POST on push                                              | khive.ai updates immediately without webhook  | Couples CLI to khive.ai availability; breaks offline workflow; redundant when webhooks exist                                              | GitHub App webhooks handle push notification without any CLI-side code                                                         |
-| Pre-commit hook instead of `khive kg commit`                            | Transparent: `git commit` auto-exports        | Complex hook logic; silent failures confuse users; `git commit --no-verify` skips it                                                      | Explicit `khive kg commit` is more predictable and its failures are visible                                                    |
+| Alternative                                                             | Pros                                   | Cons                                                                                                                                      | Why rejected                                                                                                                   |
+| ----------------------------------------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Full git wrapper (`khive kg push/pull/branch/checkout/merge/stash/log`) | Familiar "all-in-one" surface          | Massive maintenance cost; wrapping git introduces behavioral surprises; users already know git; git hooks achieve the same automatic sync | The wrapper adds no KG-specific value for transport/branching; git hooks + `sync` is simpler and works with all git interfaces |
+| `khive kg commit` without automatic export                              | User controls export timing            | Developer forgets to export after last edit; commits stale NDJSON                                                                         | Correctness invariant: commit ≡ export + validate + git commit. Auto-export is the right default.                              |
+| Pre-commit hook instead of `khive kg commit`                            | Transparent: `git commit` auto-exports | Complex hook logic; silent failures confuse users; `git commit --no-verify` skips it                                                      | Explicit `khive kg commit` is more predictable and its failures are visible                                                    |
 
 ## Consequences
 
@@ -383,11 +242,6 @@ configure the namespace.
   which git interface the user prefers (CLI, IDE, GUI).
 - The CLI surface is small: `init`, `commit`, `sync`, `status` are the only KG-specific commands.
   Users use standard git for everything else. No new mental model for transport or branching.
-- `khive auth login` follows the `gh auth login` precedent, but is entirely optional. The local
-  workflow is complete without a khive.ai account.
-- khive.ai receives push events via GitHub App webhooks. No CLI-side cloud sync code is needed,
-  eliminating a failure mode and a network dependency from the CLI.
-
 ### Negative
 
 - `khive kg commit` runs `khive kg export` unconditionally, even if the live database has not
@@ -398,21 +252,9 @@ configure the namespace.
   run `khive kg sync` to bootstrap `working.db`, then install hooks manually (or wait for
   the `khive kg install-hooks` command deferred to Phase C2). Developers who skip this step
   will not get automatic sync but can always run `khive kg sync` manually.
-- The browser OAuth flow requires the CLI to open a browser, which fails silently in some
-  environments (e.g., remote SSH sessions without X11 forwarding). The CLI must detect this case
-  and print the URL for manual opening.
-- Token storage in `~/.khive/auth.json` is not encrypted at rest. A developer with read access to
-  the home directory can read the access token. This is the same exposure as `~/.config/gh/hosts.yml`
-  (the `gh` credentials file). The `0600` permissions prevent access by other OS users but do not
-  protect against the current user's own processes or physical access.
-- Requires a GitHub account for khive.ai platform features (authentication, GitHub App
-  installation). Users on GitLab or other hosts can use the local CLI fully but cannot connect
-  to khive.ai until additional OAuth providers are supported.
 
 ### Neutral
 
-- The `khive auth` commands have no Rust component. They are Deno (TypeScript) commands in the same
-  Deno CLI binary as the existing `khive kg` commands.
 - Standard git commands (`push`, `pull`, `branch`, `checkout`, `merge`, `log`) are not wrapped.
   Users use git directly. This is a deliberate design choice, not a missing feature.
 

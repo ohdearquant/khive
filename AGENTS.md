@@ -354,4 +354,3 @@ If you are an AI agent authoring PRs, issues, or comments via someone's CLI:
 - `CLAUDE.md` — for working on khive itself
 - `docs/adr/` — Architecture Decision Records (the design contract)
 - `docs/adr/README.md` — full ADR index
-- khive.ai — public hosted instance (when live)
