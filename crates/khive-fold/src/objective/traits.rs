@@ -123,6 +123,21 @@ pub trait Objective<T>: Send + Sync {
     /// Evaluate a single candidate.
     fn score(&self, candidate: &T, context: &ObjectiveContext) -> f64;
 
+    /// Precision (inverse variance) estimate for the score of a candidate.
+    ///
+    /// Default is 1.0 (fully trusted). Override when score reliability varies
+    /// across candidates — e.g., an embedding model that returns a confidence
+    /// alongside the similarity score. The effective ranking value used by the
+    /// default `select` / `select_top` implementations is `score * precision`
+    /// (ADR-059, Predictive Coding).
+    ///
+    /// When overriding, return values in (0, 1]. Non-finite values are treated
+    /// as 1.0 by the default implementations.
+    #[inline]
+    fn precision(&self, _candidate: &T, _context: &ObjectiveContext) -> f64 {
+        1.0
+    }
+
     /// Check if a score passes the threshold.
     ///
     /// Non-finite scores never pass.
@@ -154,6 +169,10 @@ pub trait Objective<T>: Send + Sync {
     }
 
     /// Select the best candidate from a list.
+    ///
+    /// Ranking uses `score * precision` so that unreliable high-scores do not
+    /// dominate over lower-scoring but precise candidates (ADR-059). When all
+    /// precisions are 1.0 (the default), ranking is identical to raw score order.
     fn select<'a>(
         &self,
         candidates: &'a [T],
@@ -170,6 +189,7 @@ pub trait Objective<T>: Send + Sync {
         let mut has_best = false;
         let mut best_index = 0usize;
         let mut best_score = 0.0f64;
+        let mut best_precision = 1.0f64;
         let mut best_det = DeterministicScore::ZERO;
 
         for (index, candidate) in candidates.iter().take(considered_limit).enumerate() {
@@ -182,11 +202,19 @@ pub trait Objective<T>: Send + Sync {
 
             passed += 1;
 
-            let det = DeterministicScore::from_f64(score);
+            let precision = self.precision(candidate, context);
+            let effective = score
+                * if precision.is_finite() {
+                    precision
+                } else {
+                    1.0
+                };
+            let det = DeterministicScore::from_f64(effective);
             if !has_best || det > best_det {
                 has_best = true;
                 best_index = index;
                 best_score = score;
+                best_precision = precision;
                 best_det = det;
             }
         }
@@ -194,6 +222,7 @@ pub trait Objective<T>: Send + Sync {
         if has_best {
             Ok(
                 Selection::new(&candidates[best_index], best_score, best_index)
+                    .with_precision(best_precision)
                     .with_considered(considered)
                     .with_passed(passed),
             )
@@ -204,8 +233,8 @@ pub trait Objective<T>: Send + Sync {
 
     /// Select the top N candidates.
     ///
-    /// Small `n` (≤96) uses a sorted small-vector path with binary-search insertion.
-    /// Large `n` uses a worst-first heap.
+    /// Ranking uses `score * precision` (ADR-059). Small `n` (≤96) uses a sorted
+    /// small-vector path with binary-search insertion. Large `n` uses a worst-first heap.
     fn select_top<'a>(
         &self,
         candidates: &'a [T],
@@ -237,7 +266,14 @@ pub trait Objective<T>: Send + Sync {
                 }
 
                 passed += 1;
-                let entry = RankedIndex::new(score, index);
+                let precision = self.precision(candidate, context);
+                let effective = score
+                    * if precision.is_finite() {
+                        precision
+                    } else {
+                        1.0
+                    };
+                let entry = RankedIndex::new(effective, index);
 
                 if top.len() == n {
                     let worst = *top.last().expect("non-empty top when len == n");
@@ -276,7 +312,14 @@ pub trait Objective<T>: Send + Sync {
             }
 
             passed += 1;
-            let entry = RankedIndex::new(score, index);
+            let precision = self.precision(candidate, context);
+            let effective = score
+                * if precision.is_finite() {
+                    precision
+                } else {
+                    1.0
+                };
+            let entry = RankedIndex::new(effective, index);
 
             if heap.len() < n {
                 heap.push(WorstRankedIndex(entry));
@@ -382,6 +425,7 @@ where
         let mut has_best = false;
         let mut best_index = 0usize;
         let mut best_score = 0.0f64;
+        let mut best_precision = 1.0f64;
         let mut best_det = DeterministicScore::ZERO;
         let mut best_id = Uuid::nil();
 
@@ -395,12 +439,20 @@ where
 
             passed += 1;
             let id = candidate.id();
-            let det = DeterministicScore::from_f64(score);
+            let precision = self.precision(candidate, context);
+            let effective = score
+                * if precision.is_finite() {
+                    precision
+                } else {
+                    1.0
+                };
+            let det = DeterministicScore::from_f64(effective);
 
             if !has_best || det > best_det || (det == best_det && id < best_id) {
                 has_best = true;
                 best_index = index;
                 best_score = score;
+                best_precision = precision;
                 best_det = det;
                 best_id = id;
             }
@@ -409,6 +461,7 @@ where
         if has_best {
             Ok(
                 Selection::new(&candidates[best_index], best_score, best_index)
+                    .with_precision(best_precision)
                     .with_considered(considered)
                     .with_passed(passed),
             )
@@ -452,7 +505,14 @@ where
                 }
 
                 passed += 1;
-                let entry = ScoredEntry::new(candidate, score, index);
+                let precision = self.precision(candidate, context);
+                let effective = score
+                    * if precision.is_finite() {
+                        precision
+                    } else {
+                        1.0
+                    };
+                let entry = ScoredEntry::new(candidate, effective, index);
 
                 if top.len() == n {
                     let worst = *top.last().expect("non-empty top when len == n");
@@ -491,7 +551,14 @@ where
             }
 
             passed += 1;
-            let entry = ScoredEntry::new(candidate, score, index);
+            let precision = self.precision(candidate, context);
+            let effective = score
+                * if precision.is_finite() {
+                    precision
+                } else {
+                    1.0
+                };
+            let entry = ScoredEntry::new(candidate, effective, index);
 
             if heap.len() < n {
                 heap.push(WorstScoredEntry(entry));
