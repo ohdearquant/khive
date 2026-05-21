@@ -10,6 +10,8 @@ import { kgInit } from "./kg/mod.ts";
 import { runCommit } from "./kg/commit.ts";
 import { runConfig } from "./kg/config.ts";
 import { runEmbed } from "./kg/embed.ts";
+import { runExport } from "./kg/export.ts";
+import { recoverImportJournal, runImport } from "./kg/import.ts";
 import { runPackCheck } from "./pack/check.ts";
 import { runPackInit } from "./pack/init.ts";
 import { runSync } from "./kg/sync.ts";
@@ -35,6 +37,8 @@ KG subcommands:
   status        Show entity/edge counts and uncommitted changes (file-level; DB diff is Phase C2)
   config        Show or modify .khive/config.toml (ADR-057)
   embed         Plan / run entity embedding (ADR-057; Phase C1 plans, Phase C2 runs)
+  export        Re-write canonical .khive/kg/*.ndjson; --format archive emits a JSON bundle
+  import        Import a KgArchive JSON file into NDJSON files
   diff          Entity-aware diff between two NDJSON states (Phase C2 — not yet implemented)
   update        Advance a remote pin in schema.yaml (Phase C2 — not yet implemented)
 
@@ -63,6 +67,8 @@ Subcommands (Phase C1 — file-level operations):
   status        Show entity/edge counts and uncommitted changes
   config        Show or modify .khive/config.toml
   embed         Plan embedding for entities awaiting vectors (run: Phase C2)
+  export        Re-write canonical .khive/kg/*.ndjson; --format archive emits a JSON bundle
+  import        Import a KgArchive JSON file into NDJSON files
 
 Planned (Phase C2+):
   diff          Entity-aware diff
@@ -84,6 +90,15 @@ async function dispatchKg(args: string[]): Promise<void> {
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
     printKgUsage();
     return;
+  }
+
+  // Recover any interrupted import before running any KG command.
+  // This is idempotent and a no-op when no journal exists.
+  try {
+    const root = await getRepoRoot();
+    await recoverImportJournal(root);
+  } catch {
+    // Not in a git repo or .khive/ not present — no journal to recover.
   }
 
   switch (subcommand) {
@@ -112,7 +127,13 @@ async function dispatchKg(args: string[]): Promise<void> {
       break;
 
     case "export":
+      await runExport(await getRepoRoot(), rest);
+      break;
+
     case "import":
+      await runImport(await getRepoRoot(), rest);
+      break;
+
     case "diff":
     case "update":
       console.error(

@@ -4,3 +4,5 @@
  */
 
 export { kgInit } from "./init.ts";
+export { runImport } from "./import.ts";
+export { runExport } from "./export.ts";

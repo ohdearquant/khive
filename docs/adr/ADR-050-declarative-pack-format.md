@@ -461,13 +461,13 @@ The workflow fails if any pack cannot be resolved or if vocabulary conflicts exi
 
 ### 8. Phasing
 
-| Phase | What                                                                                          | Target version |
-| ----- | --------------------------------------------------------------------------------------------- | -------------- |
-| P1    | `pack.yaml` manifest format specification + `khive pack check` validator                      | v0.3           |
-| P2    | `schema.yaml#packs` section + vocabulary merging in `khive pack validate`                     | v0.3           |
-| P3    | `khive pack init` + `khive pack install` (local path only, no registry)                       | v0.4           |
-| P4    | Pack cache + `khive pack install` from registry and git (registry out of scope here)          | v0.5           |
-| P5    | `khive pack publish` (registry out of scope here)                                             | v0.5           |
+| Phase | What                                                                                 | Target version |
+| ----- | ------------------------------------------------------------------------------------ | -------------- |
+| P1    | `pack.yaml` manifest format specification + `khive pack check` validator             | v0.3           |
+| P2    | `schema.yaml#packs` section + vocabulary merging in `khive pack validate`            | v0.3           |
+| P3    | `khive pack init` + `khive pack install` (local path only, no registry)              | v0.4           |
+| P4    | Pack cache + `khive pack install` from registry and git (registry out of scope here) | v0.5           |
+| P5    | `khive pack publish` (registry out of scope here)                                    | v0.5           |
 
 P1 and P2 are independently shippable and establish the format contract. Third-party tools can
 validate and author `pack.yaml` files before `khive pack install` exists. P3 enables the local

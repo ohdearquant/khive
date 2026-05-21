@@ -242,6 +242,7 @@ developer to manually configure the namespace.
   which git interface the user prefers (CLI, IDE, GUI).
 - The CLI surface is small: `init`, `commit`, `sync`, `status` are the only KG-specific commands.
   Users use standard git for everything else. No new mental model for transport or branching.
+
 ### Negative
 
 - `khive kg commit` runs `khive kg export` unconditionally, even if the live database has not

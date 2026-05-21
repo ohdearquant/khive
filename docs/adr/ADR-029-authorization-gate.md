@@ -183,15 +183,15 @@ today is the wrong default.
 
 ## Implementation Status
 
-| Step                                               | Where                                         | Status               |
-| -------------------------------------------------- | --------------------------------------------- | -------------------- |
-| `khive-gate` crate: trait + types + `AllowAllGate` | `crates/khive-gate/`                          | done                 |
-| `RuntimeConfig::gate` field + `Default::default`   | `crates/khive-runtime/src/runtime.rs`         | done                 |
-| Re-export gate types from `khive-runtime`          | `crates/khive-runtime/src/lib.rs`             | done                 |
-| Dispatch-site gate consultation (advisory)         | `crates/khive-runtime/src/pack.rs` (registry) | done                 |
-| `khive-gate-rego` crate (`RegoGate`)               | `crates/khive-gate-rego/`                     | done (ADR-032)       |
-| Audit envelope (`AuditEvent` via tracing)          | `crates/khive-gate/src/lib.rs` (type)         | accepted (ADR-033)   |
-| Hard enforcement (deny → dispatch error)           | `crates/khive-runtime/src/pack.rs`            | accepted (ADR-035)   |
+| Step                                               | Where                                         | Status             |
+| -------------------------------------------------- | --------------------------------------------- | ------------------ |
+| `khive-gate` crate: trait + types + `AllowAllGate` | `crates/khive-gate/`                          | done               |
+| `RuntimeConfig::gate` field + `Default::default`   | `crates/khive-runtime/src/runtime.rs`         | done               |
+| Re-export gate types from `khive-runtime`          | `crates/khive-runtime/src/lib.rs`             | done               |
+| Dispatch-site gate consultation (advisory)         | `crates/khive-runtime/src/pack.rs` (registry) | done               |
+| `khive-gate-rego` crate (`RegoGate`)               | `crates/khive-gate-rego/`                     | done (ADR-032)     |
+| Audit envelope (`AuditEvent` via tracing)          | `crates/khive-gate/src/lib.rs` (type)         | accepted (ADR-033) |
+| Hard enforcement (deny → dispatch error)           | `crates/khive-runtime/src/pack.rs`            | accepted (ADR-035) |
 
 ## Open Questions
 
