@@ -241,7 +241,7 @@ khive kg sync --quiet        # suppress output (for git hooks)
    are the source of truth, DB is the target).
 2. If no changes: print `DB is up to date` and exit.
 3. Run the ADR-052 atomic rebuild: validate NDJSON → import into temp DB → atomic rename into
-   `.state/working.db`.
+   `.khive/state/working.db`.
 4. Print a summary: `Synced: 472 entities, 1,111 edges`.
 
 `khive kg sync` is idempotent: running it twice produces the same result. It is safe to run at any
@@ -326,9 +326,10 @@ Git hooks work with every git interface: CLI, VS Code, JetBrains, GitHub Desktop
 `git pull` in VS Code and forgets to run `khive kg sync` afterward has a stale DB — silent and
 hard to diagnose. A hook makes sync automatic regardless of how the user invokes git.
 
-The tradeoff: hooks are per-clone (not committed), so each new clone must run `khive kg init` to
-install them. This is acceptable because `khive kg init` is already the required first step after
-cloning a KG repo (to bootstrap `.state/working.db` from the committed NDJSON files).
+The tradeoff: hooks are per-clone (not committed), so each new clone must run `khive kg sync` to
+populate `.khive/state/working.db` from the committed NDJSON files, and then install hooks via
+`khive kg init` on initial project setup. On fresh clones of an existing KG repo, contributors
+run `khive kg sync` directly (since `.khive/kg/` already exists, `khive kg init` would error).
 
 ### Why `khive auth` uses GitHub OAuth
 
@@ -393,9 +394,10 @@ configure the namespace.
   changed since the last export. This is a minor inefficiency for a no-op export (milliseconds
   for typical graph sizes), but it is simpler than maintaining a dirty flag across command
   invocations.
-- Git hooks are per-clone, not committed to the repo. Each new clone must run `khive kg init`
-  to install hooks and bootstrap `working.db`. This is the expected onboarding path, but
-  developers who forget `khive kg init` will have a stale or missing DB.
+- Git hooks are per-clone, not committed to the repo. Fresh clones of an existing KG repo
+  run `khive kg sync` to bootstrap `working.db`, then install hooks manually (or wait for
+  the `khive kg install-hooks` command deferred to Phase C2). Developers who skip this step
+  will not get automatic sync but can always run `khive kg sync` manually.
 - The browser OAuth flow requires the CLI to open a browser, which fails silently in some
   environments (e.g., remote SSH sessions without X11 forwarding). The CLI must detect this case
   and print the URL for manual opening.

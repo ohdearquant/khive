@@ -95,6 +95,23 @@ Deno.test("kg init: creates expected files", async () => {
   }
 });
 
+Deno.test("kg init: writes current branch name to .khive/state/HEAD", async () => {
+  const dir = await makeTempRepo();
+  try {
+    await runInit(dir);
+
+    // HEAD must exist and contain a non-empty branch name.
+    const headContent = await Deno.readTextFile(join(dir, ".khive/state/HEAD"));
+    const branch = headContent.trim();
+    // A freshly initialised git repo defaults to "master" or "main".
+    assertEquals(branch.length > 0, true);
+    // Must not contain path separators or whitespace other than the trailing newline stripped above.
+    assertEquals(/[\s/\\]/.test(branch), false);
+  } finally {
+    await removeDir(dir);
+  }
+});
+
 Deno.test("kg init: creates .khive/config.toml with defaults", async () => {
   const dir = await makeTempRepo();
   try {
@@ -221,6 +238,44 @@ Deno.test("kg init: errors if .khive/kg/ already exists", async () => {
   }
 });
 
+Deno.test("kg init: .khive/.gitignore ignores working.db and remote-cache", async () => {
+  const dir = await makeTempRepo();
+  try {
+    await runInit(dir);
+
+    // Verify .khive/state/working.db is gitignored.
+    const workingDbCheck = new Deno.Command("git", {
+      args: ["-C", dir, "check-ignore", "-q", ".khive/state/working.db"],
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const workingDbResult = await workingDbCheck.output();
+    assertEquals(
+      workingDbResult.code,
+      0,
+      ".khive/state/working.db should be ignored by git",
+    );
+
+    // Verify .khive/kg/.remote-cache/ entries are gitignored.
+    // Create the file so git check-ignore can test against a real path.
+    await Deno.mkdir(join(dir, ".khive/kg/.remote-cache"), { recursive: true });
+    await Deno.writeTextFile(join(dir, ".khive/kg/.remote-cache/cache.db"), "");
+    const remoteCacheCheck = new Deno.Command("git", {
+      args: ["-C", dir, "check-ignore", "-q", ".khive/kg/.remote-cache/cache.db"],
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const remoteCacheResult = await remoteCacheCheck.output();
+    assertEquals(
+      remoteCacheResult.code,
+      0,
+      ".khive/kg/.remote-cache/cache.db should be ignored by git",
+    );
+  } finally {
+    await removeDir(dir);
+  }
+});
+
 Deno.test("kg init: schema.yaml includes all 13 edge relations", async () => {
   const dir = await makeTempRepo();
   try {
@@ -261,6 +316,70 @@ Deno.test("kg init: schema.yaml includes all 6 entity kinds", async () => {
     for (const kind of ["concept", "document", "dataset", "project", "person", "org"]) {
       assertStringIncludes(schema, kind);
     }
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("kg init: runs git init in a non-git directory", async () => {
+  // Process-isolated: spawn a subprocess so Deno.exit() does not kill the test runner.
+  const dir = await Deno.makeTempDir({ prefix: "khive_init_nogit_" });
+  try {
+    // Confirm no .git exists before the test.
+    let hasDotGit = false;
+    try {
+      await Deno.stat(join(dir, ".git"));
+      hasDotGit = true;
+    } catch {
+      // Expected — no .git
+    }
+    assertEquals(hasDotGit, false, "Precondition: temp dir must not be a git repo");
+
+    // Resolve main.ts relative to this test file.
+    const mainTs = new URL("../main.ts", import.meta.url).pathname;
+
+    const result = await new Deno.Command("deno", {
+      args: ["run", "--allow-all", mainTs, "kg", "init"],
+      cwd: dir,
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+
+    const stdout = new TextDecoder().decode(result.stdout);
+    const stderr = new TextDecoder().decode(result.stderr);
+    assertEquals(
+      result.code,
+      0,
+      `kg init exited with code ${result.code}. stdout: ${stdout} stderr: ${stderr}`,
+    );
+
+    // Both .git/ and .khive/ must exist after init.
+    const dotGitStat = await Deno.stat(join(dir, ".git"));
+    assertEquals(dotGitStat.isDirectory, true, ".git/ must exist after auto git init");
+
+    const khiveStat = await Deno.stat(join(dir, ".khive"));
+    assertEquals(khiveStat.isDirectory, true, ".khive/ must exist after kg init");
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("kg init: default schema.yaml emits remotes as empty list (not empty object)", async () => {
+  const dir = await makeTempRepo();
+  try {
+    await runInit(dir);
+
+    const schemaText = await Deno.readTextFile(join(dir, ".khive/kg/schema.yaml"));
+
+    // The literal text must contain "remotes: []", not "remotes: {}"
+    assertStringIncludes(schemaText, "remotes: []");
+
+    // Also confirm it does NOT contain the empty-object form.
+    assertEquals(
+      schemaText.includes("remotes: {}"),
+      false,
+      "remotes must not be an empty object",
+    );
   } finally {
     await removeDir(dir);
   }

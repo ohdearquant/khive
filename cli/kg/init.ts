@@ -6,14 +6,14 @@
  *   2. Create .khive/kg/ with entities.ndjson, edges.ndjson, schema.yaml,
  *      and migrations/.gitkeep.
  *   3. Create .khive/config.toml with built-in defaults (ADR-057 §4).
- *   4. Create .state/ directory and ensure it is gitignored.
+ *   4. Create .khive/state/ directory; write HEAD (current branch name).
  *   5. Install post-checkout, post-merge, post-rewrite hooks (ADR-051 §6).
  *   6. Stage created files with git add.
  *   7. Print a summary.
  */
 
 import { join } from "@std/path";
-import { getGitDir, getRepoRoot, gitAdd } from "../lib/git.ts";
+import { exec, getCurrentBranch, getGitDir, getRepoRoot, gitAdd, isGitRepo } from "../lib/git.ts";
 import {
   CONFIG_FILE,
   EDGES_FILE,
@@ -71,7 +71,7 @@ note_kinds:
   - question
   - decision
   - reference
-remotes: {}
+remotes: []
 `;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +110,10 @@ const KHIVE_GITIGNORE = `\
 !kg/
 !kg/**
 !config.toml
+
+# Remote cache and derived working state are never committed.
+kg/.remote-cache/
+kg/.remote-cache/**
 `;
 
 // ---------------------------------------------------------------------------
@@ -186,12 +190,23 @@ async function installHooks(gitDir: string): Promise<HookResult[]> {
 // ---------------------------------------------------------------------------
 
 export async function kgInit(): Promise<void> {
-  // 1. Verify we are in a git repo.
+  // 1. Ensure we are in a git repo. Per ADR-052 §9 step 2: if the current
+  //    directory is not a git repository, run `git init` automatically.
+  if (!(await isGitRepo())) {
+    console.log("Not a git repository — running 'git init'...");
+    const result = await exec(["git", "init"]);
+    if (result.code !== 0) {
+      console.error(`Error: git init failed: ${result.stderr}`);
+      Deno.exit(1);
+    }
+    console.log(result.stdout || "Initialized empty Git repository.");
+  }
+
   let repoRoot: string;
   try {
     repoRoot = await getRepoRoot();
-  } catch {
-    console.error("Error: Not a git repository. Run 'git init' first.");
+  } catch (err) {
+    console.error(`Error: Failed to locate git repository root: ${(err as Error).message}`);
     Deno.exit(1);
   }
 
@@ -246,6 +261,10 @@ export async function kgInit(): Promise<void> {
   } catch {
     // Already exists.
   }
+
+  // Write current branch name to .khive/state/HEAD (ADR-052 §9).
+  const branch = await getCurrentBranch();
+  await Deno.writeTextFile(join(stateDirPath, "HEAD"), branch + "\n");
 
   // Write .khive/.gitignore allowlist (ignore everything except KG data).
   const khiveGitignorePath = join(repoRoot, ".khive", ".gitignore");

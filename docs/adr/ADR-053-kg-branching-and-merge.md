@@ -35,8 +35,8 @@ automatically via git hooks per ADR-051 §6).
 
 ### Relationship to ADR-052
 
-ADR-052 defines the `.state/` directory: `working.db` and `HEAD`. Status — whether the working
-tree is dirty — is computed via a DB-vs-committed-NDJSON diff. Every branch operation must
+ADR-052 defines the `.khive/state/` directory: `working.db` and `HEAD`. Status — whether the
+working tree is dirty — is computed via a DB-vs-committed-NDJSON diff. Every branch operation must
 maintain the ADR-052 invariant that `working.db` reflects the current branch's committed NDJSON
 plus any uncommitted working changes. The `khive kg sync` command (ADR-051 §5) enforces this
 invariant after any git operation that changes NDJSON files.
@@ -207,7 +207,7 @@ custom branch state in sync with git state adds maintenance cost without benefit
 
 ### Per-branch DB files
 
-`.khive/kg/.state/<branch>.db` — one SQLite file per branch. Rejected: disk space accumulates
+`.khive/state/<branch>.db` — one SQLite file per branch. Rejected: disk space accumulates
 with every branch and is never reclaimed when branches are deleted (git branch delete does not
 know about the DB files). A 10K-entity KG at ~20MB per DB file would consume 200MB for ten
 active branches. Clean rebuild from NDJSON via `khive kg sync` is simpler, has no accumulation
@@ -246,7 +246,7 @@ result with less code and broader compatibility.
   CI (ADR-048 §6) runs on any PR that touches `.khive/kg/`. Code review tools show entity-aware
   diffs via `khive kg diff` as a git diff driver.
 - No new state to manage. Branches live in git refs; the only khive-specific state is
-  `working.db` (rebuilt by `khive kg sync` via hooks) and `.state/HEAD` (a cheap local cache).
+  `working.db` (rebuilt by `khive kg sync` via hooks) and `.khive/state/HEAD` (a cheap local cache).
 - `khive kg resolve` provides entity-level conflict resolution that understands field-level diffs,
   not just competing JSON lines. The `--merge-properties` strategy handles the most common agent
   conflict pattern (two branches extending the same entity's properties).
@@ -263,9 +263,12 @@ result with less code and broader compatibility.
   renders them in entity-aware terms, but users who open the file directly see raw JSON.
 - Base-ontology schema conflicts always require manual resolution. There is no automated strategy
   for changes to the 13 closed edge relations (ADR-002).
-- Git hooks must be installed via `khive kg init`. Developers who clone a KG repo and forget to
-  run `khive kg init` will not get automatic sync. This is mitigated by `khive kg init` being the
-  required first step (it also bootstraps `working.db`).
+- Git hooks must be installed per-clone. Fresh clones of an existing KG repo run
+  `khive kg sync` to bootstrap `working.db` (since `.khive/kg/` already exists,
+  `khive kg init` would error). Hook installation for fresh clones is manual until
+  `khive kg install-hooks` is provided (Phase C2). Developers who skip hook installation
+  will not get automatic sync but can always run `khive kg sync` manually after branch
+  switches and merges.
 
 ### Neutral
 
@@ -296,7 +299,7 @@ and log use standard git commands, with `khive kg sync` (ADR-051) running automa
 
 ### No new DB schema changes
 
-This ADR introduces no new SQL tables or migrations. The `.state/` directory structure is
+This ADR introduces no new SQL tables or migrations. The `.khive/state/` directory structure is
 defined by ADR-052 and requires no additions.
 
 ### Phasing

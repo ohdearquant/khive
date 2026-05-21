@@ -1,6 +1,6 @@
 # ADR-052: KG Storage Model — DB and File Layer Reconciliation
 
-**Status**: proposed\
+**Status**: accepted (Phase C1 — directory layout, `khive kg init`, NDJSON-as-snapshot, `.khive/state/working.db` placeholder, and `.khive/.gitignore` allowlist implemented; Phase C2 — DB-vs-NDJSON diff, atomic DB rebuild, status with mode detection deferred until the Rust runtime ships `lattice-embed` and the storage layer is wired)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
@@ -29,10 +29,10 @@ The design is structurally identical to git's own storage model:
 | Object store / committed snapshot | `entities.ndjson`, `edges.ndjson` — committed, git-tracked   |
 | `git add && git commit`           | `khive kg commit` (exports DB → files → `git commit`)        |
 | `git checkout` / `git pull`       | `khive kg pull` (files → DB rebuild)                         |
-| `.git/`                           | `.khive/kg/.state/` (gitignored, ephemeral)                  |
+| `.git/`                           | `.khive/state/` (gitignored, ephemeral)                      |
 
 The DB is git's working tree: where active edits happen. The NDJSON files are the committed
-snapshot: what git tracks, diffs, and merges. The `.state/` directory is the internal
+snapshot: what git tracks, diffs, and merges. The `.khive/state/` directory is the internal
 bookkeeping that makes transitions between them efficient.
 
 ## Decision
@@ -40,23 +40,41 @@ bookkeeping that makes transitions between them efficient.
 ### 1. Directory layout
 
 ```
-.khive/kg/
-  schema.yaml              # ontology definition (git-tracked)
-  entities.ndjson          # committed entity data (git-tracked, diffable)
-  edges.ndjson             # committed edge data (git-tracked, diffable)
-  .state/                  # gitignored — working state (ephemeral)
+.khive/
+  .gitignore               # allowlist — only kg/ and config.toml are committed
+  config.toml              # project config (ADR-057) — git-tracked
+  kg/                      # committed KG snapshot
+    schema.yaml            # ontology definition (git-tracked)
+    entities.ndjson        # committed entity data (git-tracked, diffable)
+    edges.ndjson           # committed edge data (git-tracked, diffable)
+    migrations/            # schema migration scripts (git-tracked; ADR-054)
+    .remote-cache/         # cached remote repos (gitignored; ADR-048 §5)
+  state/                   # gitignored — working state (ephemeral)
     working.db             # SQLite with FTS5 + vector indexes
     HEAD                   # current branch name (plain text, mirrors git HEAD)
 ```
 
-`khive kg init` creates the full structure and appends `.khive/kg/.state/` to
-`.gitignore`. The `.state/` directory is not committed. It is fully reconstructable
-from the NDJSON files at any time via `khive kg pull` (files → DB rebuild).
+`khive kg init` creates the full structure. The `.khive/.gitignore` is an
+**allowlist** rather than a blocklist: it ignores everything inside `.khive/` by
+default and explicitly re-allows `kg/` and `config.toml`. This means `state/`
+(and any future `.khive/` subdirectories) are gitignored without needing
+per-path entries — adding new working-state directories is a no-op for
+`.gitignore`. The state directory is fully reconstructable from the NDJSON
+files at any time via `khive kg sync` (files → DB rebuild).
 
-The three files under `.khive/kg/` (`schema.yaml`, `entities.ndjson`, `edges.ndjson`)
-are committed to the project's git repository alongside source code. `entities.ndjson`
-and `edges.ndjson` begin empty (`khive kg init` writes zero-length files with a
-trailing newline to satisfy the NDJSON "newline after last record" rule).
+The committed paths (`.khive/config.toml`, `.khive/kg/schema.yaml`,
+`.khive/kg/entities.ndjson`, `.khive/kg/edges.ndjson`,
+`.khive/kg/migrations/.gitkeep`) are tracked by the project's git repository
+alongside source code. `entities.ndjson` and `edges.ndjson` begin as zero-byte
+files; the NDJSON readers treat empty files as zero records, satisfying the
+"newline after last record" rule by induction (no records ⇒ no required
+trailing newline).
+
+> **Note**: An earlier draft of this ADR placed the working state inside
+> `.khive/kg/`. The implementation uses a sibling `.khive/state/` directory
+> so that gitignore rules can use a single allowlist on the `.khive/` root
+> rather than per-subdirectory blocklists. The implementation is the canonical
+> layout; this section reflects it.
 
 ### 2. One KG per repository
 
@@ -177,24 +195,23 @@ simpler and more correct than tracking a change log.
 
 #### Checkout/pull flow: files → DB (atomic)
 
-Triggered by `khive kg pull` or `khive kg checkout`. Also triggered automatically by
-`khive kg init` if the repo already contains committed NDJSON files.
+Triggered by `khive kg pull` or `khive kg checkout`.
 
 1. Run the §7 diff against committed NDJSON. If the diff is non-empty, refuse with:
    "Uncommitted changes in working.db. Run `khive kg commit` or `khive kg reset` first."
 2. **Validate first**: run `khive kg validate` against the NDJSON files before touching
    the database. If validation fails, abort with a structured error report. No DB changes
    are made on validation failure.
-3. Create a temporary SQLite file at `.state/working.db.tmp` with the §4 DDL.
-4. Open a single write transaction on `.state/working.db.tmp`.
+3. Create a temporary SQLite file at `.khive/state/working.db.tmp` with the §4 DDL.
+4. Open a single write transaction on `.khive/state/working.db.tmp`.
 5. Parse `entities.ndjson` line by line. For each line, `INSERT INTO entities`. Any
-   JSON parse error aborts the transaction and removes `.state/working.db.tmp`.
+   JSON parse error aborts the transaction and removes `.khive/state/working.db.tmp`.
 6. Parse `edges.ndjson` line by line. `INSERT INTO edges`. Any error aborts the
-   transaction and removes `.state/working.db.tmp`.
+   transaction and removes `.khive/state/working.db.tmp`.
 7. Rebuild FTS5 index: `INSERT INTO entities_fts(entities_fts) VALUES('rebuild')`.
-8. Commit the transaction on `.state/working.db.tmp`.
-9. Atomically rename `.state/working.db.tmp` → `.state/working.db` (replaces old DB).
-10. Write current git branch name to `.state/HEAD`:
+8. Commit the transaction on `.khive/state/working.db.tmp`.
+9. Atomically rename `.khive/state/working.db.tmp` → `.khive/state/working.db` (replaces old DB).
+10. Write current git branch name to `.khive/state/HEAD`:
     `git rev-parse --abbrev-ref HEAD`.
 11. (No dirty file to remove — status is computed from DB-vs-NDJSON diff, not a flag.)
 
@@ -218,7 +235,7 @@ This is the invariant that makes the DB a true materialized view of the NDJSON.
 ### 6. Status tracking
 
 `khive kg status` always computes status by comparing the current DB export against the committed
-NDJSON files. There is no `.state/dirty` flag. This approach is canonical: it catches uncommitted
+NDJSON files. There is no `.khive/state/dirty` flag. This approach is canonical: it catches uncommitted
 DB changes that `git status .khive/kg/` cannot see (because the DB is gitignored), while
 remaining correct across crash recovery, concurrent writes, and process restarts.
 
@@ -235,7 +252,7 @@ The full-comparison cost is bounded: for graphs up to ~100K entities the in-memo
 sub-second on modern hardware (§7). At larger scales, a row-level change log table in
 `working.db` is an optimization path deferred to a later version.
 
-The `.state/` directory layout shown in §1 no longer includes a `dirty` file. The directory
+The `.khive/state/` directory layout shown in §1 no longer includes a `dirty` file. The directory
 contains only `working.db` and `HEAD`.
 
 ### 7. Status and diff computation
@@ -281,15 +298,15 @@ main khive database (`~/.khive/khive.db` or the configured path). No `.khive/kg/
 exists. No versioning. This is the existing behavior — this ADR does not change it.
 
 **Git-native mode** (`khive kg init` has been run): The verb surface writes to
-`.khive/kg/.state/working.db`. The `khive kg` subcommands (`commit`, `status`, `pull`,
+`.khive/state/working.db`. The `khive kg` subcommands (`commit`, `status`, `pull`,
 `reset`) manage the lifecycle. Requires git on `$PATH`.
 
-Mode detection at runtime: if `.khive/kg/.state/working.db` exists in the current directory
+Mode detection at runtime: if `.khive/state/working.db` exists in the current directory
 or any parent (walking up to the filesystem root), the KG verbs route to that DB. Otherwise,
 they route to the main database.
 
 This is the same heuristic git uses to locate `.git/` — the CLI walks up from `$CWD` to find
-the nearest `.khive/kg/.state/working.db`. If found, git-native mode is active. If not found,
+the nearest `.khive/state/working.db`. If found, git-native mode is active. If not found,
 standalone mode is used. The search stops at the filesystem root.
 
 ### 9. Initialization
@@ -297,16 +314,14 @@ standalone mode is used. The search stops at the filesystem root.
 `khive kg init` performs the following:
 
 1. **Detect state**:
-   - If `.khive/kg/` exists AND `.state/working.db` exists: error
-     "KG already initialized in this directory (working.db found). Run `khive kg status` to
-     check state, or `khive kg reset` to rebuild from committed files."
-   - If `.khive/kg/` exists AND `.state/working.db` is absent (fresh clone):
-     bootstrap mode — skip to step 3 (skip creating files that already exist).
+   - If `.khive/kg/` exists: error
+     "KG already initialized in this directory. Run `khive kg status` to
+     check state, or `khive kg sync` to rebuild `working.db` from committed files."
    - If `.khive/kg/` does not exist: fresh init — execute all steps below.
 
 2. If the current directory is not a git repository: run `git init`.
 
-3. Create `.khive/kg/`, `.khive/kg/.state/`, and `.khive/kg/migrations/` if they do not already
+3. Create `.khive/kg/`, `.khive/state/`, and `.khive/kg/migrations/` if they do not already
    exist. Add a `.gitkeep` file to `migrations/` so the directory is tracked by git (ADR-054
    expects this directory for schema migration sequences).
 
@@ -314,20 +329,22 @@ standalone mode is used. The search stops at the filesystem root.
    kinds + ADR-002 edge relations, `format_version: "1.0.0"`, `ontology_version: "1.0.0"`,
    `khive_version: "<current>"`, empty `remotes: []`).
 
-5. If `entities.ndjson` does not already exist: write empty `entities.ndjson` (single `\n`).
-   If `edges.ndjson` does not already exist: write empty `edges.ndjson` (single `\n`).
+5. If `entities.ndjson` does not already exist: write empty (zero-byte) `entities.ndjson`.
+   If `edges.ndjson` does not already exist: write empty (zero-byte) `edges.ndjson`.
 
-6. If committed NDJSON files are non-empty (bootstrap mode): run the §5 atomic rebuild
-   (validate → temp DB → swap) to populate `working.db` from the existing NDJSON files.
-   If the NDJSON files are empty (fresh init): create empty `working.db` with the §4 schema.
+6. Create `.khive/state/` directory if absent. `working.db` is not created by `khive kg init`;
+   it is created on first `khive kg sync` (Phase C2 will integrate the full rebuild here).
 
-7. Write current git branch to `.state/HEAD`.
+7. Write current git branch to `.khive/state/HEAD`.
 
-8. Append `.khive/kg/.state/` to `.gitignore` (creating `.gitignore` if absent, idempotent
-   if the entry already exists).
+8. Write `.khive/.gitignore` with the allowlist pattern (ignore everything under `.khive/`
+   except `kg/` and `config.toml`). This subsumes the previously-separate top-level
+   `.gitignore` entry for the state directory: any new `.khive/<dir>/` directory created in
+   future is gitignored by default. Idempotent — if `.khive/.gitignore` already exists, it is
+   left untouched.
 
-9. Stage the KG files, migrations directory, and `.gitignore`:
-   `git add .khive/kg/schema.yaml .khive/kg/entities.ndjson .khive/kg/edges.ndjson .khive/kg/migrations/.gitkeep .gitignore`.
+9. Stage the KG files, migrations directory, and `.khive/.gitignore`:
+   `git add .khive/kg/schema.yaml .khive/kg/entities.ndjson .khive/kg/edges.ndjson .khive/kg/migrations/.gitkeep .khive/.gitignore`.
 
 10. Emit: "KG initialized. Run `khive kg status` to check state."
 
@@ -335,11 +352,12 @@ standalone mode is used. The search stops at the filesystem root.
 `khive kg commit` will commit them alongside actual graph content.
 
 **Fresh clone bootstrap**: On a fresh clone, `.khive/kg/` contains tracked NDJSON files but no
-`.state/` directory (`.state/` is gitignored). Running `khive kg init` detects this state
-(`.khive/kg/` present, `working.db` absent) and bootstraps `.state/working.db` via the atomic
-rebuild flow (§5). This is the expected onboarding path for contributors joining an existing KG
-project. No data is lost or overwritten — the NDJSON files are the source of truth, and the
-DB is rebuilt from them deterministically.
+`.khive/state/` directory (`.khive/state/` is gitignored). Running `khive kg init` on an existing
+clone will error because `.khive/kg/` already exists; contributors should instead run
+`khive kg sync` to create `.khive/state/working.db` from the committed NDJSON files. This is the
+expected onboarding path. No data is lost or overwritten — the NDJSON files are the source of
+truth, and the DB is rebuilt from them deterministically. (Phase C2 will extend `khive kg init`
+to detect the bootstrap case and run sync automatically.)
 
 ## Alternatives Considered
 
@@ -402,7 +420,7 @@ limitation of the implementation.
 ### Positive
 
 - The DB is always reconstructable from the NDJSON files. No backup strategy is needed
-  for `.state/working.db` — if it is lost or corrupted, `khive kg pull` rebuilds it.
+  for `.khive/state/working.db` — if it is lost or corrupted, `khive kg sync` rebuilds it.
 - `khive kg status` is always computed from a DB-vs-NDJSON diff, which catches DB changes
   that `git status` cannot see (the DB is gitignored). The diff is bounded by graph size
   and is sub-second for graphs up to ~100K entities.

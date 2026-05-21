@@ -70,9 +70,13 @@ export async function gitCommit(message: string): Promise<string> {
   return match ? match[1] : "";
 }
 
-/** Return the name of the current git branch. */
+/**
+ * Return the name of the current git branch.
+ * Uses `symbolic-ref --short HEAD` rather than `rev-parse --abbrev-ref HEAD`
+ * so that it works on a freshly initialised repo with no commits yet.
+ */
 export async function getCurrentBranch(): Promise<string> {
-  const result = await exec(["git", "rev-parse", "--abbrev-ref", "HEAD"]);
+  const result = await exec(["git", "symbolic-ref", "--short", "HEAD"]);
   if (result.code !== 0) {
     throw new Error(`Failed to get current branch: ${result.stderr}`);
   }

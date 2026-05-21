@@ -40,7 +40,7 @@ This means:
 - ADR-048 (`export`, `import`, `validate`) and ADR-051 (`commit`, `sync`): unchanged in
   their external behavior. This ADR specifies _when_ embedding runs within those operations,
   not how they work.
-- ADR-052 (`working.db` schema, `.state/` layout): unchanged. Embeddings are stored in
+- ADR-052 (`working.db` schema, `.khive/state/` layout): unchanged. Embeddings are stored in
   `working.db` via the sqlite-vec extension already present in the schema (ADR-009).
 - lattice-embed crate (local inference): consumed as-is. This ADR specifies only which model
   name and device the crate receives, not how it works.
@@ -232,7 +232,7 @@ Vectors are stored in `working.db` only. They are **not** written to the NDJSON 
 - Two contributors with the same model config will produce identical vectors for the same entity
   text, so there is no loss from discarding vectors on sync and recomputing them locally.
 
-`working.db` is gitignored (ADR-052 §1). The `.state/` directory is ephemeral by design.
+`working.db` is gitignored (ADR-052 §1). The `.khive/state/` directory is ephemeral by design.
 
 ### 7. Model change workflow
 
@@ -497,7 +497,7 @@ changes. E3 and E4 deliver the automatic embedding pipeline. E5 improves error m
 - [ADR-048](ADR-048-git-native-kg-versioning.md) — NDJSON format, `khive kg init`, CLI commands
 - [ADR-051](ADR-051-cli-auth-and-kg-git-workflow.md) — `khive kg commit` and `khive kg sync`
   pipelines extended in §5
-- [ADR-052](ADR-052-kg-storage-model.md) — `working.db` schema; `.state/` layout; sqlite-vec
+- [ADR-052](ADR-052-kg-storage-model.md) — `working.db` schema; `.khive/state/` layout; sqlite-vec
 - [ADR-012](ADR-012-retrieval-architecture.md) — lattice-embed integration for local inference
 - [ADR-056](ADR-056-kg-validation-pipelines.md) — validation pipelines that can consume config
   settings in future rules
