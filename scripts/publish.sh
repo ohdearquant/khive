@@ -54,6 +54,7 @@ CRATES=(
     khive-pack-kg
     khive-pack-gtd
     khive-pack-memory
+    khive-pack-brain
     khive-vcs
     khive-merge
     khive-mcp

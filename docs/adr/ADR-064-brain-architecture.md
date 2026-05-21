@@ -47,27 +47,44 @@ nor production Thompson sampling routers provide.
 
 ## Decision
 
-### 1. Event substrate
+### 1. Event substrate — no parallel event types
 
-Brain events use the Event observable (ADR-004). Events are immutable and append-only — they
-are never modified or soft-deleted, unlike notes. This guarantees the replay invariant: the
-brain can reconstruct its state from the event stream at any point.
+The brain consumes the **existing** Event observable (ADR-004) directly. There is no
+`BrainEvent` enum. Events are immutable and append-only — they are never modified or
+soft-deleted, unlike notes. This guarantees the replay invariant: the brain can reconstruct
+its state from the event stream at any point.
+
+The brain **interprets** raw events by pattern-matching on `event.verb`, `event.outcome`,
+`event.target_id`, and `event.data`:
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type")]
-pub enum BrainEvent {
-    RecallUsed { note_id: Uuid, query: String, latency_ms: u64 },
-    RecallSkipped { note_id: Uuid, query: String },
-    RecallMiss { query: String },
-    NoteAccessed { note_id: Uuid },
-    SearchCompleted { query: String, result_count: u32, latency_ms: u64 },
-    Feedback { note_id: Uuid, signal: FeedbackSignal },
+/// Interpreted brain signal extracted from a raw Event.
+pub enum BrainSignal {
+    RecallHit { target_id: Uuid, latency_us: i64 },
+    RecallMiss,
+    SearchCompleted { latency_us: i64 },
+    Feedback { target_id: Uuid, signal: FeedbackSignal },
+    NoteAccessed { target_id: Uuid },
+    Irrelevant,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FeedbackSignal { Useful, NotUseful, Wrong }
+pub fn interpret(event: &khive_storage::Event) -> BrainSignal {
+    match event.verb.as_str() {
+        "recall" => /* Success + target_id → RecallHit, else RecallMiss */,
+        "search" => BrainSignal::SearchCompleted { .. },
+        "brain.emit" => /* parse data.signal → Feedback */,
+        "get" | "remember" => /* target_id → NoteAccessed */,
+        _ => BrainSignal::Irrelevant,
+    }
+}
 ```
+
+This means **any pack that emits Events through the standard dispatch path automatically
+feeds the brain**. No coupling to memory or any specific pack. To add a new signal source,
+extend `interpret()` with another verb match arm.
+
+Explicit feedback uses the `brain.emit` verb, which creates a standard Event with structured
+`data: {"signal": "useful|not_useful|wrong"}` and a `target_id` pointing to the entity.
 
 ### 2. Pack-generic tuning interface
 
@@ -76,16 +93,9 @@ The brain tunes any pack, not just memory. Every pack that wants auto-tuning imp
 
 ```rust
 pub trait PackTunable: PackRuntime {
-    fn event_schema(&self) -> &[EventSchema];
     fn parameter_space(&self) -> ParameterSpace;
     fn project_config(&self, state: &BrainState) -> Value;
     fn apply_config(&self, config: Value) -> Result<(), RuntimeError>;
-}
-
-pub struct EventSchema {
-    pub event_type: &'static str,
-    pub positive: bool,
-    pub parameter_target: &'static str,
 }
 
 pub struct ParameterSpace {
@@ -93,23 +103,38 @@ pub struct ParameterSpace {
 }
 
 pub struct ParameterDef {
-    pub name: &'static str,
-    pub prior: BetaPosterior,
+    pub name: String,
+    pub prior_alpha: f64,
+    pub prior_beta: f64,
     pub bounds: (f64, f64),
 }
 ```
 
+Note: there is no `EventSchema` type. Event-to-parameter routing lives in `interpret()` +
+`is_recall_positive()` (and future per-pack signal extractors) — not in a static schema
+declaration. This is simpler: the brain reads the event stream directly, and `interpret()`
+is the single place that maps verbs to brain signals.
+
 The brain discovers tunable packs via the `PackRegistry` (ADR-063) at startup. It merges all
-parameter spaces into a unified `BrainState` keyed by `pack::parameter`. Events from any pack
-route to the relevant posterior via `EventSchema.parameter_target`.
+parameter spaces into a unified `BrainState` keyed by `pack::parameter_name`.
 
 ### 3. BrainState: pack-generic learned parameters
 
+`BrainState` is the runtime type (not directly serializable due to the LRU cache).
+`BrainStateSnapshot` is the serde-compatible projection used for persistence and inspection.
+
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainState {
     pub parameters: HashMap<String, BetaPosterior>,
-    pub entity_posteriors: LruCache<Uuid, BetaPosterior>,
+    pub entity_posteriors: EntityPosteriors, // bounded LRU, 10K capacity
+    pub total_events: u64,
+    pub exploration_epoch: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct BrainStateSnapshot {
+    pub parameters: HashMap<String, BetaPosterior>,
+    pub entity_posteriors: HashMap<Uuid, BetaPosterior>,
     pub total_events: u64,
     pub exploration_epoch: u64,
 }
@@ -147,43 +172,41 @@ Key differences from earlier draft:
   it has already observed 10 events (7 successes, 3 failures). This is a design choice:
   informative priors warm-start the brain but take ~10 real events to override.
 
-### 4. EventFold: the brain as a fold
+### 4. EventFold: the brain as a fold over the Event substrate
 
 ```rust
 pub struct EventFold {
-    schema_map: HashMap<String, EventSchema>,
+    entity_capacity: usize,
 }
 
-impl Fold<BrainEvent, BrainState> for EventFold {
+impl Fold<khive_storage::Event, BrainState> for EventFold {
     fn initial(&self, _context: &FoldContext) -> BrainState {
-        // Populated from merged PackTunable::parameter_space() at construction
-        BrainState {
-            parameters: self.initial_parameters(),
-            entity_posteriors: LruCache::new(10_000),
-            total_events: 0,
-            exploration_epoch: 0,
-        }
+        BrainState::new(
+            [("recall::relevance_weight", Beta(7.0, 3.0)),
+             ("recall::importance_weight", Beta(2.0, 8.0)),
+             ("recall::temporal_weight", Beta(1.0, 9.0))].into(),
+            self.entity_capacity,
+        )
     }
 
-    fn step(&self, mut state: BrainState, event: &BrainEvent, _ctx: &FoldContext) -> BrainState {
+    fn step(&self, mut state: BrainState, event: &Event, _ctx: &FoldContext) -> BrainState {
+        let signal = interpret(event);  // raw Event → BrainSignal
         state.total_events += 1;
-        let event_type = event.event_type_str();
 
-        if let Some(schema) = self.schema_map.get(event_type) {
-            if let Some(posterior) = state.parameters.get_mut(schema.parameter_target) {
-                if schema.positive {
-                    posterior.update_success();
-                } else {
-                    posterior.update_failure();
-                }
+        // Global parameter updates
+        if let Some(positive) = is_recall_positive(&signal) {
+            if let Some(posterior) = state.parameters.get_mut("recall::relevance_weight") {
+                if positive { posterior.update_success(); }
+                else { posterior.update_failure(); }
             }
         }
 
-        // Per-entity updates (e.g., per-memory importance)
-        if let Some((entity_id, positive)) = event.entity_signal() {
+        // Per-entity updates
+        if let Some((entity_id, positive)) = entity_signal(&signal) {
             let posterior = state.entity_posteriors
                 .get_or_insert(entity_id, || BetaPosterior::new(1.0, 1.0));
-            if positive { posterior.update_success(); } else { posterior.update_failure(); }
+            if positive { posterior.update_success(); }
+            else { posterior.update_failure(); }
         }
 
         state
@@ -192,7 +215,11 @@ impl Fold<BrainEvent, BrainState> for EventFold {
 ```
 
 The EventFold is deterministic: same events in the same order produce the same BrainState.
-The LRU cache is deterministic given the same insertion order.
+The bounded LRU cache (FIFO eviction) is deterministic given the same insertion order.
+
+Key difference from earlier draft: the fold takes `khive_storage::Event` directly, not a
+custom `BrainEvent`. The `interpret()` function is the mapping layer — it extracts brain
+signals from the universal event stream without requiring producers to know about the brain.
 
 ### 5. Config projection and explore/exploit
 
@@ -243,11 +270,11 @@ No top-level verbs. The brain is infrastructure. Events are emitted automaticall
 
 ### 7. Hoare triple
 
-| Component         | Brain instantiation                                                                                                                                 |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Precondition**  | Event stream is append-only (Event substrate, ADR-004). All BetaPosterior priors have alpha > 0, beta > 0. PackTunable schemas are valid.           |
-| **Program**       | EventFold processes events in order, routing each to the correct posterior via EventSchema. LRU eviction is deterministic given insertion order.    |
-| **Postcondition** | BrainState is deterministic (replay-verifiable). All posteriors maintain alpha > 0, beta > 0. Projected configs have values within declared bounds. |
+| Component         | Brain instantiation                                                                                                                                  |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Precondition**  | Event stream is append-only (Event substrate, ADR-004). All BetaPosterior priors have alpha > 0, beta > 0.                                           |
+| **Program**       | EventFold processes events in order, interpreting each via `interpret()` and routing to the correct posterior. LRU eviction is deterministic (FIFO). |
+| **Postcondition** | BrainState is deterministic (replay-verifiable). All posteriors maintain alpha > 0, beta > 0. Projected configs have values within declared bounds.  |
 
 ## Alternatives Considered
 
