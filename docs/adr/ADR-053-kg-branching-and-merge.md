@@ -1,6 +1,6 @@
 # ADR-053: KG Branching and Merge
 
-**Status**: proposed\
+**Status**: accepted (Phase B1+B2 — `khive kg resolve` with `--ours`/`--theirs`/`--merge-properties` + per-entity/edge overrides + NDJSON re-sort + validate-on-finish landed in Deno CLI; B3 schema conflict categorisation and B4 `khive kg log --entity` deferred)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 

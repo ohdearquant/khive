@@ -14,6 +14,7 @@ import { runExport } from "./kg/export.ts";
 import { recoverImportJournal, runImport } from "./kg/import.ts";
 import { runPackCheck } from "./pack/check.ts";
 import { runPackInit } from "./pack/init.ts";
+import { runResolve } from "./kg/resolve.ts";
 import { runSync } from "./kg/sync.ts";
 import { runStatus } from "./kg/status.ts";
 import { runValidate } from "./kg/validate.ts";
@@ -39,6 +40,7 @@ KG subcommands:
   embed         Plan / run entity embedding (ADR-057; Phase C1 plans, Phase C2 runs)
   export        Re-write canonical .khive/kg/*.ndjson; --format archive emits a JSON bundle
   import        Import a KgArchive JSON file into NDJSON files
+  resolve       Resolve NDJSON merge conflicts (ADR-053)
   diff          Entity-aware diff between two NDJSON states (Phase C2 — not yet implemented)
   update        Advance a remote pin in schema.yaml (Phase C2 — not yet implemented)
 
@@ -69,6 +71,7 @@ Subcommands (Phase C1 — file-level operations):
   embed         Plan embedding for entities awaiting vectors (run: Phase C2)
   export        Re-write canonical .khive/kg/*.ndjson; --format archive emits a JSON bundle
   import        Import a KgArchive JSON file into NDJSON files
+  resolve       Resolve NDJSON merge conflicts after 'git merge'
 
 Planned (Phase C2+):
   diff          Entity-aware diff
@@ -125,6 +128,11 @@ async function dispatchKg(args: string[]): Promise<void> {
     case "embed":
       await runEmbed(await getRepoRoot(), rest);
       break;
+    case "resolve": {
+      const code = await runResolve(await getRepoRoot(), rest);
+      if (code !== 0) Deno.exit(code);
+      break;
+    }
 
     case "export":
       await runExport(await getRepoRoot(), rest);
