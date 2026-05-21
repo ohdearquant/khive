@@ -345,20 +345,9 @@ impl khive_storage::SqlWriter for SqliteWriter {
             operation: "execute_script".into(),
             message: "connection already consumed".into(),
         })?;
-        // Wrap in BEGIN IMMEDIATE / COMMIT so that a multi-statement DDL block
-        // (e.g. VCS_MIGRATIONS_V1) is applied atomically: if any statement fails,
-        // the ROLLBACK ensures no partial schema is left behind.
         let (conn, result) = tokio::task::spawn_blocking(move || {
-            let result = (|| -> Result<(), rusqlite::Error> {
-                conn.execute_batch("BEGIN IMMEDIATE")?;
-                conn.execute_batch(&script)?;
-                conn.execute_batch("COMMIT")?;
-                Ok(())
-            })();
-            if result.is_err() {
-                let _ = conn.execute_batch("ROLLBACK");
-            }
-            (conn, result)
+            let res = conn.execute_batch(&script);
+            (conn, res)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script", e))?;
@@ -745,21 +734,13 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
         let pool = Arc::clone(&self.pool);
-        // Wrap in BEGIN IMMEDIATE / COMMIT for atomicity (matches the file-backed impl).
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute_script", e)
             })?;
-            let result = (|| -> Result<(), rusqlite::Error> {
-                guard.execute_batch("BEGIN IMMEDIATE")?;
-                guard.execute_batch(&script)?;
-                guard.execute_batch("COMMIT")?;
-                Ok(())
-            })();
-            if result.is_err() {
-                let _ = guard.execute_batch("ROLLBACK");
-            }
-            result.map_err(|e| map_rusqlite_err(e, "pool_writer.execute_script"))
+            guard
+                .execute_batch(&script)
+                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_script"))
         })
         .await
         .map_err(|e| {
