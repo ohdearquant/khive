@@ -1,6 +1,6 @@
 # ADR-050: Declarative Pack Format and Local Pack Management
 
-**Status**: proposed\
+**Status**: accepted (Phase E1 — pack.yaml schema + Deno-side validator (`khive pack check`) + scaffold (`khive pack init`) implemented. Phase E2 — Rust `DeclarativePack` runtime, `khive pack install/remove`, registry interaction deferred until the Rust runtime is wired to consume pack.yaml at startup.)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 

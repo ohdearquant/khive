@@ -7,7 +7,8 @@
     "jsr:@std/fs@^1.0.23": "1.0.23",
     "jsr:@std/internal@^1.0.12": "1.0.13",
     "jsr:@std/path@^1.1.4": "1.1.4",
-    "jsr:@std/toml@^1.0.11": "1.0.11"
+    "jsr:@std/toml@^1.0.11": "1.0.11",
+    "jsr:@std/yaml@^1.1.0": "1.1.0"
   },
   "jsr": {
     "@std/assert@1.0.19": {
@@ -43,6 +44,9 @@
       "dependencies": [
         "jsr:@std/collections"
       ]
+    },
+    "@std/yaml@1.1.0": {
+      "integrity": "fc1c5c63e05c4c5eb6118355f557958035d41940d6c29d35b306ef7155d6edb0"
     }
   },
   "workspace": {
@@ -51,7 +55,8 @@
       "jsr:@std/fmt@1",
       "jsr:@std/fs@^1.0.23",
       "jsr:@std/path@^1.1.4",
-      "jsr:@std/toml@^1.0.11"
+      "jsr:@std/toml@^1.0.11",
+      "jsr:@std/yaml@^1.1.0"
     ]
   }
 }

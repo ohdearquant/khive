@@ -10,6 +10,8 @@ import { kgInit } from "./kg/mod.ts";
 import { runCommit } from "./kg/commit.ts";
 import { runConfig } from "./kg/config.ts";
 import { runEmbed } from "./kg/embed.ts";
+import { runPackCheck } from "./pack/check.ts";
+import { runPackInit } from "./pack/init.ts";
 import { runSync } from "./kg/sync.ts";
 import { runStatus } from "./kg/status.ts";
 import { runValidate } from "./kg/validate.ts";
@@ -21,8 +23,9 @@ function printUsage(): void {
   console.log(`khive ${VERSION} — research knowledge graph CLI
 
 Usage:
-  khive kg <subcommand>    Manage the git-native knowledge graph
-  khive auth <subcommand>  Authenticate with khive.ai (optional)
+  khive kg <subcommand>     Manage the git-native knowledge graph
+  khive pack <subcommand>   Author and validate declarative packs (ADR-050)
+  khive auth <subcommand>   Authenticate with khive.ai (optional)
 
 KG subcommands:
   init          Initialise .khive/kg/ in the current git repo
@@ -34,6 +37,10 @@ KG subcommands:
   embed         Plan / run entity embedding (ADR-057; Phase C1 plans, Phase C2 runs)
   diff          Entity-aware diff between two NDJSON states (Phase C2 — not yet implemented)
   update        Advance a remote pin in schema.yaml (Phase C2 — not yet implemented)
+
+Pack subcommands (ADR-050):
+  init          Scaffold a new declarative pack
+  check         Validate a pack.yaml manifest
 
 Auth subcommands:
   login         Sign in to khive.ai via GitHub OAuth
@@ -153,6 +160,48 @@ function dispatchAuth(args: string[]): void {
 // Entry point
 // ---------------------------------------------------------------------------
 
+async function dispatchPack(args: string[]): Promise<void> {
+  const [subcommand, ...rest] = args;
+  if (!subcommand || subcommand === "--help" || subcommand === "-h") {
+    console.log(`Usage: khive pack <subcommand>
+
+Subcommands (ADR-050):
+  init           Scaffold a new declarative pack (creates ./pack.yaml)
+  check <path>   Validate a pack.yaml manifest
+
+Planned:
+  install        Install a pack from registry/local/git
+  remove         Uninstall a pack
+  publish        Publish to a pack registry`);
+    return;
+  }
+  let code = 0;
+  switch (subcommand) {
+    case "init":
+      code = await runPackInit(rest);
+      break;
+    case "check":
+      code = await runPackCheck(rest);
+      break;
+    case "validate":
+    case "install":
+    case "remove":
+    case "publish":
+    case "search":
+    case "info":
+      console.error(
+        `'khive pack ${subcommand}' is not yet implemented (deferred to Phase 2).`,
+      );
+      code = 1;
+      break;
+    default:
+      console.error(`Unknown pack subcommand: '${subcommand}'`);
+      console.error("Run 'khive pack --help' for available subcommands.");
+      code = 1;
+  }
+  if (code !== 0) Deno.exit(code);
+}
+
 const [group, ...groupArgs] = Deno.args;
 
 if (!group || group === "--help" || group === "-h") {
@@ -161,6 +210,8 @@ if (!group || group === "--help" || group === "-h") {
   console.log(`khive ${VERSION}`);
 } else if (group === "kg") {
   await dispatchKg(groupArgs);
+} else if (group === "pack") {
+  await dispatchPack(groupArgs);
 } else if (group === "auth") {
   dispatchAuth(groupArgs);
 } else {
