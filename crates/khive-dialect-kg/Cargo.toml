@@ -12,4 +12,5 @@ description = "KG dialect for khive-mcp — bundles the kg and gtd packs into a 
 khive-pack-kg = { version = "0.1.4", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.1.4", path = "../khive-pack-gtd" }
 khive-pack-memory = { version = "0.1.4", path = "../khive-pack-memory" }
+khive-pack-vcs = { path = "../khive-pack-vcs" }
 khive-runtime = { version = "0.1.4", path = "../khive-runtime" }

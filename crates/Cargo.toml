@@ -13,6 +13,7 @@ members = [
     "khive-pack-kg",
     "khive-pack-gtd",
     "khive-pack-memory",
+    "khive-pack-vcs",
     "khive-dialect-kg",
     "khive-mcp",
     "khive-vcs",

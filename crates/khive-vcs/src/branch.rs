@@ -162,11 +162,21 @@ pub async fn checkout(
     let (resolved_branch, resolved_snap_id) =
         resolve_checkout_target(runtime, &ns, branch_name, snapshot_id).await?;
 
-    // Check dirty flag (unless force=true).
+    // Check for uncommitted changes (unless force=true).
+    // ADR-042/ADR-015: checkout must reject when the live state diverges from the
+    // last committed snapshot. Runtime entity writes do not set kg_vcs_state.dirty
+    // directly, so we detect divergence by hashing the current archive and comparing
+    // it against last_committed_id stored in kg_vcs_state.
     if !force {
         let state = crate::snapshot::load_vcs_state(runtime, &ns).await?;
-        if state.dirty {
-            // Count uncommitted changes as a rough estimate.
+        let has_uncommitted = if state.dirty {
+            // Dirty flag explicitly set (e.g. by a previous partial operation).
+            true
+        } else {
+            // Hash-compare live state to the last committed snapshot.
+            has_diverged_from_last_commit(runtime, &ns, state.last_committed_id.as_ref()).await?
+        };
+        if has_uncommitted {
             let count = estimate_uncommitted_count(runtime, &ns).await?;
             return Err(VcsError::UncommittedChanges { count });
         }
@@ -310,24 +320,125 @@ async fn resolve_checkout_target(
     }
 }
 
-/// Estimate uncommitted change count by comparing current entity count against last snapshot.
+/// Estimate uncommitted change count as the symmetric difference between the
+/// last committed archive and the live export.
+///
+/// Returns the number of entity IDs and edge IDs that appear in one snapshot
+/// but not the other (i.e. added + deleted).  A pure deletion (e.g. committing
+/// one entity then deleting it) therefore reports `count = 1`, not `count = 0`.
+///
+/// Falls back to the live entity count when no committed snapshot exists yet.
 async fn estimate_uncommitted_count(
     runtime: &KhiveRuntime,
     namespace: &str,
 ) -> Result<usize, VcsError> {
-    // Simple estimate: any write since last commit is counted as ≥1 change.
-    // A proper implementation would compare entity counts between live state and last snapshot.
-    let entities = runtime
-        .list_entities(Some(namespace), None, u32::MAX)
+    let state = crate::snapshot::load_vcs_state(runtime, namespace).await?;
+
+    let last_committed_id = match state.last_committed_id {
+        Some(id) => id,
+        None => {
+            // No prior commit — live count is the best estimate.
+            let entities = runtime
+                .list_entities(Some(namespace), None, u32::MAX)
+                .await
+                .map_err(|e| VcsError::Storage(e.to_string()))?;
+            return Ok(entities.len());
+        }
+    };
+
+    let committed = crate::snapshot::load_archive(runtime, &last_committed_id).await?;
+    let live = runtime
+        .export_kg(Some(namespace))
         .await
         .map_err(|e| VcsError::Storage(e.to_string()))?;
-    Ok(entities.len())
+
+    use std::collections::HashSet;
+
+    // Compare by entity UUID strings.
+    let committed_entity_ids: HashSet<String> = committed
+        .entities
+        .iter()
+        .map(|e| e.id.to_string())
+        .collect();
+    let live_entity_ids: HashSet<String> = live.entities.iter().map(|e| e.id.to_string()).collect();
+
+    // Edges have no standalone ID; use (source, target, relation) as a composite key.
+    let committed_edge_keys: HashSet<String> = committed
+        .edges
+        .iter()
+        .map(|e| format!("{}/{}/{}", e.source, e.target, e.relation))
+        .collect();
+    let live_edge_keys: HashSet<String> = live
+        .edges
+        .iter()
+        .map(|e| format!("{}/{}/{}", e.source, e.target, e.relation))
+        .collect();
+
+    // Symmetric difference: records present in one set but not the other.
+    let entity_diff = committed_entity_ids
+        .symmetric_difference(&live_entity_ids)
+        .count();
+    let edge_diff = committed_edge_keys
+        .symmetric_difference(&live_edge_keys)
+        .count();
+
+    Ok(entity_diff + edge_diff)
+}
+
+/// Return `true` when the live namespace state has diverged from the last committed snapshot.
+///
+/// Hashes the current `export_kg` archive and compares it against `last_committed_id`.
+/// If there is no committed snapshot yet (first-use), any non-empty live state is
+/// considered dirty (must commit before checkout).
+async fn has_diverged_from_last_commit(
+    runtime: &KhiveRuntime,
+    namespace: &str,
+    last_committed_id: Option<&SnapshotId>,
+) -> Result<bool, VcsError> {
+    let archive = runtime
+        .export_kg(Some(namespace))
+        .await
+        .map_err(|e| VcsError::Storage(e.to_string()))?;
+    let live_id = crate::hash::snapshot_id_for_archive(&archive)?;
+
+    match last_committed_id {
+        Some(committed) => Ok(&live_id != committed),
+        None => {
+            // No previous commit: only clean if the namespace is completely empty.
+            Ok(!archive.entities.is_empty() || !archive.edges.is_empty())
+        }
+    }
+}
+
+/// Delete all entities and edges in a namespace to prepare for a merge restore.
+///
+/// Exposed for the VCS pack's `merge_branch` handler which needs to apply
+/// the merged archive through a restore-style path (wipe + import) so that
+/// entities/edges absent from the merge result are removed from live state.
+pub async fn wipe_namespace_for_merge(
+    runtime: &KhiveRuntime,
+    namespace: Option<&str>,
+) -> Result<(), VcsError> {
+    let ns = runtime.ns(namespace).to_string();
+    wipe_namespace(runtime, &ns).await
 }
 
 /// Delete all entities and edges in a namespace to prepare for checkout restore.
 ///
-/// Uses bulk SQL DELETEs instead of per-entity loop to avoid N+1 overhead.
+/// Uses bulk SQL DELETEs (edges first, then entities) to avoid N+1 overhead.
+/// FTS5 and vector index cleanup is intentionally skipped here: the subsequent
+/// `import_kg` call rebuilds both indexes via `reindex_entity` for every imported
+/// entity, so any stale entries left behind are overwritten on import.
 async fn wipe_namespace(runtime: &KhiveRuntime, namespace: &str) -> Result<(), VcsError> {
+    // Ensure the entity/graph schemas exist before running raw SQL against them.
+    // (Lazy schema creation means tables may not exist yet on a fresh in-memory DB.)
+    runtime
+        .entities(Some(namespace))
+        .map_err(|e| VcsError::Storage(e.to_string()))?;
+    runtime
+        .graph(Some(namespace))
+        .map_err(|e| VcsError::Storage(e.to_string()))?;
+
     let sql = runtime.sql();
     let mut writer = sql
         .writer()
@@ -336,30 +447,12 @@ async fn wipe_namespace(runtime: &KhiveRuntime, namespace: &str) -> Result<(), V
 
     let ns_param = vec![SqlValue::Text(namespace.to_string())];
 
-    // Edges first (referential integrity), then FTS/vector indexes, then entities.
+    // Delete edges before entities (referential integrity).
     writer
         .execute(SqlStatement {
-            sql: "DELETE FROM edges WHERE namespace = ?1".to_string(),
+            sql: "DELETE FROM graph_edges WHERE namespace = ?1".to_string(),
             params: ns_param.clone(),
             label: Some("wipe_edges".to_string()),
-        })
-        .await
-        .map_err(|e| VcsError::Storage(e.to_string()))?;
-
-    writer
-        .execute(SqlStatement {
-            sql: "DELETE FROM text_index WHERE namespace = ?1".to_string(),
-            params: ns_param.clone(),
-            label: Some("wipe_text_index".to_string()),
-        })
-        .await
-        .map_err(|e| VcsError::Storage(e.to_string()))?;
-
-    writer
-        .execute(SqlStatement {
-            sql: "DELETE FROM vectors WHERE namespace = ?1".to_string(),
-            params: ns_param.clone(),
-            label: Some("wipe_vectors".to_string()),
         })
         .await
         .map_err(|e| VcsError::Storage(e.to_string()))?;

@@ -17,6 +17,7 @@
 pub use khive_pack_gtd::GtdPack;
 pub use khive_pack_kg::KgPack;
 pub use khive_pack_memory::MemoryPack;
+pub use khive_pack_vcs::VcsPack;
 
 use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
 
@@ -24,7 +25,7 @@ use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
 ///
 /// Used by `khive-mcp` to build its `BUILTIN_PACKS` constant and error
 /// messages without importing either pack crate directly.
-pub const BUILTIN_PACK_NAMES: &[&str] = &["kg", "gtd", "memory"];
+pub const BUILTIN_PACK_NAMES: &[&str] = &["kg", "gtd", "memory", "vcs"];
 
 /// Register a named pack from this dialect into `builder`.
 ///
@@ -49,6 +50,10 @@ pub fn register_pack(
             builder.register(MemoryPack::new(runtime));
             Ok(())
         }
+        "vcs" => {
+            builder.register(VcsPack::new(runtime));
+            Ok(())
+        }
         other => Err(other.to_string()),
     }
 }
@@ -69,10 +74,11 @@ mod tests {
     }
 
     #[test]
-    fn builtin_pack_names_includes_kg_and_gtd() {
+    fn builtin_pack_names_includes_all_packs() {
         assert!(BUILTIN_PACK_NAMES.contains(&"kg"));
         assert!(BUILTIN_PACK_NAMES.contains(&"gtd"));
         assert!(BUILTIN_PACK_NAMES.contains(&"memory"));
+        assert!(BUILTIN_PACK_NAMES.contains(&"vcs"));
     }
 
     #[test]
@@ -110,14 +116,16 @@ mod tests {
     }
 
     #[test]
-    fn both_packs_register_together() {
+    fn all_packs_register_together() {
         let rt1 = make_runtime();
         let rt2 = make_runtime();
         let rt3 = make_runtime();
+        let rt4 = make_runtime();
         let mut builder = VerbRegistryBuilder::new();
         register_pack("kg", rt1, &mut builder).unwrap();
         register_pack("gtd", rt2, &mut builder).unwrap();
         register_pack("memory", rt3, &mut builder).unwrap();
+        register_pack("vcs", rt4, &mut builder).unwrap();
         let registry = builder.build().expect("registry builds");
         let verb_names: Vec<&str> = registry.all_verbs().iter().map(|v| v.name).collect();
         // KG verbs present
@@ -127,5 +135,21 @@ mod tests {
         // Memory verbs present
         assert!(verb_names.contains(&"remember"));
         assert!(verb_names.contains(&"recall"));
+        // VCS verbs present (ADR-023 names)
+        assert!(verb_names.contains(&"commit"));
+        assert!(verb_names.contains(&"branch"));
+        assert!(verb_names.contains(&"checkout"));
+        assert!(verb_names.contains(&"merge_branch"));
+        assert!(verb_names.contains(&"export_kg"));
+        assert!(verb_names.contains(&"import_kg"));
+        // shortest_path removed from VCS — belongs in KG/graph pack
+        assert!(
+            !verb_names.contains(&"snapshot"),
+            "old name 'snapshot' must not appear"
+        );
+        assert!(
+            !verb_names.contains(&"vcs_merge"),
+            "old name 'vcs_merge' must not appear"
+        );
     }
 }
