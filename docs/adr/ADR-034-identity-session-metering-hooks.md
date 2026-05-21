@@ -1,8 +1,40 @@
 # ADR-034: Identity, Session, and Metering Extension Hooks
 
-**Status**: superseded\
+**Status**: superseded — identity, session, and metering are cloud middleware concerns (khive-cloud ADR-039)\
 **Date**: 2026-05-19\
+**Superseded**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
+
+## Why This ADR Was Superseded
+
+The gate-based extension hook approach described below (`ActorStore`/`SessionStore` traits in
+`khive-gate`, `Obligation::Meter` variant) was considered and rejected after further design work.
+
+**Decision**: Identity resolution, session lifecycle, and metering are **cloud middleware
+concerns**, not OSS gate concerns. The gate in OSS stays minimal: authorization policy only
+(allow/deny). No identity resolution traits, no session lifecycle traits, no metering
+obligation variant belong in `khive-gate`.
+
+Reasons:
+
+1. **Wrong layer.** The OSS gate is a policy evaluation engine. Injecting actor persistence
+   and session lifecycle into it couples the policy evaluation path to infrastructure that
+   varies per deployment and belongs in the transport/middleware layer.
+2. **Cloud middleware is the right insertion point.** Downstream deployments that need
+   identity resolution, session lifecycle, or metering implement them as middleware in their
+   own transport layer (HTTP middleware, MCP wrapper, etc.) — before the request reaches the
+   gate. The gate receives a fully resolved `ActorRef`; it does not need to know how that
+   resolution happened.
+3. **OSS gate stays minimal.** The gate contract remains: `Gate::check(GateRequest) ->
+   GateDecision`. No `ActorStore`, no `SessionStore`, no `Obligation::Meter` field. This
+   keeps the extension surface narrow and the security boundary clean.
+
+Downstream deployments that need these hooks implement them as middleware in their own
+transport layer. See khive-cloud for the middleware-based approach.
+
+The original design discussion below is preserved as a record of alternatives considered.
+
+---
 
 ## Context
 
@@ -44,17 +76,27 @@ substrate is also the **single dispatch site** (ADR-027), so any extension that 
 intercept the request lifecycle must do it through traits the substrate exposes — or fork
 the dispatcher.
 
-This ADR adds the trait surface and obligation variant that let downstream deployments
-implement persistent identity, session lifecycle, ownership policy, and metering without
-forking dispatch.
+---
+
+> **Superseded / historical — no OSS implementation.** The design below was the original
+> proposal. It was rejected in full: no `ActorStore`, no `SessionStore`, no
+> `Obligation::Meter` will be added to `khive-gate`. Every deliverable listed in the
+> implementation table below is marked `rejected` or `cloud-only`. The text is preserved
+> as a record of alternatives considered.
 
 ---
 
-## Decision
+The original proposal would have added the trait surface and obligation variant that let
+downstream deployments implement persistent identity, session lifecycle, ownership policy,
+and metering without forking dispatch.
+
+---
+
+## Rejected Proposal (historical record only — not normative)
 
 ### D1: Actor Persistence — `ActorStore` trait in `khive-gate`
 
-The OSS deliverable is a trait, not an implementation:
+The proposed OSS deliverable was a trait, not an implementation:
 
 ```rust
 // crates/khive-gate/src/lib.rs (additive)
@@ -70,12 +112,12 @@ pub struct ActorRecord {
 }
 ```
 
-`ActorRecord` is the persisted projection of `ActorRef` plus its owned namespace.
-No pack, no verb — storing actor records is out of scope for the pack model. OSS ships
-`NoopActorStore` — returns `None` for every lookup, meaning the transport-asserted
-`ActorRef` is accepted as-is, preserving today's behavior. Downstream deployments that
-need persistence implement `ActorStore` (e.g., backed by SQL) and wire it into
-`RuntimeConfig`.
+`ActorRecord` was the proposed persisted projection of `ActorRef` plus its owned namespace.
+No pack, no verb — storing actor records is out of scope for the pack model. The proposal
+included `NoopActorStore` — returning `None` for every lookup so the transport-asserted
+`ActorRef` would be accepted as-is, preserving existing behavior. Downstream deployments that
+needed persistence would implement `ActorStore` (e.g., backed by SQL) and wire it into
+`RuntimeConfig`. None of this was implemented; the entire design was rejected.
 
 `ActorStore` lives in `khive-gate` for the same reason `Gate` does: it is part of the gate
 layer's input resolution, not the storage layer's CRUD. Placing it in `khive-types` or
@@ -126,9 +168,10 @@ it on `GateContext::session_id`; the gate resolves that string against
 expiry) into its policy input by the same internal mechanism it uses for `ActorStore`
 resolution (see D1). The OSS `GateContext` wire shape is unchanged.
 
-OSS ships `EphemeralSessionStore` — an in-memory `HashMap<String, SessionRecord>` suitable for
-testing and single-process personal deployments. It is not durable; restart evicts all sessions.
-Downstream deployments that need persistence implement `SessionStore` (e.g., backed by SQL).
+The proposal included `EphemeralSessionStore` — an in-memory `HashMap<String, SessionRecord>`
+intended for testing and single-process personal deployments. It would not be durable; restart
+would evict all sessions. Downstream deployments needing persistence would implement `SessionStore`
+(e.g., backed by SQL). None of this was implemented; the entire design was rejected.
 
 The `session_id` field on `GateContext` and `AuditEvent` (ADR-033) remains a plain
 `Option<String>` — the gate populates it from the resolved `SessionRecord.token`,
@@ -182,17 +225,17 @@ pub enum Obligation {
 }
 ```
 
-**Rust source-compatibility precondition:** today's `Obligation` enum is a public,
-exhaustive enum. Adding `Meter` is **not** source-compatible — downstream crates that
-`match Obligation { … }` exhaustively will fail to compile. The implementation PR that
-lands `Meter` MUST either (a) mark `Obligation` `#[non_exhaustive]` in the same commit,
-or (b) land `#[non_exhaustive]` in a separate prep PR that ships first. Until then,
-the `Custom { value }` variant is the documented escape hatch for downstream policies
-that need metering-shaped data on the existing enum. The serde wire shape
-(`{"kind":"meter", "tag":..., "dimensions":...}`) is JSON-additive regardless — existing
-policies that emit only `Audit` obligations remain valid.
+**Rust source-compatibility precondition (historical — never implemented):** at the time of
+proposal, `Obligation` was a public exhaustive enum. Adding `Meter` would not have been
+source-compatible — downstream crates that `match Obligation { … }` exhaustively would fail
+to compile. The proposal required either (a) marking `Obligation` `#[non_exhaustive]` in the
+same commit, or (b) landing `#[non_exhaustive]` in a separate prep PR first. The `Custom {
+value }` variant was the documented escape hatch for downstream policies that needed
+metering-shaped data on the existing enum. The serde wire shape
+(`{"kind":"meter", "tag":..., "dimensions":...}`) would have been JSON-additive. The design
+was rejected before any of this was implemented.
 
-**Consumption scope:** ADR-034 ships only the obligation variant and its serde wire shape.
+**Consumption scope (historical — rejected for OSS):** The original proposal would have shipped only the obligation variant and its serde wire shape.
 `Meter` is **advisory** in OSS: the dispatcher includes any emitted `Meter` obligations in
 the `AuditEvent` it logs / persists via the ADR-033 path, alongside `Audit` and any other
 obligations. ADR-034 does **not** add a dispatcher-side consumer hook (no `MeterSink` field
@@ -228,17 +271,17 @@ not in OSS source.
 ```text
 gate.check() → obligations: [Meter{tag, dims}, Audit{tag}, ...]
    ↓
-dispatcher emits AuditEvent { obligations, ... }   (today: tracing::info!
-                                                    planned per ADR-033: append to EventStore)
+dispatcher emits AuditEvent { obligations, ... }   (proposal: tracing::info! initially,
+                                                    then EventStore per ADR-033)
    ↓
 verb dispatch runs
 ```
 
-There is no Kafka, no Redis Streams, no NATS in the OSS surface introduced by ADR-034. Once
-ADR-033's dispatch-time wiring lands, `EventStore` also serves as a durable event log
-indexed by `created_at`, which a future consumer-hook ADR can use as the pull-based fallback
-path. The shape of that hook (synchronous trait call, channel, polled reader) is explicitly
-deferred.
+The proposal would not have added Kafka, Redis Streams, or NATS to the OSS surface. The
+design assumed ADR-033's dispatch-time wiring would land, enabling `EventStore` to serve as a
+durable event log indexed by `created_at`, which a future consumer-hook ADR could use as a
+pull-based fallback. The shape of that hook was left as explicitly deferred. None of this was
+implemented; the design was rejected before any of these components shipped in OSS.
 
 ### D5: Extension Boundary Rules
 
@@ -294,12 +337,13 @@ evolves (single owner → delegation → hierarchical → team). A Rego document
 enforcement logic in policy files where it is auditable and changeable without recompiling the
 binary.
 
-ADR-034 ships only the **single-owner data document shape** for v0.3. A `NamespaceOwnerStore`
-Rust trait was rejected because the shape will plausibly need to grow (delegation, team,
-hierarchy), and a trait-based evolution path would require a breaking impl swap. Because the
-contract lives in Rego, future evolution requires only an ADR-034 amendment to the document
+The proposal specified only the **single-owner data document shape** for v0.3. A `NamespaceOwnerStore`
+Rust trait was rejected because the shape would plausibly need to grow (delegation, team,
+hierarchy), and a trait-based evolution path would require a breaking impl swap. Keeping the
+contract in Rego would mean future evolution required only an ADR-034 amendment to the document
 shape — no Rust trait change, no impl breakage, no semver event for downstream consumers.
-The flat shape is a starting commitment, not the final shape.
+The flat shape was intended as a starting commitment, not the final shape. The entire design was
+rejected; no Rego document contract was adopted in OSS.
 
 ### D4 rationale: `Obligation::Meter` over a separate metering hook
 
@@ -339,61 +383,67 @@ resolution and verb dispatch.
 
 ---
 
-## Consequences
+## Anticipated Consequences (historical — proposal was rejected)
 
 ### Positive
 
-- The Rego policy contract for namespace ownership means ownership semantics are auditable,
-  changeable without a code release, and applicable to any deployment that wants namespace
-  scoping (not only one specific consumer).
-- `Obligation::Meter` makes metering policy-driven. Self-hosted deployments that never want
-  metering author a policy that emits no `Meter` obligations; no code change required.
-- `AuditEvent` (ADR-033) captures `Obligation::Meter` in the same structured record it already
-  captures `Obligation::Audit`. No second log channel.
-- OSS default behavior is unchanged: `AllowAllGate` + `NoopActorStore` + `EphemeralSessionStore`
-  produce the same end-user experience as today.
-- Adding HTTP, CLI, or any future transport does not require duplicating identity resolution
+- The Rego policy contract for namespace ownership would have meant ownership semantics were
+  auditable, changeable without a code release, and applicable to any deployment that wants
+  namespace scoping (not only one specific consumer).
+- `Obligation::Meter` would have made metering policy-driven. Self-hosted deployments that
+  never want metering would author a policy that emits no `Meter` obligations; no code change
+  required.
+- `AuditEvent` (ADR-033) would have captured `Obligation::Meter` in the same structured record
+  it already captures `Obligation::Audit`. No second log channel.
+- OSS default behavior would have been unchanged: `AllowAllGate` + `NoopActorStore` +
+  `EphemeralSessionStore` would produce the same end-user experience as today.
+- Adding HTTP, CLI, or any future transport would not require duplicating identity resolution
   per-transport — the gate is the single resolution point.
 
 ### Negative
 
-- `ActorStore` and `SessionStore` traits in `khive-gate` expand the crate's public surface.
-  Breaking changes to `ActorRecord` or `SessionRecord` field names require a deprecation cycle.
-- `Obligation::Meter` is advisory in OSS. Deployments that depend only on khive-oss for
-  metering will not get durable counts — the obligation is logged via `AuditEvent`, not
-  separately stored.
-- The `data.khive.namespace_owner` document contract is a soft contract: it is specified in
-  this ADR and enforced by convention in policy files, not by the Rust type system.
+- `ActorStore` and `SessionStore` traits in `khive-gate` would have expanded the crate's
+  public surface. Breaking changes to `ActorRecord` or `SessionRecord` field names would have
+  required a deprecation cycle.
+- `Obligation::Meter` would have been advisory in OSS. Deployments depending only on
+  khive-oss for metering would not have gotten durable counts — the obligation would have been
+  logged via `AuditEvent`, not separately stored.
+- The `data.khive.namespace_owner` document contract would have been a soft contract: specified
+  in this ADR and enforced by convention in policy files, not by the Rust type system.
 
 ### Neutral
 
-- `GateContext::session_id` wire shape is unchanged. Transports that today pass an arbitrary
-  session string continue to work. Persistence-aware transports replace the arbitrary string
-  with a token resolved via `SessionStore::validate`.
-- `Obligation` remains an internally-tagged enum. The serde representation
-  `{"kind": "meter", "tag": "...", "dimensions": {...}}` is JSON-additive — existing
-  policies that emit only `Audit` obligations require no change. The Rust enum surface
-  changes per D4's precondition (`#[non_exhaustive]` must land alongside or before
-  `Meter`); downstream Rust consumers that match `Obligation` exhaustively need a
+- `GateContext::session_id` wire shape was unchanged in the proposal. Transports passing an
+  arbitrary session string would have continued to work. Persistence-aware transports would
+  replace the arbitrary string with a token resolved via `SessionStore::validate`.
+- `Obligation` would have remained an internally-tagged enum. The serde representation
+  `{"kind": "meter", "tag": "...", "dimensions": {...}}` would be JSON-additive — existing
+  policies that emit only `Audit` obligations would require no change. The Rust enum surface
+  was to change per D4's precondition (`#[non_exhaustive]` must land alongside or before
+  `Meter`); downstream Rust consumers that match `Obligation` exhaustively would have needed a
   fallback arm at that point.
-- Extension-owned tables (actor records, session records, metering counters) are NOT managed
-  by the OSS migration system ([ADR-022](ADR-022-schema-migrations.md)). Downstream
-  migrations are separate.
+- Extension-owned tables (actor records, session records, metering counters) were NOT to be
+  managed by the OSS migration system ([ADR-022](ADR-022-schema-migrations.md)). Downstream
+  migrations were to be separate.
 
 ---
 
 ## Implementation Status
 
-| Deliverable                                             | Location                           | Status                             |
-| ------------------------------------------------------- | ---------------------------------- | ---------------------------------- |
-| `ActorStore` trait + `ActorRecord` type                 | `crates/khive-gate/`               | planned                            |
-| `NoopActorStore` default impl                           | `crates/khive-gate/`               | planned                            |
-| `SessionStore` trait + `SessionRecord` + `SessionToken` | `crates/khive-gate/`               | planned                            |
-| `EphemeralSessionStore` in-memory impl                  | `crates/khive-gate/`               | planned                            |
-| `Obligation::Meter { tag, dimensions }` variant         | `crates/khive-gate/`               | planned                            |
-| `data.khive.namespace_owner` document contract          | ADR-034 (this) + policy files      | specified                          |
-| Hard gate enforcement (deny → dispatch error)           | `crates/khive-runtime/src/pack.rs` | planned (separate PR / ADR)        |
-| `EventStore` wiring for `AuditEvent` dispatch           | `crates/khive-runtime/src/pack.rs` | planned (per ADR-033, separate PR) |
+> **All deliverables below are rejected for khive-oss.** None of these will be implemented
+> in `khive-gate` or any OSS crate. Identity, session, and metering belong in cloud
+> middleware, not the OSS gate. The table is preserved as a record of what was considered.
+
+| Deliverable                                             | Location                           | Status                                         |
+| ------------------------------------------------------- | ---------------------------------- | ---------------------------------------------- |
+| `ActorStore` trait + `ActorRecord` type                 | `crates/khive-gate/`               | rejected — cloud-only                          |
+| `NoopActorStore` default impl                           | `crates/khive-gate/`               | rejected — cloud-only                          |
+| `SessionStore` trait + `SessionRecord` + `SessionToken` | `crates/khive-gate/`               | rejected — cloud-only                          |
+| `EphemeralSessionStore` in-memory impl                  | `crates/khive-gate/`               | rejected — cloud-only                          |
+| `Obligation::Meter { tag, dimensions }` variant         | `crates/khive-gate/`               | rejected — cloud-only                          |
+| `data.khive.namespace_owner` document contract          | ADR-034 (this) + policy files      | rejected — cloud-only                          |
+| Hard gate enforcement (deny → dispatch error)           | `crates/khive-runtime/src/pack.rs` | no-op for khive-oss (owned by ADR-035)         |
+| `EventStore` wiring for `AuditEvent` dispatch           | `crates/khive-runtime/src/pack.rs` | no-op for khive-oss (owned by ADR-033/ADR-035) |
 
 Downstream impls (persisted `ActorStore`/`SessionStore`, gate impls that populate
 `namespace_owner` and observe `Meter` obligations) live in their own repositories. The
@@ -402,56 +452,32 @@ dispatcher-side obligation consumer hook itself is out of scope for ADR-034 — 
 
 ---
 
-## Decisions Resolved
+## Design Decisions Made in the Rejected Proposal (historical record only)
 
-The following design choices were called out during ADR review and are locked here so
-implementation PRs do not re-litigate them:
+The following design choices were resolved during ADR review. They are preserved as a record
+of the rationale considered, but they are not normative — the proposal was rejected.
 
-1. **`ActorStore::resolve` is gate-side, not transport-side.** See D1 above.
-2. **Metering uses the obligation channel, not a separate `MeterSink` field on
+1. **`ActorStore::resolve` would have been gate-side, not transport-side.** See D1 above.
+2. **Metering was to use the obligation channel, not a separate `MeterSink` field on
    `RuntimeConfig`.** See D4 above and the alternatives table.
-3. **No event-streaming infrastructure is added by this ADR.** See D4 — `Meter` is captured
-   in `AuditEvent.obligations`. Once ADR-033's dispatch-time wiring lands, `EventStore`
-   becomes a polled fallback path for downstream consumers.
-4. **No dispatcher-side consumer hook is added by this ADR.** A consumer hook (synchronous
-   trait call, channel, polled reader) is a separate concern and is tracked as future work
-   (see "Future Work" below). Downstream deployments that need synchronous metering today
-   consume `Meter` inside their own gate impl (`LambdaGate` wraps `RegoGate`, observes
-   obligations, calls its sink, returns the unchanged decision).
+3. **No event-streaming infrastructure was to be added by this ADR.** See D4 — `Meter` would
+   have been captured in `AuditEvent.obligations`. Once ADR-033's dispatch-time wiring landed,
+   `EventStore` would have become a polled fallback path for downstream consumers.
+4. **No dispatcher-side consumer hook was to be added by this ADR.** A consumer hook was a
+   separate concern. Downstream deployments needing synchronous metering would have consumed
+   `Meter` inside their own gate impl.
 
-## Future Work
+## Deferred Design Decisions (historical record only — proposal was rejected)
 
-The following are explicitly **out of scope** for ADR-034 and tracked for a separate ADR:
-
-- **Dispatcher-side obligation consumer hook.** A trait + `RuntimeConfig` field that lets
-  downstream code consume obligations (including `Meter`) synchronously from the dispatcher,
-  without wrapping a gate impl. Shape options include `ObligationConsumer::consume(&self,
-  obligation, gate_request, gate_decision)`, a typed `MeterSink::record(...)` specialization,
-  or a channel-based fan-out. The right shape depends on performance characteristics
-  (synchronous backpressure vs. write-behind) and failure-mode requirements (fail-closed on
-  consumer error vs. best-effort) — both of which need empirical evidence before being
-  baked into OSS.
-- **`AuditEvent` pull-based consumers.** Once ADR-033 wires `EventStore` into the dispatch
-  path, a pattern emerges for any consumer (analytics, replay, fraud detection) to poll the
-  event log instead of subscribing in-process. The polling cadence, cursor semantics, and
-  delivery guarantees would belong in a separate ADR.
-
-## Deferred to Implementation PRs
-
-The following are intentionally not specified in this ADR; each will be decided in the PR
-that lands the relevant impl:
+The following were intentionally unresolved in the rejected proposal:
 
 1. **`namespace_owner` document invalidation strategy.** Per-request refresh vs. cached
    (TTL) vs. session-scoped vs. event-driven invalidation is a perf-vs-staleness tradeoff
-   that depends on the deployment's actor cardinality and write rate. The trait shape does
-   not force a choice.
+   that depends on the deployment's actor cardinality and write rate.
 2. **`EphemeralSessionStore` thread-safety model.** `RwLock<HashMap>` vs. `DashMap` vs. a
-   single-threaded assumption. Implementation detail of one impl; revisit if benchmarking
-   shows contention.
+   single-threaded assumption.
 3. **Session token format.** Opaque random ID (DB round-trip on validate) vs. signed JWT
-   with embedded claims (stateless validate) is a latency-vs-statefulness tradeoff. The
-   `SessionToken(String)` trait shape accommodates both; the choice belongs to each
-   `SessionStore` impl.
+   with embedded claims (stateless validate) is a latency-vs-statefulness tradeoff.
 
 ---
 
@@ -466,16 +492,14 @@ that lands the relevant impl:
   `GateContext::session_id`, and `Obligation` enum extended here
 - [ADR-032](ADR-032-rego-gate.md): Rego policy backend — the enforcement engine for
   `data.khive.namespace_owner` policy
-- [ADR-033](ADR-033-audit-envelope.md): Audit envelope — `Obligation::Meter` is captured
-  alongside `Obligation::Audit` in `AuditEvent.obligations`; `EventStore` provides the
-  event log seam
-- Hard gate enforcement (deny → dispatch error) and dispatch-time `EventStore` wiring are
-  prerequisites for the `Meter` obligation channel and the "EventStore as fallback event log"
-  claim in D4. They are tracked as separate planned work, not assumed by this ADR. Until they
-  land, `Obligation::Meter` is logged via `tracing::info!` only and downstream sinks must
-  consume it from the gate decision directly (not from a persisted log).
-- `crates/khive-gate/src/lib.rs`: Existing `Gate`, `ActorRef`, `GateContext`, `Obligation`
-  types this ADR extends
+- [ADR-033](ADR-033-audit-envelope.md): Audit envelope — the proposal assumed `Obligation::Meter`
+  would be captured alongside `Obligation::Audit` in `AuditEvent.obligations`; `EventStore`
+  would have provided the event log seam
+- Hard gate enforcement (deny → dispatch error) and dispatch-time `EventStore` wiring were
+  identified as prerequisites for the `Meter` obligation channel in D4. The design was rejected
+  before either prerequisite was evaluated.
+- `crates/khive-gate/src/lib.rs`: `Gate`, `ActorRef`, `GateContext`, `Obligation` types
+  referenced by the rejected proposal
 - `crates/khive-types/src/namespace.rs`: `Namespace` — the open string this ADR adds
 
 ---

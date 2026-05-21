@@ -715,7 +715,8 @@ gateway route switches to calling it without any frontend change.
   The larger bundle is justified by the per-query stale time configuration.
 - The `PUT /api/projects/:namespace/schema` route writes files to disk from the HTTP layer.
   This is a side effect beyond the DSL verb surface. The gateway runs on localhost in phase 1;
-  for cloud deployments this route must be gated behind write authorization (ADR-034 scope).
+  for cloud deployments this route must be gated behind write authorization (a cloud middleware
+  concern — ADR-034 was rejected for OSS; authorization enforcement is specified in khive-cloud).
 
 ### Neutral
 
@@ -790,9 +791,9 @@ gateway route switches to calling it without any frontend change.
    block on it.
 
 2. **Schema edit authorization.** `PUT /api/projects/:namespace/schema` writes files to disk.
-   In single-user local deployments this is acceptable. For cloud deployments (ADR-034 scope),
-   this route must be gated behind a namespace-owner authorization check. The ADR-034 `namespace_owner`
-   Rego contract is the right hook; this is deferred to when ADR-034 is accepted.
+   In single-user local deployments this is acceptable. For cloud deployments, this route must be
+   gated behind a namespace-owner authorization check. ADR-034 was rejected for OSS — authorization
+   enforcement at this boundary is a cloud middleware concern; a cloud ADR will specify the hook.
 
 3. **Pack hot-reload.** Phase 7 (pack toggle) requires the running `khive-mcp` to reload its
    `VerbRegistry` without a restart. This is a non-trivial server-side change. A design is needed

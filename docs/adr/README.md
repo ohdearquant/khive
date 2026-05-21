@@ -80,6 +80,7 @@ For new contributors:
 - **proposed**: Under review. Not yet normative; may change based on feedback.
 - **accepted**: Decision made. Implementation in progress or complete for v0.1.
 - **planned**: Designed but deferred to a later version (v0.2+). Tracked for forward compatibility.
+- **rejected**: Proposal was considered and is not normative. The ADR retains a "why rejected" rationale and avoids active implementation guidance. The design may have moved to another repository (e.g., khive-cloud) or been abandoned.
 - **deprecated**: No longer guidance. See replacement ADR (none in v0.1).
 - **superseded**: Replaced by a newer ADR in this repository. The superseding ADR is cited in the status line.
 - **moved**: Design migrated to another repository (khive-cloud). The destination ADR is cited in the status line. The file is kept here as a pointer.

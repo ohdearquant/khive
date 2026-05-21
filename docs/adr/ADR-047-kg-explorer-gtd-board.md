@@ -39,8 +39,9 @@ Both views call the Deno HTTP gateway (ADR-003 §Implementation), which in turn 
 
 - The Deno HTTP gateway route design (to be addressed in a separate ADR when the gateway is
   scaffolded).
-- Authentication and authorization at the frontend layer (deferred; ADR-034 covers the extension
-  traits).
+- Authentication and authorization at the frontend layer (deferred; ADR-034 was rejected for
+  OSS — identity/session handling is a cloud middleware concern specified in khive-cloud ADR-031,
+  not OSS gate traits).
 - Mobile layout (future; desktop-first for phase 1).
 - The memory pack visualization (future; ADR-036 is proposed, not accepted).
 
@@ -628,9 +629,10 @@ server in one batch. This is the designed use case for the batch syntax.
 
 2. **Authentication in the frontend**: the frontend has no auth surface in phase 1 (localhost
    only). When deployed as a SaaS dashboard (khive-cloud), authentication must be threaded from
-   the Deno gateway session through to namespace resolution. ADR-034's `ActorStore` and
-   `SessionStore` extension traits are the hook; an amendment to this ADR will be filed at that
-   point.
+   the Deno gateway session through to namespace resolution. ADR-034 was rejected for OSS —
+   identity resolution and session management are cloud middleware concerns specified in
+   khive-cloud ADR-031 and implemented at the gateway layer; an amendment to this ADR will be
+   filed when cloud auth lands.
 
 3. **Mobile layout**: desktop-first is the stated constraint. A mobile layout for the GTD Board
    (cards stacked vertically, one status visible at a time) is useful but out of scope for phase 1.
@@ -656,7 +658,7 @@ server in one batch. This is the designed use case for the batch syntax.
 - [ADR-023](ADR-023-verb-consolidated-mcp-surface.md): Verb-Consolidated MCP Surface (verbs used)
 - [ADR-026](ADR-026-gtd-pack.md): GTD Pack (task lifecycle, 7 statuses, 4 priority tiers, 5 verbs)
 - [ADR-027](ADR-027-single-tool-mcp-surface.md): Single Tool MCP Surface (`request` is the only tool)
-- [ADR-034](ADR-034-identity-session-metering-hooks.md): Identity/Session hooks (future auth path)
+- [ADR-034](ADR-034-identity-session-metering-hooks.md): Identity/Session hooks (rejected for OSS; identity and session management are cloud middleware concerns, not OSS gate concerns)
 - [ADR-035](ADR-035-hard-enforcement-and-audit-persistence.md): Hard Authorization Enforcement
 - [ADR-038](ADR-038-events-surface.md): Events Surface (task timeline dependency)
 - [React Flow](https://reactflow.dev/): Graph canvas library

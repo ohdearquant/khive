@@ -42,7 +42,7 @@ This ADR does **not** specify:
 - The HTTP gateway crate architecture (deferred; that is a separate platform ADR).
 - OAuth provider integrations beyond the interface boundary (deferred to the OAuth provider
   integration ADR).
-- The `SessionStore` SQL implementation (deferred per ADR-034 §"Deferred to Implementation PRs").
+- The `SessionStore` SQL implementation (ADR-034 was rejected for OSS; the `SessionStore` contract and its SQL implementation are specified in khive-cloud ADR-031).
 
 ## Decision
 
@@ -82,9 +82,10 @@ Each tier is a strict superset of the previous one's behavior.
 
 ### B. Session Model
 
-Sessions are stateless JWT tokens issued by the HTTP gateway. The `SessionStore` trait
-([ADR-034](ADR-034-identity-session-metering-hooks.md), D2) is the persistence boundary; the
-HTTP gateway calls `SessionStore::create` on login and `SessionStore::validate` on each
+Sessions are stateless JWT tokens issued by the HTTP gateway. A `SessionStore` interface is the
+persistence boundary (ADR-034 was rejected for OSS — `SessionStore` is not an OSS gate trait;
+it is specified as cloud middleware in khive-cloud ADR-031 and implemented at the gateway layer);
+the HTTP gateway calls `SessionStore::create` on login and `SessionStore::validate` on each
 subsequent request.
 
 #### JWT Claim Structure
@@ -565,8 +566,8 @@ claim only — closes this attack surface before the request reaches dispatch.
 - `httpOnly` cookies require HTTPS in production (the `Secure` flag). HTTP-only deployments
   are limited to Tier 1 (localhost).
 - Refresh token rotation requires server-side state (`SessionStore` must persist refresh
-  token records). The `EphemeralSessionStore` default (ADR-034) is not sufficient for
-  production — a SQL-backed implementation is required for Tier 2 and Tier 3 deployments.
+  token records). ADR-034 was rejected for OSS — session store implementation is specified in
+  khive-cloud ADR-031; a SQL-backed implementation is required for Tier 2 and Tier 3 deployments.
 - WebSocket fan-out is synchronous in Deno's event loop. At high event volumes, a slow
   WebSocket client blocks fan-out to all clients in the same isolate. The
   `BroadcastChannel`/external pub-sub scale-out path must be prioritized before cloud
@@ -607,7 +608,7 @@ claim only — closes this attack surface before the request reaches dispatch.
 | Client-side WS/SSE fallback probe                                       | `products/khive-dashboard/lib/realtime.ts`       | planned                       |
 | Optimistic update helpers (mutate + revert)                             | `products/khive-dashboard/lib/optimistic.ts`     | planned (depends on Phase 2)  |
 | `_khive_api_keys` table migration                                       | `crates/khive-db/src/migrations.rs`              | planned                       |
-| SQL-backed `SessionStore` (refresh token persistence)                   | downstream (gateway crate or cloud)              | planned (Tier 2 prerequisite) |
+| SQL-backed `SessionStore` (refresh token persistence)                   | cloud middleware (see khive-cloud ADR-031)       | planned (Tier 2 prerequisite) |
 
 ## Open Questions
 
@@ -646,7 +647,8 @@ claim only — closes this attack surface before the request reaches dispatch.
 - [ADR-029](ADR-029-authorization-gate.md): Authorization gate — `Gate` trait, `AllowAllGate`
   default, `GateRequest.namespace` as the contract
 - [ADR-034](ADR-034-identity-session-metering-hooks.md): Identity, session, and metering hooks
-  — `SessionStore` trait, `EphemeralSessionStore`, refresh token storage model
+  — rejected for OSS; `SessionStore` is a cloud middleware concern specified in khive-cloud ADR-031,
+  not an OSS gate trait
 - [ADR-035](ADR-035-hard-enforcement-and-audit-persistence.md): Hard authorization enforcement
   — `PermissionDenied` error, `EventStore` wiring at dispatch site
 - [ADR-038](ADR-038-events-surface.md): Events surface — `list(kind="event", since=...)` used
