@@ -1,0 +1,18 @@
+[package]
+name = "khive-fold"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Cognitive primitives — Fold, Anchor, Objective, Selector"
+
+[dependencies]
+khive-score = { version = "0.1.4", path = "../khive-score" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+

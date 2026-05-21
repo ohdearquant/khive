@@ -152,9 +152,16 @@ pub struct SelectorWeights { pub category_weights: BTreeMap<String, f32>, pub mi
 
 ### 5. Determinism guarantees
 
-All ordering is deterministic across platforms:
+All ordering is deterministic across platforms via `khive-score::DeterministicScore`:
 
-- Scores use `canonical_f64` (branchless NaN normalization, IEEE-754 total order)
+- `Objective::score()` returns `f64` (the math layer); all ranking/selection converts to
+  `DeterministicScore` (i64 fixed-point, 2^32 scale) at the comparison boundary
+- `ScoredEntry<T>` stores `DeterministicScore` internally; `Ord` impl delegates to score's
+  deterministic comparison
+- `cmp_desc_score_then_id` / `cmp_asc_score_then_id` delegate to `khive_score::cmp_desc_then_id`
+  / `cmp_asc_then_id` after `DeterministicScore::from_f64()` conversion
+- `QuantKey` re-exported from `khive-score` (not reimplemented)
+- `canonical_f64` (branchless NaN normalization) remains fold-local for pre-conversion cleanup
 - Tie-breaking: score descending, then UUID ascending (`DeterministicObjective<T>`)
 - `FoldOutcome` includes `entries_processed` count for replay verification
 - `Selector` tie-breaking: score descending, size ascending, id ascending
@@ -255,22 +262,36 @@ Deferred to styx/ formalization. Note the conjecture in this ADR; file formal pr
 - **Brain Phase 7 interface locked**: `ComposePipeline` contract prevents implementation drift
 - **Hoare structure documented**: every domain fold has a stated triple, enabling future formal verification
 - **Decision Anatomy bridge explicit**: fold passes are decisions; compliance = replay verification
-- **Determinism guaranteed**: cross-platform reproducibility via canonical ordering
+- **Determinism guaranteed**: cross-platform reproducibility via `khive-score::DeterministicScore`
+- **No ordering duplication**: ranking primitives (`QuantKey`, `Ranked`, comparators) re-exported
+  from `khive-score`, not reimplemented
 
 ### Negative
 
-- **Crate grows to ~10K LOC**: acceptable for foundation-level primitives with comprehensive tests
 - **Hoare documentation convention is not enforced**: until Lean4 proofs land, the triples are
   claims in doc comments, not machine-checked properties
-- **`parking_lot` in foundation**: `ObjectiveRegistry` uses `RwLock`. Pure synchronization, no IO.
+
+### Excluded from khive-fold (by design)
+
+The following are related to fold but live in consuming crates, not the foundation:
+
+| Item                                                                         | Why excluded                             | Where it lives                                      |
+| ---------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------- |
+| `ObjectiveRegistry` (named registration + lookup + defaults)                 | Runtime infrastructure, not algebra      | `khive-runtime`                                     |
+| `Checkpoint<S>` + stores (fold state persistence)                            | Storage/IO concern                       | `khive-runtime`                                     |
+| `Scored<T>` + `ObjectiveConfig` (thin wrappers)                              | Not fold-specific                        | Inline in consumers                                 |
+| `FoldContext.actor/role/task/query` (domain fields)                          | Couples fold to khive actor model        | Consumers put domain context in `FoldContext.extra` |
+| Domain folds (`MemoryFold`, `PolicyFold`, `ConsentFold`)                     | Domain-specific, depend on runtime types | Pack crates that own the domain                     |
+| Retrieval objectives (`VectorSimilarity`, `TextRelevance`, `GraphProximity`) | Depend on runtime retrieval types        | `khive-runtime::objectives` (ADR-061)               |
+
+The fold crate is pure math: traits, built-in strategies, composition combinators, deterministic
+ordering. Everything else composes on top.
 
 ## Open Questions
 
-1. **Precision and epistemic-weight timing**: when should ADR-059 (Bayesian-brain extensions) be
-   drafted? After Brain Phase 7 compose lands, or in parallel?
-2. **IOCTA derivation**: is the conjecture that fold audit completeness follows from substrate
+1. **IOCTA derivation**: is the conjecture that fold audit completeness follows from substrate
    axioms sound? Needs styx/ investigation before claiming.
-3. **Cloud fold stub**: `khive-cloud/crates/fold` exists as a stub. Should it re-export from
+2. **Cloud fold stub**: `khive-cloud/crates/fold` exists as a stub. Should it re-export from
    `khive-fold` or remain a separate cloud-specific layer?
 
 ## References
