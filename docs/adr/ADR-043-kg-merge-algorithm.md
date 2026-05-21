@@ -1,8 +1,45 @@
 # ADR-043: KG Merge Algorithm — Three-Way Merge with Conflict Detection
 
-**Status**: proposed\
+**Status**: partially superseded by [ADR-048](ADR-048-git-native-kg-versioning.md)\
 **Date**: 2026-05-19\
 **Authors**: Ocean, lambda:khive
+
+### Amendment 2026-05-20 — Partial supersession by ADR-048
+
+**Status**: partially superseded — full MergeEngine and merge_branch workflow superseded;
+conflict taxonomy and MergeStrategy enum retained as historical input to ADR-053\
+**Date**: 2026-05-20\
+**Rationale**: ADR-048 delegates NDJSON merging to git, eliminating the need for the custom
+merge engine. The conflict taxonomy from this ADR informs ADR-053's `khive kg resolve` command,
+but the resolve strategy flags are now `--ours`, `--theirs`, and `--merge-properties` per
+ADR-053 — there is no `--auto` flag in the shipped surface. The `MergeStrategy` enum values
+(`Auto`, `Ours`, `Theirs`) map to those flags conceptually, with `Auto` corresponding to
+`--merge-properties` semantics in ADR-053.\
+**Affected sections**: §4 three-way merge engine (superseded); §5 merge_branch MCP tool
+(superseded); §6 conflict taxonomy (retained, feeds ADR-053); §4.2 field-level rules (retained
+as ADR-053 `--merge-properties` implementation guidance)
+
+**Changed**: ADR-048 replaces the full three-way merge engine designed in this ADR with
+git-native line-level merging of sorted NDJSON files. Specifically, the following are superseded:
+
+- The `khive-merge` crate as a full `MergeEngine` implementation driving `merge_branch`
+- The `find_lca` + `three_way_merge` top-level workflow wired into a `merge_branch` MCP tool
+- The `MergeResult::Conflicts` flow requiring a separate MCP round-trip to resolve
+
+**What remains in scope from this ADR**:
+
+- The conflict type taxonomy (§6: `NameConflict`, `KindConflict`, `PropertyMismatch`,
+  `ModifyDelete`, `EdgeModifyDelete`, `DanglingEdge`) — reused by ADR-053's `khive kg resolve`
+  command for entity-level conflict resolution after git merge produces NDJSON conflicts
+- The field-level auto-resolution rules (§4.2) — input to ADR-053's `--merge-properties`
+  strategy (the closest equivalent to the former `Auto` mode; there is no `--auto` flag)
+- The `MergeStrategy` enum (`Auto`, `Ours`, `Theirs`) — conceptual predecessors to ADR-053's
+  `--merge-properties`, `--ours`, and `--theirs` flags respectively
+
+ADR-048's insight: git's line-level three-way merge handles non-conflicting NDJSON additions
+automatically (sorted files make additions non-overlapping). The conflict detection logic in
+this ADR is now a post-merge validation pass rather than a full merge engine. See ADR-053 for
+the git-native branching and merge design.
 
 ## Context
 

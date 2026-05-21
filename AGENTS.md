@@ -67,8 +67,15 @@ request(ops="[{\"tool\":\"create\",\"args\":{\"kind\":\"entity\",\"entity_kind\"
 Ops in a batch run in parallel and have no ordering guarantee. If op B depends on op A's output
 (e.g. create-then-link), use two `request` calls.
 
-**Deferred (not available in v0.1 semantics):** `supersede` (use `link(..., relation="supersedes")`
-as a workaround), note merge (only entity merge is implemented).
+**Deferred (not available in v0.1 semantics):**
+
+- `supersede` verb — use `link(source_id=new_id, target_id=old_id, relation="supersedes")` as a
+  workaround.
+- `create(supersedes=<old-id>)` parameter shortcut — this convenience form (which would atomically
+  create a new record and add a `supersedes` edge to the old one) is **not in the v0.1 wire
+  surface**. Use the two-step workaround: `create(...)` then `link(..., relation="supersedes")`.
+- Note merge — only entity merge is implemented in v0.1 (`merge(into_id=..., from_id=...)`).
+  Deduplicating two notes is not yet supported; add a `supersedes` edge manually as a workaround.
 
 ### Notes vs entities
 

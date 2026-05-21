@@ -1,8 +1,43 @@
 # ADR-042: KG Versioning Implementation — Snapshots, Branches, and Remotes
 
-**Status**: proposed\
+**Status**: partially superseded by [ADR-048](ADR-048-git-native-kg-versioning.md)\
 **Date**: 2026-05-19\
 **Authors**: Ocean, lambda:khive
+
+### Amendment 2026-05-20 — Partial supersession by ADR-048
+
+**Status**: partially superseded — custom VCS layer, MergeEngine trait, and related SQLite tables
+superseded by ADR-048; content-hash algorithm and KgArchive type retained\
+**Date**: 2026-05-20\
+**Rationale**: ADR-048 adopts git as the versioning layer, making the custom VCS engine,
+branching model, HTTP remote protocol, and snapshot tables redundant. The `MergeEngine` trait
+and `NoOpMergeEngine` implementation are deleted per ADR-048 §Comparison table (line 454);
+git merge replaces them for NDJSON-level conflicts. The content-hash algorithm and KgArchive
+in-memory representation remain valid and are reused by ADR-048's export/import path.\
+**Affected sections**: §4 VCS engine design (superseded); §5 HTTP remote protocol (superseded);
+§6 SQLite versioning tables (superseded); §1 content-hash algorithm (retained); §3 KgArchive
+type (retained)
+
+**Changed**: ADR-048 replaces the custom VCS layer designed in this ADR with a git-native
+approach. Specifically, the following from this ADR are superseded:
+
+- Custom `commit`, `branch`, `checkout`, `merge_branch`, `log`, `push`, `pull` MCP tools
+- The `khive-sync` HTTP remote protocol (§5)
+- `kg_snapshots`, `kg_snapshot_archives`, `kg_branches`, `kg_vcs_state` SQLite tables as the
+  primary versioning store
+- The `khive-vcs` crate's scope as a full VCS engine
+- The `MergeEngine` trait and `NoOpMergeEngine` implementation — deleted per ADR-048; git merge
+  handles NDJSON-level conflicts
+
+**What remains in scope from this ADR**:
+
+- The content-hash algorithm (SHA-256 of canonical sorted JSON, §1) — reused by ADR-048's
+  export integrity checks
+- The `KgArchive` in-memory representation — preserved as the serialization type for export/import
+- The dirty-flag design rationale remains instructive for ADR-052's reconciliation protocol
+
+Git/GitHub provides versioning, branching, merging, and federation. See ADR-048 for the
+replacement design and ADR-052 for the DB-vs-NDJSON reconciliation protocol.
 
 ## Context
 

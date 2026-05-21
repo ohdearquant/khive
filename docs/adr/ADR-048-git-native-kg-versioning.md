@@ -1,6 +1,6 @@
 # ADR-048: Git-Native KG Versioning
 
-**Status**: proposed\
+**Status**: accepted (Phase C1 — NDJSON format, schema.yaml, sorted file layout implemented in Deno CLI; Phase C2 — DB rebuild, embedding, cross-repo sync deferred)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
@@ -462,10 +462,10 @@ ADR-043's three-way merge algorithm is replaced by git's line-level merge on sor
 for the common case. The remaining role for ADR-043-style logic is:
 
 - **Merge conflict resolution**: when git cannot auto-merge (two branches modified the same entity
-  line), `khive kg validate --conflicts` parses the conflict markers in the NDJSON file and
-  renders them in entity-aware terms (which fields on which entities conflict). The agent then
-  edits the live database, re-exports, and commits. This is narrower than ADR-043's full
-  three-archive merge engine.
+  line), `khive kg resolve` parses the conflict markers in the NDJSON file and renders them in
+  entity-aware terms (which fields on which entities conflict), accepting `--ours`, `--theirs`,
+  or `--merge-properties` as resolution strategies. See ADR-053 for the full resolve command
+  contract. This is narrower than ADR-043's full three-archive merge engine.
 - **Post-merge validation**: after `git merge` produces a clean NDJSON merge, `khive kg validate`
   checks that the merged state is semantically valid (no dangling edges, no duplicate UUIDs
   introduced by the merge). This is a validation pass, not a merge computation.
@@ -606,8 +606,11 @@ in development environments.
   nearly universally installed in development environments; document it as a prerequisite.
 - Two branches that modify the same entity line produce a git merge conflict in the NDJSON file.
   The conflict markers are raw JSON, not human-readable diff output. Mitigation: `khive kg
-  validate --conflicts` renders them in entity-aware terms. This is a narrower failure mode than
-  ADR-042/043's design, not a broader one.
+  resolve` parses the conflict markers and renders them in entity-aware terms, accepting
+  `--ours`, `--theirs`, or `--merge-properties` as resolution strategies (see ADR-053 for the
+  full resolve command contract). After conflicts are resolved, `khive kg validate` checks the
+  merged state for semantic validity (no dangling edges, no duplicate UUIDs). This is a narrower
+  failure mode than ADR-042/043's design, not a broader one.
 - Remote resolution requires network access during `validate` and `import`. Mitigation: the
   `.remote-cache/` directory avoids repeated fetches for pinned refs.
 - The file-based format is not suitable for real-time multi-agent writes within a single session.

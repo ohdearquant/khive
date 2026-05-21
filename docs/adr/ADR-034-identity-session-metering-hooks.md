@@ -1,6 +1,6 @@
 # ADR-034: Identity, Session, and Metering Extension Hooks
 
-**Status**: planned\
+**Status**: superseded\
 **Date**: 2026-05-19\
 **Authors**: Ocean, lambda:khive
 
@@ -477,4 +477,19 @@ that lands the relevant impl:
 - `crates/khive-gate/src/lib.rs`: Existing `Gate`, `ActorRef`, `GateContext`, `Obligation`
   types this ADR extends
 - `crates/khive-types/src/namespace.rs`: `Namespace` — the open string this ADR adds
-  ownership semantics to
+
+---
+
+## Amendment — 2026-05-20
+
+**Status**: superseded\
+**Date**: 2026-05-20\
+**Rationale**: Identity, session lifecycle, and metering are cloud middleware concerns, not OSS
+gate concerns. The extension hooks specified here (`ActorStore`, `SessionStore`,
+`Obligation::Meter`) belong in the khive-cloud authorization layer (khive-cloud ADR-039), where
+tenant identity and billing context are available at request time. The OSS `khive-gate` crate
+stays minimal: authorization decisions only, no identity persistence or metering obligations.\
+**Affected sections**: Status line (above); Implementation Status table (§Implementation
+Status) — all deliverables listed as planned remain unimplemented and will not be implemented
+in the OSS layer; Future Work section — cloud metering channel transfers to khive-cloud scope.
+ownership semantics to

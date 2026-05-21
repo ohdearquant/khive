@@ -1,7 +1,7 @@
 # ADR-039: Bulk Import Adapters
 
-**Status**: proposed
-**Date**: 2026-05-19
+**Status**: proposed (partially superseded — D1 import verb rescinded from MCP surface; bulk import is CLI-level only; `khive kg import/export` CLI commands are Phase C2 deferred, not yet implemented)\
+**Date**: 2026-05-19\
 **Authors**: khive maintainers
 
 ## Context
@@ -365,10 +365,37 @@ This table is deferred; the ADR-033 tracing event carries the same information f
 
 ## Amendments
 
-This ADR amends **ADR-023** (Verb-Consolidated MCP Surface) by adding `import` to the KG pack's
-verb set, bringing the total to 12 verbs. The `import` verb is not a top-level MCP tool — it is
-dispatched through the `request` tool surface (ADR-027), consistent with every other KG verb.
-ADR-023's single-surface principle and `kind=` discriminant pattern are unchanged.
+### Amendment 2026-05-20 — D1 superseded; scope narrowed to CLI-level import semantics
+
+**Status**: partially superseded (D1 MCP verb rescinded; CLI command deferred to Phase C2)\
+**Date**: 2026-05-20\
+**Rationale**: Ocean directive (2026-05-20) established that bulk import is a CLI-level
+operation, not an MCP-exposed verb. Additionally, the `khive kg import/export` CLI commands
+are Phase C2 deferred (not yet implemented), so any claim that they are implemented is
+incorrect. The original D1 decision (adding `import` to the MCP surface) is rescinded.\
+**Affected sections**: §D1 (import verb — rescinded); §Status field (remove "implemented" claim
+for CLI import/export); ADR-023 amendment to add `import` to KG pack verb set (rescinded)
+
+**Changed**: The original D1 decision — adding an `import` verb to `khive-pack-kg` exposed
+through the MCP `request` tool — is superseded by Ocean's directive (2026-05-20): bulk import
+is a CLI-level operation, not an MCP-exposed verb. It is inappropriate to route large file-based
+batch operations through the agent MCP surface.
+
+**What this means**:
+
+- The `import` verb is NOT added to `khive-pack-kg` or dispatched via the `request` tool.
+- The original ADR-023 amendment text below (which added `import` to the KG pack verb set) is
+  rescinded. ADR-023's verb surface remains 11 verbs; this ADR does not amend it.
+- The remaining scope of ADR-039 is: CLI-level import semantics — the validation pipeline, the
+  `{records, edges}` payload contract, atomicity guarantees (D2), endpoint validation (D3),
+  idempotency options (D4), and the reference adapter design (D7). These apply to `khive kg import`
+  as a CLI command (Phase C2, deferred) per ADR-048's command surface.
+- The `import` verb wire shape defined in D1 (function-call form, JSON request form, field
+  semantics) is preserved as the contract for the CLI command's input format; only the transport
+  layer changes (CLI stdin/file argument, not MCP request).
+
+**Status of original ADR-023 amendment**: rescinded. The sentence below beginning "This ADR
+amends ADR-023..." no longer applies. ADR-023's verb count stays at 11.
 
 ## References
 

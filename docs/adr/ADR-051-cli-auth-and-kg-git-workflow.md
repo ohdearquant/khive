@@ -1,6 +1,6 @@
 # ADR-051: CLI Authentication and KG Git Workflow Commands
 
-**Status**: proposed\
+**Status**: accepted (Phase C1 — commit/sync/status/git-hooks file-level implemented; Phase C2 — DB export integration, atomic rebuild, and auth login/status/logout deferred)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 
@@ -493,6 +493,44 @@ async function installHooks(gitDir: string): Promise<void> {
   }
 }
 ```
+
+## Amendments
+
+### Amendment 2026-05-20 — C1 scope is file-level only; DB export and atomic rebuild deferred to C2
+
+**Status**: accepted — C1 scope narrowed; C2 deferred list expanded\
+**Date**: 2026-05-20\
+**Rationale**: The ADR body's §4 description of `khive kg commit` implies it runs `khive kg export`
+as a pre-step, and the `khive kg sync` description implies full ADR-052 atomic rebuild. Neither
+is implemented in Phase C1. Additionally, the Status field was too narrow — it listed only auth as
+C2-deferred, omitting DB export integration and atomic rebuild. This amendment corrects both.\
+**Affected sections**: §Status field (adds DB export and atomic rebuild to C2 list); §4 `khive kg
+commit` (clarify export is C2); §4 `khive kg sync` (clarify atomic rebuild is C2)
+
+**Changed**: The Phase C1 implementation of `khive kg commit` and `khive kg sync` is more limited
+than what the ADR body implies. This amendment makes the C1 scope explicit.
+
+**C1 actual scope (shipped)**:
+
+- `khive kg commit`: validates existing `.khive/kg/` NDJSON files for consistency, then runs
+  `git add` + `git commit`. It does NOT run `khive kg export` (DB → NDJSON) as a pre-step.
+  The export step is defined in the ADR body (§4, step 1) but is Phase C2. In C1, the user is
+  responsible for ensuring the NDJSON files reflect the current DB state before committing.
+- `khive kg sync`: touches/creates `.khive/state/working.db` as a placeholder. It does NOT
+  perform the full ADR-052 atomic rebuild (validate → temp DB → atomic rename). The atomic
+  rebuild is Phase C2.
+- Both commands exist on the CLI surface and handle their file-level responsibilities correctly.
+  The DB-layer operations (export and atomic rebuild) are deferred.
+
+**C2 deferred**:
+
+- Full `khive kg export` integration into `khive kg commit` (DB → sorted NDJSON before validate)
+- Full `khive kg sync` atomic rebuild (NDJSON → validate → temp DB → atomic rename to `working.db`)
+- `khive auth login/status/logout`
+
+This amendment does not change the C1 or C2 surface definitions in §7. It narrows the
+implementation claims so that readers do not infer that DB-level export and rebuild are
+operational in C1 when they are not.
 
 ## References
 

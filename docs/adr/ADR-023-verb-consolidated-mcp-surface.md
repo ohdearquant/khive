@@ -73,6 +73,46 @@ Supersession (history-preserving replacement via a `supersedes` edge) is a plann
 deferred past v0.1. Agents that need to mark any record obsolete can add a `supersedes` edge
 manually via `link(source_id=new_id, target_id=old_id, relation="supersedes")`.
 
+### Amendment 2026-05-20 — `create(supersedes=)` deferred parameter shortcut
+
+**Status**: accepted — shortcut documented as deferred; v0.1 wire surface unchanged\
+**Date**: 2026-05-20\
+**Rationale**: The `create(supersedes=)` shortcut is a common pattern that agents request.
+Documenting it here prevents implementers from treating the two-step workaround as permanent
+API, and ensures the shortcut's semantics are specified before implementation. No wire change
+is made; this is a forward-compatibility annotation.\
+**Affected sections**: §Decision — tool list (note on `create` parameter extension); this
+amendment block
+
+**Changed**: Documents the `create(supersedes=)` parameter as a deferred shortcut; no v0.1 wire
+change. The two-step workaround (create + link supersedes) remains the v0.1 contract.
+
+A common pattern is creating a new record that immediately supersedes an existing one:
+
+```
+create(kind="entity", entity_kind="concept", name="LoRA v2", supersedes="<old-id>")
+```
+
+This shortcut is **not in the v0.1 wire surface**. When the shortcut ships (post-v0.1), it will be
+strictly equivalent to the two-step sequence:
+
+1. `create(kind=..., ...)` — creates the new record, returns `new_id`.
+2. `link(source_id=new_id, target_id=old_id, relation="supersedes")` — marks the old record
+   obsolete.
+
+No new verbs are introduced; `create(supersedes=)` is a parameter extension on `create` that the
+runtime expands into the above two operations atomically.
+
+**v0.1 workaround**: perform the two steps manually.
+
+```
+# Step 1 — create the replacement record
+create(kind="entity", entity_kind="concept", name="LoRA v2", ...)
+
+# Step 2 — mark the old record as superseded
+link(source_id="<new-id>", target_id="<old-id>", relation="supersedes")
+```
+
 ### Versioning tools (when ADR-015 ships)
 
 `commit`, `branch`, `checkout`, `merge_branch`, `log`, `diff`, `apply_diff` — these are verb-shaped
