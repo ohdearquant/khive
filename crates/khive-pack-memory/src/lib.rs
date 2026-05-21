@@ -1,3 +1,4 @@
+pub mod config;
 pub mod handlers;
 
 use async_trait::async_trait;
@@ -92,6 +93,10 @@ impl PackRuntime for MemoryPack {
         match verb {
             "remember" => self.handle_remember(params).await,
             "recall" => self.handle_recall(params, registry).await,
+            "recall.embed" => self.handle_recall_embed(params).await,
+            "recall.candidates" => self.handle_recall_candidates(params).await,
+            "recall.fuse" => self.handle_recall_fuse(params, registry).await,
+            "recall.score" => self.handle_recall_score(params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "memory pack does not handle verb {verb:?}"
             ))),
