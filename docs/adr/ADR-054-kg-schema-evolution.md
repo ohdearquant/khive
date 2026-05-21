@@ -1,6 +1,6 @@
 # ADR-054: KG Schema Evolution
 
-**Status**: proposed\
+**Status**: accepted (Phase E1 — `khive kg migrate` with add_kind / rename_kind / remove_kind (error|migrate_to) / add_property / rename_property / remove_property / add_relation_endpoint / remove_relation_endpoint (error|drop) implemented in Deno CLI; --dry-run, --to, --list flags + sequence-gap detection + atomic per-migration apply. Phase E2 — change_property_type with coerce deferred. Phase E3 — schema diff helpers + on-pull compatibility checks deferred)\
 **Date**: 2026-05-20\
 **Authors**: Ocean, lambda:khive
 

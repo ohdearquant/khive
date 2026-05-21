@@ -31,6 +31,7 @@ import {
 
 const DEFAULT_SCHEMA_YAML = `\
 format_version: "1.0.0"
+ontology_version: "1.0.0"
 entity_kinds:
   - concept
   - document

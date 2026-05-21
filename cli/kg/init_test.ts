@@ -80,6 +80,9 @@ Deno.test("kg init: creates expected files", async () => {
     // schema.yaml exists and contains required top-level keys.
     const schema = await Deno.readTextFile(join(dir, ".khive/kg/schema.yaml"));
     assertStringIncludes(schema, 'format_version: "1.0.0"');
+    // reg-init-ontology-version: freshly initialised schema must carry ontology_version
+    // so that `khive kg migrate` has a stable baseline (ADR-054 §1).
+    assertStringIncludes(schema, 'ontology_version: "1.0.0"');
     assertStringIncludes(schema, "concept");
     assertStringIncludes(schema, "implements");
 
