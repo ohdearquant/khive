@@ -18,6 +18,18 @@ use khive_types::{EdgeEndpointRule, EndpointKind, SubstrateKind};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::KhiveRuntime;
 
+// Test-only failure injection for `create_note_inner`.
+//
+// A test sets `LINK_FAIL_AFTER` to N > 0 before calling `create_note`.  The
+// Nth `link` call inside the loop returns `RuntimeError::Internal("injected
+// link failure")` instead of calling the real implementation.  The counter is
+// reset to 0 after each call regardless of whether it triggered, so tests are
+// isolated from one another.
+#[cfg(test)]
+std::thread_local! {
+    static LINK_FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A note search result with UUID and salience-weighted RRF score.
 #[derive(Clone, Debug)]
 pub struct NoteSearchHit {
@@ -543,9 +555,84 @@ impl KhiveRuntime {
                 .await?;
         }
 
-        for target_id in annotates {
-            self.link(Some(ns), note.id, target_id, EdgeRelation::Annotates, 1.0)
-                .await?;
+        // Create annotates edges, compensating on failure to preserve atomicity.
+        //
+        // Pre-validation (above) ensures all targets exist, so link failures are
+        // unexpected. If one occurs: delete any edges already created, then remove
+        // the note, its FTS document, and its vector entry.
+        let mut created_edges: Vec<Uuid> = Vec::with_capacity(annotates.len());
+
+        // In test builds, iterate with an index so the failure-injection hook can
+        // target a specific call.  In release builds, skip the enumerate overhead.
+        #[cfg(test)]
+        let annotates_iter: Vec<(usize, Uuid)> = annotates
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (i, id))
+            .collect();
+        #[cfg(test)]
+        macro_rules! next_target {
+            ($pair:expr) => {
+                $pair.1
+            };
+        }
+        #[cfg(not(test))]
+        let annotates_iter: Vec<Uuid> = annotates.to_vec();
+        #[cfg(not(test))]
+        macro_rules! next_target {
+            ($pair:expr) => {
+                $pair
+            };
+        }
+
+        for pair in annotates_iter {
+            let target_id = next_target!(pair);
+
+            // Test-only: inject a failure on the configured call index (1-based).
+            #[cfg(test)]
+            let injected_err: Option<RuntimeError> = {
+                let call_idx = pair.0;
+                LINK_FAIL_AFTER.with(|cell| {
+                    let n = cell.get();
+                    if n > 0 && call_idx + 1 == n {
+                        cell.set(0); // reset so subsequent calls are unaffected
+                        Some(RuntimeError::Internal("injected link failure".to_string()))
+                    } else {
+                        None
+                    }
+                })
+            };
+            #[cfg(not(test))]
+            let injected_err: Option<RuntimeError> = None;
+
+            let link_result = if let Some(e) = injected_err {
+                Err(e)
+            } else {
+                self.link(Some(ns), note.id, target_id, EdgeRelation::Annotates, 1.0)
+                    .await
+            };
+
+            match link_result {
+                Ok(edge) => created_edges.push(edge.id.into()),
+                Err(e) => {
+                    // Best-effort compensation — ignore cleanup errors.
+                    for edge_id in created_edges {
+                        let _ = self.delete_edge(Some(ns), edge_id).await;
+                    }
+                    if let Ok(store) = self.notes(Some(ns)) {
+                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                    }
+                    if let Ok(fts) = self.text_for_notes(Some(ns)) {
+                        let _ = fts.delete_document(ns, note.id).await;
+                    }
+                    if self.config().embedding_model.is_some() {
+                        if let Ok(vs) = self.vectors(Some(ns)) {
+                            let _ = vs.delete(note.id).await;
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         Ok(note)
@@ -809,6 +896,12 @@ impl KhiveRuntime {
 
     /// Delete a note by ID, enforcing namespace isolation.
     ///
+    /// On hard delete, cascades to remove all incident edges (both inbound and
+    /// outbound) and cleans up FTS and vector indexes, preventing dangling
+    /// references for `annotates` edges that target this note (ADR-002, ADR-024).
+    /// Soft delete leaves edges and indexes in place — queries filter by
+    /// `deleted_at IS NULL`.
+    ///
     /// Returns `false` without deleting if the note does not exist or belongs to
     /// a different namespace (ADR-007 namespace isolation).
     pub async fn delete_note(
@@ -831,6 +924,29 @@ impl KhiveRuntime {
         } else {
             DeleteMode::Soft
         };
+
+        // On hard delete, cascade-remove incident edges and clean up indexes.
+        if hard {
+            let graph = self.graph(namespace)?;
+            for direction in [Direction::Out, Direction::In] {
+                let hits = graph
+                    .neighbors(
+                        id,
+                        NeighborQuery {
+                            direction,
+                            relations: None,
+                            limit: None,
+                            min_weight: None,
+                        },
+                    )
+                    .await?;
+                for hit in hits {
+                    graph.delete_edge(LinkId::from(hit.edge_id)).await?;
+                }
+            }
+            self.remove_from_indexes(namespace, id).await?;
+        }
+
         Ok(note_store.delete_note(id, mode).await?)
     }
 
@@ -1002,12 +1118,44 @@ impl KhiveRuntime {
         Ok(edge)
     }
 
-    /// Hard-delete an edge by id. Returns `true` if an edge was removed.
+    /// Hard-delete an edge by id.
+    ///
+    /// Cascades to remove any `annotates` edges whose target is the deleted edge
+    /// (ADR-002: `annotates` is note → anything; deleting an edge target leaves
+    /// annotation edges dangling if not cleaned up). Returns `true` if the primary
+    /// edge was removed.
+    ///
+    /// If `edge_id` does not refer to an edge (e.g. the caller passes an entity or
+    /// note UUID by mistake), this method returns `Ok(false)` immediately with no
+    /// side effects — it does **not** cascade inbound edges of the non-edge record.
     pub async fn delete_edge(&self, namespace: Option<&str>, edge_id: Uuid) -> RuntimeResult<bool> {
-        Ok(self
-            .graph(namespace)?
-            .delete_edge(LinkId::from(edge_id))
-            .await?)
+        let graph = self.graph(namespace)?;
+
+        // Guard: verify `edge_id` is actually an edge before touching anything.
+        // Without this check, passing an entity/note UUID would delete all inbound
+        // annotates edges targeting that record and then return false — a destructive
+        // side effect on an invalid call.
+        if graph.get_edge(LinkId::from(edge_id)).await?.is_none() {
+            return Ok(false);
+        }
+
+        // Cascade: remove annotate edges that target this edge (inbound from note sources).
+        let inbound = graph
+            .neighbors(
+                edge_id,
+                NeighborQuery {
+                    direction: Direction::In,
+                    relations: None,
+                    limit: None,
+                    min_weight: None,
+                },
+            )
+            .await?;
+        for hit in inbound {
+            graph.delete_edge(LinkId::from(hit.edge_id)).await?;
+        }
+
+        Ok(graph.delete_edge(LinkId::from(edge_id)).await?)
     }
 
     /// Count edges matching `filter`.
@@ -1748,6 +1896,50 @@ mod tests {
         );
     }
 
+    // ---- Event resolution tests (issue #30) ----
+    //
+    // resolve_prefix and handle_get already include events; these tests are
+    // regression coverage confirming event UUIDs are resolvable and that get()
+    // returns kind="event".
+
+    #[tokio::test]
+    async fn resolve_finds_event_by_full_uuid() {
+        use khive_storage::Event;
+        use khive_types::SubstrateKind;
+
+        let rt = rt();
+        let ns = rt.ns(None);
+        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "actor");
+        let event_id = event.id;
+        rt.events(None).unwrap().append_event(event).await.unwrap();
+
+        let resolved = rt.resolve(None, event_id).await.unwrap();
+        assert!(
+            matches!(resolved, Some(Resolved::Event(_))),
+            "event UUID must resolve to Resolved::Event, got {resolved:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_finds_event() {
+        use khive_storage::Event;
+        use khive_types::SubstrateKind;
+
+        let rt = rt();
+        let ns = rt.ns(None);
+        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "actor");
+        let event_id = event.id;
+        rt.events(None).unwrap().append_event(event).await.unwrap();
+
+        let prefix = &event_id.to_string()[..8];
+        let resolved = rt.resolve_prefix(None, prefix).await.unwrap();
+        assert_eq!(
+            resolved,
+            Some(event_id),
+            "resolve_prefix must return event UUID for 8-char prefix"
+        );
+    }
+
     // ---- Referential integrity tests (fix/link-referential-integrity) ----
 
     #[tokio::test]
@@ -1872,6 +2064,52 @@ mod tests {
             .unwrap();
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].node_id, entity.id);
+    }
+
+    // Atomicity: multi-target annotates golden path — all edges created, note present.
+    #[tokio::test]
+    async fn create_note_multi_annotates_creates_all_edges() {
+        let rt = rt();
+        let t1 = rt
+            .create_entity(None, "concept", "Target1", None, None, vec![])
+            .await
+            .unwrap();
+        let t2 = rt
+            .create_entity(None, "concept", "Target2", None, None, vec![])
+            .await
+            .unwrap();
+
+        let note = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "content",
+                0.5,
+                None,
+                vec![t1.id, t2.id],
+            )
+            .await
+            .unwrap();
+
+        let neighbors = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            neighbors.len(),
+            2,
+            "multi-annotates note must have exactly 2 outbound annotates edges"
+        );
+        let target_ids: Vec<Uuid> = neighbors.iter().map(|n| n.node_id).collect();
+        assert!(target_ids.contains(&t1.id));
+        assert!(target_ids.contains(&t2.id));
     }
 
     #[tokio::test]
@@ -2654,6 +2892,576 @@ mod tests {
         assert!(
             result.is_ok(),
             "note→edge Annotates must still succeed after supersedes fix, got {result:?}"
+        );
+    }
+
+    // ---- Compensation-path rollback (fix/annotates) ----
+
+    // The compensation branch in `create_note_inner` (operations.rs) rolls back
+    // a partial write — note row + first edge + FTS + vector — when a subsequent
+    // link call fails. The failure trigger is a storage error (e.g. I/O failure)
+    // that cannot occur in the in-memory runtime; this test instead exercises the
+    // exact cleanup operations that the compensation branch performs, starting from
+    // a manually-constructed partial state, and verifies the post-cleanup invariants.
+    //
+    // What this covers: the cleanup sequence (delete_edge, delete_note hard, FTS
+    // index clean) is correct and leaves the DB in a pristine state. What it does
+    // not cover: the trigger condition (second link failure). Storage-error injection
+    // would require a mock GraphStore, which is beyond the current test infrastructure.
+    #[tokio::test]
+    async fn create_note_multi_annotates_compensation_cleanup_restores_pristine_state() {
+        let rt = rt();
+        let t1 = rt
+            .create_entity(None, "concept", "T1", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Construct the partial state that the compensation branch would encounter:
+        // note persisted + first annotates edge created.
+        let note = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "partial note",
+                0.5,
+                None,
+                vec![t1.id],
+            )
+            .await
+            .unwrap();
+
+        // Confirm the partial state exists before compensation.
+        let before_notes = rt.list_notes(None, None, 1000).await.unwrap();
+        assert_eq!(before_notes.len(), 1, "note must be present before cleanup");
+        let before_edges = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            before_edges.len(),
+            1,
+            "one annotates edge must exist before cleanup"
+        );
+        let edge_id: Uuid = before_edges[0].edge_id;
+
+        // Execute the same cleanup sequence that `create_note_inner`'s Err branch runs.
+        rt.delete_edge(None, edge_id).await.unwrap();
+        rt.delete_note(None, note.id, true /* hard */)
+            .await
+            .unwrap();
+
+        // Post-compensation invariants:
+        let after_notes = rt.list_notes(None, None, 1000).await.unwrap();
+        assert!(
+            after_notes.is_empty(),
+            "compensation must remove the note row; got {after_notes:?}"
+        );
+        let search_hits = rt
+            .search_notes(None, "partial note", None, 10, None)
+            .await
+            .unwrap();
+        assert!(
+            search_hits.is_empty(),
+            "compensation must clean the FTS index; got {search_hits:?}"
+        );
+        let after_edges = rt
+            .neighbors(None, note.id, Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert!(
+            after_edges.is_empty(),
+            "compensation must remove all partial edges; got {after_edges:?}"
+        );
+    }
+
+    // ---- Hard-delete cascade for note and edge annotation targets (fix/annotates) ----
+
+    // ADR-002:73 — annotates is note → ANYTHING (entity, note, edge, event).
+    // ADR-024:103 — targets may be entity, edge, event, or note.
+    // Hard-deleting any of those targets must cascade incident annotates edges.
+    // Soft deletes leave edges (data-vs-view rule).
+
+    #[tokio::test]
+    async fn annotated_entity_hard_delete_cascades_annotate_edge() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(None, "concept", "E", None, None, vec![])
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "note about entity",
+                0.5,
+                None,
+                vec![entity.id],
+            )
+            .await
+            .unwrap();
+
+        // Confirm edge exists before delete.
+        let before = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "annotates edge must exist before entity delete"
+        );
+
+        // Hard delete the entity.
+        let deleted = rt.delete_entity(None, entity.id, true).await.unwrap();
+        assert!(deleted, "entity hard delete must return true");
+
+        // Annotates edge must be gone.
+        let after = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            after.is_empty(),
+            "annotates edge must be cascaded on entity hard delete; got {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn annotated_note_hard_delete_cascades_annotate_edge() {
+        let rt = rt();
+        // note_target is the thing being annotated (a note itself).
+        let note_target = rt
+            .create_note(None, "observation", None, "target note", 0.5, None, vec![])
+            .await
+            .unwrap();
+        // note_source annotates note_target.
+        let note_source = rt
+            .create_note(
+                None,
+                "insight",
+                None,
+                "annotation",
+                0.5,
+                None,
+                vec![note_target.id],
+            )
+            .await
+            .unwrap();
+
+        let before = rt
+            .neighbors(
+                None,
+                note_source.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "annotates edge must exist before note delete"
+        );
+
+        // Hard delete the annotation TARGET note.
+        let deleted = rt.delete_note(None, note_target.id, true).await.unwrap();
+        assert!(deleted, "note hard delete must return true");
+
+        // The annotates edge targeting note_target must be gone.
+        let after = rt
+            .neighbors(
+                None,
+                note_source.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            after.is_empty(),
+            "annotates edge must be cascaded on note-target hard delete; got {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn annotated_edge_delete_cascades_annotate_edge() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "B", None, None, vec![])
+            .await
+            .unwrap();
+        // Create an edge to annotate.
+        let base_edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let base_edge_uuid: Uuid = base_edge.id.into();
+
+        // Create a note that annotates the edge.
+        let note = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "note about edge",
+                0.5,
+                None,
+                vec![base_edge_uuid],
+            )
+            .await
+            .unwrap();
+
+        let before = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "annotates edge must exist before base edge delete"
+        );
+
+        // Delete the base edge.
+        let deleted = rt.delete_edge(None, base_edge_uuid).await.unwrap();
+        assert!(deleted, "edge delete must return true");
+
+        // The annotates edge targeting base_edge must be gone.
+        let after = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            after.is_empty(),
+            "annotates edge must be cascaded on base edge delete; got {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_multi_annotates_partial_target_hard_delete_leaves_remaining_edges() {
+        let rt = rt();
+        let t1 = rt
+            .create_entity(None, "concept", "T1", None, None, vec![])
+            .await
+            .unwrap();
+        let t2 = rt
+            .create_entity(None, "concept", "T2", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Note annotates both t1 and t2.
+        let note = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "multi-target note",
+                0.5,
+                None,
+                vec![t1.id, t2.id],
+            )
+            .await
+            .unwrap();
+
+        let before = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            2,
+            "must have 2 annotates edges before any delete"
+        );
+
+        // Hard delete only t1.
+        rt.delete_entity(None, t1.id, true).await.unwrap();
+
+        // Edge to t1 must be gone, edge to t2 must remain.
+        let after = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "only the edge to t1 must be cascaded; t2 edge must remain"
+        );
+        assert_eq!(
+            after[0].node_id, t2.id,
+            "remaining annotates edge must point to t2"
+        );
+    }
+
+    #[tokio::test]
+    async fn annotated_note_soft_delete_preserves_annotate_edge() {
+        let rt = rt();
+        let note_target = rt
+            .create_note(None, "observation", None, "target", 0.5, None, vec![])
+            .await
+            .unwrap();
+        let note_source = rt
+            .create_note(
+                None,
+                "insight",
+                None,
+                "annotation",
+                0.5,
+                None,
+                vec![note_target.id],
+            )
+            .await
+            .unwrap();
+
+        let before = rt
+            .neighbors(
+                None,
+                note_source.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+
+        // Soft delete must NOT cascade edges (data-vs-view principle).
+        let deleted = rt.delete_note(None, note_target.id, false).await.unwrap();
+        assert!(deleted, "soft delete must return true");
+
+        let after = rt
+            .neighbors(
+                None,
+                note_source.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "soft delete must NOT cascade edges; got {after:?}"
+        );
+    }
+
+    // ---- delete_edge public-API safety (fix/annotates round-3) ----
+
+    // Passing an entity/note UUID to `delete_edge` must return Ok(false) with no
+    // side effects — it must NOT delete inbound annotates edges targeting that record.
+    // Without the get_edge guard, the old code would cascade inbound edges before
+    // returning false.
+    #[tokio::test]
+    async fn delete_edge_non_edge_uuid_has_no_side_effects() {
+        let rt = rt();
+
+        // Create an entity that has an inbound annotates edge.
+        let entity = rt
+            .create_entity(None, "concept", "Target", None, None, vec![])
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "annotates the entity",
+                0.5,
+                None,
+                vec![entity.id],
+            )
+            .await
+            .unwrap();
+
+        // Confirm the annotates edge exists.
+        let before = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1, "annotates edge must exist before test");
+        let annotates_edge_id: Uuid = before[0].edge_id;
+
+        // Call delete_edge with the entity UUID (NOT an edge UUID).
+        let result = rt.delete_edge(None, entity.id).await;
+        assert!(
+            result.is_ok(),
+            "delete_edge must not error on a non-edge UUID"
+        );
+        assert!(
+            !result.unwrap(),
+            "delete_edge must return false for a non-edge UUID"
+        );
+
+        // The inbound annotates edge to the entity must still exist — no side effects.
+        let after = rt
+            .neighbors(
+                None,
+                note.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "delete_edge with a non-edge UUID must not touch inbound annotates edges"
+        );
+        assert_eq!(
+            after[0].edge_id, annotates_edge_id,
+            "the original annotates edge must be unchanged"
+        );
+    }
+
+    // ---- create_note compensation branch (fix/annotates round-3) ----
+
+    // This test injects a deterministic failure on the second `link` call inside
+    // `create_note_inner` (the one that would create the second annotates edge).
+    // It verifies that the compensation branch is wired — i.e. this test would
+    // fail if the `Err(e)` rollback arm at operations.rs were deleted.
+    //
+    // Injection mechanism: LINK_FAIL_AFTER thread-local (ops.rs, cfg(test) only).
+    // Setting it to 2 forces the 2nd link call to return an error.  The counter is
+    // reset to 0 once triggered, so no other test is affected.
+    #[tokio::test]
+    async fn create_note_multi_annotates_second_link_failure_rolls_back_partial_write() {
+        let rt = rt();
+        let t1 = rt
+            .create_entity(None, "concept", "T1", None, None, vec![])
+            .await
+            .unwrap();
+        let t2 = rt
+            .create_entity(None, "concept", "T2", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Arm the injection: fail on the 2nd link (link_idx+1 == 2).
+        LINK_FAIL_AFTER.with(|cell| cell.set(2));
+
+        let result = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "rollback target",
+                0.5,
+                None,
+                vec![t1.id, t2.id],
+            )
+            .await;
+
+        // The call must fail with the injected error.
+        assert!(
+            result.is_err(),
+            "create_note must propagate the injected link failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected link failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        // Compensation must have removed the note row.
+        let notes = rt.list_notes(None, None, 1000).await.unwrap();
+        assert!(
+            notes.is_empty(),
+            "compensation must remove the note row; got {notes:?}"
+        );
+
+        // FTS must have no hit for the content.
+        let hits = rt
+            .search_notes(None, "rollback target", None, 10, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "compensation must clean FTS index; got {hits:?}"
+        );
+
+        // No partial annotates edges must remain (first edge must have been deleted).
+        let edges_from_t1 = rt
+            .neighbors(
+                None,
+                t1.id,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        let edges_from_t2 = rt
+            .neighbors(
+                None,
+                t2.id,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            edges_from_t1.is_empty(),
+            "compensation must delete the first annotates edge; got {edges_from_t1:?}"
+        );
+        assert!(
+            edges_from_t2.is_empty(),
+            "no second annotates edge must exist; got {edges_from_t2:?}"
         );
     }
 }

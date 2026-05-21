@@ -990,8 +990,6 @@ mod tests {
 
     use serial_test::serial;
     use tracing::field::{Field, Visit};
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::Layer;
 
     #[derive(Clone, Debug, Default)]
     struct CapturedEvent {
@@ -1030,32 +1028,48 @@ mod tests {
         }
     }
 
-    struct CaptureLayer(Arc<StdMutex<Vec<CapturedEvent>>>);
+    /// Minimal `tracing::Subscriber` that captures events into a shared vec.
+    ///
+    /// Implemented directly (without `tracing_subscriber::registry()` layering)
+    /// to avoid the layer machinery that can cause thread-local dispatch to be
+    /// bypassed when the registry's internal global state is initialised by
+    /// another subscriber in the same test binary (Ubuntu CI regression).
+    struct CaptureSubscriber(Arc<StdMutex<Vec<CapturedEvent>>>);
 
-    impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
             let mut visitor = CapturedEventVisitor::default();
             event.record(&mut visitor);
             self.0.lock().unwrap().push(visitor.0);
         }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     /// Run an async block under a scoped tracing subscriber and return the
-    /// events captured during the run. Uses a current-thread tokio runtime so
-    /// the thread-local subscriber set by `with_default` covers every task
-    /// spawned in the body.
+    /// events captured during the run.
+    ///
+    /// Uses a minimal `Subscriber` implementation (not `tracing_subscriber::registry()`)
+    /// to avoid layer-machinery global-state races on Ubuntu CI. The current-thread
+    /// tokio runtime keeps all async work on the same thread as `with_default`, so
+    /// the thread-local subscriber captures every `tracing::info!` call in the body.
     fn capture_dispatch_events<Fut>(future: Fut) -> Vec<CapturedEvent>
     where
         Fut: std::future::Future<Output = ()>,
     {
         let captured: Arc<StdMutex<Vec<CapturedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+        let subscriber = CaptureSubscriber(Arc::clone(&captured));
+        let dispatch = tracing::Dispatch::new(subscriber);
 
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::dispatcher::with_default(&dispatch, || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1779,6 +1793,92 @@ mod tests {
             ),
             other => panic!("expected Audit obligation, got {other:?}"),
         }
+    }
+
+    // ---- Audit payload shape for 'create' verb dispatch (ADR-033 / ADR-035) ----
+    //
+    // The previous audit tests verify the envelope shape for the 'list' verb.
+    // This test dispatches 'create' (matching the create_note + annotates path)
+    // and verifies that ev.verb, ev.outcome, and ev.data all round-trip correctly
+    // through the EventStore. Ensures the ADR-035 wire shape is independent of
+    // which verb triggers the gate check.
+    #[tokio::test]
+    async fn audit_event_payload_shape_for_create_verb_matches_adr035_envelope() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        builder.with_default_namespace("test-ns");
+        let reg = builder.build().expect("registry builds");
+
+        // Dispatch 'create' — AlphaPack returns a stub value; what matters is
+        // the EventStore entry emitted by the registry's gate-check path.
+        reg.dispatch("create", serde_json::json!({"namespace": "test-ns"}))
+            .await
+            .unwrap();
+
+        let count = store.count_events(EventFilter::default()).await.unwrap();
+        assert_eq!(count, 1, "exactly one audit event for one dispatch");
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let ev = &page.items[0];
+
+        // Top-level Event fields (ADR-035 §Emission).
+        assert_eq!(ev.verb, "create", "ev.verb must be the dispatched verb");
+        assert_eq!(
+            ev.outcome,
+            EventOutcome::Success,
+            "ev.outcome must be Success on allow"
+        );
+        assert_eq!(
+            ev.namespace, "test-ns",
+            "ev.namespace must match the dispatch namespace"
+        );
+
+        // ev.data must hold the full AuditEvent envelope (ADR-033 / ADR-035 contract).
+        let data = ev
+            .data
+            .as_ref()
+            .expect("ev.data must be Some — full AuditEvent envelope required by ADR-035");
+
+        let audit: khive_gate::AuditEvent =
+            serde_json::from_value(data.clone()).expect("ev.data must deserialize to AuditEvent");
+
+        assert_eq!(
+            audit.decision,
+            khive_gate::AuditDecision::Allow,
+            "AuditEvent.decision must be Allow"
+        );
+        assert_eq!(audit.verb, "create", "AuditEvent.verb must be 'create'");
+        assert_eq!(
+            audit.namespace, "test-ns",
+            "AuditEvent.namespace must be preserved"
+        );
+        assert_eq!(
+            audit.gate_impl, "AllowAllGate",
+            "AuditEvent.gate_impl must name the gate implementation"
+        );
+        assert!(
+            audit.deny_reason.is_none(),
+            "AuditEvent.deny_reason must be None on Allow"
+        );
+        // Wire-shape check: obligations serializes as [] on AllowAllGate.
+        let payload_json: serde_json::Value =
+            serde_json::from_value(data.clone()).expect("data must be valid JSON");
+        assert_eq!(
+            payload_json["obligations"],
+            serde_json::Value::Array(Vec::new()),
+            "obligations must be [] on AllowAllGate (wire-shape rule ADR-033)"
+        );
     }
 }
 
