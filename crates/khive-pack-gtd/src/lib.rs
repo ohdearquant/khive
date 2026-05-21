@@ -50,23 +50,32 @@ static GTD_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
     target: EndpointKind::NoteOfKind("task"),
 }];
 
+// ADR-060: Illocutionary classification (Searle 1976)
+//   Directive — attempts to get hearer to do something
+//   Assertive — retrieves/presents state of affairs
+//   Declaration — changes institutional status by fiat
 static GTD_VERBS: [VerbDef; 5] = [
+    // Directive: directs an actor to perform work
     VerbDef {
         name: "assign",
         description: "Create a GTD task (note with kind=task)",
     },
+    // Assertive: retrieves actionable tasks
     VerbDef {
         name: "next",
         description: "List actionable tasks (status=next or active) by priority",
     },
+    // Declaration: declares a task done
     VerbDef {
         name: "complete",
         description: "Mark a task done with an optional result note",
     },
+    // Assertive: retrieves filtered task listing
     VerbDef {
         name: "tasks",
         description: "List tasks filtered by status, assignee, priority",
     },
+    // Declaration: changes task lifecycle status
     VerbDef {
         name: "transition",
         description: "Explicit GTD status transition with lifecycle validation",

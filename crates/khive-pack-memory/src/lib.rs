@@ -19,11 +19,16 @@ impl Pack for MemoryPack {
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
+// ADR-060: Illocutionary classification (Searle 1976)
+//   Commissive — commits caller to a persistent change
+//   Assertive — retrieves/presents state of affairs
 static MEMORY_VERBS: [VerbDef; 2] = [
+    // Commissive: commits a memory to the namespace
     VerbDef {
         name: "remember",
         description: "Create a memory note with salience and decay",
     },
+    // Assertive: retrieves memory notes via decay-aware ranking
     VerbDef {
         name: "recall",
         description: "Recall memory notes with decay-aware hybrid ranking",

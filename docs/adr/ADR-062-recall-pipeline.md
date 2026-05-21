@@ -85,13 +85,13 @@ parameter shift, not a code change.
 The recall pipeline decomposes into 5 stages. Each stage is an independently callable handler.
 The `recall` verb runs all 5 in sequence. Individual handlers are available for calibration.
 
-| Handler | Verb? | Input | Output | Purpose |
-|---------|-------|-------|--------|---------|
-| `recall.embed` | No | `{query: str}` | `{embedding: [f32]}` | Generate query embedding |
-| `recall.candidates` | No | `{query, namespace, limit}` | `{text_hits, vector_hits}` | Broad recall from FTS + vector |
-| `recall.fuse` | No | `{text_hits, vector_hits, strategy}` | `{fused_hits}` | Apply fusion strategy |
-| `recall.score` | No | `{fused_hits, config}` | `{scored: [{id, score, breakdown}]}` | Apply importance/temporal/relevance scoring with breakdown |
-| `recall` | **Yes** | `{query, namespace, limit, ...config_overrides}` | `{results}` | Full pipeline (all 5 stages) |
+| Handler             | Verb?   | Input                                            | Output                               | Purpose                                                    |
+| ------------------- | ------- | ------------------------------------------------ | ------------------------------------ | ---------------------------------------------------------- |
+| `recall.embed`      | No      | `{query: str}`                                   | `{embedding: [f32]}`                 | Generate query embedding                                   |
+| `recall.candidates` | No      | `{query, namespace, limit}`                      | `{text_hits, vector_hits}`           | Broad recall from FTS + vector                             |
+| `recall.fuse`       | No      | `{text_hits, vector_hits, strategy}`             | `{fused_hits}`                       | Apply fusion strategy                                      |
+| `recall.score`      | No      | `{fused_hits, config}`                           | `{scored: [{id, score, breakdown}]}` | Apply importance/temporal/relevance scoring with breakdown |
+| `recall`            | **Yes** | `{query, namespace, limit, ...config_overrides}` | `{results}`                          | Full pipeline (all 5 stages)                               |
 
 The `.score` handler returns a **breakdown** per result:
 
@@ -230,11 +230,11 @@ human (or agent) turns them.
 
 ### 7. Recall Hoare triple
 
-| Component | Recall instantiation |
-|-----------|---------------------|
-| **Precondition** | Query string provided. Namespace has memory-kind notes. Optionally: embedding model configured for vector path. RecallConfig valid (weights non-negative, sum > 0). |
-| **Program** | Stage 1: broad recall (FTS + vector, candidate_multiplier × limit). Stage 2: pre-filter to memory kind. Stage 3: fuse (strategy from config). Stage 4: score (WeightedObjective with 3 components). Stage 5: select (truncate to limit, optional budget via GreedySelector). |
-| **Postcondition** | Output is a deterministic list of memory notes, ordered by composite score, within limit. All returned notes are alive and kind=memory. Score breakdown available via `recall.score` handler. |
+| Component         | Recall instantiation                                                                                                                                                                                                                                                         |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Precondition**  | Query string provided. Namespace has memory-kind notes. Optionally: embedding model configured for vector path. RecallConfig valid (weights non-negative, sum > 0).                                                                                                          |
+| **Program**       | Stage 1: broad recall (FTS + vector, candidate_multiplier × limit). Stage 2: pre-filter to memory kind. Stage 3: fuse (strategy from config). Stage 4: score (WeightedObjective with 3 components). Stage 5: select (truncate to limit, optional budget via GreedySelector). |
+| **Postcondition** | Output is a deterministic list of memory notes, ordered by composite score, within limit. All returned notes are alive and kind=memory. Score breakdown available via `recall.score` handler.                                                                                |
 
 ## Alternatives Considered
 

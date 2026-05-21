@@ -15,9 +15,9 @@ set covers all user-facing operations, and the closed discipline prevents verb s
 
 What was never formalized: the verbs are not arbitrary API names. They are **illocutionary acts**
 in the Speech Act Theory sense (Austin 1962, Searle 1969). Each verb constitutes an institutional
-fact in the namespace — `remember` doesn't just store bytes, it *commits* the caller to a memory;
-`assign` doesn't just create a row, it *directs* an actor to do work; `complete` doesn't just
-update a status, it *declares* a task done.
+fact in the namespace — `remember` doesn't just store bytes, it _commits_ the caller to a memory;
+`assign` doesn't just create a row, it _directs_ an actor to do work; `complete` doesn't just
+update a status, it _declares_ a task done.
 
 This structural correspondence was identified during KG analysis: the same closed-vocabulary
 principle governs both deontic compliance vocabularies (27 prefixes in compliance frameworks) and
@@ -41,13 +41,13 @@ Without this, the "closed" discipline in ADR-015 relies on taste rather than the
 
 Following Searle's five categories (1976):
 
-| Category | Illocutionary force | Verbs | What the verb DOES |
-|----------|-------------------|-------|-------------------|
-| **Assertive** | Speaker represents a state of affairs | `recall`, `search`, `list`, `inbox`, `next` | Retrieves and presents facts from the substrate |
-| **Directive** | Speaker attempts to get hearer to do something | `assign` | Directs an actor to perform work |
-| **Commissive** | Speaker commits to a future course of action | `remember`, `send`, `link`, `create` | Commits the caller to a persistent change |
-| **Declaration** | Speaker brings about a state of affairs | `complete`, `delete`, `update` | Changes institutional status by fiat |
-| **Expressive** | Speaker expresses psychological state | *(none)* | No verb currently — and this is correct |
+| Category        | Illocutionary force                            | Verbs                                       | What the verb DOES                              |
+| --------------- | ---------------------------------------------- | ------------------------------------------- | ----------------------------------------------- |
+| **Assertive**   | Speaker represents a state of affairs          | `recall`, `search`, `list`, `inbox`, `next` | Retrieves and presents facts from the substrate |
+| **Directive**   | Speaker attempts to get hearer to do something | `assign`                                    | Directs an actor to perform work                |
+| **Commissive**  | Speaker commits to a future course of action   | `remember`, `send`, `link`, `create`        | Commits the caller to a persistent change       |
+| **Declaration** | Speaker brings about a state of affairs        | `complete`, `delete`, `update`              | Changes institutional status by fiat            |
+| **Expressive**  | Speaker expresses psychological state          | _(none)_                                    | No verb currently — and this is correct         |
 
 The `suggest` and `compose` verbs are internal-only (lore service) and not part of the product
 surface. They would classify as assertives (they retrieve and present domain knowledge).
@@ -68,15 +68,15 @@ A new verb is admissible if and only if:
 
 3. **The 15-verb cap is a guideline, not a law.** The ceiling exists because agent comprehension
    degrades with surface size. But if a genuinely new illocutionary force appears (e.g., a
-   *permissive* — granting rights, which is neither directive nor declaration), the cap yields
+   _permissive_ — granting rights, which is neither directive nor declaration), the cap yields
    to the taxonomy. The taxonomy is the invariant, not the count.
 
 ### 3. Batch `request` verb classification
 
 The `request` verb (ADR-020/ADR-027) is a meta-verb: it composes other verbs. Its illocutionary
-force is *inherited* from the verbs it contains. `request("[assign(...), complete(...)]")`
-performs a directive followed by a declaration. The request verb itself is a *speech-act
-combinator*, analogous to a conjunction of illocutionary acts.
+force is _inherited_ from the verbs it contains. `request("[assign(...), complete(...)]")`
+performs a directive followed by a declaration. The request verb itself is a _speech-act
+combinator_, analogous to a conjunction of illocutionary acts.
 
 ### 4. Documentation convention
 

@@ -40,22 +40,22 @@ Fold-lines + fold-rules + fold-act = paper plane.
 
 Each fold pass has the shape `{P} c {Q}`:
 
-| Hoare component | Fold component | Type |
-|-----------------|---------------|------|
-| **Precondition {P}** | Anchor state — what role, what context, what provenance chain | `AnchorGraph` |
-| **Program c** | Selector picks candidates under budget; Objective scores them | `Selector<T>` + `Objective<T>` |
-| **Postcondition {Q}** | Ranked/scored output, deterministic | `FoldOutcome<S>` / `Selection<T>` |
+| Hoare component       | Fold component                                                | Type                              |
+| --------------------- | ------------------------------------------------------------- | --------------------------------- |
+| **Precondition {P}**  | Anchor state — what role, what context, what provenance chain | `AnchorGraph`                     |
+| **Program c**         | Selector picks candidates under budget; Objective scores them | `Selector<T>` + `Objective<T>`    |
+| **Postcondition {Q}** | Ranked/scored output, deterministic                           | `FoldOutcome<S>` / `Selection<T>` |
 
 This structural correspondence maps to the Decision Anatomy Invariant (a compliance
 framework pattern where every decision = Facts + Evidence + Policy + Verdict + Certificate):
 
-| Decision Anatomy | Fold pass |
-|-----------------|-----------|
-| Facts | Anchor state (what is already known) |
-| Evidence | Selected candidates (what was considered) |
-| Policy | Objective function (the scoring/selection rule) |
-| Verdict | Ranked output (the decision) |
-| Certificate | `FoldOutcome` provenance (entries_processed, timing, context) |
+| Decision Anatomy | Fold pass                                                     |
+| ---------------- | ------------------------------------------------------------- |
+| Facts            | Anchor state (what is already known)                          |
+| Evidence         | Selected candidates (what was considered)                     |
+| Policy           | Objective function (the scoring/selection rule)               |
+| Verdict          | Ranked output (the decision)                                  |
+| Certificate      | `FoldOutcome` provenance (entries_processed, timing, context) |
 
 The correspondence is structural: if a fold pass satisfies the Hoare triple (precondition holds,
 program terminates, postcondition verified), then Decision Anatomy validity follows. Compliance
@@ -126,6 +126,7 @@ pub struct SelectorWeights { pub category_weights: BTreeMap<String, f32>, pub mi
 ### 4. Built-in objectives and composition combinators
 
 **6 built-in objectives** (common strategies, pure-math):
+
 - `MaxScoreObjective` — highest raw score wins
 - `ThresholdObjective` — pass/fail gate at a score threshold
 - `FirstMatchObjective` — first candidate that passes
@@ -134,6 +135,7 @@ pub struct SelectorWeights { pub category_weights: BTreeMap<String, f32>, pub mi
 - `RelevanceObjective` — relevance scoring from context
 
 **6 composition combinators** (objective algebra):
+
 - `WeightedObjective` — weighted sum of sub-objectives
 - `PriorityObjective` — lexicographic: try first, fallback to second
 - `ConsensusObjective` — geometric mean of sub-objectives
@@ -142,6 +144,7 @@ pub struct SelectorWeights { pub category_weights: BTreeMap<String, f32>, pub mi
 - `ScaleObjective` — multiply scores by a constant
 
 **Fold composition** (fold algebra):
+
 - `SequentialFold` — run fold₁, use its state to build context for fold₂
 - `DualFold` — run two folds independently over same entries, return both results
 - `FilterFold` — predicate gate before folding
@@ -150,6 +153,7 @@ pub struct SelectorWeights { pub category_weights: BTreeMap<String, f32>, pub mi
 ### 5. Determinism guarantees
 
 All ordering is deterministic across platforms:
+
 - Scores use `canonical_f64` (branchless NaN normalization, IEEE-754 total order)
 - Tie-breaking: score descending, then UUID ascending (`DeterministicObjective<T>`)
 - `FoldOutcome` includes `entries_processed` count for replay verification
@@ -159,6 +163,7 @@ All ordering is deterministic across platforms:
 
 Every domain-specific fold implementation (memory scoring, lore composition, retrieval ranking)
 must document its Hoare triple:
+
 - **Precondition**: what anchor state / context is required
 - **Program**: what objective function is applied, what selector budget
 - **Postcondition**: what invariants the output satisfies

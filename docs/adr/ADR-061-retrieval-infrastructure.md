@@ -31,14 +31,14 @@ Three things have changed since then:
 
 ### What exists today
 
-| Component | Crate | LOC | What it does |
-|-----------|-------|-----|-------------|
+| Component           | Crate           | LOC | What it does                                                                           |
+| ------------------- | --------------- | --- | -------------------------------------------------------------------------------------- |
 | `VectorStore` trait | `khive-storage` | 446 | Insert, search, delete, capabilities. sqlite-vec backend (brute-force cosine, O(N·D)). |
-| `TextSearch` | `khive-storage` | — | FTS5 trigram search. |
-| `hybrid_search` | `khive-runtime` | 430 | Embed query → vector search + FTS → RRF fusion → alive filter → truncate. |
-| `FusionStrategy` | `khive-runtime` | 552 | RRF, Weighted, Union, VectorOnly. 4 strategies, well-tested. |
-| `rrf_score` | `khive-score` | ~50 | Reciprocal Rank Fusion score computation. |
-| `rerank` | `khive-runtime` | ~30 | Post-hoc cosine reranking of a candidate set. |
+| `TextSearch`        | `khive-storage` | —   | FTS5 trigram search.                                                                   |
+| `hybrid_search`     | `khive-runtime` | 430 | Embed query → vector search + FTS → RRF fusion → alive filter → truncate.              |
+| `FusionStrategy`    | `khive-runtime` | 552 | RRF, Weighted, Union, VectorOnly. 4 strategies, well-tested.                           |
+| `rrf_score`         | `khive-score`   | ~50 | Reciprocal Rank Fusion score computation.                                              |
+| `rerank`            | `khive-runtime` | ~30 | Post-hoc cosine reranking of a candidate set.                                          |
 
 What's missing: graph-aware retrieval, multi-stage pipelines, retrieval-as-fold integration,
 and a scalable vector index path.
@@ -162,6 +162,7 @@ primitives. Fold objectives operate on typed candidates with scores; fusion oper
 storage hits before they become typed candidates.
 
 The pipeline flow:
+
 ```
 khive-storage (raw hits) → fusion (merge lists) → typed candidates → fold objectives (score) → selector (budget)
 ```
@@ -197,6 +198,7 @@ Hypothetical Document Embedding (HyDE): generate a hypothetical answer via LLM, 
 search with that embedding. `VectorStore::search_batch` already supports N query vectors.
 
 HyDE belongs in the **service layer**, not in fold:
+
 - It requires LLM inference (IO, async — violates fold's no-IO invariant)
 - The fold layer receives the HyDE embeddings as pre-computed inputs via `ObjectiveContext`
 - The runtime layer orchestrates: LLM call → embed hypothetical → feed to ComposePipeline
@@ -208,10 +210,10 @@ generate reformulations (service layer) → embed each → search_batch → fuse
 
 Per ADR-058 §6, the retrieval fold documents its Hoare triple:
 
-| Component | Retrieval instantiation |
-|-----------|------------------------|
-| **Precondition** | Query text/vector provided. Anchor set identified (may be empty for unanchored search). VectorStore and TextSearch backends available. |
-| **Program** | Stage 1: broad recall via VectorSimilarity + TextRelevance. Stage 2: rerank via Weighted composite. Stage 3: select via GreedySelector under budget. |
+| Component         | Retrieval instantiation                                                                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Precondition**  | Query text/vector provided. Anchor set identified (may be empty for unanchored search). VectorStore and TextSearch backends available.                                                     |
+| **Program**       | Stage 1: broad recall via VectorSimilarity + TextRelevance. Stage 2: rerank via Weighted composite. Stage 3: select via GreedySelector under budget.                                       |
 | **Postcondition** | Output is a deterministic `SelectorOutput<T>` within budget. Ordering is reproducible (DeterministicObjective with UUID tie-breaking). All returned entities are alive (not soft-deleted). |
 
 ## Alternatives Considered

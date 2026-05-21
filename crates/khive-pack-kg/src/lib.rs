@@ -35,47 +35,62 @@ impl Pack for KgPack {
     const VERBS: &'static [VerbDef] = &KG_VERBS;
 }
 
+// ADR-060: Illocutionary classification (Searle 1976)
+//   Assertive — retrieves/presents state of affairs
+//   Commissive — commits caller to a persistent change
+//   Declaration — changes institutional status by fiat
 static KG_VERBS: [VerbDef; 11] = [
+    // Commissive: commits an entity or note to the namespace
     VerbDef {
         name: "create",
         description: "Create an entity or note",
     },
+    // Assertive: retrieves and presents a record
     VerbDef {
         name: "get",
         description: "Fetch any record by UUID",
     },
+    // Assertive: retrieves and presents filtered records
     VerbDef {
         name: "list",
         description: "List records with optional filtering",
     },
+    // Declaration: changes entity or edge state by fiat
     VerbDef {
         name: "update",
         description: "Patch entity or edge fields",
     },
+    // Declaration: declares a record removed
     VerbDef {
         name: "delete",
         description: "Soft or hard delete a record",
     },
+    // Declaration: declares two entities identical
     VerbDef {
         name: "merge",
         description: "Deduplicate two entities",
     },
+    // Assertive: retrieves and presents search results
     VerbDef {
         name: "search",
         description: "Hybrid FTS + vector search",
     },
+    // Commissive: commits a typed edge to the graph
     VerbDef {
         name: "link",
         description: "Create a typed directed edge",
     },
+    // Assertive: retrieves immediate graph neighbors
     VerbDef {
         name: "neighbors",
         description: "Immediate graph neighbors",
     },
+    // Assertive: retrieves multi-hop traversal results
     VerbDef {
         name: "traverse",
         description: "Multi-hop BFS traversal",
     },
+    // Assertive: retrieves pattern-matched results
     VerbDef {
         name: "query",
         description: "GQL/SPARQL pattern matching",

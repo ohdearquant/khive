@@ -135,6 +135,7 @@ The crate is removed. Its only function (static match dispatch) is replaced by
 `khive-mcp/src/server.rs` uses `PackRegistry` directly.
 
 Migration:
+
 - Remove `khive-dialect-kg` from workspace `Cargo.toml`
 - Remove `khive-mcp`'s dependency on `khive-dialect-kg`
 - Add `khive-mcp`'s dependency on `inventory`

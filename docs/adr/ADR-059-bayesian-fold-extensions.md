@@ -108,10 +108,10 @@ the embedding space needed to estimate KL divergence. This preserves the no-IO i
 
 With these extensions, the fold Hoare triple (ADR-058 §Context) becomes:
 
-| Hoare component | Without extensions | With extensions |
-|-----------------|-------------------|-----------------|
-| **Precondition** | Anchor state | Anchor state + precision estimates + information-gain estimates |
-| **Program** | Score + rank | Score × precision + rank; epistemic-weighted selection |
+| Hoare component   | Without extensions          | With extensions                                                                      |
+| ----------------- | --------------------------- | ------------------------------------------------------------------------------------ |
+| **Precondition**  | Anchor state                | Anchor state + precision estimates + information-gain estimates                      |
+| **Program**       | Score + rank                | Score × precision + rank; epistemic-weighted selection                               |
 | **Postcondition** | Deterministic ranked output | Deterministic ranked output where ranking is Bayes-optimal given precision estimates |
 
 The Bayes-optimality claim: if precision estimates are accurate (calibrated), then
@@ -121,6 +121,7 @@ is provable for single-layer hierarchies; multi-layer hierarchies are deferred.
 ### 4. Backwards compatibility
 
 Both extensions default to identity behavior:
+
 - `precision: 1.0` → `score * 1.0 = score` (no change)
 - `epistemic_weight: 0.0` → `score + 0.0 * gain = score` (no change)
 - `information_gain: None` → treated as `0.0`

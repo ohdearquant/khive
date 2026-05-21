@@ -136,6 +136,7 @@ impl BetaPosterior {
 ```
 
 Key differences from earlier draft:
+
 - **`parameters`** is a generic `HashMap<String, BetaPosterior>` keyed by `pack::param_name`,
   not hardcoded recall fields. Populated from `PackTunable::parameter_space()` at startup.
 - **`entity_posteriors`** uses an LRU cache (bounded, e.g., 10K entries) instead of an
@@ -230,22 +231,22 @@ Switch to explore when posterior variance is high or success rate drops.
 
 The brain registers as `khive-pack-brain` via the pack registry (ADR-063):
 
-| Handler | What it does |
-|---------|-------------|
-| `brain.state` | Return current BrainState (for inspection) |
-| `brain.config` | Return projected config for a named pack |
-| `brain.events` | List recent events (for debugging) |
-| `brain.reset` | Reset to priors (start learning over) |
-| `brain.emit` | Manually emit an event (for testing) |
+| Handler        | What it does                               |
+| -------------- | ------------------------------------------ |
+| `brain.state`  | Return current BrainState (for inspection) |
+| `brain.config` | Return projected config for a named pack   |
+| `brain.events` | List recent events (for debugging)         |
+| `brain.reset`  | Reset to priors (start learning over)      |
+| `brain.emit`   | Manually emit an event (for testing)       |
 
 No top-level verbs. The brain is infrastructure. Events are emitted automatically by pipelines.
 
 ### 7. Hoare triple
 
-| Component | Brain instantiation |
-|-----------|-------------------|
-| **Precondition** | Event stream is append-only (Event substrate, ADR-004). All BetaPosterior priors have alpha > 0, beta > 0. PackTunable schemas are valid. |
-| **Program** | EventFold processes events in order, routing each to the correct posterior via EventSchema. LRU eviction is deterministic given insertion order. |
+| Component         | Brain instantiation                                                                                                                                 |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Precondition**  | Event stream is append-only (Event substrate, ADR-004). All BetaPosterior priors have alpha > 0, beta > 0. PackTunable schemas are valid.           |
+| **Program**       | EventFold processes events in order, routing each to the correct posterior via EventSchema. LRU eviction is deterministic given insertion order.    |
 | **Postcondition** | BrainState is deterministic (replay-verifiable). All posteriors maintain alpha > 0, beta > 0. Projected configs have values within declared bounds. |
 
 ## Alternatives Considered
