@@ -1,6 +1,6 @@
 # ADR-040: Embedding Model Migration Path
 
-**Status**: proposed\
+**Status**: proposed (V3 slot taken by `add_events_namespace_created_index` in the interim; this migration is now V4. Implementation deferred — requires `lattice-embed` integration plus the per-dimension `vec_{dim}` virtual table machinery.)\
 **Date**: 2026-05-19\
 **Authors**: khive maintainers
 
@@ -65,12 +65,16 @@ When a user switches the active model:
    degrades rather than breaking.
 4. A background re-embed job (D4) restores full hybrid coverage asynchronously.
 
-### D3: Schema — V3 migration
+### D3: Schema — V4 migration
 
-Building on the versioned migration system (ADR-022), the next migration is **V3** (current last
-version in `MIGRATIONS` is V2: `add_name_to_notes`, `crates/khive-db/src/migrations.rs` line 176).
+Building on the versioned migration system (ADR-022), the embedding-model migration is **V4**.
 
-V3 creates the `_embedding_models` registry table and drops legacy per-model-key vector tables.
+> **Note**: An earlier draft of this ADR referred to this migration as V3, but the V3 slot was
+> taken in the interim by `add_events_namespace_created_index`
+> (`crates/khive-db/src/migrations.rs`). The embedding-model migration must therefore be appended
+> as V4 to keep the sequence contiguous.
+
+V4 creates the `_embedding_models` registry table and drops legacy per-model-key vector tables.
 No vector virtual table is created during the migration — the runtime creates per-dimension
 `vec_{dim}` tables lazily on first model registration (see the authoritative DDL below).
 
@@ -82,7 +86,7 @@ column pointing to the correct table; the runtime dispatches via a `model_id →
 lookup. This is the minimal departure from the idealized single-table design required by the
 storage constraint.
 
-The V3 DDL is:
+The V4 DDL is:
 
 ```sql
 CREATE TABLE IF NOT EXISTS _embedding_models (
@@ -114,9 +118,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_{dim} USING vec0(
 );
 ```
 
-Existing `vec_{model_key}` tables from pre-V3 databases are dropped during the migration
+Existing `vec_{model_key}` tables from pre-V4 databases are dropped during the migration
 (pre-alpha: no production data at risk). The runtime creates `vec_{dim}` tables lazily on first
-model registration; no backfill is needed because pre-V3 vectors are model-specific and cannot be
+model registration; no backfill is needed because pre-V4 vectors are model-specific and cannot be
 reused across model boundaries.
 
 ### D4: Background re-embed strategy
@@ -235,7 +239,7 @@ matters; the `"default"` sentinel is practical for users who do not track checkp
 
 ### Neutral
 
-- Existing databases at V2 receive V3 via the standard `run_migrations` path (ADR-022). The
+- Existing databases at V3 receive V4 via the standard `run_migrations` path (ADR-022). The
   migration drops legacy `vec_*` per-model-key tables and creates the `_embedding_models`
   registry. No vector virtual table is created during migration; the runtime creates `vec_{dim}`
   tables lazily on first model registration.
@@ -250,21 +254,21 @@ matters; the `"default"` sentinel is practical for users who do not track checkp
 
 ## Implementation
 
-### V3 migration (`crates/khive-db/src/migrations.rs`)
+### V4 migration (`crates/khive-db/src/migrations.rs`)
 
-Add to `MIGRATIONS` (append after the V2 entry at line 176):
+Add to `MIGRATIONS` (append after the V3 `add_events_namespace_created_index` entry):
 
 ```rust
 VersionedMigration {
-    version: 3,
+    version: 4,
     name: "embedding_model_registry",
-    up: V3_UP,
+    up: V4_UP,
 },
 ```
 
-`V3_UP` creates the `_embedding_models` table, drops existing per-key vec tables (idempotent
+`V4_UP` creates the `_embedding_models` table, drops existing per-key vec tables (idempotent
 via `DROP TABLE IF EXISTS vec_%`-style enumeration at migration time), and creates no virtual
-table — the runtime creates `vec_{dim}` tables lazily on first model registration. V3 therefore
+table — the runtime creates `vec_{dim}` tables lazily on first model registration. V4 therefore
 has no data loss risk on fresh databases (no vec tables yet) and handles the pre-alpha case by
 dropping whatever `vec_*` tables exist.
 
@@ -424,8 +428,9 @@ The following test scenarios must be present before this ADR is considered imple
   `RuntimeConfig.embedding_model` as the active model field; this ADR extends that config
 - ADR-013: Retrieval Port Scope — `embed_batch` is in-scope for v0.1; the background re-embed
   job in this ADR uses it directly
-- ADR-022: Schema Migrations — V3 migration follows the `VersionedMigration` pattern defined
-  there; new entry appended to `MIGRATIONS` at `version = 3`
+- ADR-022: Schema Migrations — V4 migration follows the `VersionedMigration` pattern defined
+  there; new entry appended to `MIGRATIONS` at `version = 4`, after the existing V3
+  `add_events_namespace_created_index`
 - ADR-024: Note Search and Cross-Substrate — vector store schema changes in this ADR extend the
   `vec_{dim}` tables to cover notes as well as entities (the `kind` column is preserved)
 - GitHub issue #4 (`ohdearquant/khive`): "Embedding model migration path" — this ADR closes
@@ -434,7 +439,7 @@ The following test scenarios must be present before this ADR is considered imple
 - `crates/khive-db/src/stores/vectors.rs` — `SqliteVecStore` implementation this ADR modifies
 - `crates/khive-runtime/src/runtime.rs` — `RuntimeConfig` and `vec_model_key()` this ADR extends
 - `crates/khive-runtime/src/retrieval.rs` — `embed_batch` reused by the background re-embed job
-- `crates/khive-db/src/migrations.rs` — V3 migration appended here; current last version is V2
-  (`add_name_to_notes`, line 176)
+- `crates/khive-db/src/migrations.rs` — V4 migration appended here; current last version is V3
+  (`add_events_namespace_created_index`)
 - `lattice-embed` (crates.io): the embedding library providing `EmbeddingModel::dimensions()`,
   `EmbeddingModel::to_string()`, and `EmbeddingService::embed`
