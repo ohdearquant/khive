@@ -98,6 +98,7 @@ fn entity_to_canonical_value(e: &ExportedEntity) -> Value {
 /// Serialize a single edge with fixed key order.
 fn edge_to_canonical_value(e: &ExportedEdge) -> Result<Value, VcsError> {
     let mut obj = Map::new();
+    obj.insert("edge_id".to_string(), Value::String(e.edge_id.to_string()));
     obj.insert("source".to_string(), Value::String(e.source.to_string()));
     obj.insert("target".to_string(), Value::String(e.target.to_string()));
     obj.insert(
@@ -235,6 +236,7 @@ mod tests {
         let mut with_edge = empty_archive();
         with_edge.entities = vec![e1, e2];
         with_edge.edges = vec![ExportedEdge {
+            edge_id: Uuid::new_v4(),
             source: uid1,
             target: uid2,
             relation: EdgeRelation::Extends,

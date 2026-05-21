@@ -37,8 +37,19 @@ pub fn merge_edges(
     let mut merged: Vec<ExportedEdge> = Vec::new();
     let mut conflicts: Vec<MergeConflict> = Vec::new();
 
-    // Build edge lookup from base for unchanged reference.
+    // Build edge lookups so we can retrieve the original edge_id when
+    // constructing merged edges (ADR-048 D1: preserve edge identity).
     let base_edge_map: HashMap<EdgeKey, &ExportedEdge> = base
+        .edges
+        .iter()
+        .map(|e| (EdgeKey::from_edge(e), e))
+        .collect();
+    let ours_edge_map: HashMap<EdgeKey, &ExportedEdge> = ours
+        .edges
+        .iter()
+        .map(|e| (EdgeKey::from_edge(e), e))
+        .collect();
+    let theirs_edge_map: HashMap<EdgeKey, &ExportedEdge> = theirs
         .edges
         .iter()
         .map(|e| (EdgeKey::from_edge(e), e))
@@ -88,27 +99,30 @@ pub fn merge_edges(
             (Some(EdgeChange::Unchanged), Some(EdgeChange::Deleted))
             | (None, Some(EdgeChange::Deleted)) => {}
 
-            // Weight modified in ours only → take ours.
+            // Weight modified in ours only → take ours (preserve ours edge_id).
             (
                 Some(EdgeChange::WeightModified { branch_weight, .. }),
                 Some(EdgeChange::Unchanged),
             )
             | (Some(EdgeChange::WeightModified { branch_weight, .. }), None) => {
-                let edge = build_edge(key, *branch_weight)?;
+                let id = ours_edge_map.get(key).map(|e| e.edge_id);
+                let edge = build_edge(key, *branch_weight, id)?;
                 merged.push(edge);
             }
 
-            // Weight modified in theirs only → take theirs.
+            // Weight modified in theirs only → take theirs (preserve theirs edge_id).
             (
                 Some(EdgeChange::Unchanged),
                 Some(EdgeChange::WeightModified { branch_weight, .. }),
             )
             | (None, Some(EdgeChange::WeightModified { branch_weight, .. })) => {
-                let edge = build_edge(key, *branch_weight)?;
+                let id = theirs_edge_map.get(key).map(|e| e.edge_id);
+                let edge = build_edge(key, *branch_weight, id)?;
                 merged.push(edge);
             }
 
             // Weight modified in both → auto-resolve: max weight.
+            // Prefer ours edge_id for determinism; fall back to theirs or a fresh UUID.
             (
                 Some(EdgeChange::WeightModified {
                     branch_weight: ours_w,
@@ -119,7 +133,11 @@ pub fn merge_edges(
                     ..
                 }),
             ) => {
-                let edge = build_edge(key, f64::max(*ours_w, *theirs_w))?;
+                let id = ours_edge_map
+                    .get(key)
+                    .or_else(|| theirs_edge_map.get(key))
+                    .map(|e| e.edge_id);
+                let edge = build_edge(key, f64::max(*ours_w, *theirs_w), id)?;
                 merged.push(edge);
             }
 
@@ -181,12 +199,21 @@ pub fn validate_dangling_edges(
     conflicts
 }
 
-fn build_edge(key: &EdgeKey, weight: f64) -> Result<ExportedEdge, VcsError> {
+/// Build a merged edge, preserving `edge_id` when it is already known.
+///
+/// Pass `existing_id` from the ours/theirs/base archive to avoid generating a
+/// fresh UUID and breaking ADR-048 D1 edge-identity continuity.
+fn build_edge(
+    key: &EdgeKey,
+    weight: f64,
+    existing_id: Option<Uuid>,
+) -> Result<ExportedEdge, VcsError> {
     let relation = key
         .relation
         .parse::<khive_storage::EdgeRelation>()
         .map_err(|e| VcsError::Internal(e.to_string()))?;
     Ok(ExportedEdge {
+        edge_id: existing_id.unwrap_or_else(Uuid::new_v4),
         source: key.source,
         target: key.target,
         relation,
@@ -218,6 +245,7 @@ mod tests {
 
     fn edge(src: Uuid, tgt: Uuid, weight: f64) -> ExportedEdge {
         ExportedEdge {
+            edge_id: Uuid::new_v4(),
             source: src,
             target: tgt,
             relation: EdgeRelation::Extends,
@@ -289,5 +317,68 @@ mod tests {
             conflicts[0],
             MergeConflict::EdgeModifyDelete { .. }
         ));
+    }
+
+    // ── edge_id preservation tests (ADR-048 D1) ──────────────────────────────
+
+    /// Branch adds an edge not present in base → merged result uses the branch's edge_id.
+    #[test]
+    fn merge_preserves_added_edge_id() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let branch_edge = edge(a, b, 1.0);
+        let expected_id = branch_edge.edge_id;
+
+        let base = archive(vec![]);
+        let ours = archive(vec![branch_edge]);
+        let theirs = archive(vec![]);
+
+        let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+        assert!(conflicts.is_empty());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].edge_id, expected_id,
+            "merged edge_id must equal the branch's edge_id, not a fresh UUID"
+        );
+    }
+
+    /// Weight-modified edge in ours (theirs unchanged) → merged result preserves ours' edge_id.
+    #[test]
+    fn merge_preserves_weight_modified_edge_id() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        // base and theirs share the same edge at weight 0.5.
+        let base_edge = ExportedEdge {
+            edge_id: Uuid::new_v4(),
+            source: a,
+            target: b,
+            relation: EdgeRelation::Extends,
+            weight: 0.5,
+        };
+        // ours modifies only the weight; the edge_id differs from base to simulate
+        // a fresh edge_id that ours assigned (ADR-048 D1 identity must survive).
+        let ours_edge = ExportedEdge {
+            edge_id: Uuid::new_v4(),
+            source: a,
+            target: b,
+            relation: EdgeRelation::Extends,
+            weight: 0.9,
+        };
+        let expected_id = ours_edge.edge_id;
+
+        let base = archive(vec![base_edge.clone()]);
+        let ours = archive(vec![ours_edge]);
+        // theirs is Unchanged (same as base) so the diff produces WeightModified in ours only.
+        let theirs = archive(vec![base_edge]);
+
+        let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+        assert!(conflicts.is_empty());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].weight, 0.9);
+        assert_eq!(
+            merged[0].edge_id, expected_id,
+            "merged edge_id must equal ours' edge_id after weight modification"
+        );
     }
 }

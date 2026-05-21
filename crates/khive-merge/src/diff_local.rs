@@ -102,19 +102,23 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
 }
 
 /// Compute edge changes between `base` and `branch`.
+///
+/// The maps retain full `ExportedEdge` values (not just weights) so that
+/// `edge_id` is preserved in `EdgeChange::Added` entries. This is required by
+/// ADR-048 D1: edge identity must survive merge/diff cycles.
 pub fn diff_edges(
     base: &KgArchive,
     branch: &KgArchive,
 ) -> Result<HashMap<EdgeKey, EdgeChange>, VcsError> {
-    let base_map: HashMap<EdgeKey, f64> = base
+    let base_map: HashMap<EdgeKey, &ExportedEdge> = base
         .edges
         .iter()
-        .map(|e| (EdgeKey::from_edge(e), e.weight))
+        .map(|e| (EdgeKey::from_edge(e), e))
         .collect();
-    let branch_map: HashMap<EdgeKey, f64> = branch
+    let branch_map: HashMap<EdgeKey, &ExportedEdge> = branch
         .edges
         .iter()
-        .map(|e| (EdgeKey::from_edge(e), e.weight))
+        .map(|e| (EdgeKey::from_edge(e), e))
         .collect();
 
     let all_keys: HashSet<EdgeKey> = base_map.keys().chain(branch_map.keys()).cloned().collect();
@@ -122,23 +126,16 @@ pub fn diff_edges(
 
     for key in all_keys {
         let change = match (base_map.get(&key), branch_map.get(&key)) {
-            (None, Some(&w)) => EdgeChange::Added(ExportedEdge {
-                source: key.source,
-                target: key.target,
-                relation: key
-                    .relation
-                    .parse::<khive_storage::EdgeRelation>()
-                    .map_err(|e| VcsError::Internal(e.to_string()))?,
-                weight: w,
-            }),
+            // Added in branch: carry the branch edge verbatim to preserve edge_id.
+            (None, Some(branch_e)) => EdgeChange::Added((*branch_e).clone()),
             (Some(_), None) => EdgeChange::Deleted,
-            (Some(&base_w), Some(&branch_w)) => {
-                if (base_w - branch_w).abs() < f64::EPSILON {
+            (Some(base_e), Some(branch_e)) => {
+                if (base_e.weight - branch_e.weight).abs() < f64::EPSILON {
                     EdgeChange::Unchanged
                 } else {
                     EdgeChange::WeightModified {
-                        base_weight: base_w,
-                        branch_weight: branch_w,
+                        base_weight: base_e.weight,
+                        branch_weight: branch_e.weight,
                     }
                 }
             }
@@ -205,6 +202,7 @@ mod tests {
 
     fn edge(src: Uuid, tgt: Uuid, weight: f64) -> ExportedEdge {
         ExportedEdge {
+            edge_id: Uuid::new_v4(),
             source: src,
             target: tgt,
             relation: EdgeRelation::Extends,

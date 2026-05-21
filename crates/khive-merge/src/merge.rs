@@ -129,6 +129,7 @@ mod tests {
 
     fn edge(src: Uuid, tgt: Uuid) -> ExportedEdge {
         ExportedEdge {
+            edge_id: Uuid::new_v4(),
             source: src,
             target: tgt,
             relation: EdgeRelation::Extends,

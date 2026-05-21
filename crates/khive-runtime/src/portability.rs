@@ -62,6 +62,12 @@ pub struct ExportedEntity {
 /// A directed edge record in the portable archive.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExportedEdge {
+    /// Stable edge identity across export/import cycles (ADR-048 D1).
+    ///
+    /// Old archives (pre-0.2) omit this field. `serde(default)` assigns a fresh
+    /// UUID on import so backward-compatible archives are accepted as-is.
+    #[serde(default = "Uuid::new_v4")]
+    pub edge_id: Uuid,
     pub source: Uuid,
     pub target: Uuid,
     /// One of the 13 canonical relations defined in ADR-002.
@@ -154,6 +160,7 @@ impl KhiveRuntime {
                 .into_iter()
                 .filter(|e| id_set.contains(&e.source_id))
                 .map(|e| ExportedEdge {
+                    edge_id: e.id.into(),
                     source: e.source_id,
                     target: e.target_id,
                     relation: e.relation,
@@ -266,7 +273,7 @@ impl KhiveRuntime {
                 continue;
             }
             let edge = khive_storage::types::Edge {
-                id: LinkId::from(Uuid::new_v4()),
+                id: LinkId::from(ee.edge_id),
                 source_id: ee.source,
                 target_id: ee.target,
                 relation: ee.relation,
@@ -476,7 +483,8 @@ mod tests {
             "format":"khive-kg","version":"0.1","namespace":"local",
             "exported_at":"2026-01-01T00:00:00Z",
             "entities":[],
-            "edges":[{"source":"00000000-0000-0000-0000-000000000001",
+            "edges":[{"edge_id":"00000000-0000-0000-0000-000000000099",
+                       "source":"00000000-0000-0000-0000-000000000001",
                        "target":"00000000-0000-0000-0000-000000000002",
                        "relation":"related_to","weight":0.5}]
         }"#;
@@ -521,6 +529,7 @@ mod tests {
                 updated_at: Utc::now(),
             }],
             edges: vec![ExportedEdge {
+                edge_id: Uuid::new_v4(),
                 source: phantom_source,
                 target: real.id,
                 relation: EdgeRelation::Extends,
@@ -571,6 +580,7 @@ mod tests {
                 updated_at: Utc::now(),
             }],
             edges: vec![ExportedEdge {
+                edge_id: Uuid::new_v4(),
                 source: real.id,
                 target: phantom_target,
                 relation: EdgeRelation::DependsOn,
@@ -654,6 +664,7 @@ mod tests {
             edges: vec![
                 // Valid: A → B
                 ExportedEdge {
+                    edge_id: Uuid::new_v4(),
                     source: a.id,
                     target: b.id,
                     relation: EdgeRelation::Extends,
@@ -661,6 +672,7 @@ mod tests {
                 },
                 // Valid: B → C
                 ExportedEdge {
+                    edge_id: Uuid::new_v4(),
                     source: b.id,
                     target: c.id,
                     relation: EdgeRelation::DependsOn,
@@ -668,6 +680,7 @@ mod tests {
                 },
                 // Dangling: A → phantom
                 ExportedEdge {
+                    edge_id: Uuid::new_v4(),
                     source: a.id,
                     target: phantom,
                     relation: EdgeRelation::Enables,
@@ -712,6 +725,194 @@ mod tests {
         assert_eq!(
             summary.edges_skipped, 0,
             "no edges should be skipped when all endpoints exist"
+        );
+    }
+
+    // ── edge_id contract tests (ADR-048 D1) ──────────────────────────────────
+
+    /// 10. export_kg sets edge_id in the archive to the LinkId returned by link.
+    #[tokio::test]
+    async fn export_kg_preserves_edge_id() {
+        let rt = make_rt().await;
+        let a = rt
+            .create_entity(None, "concept", "Alpha", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "Beta", None, None, vec![])
+            .await
+            .unwrap();
+        let stored_edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let stored_id: Uuid = stored_edge.id.into();
+
+        let archive = rt.export_kg(None).await.unwrap();
+        assert_eq!(archive.edges.len(), 1);
+        assert_eq!(
+            archive.edges[0].edge_id, stored_id,
+            "exported edge_id must equal the LinkId returned by link"
+        );
+    }
+
+    /// 11. import_kg writes the archive edge_id as the stored LinkId.
+    #[tokio::test]
+    async fn import_kg_persists_edge_id() {
+        let src = make_rt().await;
+        let a = src
+            .create_entity(None, "concept", "Alpha", None, None, vec![])
+            .await
+            .unwrap();
+        let b = src
+            .create_entity(None, "concept", "Beta", None, None, vec![])
+            .await
+            .unwrap();
+        let stored_edge = src
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let original_id: Uuid = stored_edge.id.into();
+
+        let archive = src.export_kg(None).await.unwrap();
+        let dst = make_rt().await;
+        dst.import_kg(&archive, None).await.unwrap();
+
+        // The imported edge must carry the same UUID as the original.
+        let imported_edge = dst.get_edge(None, original_id).await.unwrap();
+        assert!(
+            imported_edge.is_some(),
+            "imported edge must be retrievable by the original edge_id"
+        );
+        let imported_edge = imported_edge.unwrap();
+        assert_eq!(
+            Uuid::from(imported_edge.id),
+            original_id,
+            "stored edge id must equal the archive edge_id"
+        );
+    }
+
+    /// 12. Old archive (no edge_id field) deserializes, imports, and re-exports with the
+    ///     same generated UUID — proving the generated ID survives the full round trip.
+    ///
+    ///     The fixture includes two entities so the edge is not skipped during import.
+    #[tokio::test]
+    async fn old_archive_missing_edge_id_round_trips() {
+        // Two entity UUIDs that will appear in both the fixture and the entity list.
+        let src_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let tgt_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+
+        // Simulate a pre-0.2 archive JSON where the edge lacks an edge_id field.
+        let json = format!(
+            r#"{{
+                "format": "khive-kg",
+                "version": "0.1",
+                "namespace": "local",
+                "exported_at": "2026-01-01T00:00:00Z",
+                "entities": [
+                    {{"id":"{src_id}","kind":"concept","name":"SrcNode","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}},
+                    {{"id":"{tgt_id}","kind":"concept","name":"TgtNode","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}
+                ],
+                "edges": [
+                    {{
+                        "source": "{src_id}",
+                        "target": "{tgt_id}",
+                        "relation": "extends",
+                        "weight": 0.9
+                    }}
+                ]
+            }}"#
+        );
+
+        // Deserialize: serde(default) must assign a non-nil UUID.
+        let archive: KgArchive = serde_json::from_str(&json)
+            .expect("old archive without edge_id must deserialize successfully");
+        assert_eq!(archive.edges.len(), 1);
+        let generated_id = archive.edges[0].edge_id;
+        assert_ne!(
+            generated_id,
+            Uuid::nil(),
+            "missing edge_id in old archive must get a fresh non-nil UUID"
+        );
+
+        // Import into a fresh runtime and verify the generated ID is persisted.
+        let rt = make_rt().await;
+        let summary = rt.import_kg(&archive, None).await.unwrap();
+        assert_eq!(summary.entities_imported, 2);
+        assert_eq!(
+            summary.edges_imported, 1,
+            "edge must be imported when both endpoints exist"
+        );
+
+        let stored = rt.get_edge(None, generated_id).await.unwrap();
+        assert!(
+            stored.is_some(),
+            "imported edge must be retrievable by the generated edge_id"
+        );
+        assert_eq!(
+            Uuid::from(stored.unwrap().id),
+            generated_id,
+            "stored edge id must equal the generated edge_id"
+        );
+
+        // Re-export and verify the same UUID appears in the archive.
+        let re_archive = rt.export_kg(None).await.unwrap();
+        assert_eq!(re_archive.edges.len(), 1);
+        assert_eq!(
+            re_archive.edges[0].edge_id, generated_id,
+            "re-exported edge_id must equal the ID generated on first import"
+        );
+    }
+
+    /// 13. Explicit export → import → export equality: the edge_id is unchanged across
+    ///     a full round trip when the source archive already contains an edge_id.
+    ///
+    ///     Verifies by (source, target, relation) key that re-export emits the original ID.
+    #[tokio::test]
+    async fn export_import_export_edge_id_equality() {
+        // Build a graph on the source runtime.
+        let src = make_rt().await;
+        let a = src
+            .create_entity(None, "concept", "NodeA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = src
+            .create_entity(None, "concept", "NodeB", None, None, vec![])
+            .await
+            .unwrap();
+        let stored = src
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .await
+            .unwrap();
+        let original_edge_id: Uuid = stored.id.into();
+
+        // First export.
+        let archive1 = src.export_kg(None).await.unwrap();
+        assert_eq!(archive1.edges.len(), 1);
+        assert_eq!(
+            archive1.edges[0].edge_id, original_edge_id,
+            "first export must carry the stored edge_id"
+        );
+
+        // Import into a fresh runtime.
+        let dst = make_rt().await;
+        dst.import_kg(&archive1, None).await.unwrap();
+
+        // Second export from the destination runtime.
+        let archive2 = dst.export_kg(None).await.unwrap();
+        assert_eq!(archive2.edges.len(), 1);
+
+        // Find the edge by (source, target, relation) and assert the ID is unchanged.
+        let re_edge = archive2
+            .edges
+            .iter()
+            .find(|e| e.source == a.id && e.target == b.id && e.relation == EdgeRelation::Extends)
+            .expect(
+                "re-exported archive must contain the original edge by (source,target,relation)",
+            );
+        assert_eq!(
+            re_edge.edge_id, original_edge_id,
+            "edge_id must be identical across export → import → export"
         );
     }
 }
