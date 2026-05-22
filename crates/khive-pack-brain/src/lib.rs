@@ -76,6 +76,15 @@ impl BrainPack {
         serde_json::to_value(&snapshot).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
     }
 
+    /// Public snapshot of the current `BrainState`.
+    ///
+    /// Equivalent to dispatching the `brain.state` verb but callable directly
+    /// when you hold an `Arc<BrainPack>` (e.g. a test that registered the pack
+    /// as a `DispatchHook` and wants to verify posteriors updated).
+    pub fn snapshot(&self) -> crate::state::BrainStateSnapshot {
+        self.state.lock().unwrap().to_snapshot()
+    }
+
     async fn handle_config(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         struct ConfigParams {
