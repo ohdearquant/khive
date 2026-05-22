@@ -1,11 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{RuntimeError, VerbRegistry};
-use khive_storage::types::{TextFilter, TextQueryMode, TextSearchRequest, VectorSearchRequest};
+use khive_runtime::fusion::fuse_with_strategy;
+use khive_runtime::{RuntimeError, SearchHit, SearchSource, VerbRegistry};
+use khive_storage::types::{
+    TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
+    VectorSearchRequest,
+};
 use khive_types::SubstrateKind;
 
 use crate::config::{RecallConfig, ScoreBreakdown, WeightedContributions};
@@ -105,9 +109,130 @@ fn compute_score(
     (total, breakdown)
 }
 
+struct RecallCandidateSet {
+    namespace: String,
+    text_hits: Vec<TextSearchHit>,
+    vector_hits: Vec<VectorSearchHit>,
+}
+
+fn recall_candidate_count(cfg: &RecallConfig, limit: u32) -> u32 {
+    cfg.candidate_limit
+        .unwrap_or_else(|| limit.saturating_mul(cfg.candidate_multiplier).max(40))
+}
+
+fn search_source_label(source: SearchSource) -> &'static str {
+    match source {
+        SearchSource::Vector => "vector",
+        SearchSource::Text => "text",
+        SearchSource::Both => "both",
+    }
+}
+
+fn fuse_candidates(
+    text_hits: Vec<TextSearchHit>,
+    vector_hits: Vec<VectorSearchHit>,
+    memory_ids: &HashSet<Uuid>,
+    cfg: &RecallConfig,
+    limit: usize,
+) -> Vec<SearchHit> {
+    let text: Vec<TextSearchHit> = text_hits
+        .into_iter()
+        .filter(|h| memory_ids.contains(&h.subject_id))
+        .collect();
+    let vec: Vec<VectorSearchHit> = vector_hits
+        .into_iter()
+        .filter(|h| memory_ids.contains(&h.subject_id))
+        .collect();
+    fuse_with_strategy(text, vec, &cfg.fuse_strategy, limit)
+}
+
 impl MemoryPack {
+    async fn collect_recall_candidates(
+        &self,
+        query: &str,
+        namespace: Option<&str>,
+        candidate_limit: u32,
+    ) -> Result<RecallCandidateSet, RuntimeError> {
+        let ns = self.runtime.ns(namespace).to_string();
+        let text_hits = self
+            .runtime
+            .text_for_notes(namespace)?
+            .search(TextSearchRequest {
+                query: query.to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(TextFilter {
+                    namespaces: vec![ns.clone()],
+                    ..TextFilter::default()
+                }),
+                top_k: candidate_limit,
+                snippet_chars: 200,
+            })
+            .await?;
+
+        let vector_hits = if self.runtime.config().embedding_model.is_some() {
+            let vec = self.runtime.embed(query).await?;
+            self.runtime
+                .vectors(namespace)?
+                .search(VectorSearchRequest {
+                    query_embedding: vec,
+                    top_k: candidate_limit,
+                    namespace: Some(ns.clone()),
+                    kind: Some(SubstrateKind::Note),
+                })
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(RecallCandidateSet {
+            namespace: ns,
+            text_hits,
+            vector_hits,
+        })
+    }
+
+    async fn load_memory_candidate_notes(
+        &self,
+        namespace: Option<&str>,
+        text_hits: &[TextSearchHit],
+        vector_hits: &[VectorSearchHit],
+    ) -> Result<(HashSet<Uuid>, HashMap<Uuid, khive_storage::note::Note>), RuntimeError> {
+        let candidate_ids: Vec<Uuid> = {
+            let mut seen = HashSet::new();
+            let mut ids = Vec::new();
+            for id in text_hits
+                .iter()
+                .map(|h| h.subject_id)
+                .chain(vector_hits.iter().map(|h| h.subject_id))
+            {
+                if seen.insert(id) {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+
+        let note_store = self.runtime.notes(namespace)?;
+        let batch = note_store.get_notes_batch(&candidate_ids).await?;
+        let mut memory_ids = HashSet::new();
+        let mut notes_by_id = HashMap::new();
+        for note in batch {
+            if note.deleted_at.is_none() && note.kind == "memory" {
+                memory_ids.insert(note.id);
+                notes_by_id.insert(note.id, note);
+            }
+        }
+
+        Ok((memory_ids, notes_by_id))
+    }
+
     pub(crate) async fn handle_remember(&self, params: Value) -> Result<Value, RuntimeError> {
         let p: RememberParams = deser(params)?;
+        if p.content.trim().is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "content must not be empty".into(),
+            ));
+        }
 
         if let Some(mt) = &p.memory_type {
             validate_memory_type(mt)?;
@@ -166,7 +291,6 @@ impl MemoryPack {
         params: Value,
         _registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        const RRF_K: f64 = 60.0;
         let p: RecallParams = deser(params)?;
 
         if let Some(mt) = &p.memory_type {
@@ -177,93 +301,37 @@ impl MemoryPack {
         cfg.validate()?;
 
         let limit = p.limit.unwrap_or(10).min(100);
-        let candidates = limit.saturating_mul(cfg.candidate_multiplier).max(40);
-        let ns = self.runtime.ns(p.namespace.as_deref()).to_string();
-
-        // FTS search over notes index
-        let text_hits = self
-            .runtime
-            .text_for_notes(p.namespace.as_deref())?
-            .search(TextSearchRequest {
-                query: p.query.clone(),
-                mode: TextQueryMode::Plain,
-                filter: Some(TextFilter {
-                    namespaces: vec![ns.clone()],
-                    ..TextFilter::default()
-                }),
-                top_k: candidates,
-                snippet_chars: 200,
-            })
+        let candidate_limit = recall_candidate_count(&cfg, limit);
+        let candidates = self
+            .collect_recall_candidates(&p.query, p.namespace.as_deref(), candidate_limit)
+            .await?;
+        let (memory_ids, mut notes_by_id) = self
+            .load_memory_candidate_notes(
+                p.namespace.as_deref(),
+                &candidates.text_hits,
+                &candidates.vector_hits,
+            )
             .await?;
 
-        // Vector search if embedding model is configured
-        let vector_hits = if self.runtime.config().embedding_model.is_some() {
-            let vec = self.runtime.embed(&p.query).await?;
-            self.runtime
-                .vectors(p.namespace.as_deref())?
-                .search(VectorSearchRequest {
-                    query_embedding: vec,
-                    top_k: candidates,
-                    namespace: Some(ns.clone()),
-                    kind: Some(SubstrateKind::Note),
-                })
-                .await?
-        } else {
-            vec![]
-        };
+        let fused = fuse_candidates(
+            candidates.text_hits,
+            candidates.vector_hits,
+            &memory_ids,
+            &cfg,
+            candidate_limit as usize,
+        );
 
-        // Pre-filter candidates to memory kind before RRF fusion so non-memory
-        // notes do not consume ranked-slot budget (ADR-036 §6).
-        let note_store = self.runtime.notes(p.namespace.as_deref())?;
-        let now_micros = chrono::Utc::now().timestamp_micros();
-
-        let mut memory_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        let candidate_ids: Vec<Uuid> = {
-            let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-            let mut ids: Vec<Uuid> = Vec::new();
-            for id in text_hits
-                .iter()
-                .map(|h| h.subject_id)
-                .chain(vector_hits.iter().map(|h| h.subject_id))
-            {
-                if seen.insert(id) {
-                    ids.push(id);
-                }
-            }
-            ids
-        };
-        let mut notes_by_id: HashMap<Uuid, khive_storage::note::Note> = HashMap::new();
-        let batch = note_store.get_notes_batch(&candidate_ids).await?;
-        for note in batch {
-            if note.deleted_at.is_none() && note.kind == "memory" {
-                memory_ids.insert(note.id);
-                notes_by_id.insert(note.id, note);
-            }
-        }
-
-        // RRF fusion (raw f64) — only over memory-kind candidates.
-        let mut buckets: HashMap<Uuid, f64> = HashMap::new();
-        for (i, hit) in text_hits.into_iter().enumerate() {
-            if memory_ids.contains(&hit.subject_id) {
-                let rank = (i + 1) as f64;
-                *buckets.entry(hit.subject_id).or_default() += 1.0 / (RRF_K + rank);
-            }
-        }
-        for (i, hit) in vector_hits.into_iter().enumerate() {
-            if memory_ids.contains(&hit.subject_id) {
-                let rank = (i + 1) as f64;
-                *buckets.entry(hit.subject_id).or_default() += 1.0 / (RRF_K + rank);
-            }
-        }
-
-        if buckets.is_empty() {
+        if fused.is_empty() {
             return to_json(&Vec::<Value>::new());
         }
 
-        let mut ranked: Vec<(Uuid, f64, khive_storage::note::Note)> = Vec::new();
-        for (&id, &rrf) in &buckets {
+        let now_micros = chrono::Utc::now().timestamp_micros();
+        let mut ranked: Vec<(Uuid, f64, ScoreBreakdown, khive_storage::note::Note)> = Vec::new();
+        for hit in fused {
+            let id = hit.entity_id;
+            let relevance = hit.score.to_f64();
             let note = match notes_by_id.remove(&id) {
-                Some(n) => n,
+                Some(note) => note,
                 None => continue,
             };
             if let Some(mt) = &p.memory_type {
@@ -282,13 +350,13 @@ impl MemoryPack {
 
             let age_micros = (now_micros - note.created_at).max(0) as f64;
             let age_days = age_micros / (1_000_000.0 * 86_400.0);
-            let (final_score, _breakdown) =
-                compute_score(&cfg, rrf, note.salience, note.decay_factor, age_days);
+            let (final_score, breakdown) =
+                compute_score(&cfg, relevance, note.salience, note.decay_factor, age_days);
 
             if final_score < cfg.min_score {
                 continue;
             }
-            ranked.push((id, final_score, note));
+            ranked.push((id, final_score, breakdown, note));
         }
 
         ranked.sort_by(|a, b| {
@@ -298,10 +366,11 @@ impl MemoryPack {
         });
         ranked.truncate(limit as usize);
 
+        let include_breakdown = cfg.include_breakdown;
         let results: Vec<Value> = ranked
             .into_iter()
-            .map(|(id, score, note)| {
-                json!({
+            .map(|(id, score, breakdown, note)| {
+                let mut result = json!({
                     "note_id": id.to_string(),
                     "score": score,
                     "content": note.content,
@@ -311,7 +380,11 @@ impl MemoryPack {
                         .and_then(|p| p.get("memory_type"))
                         .and_then(|v| v.as_str()),
                     "created_at": note.created_at,
-                })
+                });
+                if include_breakdown {
+                    result["breakdown"] = json!(breakdown);
+                }
+                result
             })
             .collect();
 
@@ -340,52 +413,46 @@ impl MemoryPack {
         &self,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        #[derive(Deserialize)]
-        struct CandidatesParams {
-            query: String,
-            namespace: Option<String>,
-            limit: Option<u32>,
-            config: Option<RecallConfig>,
-        }
-        let p: CandidatesParams = deser(params)?;
-        let cfg = p.config.unwrap_or_default();
-        let limit = p.limit.unwrap_or(10).min(100);
-        let candidates = limit.saturating_mul(cfg.candidate_multiplier).max(40);
-        let ns = self.runtime.ns(p.namespace.as_deref()).to_string();
+        let p: RecallParams = deser(params)?;
+        let cfg = p.effective_config();
+        cfg.validate()?;
 
-        let text_hits = self
-            .runtime
-            .text_for_notes(p.namespace.as_deref())?
-            .search(TextSearchRequest {
-                query: p.query.clone(),
-                mode: TextQueryMode::Plain,
-                filter: Some(TextFilter {
-                    namespaces: vec![ns.clone()],
-                    ..TextFilter::default()
-                }),
-                top_k: candidates,
-                snippet_chars: 200,
-            })
+        let limit = p.limit.unwrap_or(10).min(100);
+        let candidate_limit = recall_candidate_count(&cfg, limit);
+        let candidates = self
+            .collect_recall_candidates(&p.query, p.namespace.as_deref(), candidate_limit)
             .await?;
 
-        let vector_hits = if self.runtime.config().embedding_model.is_some() {
-            let vec = self.runtime.embed(&p.query).await?;
-            self.runtime
-                .vectors(p.namespace.as_deref())?
-                .search(VectorSearchRequest {
-                    query_embedding: vec,
-                    top_k: candidates,
-                    namespace: Some(ns),
-                    kind: Some(SubstrateKind::Note),
+        let text_candidates: Vec<Value> = candidates
+            .text_hits
+            .iter()
+            .map(|hit| {
+                json!({
+                    "note_id": hit.subject_id.to_string(),
+                    "score": hit.score.to_f64(),
+                    "rank": hit.rank,
+                    "title": hit.title.as_deref(),
+                    "snippet": hit.snippet.as_deref(),
                 })
-                .await?
-        } else {
-            vec![]
-        };
+            })
+            .collect();
+        let vector_candidates: Vec<Value> = candidates
+            .vector_hits
+            .iter()
+            .map(|hit| {
+                json!({
+                    "note_id": hit.subject_id.to_string(),
+                    "score": hit.score.to_f64(),
+                    "rank": hit.rank,
+                })
+            })
+            .collect();
 
         to_json(&json!({
-            "text_hits": text_hits.len(),
-            "vector_hits": vector_hits.len(),
+            "namespace": candidates.namespace,
+            "candidate_limit": candidate_limit,
+            "text_candidates": text_candidates,
+            "vector_candidates": vector_candidates,
         }))
     }
 
@@ -394,9 +461,64 @@ impl MemoryPack {
         params: Value,
         _registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        // Thin wrapper exposing the RRF fusion step for diagnostics.
-        // Full recall pipeline is in handle_recall; this exposes intermediate state.
-        self.handle_recall(params, _registry).await
+        let p: RecallParams = deser(params)?;
+        if let Some(mt) = &p.memory_type {
+            validate_memory_type(mt)?;
+        }
+
+        let cfg = p.effective_config();
+        cfg.validate()?;
+
+        let limit = p.limit.unwrap_or(10).min(100);
+        let candidate_limit = recall_candidate_count(&cfg, limit);
+        let candidates = self
+            .collect_recall_candidates(&p.query, p.namespace.as_deref(), candidate_limit)
+            .await?;
+        let (memory_ids, notes_by_id) = self
+            .load_memory_candidate_notes(
+                p.namespace.as_deref(),
+                &candidates.text_hits,
+                &candidates.vector_hits,
+            )
+            .await?;
+
+        let fused = fuse_candidates(
+            candidates.text_hits,
+            candidates.vector_hits,
+            &memory_ids,
+            &cfg,
+            candidate_limit as usize,
+        );
+
+        let fused_candidates: Vec<Value> = fused
+            .into_iter()
+            .filter_map(|hit| {
+                let note = notes_by_id.get(&hit.entity_id)?;
+                if let Some(mt) = &p.memory_type {
+                    let stored = note
+                        .properties
+                        .as_ref()
+                        .and_then(|props| props.get("memory_type"))
+                        .and_then(|v| v.as_str());
+                    if stored != Some(mt.as_str()) {
+                        return None;
+                    }
+                }
+                Some(json!({
+                    "note_id": hit.entity_id.to_string(),
+                    "fused_score": hit.score.to_f64(),
+                    "source": search_source_label(hit.source),
+                    "title": hit.title,
+                    "snippet": hit.snippet,
+                }))
+            })
+            .collect();
+
+        to_json(&json!({
+            "strategy": cfg.fuse_strategy,
+            "candidate_limit": candidate_limit,
+            "fused_candidates": fused_candidates,
+        }))
     }
 
     pub(crate) async fn handle_recall_score(&self, params: Value) -> Result<Value, RuntimeError> {

@@ -23,7 +23,7 @@ impl Pack for MemoryPack {
 // ADR-060: Illocutionary classification (Searle 1976)
 //   Commissive — commits caller to a persistent change
 //   Assertive — retrieves/presents state of affairs
-static MEMORY_VERBS: [VerbDef; 2] = [
+static MEMORY_VERBS: [VerbDef; 6] = [
     // Commissive: commits a memory to the namespace
     VerbDef {
         name: "remember",
@@ -33,6 +33,22 @@ static MEMORY_VERBS: [VerbDef; 2] = [
     VerbDef {
         name: "recall",
         description: "Recall memory notes with decay-aware hybrid ranking",
+    },
+    VerbDef {
+        name: "recall.embed",
+        description: "Return the embedding vector used by memory recall",
+    },
+    VerbDef {
+        name: "recall.candidates",
+        description: "Return raw memory recall candidates by retrieval source",
+    },
+    VerbDef {
+        name: "recall.fuse",
+        description: "Return fused memory recall candidates before final scoring",
+    },
+    VerbDef {
+        name: "recall.score",
+        description: "Score a memory recall candidate and return score breakdown",
     },
 ];
 

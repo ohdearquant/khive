@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use khive_runtime::RuntimeError;
+use khive_runtime::{FusionStrategy, RuntimeError};
 
 /// Configuration for the recall scoring pipeline.
 /// All fields have sensible defaults matching current behavior.
@@ -24,10 +24,17 @@ pub struct RecallConfig {
     // --- Retrieval parameters ---
     /// Candidates per retrieval path before fusion = limit × this. Default 20.
     pub candidate_multiplier: u32,
+    /// Explicit max candidates per retrieval path before fusion. When None,
+    /// candidate_multiplier keeps the legacy behavior.
+    pub candidate_limit: Option<u32>,
+    /// Strategy used to fuse retrieval-source candidate lists. Default RRF k=60.
+    pub fuse_strategy: FusionStrategy,
     /// Minimum composite score to include in results. Default 0.0.
     pub min_score: f64,
     /// Minimum raw salience to include in results. Default 0.0.
     pub min_salience: f64,
+    /// Include per-component score breakdowns in recall responses. Default false.
+    pub include_breakdown: bool,
 }
 
 impl Default for RecallConfig {
@@ -39,8 +46,11 @@ impl Default for RecallConfig {
             temporal_half_life_days: 30.0,
             decay_model: DecayModel::default(),
             candidate_multiplier: 20,
+            candidate_limit: None,
+            fuse_strategy: FusionStrategy::default(),
             min_score: 0.0,
             min_salience: 0.0,
+            include_breakdown: false,
         }
     }
 }
@@ -77,6 +87,21 @@ impl RecallConfig {
         if self.temporal_half_life_days <= 0.0 {
             return Err(RuntimeError::InvalidInput(
                 "temporal_half_life_days must be positive".to_string(),
+            ));
+        }
+        if self.candidate_limit == Some(0) {
+            return Err(RuntimeError::InvalidInput(
+                "candidate_limit must be positive when provided".to_string(),
+            ));
+        }
+        if !self.min_score.is_finite() {
+            return Err(RuntimeError::InvalidInput(
+                "min_score must be finite".to_string(),
+            ));
+        }
+        if !self.min_salience.is_finite() {
+            return Err(RuntimeError::InvalidInput(
+                "min_salience must be finite".to_string(),
             ));
         }
         Ok(())
@@ -376,6 +401,77 @@ mod tests {
         let diff2 = (cfg.importance_weight - 0.20).abs();
         assert!(diff2 < 1e-12);
         assert_eq!(cfg.decay_model, DecayModel::Exponential);
+    }
+
+    // ── RecallConfig new fields ───────────────────────────────────────────────
+
+    #[test]
+    fn new_fields_have_correct_defaults() {
+        let cfg = RecallConfig::default();
+        assert_eq!(cfg.candidate_limit, None);
+        assert_eq!(cfg.fuse_strategy, FusionStrategy::Rrf { k: 60 });
+        assert!(!cfg.include_breakdown);
+    }
+
+    #[test]
+    fn candidate_limit_zero_fails_validation() {
+        let cfg = RecallConfig {
+            candidate_limit: Some(0),
+            ..RecallConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn candidate_limit_some_positive_validates() {
+        let cfg = RecallConfig {
+            candidate_limit: Some(100),
+            ..RecallConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn min_score_nan_fails_validation() {
+        let cfg = RecallConfig {
+            min_score: f64::NAN,
+            ..RecallConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn min_salience_nan_fails_validation() {
+        let cfg = RecallConfig {
+            min_salience: f64::NAN,
+            ..RecallConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn new_fields_roundtrip() {
+        let cfg = RecallConfig {
+            candidate_limit: Some(50),
+            fuse_strategy: FusionStrategy::Union,
+            include_breakdown: true,
+            ..RecallConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: RecallConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.candidate_limit, Some(50));
+        assert_eq!(back.fuse_strategy, FusionStrategy::Union);
+        assert!(back.include_breakdown);
+    }
+
+    #[test]
+    fn partial_config_new_fields_use_defaults() {
+        // Parse JSON that omits all new fields — they should fall back to defaults.
+        let json = r#"{"temporal_weight": 0.15}"#;
+        let cfg: RecallConfig = serde_json::from_str(json).expect("deserialize partial");
+        assert_eq!(cfg.candidate_limit, None);
+        assert_eq!(cfg.fuse_strategy, FusionStrategy::Rrf { k: 60 });
+        assert!(!cfg.include_breakdown);
     }
 
     // ── ScoreBreakdown ────────────────────────────────────────────────────────
