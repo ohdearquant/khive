@@ -53,7 +53,7 @@ Deno.test("embed (default) — prints embed plan", async () => {
     const cap = captureStdout();
     await runEmbed(root, []);
     const out = cap.restore();
-    assertStringIncludes(out, "Embed plan: 2/2 entities pending");
+    assertStringIncludes(out, "Embed dry-run plan: 2/2 entities pending");
     assertStringIncludes(out, "model=mE5-small");
   });
 });
@@ -63,9 +63,9 @@ Deno.test("embed --dry-run — silences trailing notice", async () => {
     const cap = captureStdout();
     await runEmbed(root, ["--dry-run"]);
     const out = cap.restore();
-    assertStringIncludes(out, "Embed plan");
+    assertStringIncludes(out, "Embed dry-run plan");
     // Notice about Phase C1 should NOT appear when --dry-run is set.
-    if (out.includes("Phase C1 — embedding runtime not wired")) {
+    if (out.includes("Dry-run only: embedding runtime is not wired")) {
       throw new Error("--dry-run should silence the Phase C1 notice");
     }
   });
@@ -76,7 +76,7 @@ Deno.test("embed --ids — filters to specified short or full IDs", async () => 
     const cap = captureStdout();
     await runEmbed(root, ["--ids", "10000000"]);
     const out = cap.restore();
-    assertStringIncludes(out, "Embed plan: 1/2 entities pending");
+    assertStringIncludes(out, "Embed dry-run plan: 1/2 entities pending");
   });
 });
 
@@ -106,7 +106,7 @@ Deno.test("embed empty repo — prints empty plan", async () => {
     const cap = captureStdout();
     await runEmbed(root, []);
     const out = cap.restore();
-    assertStringIncludes(out, "Embed plan: nothing to embed");
+    assertStringIncludes(out, "Embeddings are up-to-date, nothing to do.");
   } finally {
     await Deno.remove(root, { recursive: true });
   }

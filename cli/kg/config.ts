@@ -299,6 +299,8 @@ export async function writeConfigKey(
   const keyPattern = new RegExp(`^\\s*${parsed.field}\\s*=`);
   let updated = false;
   for (let i = tableStart + 1; i < tableEnd; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith("#")) continue;
     if (keyPattern.test(lines[i])) {
       lines[i] = newLine;
       updated = true;

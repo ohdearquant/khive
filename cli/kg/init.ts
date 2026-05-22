@@ -14,6 +14,7 @@
 
 import { join } from "@std/path";
 import { exec, getCurrentBranch, getGitDir, getRepoRoot, gitAdd, isGitRepo } from "../lib/git.ts";
+import { DEFAULT_SCHEMA_YAML } from "../lib/schema.ts";
 import {
   CONFIG_FILE,
   EDGES_FILE,
@@ -24,56 +25,6 @@ import {
   SCHEMA_FILE,
   STATE_DIR,
 } from "../lib/paths.ts";
-
-// ---------------------------------------------------------------------------
-// Schema template (ADR-048 §3 + ADR-001 + ADR-002)
-// ---------------------------------------------------------------------------
-
-const DEFAULT_SCHEMA_YAML = `\
-format_version: "1.0.0"
-ontology_version: "1.0.0"
-entity_kinds:
-  - concept
-  - document
-  - dataset
-  - project
-  - person
-  - org
-edge_relations:
-  - relation: contains
-    category: structure
-  - relation: part_of
-    category: structure
-  - relation: instance_of
-    category: structure
-  - relation: extends
-    category: derivation
-  - relation: variant_of
-    category: derivation
-  - relation: introduced_by
-    category: derivation
-  - relation: supersedes
-    category: derivation
-  - relation: depends_on
-    category: dependency
-  - relation: enables
-    category: dependency
-  - relation: implements
-    category: implementation
-  - relation: competes_with
-    category: lateral
-  - relation: composed_with
-    category: lateral
-  - relation: annotates
-    category: annotation
-note_kinds:
-  - observation
-  - insight
-  - question
-  - decision
-  - reference
-remotes: []
-`;
 
 // ---------------------------------------------------------------------------
 // Project config template (ADR-057 §4)
@@ -121,15 +72,30 @@ kg/.remote-cache/**
 // Git hook content (ADR-051 §6)
 // ---------------------------------------------------------------------------
 
-const HOOK_CONTENT = `#!/bin/sh
+const HOOK_NAMES = ["post-checkout", "post-merge", "post-rewrite"] as const;
+type HookName = typeof HOOK_NAMES[number];
+
+function hookContent(name: HookName): string {
+  const checkoutGuard = name === "post-checkout"
+    ? `
+# Git passes old-ref, new-ref, and checkout type. For branch checkouts,
+# skip the DB sync when KG files are identical between the two refs.
+if [ "\${3:-}" = "1" ] && [ -n "\${1:-}" ] && [ -n "\${2:-}" ]; then
+  if git diff --quiet "$1" "$2" -- .khive/kg; then
+    exit 0
+  fi
+fi
+`
+    : "";
+
+  return `#!/bin/sh
 # Installed by khive kg init. Rebuilds working.db after git operations.
 # Add your own logic below this line — do not remove the khive line.
-if command -v khive >/dev/null 2>&1; then
+${checkoutGuard}if command -v khive >/dev/null 2>&1; then
   khive kg sync --quiet 2>/dev/null || true
 fi
 `;
-
-const HOOK_NAMES = ["post-checkout", "post-merge", "post-rewrite"] as const;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -178,7 +144,7 @@ async function installHooks(gitDir: string): Promise<HookResult[]> {
       results.push({ name, installed: false, existed: true });
     } catch {
       // Does not exist — create it.
-      await Deno.writeTextFile(hookPath, HOOK_CONTENT);
+      await Deno.writeTextFile(hookPath, hookContent(name));
       await Deno.chmod(hookPath, 0o755);
       results.push({ name, installed: true, existed: false });
     }

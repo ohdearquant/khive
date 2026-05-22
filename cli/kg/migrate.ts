@@ -265,7 +265,9 @@ function emptyCounts(): RewriteCounts {
 async function readNdjsonLines(repoRoot: string, rel: string): Promise<string[]> {
   try {
     const text = await Deno.readTextFile(join(repoRoot, rel));
-    return text.split("\n").filter((l) => l.length > 0);
+    return text.split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
   } catch (err) {
     if (err instanceof Deno.errors.NotFound) return [];
     throw err;

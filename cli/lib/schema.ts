@@ -1,10 +1,8 @@
 /**
  * Schema loading and validation for .khive/kg/schema.yaml (ADR-048).
  *
- * schema.yaml is a simple, hand-maintained file.  We parse it with a
- * line-oriented approach rather than pulling in a full YAML library —
- * the file structure is regular enough that line-by-line parsing is
- * correct and dependency-free.
+ * schema.yaml is a simple, hand-maintained file.  We parse it with
+ * @std/yaml and validate the result against the expected shape.
  *
  * Expected shape:
  *
@@ -29,7 +27,56 @@
  *       version: "0.1"
  */
 
+import { parse as parseYaml } from "@std/yaml";
 import { SCHEMA_FILE } from "./paths.ts";
+
+// ─── Default schema template (ADR-048 §3 + ADR-001 + ADR-002) ────────────────
+
+export const DEFAULT_SCHEMA_YAML = `\
+format_version: "1.0.0"
+ontology_version: "1.0.0"
+entity_kinds:
+  - concept
+  - document
+  - dataset
+  - project
+  - person
+  - org
+edge_relations:
+  - relation: contains
+    category: structure
+  - relation: part_of
+    category: structure
+  - relation: instance_of
+    category: structure
+  - relation: extends
+    category: derivation
+  - relation: variant_of
+    category: derivation
+  - relation: introduced_by
+    category: derivation
+  - relation: supersedes
+    category: derivation
+  - relation: depends_on
+    category: dependency
+  - relation: enables
+    category: dependency
+  - relation: implements
+    category: implementation
+  - relation: competes_with
+    category: lateral
+  - relation: composed_with
+    category: lateral
+  - relation: annotates
+    category: annotation
+note_kinds:
+  - observation
+  - insight
+  - question
+  - decision
+  - reference
+remotes: []
+`;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -67,235 +114,29 @@ export interface ValidationError {
   message: string;
 }
 
-// ─── Simple YAML parser ───────────────────────────────────────────────────────
+// ─── YAML parser (delegates to @std/yaml) ────────────────────────────────────
 
-/**
- * Minimal YAML parser for the schema.yaml subset we care about.
- *
- * Supports:
- *   - Top-level scalar keys: `key: value` or `key: "value"`
- *   - Sequence items: `  - value`
- *   - Mapping items under a sequence: `    key: value` after `  - relation: value`
- *   - Nested mappings: `remotes:` → `  name:` → `    url: value`
- *
- * Does NOT support: anchors, aliases, multi-line strings, explicit tags.
- */
 function parseSchemaYaml(text: string): Schema {
-  const lines = text.split("\n");
-  const schema: Schema = {
-    format_version: "",
-    entity_kinds: [],
-    edge_relations: [],
+  const parsed = parseYaml(text);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`${SCHEMA_FILE} must be a YAML mapping`);
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  return {
+    format_version: String(obj["format_version"] ?? ""),
+    entity_kinds: Array.isArray(obj["entity_kinds"]) ? obj["entity_kinds"].map(String) : [],
+    edge_relations: Array.isArray(obj["edge_relations"])
+      ? obj["edge_relations"].map((rel) =>
+        typeof rel === "string" ? { relation: rel } : rel as EdgeRelationDef
+      )
+      : [],
+    note_kinds: Array.isArray(obj["note_kinds"]) ? obj["note_kinds"].map(String) : undefined,
+    remotes: Array.isArray(obj["remotes"]) ? obj["remotes"] as RemoteDef[] : undefined,
+    packs: Array.isArray(obj["packs"])
+      ? obj["packs"].map((pack) => typeof pack === "string" ? { name: pack } : pack as PackRef)
+      : undefined,
   };
-
-  type ParseState =
-    | "root"
-    | "entity_kinds"
-    | "edge_relations"
-    | "note_kinds"
-    | "remotes"
-    | "remotes_entry"
-    | "packs"
-    | "packs_entry";
-
-  let state: ParseState = "root";
-  let currentEdge: Partial<EdgeRelationDef> | null = null;
-  let currentPack: Partial<PackRef> | null = null;
-  let currentRemote: Partial<RemoteDef> | null = null;
-
-  function flushEdge() {
-    if (currentEdge?.relation) {
-      schema.edge_relations.push(currentEdge as EdgeRelationDef);
-    }
-    currentEdge = null;
-  }
-
-  function flushPack() {
-    if (currentPack?.name) {
-      schema.packs ??= [];
-      schema.packs.push(currentPack as PackRef);
-    }
-    currentPack = null;
-  }
-
-  function flushRemote() {
-    if (currentRemote?.name) {
-      schema.remotes ??= [];
-      schema.remotes.push(currentRemote as RemoteDef);
-    }
-    currentRemote = null;
-  }
-
-  for (const rawLine of lines) {
-    const line = rawLine.trimEnd();
-    if (line.trim() === "" || line.trim().startsWith("#")) continue;
-
-    const indent = line.length - line.trimStart().length;
-    const trimmed = line.trim();
-
-    // Detect top-level section headers (indent 0, ends with ':')
-    if (indent === 0) {
-      flushEdge();
-      flushPack();
-      flushRemote();
-
-      // scalar: `key: value`
-      const scalarMatch = trimmed.match(/^(\w+):\s+(.+)$/);
-      if (scalarMatch) {
-        const key = scalarMatch[1];
-        const val = scalarMatch[2].replace(/^["']|["']$/g, "").trim();
-        if (key === "format_version") {
-          schema.format_version = val;
-        }
-        state = "root";
-        continue;
-      }
-
-      // section header: `key:`
-      const sectionMatch = trimmed.match(/^(\w+):$/);
-      if (sectionMatch) {
-        const key = sectionMatch[1];
-        switch (key) {
-          case "entity_kinds":
-            state = "entity_kinds";
-            break;
-          case "edge_relations":
-            state = "edge_relations";
-            break;
-          case "note_kinds":
-            schema.note_kinds ??= [];
-            state = "note_kinds";
-            break;
-          case "remotes":
-            schema.remotes ??= [];
-            state = "remotes";
-            break;
-          case "packs":
-            schema.packs ??= [];
-            state = "packs";
-            break;
-          default:
-            state = "root";
-        }
-        continue;
-      }
-    }
-
-    // ── entity_kinds / note_kinds ─────────────────────────────────────────
-    if (
-      (state === "entity_kinds" || state === "note_kinds") &&
-      indent === 2 &&
-      trimmed.startsWith("- ")
-    ) {
-      const val = trimmed.slice(2).trim();
-      if (state === "entity_kinds") {
-        schema.entity_kinds.push(val);
-      } else {
-        schema.note_kinds!.push(val);
-      }
-      continue;
-    }
-
-    // ── edge_relations ────────────────────────────────────────────────────
-    if (state === "edge_relations") {
-      if (indent === 2 && trimmed.startsWith("- relation:")) {
-        flushEdge();
-        currentEdge = {
-          relation: trimmed.replace(/^- relation:\s*/, "").replace(/^["']|["']$/g, "").trim(),
-        };
-        continue;
-      }
-      if (indent === 4 && currentEdge && trimmed.startsWith("description:")) {
-        currentEdge.description = trimmed
-          .replace(/^description:\s*/, "")
-          .replace(/^["']|["']$/g, "")
-          .trim();
-        continue;
-      }
-      // simple list form: `  - contains`
-      if (indent === 2 && trimmed.startsWith("- ") && !trimmed.includes(":")) {
-        flushEdge();
-        schema.edge_relations.push({ relation: trimmed.slice(2).trim() });
-        continue;
-      }
-    }
-
-    // ── remotes (ADR-048 §3: list of {name, repo, path, commit}) ─────────
-    if (state === "remotes") {
-      // New list entry: `  - name: lattice`
-      if (indent === 2 && trimmed.startsWith("- name:")) {
-        flushRemote();
-        currentRemote = {
-          name: trimmed.replace(/^- name:\s*/, "").replace(/^["']|["']$/g, "").trim(),
-          repo: "",
-          path: "",
-          commit: "",
-        };
-        state = "remotes_entry";
-        continue;
-      }
-    }
-    if (state === "remotes_entry") {
-      if (indent === 4) {
-        const kvMatch = trimmed.match(/^(\w+):\s+(.+)$/);
-        if (kvMatch && currentRemote) {
-          const key = kvMatch[1];
-          const val = kvMatch[2].replace(/^["']|["']$/g, "").trim();
-          if (key === "repo") currentRemote.repo = val;
-          if (key === "path") currentRemote.path = val;
-          if (key === "commit") currentRemote.commit = val;
-        }
-        continue;
-      }
-      // Next remote list entry
-      if (indent === 2 && trimmed.startsWith("- name:")) {
-        flushRemote();
-        currentRemote = {
-          name: trimmed.replace(/^- name:\s*/, "").replace(/^["']|["']$/g, "").trim(),
-          repo: "",
-          path: "",
-          commit: "",
-        };
-        continue;
-      }
-      if (indent === 0) {
-        flushRemote();
-        state = "root";
-      }
-    }
-
-    // ── packs ─────────────────────────────────────────────────────────────
-    if (state === "packs") {
-      if (indent === 2 && trimmed.startsWith("- name:")) {
-        flushPack();
-        currentPack = {
-          name: trimmed.replace(/^- name:\s*/, "").replace(/^["']|["']$/g, "").trim(),
-        };
-        continue;
-      }
-      if (indent === 2 && trimmed.startsWith("- ") && !trimmed.includes(":")) {
-        // simple list: `  - gtd`
-        flushPack();
-        schema.packs!.push({ name: trimmed.slice(2).trim() });
-        continue;
-      }
-      if (indent === 4 && currentPack) {
-        const kvMatch = trimmed.match(/^(\w+):\s+(.+)$/);
-        if (kvMatch) {
-          const key = kvMatch[1];
-          const val = kvMatch[2].replace(/^["']|["']$/g, "").trim();
-          if (key === "version") currentPack.version = val;
-        }
-        continue;
-      }
-    }
-  }
-
-  flushEdge();
-  flushPack();
-  flushRemote();
-
-  return schema;
 }
 
 // ─── Schema loading ───────────────────────────────────────────────────────────

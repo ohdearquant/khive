@@ -19,10 +19,29 @@ import { RulesFileErrors } from "../lib/rules.ts";
 
 /** Read a single line from stdin. Returns empty string on EOF. */
 async function readLine(): Promise<string> {
-  const buf = new Uint8Array(1024);
-  const n = await Deno.stdin.read(buf);
-  if (n === null) return "";
-  return new TextDecoder().decode(buf.subarray(0, n)).trim();
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const buf = new Uint8Array(4096);
+    const n = await Deno.stdin.read(buf);
+    if (n === null) break;
+
+    const chunk = buf.subarray(0, n);
+    const newline = chunk.indexOf(10);
+    if (newline !== -1) {
+      chunks.push(chunk.subarray(0, newline));
+      break;
+    }
+    chunks.push(chunk);
+  }
+
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return new TextDecoder().decode(merged).trim();
 }
 
 // ─── Staged-change check ──────────────────────────────────────────────────────
@@ -78,7 +97,11 @@ export async function runCommit(repoRoot: string, args: string[]): Promise<void>
     }
   }
 
-  // ── 2. Export step (Phase C1: validation pass on existing NDJSON) ─────────
+  // ── 2. Snapshot current counts before any export/validation operation ─────
+  const beforeEntityCount = await countLines(`${repoRoot}/${ENTITIES_FILE}`);
+  const beforeEdgeCount = await countLines(`${repoRoot}/${EDGES_FILE}`);
+
+  // ── 3. Export step (Phase C1: validation pass on existing NDJSON) ─────────
   // When `khive kg export` is available, this step will run:
   //   await runExport(repoRoot);
   // For now we validate the existing NDJSON files, which is the same
@@ -109,7 +132,7 @@ export async function runCommit(repoRoot: string, args: string[]): Promise<void>
     Deno.exit(1);
   }
 
-  // ── 2b. Embed step (ADR-057 §E3, Phase C1: plan only) ─────────────────────
+  // ── 3b. Embed step (ADR-057 §E3, Phase C1: plan only) ─────────────────────
   // When `embed.auto_embed = true` (the default), print an embed plan so
   // commits surface entities awaiting vectorization. Embedding execution is
   // Phase C2 — wired when `lattice-embed` is available.
@@ -121,21 +144,21 @@ export async function runCommit(repoRoot: string, args: string[]): Promise<void>
     }
   }
 
-  // ── 3. Stage KG files ─────────────────────────────────────────────────────
+  // ── 4. Stage KG files ─────────────────────────────────────────────────────
   await gitAdd([
     `${repoRoot}/${ENTITIES_FILE}`,
     `${repoRoot}/${EDGES_FILE}`,
     `${repoRoot}/${SCHEMA_FILE}`,
   ]);
 
-  // ── 4. Check for staged changes ───────────────────────────────────────────
+  // ── 5. Check for staged changes ───────────────────────────────────────────
   const hasChanges = await hasStagedKgChanges(repoRoot);
   if (!hasChanges) {
     console.log("Nothing to commit (KG is clean)");
     return;
   }
 
-  // ── 5. Git commit ─────────────────────────────────────────────────────────
+  // ── 6. Git commit ─────────────────────────────────────────────────────────
   let shortSha: string;
   try {
     shortSha = await gitCommit(message);
@@ -144,16 +167,18 @@ export async function runCommit(repoRoot: string, args: string[]): Promise<void>
     Deno.exit(1);
   }
 
-  // ── 6. Print summary ──────────────────────────────────────────────────────
+  // ── 7. Print summary ──────────────────────────────────────────────────────
   const branch = await getCurrentBranch();
   const entityCount = await countLines(`${repoRoot}/${ENTITIES_FILE}`);
   const edgeCount = await countLines(`${repoRoot}/${EDGES_FILE}`);
-
-  const entityChanged = validationResult.entityCount;
-  const edgeChanged = validationResult.edgeCount;
+  const entityChanged = entityCount - beforeEntityCount;
+  const edgeChanged = edgeCount - beforeEdgeCount;
+  const formatDelta = (delta: number): string => delta >= 0 ? `+${delta}` : `${delta}`;
 
   console.log(`[${branch} ${shortSha}] ${message}`);
   console.log(
-    `  ${entityCount} entities, ${edgeCount} edges (${entityChanged} validated, ${edgeChanged} edges validated)`,
+    `  ${entityCount} entities, ${edgeCount} edges (${formatDelta(entityChanged)} entities, ${
+      formatDelta(edgeChanged)
+    } edges)`,
   );
 }

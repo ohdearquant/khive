@@ -16,7 +16,8 @@ export const SETTINGS_FILE = ".khive/settings.json";
 export const STATE_DIR = ".khive/state";
 export const WORKING_DB = ".khive/state/working.db";
 
-export const GLOBAL_CONFIG_DIR = `${Deno.env.get("HOME") ?? "~"}/.khive`;
+const HOME_DIR = Deno.env.get("HOME") ?? Deno.env.get("USERPROFILE") ?? "/tmp";
+export const GLOBAL_CONFIG_DIR = `${HOME_DIR}/.khive`;
 export const GLOBAL_CONFIG_FILE = `${GLOBAL_CONFIG_DIR}/config.toml`;
 export const GLOBAL_AUTH_FILE = `${GLOBAL_CONFIG_DIR}/auth.json`;
 

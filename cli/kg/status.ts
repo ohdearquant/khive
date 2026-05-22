@@ -21,11 +21,16 @@ import { validate } from "./validate.ts";
 
 // ─── Git diff helpers ─────────────────────────────────────────────────────────
 
+interface ModifiedKgFiles {
+  paths: string[];
+  noCommits: boolean;
+}
+
 /**
  * Returns the names of .khive/kg/ files that differ from HEAD.
- * Returns an empty array if the repo has no commits yet.
+ * Marks repositories with no commits so status can report that explicitly.
  */
-async function getModifiedKgFiles(repoRoot: string): Promise<string[]> {
+async function getModifiedKgFiles(repoRoot: string): Promise<ModifiedKgFiles> {
   const result = await exec([
     "git",
     "diff",
@@ -35,13 +40,15 @@ async function getModifiedKgFiles(repoRoot: string): Promise<string[]> {
     `${repoRoot}/${KG_DIR}`,
   ]);
   if (result.code !== 0) {
-    // No commits yet — everything is untracked
-    return [];
+    return { paths: [], noCommits: true };
   }
-  return result.stdout
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+  return {
+    paths: result.stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0),
+    noCommits: false,
+  };
 }
 
 /**
@@ -87,6 +94,7 @@ interface KgStatus {
   edgeCount: number;
   edgeChangedCount: number;
   modifiedFiles: Array<{ path: string; description: string }>;
+  gitStatus: string | null;
   validationErrors: number;
   validationErrorMessages: string[];
 }
@@ -116,7 +124,8 @@ async function computeStatus(
   const edgeCount = await countLines(`${repoRoot}/${EDGES_FILE}`);
 
   // ── Modified files + change counts ───────────────────────────────────────
-  const modifiedPaths = await getModifiedKgFiles(repoRoot);
+  const modified = await getModifiedKgFiles(repoRoot);
+  const modifiedPaths = modified.paths;
   const modifiedFiles: Array<{ path: string; description: string }> = [];
   let entityChangedCount = 0;
   let edgeChangedCount = 0;
@@ -162,6 +171,7 @@ async function computeStatus(
     edgeCount,
     edgeChangedCount,
     modifiedFiles,
+    gitStatus: modified.noCommits ? "no commits yet" : null,
     validationErrors: validationResult.errors.length,
     validationErrorMessages: validationResult.errors
       .slice(0, 5)
@@ -199,6 +209,11 @@ function formatStatus(s: KgStatus): string {
     ? " (modified since last commit)"
     : "";
   lines.push(`  Edges: ${s.edgeCount}${edgeDiff}`);
+
+  if (s.gitStatus) {
+    lines.push("");
+    lines.push(`  Git: ${s.gitStatus}`);
+  }
 
   // Modified files
   if (s.modifiedFiles.length > 0) {

@@ -92,14 +92,19 @@ export async function runEmbed(
     return;
   }
 
-  printEmbedPlan(plan);
+  if (plan.pending.length === 0) {
+    console.log(
+      `Embeddings are up-to-date, nothing to do. ` +
+        `(${plan.total} entities scanned, model=${plan.model})`,
+    );
+    return;
+  }
+
+  printEmbedPlan(plan, false, "Embed dry-run plan");
 
   // Phase C1: dry-run only. Phase C2 will call embedEntities(plan, config.embed).
   if (!opts.dryRun && plan.pending.length > 0) {
     console.log("");
-    console.log(
-      "Note: Phase C1 — embedding runtime not wired. " +
-        "Re-run with `--dry-run` to silence this notice, or wait for Phase C2.",
-    );
+    console.log("Dry-run only: embedding runtime is not wired in Phase C1.");
   }
 }

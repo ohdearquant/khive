@@ -523,11 +523,28 @@ export async function runValidate(
     ));
   } else if (opts.format === "github") {
     // Emit GitHub Actions annotations (https://docs.github.com/actions).
+    // Percent-encode special characters per the workflow command spec.
+    function escapeAnnotationData(value: unknown): string {
+      return String(value)
+        .replace(/%/g, "%25")
+        .replace(/\r/g, "%0D")
+        .replace(/\n/g, "%0A")
+        .replace(/:/g, "%3A");
+    }
+    function escapeAnnotationProperty(value: unknown): string {
+      return escapeAnnotationData(value).replace(/,/g, "%2C");
+    }
     for (const e of result.errors) {
-      console.log(`::error file=${e.file},line=${e.line}::${e.message}`);
+      console.log(
+        `::error file=${escapeAnnotationProperty(e.file)},line=${e.line}::` +
+          escapeAnnotationData(e.message),
+      );
     }
     for (const w of result.warnings) {
-      console.log(`::warning file=${w.file},line=${w.line}::${w.message}`);
+      console.log(
+        `::warning file=${escapeAnnotationProperty(w.file)},line=${w.line}::` +
+          escapeAnnotationData(w.message),
+      );
     }
     for (const v of result.ruleViolations) {
       const cmd = v.severity === "error"
@@ -537,7 +554,10 @@ export async function runValidate(
         : "notice";
       const file = v.file ?? ".khive/kg/";
       const line = v.line ?? 0;
-      console.log(`::${cmd} file=${file},line=${line},title=${v.rule}::${v.message}`);
+      console.log(
+        `::${cmd} file=${escapeAnnotationProperty(file)},line=${line},` +
+          `title=${escapeAnnotationProperty(v.rule)}::${escapeAnnotationData(v.message)}`,
+      );
     }
   } else {
     // text

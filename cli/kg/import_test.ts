@@ -812,12 +812,14 @@ async function runCrashHarness(
   archivePath: string,
   crashAfter: string,
 ): Promise<number> {
+  const configPath = new URL("../deno.json", import.meta.url).pathname;
   const cmd = new Deno.Command(Deno.execPath(), {
-    args: ["run", "--allow-all", harnessScript],
+    args: ["run", "--allow-all", "--config", configPath, harnessScript],
     env: {
       KHIVE_TEST_REPO_ROOT: repoRoot,
       KHIVE_TEST_ARCHIVE_PATH: archivePath,
       KHIVE_TEST_CRASH_AFTER: crashAfter,
+      KHIVE_DEV: "1",
       // Propagate HOME so Deno can resolve stdlib cache.
       HOME: Deno.env.get("HOME") ?? "",
       DENO_DIR: Deno.env.get("DENO_DIR") ?? "",
@@ -1118,6 +1120,193 @@ Deno.test("crash-recovery: recoverImportJournal is idempotent (no journal = null
     // Calling again is also safe.
     const result2 = await recoverImportJournal(dir);
     assertEquals(result2, null);
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+// ─── --on-conflict tests ──────────────────────────────────────────────────────
+
+/** Write an archive with specific entities and edges. */
+async function writeConflictArchive(
+  dir: string,
+  entities: unknown[],
+  edges: unknown[],
+  filename = "archive.json",
+): Promise<string> {
+  const path = join(dir, filename);
+  await Deno.writeTextFile(
+    path,
+    JSON.stringify({ format: "khive-kg", version: "0.1", entities, edges }),
+  );
+  return path;
+}
+
+const CONFLICT_ENTITY_A = {
+  id: "aaaaaaaa-bbbb-cccc-dddd-000000000001",
+  kind: "concept",
+  name: "Original A",
+  properties: { x: 1 },
+  tags: ["alpha"],
+};
+
+const CONFLICT_ENTITY_A_UPDATED = {
+  id: "aaaaaaaa-bbbb-cccc-dddd-000000000001", // same id
+  kind: "concept",
+  name: "Updated A",
+  properties: { y: 2 },
+  tags: ["beta"],
+};
+
+const CONFLICT_ENTITY_NEW = {
+  id: "aaaaaaaa-bbbb-cccc-dddd-000000000002",
+  kind: "project",
+  name: "New Entity",
+  properties: {},
+  tags: [],
+};
+
+Deno.test("on-conflict: no existing files acts like normal import", async () => {
+  const dir = await makeTempDir();
+  try {
+    const archivePath = await writeConflictArchive(dir, [CONFLICT_ENTITY_A], []);
+    // With --on-conflict skip and no existing files, should succeed
+    await importArchive(dir, archivePath, { onConflict: "skip" });
+    const lines = await readEntitiesLines(dir);
+    assertEquals(lines.length, 1);
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("on-conflict skip: existing record is kept, new records are added", async () => {
+  const dir = await makeTempDir();
+  try {
+    // First import: establish base
+    const archivePath1 = await writeConflictArchive(dir, [CONFLICT_ENTITY_A], []);
+    await importArchive(dir, archivePath1);
+
+    // Second import: conflicting entity + new entity, policy = skip
+    const archivePath2 = await writeConflictArchive(
+      dir,
+      [CONFLICT_ENTITY_A_UPDATED, CONFLICT_ENTITY_NEW],
+      [],
+    );
+    await importArchive(dir, archivePath2, { onConflict: "skip" });
+
+    const lines = await readEntitiesLines(dir);
+    assertEquals(lines.length, 2); // original A + new entity
+
+    // Original A should be preserved (name not updated)
+    const entities = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const entityA = entities.find((e) => e["id"] === CONFLICT_ENTITY_A.id);
+    assertEquals(entityA?.["name"], "Original A");
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("on-conflict replace: incoming record replaces existing", async () => {
+  const dir = await makeTempDir();
+  try {
+    const archivePath1 = await writeConflictArchive(dir, [CONFLICT_ENTITY_A], []);
+    await importArchive(dir, archivePath1);
+
+    const archivePath2 = await writeConflictArchive(
+      dir,
+      [CONFLICT_ENTITY_A_UPDATED, CONFLICT_ENTITY_NEW],
+      [],
+    );
+    await importArchive(dir, archivePath2, { onConflict: "replace" });
+
+    const lines = await readEntitiesLines(dir);
+    assertEquals(lines.length, 2);
+
+    const entities = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const entityA = entities.find((e) => e["id"] === CONFLICT_ENTITY_A.id);
+    assertEquals(entityA?.["name"], "Updated A"); // incoming wins
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("on-conflict merge: properties deep-merged, tags unioned", async () => {
+  const dir = await makeTempDir();
+  try {
+    const archivePath1 = await writeConflictArchive(dir, [CONFLICT_ENTITY_A], []);
+    await importArchive(dir, archivePath1);
+
+    const archivePath2 = await writeConflictArchive(
+      dir,
+      [CONFLICT_ENTITY_A_UPDATED],
+      [],
+    );
+    await importArchive(dir, archivePath2, { onConflict: "merge" });
+
+    const lines = await readEntitiesLines(dir);
+    assertEquals(lines.length, 1);
+
+    const entity = JSON.parse(lines[0]) as Record<string, unknown>;
+    // Properties should be deep-merged: x from original, y from incoming
+    const props = entity["properties"] as Record<string, unknown>;
+    assertEquals(props["x"], 1);
+    assertEquals(props["y"], 2);
+    // Tags should be unioned and sorted
+    const tags = entity["tags"] as string[];
+    assertEquals(tags.includes("alpha"), true);
+    assertEquals(tags.includes("beta"), true);
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("on-conflict: bypasses file-level overwrite check", async () => {
+  const dir = await makeTempDir();
+  try {
+    const archivePath1 = await writeConflictArchive(dir, [CONFLICT_ENTITY_A], []);
+    await importArchive(dir, archivePath1);
+
+    // Without onConflict and without overwrite, should throw
+    const archivePath2 = await writeConflictArchive(
+      dir,
+      [CONFLICT_ENTITY_NEW],
+      [],
+      "archive2.json",
+    );
+    await assertRejects(
+      () => importArchive(dir, archivePath2),
+      Error,
+      "already exists",
+    );
+
+    // With onConflict, should succeed without --overwrite
+    await importArchive(dir, archivePath2, { onConflict: "skip" });
+  } finally {
+    await removeDir(dir);
+  }
+});
+
+Deno.test("runImport: --on-conflict skip is parsed and applied", async () => {
+  const dir = await makeTempDir();
+  try {
+    // Establish existing file
+    const archivePath1 = await writeConflictArchive(dir, [CONFLICT_ENTITY_A], []);
+    await importArchive(dir, archivePath1);
+
+    // Run via CLI with --on-conflict skip
+    const archivePath2 = await writeConflictArchive(
+      dir,
+      [CONFLICT_ENTITY_A_UPDATED, CONFLICT_ENTITY_NEW],
+      [],
+      "archive2.json",
+    );
+    await runImport(dir, ["--on-conflict", "skip", archivePath2]);
+
+    const lines = await readEntitiesLines(dir);
+    assertEquals(lines.length, 2);
+    const entities = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const entityA = entities.find((e) => e["id"] === CONFLICT_ENTITY_A.id);
+    assertEquals(entityA?.["name"], "Original A"); // original preserved
   } finally {
     await removeDir(dir);
   }
