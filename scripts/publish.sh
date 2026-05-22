@@ -54,8 +54,8 @@ CRATES=(
     khive-request
     khive-pack-kg
     khive-pack-gtd
-    khive-pack-memory
     khive-pack-brain
+    khive-pack-memory
     khive-vcs
     # khive-merge — forward-deployed (ADR-043), not yet compilable against
     # restructured khive-vcs. Skipped until ADR-043 integration lands.
