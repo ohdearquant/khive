@@ -540,13 +540,9 @@ impl VerbRegistry {
 
                 // Post-dispatch hook: fires on success, opt-in (Issue #158).
                 if let (Ok(_), Some(hook)) = (&result, &self.dispatch_hook) {
-                    let dispatch_event = Event::new(
-                        ns_str.as_str(),
-                        verb,
-                        SubstrateKind::Event,
-                        pack.name(),
-                    )
-                    .with_outcome(EventOutcome::Success);
+                    let dispatch_event =
+                        Event::new(ns_str.as_str(), verb, SubstrateKind::Event, pack.name())
+                            .with_outcome(EventOutcome::Success);
                     let hook = Arc::clone(hook);
                     hook.on_dispatch(&dispatch_event).await;
                 }
@@ -2584,12 +2580,9 @@ mod hook_tests {
         builder.with_dispatch_hook(ns_hook.clone());
         let reg = builder.build().expect("registry builds");
 
-        reg.dispatch(
-            "ping",
-            serde_json::json!({"namespace": "tenant-abc"}),
-        )
-        .await
-        .unwrap();
+        reg.dispatch("ping", serde_json::json!({"namespace": "tenant-abc"}))
+            .await
+            .unwrap();
 
         assert_eq!(
             ns_hook.ns.lock().unwrap().as_str(),

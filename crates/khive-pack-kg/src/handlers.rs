@@ -729,7 +729,12 @@ impl KgPack {
                 let offset = p.offset.unwrap_or(0);
                 let entities = self
                     .runtime
-                    .list_entities(p.namespace.as_deref(), kind_filter.as_deref(), limit, offset)
+                    .list_entities(
+                        p.namespace.as_deref(),
+                        kind_filter.as_deref(),
+                        limit,
+                        offset,
+                    )
                     .await?;
                 to_json(&entities)
             }
@@ -777,7 +782,12 @@ impl KgPack {
                 let offset = p.offset.unwrap_or(0);
                 let notes = self
                     .runtime
-                    .list_notes(p.namespace.as_deref(), kind_filter.as_deref(), limit, offset)
+                    .list_notes(
+                        p.namespace.as_deref(),
+                        kind_filter.as_deref(),
+                        limit,
+                        offset,
+                    )
                     .await?;
                 to_json(&notes)
             }

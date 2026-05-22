@@ -1397,7 +1397,10 @@ mod tests {
 
         // id3 must not match; id1 and id2 should.
         assert!(hits.len() >= 1, "at least one doc must match");
-        assert!(hits.iter().all(|h| h.subject_id != id3), "id3 must not appear");
+        assert!(
+            hits.iter().all(|h| h.subject_id != id3),
+            "id3 must not appear"
+        );
 
         // All scores must be in (0, 1].
         for h in &hits {
