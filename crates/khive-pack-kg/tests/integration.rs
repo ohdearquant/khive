@@ -684,6 +684,124 @@ async fn link_two_entities_visible_via_neighbors() {
     );
 }
 
+/// Regression for #160: search response includes `entity_kind` so agents can
+/// distinguish hit kinds without an extra `get()` call.
+#[tokio::test]
+async fn search_entity_response_includes_entity_kind() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "AlphaSearch", "entity_kind": "concept"}),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch("search", json!({"kind": "entity", "query": "AlphaSearch"}))
+        .await
+        .expect("search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "search must return the entity we just created"
+    );
+    let hit = &arr[0];
+    assert_eq!(
+        hit.get("entity_kind").and_then(Value::as_str),
+        Some("concept"),
+        "#160: search response must carry entity_kind; got hit {hit}"
+    );
+}
+
+/// Regression for #160 (note half): note search response includes `note_kind`.
+#[tokio::test]
+async fn search_note_response_includes_note_kind() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "content": "BetaInsight unique_marker_4761",
+            "note_kind": "insight"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({"kind": "note", "query": "unique_marker_4761"}),
+        )
+        .await
+        .expect("note search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "note search must return the note we just created"
+    );
+    let hit = &arr[0];
+    assert_eq!(
+        hit.get("note_kind").and_then(Value::as_str),
+        Some("insight"),
+        "#160 (note half): search response must carry note_kind; got hit {hit}"
+    );
+}
+
+/// Regression for #163: `search` accepts a `properties` filter that restricts
+/// results to entities whose properties contain the given key=value pairs.
+#[tokio::test]
+async fn search_properties_filter_restricts_results() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "name": "EntInference",
+            "entity_kind": "concept",
+            "properties": {"domain": "inference"}
+        }),
+    )
+    .await
+    .unwrap();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "name": "EntTraining",
+            "entity_kind": "concept",
+            "properties": {"domain": "training"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Search with properties filter — only the inference entity must come back.
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "entity",
+                "query": "Ent",
+                "properties": {"domain": "inference"}
+            }),
+        )
+        .await
+        .expect("filtered search must succeed");
+    let arr = resp.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "#163: properties filter must return matching entities; got empty result"
+    );
+    for hit in arr {
+        let name = hit.get("title").and_then(Value::as_str).unwrap_or("");
+        assert!(
+            name.contains("Inference") || name == "EntInference",
+            "#163: properties filter must EXCLUDE entities with domain=training; got hit {hit}"
+        );
+    }
+}
+
 /// Regression for #148: `neighbors` accepts `id` (canonical) AND `node_id` (legacy alias).
 /// Both inputs must work and the response must use `id`.
 #[tokio::test]
