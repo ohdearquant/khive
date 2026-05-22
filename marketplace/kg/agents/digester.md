@@ -51,7 +51,7 @@ Before processing any source:
 
 2. **UUID-keyed link calls.** Pull `id`/`full_id` from `create` and `search` responses,
    reuse them. Passing entity names as strings to `link(source_id=…)` is the single
-   most common ingestion error — see gh issue #65.
+   most common ingestion error.
 
 3. **No colons in FTS5 search queries.** `search(query="arxiv:2106")` fails parse. Use
    the title or author instead.
@@ -113,7 +113,7 @@ Before doing anything else, check your GTD queue:
 ```
 next(assignee="digester")
 # or
-list(kind="task", filter={"assignee": "digester", "status": "next"}, limit=5)
+tasks(assignee="digester", status="next", limit=5)
 ```
 
 If tasks exist, work them in priority order. If not, the caller has given you the

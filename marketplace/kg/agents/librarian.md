@@ -44,10 +44,10 @@ escalation, or a scheduled sweep.
 Run these in parallel:
 
 ```
-[list(kind="task", filter={"assignee": "digester", "status": "next"}, limit=20),
- list(kind="task", filter={"assignee": "polisher", "status": "next"}, limit=20),
- list(kind="task", filter={"assignee": "gap-analyst", "status": "next"}, limit=20),
- list(kind="task", filter={"assignee": "expander", "status": "next"}, limit=20)]
+[tasks(assignee="digester", status="next", limit=20),
+ tasks(assignee="polisher", status="next", limit=20),
+ tasks(assignee="gap-analyst", status="next", limit=20),
+ tasks(assignee="expander", status="next", limit=20)]
 ```
 
 For each agent's queue:

@@ -1,7 +1,7 @@
 {
-  "name": "kg",
-  "description": "Persistent knowledge graph for AI agents — typed entities, closed edge ontology, hybrid search, GQL queries.",
-  "version": "0.1.1",
+  "name": "memory",
+  "description": "Persistent agent memory for khive — remember durable context and recall it with decay-aware ranking.",
+  "version": "0.1.0",
   "author": {
     "name": "Ocean (HaiyangLi)",
     "url": "https://github.com/ohdearquant"
@@ -10,15 +10,15 @@
   "repository": "https://github.com/ohdearquant/khive",
   "license": "Apache-2.0",
   "mcpServers": {
-    "kg": {
+    "memory": {
       "type": "stdio",
       "command": "khive-mcp",
       "args": [],
       "env": {
-        "KHIVE_PACKS": "kg,gtd"
+        "KHIVE_PACKS": "memory"
       },
       "installHint": "cargo install khive-mcp"
     }
   },
-  "keywords": ["knowledge-graph", "research", "entities", "mcp", "knowledge-management"]
+  "keywords": ["memory", "recall", "agents", "mcp", "knowledge-management"]
 }
