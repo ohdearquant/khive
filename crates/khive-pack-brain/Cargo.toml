@@ -24,3 +24,4 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+khive-pack-kg = { version = "0.1.4", path = "../khive-pack-kg" }
