@@ -40,10 +40,16 @@ When a hit matters, carry forward its `note_id` in your notes or response so it 
 
 ### 4. Adjust thresholds only after the first pass
 
-If the first query returns too much noise, raise the threshold:
+Recall scores are decay-aware hybrid scores (combining vector similarity, FTS rank, salience, and temporal decay), not raw cosine similarity. Typical scores range from 0.01 to 0.10 — a `min_score` of 0.4 would filter out everything. Start without `min_score` and inspect the returned scores before setting a threshold:
 
 ```
-request(ops="recall(query=\"memory pack source_id annotates\", min_score=0.4, limit=5)")
+request(ops="recall(query=\"memory pack source_id annotates\", limit=5)")
+```
+
+If the results include low-quality hits, set `min_score` just below the score of the last useful result:
+
+```
+request(ops="recall(query=\"memory pack source_id annotates\", min_score=0.02, limit=5)")
 ```
 
 If important memories may be low-salience, keep `min_score` unset and refine the query instead.

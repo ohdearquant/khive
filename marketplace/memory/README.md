@@ -25,14 +25,42 @@ Memory types:
 - **remember** - store durable context intentionally, with the right memory type and importance.
 - **recall** - retrieve prior context before acting, planning, or answering from memory.
 
+## Prerequisites
+
+This plugin provides skills only — it does **not** bundle an MCP server.
+You must install the `khive-mcp` binary and register it as an MCP server in your
+harness **before** using any of the skills below.
+
+```bash
+# Install the binary
+cargo install khive-mcp
+
+# Register in your harness (Claude Code example)
+claude mcp add --transport stdio khive -- khive-mcp --pack memory
+```
+
+Or add to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "khive": {
+      "command": "khive-mcp",
+      "args": ["--pack", "memory"]
+    }
+  }
+}
+```
+
+The runtime resolves the memory pack's `kg` dependency, so memory notes are stored
+in the same substrate as the knowledge graph.
+
 ## Install
 
 ```bash
 /plugin marketplace add ohdearquant/khive
 /plugin install memory
 ```
-
-The plugin's MCP server starts with `KHIVE_PACKS=memory`. The runtime resolves the memory pack's `kg` dependency, so memory notes are stored in the same substrate as the knowledge graph.
 
 ## License
 

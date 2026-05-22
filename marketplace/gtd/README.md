@@ -24,15 +24,42 @@ Statuses accept canonical names _or_ aliases: `in_progress → active`, `todo �
 - **today** — review actionable work and pick what to do now.
 - **review** — weekly sweep: triage inbox, defer / cancel stale items.
 
+## Prerequisites
+
+This plugin provides skills only — it does **not** bundle an MCP server.
+You must install the `khive-mcp` binary and register it as an MCP server in your
+harness **before** using any of the skills below.
+
+```bash
+# Install the binary
+cargo install khive-mcp
+
+# Register in your harness (Claude Code example)
+claude mcp add --transport stdio khive -- khive-mcp --pack gtd
+```
+
+Or add to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "khive": {
+      "command": "khive-mcp",
+      "args": ["--pack", "gtd"]
+    }
+  }
+}
+```
+
+Install the `kg` pack alongside if you want knowledge graph verbs in the same session:
+`"args": ["--pack", "kg", "--pack", "gtd"]`
+
 ## Install
 
-```
+```bash
 /plugin marketplace add ohdearquant/khive
 /plugin install gtd
 ```
-
-The plugin's MCP server starts with `KHIVE_PACKS=gtd`, so only GTD verbs are advertised. Install the
-`kg` plugin alongside if you want the knowledge graph verbs in the same agent session.
 
 ## License
 
