@@ -604,6 +604,8 @@ impl GraphStore for SqlGraphStore {
                     edge_id: parse_uuid(&eid_str)?,
                     relation,
                     weight,
+                    name: None,
+                    kind: None,
                 });
             }
 
@@ -724,6 +726,8 @@ impl GraphStore for SqlGraphStore {
                         node_id: *root_id,
                         via_edge: None,
                         depth: 0,
+                        name: None,
+                        kind: None,
                     });
                 }
 
@@ -735,6 +739,8 @@ impl GraphStore for SqlGraphStore {
                         node_id,
                         via_edge,
                         depth: depth as usize,
+                        name: None,
+                        kind: None,
                     });
                     if total_weight > max_weight {
                         max_weight = total_weight;

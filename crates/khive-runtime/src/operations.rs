@@ -475,7 +475,9 @@ impl KhiveRuntime {
         node_id: Uuid,
         query: NeighborQuery,
     ) -> RuntimeResult<Vec<NeighborHit>> {
-        Ok(self.graph(namespace)?.neighbors(node_id, query).await?)
+        let mut hits = self.graph(namespace)?.neighbors(node_id, query).await?;
+        self.enrich_neighbor_hits(namespace, &mut hits).await;
+        Ok(hits)
     }
 
     /// Traverse the graph from a set of root nodes.
@@ -484,7 +486,52 @@ impl KhiveRuntime {
         namespace: Option<&str>,
         request: TraversalRequest,
     ) -> RuntimeResult<Vec<GraphPath>> {
-        Ok(self.graph(namespace)?.traverse(request).await?)
+        let mut paths = self.graph(namespace)?.traverse(request).await?;
+        self.enrich_path_nodes(namespace, &mut paths).await;
+        Ok(paths)
+    }
+
+    /// Populate `name` and `kind` on each `NeighborHit` from the corresponding
+    /// entity record (#162). Best-effort — IDs that don't resolve to an entity
+    /// (e.g. note-to-note `annotates` edges) leave the fields `None`.
+    ///
+    /// Done as a single batched entity fetch instead of an SQL JOIN at the
+    /// graph store, so test databases that wire up a graph store without an
+    /// entities table still work. Cost: one query per neighbors() call.
+    async fn enrich_neighbor_hits(&self, namespace: Option<&str>, hits: &mut [NeighborHit]) {
+        if hits.is_empty() {
+            return;
+        }
+        let store = match self.entities(namespace) {
+            Ok(s) => s,
+            Err(_) => return, // no entity store configured; leave name/kind as None
+        };
+        for hit in hits.iter_mut() {
+            if let Ok(Some(entity)) = store.get_entity(hit.node_id).await {
+                hit.name = Some(entity.name);
+                hit.kind = Some(entity.kind);
+            }
+        }
+    }
+
+    /// Populate `name` and `kind` on each `PathNode` from the corresponding
+    /// entity record (#162). Same best-effort policy as `enrich_neighbor_hits`.
+    async fn enrich_path_nodes(&self, namespace: Option<&str>, paths: &mut [GraphPath]) {
+        if paths.is_empty() {
+            return;
+        }
+        let store = match self.entities(namespace) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for path in paths.iter_mut() {
+            for node in path.nodes.iter_mut() {
+                if let Ok(Some(entity)) = store.get_entity(node.node_id).await {
+                    node.name = Some(entity.name);
+                    node.kind = Some(entity.kind);
+                }
+            }
+        }
     }
 
     // ---- Note operations ----

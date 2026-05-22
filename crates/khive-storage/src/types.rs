@@ -360,12 +360,26 @@ pub struct NeighborQuery {
     pub min_weight: Option<f64>,
 }
 
+/// One neighbor returned by a graph query.
+///
+/// Field naming (#148): on the JSON wire, the node identifier is serialized as
+/// `id` (not `node_id`) so it matches the verb-wide identifier convention.
+/// Internal Rust code still uses `.node_id` on the struct.
+///
+/// Enrichment (#162): `name` and `kind` are populated by the runtime layer
+/// after the storage call returns. Storage `GraphStore` impls leave them
+/// `None`; the runtime batch-fetches the entity rows and fills them in.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NeighborHit {
+    #[serde(rename = "id")]
     pub node_id: Uuid,
     pub edge_id: Uuid,
     pub relation: EdgeRelation,
     pub weight: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -398,11 +412,20 @@ pub struct TraversalRequest {
     pub include_roots: bool,
 }
 
+/// One node along a traversal path.
+///
+/// Field naming (#148): JSON wire serialization is `id`. Enrichment (#162):
+/// `name`/`kind` are filled by the runtime layer after the storage call.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PathNode {
+    #[serde(rename = "id")]
     pub node_id: Uuid,
     pub via_edge: Option<Uuid>,
     pub depth: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

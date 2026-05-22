@@ -322,7 +322,8 @@ def main():
             "max_depth": 2,
             "include_roots": False,
         })
-        all_node_ids = [n["node_id"] for p in paths for n in p.get("nodes", [])]
+        # #148: traverse response uses canonical "id" (not "node_id")
+        all_node_ids = [n["id"] for p in paths for n in p.get("nodes", [])]
         assert b["id"] in all_node_ids, "B must be reachable"
         assert c["id"] in all_node_ids, "C must be reachable at depth 2"
         print(f"  [ok] traverse — depth-2 multi-hop")

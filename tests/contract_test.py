@@ -815,7 +815,8 @@ def test_annotates_source_must_be_note(proc: subprocess.Popen) -> None:
         "direction": "in",
         "relations": ["annotates"],
     })
-    neighbor_ids = [n.get("node_id", n.get("id", "")) for n in nbrs]
+    # #148: response uses canonical "id"; "node_id" accepted as alias on input only.
+    neighbor_ids = [n.get("id", "") for n in nbrs]
     assert note["id"] in neighbor_ids, (
         f"Note should appear as annotates neighbor of concept; neighbors: {neighbor_ids}"
     )

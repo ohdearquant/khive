@@ -556,14 +556,124 @@ async fn link_two_entities_visible_via_neighbors() {
         !items.is_empty(),
         "source must have at least one outbound neighbor after linking"
     );
-    // NeighborHit serializes as {node_id, edge_id, relation, weight}
+    // #148: NeighborHit serializes as {id, edge_id, relation, weight, name?, kind?}
     let node_ids: Vec<&str> = items
         .iter()
-        .filter_map(|v| v.get("node_id").and_then(Value::as_str))
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
         .collect();
     assert!(
-        node_ids.iter().any(|&id| id == tgt_id || tgt_id.starts_with(id) || id.starts_with(&tgt_id[..8])),
-        "neighbors must include the linked target node; node_ids: {node_ids:?}, expected tgt: {tgt_id}"
+        node_ids
+            .iter()
+            .any(|&id| id == tgt_id || tgt_id.starts_with(id) || id.starts_with(&tgt_id[..8])),
+        "neighbors must include the linked target node; ids: {node_ids:?}, expected tgt: {tgt_id}"
+    );
+}
+
+/// Regression for #148: `neighbors` accepts `id` (canonical) AND `node_id` (legacy alias).
+/// Both inputs must work and the response must use `id`.
+#[tokio::test]
+async fn neighbors_accepts_id_alias_and_responds_with_id() {
+    let pack = pack();
+    let src = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Src", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let tgt = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Tgt", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let src_id = src["id"].as_str().unwrap();
+    let tgt_id = tgt["id"].as_str().unwrap();
+    pack.dispatch(
+        "link",
+        json!({"source_id": src_id, "target_id": tgt_id, "relation": "contains", "weight": 1.0}),
+    )
+    .await
+    .unwrap();
+
+    // Canonical `id` argument works.
+    let via_id = pack
+        .dispatch("neighbors", json!({"id": src_id, "direction": "out"}))
+        .await
+        .expect("neighbors with id arg must succeed (canonical)");
+    // Legacy `node_id` alias also works.
+    let via_legacy = pack
+        .dispatch("neighbors", json!({"node_id": src_id, "direction": "out"}))
+        .await
+        .expect("neighbors with node_id arg must succeed (alias)");
+
+    for resp in [&via_id, &via_legacy] {
+        let arr = resp.as_array().expect("neighbors returns array");
+        assert!(!arr.is_empty(), "expected at least one neighbor");
+        let hit = &arr[0];
+        // Response uses `id`, NOT `node_id`.
+        assert!(
+            hit.get("id").is_some(),
+            "neighbor hit must serialize as `id` (#148); got keys {:?}",
+            hit.as_object().map(|m| m.keys().collect::<Vec<_>>())
+        );
+        assert!(
+            hit.get("node_id").is_none(),
+            "neighbor hit must NOT also serialize as `node_id` (#148 wire normalization); got keys {:?}",
+            hit.as_object().map(|m| m.keys().collect::<Vec<_>>())
+        );
+    }
+}
+
+/// Regression for #162: neighbor hits include enriched `name` and `kind`
+/// from the corresponding entity record.
+#[tokio::test]
+async fn neighbors_enriches_with_name_and_kind() {
+    let pack = pack();
+    let src = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "FlashAttention", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let tgt = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "GQA", "entity_kind": "project"}),
+        )
+        .await
+        .unwrap();
+    let src_id = src["id"].as_str().unwrap();
+    let tgt_id = tgt["id"].as_str().unwrap();
+    pack.dispatch(
+        "link",
+        json!({"source_id": src_id, "target_id": tgt_id, "relation": "extends", "weight": 1.0}),
+    )
+    .await
+    .unwrap();
+
+    let resp = pack
+        .dispatch("neighbors", json!({"id": src_id, "direction": "out"}))
+        .await
+        .expect("neighbors must succeed");
+    let arr = resp.as_array().expect("array");
+    let hit = arr
+        .iter()
+        .find(|h| h.get("id").and_then(Value::as_str) == Some(tgt_id))
+        .expect("must find tgt in neighbors");
+
+    // #162: enrichment must populate name + kind from the target entity.
+    assert_eq!(
+        hit.get("name").and_then(Value::as_str),
+        Some("GQA"),
+        "neighbor hit must carry entity name (#162); hit={hit}"
+    );
+    assert_eq!(
+        hit.get("kind").and_then(Value::as_str),
+        Some("project"),
+        "neighbor hit must carry entity kind (#162); hit={hit}"
     );
 }
 
