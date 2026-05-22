@@ -1,0 +1,203 @@
+//! Document indexing operations for BM25 index.
+
+use std::collections::BTreeMap;
+
+use super::{Bm25Index, DocumentId};
+use crate::error::{Result, RetrievalError};
+use crate::metrics::{self, MetricEvent, MetricValue};
+
+impl Bm25Index {
+    /// Index a document.
+    ///
+    /// Tokenizes the text and adds it to the inverted index.
+    /// If the document already exists, it will be re-indexed (old version removed first,
+    /// budget check bypassed for re-indexing).
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_id` - Unique document identifier (accepts `String`, `&str`, or
+    ///   [`DocumentId`] directly via [`Into<DocumentId>`]).
+    /// * `text` - Document text to index
+    ///
+    /// # Errors
+    ///
+    /// Returns `RetrievalError::BudgetExceeded` if a memory budget is configured
+    /// and the new document would cause the index to exceed it. Re-indexing an
+    /// existing document bypasses the budget check.
+    ///
+    /// Emits `bm25.index_document.duration_ms`, `bm25.index_document.count`,
+    /// and `bm25.index.size` metrics when a sink is attached.
+    pub fn index_document(&mut self, doc_id: impl Into<DocumentId>, text: &str) -> Result<()> {
+        let start = std::time::Instant::now();
+
+        let result = self.index_document_inner(doc_id, text);
+
+        // Emit metrics
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        metrics::emit(
+            &self.metrics,
+            MetricEvent {
+                name: metrics::names::BM25_INDEX_DURATION_MS,
+                value: MetricValue::Histogram(elapsed),
+                labels: vec![],
+            },
+        );
+        metrics::emit(
+            &self.metrics,
+            MetricEvent {
+                name: metrics::names::BM25_INDEX_COUNT,
+                value: MetricValue::Counter(1),
+                labels: vec![],
+            },
+        );
+        metrics::emit(
+            &self.metrics,
+            MetricEvent {
+                name: metrics::names::BM25_INDEX_SIZE,
+                value: MetricValue::Gauge(self.doc_count() as f64),
+                labels: vec![],
+            },
+        );
+
+        result
+    }
+
+    /// Inner `index_document` logic (uninstrumented).
+    fn index_document_inner(&mut self, doc_id: impl Into<DocumentId>, text: &str) -> Result<()> {
+        let doc_id: DocumentId = doc_id.into();
+        // Check if this is a re-index (bypass budget for existing docs)
+        let is_reindex = self.contains_document(&doc_id);
+
+        // Remove existing document if present
+        if is_reindex {
+            self.remove_document(&doc_id);
+        }
+
+        // Tokenize using instance tokenizer
+        let tokens = self.tokenizer.tokenize(text);
+        let doc_length = tokens.len();
+
+        if doc_length == 0 {
+            // Don't index empty documents
+            return Ok(());
+        }
+
+        // Budget check for new documents only (re-index bypasses)
+        if !is_reindex {
+            if let Some(limit) = self.config.memory_budget {
+                let current = self.memory_usage();
+                let cost = self.estimate_document_cost(text);
+                if current + cost > limit {
+                    return Err(RetrievalError::budget_exceeded(current, cost, limit));
+                }
+            }
+        }
+
+        // Get or assign internal u32 ID
+        let internal_id = self.get_or_assign_internal_id(&doc_id);
+
+        // Count term frequencies
+        let mut term_freqs: BTreeMap<String, u32> = BTreeMap::new();
+        for token in &tokens {
+            *term_freqs.entry(token.clone()).or_insert(0) += 1;
+        }
+
+        // Update inverted index with sorted insertion to maintain doc_id order.
+        // WAND requires posting lists sorted by doc_id for binary-search seeks.
+        for (term, freq) in &term_freqs {
+            let postings = self.inverted_index.entry(term.clone()).or_default();
+            let insert_at = postings.partition_point_by_doc_id(internal_id);
+            // Clamp to u8::MAX (255) for compact posting storage.
+            // BM25's TF saturation means tf>10 is already ~85% of max
+            // contribution at k1=1.2, so clamping at 255 has negligible
+            // scoring impact. For very long documents (>255 occurrences of
+            // a single term), the score will plateau slightly early.
+            postings.insert(insert_at, internal_id, (*freq).min(255) as u8);
+        }
+
+        // Populate forward index: doc -> list of its terms (for O(terms) removal).
+        self.forward_index
+            .insert(internal_id, term_freqs.keys().cloned().collect());
+
+        // Update document metadata
+        self.doc_lengths.insert(internal_id, doc_length);
+        self.set_doc_length_fast(internal_id, doc_length);
+        self.total_tokens += doc_length;
+
+        // IDF cache auto-invalidates on the next search when it detects
+        // that doc_count() has changed. No per-term eviction needed.
+
+        // Block-max metadata is epoch-invalidated (lazy rebuild on next WAND search).
+        self.invalidate_block_max_after_mutation();
+
+        Ok(())
+    }
+
+    /// Remove a document from the index.
+    ///
+    /// Returns true if the document was found and removed, false otherwise.
+    pub fn remove_document(&mut self, doc_id: &str) -> bool {
+        // Look up internal ID
+        let internal_id = match self.id_to_internal.get(doc_id).copied() {
+            Some(id) => id,
+            None => return false,
+        };
+
+        // Get and remove document length
+        let doc_length = match self.doc_lengths.remove(&internal_id) {
+            Some(len) => len,
+            None => return false,
+        };
+
+        // Clear the fast-path vec entries (both usize and f32 mirrors).
+        let idx = internal_id as usize;
+        if idx < self.doc_lengths_vec.len() {
+            self.doc_lengths_vec[idx] = 0;
+        }
+        if idx < self.doc_lengths_f32.len() {
+            self.doc_lengths_f32[idx] = 0.0;
+        }
+
+        // Update total tokens
+        self.total_tokens = self.total_tokens.saturating_sub(doc_length);
+
+        // Remove from posting lists using the forward index (O(terms_in_doc) not O(|V|)).
+        // Falls back to full scan when the forward index is absent (e.g. after deserialization).
+        if let Some(terms) = self.forward_index.remove(&internal_id) {
+            for term in &terms {
+                if let Some(postings) = self.inverted_index.get_mut(term) {
+                    let idx = postings.partition_point_by_doc_id(internal_id);
+                    if idx < postings.len() && postings.doc_ids[idx] == internal_id {
+                        postings.remove(idx);
+                    }
+                    if postings.is_empty() {
+                        self.inverted_index.remove(term);
+                    }
+                }
+            }
+        } else {
+            // Fallback: forward index not available (deserialized index).
+            // Scan all posting lists (original O(|V|) behavior).
+            for (_term, postings) in self.inverted_index.iter_mut() {
+                let idx = postings.partition_point_by_doc_id(internal_id);
+                if idx < postings.len() && postings.doc_ids[idx] == internal_id {
+                    postings.remove(idx);
+                }
+            }
+            self.inverted_index
+                .retain(|_, postings| !postings.is_empty());
+        }
+
+        // Remove from ID maps
+        self.id_to_internal.remove(doc_id);
+        // Note: don't remove from internal_to_id Vec (leaves hole, but u32 IDs are never reused)
+
+        // IDF cache auto-invalidates on the next search when it detects
+        // that doc_count() has changed. No per-term eviction needed.
+
+        // Block-max metadata is epoch-invalidated.
+        self.invalidate_block_max_after_mutation();
+
+        true
+    }
+}

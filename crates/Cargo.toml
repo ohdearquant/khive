@@ -10,6 +10,7 @@ members = [
     "khive-gate",
     "khive-gate-rego",
     "khive-fusion",
+    "khive-bm25",
     "khive-runtime",
     "khive-request",
     "khive-pack-kg",
