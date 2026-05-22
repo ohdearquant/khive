@@ -56,8 +56,10 @@ CRATES=(
     khive-pack-memory
     khive-pack-brain
     khive-vcs
-    khive-merge
+    # khive-merge — forward-deployed (ADR-043), not yet compilable against
+    # restructured khive-vcs. Skipped until ADR-043 integration lands.
     khive-mcp
+    kkernel
 )
 
 DELAY=30  # seconds to wait for crates.io index between publishes

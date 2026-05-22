@@ -19,6 +19,8 @@ members = [
     "khive-vcs",
     "kkernel",
 ]
+# khive-merge excluded — forward-deployed (ADR-043) but not yet compilable
+# against restructured khive-vcs. Will be re-added when ADR-043 integrates.
 
 [workspace.package]
 version = "0.2.0"
