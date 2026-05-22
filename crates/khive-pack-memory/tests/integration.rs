@@ -1,3 +1,4 @@
+use khive_pack_brain::tunable::PackTunable;
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
 use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
@@ -626,4 +627,110 @@ async fn test_recall_excludes_non_memory_notes() {
             "hit has salience field (memory pack shape)"
         );
     }
+}
+
+/// Regression for #159: PackTunable::apply_config must actually affect recall
+/// scoring, not just mutate a Mutex that handlers ignore.
+///
+/// The wire is:
+///   apply_config(weights) → MemoryPack.config (Mutex)
+///   → MemoryPack::active_config() reads it
+///   → handle_recall / handle_recall_score use it as the base
+///   → compute_score uses the tuned weights
+///
+/// This test uses `recall.score` (deterministic — no FTS/vector noise) with
+/// no per-call `config` argument, applies different configs via
+/// PackTunable::apply_config, and verifies the resulting `total` score
+/// reflects the tuned weights. Without the active_config wire (issue #159
+/// bug), the result would always reflect RecallConfig::default() regardless
+/// of apply_config.
+#[tokio::test]
+async fn test_pack_tunable_apply_config_affects_recall_score() {
+    use khive_pack_memory::config::RecallConfig;
+
+    let rt = make_runtime();
+    let pack = MemoryPack::new(rt.clone());
+
+    // Sanity: with default config (0.70/0.20/0.10), the score for
+    //   rrf=1.0, salience=1.0, decay=0.0, age=0 → 0.70+0.20+0.10 = 1.0
+    // With importance_only (0.0/1.0/0.0), the score for
+    //   rrf=1.0, salience=0.0, decay=0.0, age=0 → 0.0
+    // The difference is large enough to prove the weights flow through.
+
+    // Apply importance-only config to the pack.
+    let importance_only = RecallConfig {
+        relevance_weight: 0.0,
+        importance_weight: 1.0,
+        temporal_weight: 0.0,
+        ..RecallConfig::default()
+    };
+    pack.apply_config(serde_json::to_value(&importance_only).unwrap())
+        .expect("apply_config (importance-only) succeeds");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("registry builds");
+
+    // Call recall.score with high relevance but ZERO salience — under
+    // importance-only weights, score MUST be 0.0. Under default weights
+    // (the bug), it would be 0.70.
+    let result = registry
+        .dispatch(
+            "recall.score",
+            json!({
+                "rrf": 1.0,
+                "salience": 0.0,
+                "decay_factor": 0.0,
+                "age_days": 0.0,
+            }),
+        )
+        .await
+        .expect("recall.score succeeds");
+    let total = result["total"].as_f64().expect("total is a number");
+    assert!(
+        total.abs() < 1e-9,
+        "under importance_weight=1.0, salience=0 → score=0; got {total}. \
+         If non-zero, MemoryPack::active_config() is not being used by \
+         recall.score (#159 regression)."
+    );
+
+    // Mirror check: under relevance-only weights with rrf=1.0, salience=0 → score=1.0.
+    // This requires a SECOND pack instance because PackRuntime ownership prevents
+    // mutating the live registry's config from outside. We construct the test
+    // by exercising the same wire on a fresh pack.
+    let rt2 = make_runtime();
+    let pack2 = MemoryPack::new(rt2.clone());
+    let relevance_only = RecallConfig {
+        relevance_weight: 1.0,
+        importance_weight: 0.0,
+        temporal_weight: 0.0,
+        ..RecallConfig::default()
+    };
+    pack2
+        .apply_config(serde_json::to_value(&relevance_only).unwrap())
+        .expect("apply_config (relevance-only) succeeds");
+
+    let mut builder2 = VerbRegistryBuilder::new();
+    builder2.register(KgPack::new(rt2.clone()));
+    builder2.register(pack2);
+    let registry2 = builder2.build().expect("registry2 builds");
+
+    let result2 = registry2
+        .dispatch(
+            "recall.score",
+            json!({
+                "rrf": 1.0,
+                "salience": 0.0,
+                "decay_factor": 0.0,
+                "age_days": 0.0,
+            }),
+        )
+        .await
+        .expect("recall.score (relevance-only) succeeds");
+    let total2 = result2["total"].as_f64().expect("total is a number");
+    assert!(
+        (total2 - 1.0).abs() < 1e-9,
+        "under relevance_weight=1.0 with rrf=1.0 → score=1.0; got {total2}"
+    );
 }

@@ -58,10 +58,22 @@ struct RecallParams {
 }
 
 impl RecallParams {
-    /// Merge per-call config with legacy field overrides.
-    /// Priority: explicit config fields > legacy top-level fields > defaults.
-    fn effective_config(&self) -> RecallConfig {
-        let mut cfg = self.config.clone().unwrap_or_default();
+    /// Compute the effective recall config for this request.
+    ///
+    /// Resolution order (highest priority wins):
+    ///   1. Explicit per-call `config` field (`self.config`)
+    ///   2. Pack-level tuned base config (`base`, from `MemoryPack::active_config()`)
+    ///   3. Legacy top-level `min_score` / `min_salience` overrides
+    ///
+    /// The legacy fields override regardless of the source because they were the
+    /// pre-`config`-field interface and explicit-on-the-wire beats inherited.
+    ///
+    /// `base` MUST be the pack's active config — this is the wire that connects
+    /// `MemoryPack::active_config()` (mutated by `PackTunable::apply_config`)
+    /// to recall behavior. Without this parameter the tuning posteriors land
+    /// in the Mutex but never reach `compute_score`.
+    fn effective_config(&self, base: RecallConfig) -> RecallConfig {
+        let mut cfg = self.config.clone().unwrap_or(base);
         if let Some(ms) = self.min_score {
             cfg.min_score = ms;
         }
@@ -297,7 +309,7 @@ impl MemoryPack {
             validate_memory_type(mt)?;
         }
 
-        let cfg = p.effective_config();
+        let cfg = p.effective_config(self.active_config());
         cfg.validate()?;
 
         let limit = p.limit.unwrap_or(10).min(100);
@@ -414,7 +426,7 @@ impl MemoryPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: RecallParams = deser(params)?;
-        let cfg = p.effective_config();
+        let cfg = p.effective_config(self.active_config());
         cfg.validate()?;
 
         let limit = p.limit.unwrap_or(10).min(100);
@@ -466,7 +478,7 @@ impl MemoryPack {
             validate_memory_type(mt)?;
         }
 
-        let cfg = p.effective_config();
+        let cfg = p.effective_config(self.active_config());
         cfg.validate()?;
 
         let limit = p.limit.unwrap_or(10).min(100);
@@ -531,7 +543,7 @@ impl MemoryPack {
             config: Option<RecallConfig>,
         }
         let p: ScoreParams = deser(params)?;
-        let cfg = p.config.unwrap_or_default();
+        let cfg = p.config.unwrap_or_else(|| self.active_config());
         cfg.validate()?;
         let (total, breakdown) = compute_score(&cfg, p.rrf, p.salience, p.decay_factor, p.age_days);
         to_json(&json!({
@@ -577,7 +589,7 @@ mod tests {
             min_salience: None,
             config: None,
         };
-        let cfg = p.effective_config();
+        let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.relevance_weight - 0.70).abs() < 1e-12);
         assert!((cfg.importance_weight - 0.20).abs() < 1e-12);
         assert!((cfg.temporal_weight - 0.10).abs() < 1e-12);
@@ -594,7 +606,7 @@ mod tests {
             min_salience: Some(0.3),
             config: None,
         };
-        let cfg = p.effective_config();
+        let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.min_score - 0.5).abs() < 1e-12);
         assert!((cfg.min_salience - 0.3).abs() < 1e-12);
     }
@@ -613,7 +625,7 @@ mod tests {
                 ..RecallConfig::default()
             }),
         };
-        let cfg = p.effective_config();
+        let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.relevance_weight - 0.50).abs() < 1e-12);
         // legacy min_score overrides config's default
         assert!((cfg.min_score - 0.1).abs() < 1e-12);
