@@ -23,7 +23,7 @@ echo "=== Contract Tests ==="
 python3 "$SCRIPT_DIR/../tests/contract_test.py"
 
 echo "=== Deno Tests ==="
-deno test --allow-all "$SCRIPT_DIR/../cli/"
+(cd "$SCRIPT_DIR/../cli" && deno test --allow-all .)
 
 echo "=== Smoke Test ==="
 python3 "$SCRIPT_DIR/../tests/smoke_test.py"
