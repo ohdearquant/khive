@@ -332,6 +332,218 @@ async fn test_remember_decay_factor_clamped() {
     );
 }
 
+#[test]
+fn test_memory_dotted_verbs_registered() {
+    let names: Vec<&str> = MemoryPack::VERBS.iter().map(|v| v.name).collect();
+    assert!(names.contains(&"recall.candidates"));
+    assert!(names.contains(&"recall.fuse"));
+    assert!(names.contains(&"recall.score"));
+    assert!(names.contains(&"recall.embed"));
+}
+
+#[tokio::test]
+async fn test_recall_candidates_returns_arrays() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    registry
+        .dispatch(
+            "remember",
+            json!({ "content": "attention recall candidates" }),
+        )
+        .await
+        .expect("remember");
+
+    let result = registry
+        .dispatch(
+            "recall.candidates",
+            json!({ "query": "attention candidates" }),
+        )
+        .await
+        .expect("recall.candidates");
+
+    let text = result["text_candidates"].as_array().expect("text array");
+    assert!(!text.is_empty());
+    assert!(text[0]["note_id"].as_str().is_some());
+    assert!(text[0]["score"].as_f64().is_some());
+    assert!(text[0]["rank"].as_u64().is_some());
+    assert!(result["candidate_limit"].as_u64().is_some());
+    assert!(
+        result.get("text_hits").is_none(),
+        "old count field must be absent"
+    );
+}
+
+#[tokio::test]
+async fn test_recall_fuse_returns_fused_candidates_not_full_recall() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    registry
+        .dispatch(
+            "remember",
+            json!({ "content": "attention fusion diagnostic" }),
+        )
+        .await
+        .expect("remember");
+
+    let result = registry
+        .dispatch("recall.fuse", json!({ "query": "attention fusion" }))
+        .await
+        .expect("recall.fuse");
+
+    let fused = result["fused_candidates"].as_array().expect("fused array");
+    assert!(!fused.is_empty());
+    assert!(fused[0]["fused_score"].as_f64().is_some());
+    assert!(fused[0]["source"].as_str().is_some());
+    assert!(
+        fused[0].get("content").is_none(),
+        "full recall field must be absent"
+    );
+    assert!(
+        fused[0].get("salience").is_none(),
+        "full recall field must be absent"
+    );
+}
+
+#[tokio::test]
+async fn test_recall_breakdown_is_opt_in() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    registry
+        .dispatch(
+            "remember",
+            json!({ "content": "attention score breakdown", "importance": 0.8 }),
+        )
+        .await
+        .expect("remember");
+
+    let plain = registry
+        .dispatch("recall", json!({ "query": "attention breakdown" }))
+        .await
+        .expect("recall");
+    let hits = plain.as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert!(
+        hits[0].get("breakdown").is_none(),
+        "breakdown must be absent by default"
+    );
+
+    let explained = registry
+        .dispatch(
+            "recall",
+            json!({ "query": "attention breakdown", "config": { "include_breakdown": true } }),
+        )
+        .await
+        .expect("recall with breakdown");
+    let hits = explained.as_array().unwrap();
+    assert!(!hits.is_empty());
+    let bd = &hits[0]["breakdown"];
+    assert!(bd["relevance"].as_f64().is_some());
+    assert!(bd["importance_raw"].as_f64().is_some());
+    assert!(bd["importance_decayed"].as_f64().is_some());
+    assert!(bd["temporal"].as_f64().is_some());
+    assert!(bd["weighted"]["relevance_contribution"].as_f64().is_some());
+}
+
+/// recall.candidates always includes both array keys even when the embedding model is absent
+/// and the vector path returns nothing.
+#[tokio::test]
+async fn test_recall_candidates_vector_field_always_present() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    registry
+        .dispatch(
+            "remember",
+            json!({ "content": "text only candidate check" }),
+        )
+        .await
+        .expect("remember");
+
+    let result = registry
+        .dispatch(
+            "recall.candidates",
+            json!({ "query": "text only candidate" }),
+        )
+        .await
+        .expect("recall.candidates");
+
+    // Both arrays must be present even if one is empty.
+    assert!(
+        result["vector_candidates"].as_array().is_some(),
+        "vector_candidates key must always be present"
+    );
+    assert!(
+        result["text_candidates"].as_array().is_some(),
+        "text_candidates key must always be present"
+    );
+}
+
+/// recall.fuse source field must be a plain string ("text"), not a serde-tagged enum.
+#[tokio::test]
+async fn test_recall_fuse_source_field_is_plain_string() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    registry
+        .dispatch("remember", json!({ "content": "fuse source string check" }))
+        .await
+        .expect("remember");
+
+    let result = registry
+        .dispatch("recall.fuse", json!({ "query": "fuse source string" }))
+        .await
+        .expect("recall.fuse");
+
+    let fused = result["fused_candidates"].as_array().expect("fused array");
+    assert!(!fused.is_empty());
+    let source = fused[0]["source"].as_str().expect("source is string");
+    // Must be a plain label, not a JSON object or enum tag.
+    assert!(
+        source == "text" || source == "vector" || source == "both",
+        "source must be a plain label, got {source:?}"
+    );
+}
+
+/// When include_breakdown is true, breakdown.total() must equal the hit's composite score.
+#[tokio::test]
+async fn test_recall_breakdown_total_matches_composite_score() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    registry
+        .dispatch(
+            "remember",
+            json!({ "content": "arithmetic score check memory", "importance": 0.7 }),
+        )
+        .await
+        .expect("remember");
+
+    let result = registry
+        .dispatch(
+            "recall",
+            json!({ "query": "arithmetic score check", "config": { "include_breakdown": true } }),
+        )
+        .await
+        .expect("recall with breakdown");
+
+    let hits = result.as_array().unwrap();
+    assert!(!hits.is_empty());
+    let hit = &hits[0];
+    let score = hit["score"].as_f64().expect("hit has score");
+    let bd = &hit["breakdown"];
+    let rc = bd["weighted"]["relevance_contribution"].as_f64().unwrap();
+    let ic = bd["weighted"]["importance_contribution"].as_f64().unwrap();
+    let tc = bd["weighted"]["temporal_contribution"].as_f64().unwrap();
+    let total = rc + ic + tc;
+    assert!(
+        (total - score).abs() < 1e-9,
+        "breakdown weighted sum {total} must equal composite score {score}"
+    );
+}
+
 /// Regression test for issue #94: non-memory notes must not appear in recall results.
 ///
 /// Creates more non-memory notes than the default `limit * 4` candidate threshold (the amount
