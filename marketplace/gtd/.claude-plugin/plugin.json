@@ -15,7 +15,7 @@
       "command": "khive-mcp",
       "args": [],
       "env": {
-        "KHIVE_PACKS": "gtd"
+        "KHIVE_PACKS": "kg,gtd,memory,brain"
       },
       "installHint": "cargo install khive-mcp"
     }

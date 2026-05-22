@@ -15,6 +15,11 @@
       "name": "gtd",
       "source": "./marketplace/gtd",
       "description": "GTD-style task lifecycle (assign/next/complete/transition) over the notes substrate"
+    },
+    {
+      "name": "memory",
+      "source": "./marketplace/memory",
+      "description": "Persistent agent memory with decay-aware recall (remember/recall verbs)"
     }
   ]
 }
