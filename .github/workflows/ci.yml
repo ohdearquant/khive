@@ -30,6 +30,9 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
       - run: ../scripts/ci.sh
 
   docs:

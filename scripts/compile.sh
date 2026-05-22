@@ -42,10 +42,15 @@ deno compile \
 
 # Windows x64
 echo "  -> win32-x64"
+WIN_TARGET="x86_64-pc-windows-msvc"
+WIN_OUTPUT="${OUT_DIR}/khive-win32-x64"
+if [[ "$WIN_TARGET" == *windows* || "$WIN_TARGET" == *win* ]]; then
+  WIN_OUTPUT="${WIN_OUTPUT}.exe"
+fi
 deno compile \
   --allow-read --allow-write --allow-run --allow-env \
-  --target x86_64-pc-windows-msvc \
-  --output "${OUT_DIR}/khive-win32-x64" \
+  --target "$WIN_TARGET" \
+  --output "$WIN_OUTPUT" \
   cli/main.ts
 
 echo "Done. Binaries in ${OUT_DIR}/"

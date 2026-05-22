@@ -29,6 +29,7 @@ impl Fixture {
         self.registry.all_note_kinds()
     }
 
+    #[allow(dead_code)]
     fn entity_kinds(&self) -> Vec<&'static str> {
         self.registry.all_entity_kinds()
     }
