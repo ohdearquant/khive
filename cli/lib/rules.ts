@@ -143,10 +143,15 @@ export function validateRulesFile(parsed: unknown): RulesFileError[] {
     const cfg = entry as Record<string, unknown>;
 
     // Validate unknown entry-level keys.
-    // 'module' is intentionally excluded from the valid set so it is caught by
-    // the dedicated Phase E2 check below (which produces a more informative error).
-    const VALID_ENTRY_KEYS = new Set(["severity", "enabled", "config", "module"]);
+    const VALID_ENTRY_KEYS = new Set(["severity", "enabled", "config"]);
     for (const key of Object.keys(cfg)) {
+      if (key === "module") {
+        errors.push({
+          message:
+            `${prefix}: 'module' (custom rule modules) is a Phase E2 feature and is not yet supported`,
+        });
+        continue;
+      }
       if (!VALID_ENTRY_KEYS.has(key)) {
         errors.push({ message: `${prefix}: unknown entry key '${key}'` });
       }
@@ -165,14 +170,6 @@ export function validateRulesFile(parsed: unknown): RulesFileError[] {
     if (cfg["enabled"] !== undefined && typeof cfg["enabled"] !== "boolean") {
       errors.push({
         message: `${prefix}: 'enabled' must be a boolean, got ${typeof cfg["enabled"]}`,
-      });
-    }
-
-    // Validate 'module' key is not present (Phase E2 — deferred).
-    if ("module" in cfg) {
-      errors.push({
-        message:
-          `${prefix}: 'module' (custom rule modules) is a Phase E2 feature and is not yet supported`,
       });
     }
 

@@ -119,9 +119,9 @@ function parseArgs(args: string[]): ResolveArgs {
 
 // ─── Conflict marker parser ───────────────────────────────────────────────────
 
-const CONFLICT_START = /^<{7} /;
-const CONFLICT_MID = /^={7}$/;
-const CONFLICT_END = /^>{7} /;
+const CONFLICT_START = /^<{7}(?: .*)?$/;
+const CONFLICT_MID = /^={7}(?: .*)?$/;
+const CONFLICT_END = /^>{7}(?: .*)?$/;
 
 /**
  * Scan `lines` for conflict blocks. Returns the list of blocks plus the
@@ -179,9 +179,9 @@ export function parseConflicts(
 // Multiline versions for whole-file marker scanning (hasConflictMarkers).
 // The line-level constants above use `^` as start-of-string (single line);
 // these use the `m` flag so `^` matches start of any line in the full text.
-const CONFLICT_START_M = /^<{7} /m;
-const CONFLICT_MID_M = /^={7}$/m;
-const CONFLICT_END_M = /^>{7} /m;
+const CONFLICT_START_M = /^<{7}(?: .*)?$/m;
+const CONFLICT_MID_M = /^={7}(?: .*)?$/m;
+const CONFLICT_END_M = /^>{7}(?: .*)?$/m;
 
 /**
  * Returns true if `text` contains any git conflict markers.

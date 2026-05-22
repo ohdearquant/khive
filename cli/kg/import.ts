@@ -19,54 +19,10 @@
  */
 
 import { EDGES_FILE, ENTITIES_FILE, KG_DIR, SCHEMA_FILE } from "../lib/paths.ts";
+import { DEFAULT_SCHEMA_YAML } from "../lib/schema.ts";
 import { canonicalEdgeJson, canonicalEntityJson } from "../lib/canonical.ts";
+import { readNdjson } from "../lib/ndjson.ts";
 import { validate } from "./validate.ts";
-
-// Default schema.yaml content (matches init.ts's DEFAULT_SCHEMA_YAML).
-// Used when the repo has no schema.yaml yet so validate() has the closed sets.
-const DEFAULT_SCHEMA_YAML = `\
-format_version: "1.0.0"
-entity_kinds:
-  - concept
-  - document
-  - dataset
-  - project
-  - person
-  - org
-edge_relations:
-  - relation: contains
-    category: structure
-  - relation: part_of
-    category: structure
-  - relation: instance_of
-    category: structure
-  - relation: extends
-    category: derivation
-  - relation: variant_of
-    category: derivation
-  - relation: introduced_by
-    category: derivation
-  - relation: supersedes
-    category: derivation
-  - relation: depends_on
-    category: dependency
-  - relation: enables
-    category: dependency
-  - relation: implements
-    category: implementation
-  - relation: competes_with
-    category: lateral
-  - relation: composed_with
-    category: lateral
-  - relation: annotates
-    category: annotation
-note_kinds:
-  - observation
-  - insight
-  - question
-  - decision
-  - reference
-`;
 
 // ─── KgArchive types ──────────────────────────────────────────────────────────
 
@@ -132,6 +88,142 @@ interface ImportJournal {
   files_to_swap: JournalSwap[];
   status: JournalStatus;
   timestamp: string;
+}
+
+// ─── Conflict resolution (for --on-conflict) ──────────────────────────────────
+
+/**
+ * Per-record conflict policy when importing into an existing KG.
+ *   error   — default; fail if any live files exist (file-level, not record-level)
+ *   skip    — keep the existing record, ignore the incoming one
+ *   replace — overwrite the existing record with the incoming one
+ *   merge   — deep-merge properties, union tags, preserve existing scalars
+ */
+export type ConflictPolicy = "error" | "skip" | "replace" | "merge";
+
+async function readExistingArchive(repoRoot: string): Promise<KgArchive> {
+  const entities: KgArchiveEntity[] = [];
+  const edges: KgArchiveEdge[] = [];
+  for await (const { data } of readNdjson(`${repoRoot}/${ENTITIES_FILE}`)) {
+    if (data) entities.push(data as unknown as KgArchiveEntity);
+  }
+  for await (const { data } of readNdjson(`${repoRoot}/${EDGES_FILE}`)) {
+    if (data) edges.push(data as unknown as KgArchiveEdge);
+  }
+  return { format: "khive-kg", version: "0.1", entities, edges };
+}
+
+function deepMergeObjects(
+  base: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(incoming)) {
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      typeof result[key] === "object" &&
+      result[key] !== null &&
+      !Array.isArray(result[key])
+    ) {
+      result[key] = deepMergeObjects(
+        result[key] as Record<string, unknown>,
+        value as Record<string, unknown>,
+      );
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+/**
+ * Resolve an entity conflict according to policy.
+ * Returns null to keep the existing record (skip), or the resolved entity.
+ */
+function mergeEntityConflict(
+  existing: KgArchiveEntity,
+  incoming: KgArchiveEntity,
+  policy: ConflictPolicy,
+): KgArchiveEntity | null {
+  if (policy === "skip") return null;
+  if (policy === "replace") return incoming;
+  // merge: deep-merge properties, union+sort tags, prefer existing scalar fields
+  const mergedProperties = deepMergeObjects(
+    existing.properties ?? {},
+    incoming.properties ?? {},
+  );
+  const tagSet = new Set([...(existing.tags ?? []), ...(incoming.tags ?? [])]);
+  return {
+    ...existing,
+    properties: mergedProperties,
+    tags: [...tagSet].sort(),
+    updated_at: incoming.updated_at ?? existing.updated_at,
+  };
+}
+
+/**
+ * Resolve an edge conflict according to policy.
+ * Returns null to keep the existing record (skip), or the resolved edge.
+ */
+function mergeEdgeConflict(
+  existing: KgArchiveEdge,
+  incoming: KgArchiveEdge,
+  policy: ConflictPolicy,
+): KgArchiveEdge | null {
+  if (policy === "skip") return null;
+  if (policy === "replace") return incoming;
+  // merge: deep-merge properties, prefer incoming weight when present
+  const mergedProperties = deepMergeObjects(
+    existing.properties ?? {},
+    incoming.properties ?? {},
+  );
+  return {
+    ...existing,
+    properties: mergedProperties,
+    weight: incoming.weight ?? existing.weight,
+  };
+}
+
+/**
+ * Build the candidate archive by merging existing and incoming archives
+ * record-by-record according to the conflict policy.
+ */
+function buildCandidateArchive(
+  existing: KgArchive,
+  incoming: KgArchive,
+  policy: ConflictPolicy,
+): KgArchive {
+  const entityMap = new Map(existing.entities.map((e) => [e.id, e]));
+  const edgeMap = new Map(existing.edges.map((e) => [e.edge_id, e]));
+
+  for (const incomingEntity of incoming.entities) {
+    const existingEntity = entityMap.get(incomingEntity.id);
+    if (!existingEntity) {
+      entityMap.set(incomingEntity.id, incomingEntity);
+    } else {
+      const resolved = mergeEntityConflict(existingEntity, incomingEntity, policy);
+      if (resolved !== null) entityMap.set(incomingEntity.id, resolved);
+      // null → skip: existing record stays in map
+    }
+  }
+
+  for (const incomingEdge of incoming.edges) {
+    const existingEdge = edgeMap.get(incomingEdge.edge_id);
+    if (!existingEdge) {
+      edgeMap.set(incomingEdge.edge_id, incomingEdge);
+    } else {
+      const resolved = mergeEdgeConflict(existingEdge, incomingEdge, policy);
+      if (resolved !== null) edgeMap.set(incomingEdge.edge_id, resolved);
+    }
+  }
+
+  return {
+    ...existing,
+    entities: [...entityMap.values()],
+    edges: [...edgeMap.values()],
+  };
 }
 
 // ─── Sort helpers ─────────────────────────────────────────────────────────────
@@ -423,15 +515,16 @@ export async function importArchive(
   options: {
     overwrite?: boolean;
     /**
-     * @internal — test-only env-var crash point name.
+     * Per-record conflict policy for entities and edges that already exist.
+     * When set, the file-level overwrite check is bypassed.
+     * Ignored when `overwrite` is also true (full replacement takes precedence).
+     */
+    onConflict?: ConflictPolicy;
+    /**
+     * @internal — in-process crash hook for caught-error recovery tests.
      *
-     * When the KHIVE_TEST_CRASH_AFTER environment variable equals one of these
-     * values, the subprocess exits with code 42 at that point in the publish
-     * sequence.  This is used by subprocess-crash regression tests.
-     *
-     * Values:
-     *   "journal_written"  — after journal flushed, before any renames
-     *   "first_rename"     — after entities.ndjson renamed into place, before edges
+     * Subprocess crash regression tests may still use KHIVE_TEST_CRASH_AFTER,
+     * but only when KHIVE_DEV=1 is also present in the environment.
      */
     _afterFirstRename?: () => void | Promise<void>;
   } = {},
@@ -454,12 +547,25 @@ export async function importArchive(
   // ── 2. Validate archive structure ─────────────────────────────────────────
   const archive = validateArchive(raw);
 
+  // ── 2b. Apply per-record conflict resolution ──────────────────────────────
+  //
+  // When --on-conflict is set (and not combined with --overwrite), read the
+  // existing live files and merge records according to the policy before sorting
+  // and staging the candidate.  This is a no-op if no live files exist yet.
+  let candidateArchive = archive;
+  if (options.onConflict && options.onConflict !== "error" && !options.overwrite) {
+    const existing = await readExistingArchive(repoRoot);
+    if (existing.entities.length > 0 || existing.edges.length > 0) {
+      candidateArchive = buildCandidateArchive(existing, archive, options.onConflict);
+    }
+  }
+
   // ── 3. Sort entities and edges ────────────────────────────────────────────
-  const sortedEntities = [...archive.entities].sort((a, b) =>
+  const sortedEntities = [...candidateArchive.entities].sort((a, b) =>
     entitySortKey(a).localeCompare(entitySortKey(b))
   );
 
-  const sortedEdges = [...archive.edges].sort((a, b) =>
+  const sortedEdges = [...candidateArchive.edges].sort((a, b) =>
     edgeSortKey(a).localeCompare(edgeSortKey(b))
   );
 
@@ -524,14 +630,17 @@ export async function importArchive(
   const destEntitiesPath = `${repoRoot}/${ENTITIES_FILE}`;
   const destEdgesPath = `${repoRoot}/${EDGES_FILE}`;
 
-  if (!options.overwrite) {
+  // File-level overwrite guard: skip when --overwrite is set OR when
+  // --on-conflict is set (per-record merging already handled conflicts above).
+  if (!options.overwrite && !options.onConflict) {
     for (const path of [destEntitiesPath, destEdgesPath]) {
       try {
         await Deno.stat(path);
-        // File exists — refuse without --overwrite
+        // File exists — refuse without --overwrite or --on-conflict
         await Deno.remove(tmpDir, { recursive: true }).catch(() => {});
         throw new Error(
-          `${path} already exists. Pass --overwrite to replace it.`,
+          `${path} already exists. Pass --overwrite to replace it, ` +
+            `or --on-conflict <skip|replace|merge> for per-record handling.`,
         );
       } catch (err) {
         if (err instanceof Deno.errors.NotFound) {
@@ -586,8 +695,11 @@ export async function importArchive(
   };
   await writeJournal(repoRoot, journal);
 
-  // Env-var crash hook for subprocess-crash regression tests.
-  if (Deno.env.get("KHIVE_TEST_CRASH_AFTER") === "journal_written") {
+  // Dev-only crash hook for subprocess-crash regression tests.
+  if (
+    Deno.env.get("KHIVE_DEV") === "1" &&
+    Deno.env.get("KHIVE_TEST_CRASH_AFTER") === "journal_written"
+  ) {
     Deno.exit(42);
   }
 
@@ -640,10 +752,13 @@ export async function importArchive(
     // In-process exception hook (preserved for caught-error recovery tests).
     if (options._afterFirstRename) await options._afterFirstRename();
 
-    // Env-var crash hook: crash after entities renamed but before edges renamed.
+    // Dev-only crash hook: crash after entities renamed but before edges renamed.
     // The journal (status=pending) + .bak files ensure recoverImportJournal
     // can deterministically roll back this state.
-    if (Deno.env.get("KHIVE_TEST_CRASH_AFTER") === "first_rename") {
+    if (
+      Deno.env.get("KHIVE_DEV") === "1" &&
+      Deno.env.get("KHIVE_TEST_CRASH_AFTER") === "first_rename"
+    ) {
       Deno.exit(42);
     }
 
@@ -697,11 +812,13 @@ export async function importArchive(
 // ─── CLI entry point ──────────────────────────────────────────────────────────
 
 /**
- * `khive kg import [--overwrite] <archive-file>` command.
+ * `khive kg import [--overwrite] [--on-conflict <skip|replace|merge>] <archive-file>`
  *
  * Args:
- *   <archive-file>  Path to a KgArchive JSON file (required positional argument).
- *   --overwrite     Replace existing .khive/kg/ NDJSON files without error.
+ *   <archive-file>              Path to a KgArchive JSON file (required).
+ *   --overwrite                 Replace existing NDJSON files wholesale.
+ *   --on-conflict <policy>      Per-record conflict handling: skip | replace | merge.
+ *                               Bypasses the file-level overwrite check.
  *
  * Validates against schema.yaml before writing. Publishes durably via journal
  * protocol (crash-safe: recoverImportJournal handles process death mid-publish).
@@ -709,16 +826,37 @@ export async function importArchive(
  */
 export async function runImport(repoRoot: string, args: string[]): Promise<void> {
   const overwrite = args.includes("--overwrite");
-  const archivePath = args.find((a) => !a.startsWith("-"));
+
+  // Parse --on-conflict <value>
+  let onConflict: ConflictPolicy | undefined;
+  const conflictIdx = args.indexOf("--on-conflict");
+  if (conflictIdx !== -1) {
+    const value = args[conflictIdx + 1];
+    if (value === "skip" || value === "replace" || value === "merge") {
+      onConflict = value;
+    } else {
+      console.error(
+        `Error: --on-conflict value must be 'skip', 'replace', or 'merge'; ` +
+          `got '${value ?? "(missing)"}'`,
+      );
+      Deno.exit(1);
+    }
+  }
+
+  // Positional arg: first non-flag argument, excluding the --on-conflict value
+  const archivePath = args.find((a, i) => !a.startsWith("-") && args[i - 1] !== "--on-conflict");
   if (!archivePath) {
-    console.error("Usage: khive kg import [--overwrite] <archive-file>");
-    console.error("  <archive-file>  Path to a KgArchive JSON file (required)");
-    console.error("  --overwrite     Replace existing NDJSON files without error");
+    console.error(
+      "Usage: khive kg import [--overwrite] [--on-conflict <skip|replace|merge>] <archive-file>",
+    );
+    console.error("  <archive-file>              Path to a KgArchive JSON file (required)");
+    console.error("  --overwrite                 Replace existing NDJSON files without error");
+    console.error("  --on-conflict <policy>      Per-record conflict: skip | replace | merge");
     Deno.exit(1);
   }
 
   try {
-    await importArchive(repoRoot, archivePath, { overwrite });
+    await importArchive(repoRoot, archivePath, { overwrite, onConflict });
   } catch (err) {
     console.error(`Error: ${(err as Error).message}`);
     Deno.exit(1);

@@ -17,6 +17,8 @@
 import { EDGES_FILE, ENTITIES_FILE, KG_DIR } from "../lib/paths.ts";
 import { parseEdgeLine, parseEntityLine, readNdjson } from "../lib/ndjson.ts";
 import { canonicalEdgeJson, canonicalEntityJson } from "../lib/canonical.ts";
+import { exec } from "../lib/git.ts";
+import { KG_ARCHIVE_FORMAT, KG_ARCHIVE_VERSION } from "../version.ts";
 
 // ─── Default export: canonical NDJSON files ──────────────────────────────────
 
@@ -100,6 +102,11 @@ export async function exportCanonical(repoRoot: string): Promise<void> {
 
 // ─── Archive export: single JSON bundle (--format archive) ───────────────────
 
+interface ExportArchiveOptions {
+  outputPath?: string;
+  namespace?: string;
+}
+
 /**
  * Export NDJSON files from repoRoot as a KgArchive JSON bundle.
  *
@@ -107,13 +114,16 @@ export async function exportCanonical(repoRoot: string): Promise<void> {
  * with a format envelope.  The output is NOT idempotent (it includes an
  * `exported_at` timestamp) and is NOT the canonical git-native format.
  *
+ * Accepts a plain string outputPath (legacy) or an ExportArchiveOptions object.
  * Writes to outputPath if provided, otherwise to stdout.
  * Reports entity/edge counts to stderr.
  */
 export async function exportArchive(
   repoRoot: string,
-  outputPath?: string,
+  options: ExportArchiveOptions | string = {},
 ): Promise<void> {
+  const outputPath = typeof options === "string" ? options : options.outputPath;
+  const namespace = typeof options === "string" ? "local" : (options.namespace ?? "local");
   // ── 1. Read entities.ndjson ───────────────────────────────────────────────
   const entitiesPath = `${repoRoot}/${ENTITIES_FILE}`;
   const entities: Record<string, unknown>[] = [];
@@ -146,9 +156,9 @@ export async function exportArchive(
 
   // ── 3. Build KgArchive ────────────────────────────────────────────────────
   const archive = {
-    format: "khive-kg",
-    version: "0.1",
-    namespace: "local",
+    format: KG_ARCHIVE_FORMAT,
+    version: KG_ARCHIVE_VERSION,
+    namespace,
     exported_at: new Date().toISOString(),
     entities,
     edges,
@@ -167,38 +177,95 @@ export async function exportArchive(
   console.error(`Exported ${entities.length} entities and ${edges.length} edges`);
 }
 
+// ─── Namespace resolution (ADR-051 §2) ───────────────────────────────────────
+
+const NAMESPACE_RE = /^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$/;
+
+async function resolveExportNamespace(
+  repoRoot: string,
+  flagValue?: string,
+): Promise<string> {
+  let candidate: string | undefined;
+
+  if (flagValue) {
+    candidate = flagValue;
+  } else {
+    try {
+      const settingsPath = `${repoRoot}/.khive/settings.json`;
+      const text = await Deno.readTextFile(settingsPath);
+      const settings = JSON.parse(text) as Record<string, unknown>;
+      const actor = settings["actor"] as Record<string, unknown> | undefined;
+      if (typeof actor?.["name"] === "string" && actor["name"].length > 0) {
+        candidate = actor["name"] as string;
+      }
+    } catch {
+      // Not found or invalid JSON — continue
+    }
+  }
+
+  if (!candidate) {
+    try {
+      const result = await exec(["git", "remote", "get-url", "origin"]);
+      if (result.code === 0 && result.stdout) {
+        const url = result.stdout.trim();
+        const match = url.match(/[:/]([^/]+?)(?:\.git)?$/);
+        if (match) candidate = match[1];
+      }
+    } catch {
+      // No remote — continue
+    }
+  }
+
+  if (!candidate) {
+    const parts = repoRoot.split("/");
+    candidate = parts[parts.length - 1] ?? "local";
+  }
+
+  if (!NAMESPACE_RE.test(candidate)) {
+    candidate = "local";
+  }
+
+  return candidate;
+}
+
 // ─── CLI entry point ──────────────────────────────────────────────────────────
 
+function valueAfter(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  return idx !== -1 ? args[idx + 1] : undefined;
+}
+
 /**
- * `khive kg export [--format archive] [--output <file>]` command.
+ * `khive kg export [--format archive] [--output <file>] [--namespace <ns>]` command.
  *
  * Default: re-writes .khive/kg/entities.ndjson and .khive/kg/edges.ndjson
  *   in canonical ADR-048 field order.  Idempotent.
  *
- * --format archive [--output <file>]:
+ * --format archive [--output <file>] [--namespace <ns>]:
  *   Produces a single KgArchive JSON bundle.  Writes to <file> or stdout.
+ *   Namespace defaults via ADR-051 resolution when --namespace is absent.
  *   Non-canonical; includes exported_at timestamp (not idempotent).
  *
  * Exits 0 on success, 1 on error.
  */
 export async function runExport(repoRoot: string, args: string[]): Promise<void> {
-  // Detect --format archive
-  const fmtIdx = args.indexOf("--format");
-  const format = fmtIdx !== -1 ? args[fmtIdx + 1] : "ndjson";
+  const format = valueAfter(args, "--format") ?? "ndjson";
 
   if (format === "archive") {
-    let outputPath: string | undefined;
-    const outIdx = args.indexOf("--output");
-    if (outIdx !== -1) {
-      outputPath = args[outIdx + 1];
-      if (!outputPath) {
-        console.error("Error: --output requires a file path argument");
-        Deno.exit(1);
-      }
+    const outputPath = valueAfter(args, "--output");
+    const namespaceFlag = valueAfter(args, "--namespace");
+    if (args.includes("--output") && !outputPath) {
+      console.error("Error: --output requires a file path argument");
+      Deno.exit(1);
+    }
+    if (args.includes("--namespace") && !namespaceFlag) {
+      console.error("Error: --namespace requires a namespace argument");
+      Deno.exit(1);
     }
 
+    const namespace = await resolveExportNamespace(repoRoot, namespaceFlag);
     try {
-      await exportArchive(repoRoot, outputPath);
+      await exportArchive(repoRoot, { outputPath, namespace });
     } catch (err) {
       console.error(`Error: ${(err as Error).message}`);
       Deno.exit(1);

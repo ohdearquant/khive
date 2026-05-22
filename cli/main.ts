@@ -9,23 +9,26 @@
 import { kgInit } from "./kg/mod.ts";
 import { runCommit } from "./kg/commit.ts";
 import { runConfig } from "./kg/config.ts";
+import { runDiff } from "./kg/diff.ts";
+import { runDoctor } from "./kg/doctor.ts";
 import { runEmbed } from "./kg/embed.ts";
 import { runExport } from "./kg/export.ts";
 import { runHook } from "./kg/hook.ts";
 import { recoverImportJournal, runImport } from "./kg/import.ts";
+import { runLog } from "./kg/log.ts";
 import { runMigrate } from "./kg/migrate.ts";
 import { runPackCheck } from "./pack/check.ts";
 import { runPackInit } from "./pack/init.ts";
 import { runResolve } from "./kg/resolve.ts";
+import { runStats } from "./kg/stats.ts";
 import { runSync } from "./kg/sync.ts";
 import { runStatus } from "./kg/status.ts";
 import { runValidate } from "./kg/validate.ts";
 import { getRepoRoot } from "./lib/git.ts";
-
-const VERSION = "0.1.0";
+import { CLI_VERSION } from "./version.ts";
 
 function printUsage(): void {
-  console.log(`khive ${VERSION} — research knowledge graph CLI
+  console.log(`khive ${CLI_VERSION} — research knowledge graph CLI
 
 Usage:
   khive kg <subcommand>     Manage the git-native knowledge graph
@@ -45,7 +48,10 @@ KG subcommands:
   resolve       Resolve NDJSON merge conflicts (ADR-053)
   hook          Manage the pre-commit validation hook (install/uninstall/status)
   migrate       Apply schema migrations from .khive/kg/migrations/ (ADR-054)
-  diff          Entity-aware diff between two NDJSON states (Phase C2 — not yet implemented)
+  diff          Entity-aware diff between two NDJSON states
+  log           Show KG change history (commits touching .khive/kg/ files)
+  stats         Show entity/edge counts, kind breakdown, schema coverage
+  doctor        Validate KG integrity: syntax, refs, duplicates, orphans
   update        Advance a remote pin in schema.yaml (Phase C2 — not yet implemented)
 
 Pack subcommands (ADR-050):
@@ -74,13 +80,16 @@ Subcommands (Phase C1 — file-level operations):
   config        Show or modify .khive/config.toml
   embed         Plan embedding for entities awaiting vectors (run: Phase C2)
   export        Re-write canonical .khive/kg/*.ndjson; --format archive emits a JSON bundle
-  import        Import a KgArchive JSON file into NDJSON files
+  import        Import a KgArchive JSON file (flags: --overwrite, --on-conflict <skip|replace|merge>)
   resolve       Resolve NDJSON merge conflicts after 'git merge'
   hook          Manage pre-commit validation hook (install|uninstall|status)
   migrate       Apply schema migrations (ADR-054)
+  diff          Entity-aware diff between two NDJSON states (flags: --json, --name-only)
+  log           Show KG change history (flags: -n <limit>, --json, --stat)
+  stats         Show entity/edge counts, kind breakdown, schema coverage (flags: --json)
+  doctor        Validate KG integrity: syntax, refs, duplicates, orphans (flags: --json)
 
 Planned (Phase C2+):
-  diff          Entity-aware diff
   update        Advance a remote pin`);
 }
 
@@ -161,9 +170,24 @@ async function dispatchKg(args: string[]): Promise<void> {
       break;
 
     case "diff":
+      await runDiff(await getRepoRoot(), rest);
+      break;
+
+    case "log":
+      await runLog(await getRepoRoot(), rest);
+      break;
+
+    case "stats":
+      await runStats(await getRepoRoot(), rest);
+      break;
+
+    case "doctor":
+      await runDoctor(await getRepoRoot(), rest);
+      break;
+
     case "update":
       console.error(
-        `'khive kg ${subcommand}' is not yet implemented (phase E3 — v0.4+).`,
+        `'khive kg update' is not yet implemented (phase C2 — v0.4+).`,
       );
       Deno.exit(1);
       break;
@@ -254,7 +278,7 @@ const [group, ...groupArgs] = Deno.args;
 if (!group || group === "--help" || group === "-h") {
   printUsage();
 } else if (group === "--version" || group === "-V") {
-  console.log(`khive ${VERSION}`);
+  console.log(`khive ${CLI_VERSION}`);
 } else if (group === "kg") {
   await dispatchKg(groupArgs);
 } else if (group === "pack") {

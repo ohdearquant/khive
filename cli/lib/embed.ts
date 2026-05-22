@@ -132,16 +132,21 @@ function readField(data: Record<string, unknown>, field: string): string {
  * Pretty-print an EmbedPlan to stdout. Used by `--dry-run` and the
  * commit/sync auto-embed banner.
  */
-export function printEmbedPlan(plan: EmbedPlan, quiet = false): void {
+export function printEmbedPlan(
+  plan: EmbedPlan,
+  quiet = false,
+  label = "Embed dry-run plan",
+): void {
   if (quiet) return;
   if (plan.pending.length === 0) {
     console.log(
-      `Embed plan: nothing to embed (${plan.total} entities scanned, model=${plan.model})`,
+      `Embeddings are up-to-date, nothing to do. ` +
+        `(${plan.total} entities scanned, model=${plan.model})`,
     );
     return;
   }
   console.log(
-    `Embed plan: ${plan.pending.length}/${plan.total} entities pending ` +
+    `${label}: ${plan.pending.length}/${plan.total} entities pending ` +
       `(model=${plan.model}, dims=${plan.dimensions}, batch=${plan.batchSize})`,
   );
   const sample = plan.pending.slice(0, 3);
