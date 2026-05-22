@@ -489,6 +489,121 @@ async fn list_entity_kind_filter_restricts_results() {
     }
 }
 
+/// Regression for #145: `list(kind="entity")` must honor the `offset` parameter.
+///
+/// The original bug was that the handler forwarded `limit` to the runtime but
+/// hardcoded `offset: 0`, so requesting page 2 (offset=N) returned page 1.
+/// Test creates 4 entities, requests (limit=2, offset=0) and (limit=2, offset=2),
+/// and verifies the pages are disjoint.
+#[tokio::test]
+async fn list_entities_offset_returns_disjoint_pages() {
+    let pack = pack();
+    for i in 0..4 {
+        pack.dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": format!("page_test_{i:02}"),
+                "entity_kind": "concept"
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    }
+
+    let page1 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "entity", "entity_kind": "concept", "limit": 2, "offset": 0}),
+        )
+        .await
+        .expect("list page 1 must succeed");
+    let page2 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "entity", "entity_kind": "concept", "limit": 2, "offset": 2}),
+        )
+        .await
+        .expect("list page 2 must succeed");
+
+    let ids1: Vec<&str> = page1
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+    let ids2: Vec<&str> = page2
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(ids1.len(), 2, "page 1 must have 2 entities; got {ids1:?}");
+    assert_eq!(ids2.len(), 2, "page 2 must have 2 entities; got {ids2:?}");
+    for id in &ids1 {
+        assert!(
+            !ids2.contains(id),
+            "#145 regression: pages overlap — id {id} appears on both pages 1 and 2"
+        );
+    }
+}
+
+/// Regression for #145: `list(kind="note")` must honor the `offset` parameter.
+#[tokio::test]
+async fn list_notes_offset_returns_disjoint_pages() {
+    let pack = pack();
+    for i in 0..4 {
+        pack.dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": format!("page_test note #{i:02}"),
+                "note_kind": "observation"
+            }),
+        )
+        .await
+        .expect("create note must succeed");
+    }
+
+    let page1 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "note", "note_kind": "observation", "limit": 2, "offset": 0}),
+        )
+        .await
+        .expect("list page 1 must succeed");
+    let page2 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "note", "note_kind": "observation", "limit": 2, "offset": 2}),
+        )
+        .await
+        .expect("list page 2 must succeed");
+
+    let ids1: Vec<&str> = page1
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+    let ids2: Vec<&str> = page2
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(ids1.len(), 2, "note page 1 must have 2 items; got {ids1:?}");
+    assert_eq!(ids2.len(), 2, "note page 2 must have 2 items; got {ids2:?}");
+    for id in &ids1 {
+        assert!(
+            !ids2.contains(id),
+            "#145 regression: note pages overlap — id {id} on both pages"
+        );
+    }
+}
+
 #[tokio::test]
 async fn list_unknown_kind_returns_invalid_input() {
     let pack = pack();
