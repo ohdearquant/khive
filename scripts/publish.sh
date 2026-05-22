@@ -44,6 +44,7 @@ cd "$(dirname "$0")/../crates"
 CRATES=(
     khive-types
     khive-score
+    khive-fold
     khive-storage
     khive-db
     khive-query
