@@ -391,7 +391,7 @@ impl GtdPack {
         // 500 covers typical inbox/next/active backlogs without paging.
         let notes = self
             .runtime()
-            .list_notes(p.namespace.as_deref(), Some("task"), 500)
+            .list_notes(p.namespace.as_deref(), Some("task"), 500, 0)
             .await?;
 
         let mut actionable: Vec<&khive_storage::note::Note> = notes
@@ -490,7 +490,7 @@ impl GtdPack {
         let window = (offset as u32).saturating_add(limit).saturating_add(500);
         let notes = self
             .runtime()
-            .list_notes(p.namespace.as_deref(), Some("task"), window)
+            .list_notes(p.namespace.as_deref(), Some("task"), window, 0)
             .await?;
 
         let filtered: Vec<&khive_storage::note::Note> = notes

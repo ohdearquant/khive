@@ -639,11 +639,11 @@ async fn search_note_returns_created_content() {
         !hits.is_empty(),
         "search must return at least one hit for matching content"
     );
-    // Every hit must have note_id
+    // Every hit must have id (normalized from substrate-specific note_id — issue #148)
     for hit in hits {
         assert!(
-            hit.get("note_id").is_some(),
-            "each note search hit must have 'note_id'; got: {hit}"
+            hit.get("id").is_some(),
+            "each note search hit must have 'id'; got: {hit}"
         );
     }
 }
@@ -679,8 +679,8 @@ async fn search_entity_returns_created_entity() {
     );
     for hit in hits {
         assert!(
-            hit.get("entity_id").is_some(),
-            "each entity search hit must have 'entity_id'; got: {hit}"
+            hit.get("id").is_some(),
+            "each entity search hit must have 'id'; got: {hit}"
         );
         assert!(
             hit.get("score").is_some(),
@@ -962,8 +962,8 @@ async fn search_kind_memory_routes_to_note_substrate_via_registry() {
     );
     for hit in hits {
         assert!(
-            hit.get("note_id").is_some(),
-            "note-substrate hit must have 'note_id'; got: {hit}"
+            hit.get("id").is_some(),
+            "note-substrate hit must have 'id'; got: {hit}"
         );
     }
 }
@@ -1001,8 +1001,8 @@ async fn search_kind_entity_still_works_alongside_memory_pack() {
     );
     for hit in hits {
         assert!(
-            hit.get("entity_id").is_some(),
-            "entity-substrate hit must have 'entity_id'; got: {hit}"
+            hit.get("id").is_some(),
+            "entity-substrate hit must have 'id'; got: {hit}"
         );
     }
 }

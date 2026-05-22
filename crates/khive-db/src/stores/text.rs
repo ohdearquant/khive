@@ -31,9 +31,13 @@
 //!
 //! # Score normalization
 //!
-//! FTS5 `rank` values are negative (more negative = more relevant). We negate
-//! the rank so higher scores mean better matches, then normalize to `(0, 1]`
-//! via `1 / (1 + abs(rank))`.
+//! FTS5 `rank` values are negative (more negative = more relevant). We
+//! normalize within each result set so scores span `(0.05, 1.0]`, preserving
+//! relative ordering across all tokenizers (including trigram, which produces
+//! a narrow absolute range that the old `1/(1+|rank|)` formula collapsed into
+//! near-uniform noise). The best hit in a result set receives score `1.0`;
+//! the worst receives `0.05`. When all hits have the same rank (single hit or
+//! degenerate match), score is `1.0`.
 
 use std::sync::Arc;
 
@@ -590,25 +594,36 @@ impl TextSearch for Fts5TextSearch {
                     )
                 })?;
 
-                // FTS5 rank is negative (more negative = more relevant).
-                // Normalize: score = 1 / (1 + |rank|), giving (0, 1].
-                let score = 1.0 / (1.0 + fts_rank.abs());
-
                 rank_idx += 1;
-                hits.push(TextSearchHit {
-                    subject_id,
-                    score: DeterministicScore::from_f64(score),
-                    rank: rank_idx,
-                    title: if title.is_empty() { None } else { Some(title) },
-                    snippet: if snippet.is_empty() {
-                        None
-                    } else {
-                        Some(snippet)
-                    },
-                });
+                hits.push((subject_id, fts_rank, rank_idx, title, snippet));
             }
 
-            Ok(hits)
+            // Normalize scores within the result set to (0.05, 1.0].
+            // Best rank (most negative) maps to 1.0, worst to 0.05.
+            let min_rank = hits.iter().map(|h| h.1).fold(f64::INFINITY, f64::min);
+            let max_rank = hits.iter().map(|h| h.1).fold(f64::NEG_INFINITY, f64::max);
+            let range = max_rank - min_rank;
+
+            let results = hits
+                .into_iter()
+                .map(|(subject_id, raw_rank, rank, title, snippet)| {
+                    let score = if range.abs() < 1e-12 {
+                        1.0
+                    } else {
+                        let t = (max_rank - raw_rank) / range;
+                        0.05 + 0.95 * t
+                    };
+                    TextSearchHit {
+                        subject_id,
+                        score: DeterministicScore::from_f64(score),
+                        rank,
+                        title: if title.is_empty() { None } else { Some(title) },
+                        snippet: if snippet.is_empty() { None } else { Some(snippet) },
+                    }
+                })
+                .collect();
+
+            Ok(results)
         })
         .await
     }
@@ -1331,5 +1346,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    /// Score normalization: all scores stay in (0, 1], and a single-hit result
+    /// scores ≈ 1.0. This validates the normalization formula independent of
+    /// FTS5 rank ordering guarantees (which are already tested via `rank` field).
+    #[tokio::test]
+    async fn test_score_normalization_range() {
+        let store = setup_memory_store("score_range");
+
+        // Insert three documents; only two match the query.
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        store
+            .upsert_document(make_document(
+                id1,
+                "normtest topic",
+                "normtest normtest normtest",
+            ))
+            .await
+            .unwrap();
+        store
+            .upsert_document(make_document(
+                id2,
+                "normtest light",
+                "other content without the keyword",
+            ))
+            .await
+            .unwrap();
+        store
+            .upsert_document(make_document(
+                id3,
+                "irrelevant title",
+                "completely different document content",
+            ))
+            .await
+            .unwrap();
+
+        let hits = store
+            .search(TextSearchRequest {
+                query: "normtest".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+            .unwrap();
+
+        // id3 must not match; id1 and id2 should.
+        assert!(hits.len() >= 1, "at least one doc must match");
+        assert!(hits.iter().all(|h| h.subject_id != id3), "id3 must not appear");
+
+        // All scores must be in (0, 1].
+        for h in &hits {
+            let s = h.score.to_f64();
+            assert!(s > 0.0 && s <= 1.0, "score out of (0,1]: {s}");
+        }
+        // Rank field must be 1-indexed and contiguous.
+        for (i, h) in hits.iter().enumerate() {
+            assert_eq!(h.rank, (i + 1) as u32, "rank must equal position+1");
+        }
+        // Best hit (rank=1) must score ≈ 1.0 — normalization anchors the best
+        // rank to 1.0 regardless of absolute BM25 magnitude.
+        assert!(
+            hits[0].score.to_f64() > 0.99,
+            "top hit must score ≈ 1.0, got {}",
+            hits[0].score.to_f64()
+        );
+
+        // Single-hit result: the only match scores ≈ 1.0 (degenerate case:
+        // range == 0 → all hits get 1.0).
+        let single_id = Uuid::new_v4();
+        store
+            .upsert_document(make_document(
+                single_id,
+                "xqzplurp_unique_marker",
+                "xqzplurp_unique_marker body",
+            ))
+            .await
+            .unwrap();
+        let single = store
+            .search(TextSearchRequest {
+                query: "xqzplurp_unique_marker".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+            .unwrap();
+        assert_eq!(single.len(), 1);
+        assert!(
+            single[0].score.to_f64() > 0.99,
+            "single-hit must score ≈ 1.0, got {}",
+            single[0].score.to_f64()
+        );
     }
 }

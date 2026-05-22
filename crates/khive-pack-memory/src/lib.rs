@@ -1,5 +1,8 @@
 pub mod config;
 pub mod handlers;
+pub mod tunable;
+
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -8,8 +11,21 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry};
 use khive_types::{Pack, VerbDef};
 
+use crate::config::RecallConfig;
+
 pub struct MemoryPack {
     runtime: KhiveRuntime,
+    /// Active recall config.
+    config: Mutex<RecallConfig>,
+}
+
+impl MemoryPack {
+    /// Return a clone of the current active `RecallConfig`.
+    ///
+    /// Handlers call this to pick up the latest tuned parameters.
+    pub(crate) fn active_config(&self) -> RecallConfig {
+        self.config.lock().unwrap().clone()
+    }
 }
 
 impl Pack for MemoryPack {
@@ -54,7 +70,10 @@ static MEMORY_VERBS: [VerbDef; 6] = [
 
 impl MemoryPack {
     pub fn new(runtime: KhiveRuntime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            config: Mutex::new(RecallConfig::default()),
+        }
     }
 }
 

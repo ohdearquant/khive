@@ -22,6 +22,9 @@ Concretely, these tests cover:
      error with the valid values listed in the error message.
   7. Merge semantics — `merge(into_id, from_id)` rewires edges to the kept
      entity, unions tags, and the from_id is gone afterward.
+  8. annotates source-must-be-note — entity-as-source is rejected with a
+     clear error; note-as-source succeeds; hard-deleting the target cascades
+     the edge (ADR-002 §annotates endpoint validation).
 
 How to run
 ----------
@@ -746,6 +749,88 @@ def test_merge_semantics(proc: subprocess.Popen) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Contract 8 — annotates source-must-be-note constraint (ADR-002)
+# ---------------------------------------------------------------------------
+
+def test_annotates_source_must_be_note(proc: subprocess.Popen) -> None:
+    """link(source=entity, relation=annotates) must fail; link(source=note, ...) must succeed.
+
+    ADR-002 §annotates: the source of an annotates edge must be a note.
+    Attempting to use an entity as source must return a clear error message
+    containing 'annotates' and 'note', and must not create any edge.
+
+    Also verifies that deleting the annotates target (hard) removes the edge
+    (cascade-delete contract from ADR-002 §annotates endpoint validation).
+    """
+    concept = _tool(proc, "create", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "name": "AnnotatesTarget",
+    })
+    another = _tool(proc, "create", {
+        "kind": "entity",
+        "entity_kind": "concept",
+        "name": "AnnotatesWrongSource",
+    })
+
+    # ---- entity → entity annotates must fail ----
+    err = _expect_rpc_error(proc, "link", {
+        "source_id": another["id"],
+        "target_id": concept["id"],
+        "relation": "annotates",
+    })
+    assert "note" in err.lower(), (
+        f"Error must mention 'note' (ADR-002 constraint); got: {err!r}"
+    )
+    assert "annotates" in err.lower(), (
+        f"Error must mention 'annotates' relation; got: {err!r}"
+    )
+
+    # ---- No edge must have been created ----
+    edges_after = _tool(proc, "list", {"kind": "edge", "source_id": another["id"]})
+    assert edges_after == [], (
+        f"No edge should exist after rejected annotates link, got: {edges_after}"
+    )
+
+    # ---- note → entity annotates must succeed ----
+    note = _tool(proc, "create", {
+        "kind": "note",
+        "note_kind": "observation",
+        "content": "Observation about AnnotatesTarget",
+        "salience": 0.7,
+    })
+    edge = _tool(proc, "link", {
+        "source_id": note["id"],
+        "target_id": concept["id"],
+        "relation": "annotates",
+        "weight": 1.0,
+    })
+    assert edge["relation"] == "annotates", f"Expected annotates edge, got: {edge}"
+    edge_id = edge["id"]
+
+    # Confirm via neighbors that the note appears as inbound annotates neighbor
+    nbrs = _tool(proc, "neighbors", {
+        "node_id": concept["id"],
+        "direction": "in",
+        "relations": ["annotates"],
+    })
+    neighbor_ids = [n.get("node_id", n.get("id", "")) for n in nbrs]
+    assert note["id"] in neighbor_ids, (
+        f"Note should appear as annotates neighbor of concept; neighbors: {neighbor_ids}"
+    )
+
+    # ---- Hard-delete the target entity cascades the annotates edge ----
+    del_result = _tool(proc, "delete", {"id": concept["id"], "hard": True})
+    assert del_result["deleted"] is True
+
+    err_edge = _expect_rpc_error(proc, "get", {"id": edge_id})
+    assert "not found" in err_edge.lower(), (
+        f"annotates edge must be cascade-deleted when target is hard-deleted; "
+        f"get returned: {err_edge!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -765,6 +850,7 @@ def main() -> int:
         ("note_supersession", test_note_supersession),
         ("closed_taxonomy_errors", test_closed_taxonomy_errors),
         ("merge_semantics", test_merge_semantics),
+        ("annotates_source_must_be_note", test_annotates_source_must_be_note),
     ]
 
     for name, fn in tests:

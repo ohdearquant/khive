@@ -187,6 +187,7 @@ impl KhiveRuntime {
         namespace: Option<&str>,
         kind: Option<&str>,
         limit: u32,
+        offset: u32,
     ) -> RuntimeResult<Vec<Entity>> {
         let filter = EntityFilter {
             kinds: match kind {
@@ -197,7 +198,7 @@ impl KhiveRuntime {
         };
         let page = self
             .entities(namespace)?
-            .query_entities(self.ns(namespace), filter, PageRequest { offset: 0, limit })
+            .query_entities(self.ns(namespace), filter, PageRequest { offset: offset.into(), limit })
             .await?;
         Ok(page.items)
     }
@@ -681,10 +682,11 @@ impl KhiveRuntime {
         namespace: Option<&str>,
         kind: Option<&str>,
         limit: u32,
+        offset: u32,
     ) -> RuntimeResult<Vec<Note>> {
         let page = self
             .notes(namespace)?
-            .query_notes(self.ns(namespace), kind, PageRequest { offset: 0, limit })
+            .query_notes(self.ns(namespace), kind, PageRequest { offset: offset.into(), limit })
             .await?;
         Ok(page.items)
     }
@@ -2335,7 +2337,7 @@ mod tests {
         let rt = rt();
         let phantom = Uuid::new_v4();
 
-        let before_count = rt.list_notes(None, None, 1000).await.unwrap().len();
+        let before_count = rt.list_notes(None, None, 1000, 0).await.unwrap().len();
 
         let result = rt
             .create_note(
@@ -2354,7 +2356,7 @@ mod tests {
         );
 
         // Atomicity: the note row must NOT have been written.
-        let after_count = rt.list_notes(None, None, 1000).await.unwrap().len();
+        let after_count = rt.list_notes(None, None, 1000, 0).await.unwrap().len();
         assert_eq!(
             before_count, after_count,
             "failed create_note must not persist any note row (atomicity)"
@@ -3030,7 +3032,7 @@ mod tests {
             .unwrap();
 
         // Confirm the partial state exists before compensation.
-        let before_notes = rt.list_notes(None, None, 1000).await.unwrap();
+        let before_notes = rt.list_notes(None, None, 1000, 0).await.unwrap();
         assert_eq!(before_notes.len(), 1, "note must be present before cleanup");
         let before_edges = rt
             .neighbors(
@@ -3056,7 +3058,7 @@ mod tests {
             .unwrap();
 
         // Post-compensation invariants:
-        let after_notes = rt.list_notes(None, None, 1000).await.unwrap();
+        let after_notes = rt.list_notes(None, None, 1000, 0).await.unwrap();
         assert!(
             after_notes.is_empty(),
             "compensation must remove the note row; got {after_notes:?}"
@@ -3516,7 +3518,7 @@ mod tests {
         );
 
         // Compensation must have removed the note row.
-        let notes = rt.list_notes(None, None, 1000).await.unwrap();
+        let notes = rt.list_notes(None, None, 1000, 0).await.unwrap();
         assert!(
             notes.is_empty(),
             "compensation must remove the note row; got {notes:?}"

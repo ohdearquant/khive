@@ -2,6 +2,7 @@
 //!
 //! Each handler: deserialize params from Value → validate → call runtime → serialize result.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use serde::Deserialize;
@@ -11,7 +12,9 @@ use uuid::Uuid;
 use khive_runtime::{
     EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
 };
-use khive_storage::types::{Direction, NeighborQuery, TraversalOptions, TraversalRequest};
+use khive_storage::types::{
+    Direction, NeighborQuery, PageRequest, TraversalOptions, TraversalRequest,
+};
 use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
 
 use crate::vocab::{EntityKind, NoteKind};
@@ -255,6 +258,7 @@ struct SearchParams {
     limit: Option<u32>,
     entity_kind: Option<String>,
     note_kind: Option<String>,
+    properties: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -484,6 +488,25 @@ fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeErro
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }
 
+/// Returns true if `entity_props` contains all key=value pairs from `filter`.
+///
+/// Both the filter object and the entity's `properties` field must be JSON
+/// objects. If the entity has no properties, returns false when the filter is
+/// non-empty. String comparisons are case-sensitive.
+fn props_match(entity_props: Option<&Value>, filter: &Value) -> bool {
+    let required = match filter.as_object() {
+        Some(obj) if !obj.is_empty() => obj,
+        _ => return true, // empty or non-object filter matches everything
+    };
+    let actual = match entity_props.and_then(Value::as_object) {
+        Some(obj) => obj,
+        None => return false,
+    };
+    required
+        .iter()
+        .all(|(k, v)| actual.get(k).map_or(false, |av| av == v))
+}
+
 // ---- Handler implementations ----
 
 impl KgPack {
@@ -703,9 +726,10 @@ impl KgPack {
                     "entity_kind",
                 )?;
                 let limit = p.limit.unwrap_or(50).min(500);
+                let offset = p.offset.unwrap_or(0);
                 let entities = self
                     .runtime
-                    .list_entities(p.namespace.as_deref(), kind_filter.as_deref(), limit)
+                    .list_entities(p.namespace.as_deref(), kind_filter.as_deref(), limit, offset)
                     .await?;
                 to_json(&entities)
             }
@@ -750,9 +774,10 @@ impl KgPack {
                     "note_kind",
                 )?;
                 let limit = p.limit.unwrap_or(20).min(200);
+                let offset = p.offset.unwrap_or(0);
                 let notes = self
                     .runtime
-                    .list_notes(p.namespace.as_deref(), kind_filter.as_deref(), limit)
+                    .list_notes(p.namespace.as_deref(), kind_filter.as_deref(), limit, offset)
                     .await?;
                 to_json(&notes)
             }
@@ -942,21 +967,78 @@ impl KgPack {
                     |s| canonical_entity_kind(s, registry),
                     "entity_kind",
                 )?;
+                // When a properties filter is active, pull extra candidates so
+                // that filtering doesn't leave fewer results than `limit`.
+                let props_filter = p.properties.as_ref().and_then(|v| {
+                    if v.as_object().map_or(false, |m| !m.is_empty()) {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                });
+                let search_limit = if props_filter.is_some() {
+                    (limit * 4).min(100)
+                } else {
+                    limit
+                };
                 let hits = self
                     .runtime
                     .hybrid_search(
                         p.namespace.as_deref(),
                         &p.query,
                         None,
-                        limit,
+                        search_limit,
                         kind_filter.as_deref(),
                     )
                     .await?;
-                let result: Vec<Value> = hits
+
+                // Apply properties post-filter if requested.
+                let filtered_hits = if let Some(pf) = props_filter {
+                    // Batch-fetch entity records for all candidate hit IDs.
+                    let candidate_ids: Vec<Uuid> =
+                        hits.iter().map(|h| h.entity_id).collect();
+                    let entities_page = self
+                        .runtime
+                        .entities(p.namespace.as_deref())?
+                        .query_entities(
+                            self.runtime.ns(p.namespace.as_deref()),
+                            EntityFilter {
+                                ids: candidate_ids,
+                                ..EntityFilter::default()
+                            },
+                            PageRequest {
+                                offset: 0u64,
+                                limit: hits.len() as u32,
+                            },
+                        )
+                        .await
+                        .map_err(RuntimeError::Storage)?;
+
+                    let entity_props: HashMap<Uuid, Option<Value>> = entities_page
+                        .items
+                        .into_iter()
+                        .map(|e| (e.id, e.properties))
+                        .collect();
+
+                    hits.into_iter()
+                        .filter(|h| {
+                            let ep = entity_props.get(&h.entity_id);
+                            match ep {
+                                Some(props) => props_match(props.as_ref(), pf),
+                                None => false,
+                            }
+                        })
+                        .take(limit as usize)
+                        .collect::<Vec<_>>()
+                } else {
+                    hits
+                };
+
+                let result: Vec<Value> = filtered_hits
                     .iter()
                     .map(|h| {
                         serde_json::json!({
-                            "entity_id": h.entity_id.to_string(),
+                            "id": h.entity_id.to_string(),
                             "score": h.score.to_f64(),
                             "title": h.title,
                             "snippet": h.snippet,
@@ -986,7 +1068,7 @@ impl KgPack {
                     .iter()
                     .map(|h| {
                         serde_json::json!({
-                            "note_id": h.note_id.to_string(),
+                            "id": h.note_id.to_string(),
                             "score": h.score.to_f64(),
                             "title": h.title,
                             "snippet": h.snippet,

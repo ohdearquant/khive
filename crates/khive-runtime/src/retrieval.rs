@@ -191,8 +191,27 @@ impl KhiveRuntime {
                     },
                 )
                 .await?;
-            let alive: HashSet<Uuid> = alive_page.items.into_iter().map(|e| e.id).collect();
+            // Keep entity metadata to enrich hits that had no FTS5 title/snippet.
+            let mut entity_meta: HashMap<Uuid, (String, Option<String>)> = HashMap::new();
+            let mut alive: HashSet<Uuid> = HashSet::new();
+            for e in alive_page.items {
+                alive.insert(e.id);
+                entity_meta.insert(e.id, (e.name, e.description));
+            }
+
             fused.retain(|h| alive.contains(&h.entity_id));
+
+            // Enrich vector-only hits (title/snippet == None) from entity record.
+            for hit in &mut fused {
+                if let Some((name, description)) = entity_meta.get(&hit.entity_id) {
+                    if hit.title.is_none() {
+                        hit.title = Some(name.clone());
+                    }
+                    if hit.snippet.is_none() {
+                        hit.snippet = description.clone();
+                    }
+                }
+            }
         }
 
         fused.truncate(limit as usize);
@@ -500,5 +519,35 @@ mod tests {
             .block_on(rt.embed_batch(&texts));
         let embeddings = result.unwrap();
         assert_eq!(embeddings[0].len(), model.dimensions());
+    }
+
+    // ---- hybrid_search enrichment (issue #147 / #160) ----
+
+    #[tokio::test]
+    async fn hybrid_search_entity_hit_has_title() {
+        let rt = KhiveRuntime::memory().unwrap();
+        rt.create_entity(
+            None,
+            "concept",
+            "FlashAttention",
+            Some("IO-aware exact attention using tiling"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let hits = rt
+            .hybrid_search(None, "FlashAttention", None, 10, None)
+            .await
+            .unwrap();
+
+        assert!(!hits.is_empty(), "should find the entity");
+        let hit = &hits[0];
+        assert!(hit.title.is_some(), "title must be populated");
+        assert!(
+            hit.title.as_deref().unwrap().contains("FlashAttention"),
+            "title must contain entity name"
+        );
     }
 }

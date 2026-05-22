@@ -175,6 +175,32 @@ the base contract, and the closed 13-relation taxonomy is unchanged. Consumers r
 which `(source, relation, target)` triples are legal must consult both this ADR and the loaded
 packs' `EDGE_RULES`.
 
+### `annotates` endpoint validation
+
+The `annotates` relation has a stricter runtime contract than the other 12 relations:
+
+**Source must be a note.** Attempting `link(source=entity, target=anything, relation="annotates")`
+returns `InvalidInput: "annotates source <uuid> must be a note"`. This is enforced in
+`crates/khive-runtime/src/operations.rs::validate_edge_relation_endpoints` before any write is
+committed — the same function also gates `update_edge` so the constraint cannot be bypassed by
+creating a valid edge and then patching the relation field.
+
+**Target may be any substrate UUID** — entity, note, event, or another edge. The runtime
+checks only that the target record exists in the caller's namespace; it does not constrain
+the kind.
+
+**Cascade-delete on target removal.** When the target of an `annotates` edge is hard-deleted,
+the edge is removed automatically:
+
+- `delete_entity(hard=true)` — cascades all incident edges (both inbound and outbound),
+  which includes any `annotates` edges pointing at that entity.
+- `delete_note(hard=true)` — same cascade; covers `annotates` edges whose target is a note.
+- `delete_edge` — removes any `annotates` edges whose target is the deleted edge itself.
+
+Soft-delete leaves edges in place; they are not surfaced by default search/list views but
+remain retrievable via `get(id)` or `neighbors`. There is no separate "orphan sweep" needed
+because the hard-delete cascade is synchronous and atomic within the same SQLite transaction.
+
 ## References
 
 - ADR-001: Entity Kind Taxonomy (defines node kinds that edges connect)

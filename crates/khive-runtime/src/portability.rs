@@ -422,16 +422,16 @@ mod tests {
         assert_eq!(summary.entities_imported, 1);
 
         // Entity is in "b" on the destination runtime.
-        let in_b = dst.list_entities(Some("b"), None, 100).await.unwrap();
+        let in_b = dst.list_entities(Some("b"), None, 100, 0).await.unwrap();
         assert_eq!(in_b.len(), 1);
         assert_eq!(in_b[0].name, "Sinkhorn");
 
         // Namespace "a" on the source runtime is unchanged.
-        let in_a = src.list_entities(Some("a"), None, 100).await.unwrap();
+        let in_a = src.list_entities(Some("a"), None, 100, 0).await.unwrap();
         assert_eq!(in_a.len(), 1);
 
         // Namespace "a" on the destination runtime has nothing (only "b" was written).
-        let dst_a = dst.list_entities(Some("a"), None, 100).await.unwrap();
+        let dst_a = dst.list_entities(Some("a"), None, 100, 0).await.unwrap();
         assert_eq!(dst_a.len(), 0);
     }
 
