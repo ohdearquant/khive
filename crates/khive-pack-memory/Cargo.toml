@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Memory verb pack — remember/recall semantics with decay-aware ranking"
 
 [dependencies]

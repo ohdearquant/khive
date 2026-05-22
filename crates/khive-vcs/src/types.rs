@@ -222,4 +222,144 @@ mod tests {
         assert_eq!(cfg.remote_namespace("local"), "shared");
         assert_eq!(cfg.remote_namespace("other"), "other");
     }
+
+    #[test]
+    fn snapshot_id_from_hash_accepts_uppercase_and_normalizes() {
+        let upper = "A".repeat(64);
+        let id = SnapshotId::from_hash(&upper).unwrap();
+        assert_eq!(id.hex(), "a".repeat(64));
+        assert!(id.as_str().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn snapshot_id_from_hash_trims_whitespace() {
+        let hex = "b".repeat(64);
+        let padded = format!("  {hex}  ");
+        let id = SnapshotId::from_hash(&padded).unwrap();
+        assert_eq!(id.hex(), hex);
+    }
+
+    #[test]
+    fn snapshot_id_display_equals_as_str() {
+        let hex = "c".repeat(64);
+        let id = SnapshotId::from_hash(&hex).unwrap();
+        assert_eq!(id.to_string(), id.as_str());
+    }
+
+    #[test]
+    fn snapshot_id_serde_roundtrip() {
+        let hex = "d".repeat(64);
+        let id = SnapshotId::from_hash(&hex).unwrap();
+        let json = serde_json::to_string(&id).unwrap();
+        let back: SnapshotId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn kg_snapshot_serde_roundtrip() {
+        let hex = "e".repeat(64);
+        let snap = KgSnapshot {
+            id: SnapshotId::from_hash(&hex).unwrap(),
+            namespace: "test-ns".into(),
+            parent_id: None,
+            message: "initial commit".into(),
+            author: Some("ocean".into()),
+            created_at: 1_700_000_000_000_000,
+            entity_count: 42,
+            edge_count: 7,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: KgSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, snap.id);
+        assert_eq!(back.namespace, snap.namespace);
+        assert_eq!(back.parent_id, snap.parent_id);
+        assert_eq!(back.entity_count, 42);
+        assert_eq!(back.edge_count, 7);
+        assert_eq!(back.author, Some("ocean".into()));
+    }
+
+    #[test]
+    fn kg_branch_serde_roundtrip() {
+        let branch = KgBranch {
+            namespace: "test-ns".into(),
+            name: "main".into(),
+            head_id: SnapshotId::from_hash(&"f".repeat(64)).unwrap(),
+            created_at: 1_000_000,
+            updated_at: 2_000_000,
+        };
+        let json = serde_json::to_string(&branch).unwrap();
+        let back: KgBranch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.namespace, branch.namespace);
+        assert_eq!(back.name, branch.name);
+        assert_eq!(back.head_id, branch.head_id);
+        assert_eq!(back.created_at, 1_000_000);
+        assert_eq!(back.updated_at, 2_000_000);
+    }
+
+    #[test]
+    fn remote_auth_bearer_serde_round_trip_and_tag() {
+        let auth = RemoteAuth::Bearer {
+            token: "tok123".into(),
+        };
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"type\":\"bearer\""));
+        let back: RemoteAuth = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, RemoteAuth::Bearer { ref token } if token == "tok123"));
+    }
+
+    #[test]
+    fn remote_auth_debug_redacts_bearer_token() {
+        let auth = RemoteAuth::Bearer {
+            token: "super-secret".into(),
+        };
+        let debug = format!("{:?}", auth);
+        assert!(
+            debug.contains("[REDACTED]"),
+            "expected [REDACTED] in: {debug}"
+        );
+        assert!(!debug.contains("super-secret"), "secret leaked in: {debug}");
+    }
+
+    #[test]
+    fn remote_auth_debug_redacts_basic_password() {
+        let auth = RemoteAuth::Basic {
+            user: "alice".into(),
+            password: "hunter2".into(),
+        };
+        let debug = format!("{:?}", auth);
+        assert!(debug.contains("alice"));
+        assert!(
+            debug.contains("[REDACTED]"),
+            "expected [REDACTED] in: {debug}"
+        );
+        assert!(!debug.contains("hunter2"), "password leaked in: {debug}");
+    }
+
+    #[test]
+    fn remote_config_none_namespace_map_returns_local_name() {
+        let cfg = RemoteConfig {
+            name: "origin".into(),
+            url: "https://example.com".into(),
+            auth: RemoteAuth::None,
+            namespace_map: None,
+        };
+        assert_eq!(cfg.remote_namespace("my-ns"), "my-ns");
+        assert_eq!(cfg.remote_namespace("other-ns"), "other-ns");
+    }
+
+    #[test]
+    fn vcs_state_serde_roundtrip() {
+        let state = VcsState {
+            namespace: "proj".into(),
+            current_branch: Some("main".into()),
+            last_committed_id: Some(SnapshotId::from_hash(&"0".repeat(64)).unwrap()),
+            dirty: true,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: VcsState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.namespace, state.namespace);
+        assert_eq!(back.current_branch, Some("main".into()));
+        assert!(back.dirty);
+        assert_eq!(back.last_committed_id, state.last_committed_id);
+    }
 }

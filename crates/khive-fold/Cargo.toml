@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Cognitive primitives — Fold, Anchor, Objective, Selector"
 
 [dependencies]

@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Brain pack — event-driven auto-tuning via meta-fold (ADR-064)"
 
 [dependencies]
