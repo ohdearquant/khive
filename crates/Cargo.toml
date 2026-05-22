@@ -17,6 +17,7 @@ members = [
     "khive-pack-brain",
     "khive-mcp",
     "khive-vcs",
+    "kkernel",
 ]
 
 [workspace.package]
