@@ -1194,7 +1194,7 @@ mod tests {
     // dispatch, carrying an `audit_event` field that round-trips back to an
     // `AuditEvent`.
 
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Mutex as StdMutex, Once, OnceLock};
 
     use serial_test::serial;
     use tracing::field::{Field, Visit};
@@ -1241,24 +1241,20 @@ mod tests {
     /// Implemented directly (without `tracing_subscriber::registry()` layering)
     /// to avoid the layer machinery that can cause thread-local dispatch to be
     /// bypassed when the registry's internal global state is initialised by
-    /// another subscriber in the same test binary (Ubuntu CI regression).
+    /// another subscriber in the same test binary.
     ///
-    /// Only captures events emitted on the installing thread.  In CI's
-    /// multi-threaded test runner, `#[tokio::test]` futures may emit tracing
-    /// events on arbitrary pool threads; filtering by `ThreadId` prevents those
-    /// from contaminating the capture buffer of a serial tracing test running
-    /// on the same thread at the same wall-clock time.
+    /// Isolation across concurrent tests is handled at the dispatcher level by
+    /// `tracing::dispatcher::with_default`, which installs this subscriber
+    /// as the thread-local default for the duration of the test closure.
+    /// Other threads (e.g. `#[tokio::test]` pool workers) emit through their
+    /// own (typically NoSubscriber) dispatchers and never reach this instance.
     struct CaptureSubscriber {
         events: Arc<StdMutex<Vec<CapturedEvent>>>,
-        owner_thread: std::thread::ThreadId,
     }
 
     impl CaptureSubscriber {
         fn new(events: Arc<StdMutex<Vec<CapturedEvent>>>) -> Self {
-            Self {
-                events,
-                owner_thread: std::thread::current().id(),
-            }
+            Self { events }
         }
     }
 
@@ -1272,12 +1268,6 @@ mod tests {
         fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
         fn event(&self, event: &tracing::Event<'_>) {
-            // Only capture events from the thread that installed this subscriber.
-            // Concurrent #[tokio::test] futures on other pool threads must not
-            // bleed into this buffer.
-            if std::thread::current().id() != self.owner_thread {
-                return;
-            }
             let mut visitor = CapturedEventVisitor::default();
             event.record(&mut visitor);
             self.events.lock().unwrap().push(visitor.0);
@@ -1286,51 +1276,96 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// Run an async block under a scoped tracing subscriber and return the
-    /// events captured during the run.
+    /// Global capture buffer for the tracing tests.
     ///
-    /// Uses a minimal `Subscriber` implementation (not `tracing_subscriber::registry()`)
-    /// to avoid layer-machinery global-state races on Ubuntu CI. The current-thread
-    /// tokio runtime keeps all async work on the same thread as `with_default`, so
-    /// the thread-local subscriber captures every `tracing::info!` call in the body.
+    /// The subscriber is installed exactly once via `set_global_default`
+    /// (thread-local dispatchers via `with_default` proved unreliable when
+    /// other tests in the binary configure their own dispatchers in parallel —
+    /// the global state interacted unpredictably and events were lost).
     ///
-    /// Events from other threads are filtered out (see [`CaptureSubscriber`]) so
-    /// that concurrent `#[tokio::test]` fixtures cannot inject spurious events.
+    /// Each test that uses this buffer is `#[serial]`, so only one
+    /// runs at a time. The buffer is cleared at the start of each capture call.
+    static GLOBAL_CAPTURE: OnceLock<Arc<StdMutex<Vec<CapturedEvent>>>> = OnceLock::new();
+    static GLOBAL_INIT: Once = Once::new();
+
+    fn global_capture() -> Arc<StdMutex<Vec<CapturedEvent>>> {
+        GLOBAL_INIT.call_once(|| {
+            let buffer = Arc::new(StdMutex::new(Vec::new()));
+            let subscriber = CaptureSubscriber::new(Arc::clone(&buffer));
+            // Ignore error: if another subscriber is already set globally, our
+            // subscriber installation fails, but the buffer will simply stay
+            // empty and tests will fail with a clear "got 0 events" message
+            // rather than a silent corruption.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            let _ = GLOBAL_CAPTURE.set(buffer);
+        });
+        Arc::clone(GLOBAL_CAPTURE.get().expect("global capture initialized"))
+    }
+
+    /// Run an async block under the global capture subscriber and return
+    /// the events emitted during the run. Clears the buffer at the start.
+    ///
+    /// Callers MUST be `#[serial]` to prevent concurrent buffer pollution.
     fn capture_dispatch_events<Fut>(future: Fut) -> Vec<CapturedEvent>
     where
         Fut: std::future::Future<Output = ()>,
     {
-        let captured: Arc<StdMutex<Vec<CapturedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber::new(Arc::clone(&captured));
-        let dispatch = tracing::Dispatch::new(subscriber);
+        let buffer = global_capture();
+        buffer.lock().unwrap().clear();
 
-        tracing::dispatcher::with_default(&dispatch, || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build current-thread tokio runtime");
-            rt.block_on(future);
-        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread tokio runtime");
+        rt.block_on(future);
 
-        let guard = captured.lock().unwrap();
-        guard.clone()
+        let result = buffer.lock().unwrap().clone();
+        result
     }
 
-    /// Pull every captured event whose `message` matches `"gate.check"`.
-    fn gate_check_events(events: &[CapturedEvent]) -> Vec<&CapturedEvent> {
+    /// Pull every captured event whose `message` matches `"gate.check"` AND
+    /// whose audit_event JSON declares the expected `gate_impl` name.
+    ///
+    /// Filtering by `gate_impl` lets concurrent tests in the same binary
+    /// emit their own gate.check events into the global capture buffer
+    /// without polluting each others' counts.
+    fn gate_check_events_for(events: &[CapturedEvent], gate_impl: &str) -> Vec<CapturedEvent> {
         events
             .iter()
             .filter(|e| e.message.as_deref() == Some("gate.check"))
+            .filter(|e| {
+                e.audit_event
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .and_then(|v| {
+                        v.get("gate_impl")
+                            .and_then(|g| g.as_str().map(|s| s.to_string()))
+                    })
+                    .as_deref()
+                    == Some(gate_impl)
+            })
+            .cloned()
             .collect()
     }
 
     #[test]
     #[serial]
     fn dispatch_tracing_emits_one_gate_check_event_on_allow() {
+        #[derive(Debug)]
+        struct TracingAllowGate;
+        impl Gate for TracingAllowGate {
+            fn check(&self, _: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::allow())
+            }
+            fn impl_name(&self) -> &'static str {
+                "TracingAllowGate"
+            }
+        }
+
         let events = capture_dispatch_events(async {
             let mut builder = VerbRegistryBuilder::new();
             builder.register(AlphaPack);
-            builder.with_gate(Arc::new(AllowAllGate));
+            builder.with_gate(Arc::new(TracingAllowGate));
             builder.with_default_namespace("tenant-default");
             let reg = builder.build().expect("registry builds");
             reg.dispatch("list", serde_json::json!({"namespace": "tenant-q"}))
@@ -1338,7 +1373,7 @@ mod tests {
                 .unwrap();
         });
 
-        let gate_events = gate_check_events(&events);
+        let gate_events = gate_check_events_for(&events, "TracingAllowGate");
         assert_eq!(
             gate_events.len(),
             1,
@@ -1353,7 +1388,7 @@ mod tests {
         assert_eq!(audit.decision, AuditDecision::Allow);
         assert_eq!(audit.verb, "list");
         assert_eq!(audit.namespace, "tenant-q");
-        assert_eq!(audit.gate_impl, "AllowAllGate");
+        assert_eq!(audit.gate_impl, "TracingAllowGate");
         assert!(
             audit.deny_reason.is_none(),
             "deny_reason must be None on Allow"
@@ -1629,27 +1664,27 @@ mod tests {
     #[serial]
     fn dispatch_tracing_emits_gate_check_event_with_deny_payload() {
         #[derive(Debug)]
-        struct AlwaysDenyGate;
-        impl Gate for AlwaysDenyGate {
+        struct TracingDenyGate;
+        impl Gate for TracingDenyGate {
             fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
                 Ok(GateDecision::deny("denied by test gate"))
             }
             fn impl_name(&self) -> &'static str {
-                "AlwaysDenyGate"
+                "TracingDenyGate"
             }
         }
 
         let events = capture_dispatch_events(async {
             let mut builder = VerbRegistryBuilder::new();
             builder.register(AlphaPack);
-            builder.with_gate(Arc::new(AlwaysDenyGate));
+            builder.with_gate(Arc::new(TracingDenyGate));
             let reg = builder.build().expect("registry builds");
             // Hard enforcement (ADR-035) — dispatch returns PermissionDenied on Deny.
             // The tracing audit event is still emitted before the error is returned.
             let _ = reg.dispatch("create", serde_json::Value::Null).await;
         });
 
-        let gate_events = gate_check_events(&events);
+        let gate_events = gate_check_events_for(&events, "TracingDenyGate");
         assert_eq!(
             gate_events.len(),
             1,
@@ -1663,7 +1698,7 @@ mod tests {
             serde_json::from_str(payload).expect("audit_event payload must decode to AuditEvent");
         assert_eq!(audit.decision, AuditDecision::Deny);
         assert_eq!(audit.deny_reason.as_deref(), Some("denied by test gate"));
-        assert_eq!(audit.gate_impl, "AlwaysDenyGate");
+        assert_eq!(audit.gate_impl, "TracingDenyGate");
         // Wire-shape rule from ADR-033: obligations is always serialized as an
         // array, empty on Deny. Round-trip back through serde_json::Value to
         // confirm the field exists on the wire and is `[]`, not missing.

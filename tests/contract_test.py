@@ -373,11 +373,12 @@ def test_gql_property_projection(proc: subprocess.Popen) -> None:
     })
 
     # ---- RETURN a.name, b.name — must succeed and contain only those columns ----
-    rows = _tool(proc, "query", {
+    result = _tool(proc, "query", {
         "query": "MATCH (a:concept)-[e:extends]->(b:concept) RETURN a.name, b.name LIMIT 10",
     })
+    rows = result.get("rows", result) if isinstance(result, dict) else result
     assert isinstance(rows, list) and len(rows) >= 1, (
-        f"Expected >=1 rows for valid projection, got: {rows}"
+        f"Expected >=1 rows for valid projection, got: {result}"
     )
     row = rows[0]
     # The runtime serialises SqlRow as {"columns": [{"name": col_name, "value": {...}}]}.
@@ -541,7 +542,7 @@ def test_note_supersession(proc: subprocess.Popen) -> None:
         "query": "unique_token_abc",
         "limit": 20,
     })
-    hit_note_ids = [h.get("note_id", "") for h in hits]
+    hit_note_ids = [h.get("id", h.get("note_id", "")) for h in hits]
 
     assert old_id not in hit_note_ids, (
         f"Superseded note (old_id={old_id}) should be excluded from search, "
