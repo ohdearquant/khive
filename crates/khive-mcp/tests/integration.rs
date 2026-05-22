@@ -670,7 +670,7 @@ async fn search_with_granular_entity_kind() -> anyhow::Result<()> {
     assert!(!arr.is_empty(), "expected at least one hit");
     // Verify the hit kind: fetch each via get and assert kind=concept.
     for hit in arr {
-        let id = hit["entity_id"].as_str().unwrap().to_string();
+        let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
             got["data"]["kind"], "concept",
@@ -698,7 +698,7 @@ async fn search_with_granular_task_kind() -> anyhow::Result<()> {
     let arr = hits.as_array().expect("array");
     assert!(!arr.is_empty(), "expected task hits");
     for hit in arr {
-        let id = hit["note_id"].as_str().unwrap().to_string();
+        let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
             got["data"]["kind"], "task",
@@ -786,7 +786,7 @@ async fn search_substrate_kind_entity_with_legacy_entity_kind_sub_filter() -> an
     let arr = hits.as_array().expect("array");
     assert!(!arr.is_empty(), "expected concept hits, got: {arr:?}");
     for hit in arr {
-        let id = hit["entity_id"].as_str().unwrap().to_string();
+        let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
             got["data"]["kind"], "concept",
@@ -820,7 +820,7 @@ async fn search_substrate_kind_note_with_legacy_note_kind_sub_filter() -> anyhow
     let arr = hits.as_array().expect("array");
     assert!(!arr.is_empty(), "expected task hits, got: {arr:?}");
     for hit in arr {
-        let id = hit["note_id"].as_str().unwrap().to_string();
+        let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
             got["data"]["kind"], "task",
@@ -890,7 +890,7 @@ async fn search_kind_filter_surfaces_right_kind_when_wrong_kind_outranks() -> an
         "right-kind hit must surface even when wrong-kind hits outrank it; got: {arr:?}"
     );
     for hit in arr {
-        let id = hit["entity_id"].as_str().unwrap().to_string();
+        let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
             got["data"]["kind"], "concept",

@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 
 use khive_fold::{Fold, FoldContext};
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry};
-use khive_storage::event::EventFilter;
+use khive_runtime::{DispatchHook, KhiveRuntime, RuntimeError, VerbRegistry};
+use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
 use khive_types::{Pack, VerbDef};
 
@@ -296,6 +296,30 @@ impl PackRuntime for BrainPack {
                 "brain pack does not handle verb {verb:?}"
             ))),
         }
+    }
+}
+
+/// `BrainPack` as a post-dispatch hook (Issue #158).
+///
+/// When registered via `VerbRegistryBuilder::with_dispatch_hook`, every
+/// successful verb dispatch calls `on_dispatch` with a synthesized `Event`.
+/// The event is fed into `EventFold::step`, updating the brain's posteriors
+/// in real time — no polling required.
+///
+/// This is opt-in: the hook must be explicitly registered. Registries that do
+/// not load the brain pack are unaffected.
+#[async_trait]
+impl DispatchHook for BrainPack {
+    async fn on_dispatch(&self, event: &Event) {
+        let ctx = FoldContext::new();
+        let mut state = self.state.lock().unwrap();
+        // Replace state with fold result. BrainState is not Clone, so we
+        // use mem::replace with a sentinel and immediately overwrite.
+        let current = std::mem::replace(
+            &mut *state,
+            BrainState::new(std::collections::HashMap::new(), 0),
+        );
+        *state = self.fold.step(current, event, &ctx);
     }
 }
 

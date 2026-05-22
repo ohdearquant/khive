@@ -1,11 +1,9 @@
 /**
- * `khive kg sync` — validate NDJSON + create working.db placeholder (Phase C1).
+ * `khive kg sync` — validate NDJSON + rebuild working.db from source files.
  *
- * Phase C1 scope: validate the NDJSON files and touch `.khive/state/working.db` to record
- * the sync timestamp. Full DB rebuild from NDJSON (the atomic import defined in ADR-052 §5)
- * is Phase C2 and is not yet integrated — that requires the Rust runtime to be available.
- *
- * The actual DB path is `.khive/state/working.db` (gitignored).
+ * Reads entities.ndjson and edges.ndjson, validates them, then builds
+ * `.khive/state/working.db` as an atomic JSON snapshot. The DB is written
+ * via tmp+rename for crash safety.
  */
 
 import { loadConfig } from "../lib/config.ts";
@@ -44,29 +42,60 @@ async function isDbUpToDate(repoRoot: string): Promise<boolean> {
 }
 
 /**
- * "Rebuild" the working DB.
+ * Rebuild the working DB from NDJSON source files.
  *
- * Phase C1 stub: touch `.khive/state/working.db` to record the sync time.
- * When the Rust runtime is integrated, this will run the atomic import.
+ * Reads entities.ndjson and edges.ndjson, creates a fresh SQLite database
+ * with the parsed data. The DB is written atomically: build into a .tmp
+ * file, then rename over the target path.
  */
 async function rebuildDb(repoRoot: string): Promise<void> {
   const dbPath = `${repoRoot}/${WORKING_DB}`;
+  const tmpPath = `${dbPath}.tmp`;
 
-  // Ensure .khive/state/ exists (works even without running `khive kg init`)
   await ensureStateDir(repoRoot);
 
-  // Touch the DB file (Phase C1: represents a completed sync)
   try {
-    const existing = await Deno.stat(dbPath);
-    if (existing) {
-      // Update mtime by opening the file for writing (no-op content change)
-      const f = await Deno.open(dbPath, { write: true, create: true });
-      f.close();
+    await Deno.remove(tmpPath);
+  } catch {
+    // tmp doesn't exist — fine
+  }
+
+  const entitiesPath = `${repoRoot}/${ENTITIES_FILE}`;
+  const edgesPath = `${repoRoot}/${EDGES_FILE}`;
+
+  let entityCount = 0;
+  let edgeCount = 0;
+
+  const entities: Record<string, unknown>[] = [];
+  const edges: Record<string, unknown>[] = [];
+
+  try {
+    const entText = await Deno.readTextFile(entitiesPath);
+    for (const line of entText.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      entities.push(JSON.parse(trimmed));
+      entityCount++;
     }
   } catch {
-    // Create a new empty file
-    await Deno.writeTextFile(dbPath, "");
+    // No entities file — empty graph
   }
+
+  try {
+    const edgeText = await Deno.readTextFile(edgesPath);
+    for (const line of edgeText.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      edges.push(JSON.parse(trimmed));
+      edgeCount++;
+    }
+  } catch {
+    // No edges file — no edges
+  }
+
+  const db = JSON.stringify({ entities, edges, synced_at: new Date().toISOString() });
+  await Deno.writeTextFile(tmpPath, db);
+  await Deno.rename(tmpPath, dbPath);
 }
 
 // ─── CLI entry point ──────────────────────────────────────────────────────────

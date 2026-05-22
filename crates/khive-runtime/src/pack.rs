@@ -22,6 +22,25 @@ use serde_json::Value;
 
 pub use khive_types::{EdgeEndpointRule, EndpointKind, VerbDef};
 
+/// Hook called after every successful verb dispatch (Issue #158).
+///
+/// Packs that want to observe real-time dispatch outcomes (e.g. brain pack
+/// updating its posteriors) implement this trait and register it via
+/// [`VerbRegistryBuilder::with_dispatch_hook`]. The hook is opt-in: when no
+/// hook is registered, dispatch incurs zero overhead.
+///
+/// The hook receives the synthesized `Event` that was built from the dispatch
+/// outcome — same representation used by the EventStore audit path — so brain
+/// pack's `EventFold` can process it without extra conversion.
+#[async_trait]
+pub trait DispatchHook: Send + Sync {
+    /// Called with the dispatch-outcome event after a successful pack dispatch.
+    ///
+    /// Errors are logged via `tracing::warn!` and never propagated to the
+    /// caller — the dispatch has already succeeded.
+    async fn on_dispatch(&self, event: &Event);
+}
+
 use crate::error::{
     CircularPackDependency, MissingPackDependencies, MissingPackDependency, RuntimeError,
 };
@@ -142,6 +161,12 @@ pub struct VerbRegistryBuilder {
     /// registry does not depend on the full `KhiveRuntime` surface — only the
     /// audit-persistence capability is needed here.
     event_store: Option<Arc<dyn EventStore>>,
+    /// Optional post-dispatch hook (Issue #158).
+    ///
+    /// When set, every successful pack dispatch calls `hook.on_dispatch(event)`
+    /// with a synthesized Event describing the outcome. Opt-in: when None,
+    /// no overhead is incurred.
+    dispatch_hook: Option<Arc<dyn DispatchHook>>,
 }
 
 impl VerbRegistryBuilder {
@@ -151,6 +176,7 @@ impl VerbRegistryBuilder {
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::default_ns().as_str().to_string(),
             event_store: None,
+            dispatch_hook: None,
         }
     }
 
@@ -200,6 +226,21 @@ impl VerbRegistryBuilder {
     /// (the v0.2 default). There is no behavior change for them.
     pub fn with_event_store(&mut self, store: Arc<dyn EventStore>) -> &mut Self {
         self.event_store = Some(store);
+        self
+    }
+
+    /// Register a post-dispatch hook (Issue #158).
+    ///
+    /// When set, every successful pack dispatch calls `hook.on_dispatch(event)`
+    /// with a synthesized [`Event`] describing the verb outcome. The hook is
+    /// opt-in: registries without a hook incur zero overhead on the dispatch
+    /// hot path.
+    ///
+    /// Brain pack uses this to update its posteriors in real time without
+    /// polling the EventStore. Errors from `on_dispatch` are logged via
+    /// `tracing::warn!` and never propagated.
+    pub fn with_dispatch_hook(&mut self, hook: Arc<dyn DispatchHook>) -> &mut Self {
+        self.dispatch_hook = Some(hook);
         self
     }
 
@@ -290,6 +331,7 @@ impl VerbRegistryBuilder {
             gate: self.gate,
             default_namespace: self.default_namespace,
             event_store: self.event_store,
+            dispatch_hook: self.dispatch_hook,
         })
     }
 }
@@ -371,6 +413,8 @@ pub struct VerbRegistry {
     default_namespace: String,
     /// Audit event sink — `None` means tracing-only (v0.2 default) (ADR-035).
     event_store: Option<Arc<dyn EventStore>>,
+    /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
+    dispatch_hook: Option<Arc<dyn DispatchHook>>,
 }
 
 impl VerbRegistry {
@@ -405,13 +449,16 @@ impl VerbRegistry {
     /// Transports that have richer caller context (auth headers, session
     /// info) will gain a sibling dispatch path in a follow-up.
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
-        let ns_str = params
+        // Resolve namespace as an owned String before `params` is moved into
+        // pack.dispatch, so the post-dispatch hook can reference it.
+        let ns_str: String = params
             .get("namespace")
             .and_then(Value::as_str)
-            .unwrap_or(&self.default_namespace);
+            .map(str::to_string)
+            .unwrap_or_else(|| self.default_namespace.clone());
         let gate_req = GateRequest::new(
             ActorRef::anonymous(),
-            Namespace::new(ns_str),
+            Namespace::new(&ns_str),
             verb,
             params.clone(),
         );
@@ -489,7 +536,22 @@ impl VerbRegistry {
 
         for pack in self.packs.iter() {
             if pack.verbs().iter().any(|v| v.name == verb) {
-                return pack.dispatch(verb, params, self).await;
+                let result = pack.dispatch(verb, params, self).await;
+
+                // Post-dispatch hook: fires on success, opt-in (Issue #158).
+                if let (Ok(_), Some(hook)) = (&result, &self.dispatch_hook) {
+                    let dispatch_event = Event::new(
+                        ns_str.as_str(),
+                        verb,
+                        SubstrateKind::Event,
+                        pack.name(),
+                    )
+                    .with_outcome(EventOutcome::Success);
+                    let hook = Arc::clone(hook);
+                    hook.on_dispatch(&dispatch_event).await;
+                }
+
+                return result;
             }
         }
         let available: Vec<&str> = self
@@ -1184,7 +1246,25 @@ mod tests {
     /// to avoid the layer machinery that can cause thread-local dispatch to be
     /// bypassed when the registry's internal global state is initialised by
     /// another subscriber in the same test binary (Ubuntu CI regression).
-    struct CaptureSubscriber(Arc<StdMutex<Vec<CapturedEvent>>>);
+    ///
+    /// Only captures events emitted on the installing thread.  In CI's
+    /// multi-threaded test runner, `#[tokio::test]` futures may emit tracing
+    /// events on arbitrary pool threads; filtering by `ThreadId` prevents those
+    /// from contaminating the capture buffer of a serial tracing test running
+    /// on the same thread at the same wall-clock time.
+    struct CaptureSubscriber {
+        events: Arc<StdMutex<Vec<CapturedEvent>>>,
+        owner_thread: std::thread::ThreadId,
+    }
+
+    impl CaptureSubscriber {
+        fn new(events: Arc<StdMutex<Vec<CapturedEvent>>>) -> Self {
+            Self {
+                events,
+                owner_thread: std::thread::current().id(),
+            }
+        }
+    }
 
     impl tracing::Subscriber for CaptureSubscriber {
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -1196,9 +1276,15 @@ mod tests {
         fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
         fn event(&self, event: &tracing::Event<'_>) {
+            // Only capture events from the thread that installed this subscriber.
+            // Concurrent #[tokio::test] futures on other pool threads must not
+            // bleed into this buffer.
+            if std::thread::current().id() != self.owner_thread {
+                return;
+            }
             let mut visitor = CapturedEventVisitor::default();
             event.record(&mut visitor);
-            self.0.lock().unwrap().push(visitor.0);
+            self.events.lock().unwrap().push(visitor.0);
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
@@ -1211,12 +1297,15 @@ mod tests {
     /// to avoid layer-machinery global-state races on Ubuntu CI. The current-thread
     /// tokio runtime keeps all async work on the same thread as `with_default`, so
     /// the thread-local subscriber captures every `tracing::info!` call in the body.
+    ///
+    /// Events from other threads are filtered out (see [`CaptureSubscriber`]) so
+    /// that concurrent `#[tokio::test]` fixtures cannot inject spurious events.
     fn capture_dispatch_events<Fut>(future: Fut) -> Vec<CapturedEvent>
     where
         Fut: std::future::Future<Output = ()>,
     {
         let captured: Arc<StdMutex<Vec<CapturedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber(Arc::clone(&captured));
+        let subscriber = CaptureSubscriber::new(Arc::clone(&captured));
         let dispatch = tracing::Dispatch::new(subscriber);
 
         tracing::dispatcher::with_default(&dispatch, || {
@@ -2322,5 +2411,205 @@ mod dep_tests {
         let reg = builder.build().expect("packs with REQUIRES=&[] build");
         assert_eq!(reg.pack_requires("no_deps_a").unwrap(), &[] as &[&str]);
         assert_eq!(reg.pack_requires("no_deps_b").unwrap(), &[] as &[&str]);
+    }
+}
+
+// ── Dispatch hook tests (Issue #158) ─────────────────────────────────────────
+
+#[cfg(test)]
+mod hook_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use khive_types::Pack;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    struct SimplePack;
+
+    impl Pack for SimplePack {
+        const NAME: &'static str = "simple";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const VERBS: &'static [VerbDef] = &[VerbDef {
+            name: "ping",
+            description: "ping",
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for SimplePack {
+        fn name(&self) -> &str {
+            SimplePack::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            SimplePack::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            SimplePack::ENTITY_KINDS
+        }
+        fn verbs(&self) -> &'static [VerbDef] {
+            SimplePack::VERBS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({ "verb": verb }))
+        }
+    }
+
+    /// Hook that counts calls and records the last verb seen.
+    #[derive(Default)]
+    struct CountingHook {
+        calls: AtomicUsize,
+        last_verb: StdMutex<String>,
+    }
+
+    #[async_trait]
+    impl DispatchHook for CountingHook {
+        async fn on_dispatch(&self, event: &Event) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_verb.lock().unwrap() = event.verb.clone();
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_hook_fires_on_successful_dispatch() {
+        let hook = Arc::new(CountingHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(SimplePack);
+        builder.with_dispatch_hook(hook.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("ping", Value::Null).await.unwrap();
+
+        assert_eq!(
+            hook.calls.load(Ordering::SeqCst),
+            1,
+            "hook must fire once per successful dispatch"
+        );
+        assert_eq!(
+            hook.last_verb.lock().unwrap().as_str(),
+            "ping",
+            "hook event must carry the dispatched verb"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_hook_fires_multiple_times() {
+        let hook = Arc::new(CountingHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(SimplePack);
+        builder.with_dispatch_hook(hook.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("ping", Value::Null).await.unwrap();
+        reg.dispatch("ping", Value::Null).await.unwrap();
+        reg.dispatch("ping", Value::Null).await.unwrap();
+
+        assert_eq!(
+            hook.calls.load(Ordering::SeqCst),
+            3,
+            "hook must fire once per successful dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_hook_does_not_fire_on_unknown_verb() {
+        let hook = Arc::new(CountingHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(SimplePack);
+        builder.with_dispatch_hook(hook.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let _ = reg.dispatch("nonexistent", Value::Null).await;
+
+        assert_eq!(
+            hook.calls.load(Ordering::SeqCst),
+            0,
+            "hook must NOT fire for unknown verb (dispatch returns error)"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_hook_does_not_fire_on_gate_deny() {
+        use khive_gate::{Gate, GateDecision, GateError};
+
+        #[derive(Debug)]
+        struct AlwaysDenyGate;
+        impl Gate for AlwaysDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::deny("test deny"))
+            }
+        }
+
+        let hook = Arc::new(CountingHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(SimplePack);
+        builder.with_gate(Arc::new(AlwaysDenyGate));
+        builder.with_dispatch_hook(hook.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg.dispatch("ping", Value::Null).await.unwrap_err();
+        assert!(matches!(err, RuntimeError::PermissionDenied { .. }));
+
+        assert_eq!(
+            hook.calls.load(Ordering::SeqCst),
+            0,
+            "hook must NOT fire when gate denies dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_hook_event_carries_namespace_from_params() {
+        let hook = Arc::new(CountingHook::default());
+
+        #[derive(Default)]
+        struct NsCapturingHook {
+            ns: StdMutex<String>,
+        }
+
+        #[async_trait]
+        impl DispatchHook for NsCapturingHook {
+            async fn on_dispatch(&self, event: &Event) {
+                *self.ns.lock().unwrap() = event.namespace.clone();
+            }
+        }
+
+        let ns_hook = Arc::new(NsCapturingHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(SimplePack);
+        builder.with_dispatch_hook(ns_hook.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch(
+            "ping",
+            serde_json::json!({"namespace": "tenant-abc"}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ns_hook.ns.lock().unwrap().as_str(),
+            "tenant-abc",
+            "dispatch hook event must carry the resolved namespace"
+        );
+
+        // Suppress unused-variable warning from the outer hook.
+        drop(hook);
+    }
+
+    #[tokio::test]
+    async fn no_dispatch_hook_configured_dispatch_succeeds() {
+        // Regression: registries without a hook must still work.
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(SimplePack);
+        // No with_dispatch_hook call.
+        let reg = builder.build().expect("registry builds");
+
+        let res = reg.dispatch("ping", Value::Null).await.unwrap();
+        assert_eq!(res["verb"], "ping");
     }
 }

@@ -403,7 +403,105 @@ def gtd_smoke():
         assert done["to"] == "done"
         print(f"  [gtd] complete — transitioned to done")
 
+        # tasks: list tasks filtered by status
+        t1 = call_verb(proc, "assign", {
+            "title": "waiting task",
+            "status": "waiting",
+            "priority": "p1",
+        })
+        t2 = call_verb(proc, "assign", {
+            "title": "inbox task",
+            "status": "inbox",
+            "priority": "p2",
+        })
+        waiting_tasks = call_verb(proc, "tasks", {"status": "waiting"})
+        assert isinstance(waiting_tasks, list), f"tasks must return a list, got: {waiting_tasks}"
+        waiting_ids = [t["full_id"] for t in waiting_tasks]
+        assert t1["full_id"] in waiting_ids, (
+            f"'waiting task' must appear in tasks(status=waiting): {waiting_ids}"
+        )
+        assert t2["full_id"] not in waiting_ids, (
+            f"'inbox task' must NOT appear in tasks(status=waiting): {waiting_ids}"
+        )
+        print(f"  [gtd] tasks(status=waiting) — {len(waiting_tasks)} task(s)")
+
+        # transition: explicit lifecycle change with validation
+        trans = call_verb(proc, "transition", {
+            "id": t2["full_id"],
+            "status": "next",
+            "note": "promoted from inbox",
+        })
+        assert trans["transitioned"] is True, f"transition must set transitioned=true: {trans}"
+        assert trans["to"] == "next", f"transition must report to=next: {trans}"
+        print(f"  [gtd] transition inbox→next — ok")
+
+        # transition: idempotent (same status) must not error
+        trans_idem = call_verb(proc, "transition", {
+            "id": t2["full_id"],
+            "status": "next",
+        })
+        assert trans_idem["transitioned"] is False, (
+            f"idempotent transition must set transitioned=false: {trans_idem}"
+        )
+        print(f"  [gtd] transition idempotent — ok")
+
         print(f"\n  GTD PACK SMOKE TESTS PASSED")
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
+def memory_smoke():
+    """Optional smoke test for the memory pack — exercises remember and recall."""
+    proc = subprocess.Popen(
+        [
+            BINARY, "--db", ":memory:", "--no-embed", "--log", "error",
+            "--pack", "kg", "--pack", "memory",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        send(proc, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "memory-smoke", "version": "0.1.0"},
+        })
+        recv(proc)
+        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        proc.stdin.write((json.dumps(notify) + "\n").encode())
+        proc.stdin.flush()
+
+        # remember: store a memory note
+        mem = call_verb(proc, "remember", {
+            "content": "khive uses SQLite with FTS5 and sqlite-vec for hybrid search",
+            "importance": 0.9,
+            "memory_type": "semantic",
+        })
+        assert mem is not None, "remember must return a result"
+        mem_id = mem.get("id") or mem.get("note_id")
+        assert mem_id, f"remember must return an id: {mem}"
+        print(f"  [memory] remember — id {str(mem_id)[:8]}...")
+
+        # remember: second memory with different content
+        mem2 = call_verb(proc, "remember", {
+            "content": "The runtime enforces namespace isolation for every ID-based operation",
+            "importance": 0.7,
+            "memory_type": "semantic",
+        })
+        assert mem2 is not None, "second remember must return a result"
+        print(f"  [memory] remember (second) — ok")
+
+        # recall: returns a list (possibly empty with --no-embed, FTS still works)
+        hits = call_verb(proc, "recall", {
+            "query": "SQLite hybrid search",
+            "limit": 5,
+        })
+        assert isinstance(hits, list), f"recall must return a list, got: {hits}"
+        print(f"  [memory] recall — {len(hits)} hit(s)")
+
+        print(f"\n  MEMORY PACK SMOKE TESTS PASSED")
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
@@ -417,4 +515,10 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  [gtd FAIL] {e}")
             code = 2
+    if code == 0 and os.environ.get("KHIVE_SMOKE_MEMORY", "1") != "0":
+        try:
+            memory_smoke()
+        except Exception as e:
+            print(f"  [memory FAIL] {e}")
+            code = 3
     sys.exit(code)

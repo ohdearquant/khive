@@ -13,6 +13,7 @@ description = "Memory verb pack — remember/recall semantics with decay-aware r
 [dependencies]
 khive-types = { version = "0.1.4", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.1.4", path = "../khive-runtime" }
+khive-pack-brain = { version = "0.1.4", path = "../khive-pack-brain" }
 inventory = { workspace = true }
 khive-storage = { version = "0.1.4", path = "../khive-storage" }
 async-trait = { workspace = true }

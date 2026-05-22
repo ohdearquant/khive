@@ -88,16 +88,22 @@ async fn entity_list_by_kind() {
     .await
     .unwrap();
 
-    let concepts = rt.list_entities(None, Some("concept"), 50).await.unwrap();
+    let concepts = rt
+        .list_entities(None, Some("concept"), 50, 0)
+        .await
+        .unwrap();
     assert_eq!(concepts.len(), 2);
     assert!(concepts.iter().any(|e| e.name == "FlashAttention"));
     assert!(concepts.iter().any(|e| e.name == "GQA"));
 
-    let docs = rt.list_entities(None, Some("document"), 50).await.unwrap();
+    let docs = rt
+        .list_entities(None, Some("document"), 50, 0)
+        .await
+        .unwrap();
     assert_eq!(docs.len(), 1);
     assert_eq!(docs[0].name, "Attention Is All You Need");
 
-    let all = rt.list_entities(None, None, 50).await.unwrap();
+    let all = rt.list_entities(None, None, 50, 0).await.unwrap();
     assert_eq!(all.len(), 3);
 }
 
@@ -260,14 +266,20 @@ async fn create_note_and_list_notes() {
     .await
     .unwrap();
 
-    let observations = rt.list_notes(None, Some("observation"), 50).await.unwrap();
+    let observations = rt
+        .list_notes(None, Some("observation"), 50, 0)
+        .await
+        .unwrap();
     assert_eq!(observations.len(), 2);
 
-    let questions = rt.list_notes(None, Some("question"), 50).await.unwrap();
+    let questions = rt
+        .list_notes(None, Some("question"), 50, 0)
+        .await
+        .unwrap();
     assert_eq!(questions.len(), 1);
     assert_eq!(questions[0].content, "Review LoRA paper");
 
-    let all = rt.list_notes(None, None, 50).await.unwrap();
+    let all = rt.list_notes(None, None, 50, 0).await.unwrap();
     assert_eq!(all.len(), 3);
 }
 
@@ -285,7 +297,7 @@ async fn create_all_note_kinds() {
             .await
             .unwrap();
     }
-    let all = rt.list_notes(None, None, 50).await.unwrap();
+    let all = rt.list_notes(None, None, 50, 0).await.unwrap();
     assert_eq!(all.len(), 5);
 }
 
@@ -340,11 +352,11 @@ async fn namespace_isolation() {
         .await
         .unwrap();
 
-    let a_entities = rt.list_entities(Some("ns_a"), None, 50).await.unwrap();
+    let a_entities = rt.list_entities(Some("ns_a"), None, 50, 0).await.unwrap();
     assert_eq!(a_entities.len(), 1);
     assert_eq!(a_entities[0].name, "EntityA");
 
-    let b_entities = rt.list_entities(Some("ns_b"), None, 50).await.unwrap();
+    let b_entities = rt.list_entities(Some("ns_b"), None, 50, 0).await.unwrap();
     assert_eq!(b_entities.len(), 1);
     assert_eq!(b_entities[0].name, "EntityB");
 }
@@ -490,7 +502,7 @@ async fn list_notes_excludes_soft_deleted() {
         .await
         .unwrap();
 
-    let notes_before = rt.list_notes(None, None, 50).await.unwrap();
+    let notes_before = rt.list_notes(None, None, 50, 0).await.unwrap();
     assert!(
         notes_before.iter().any(|n| n.id == note.id),
         "note should appear before soft-delete"
@@ -502,7 +514,7 @@ async fn list_notes_excludes_soft_deleted() {
         .await
         .unwrap();
 
-    let notes_after = rt.list_notes(None, None, 50).await.unwrap();
+    let notes_after = rt.list_notes(None, None, 50, 0).await.unwrap();
     assert!(
         !notes_after.iter().any(|n| n.id == note.id),
         "soft-deleted note must not appear in list"
@@ -542,7 +554,7 @@ async fn file_backed_runtime_persists() {
             packs: vec!["kg".to_string()],
         };
         let rt = KhiveRuntime::new(config).unwrap();
-        let entities = rt.list_entities(None, None, 50).await.unwrap();
+        let entities = rt.list_entities(None, None, 50, 0).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "Persistent");
     }

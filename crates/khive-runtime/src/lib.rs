@@ -45,7 +45,7 @@ pub use objectives::{
 };
 pub use operations::{NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
-    KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
+    DispatchHook, KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
     VerbRegistryBuilder,
 };
 pub use portability::{ImportSummary, KgArchive};
