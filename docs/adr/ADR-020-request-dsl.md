@@ -262,3 +262,96 @@ The flat verb tools previously listed in ADR-023 (`create`, `get`, `list`, `upda
 - ADR-014: KG Curation Operations (provides the operations that benefit from batching)
 - ADR-019: Note Kind Taxonomy (parallel curation: closes another free-string gap)
 - RFC 8259: JSON spec (governs the literal-value subset of the DSL)
+
+---
+
+## Amendment: v0.2 Pipe Chains (issue #219)
+
+**Added**: 2026-05-21
+
+This amendment records the planned v0.2 pipe-chain syntax so that the parser crate
+(`crates/khive-request/src/lib.rs`) and MCP help text can be updated before implementation.
+It does not change v0.1 semantics.
+
+### Syntax
+
+A chain is a sequence of operations separated by `|`:
+
+```
+op1(arg=value) | op2(arg=$prev.field)
+```
+
+Grammar addition:
+
+```
+chain      := op ("|" op)+
+batch      := "[" op ("," op)* "]"
+request    := chain | batch | op
+```
+
+Top-level `,` and `|` are mutually exclusive in a single request. Mixing them without explicit
+bracketing is a parse error. A future ADR may define sub-chain bracketing if required.
+
+### Execution semantics
+
+- Operations in a chain run **sequentially**; each op waits for the prior to complete.
+- `$prev` inside an op's args is replaced with the full result of the immediately preceding op.
+- `$prev.field.path` performs dot-path extraction on the result JSON before substitution.
+- If an op fails, the chain is aborted; remaining ops are marked as `aborted` in the response.
+- Already-committed successful ops are **not** rolled back (no implicit cross-chain transaction).
+
+### Response shape
+
+Chain results use the same per-op `{ ok, result | error }` envelope as batch results, with
+an additional `aborted: true` flag on ops that were skipped due to an earlier failure:
+
+```json
+{
+  "results": [
+    { "ok": true,  "tool": "create", "result": { "id": "a1b2c3d4", ... } },
+    { "ok": false, "tool": "link",   "error": "not found: xyz" },
+    { "ok": false, "tool": "update", "aborted": true }
+  ],
+  "summary": { "total": 3, "succeeded": 1, "failed": 1, "aborted": 1 }
+}
+```
+
+### Parser shape
+
+`ParsedRequest` gains an execution mode discriminant:
+
+```rust
+// crates/khive-request/src/lib.rs
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionMode {
+    Parallel,  // default — existing `,` batch semantics
+    Chain,     // new — `|` separator, sequential with $prev
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedRequest {
+    pub ops: Vec<ParsedOp>,
+    pub mode: ExecutionMode,  // new field; existing parallel callers check mode == Parallel
+}
+```
+
+The `mode` field is additive. Transports that do not yet handle `Chain` should return
+`invalid_params` when `mode == Chain` until they implement sequential dispatch.
+
+### Compatibility
+
+- All v0.1 batch (`[op, op]`) and single-op inputs parse identically; `mode` is `Parallel`.
+- The `|` character is currently unambiguous in the DSL (it is not a valid identifier char
+  and does not appear in JSON literal syntax). No existing input is broken by recognising it.
+- MCP `request` tool help text should be updated to mention both `,` and `|` separators.
+
+### Implementation notes
+
+1. Update `parse_fn_batch` (or add `parse_chain`) in `crates/khive-request/src/lib.rs` to
+   recognise `|` at the top level.
+2. Implement `$prev` substitution in the transport dispatch loop
+   (`crates/khive-mcp/src/server.rs`) after the parallel path is unaffected.
+3. Update parser unit tests with chain parse, `$prev` substitution, mixed-separator rejection,
+   and aborted-op response shape.
+4. Keep the existing `// Planned: pipe chains, $prev` comment in the crate doc (or update it
+   to "In progress / v0.2").

@@ -691,3 +691,164 @@ editors (VS Code YAML extension, etc.) can validate `pack.yaml` via
   foundation)
 - YAML specification: https://yaml.org/spec/1.2.2/
 - semver specification: https://semver.org/
+
+---
+
+## Amendment: DeclarativePack Source Interface (issue #234)
+
+**Added**: 2026-05-21
+
+This amendment clarifies the Rust type boundary between the declarative pack format and the
+runtime, and specifies a source interface that avoids a naming collision with the existing
+`DeclarativePack` concrete struct.
+
+### Context
+
+ADR-050 Phase E2 defines `DeclarativePack` as a concrete struct implementing `PackRuntime`:
+
+```rust
+pub struct DeclarativePack {
+    manifest: PackManifest,
+}
+impl PackRuntime for DeclarativePack { ... }
+```
+
+Issue #234 requests a "DeclarativePack trait". A trait named `DeclarativePack` would conflict
+with this struct. The actual gap is a conversion interface: something that can produce a
+`Box<dyn PackRuntime>` (specifically a `DeclarativePack`) from a source — a path, a URL, or
+raw bytes.
+
+### Decision
+
+Introduce a `DeclarativePackSource` trait in `crates/khive-pack-format/`:
+
+```rust
+// crates/khive-pack-format/src/lib.rs
+
+/// Something that can produce a validated PackManifest.
+pub trait DeclarativePackSource: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Load and validate the manifest from this source.
+    fn load_manifest(&self) -> Result<PackManifest, Self::Error>;
+}
+
+/// Convenience: load a manifest from a filesystem path.
+pub struct FilePackSource {
+    pub path: std::path::PathBuf,
+}
+impl DeclarativePackSource for FilePackSource { ... }
+```
+
+`DeclarativePack::from_source` consumes any `DeclarativePackSource`:
+
+```rust
+impl DeclarativePack {
+    pub fn from_source<S: DeclarativePackSource>(
+        source: &S,
+    ) -> Result<Self, S::Error> {
+        Ok(Self { manifest: source.load_manifest()? })
+    }
+}
+```
+
+### Validation
+
+`load_manifest` implementations must enforce:
+
+- No duplicate entity kind names within the manifest (pack-level; cross-pack dedup is runtime's).
+- No duplicate edge relation names in `edge_endpoints`.
+- All relations named in `edge_endpoints` must appear in the base ontology (ADR-002) or the
+  pack's own declared relations; unknown relation names are a hard error.
+- `name` matches `^[a-z][a-z0-9-]{0,62}$`.
+- Manifest `version` parses as semver.
+
+### Compatibility
+
+`DeclarativePack` struct name is unchanged; no existing code is broken.
+`DeclarativePackSource` is additive.
+
+---
+
+## Amendment: Declarative Pack Dependencies (issue #235)
+
+**Added**: 2026-05-21
+
+This amendment fills the gap noted in ADR-050 §References (ADR-037): "declarative packs
+currently have no `REQUIRES` mechanism — a future extension."
+
+### Manifest field additions
+
+```yaml
+requires:
+  - kg
+  - ml-papers
+```
+
+`requires` is an optional list of pack names. The runtime loads and validates these packs
+before the declaring pack is registered. `optional_requires` is deferred — the semantics
+of "optional dependency" are unspecified until a concrete workflow needs them.
+
+### `PackManifest` Rust changes
+
+```rust
+// crates/khive-pack-format/src/lib.rs
+pub struct PackManifest {
+    pub name: String,
+    pub version: String,
+    // ... existing fields ...
+    pub requires: Vec<String>,  // new; default empty
+}
+```
+
+### JSON Schema changes
+
+Add to `deno/src/pack/pack-schema.json`:
+
+```json
+"requires": {
+  "type": "array",
+  "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
+  "default": []
+}
+```
+
+### Resolution and loading
+
+Declarative pack dependencies are resolved via the same BFS in
+`PackRegistry::register_packs` (`crates/khive-runtime/src/pack.rs:653`) that handles Rust
+pack `REQUIRES`. The `PackRuntime::requires` implementation for `DeclarativePack` returns
+`manifest.requires.iter().map(String::as_str)`.
+
+Cycle detection and topological sort are unchanged — the registry already handles this for
+Rust packs.
+
+### Vocabulary visibility
+
+After dependency resolution, the dependent pack's endpoint rules and property schemas can
+reference entity kinds and note kinds contributed by its required packs. The runtime validates
+this during vocabulary merge.
+
+### Error cases
+
+- **Missing dependency**: pack named in `requires` is not installed — fail at `khive pack check`
+  and at runtime load with a clear diagnostic listing the missing name and the declaring pack.
+- **Cycle**: `khive pack check` and runtime startup both reject packs whose `requires` graph
+  contains a cycle.
+- **Unknown dependency kind reference**: an endpoint rule references an entity kind that does
+  not exist in the merged vocabulary — validation error.
+
+### Version constraints
+
+v0 accepts pack names only (no semver range). Semver constraints on declarative dependencies
+are deferred. If added in a future amendment, the format is `name@>=1.0.0`.
+
+### Tests required
+
+- Valid dependency: pack A requires pack B; pack B is loaded first.
+- Missing dependency: pack A requires pack C (not installed); hard error.
+- Cycle: pack A requires pack B, pack B requires pack A; hard error.
+- Transitive dependency: A → B → C; all three loaded in topological order.
+- Vocabulary visibility: pack A defines entity kind `model`; pack B in `requires: [A]` uses
+  `model` in an endpoint rule; validation passes.
+- `khive pack check` reports missing and cyclic deps as errors, not warnings.

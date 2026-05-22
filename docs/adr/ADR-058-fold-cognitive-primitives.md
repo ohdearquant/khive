@@ -1,6 +1,6 @@
 # ADR-058: Fold Cognitive Primitives — Hoare-Structured Decisions
 
-**Status**: proposed\
+**Status**: accepted\
 **Date**: 2026-05-21\
 **Authors**: Ocean, lambda:khive
 

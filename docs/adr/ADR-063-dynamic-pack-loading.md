@@ -1,6 +1,6 @@
 # ADR-063: Dynamic Pack Loading — Replace Static Dialect with Registry
 
-**Status**: proposed\
+**Status**: accepted\
 **Date**: 2026-05-21\
 **Authors**: Ocean, lambda:khive\
 **Supersedes**: `khive-dialect-kg` crate (removed)\

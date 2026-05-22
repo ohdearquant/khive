@@ -1,6 +1,6 @@
 # ADR-039: Bulk Import Adapters
 
-**Status**: proposed (partially superseded — D1 import verb rescinded from MCP surface; bulk import is CLI-level only; `khive kg import/export` CLI commands are Phase C2 deferred, not yet implemented)\
+**Status**: accepted (file-level `khive kg import/export` implemented; D1 MCP import verb rescinded; bulk import is CLI-level only)\
 **Date**: 2026-05-19\
 **Authors**: khive maintainers
 
@@ -367,7 +367,7 @@ This table is deferred; the ADR-033 tracing event carries the same information f
 
 ### Amendment 2026-05-20 — D1 superseded; scope narrowed to CLI-level import semantics
 
-**Status**: partially superseded (D1 MCP verb rescinded; CLI command deferred to Phase C2)\
+**Status**: partially superseded (D1 MCP verb rescinded; CLI import/export implemented at file level)\
 **Date**: 2026-05-20\
 **Rationale**: Ocean directive (2026-05-20) established that bulk import is a CLI-level
 operation, not an MCP-exposed verb. Additionally, the `khive kg import/export` CLI commands
