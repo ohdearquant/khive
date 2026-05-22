@@ -9,16 +9,5 @@
   "homepage": "https://github.com/ohdearquant/khive",
   "repository": "https://github.com/ohdearquant/khive",
   "license": "Apache-2.0",
-  "mcpServers": {
-    "gtd": {
-      "type": "stdio",
-      "command": "khive-mcp",
-      "args": [],
-      "env": {
-        "KHIVE_PACKS": "kg,gtd,memory,brain"
-      },
-      "installHint": "cargo install khive-mcp"
-    }
-  },
   "keywords": ["gtd", "tasks", "productivity", "lifecycle", "mcp", "todo"]
 }

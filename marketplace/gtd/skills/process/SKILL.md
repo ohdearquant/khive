@@ -35,6 +35,18 @@ If the captured title is too vague to act on, do not promote it as-is. Either mo
 | `done` | It was captured after the fact and is already complete. |
 | `cancelled` | It is no longer worth tracking. |
 
+**Transition rules**: `inbox` is a one-way entry point — no state can transition back to it. `waiting` and `someday` cannot reach each other directly (go through `next` or `active`). `done` and `cancelled` report `is_terminal: true` but can only reopen to `next` or `active`.
+
+```
+inbox → next, waiting, someday, active, done, cancelled
+next → active, waiting, someday, done, cancelled
+active → next, waiting, done, cancelled
+waiting → next, active, done, cancelled
+someday → next, active, done, cancelled
+done → next, active                   (reopen)
+cancelled → next, active              (reopen)
+```
+
 Move the item with `transition`:
 
 ```

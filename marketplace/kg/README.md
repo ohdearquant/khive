@@ -5,16 +5,38 @@ hybrid search, GQL/SPARQL queries — all via MCP.
 
 Part of the [khive](https://github.com/ohdearquant/khive) marketplace.
 
+## Prerequisites
+
+This plugin provides skills and agents only — it does **not** bundle an MCP server.
+You must install the `khive-mcp` binary and register it as an MCP server in your
+harness **before** using any of the skills or agents below.
+
+```bash
+# Install the binary
+cargo install khive-mcp
+
+# Register in your harness (Claude Code example)
+claude mcp add --transport stdio khive -- khive-mcp --pack kg
+```
+
+Or add to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "khive": {
+      "command": "khive-mcp",
+      "args": ["--pack", "kg"]
+    }
+  }
+}
+```
+
 ## Install
 
 ```bash
-# Option 1: Plugin (includes skills)
 /plugin marketplace add ohdearquant/khive
 /plugin install kg
-
-# Option 2: Direct MCP (server only, no skills)
-cargo install khive-mcp
-claude mcp add --transport stdio kg -- khive-mcp
 ```
 
 ## What You Get
@@ -79,12 +101,18 @@ digester ──► polisher ──► gap-analyst ──► expander ──► p
                                 (taxonomy gaps)
 ```
 
-To enable the swarm: install **both** `kg` and `gtd` packs.
+To enable the swarm: install **both** `kg` and `gtd` plugins, and ensure your
+MCP server loads both packs:
 
 ```bash
 /plugin install kg
 /plugin install gtd
-# or set: KHIVE_PACKS=kg,gtd
+```
+
+MCP server config (both packs):
+
+```json
+{ "args": ["--pack", "kg", "--pack", "gtd"] }
 ```
 
 Each agent file documents its `Pickup protocol` and `Handoff protocol` sections —
