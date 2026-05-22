@@ -272,10 +272,7 @@ async fn create_note_and_list_notes() {
         .unwrap();
     assert_eq!(observations.len(), 2);
 
-    let questions = rt
-        .list_notes(None, Some("question"), 50, 0)
-        .await
-        .unwrap();
+    let questions = rt.list_notes(None, Some("question"), 50, 0).await.unwrap();
     assert_eq!(questions.len(), 1);
     assert_eq!(questions[0].content, "Review LoRA paper");
 

@@ -198,7 +198,14 @@ impl KhiveRuntime {
         };
         let page = self
             .entities(namespace)?
-            .query_entities(self.ns(namespace), filter, PageRequest { offset: offset.into(), limit })
+            .query_entities(
+                self.ns(namespace),
+                filter,
+                PageRequest {
+                    offset: offset.into(),
+                    limit,
+                },
+            )
             .await?;
         Ok(page.items)
     }
@@ -686,7 +693,14 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<Note>> {
         let page = self
             .notes(namespace)?
-            .query_notes(self.ns(namespace), kind, PageRequest { offset: offset.into(), limit })
+            .query_notes(
+                self.ns(namespace),
+                kind,
+                PageRequest {
+                    offset: offset.into(),
+                    limit,
+                },
+            )
             .await?;
         Ok(page.items)
     }

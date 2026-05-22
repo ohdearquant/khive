@@ -169,7 +169,8 @@ mod tests {
             ..RecallConfig::default()
         };
         let config_value = serde_json::to_value(&new_cfg).unwrap();
-        pack.apply_config(config_value).expect("apply_config succeeds");
+        pack.apply_config(config_value)
+            .expect("apply_config succeeds");
 
         let active = pack.active_config();
         assert!((active.relevance_weight - 0.5).abs() < 1e-10);
