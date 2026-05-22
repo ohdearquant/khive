@@ -1007,11 +1007,15 @@ impl KgPack {
                     )
                     .await?;
 
-                // Apply properties post-filter if requested.
-                let filtered_hits = if let Some(pf) = props_filter {
-                    // Batch-fetch entity records for all candidate hit IDs.
-                    let candidate_ids: Vec<Uuid> =
-                        hits.iter().map(|h| h.entity_id).collect();
+                // Fetch entity metadata for every hit so the response can carry
+                // `entity_kind` per #160. When a properties filter is also active
+                // (#163), reuse the same fetch for filtering.
+                let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
+                let entity_meta: HashMap<Uuid, (String, Option<Value>)> = if candidate_ids
+                    .is_empty()
+                {
+                    HashMap::new()
+                } else {
                     let entities_page = self
                         .runtime
                         .entities(p.namespace.as_deref())?
@@ -1028,20 +1032,20 @@ impl KgPack {
                         )
                         .await
                         .map_err(RuntimeError::Storage)?;
-
-                    let entity_props: HashMap<Uuid, Option<Value>> = entities_page
+                    entities_page
                         .items
                         .into_iter()
-                        .map(|e| (e.id, e.properties))
-                        .collect();
+                        .map(|e| (e.id, (e.kind, e.properties)))
+                        .collect()
+                };
 
+                // Apply properties post-filter if requested.
+                let filtered_hits = if let Some(pf) = props_filter {
                     hits.into_iter()
                         .filter(|h| {
-                            let ep = entity_props.get(&h.entity_id);
-                            match ep {
-                                Some(props) => props_match(props.as_ref(), pf),
-                                None => false,
-                            }
+                            entity_meta
+                                .get(&h.entity_id)
+                                .is_some_and(|(_, props)| props_match(props.as_ref(), pf))
                         })
                         .take(limit as usize)
                         .collect::<Vec<_>>()
@@ -1052,8 +1056,12 @@ impl KgPack {
                 let result: Vec<Value> = filtered_hits
                     .iter()
                     .map(|h| {
+                        // #160: include entity_kind so agents can distinguish hit
+                        // kinds without an extra get() call.
+                        let entity_kind = entity_meta.get(&h.entity_id).map(|(k, _)| k.as_str());
                         serde_json::json!({
                             "id": h.entity_id.to_string(),
+                            "entity_kind": entity_kind,
                             "score": h.score.to_f64(),
                             "title": h.title,
                             "snippet": h.snippet,
@@ -1079,11 +1087,28 @@ impl KgPack {
                         kind_filter.as_deref(),
                     )
                     .await?;
+
+                // #160 (note half): fetch note records so the response can
+                // carry note_kind. NoteSearchHit doesn't expose it directly.
+                let note_kinds: HashMap<Uuid, String> = if hits.is_empty() {
+                    HashMap::new()
+                } else {
+                    let note_store = self.runtime.notes(p.namespace.as_deref())?;
+                    let mut map = HashMap::new();
+                    for h in &hits {
+                        if let Ok(Some(n)) = note_store.get_note(h.note_id).await {
+                            map.insert(h.note_id, n.kind);
+                        }
+                    }
+                    map
+                };
+
                 let result: Vec<Value> = hits
                     .iter()
                     .map(|h| {
                         serde_json::json!({
                             "id": h.note_id.to_string(),
+                            "note_kind": note_kinds.get(&h.note_id),
                             "score": h.score.to_f64(),
                             "title": h.title,
                             "snippet": h.snippet,
