@@ -247,8 +247,10 @@ mod tests {
 
     #[test]
     fn test_stop_words_disabled() {
-        let mut tokenizer = SimpleTokenizer::default();
-        tokenizer.filter_stop_words = false;
+        let tokenizer = SimpleTokenizer {
+            filter_stop_words: false,
+            ..Default::default()
+        };
         let tokens = tokenizer.tokenize("The Quick, Brown FOX!");
         assert_eq!(tokens, vec!["the", "quick", "brown", "fox"]);
     }

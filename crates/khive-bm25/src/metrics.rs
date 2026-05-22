@@ -63,12 +63,19 @@ pub struct RecordingSink {
 }
 
 #[cfg(test)]
-impl RecordingSink {
-    /// Create an empty recording sink.
-    pub fn new() -> Self {
+impl Default for RecordingSink {
+    fn default() -> Self {
         Self {
             events: Mutex::new(Vec::new()),
         }
+    }
+}
+
+#[cfg(test)]
+impl RecordingSink {
+    /// Create an empty recording sink.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Return a snapshot of all recorded events.

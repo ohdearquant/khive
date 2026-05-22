@@ -813,8 +813,8 @@ mod golden_tests {
 /// Memory budget enforcement tests for BM25.
 #[cfg(test)]
 mod memory_budget_tests {
-    use crate::{Bm25Config, Bm25Index};
     use crate::error::{ErrorKind, RetrievalError};
+    use crate::{Bm25Config, Bm25Index};
 
     #[test]
     fn test_no_budget_allows_unlimited_indexing() {
@@ -844,9 +844,8 @@ mod memory_budget_tests {
                 format!("doc{i}"),
                 &format!("some content words for document number {i} with extra text"),
             );
-            if result.is_err() {
+            if let Err(err) = result {
                 rejected = true;
-                let err = result.unwrap_err();
                 assert!(
                     matches!(err, RetrievalError::BudgetExceeded { .. }),
                     "Expected BudgetExceeded, got: {err:?}"
@@ -1019,8 +1018,8 @@ mod memory_budget_tests {
 
 #[cfg(test)]
 mod metrics_tests {
-    use crate::{Bm25Config, Bm25Index};
     use crate::metrics::{names, MetricValue, RecordingSink};
+    use crate::{Bm25Config, Bm25Index};
     use std::sync::Arc;
 
     #[test]

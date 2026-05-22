@@ -1450,11 +1450,11 @@ mod tests_simd_scoring {
         let tfs_4: [u8; 4] = [0, 0, 0, 0];
         let dls_4: [f32; 4] = [10.0, 20.0, 5.0, 1.0];
         let result = score_batch_4(&tfs_4, &dls_4, TEST_IDF, TEST_K1P1, TEST_BASE, TEST_DL_FAC);
-        for i in 0..4 {
+        for val in &result {
             assert!(
-                result[i].abs() < 1e-10,
+                val.abs() < 1e-10,
                 "tf=0 should produce ~0 score, got {}",
-                result[i]
+                val
             );
         }
 
@@ -1467,11 +1467,11 @@ mod tests_simd_scoring {
             let result = unsafe {
                 score_batch_avx2(&tfs_8, &dls_8, TEST_IDF, TEST_K1P1, TEST_BASE, TEST_DL_FAC)
             };
-            for i in 0..8 {
+            for val in &result {
                 assert!(
-                    result[i].abs() < 1e-10,
+                    val.abs() < 1e-10,
                     "avx2 tf=0 should produce ~0 score, got {}",
-                    result[i]
+                    val
                 );
             }
         }

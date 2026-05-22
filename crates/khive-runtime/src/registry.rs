@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use khive_fold::objective::{Objective, ObjectiveContext, ObjectiveError, ObjectiveResult, Selection};
+use khive_fold::objective::{
+    Objective, ObjectiveContext, ObjectiveError, ObjectiveResult, Selection,
+};
 
 /// A type-erased objective wrapper.
 pub struct RegisteredObjective<T: Send + Sync> {
@@ -288,7 +290,9 @@ mod tests {
         let obj = objective_fn(|n: &i32, _ctx: &ObjectiveContext| *n as f64 * 2.0);
         registry.register("double", Box::new(obj));
 
-        let score = registry.score("double", &5, &ObjectiveContext::new()).unwrap();
+        let score = registry
+            .score("double", &5, &ObjectiveContext::new())
+            .unwrap();
         assert!((score - 10.0).abs() < 1e-12);
     }
 
@@ -330,7 +334,8 @@ mod tests {
                 let reg = Arc::clone(&registry);
                 s.spawn(move || {
                     let name = format!("obj_{i}");
-                    let obj = objective_fn(move |n: &i32, _ctx: &ObjectiveContext| *n as f64 + i as f64);
+                    let obj =
+                        objective_fn(move |n: &i32, _ctx: &ObjectiveContext| *n as f64 + i as f64);
                     reg.register(name.clone(), Box::new(obj));
 
                     assert!(reg.contains(&name));

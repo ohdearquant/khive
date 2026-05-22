@@ -1,0 +1,240 @@
+//! Batch build for HNSW index.
+//!
+//! Builds an HNSW index from a batch of vectors using a two-phase approach:
+//!
+//! 1. **Seed phase** (sequential): Insert sqrt(N) nodes normally to establish
+//!    the upper-layer graph structure and entry point.
+//!
+//! 2. **Search phase**: For remaining nodes, find neighbors against the frozen
+//!    seed graph, then merge results sequentially.
+
+use super::HnswIndex;
+use crate::error::{Result, RetrievalError};
+use crate::node::HnswNode;
+use crate::NodeId;
+use rayon::prelude::*;
+
+/// Pre-computed neighbor information for a node to be inserted.
+///
+/// Produced during the parallel search phase, consumed during the sequential merge.
+struct PrecomputedInsert {
+    id: NodeId,
+    vector: Vec<f32>,
+    level: usize,
+    /// Neighbors per layer: (layer, Vec<(distance, internal_id)>).
+    layer_candidates: Vec<(usize, Vec<(f32, usize)>)>,
+}
+
+impl HnswIndex {
+    /// Build an index from a batch of vectors.
+    ///
+    /// This is faster than individual insertions for large batches because
+    /// validation, level assignment, and merging are handled in one pass.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. **Seed phase**: The first `sqrt(N)` nodes are inserted sequentially.
+    ///    This builds the upper-layer structure that guides all subsequent searches.
+    ///
+    /// 2. **Level assignment**: Levels for remaining nodes are pre-generated
+    ///    sequentially to preserve deterministic RNG consumption order.
+    ///
+    /// 3. **Search**: Each remaining node searches the current frozen graph for
+    ///    its neighbors.
+    ///
+    /// 4. **Sequential merge**: Nodes are inserted with their pre-computed
+    ///    neighbors, adding bidirectional connections and updating the graph.
+    ///
+    /// # Quality Notes
+    ///
+    /// Because the parallel phase searches a "frozen" graph (the seed nodes),
+    /// the neighbor quality for non-seed nodes depends only on the seed graph,
+    /// not on other parallel insertions. This means recall may differ slightly
+    /// from fully sequential construction. In practice, with sqrt(N) seeds the
+    /// difference is negligible for typical workloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any vector has incorrect dimensions or if the memory
+    /// budget would be exceeded.
+    pub fn build_batch(&mut self, items: Vec<(NodeId, Vec<f32>)>) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        // Validate dimensions upfront to avoid partial builds
+        for (id, vector) in &items {
+            if vector.len() != self.config.dimensions {
+                return Err(RetrievalError::DimensionMismatch {
+                    expected: self.config.dimensions,
+                    actual: vector.len(),
+                });
+            }
+            // Check for duplicates against existing index
+            if self.id_to_internal.contains_key(id) {
+                return Err(RetrievalError::hnsw(format!(
+                    "build_batch does not support updates: ID {id:?} already exists"
+                )));
+            }
+        }
+
+        // Budget check for entire batch
+        if let Some(limit) = self.config.memory_budget {
+            let current = self.memory_usage();
+            let cost_per_node = self.estimate_insert_cost();
+            let total_cost = cost_per_node * items.len();
+            if current + total_cost > limit {
+                return Err(RetrievalError::budget_exceeded(current, total_cost, limit));
+            }
+        }
+
+        let n = items.len();
+
+        // For very small batches, fall back to sequential insertion
+        if n <= 32 {
+            for (id, vector) in items {
+                self.insert(id, vector)?;
+            }
+            return Ok(());
+        }
+
+        // Phase 1: Sequential seed insertion of sqrt(N) nodes
+        // These build the upper-layer graph structure
+        let seed_count = ((n as f64).sqrt() as usize).max(1);
+        let (seed_items, remaining_items) = items.split_at(seed_count);
+
+        for (id, vector) in seed_items {
+            self.insert(*id, vector.clone())?;
+        }
+
+        // Phase 2: Pre-generate levels for remaining nodes in deterministic RNG order.
+        let mut pending: Vec<(NodeId, Vec<f32>, usize)> = Vec::with_capacity(remaining_items.len());
+        for (id, vector) in remaining_items {
+            let level = self.random_level();
+            pending.push((*id, vector.clone(), level));
+        }
+
+        // Phase 3: Neighbor search
+        // The graph is frozen during this phase -- only read-only search_layer is called.
+        let entry_point = self.entry_point;
+        let current_max_level = self.max_level;
+        let config_ef = self.config.ef_construction;
+        let index = &*self;
+
+        let precomputed: Vec<PrecomputedInsert> = pending
+            .into_par_iter()
+            .map(|(id, vector, level)| {
+                let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+                // Navigate upper layers to find entry region
+                let ep = match entry_point {
+                    Some(ep) => ep,
+                    None => {
+                        // Should not happen after seed phase, but handle gracefully
+                        return PrecomputedInsert {
+                            id,
+                            vector,
+                            level,
+                            layer_candidates: Vec::new(),
+                        };
+                    }
+                };
+
+                let mut current_nearest = vec![ep];
+
+                // Search from top layer down to level + 1 (greedy, ef=1)
+                for l in (level + 1..=current_max_level).rev() {
+                    let nearest = index.search_layer(&vector, norm, &current_nearest, 1, l);
+                    if !nearest.is_empty() {
+                        current_nearest = vec![nearest[0].1];
+                    }
+                }
+
+                // Search layers from min(level, max_level) down to 0
+                let mut layer_candidates = Vec::new();
+                for l in (0..=level.min(current_max_level)).rev() {
+                    let candidates =
+                        index.search_layer(&vector, norm, &current_nearest, config_ef, l);
+
+                    if !candidates.is_empty() {
+                        current_nearest = vec![candidates[0].1];
+                    }
+
+                    layer_candidates.push((l, candidates));
+                }
+
+                PrecomputedInsert {
+                    id,
+                    vector,
+                    level,
+                    layer_candidates,
+                }
+            })
+            .collect();
+
+        // Phase 4: Sequential merge -- insert nodes with pre-computed neighbors
+        for pc in precomputed {
+            self.insert_with_precomputed(pc)?;
+        }
+
+        Ok(())
+    }
+
+    /// Insert a node using pre-computed neighbor candidates.
+    ///
+    /// This performs the same operations as `insert_inner`, but skips the
+    /// neighbor search phase since candidates were already found in parallel.
+    fn insert_with_precomputed(&mut self, pc: PrecomputedInsert) -> Result<()> {
+        let internal_id = self.nodes.len();
+
+        // Select neighbors from pre-computed candidates
+        let mut layer_neighbors: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (l, candidates) in &pc.layer_candidates {
+            let m = if *l == 0 {
+                self.config.m_max0
+            } else {
+                self.config.m
+            };
+            let neighbors = self.select_neighbors(candidates, m);
+            layer_neighbors.push((*l, neighbors));
+        }
+
+        // Build the node with neighbor lists
+        let mut node = HnswNode::new(pc.vector, pc.level);
+        for (l, neighbors) in &layer_neighbors {
+            while node.neighbors.len() <= *l {
+                node.neighbors.push(Vec::new());
+            }
+            node.neighbors[*l] = neighbors.clone();
+        }
+
+        // Insert into storage (including quantized arena)
+        self.quantized.push(&node.vector, node.norm);
+        self.nodes.push(node);
+        self.id_to_internal.insert(pc.id, internal_id);
+        self.internal_to_id.push(pc.id);
+
+        // Add bidirectional connections
+        for (l, neighbors) in layer_neighbors {
+            let m = if l == 0 {
+                self.config.m_max0
+            } else {
+                self.config.m
+            };
+            for neighbor_id in neighbors {
+                self.connect(neighbor_id, internal_id, l);
+                // Shrink if over m (m is already m_max0 for layer 0, m for upper layers)
+                self.shrink_connections(neighbor_id, l, m);
+            }
+        }
+
+        // Update entry point if new node is at higher level
+        if pc.level > self.max_level {
+            self.entry_point = Some(internal_id);
+            self.max_level = pc.level;
+        }
+
+        self.additions_since_rebuild += 1;
+        Ok(())
+    }
+}

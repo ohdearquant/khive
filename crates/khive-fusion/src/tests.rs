@@ -221,19 +221,11 @@ mod property_tests {
     /// Verifies the `present_gt_absent` property from RRF.lean.
     #[test]
     fn prop_rrf_more_sources_higher_score() {
-        let source1: Vec<(String, DeterministicScore)> = vec![(
-            "doc_common".to_string(),
-            DeterministicScore::from_f64(0.9),
-        )];
+        let source1: Vec<(String, DeterministicScore)> =
+            vec![("doc_common".to_string(), DeterministicScore::from_f64(0.9))];
         let source2: Vec<(String, DeterministicScore)> = vec![
-            (
-                "doc_common".to_string(),
-                DeterministicScore::from_f64(0.9),
-            ),
-            (
-                "doc_single".to_string(),
-                DeterministicScore::from_f64(0.8),
-            ),
+            ("doc_common".to_string(), DeterministicScore::from_f64(0.9)),
+            ("doc_single".to_string(), DeterministicScore::from_f64(0.8)),
         ];
 
         let fused = reciprocal_rank_fusion(vec![source1, source2], 60);

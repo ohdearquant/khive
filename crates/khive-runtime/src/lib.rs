@@ -26,9 +26,9 @@ pub mod fusion;
 pub mod graph_traversal;
 pub mod objectives;
 pub mod operations;
-pub mod registry;
 pub mod pack;
 pub mod portability;
+pub mod registry;
 pub mod retrieval;
 pub mod runtime;
 
@@ -45,11 +45,11 @@ pub use objectives::{
     VectorSimilarityObjective,
 };
 pub use operations::{NoteSearchHit, QueryResult, Resolved};
-pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use pack::{
     DispatchHook, KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
     VerbRegistryBuilder,
 };
 pub use portability::{ImportSummary, KgArchive};
+pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{parse_pack_list, KhiveRuntime, RuntimeConfig};
