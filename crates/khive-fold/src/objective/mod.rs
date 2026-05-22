@@ -4,11 +4,13 @@ pub mod builtin;
 pub mod compose;
 mod context;
 pub mod error;
+pub mod registry;
 mod selection;
 mod traits;
 
 pub use context::ObjectiveContext;
 pub use error::{ObjectiveError, ObjectiveResult};
+pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use selection::Selection;
 pub use traits::{objective_fn, DeterministicObjective, Objective};
 
