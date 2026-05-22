@@ -28,6 +28,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 lattice-embed = { workspace = true }
+parking_lot = { workspace = true }
 rusqlite = { version = "0.33" }
 tempfile = "3"
 

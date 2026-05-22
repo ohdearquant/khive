@@ -26,6 +26,7 @@ pub mod fusion;
 pub mod graph_traversal;
 pub mod objectives;
 pub mod operations;
+pub mod registry;
 pub mod pack;
 pub mod portability;
 pub mod retrieval;
@@ -44,6 +45,7 @@ pub use objectives::{
     VectorSimilarityObjective,
 };
 pub use operations::{NoteSearchHit, QueryResult, Resolved};
+pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use pack::{
     DispatchHook, KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
     VerbRegistryBuilder,
