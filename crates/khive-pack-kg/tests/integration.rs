@@ -1322,6 +1322,76 @@ async fn list_events_pagination_returns_distinct_pages() {
 }
 
 #[tokio::test]
+async fn list_events_pagination_four_items_full_disjointness() {
+    let pack = pack_with_events();
+    for name in ["Pg4-A", "Pg4-B", "Pg4-C", "Pg4-D"] {
+        pack.dispatch("create", json!({"kind": "concept", "name": name}))
+            .await
+            .expect("create must succeed");
+    }
+
+    let page1 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 2, "offset": 0}),
+        )
+        .await
+        .expect("page 1 must succeed");
+    let arr1 = page1.as_array().expect("must be array");
+    assert_eq!(arr1.len(), 2, "page 1 must have exactly 2 events");
+
+    let page2 = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 2, "offset": 2}),
+        )
+        .await
+        .expect("page 2 must succeed");
+    let arr2 = page2.as_array().expect("must be array");
+    assert_eq!(
+        arr2.len(),
+        2,
+        "page 2 must have exactly 2 events with 4 total creates"
+    );
+
+    let ids1: std::collections::HashSet<&str> = arr1
+        .iter()
+        .map(|v| v.get("id").and_then(Value::as_str).unwrap())
+        .collect();
+    let ids2: std::collections::HashSet<&str> = arr2
+        .iter()
+        .map(|v| v.get("id").and_then(Value::as_str).unwrap())
+        .collect();
+    assert!(
+        ids1.is_disjoint(&ids2),
+        "page 1 and page 2 must have no events in common: page1={ids1:?} page2={ids2:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_events_pagination_offset_beyond_end_returns_empty() {
+    let pack = pack_with_events();
+    for name in ["BeyondEnd-A", "BeyondEnd-B", "BeyondEnd-C"] {
+        pack.dispatch("create", json!({"kind": "concept", "name": name}))
+            .await
+            .expect("create must succeed");
+    }
+
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "verb": "create", "limit": 2, "offset": 99}),
+        )
+        .await
+        .expect("large offset must not error");
+    let arr = result.as_array().expect("must be array");
+    assert!(
+        arr.is_empty(),
+        "offset beyond total event count must return empty page"
+    );
+}
+
+#[tokio::test]
 async fn list_unknown_kind_includes_event_in_valid_list() {
     let pack = pack();
     let err = pack

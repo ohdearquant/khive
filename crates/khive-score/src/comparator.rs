@@ -107,4 +107,23 @@ mod tests {
         assert_eq!(items[1].1, 2);
         assert_eq!(items[2].1, 3);
     }
+
+    #[test]
+    fn cmp_asc_then_id_tie_lower_id_wins() {
+        let score = DeterministicScore::from_f64(0.5);
+        let mut items = [(score, 3u64), (score, 1u64), (score, 2u64)];
+        items.sort_by(|(sa, ia), (sb, ib)| cmp_asc_then_id(*sa, ia, *sb, ib));
+        assert_eq!(items[0].1, 1);
+        assert_eq!(items[1].1, 2);
+        assert_eq!(items[2].1, 3);
+    }
+
+    #[test]
+    fn ranked_into_parts_returns_score_and_id() {
+        let score = DeterministicScore::from_f64(0.75);
+        let ranked = Ranked::new(score, 42u64);
+        let (s, id) = ranked.into_parts();
+        assert_eq!(s, score);
+        assert_eq!(id, 42u64);
+    }
 }

@@ -148,6 +148,24 @@ mod tests {
     }
 
     #[test]
+    fn feedback_not_useful_increments_entity_beta() {
+        let fold = EventFold::new(100);
+        let ctx = FoldContext::new();
+        let mut state = fold.initial(&ctx);
+
+        let id = Uuid::new_v4();
+        let mut event = make_event("brain.emit", EventOutcome::Success, Some(id));
+        event.data = Some(serde_json::json!({"signal": "not_useful"}));
+        state = fold.step(state, &event, &ctx);
+
+        assert_eq!(state.total_events, 1);
+        let ep = state.entity_posteriors.get(&id).unwrap();
+        // default prior Beta(1,1); not_useful → update_failure → beta = 2
+        assert!((ep.alpha - 1.0).abs() < 1e-12);
+        assert!((ep.beta - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn deterministic_replay() {
         let fold = EventFold::new(100);
         let ctx = FoldContext::new();
