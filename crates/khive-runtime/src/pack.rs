@@ -635,6 +635,40 @@ impl VerbRegistry {
             .map(|p| p.requires())
     }
 
+    /// Note kinds owned by a specific registered pack.
+    ///
+    /// Returns `None` if no pack with `name` is registered. The slice is
+    /// the pack's `NOTE_KINDS` constant — `'static` lifetime, no allocation.
+    pub fn pack_note_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.packs
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.note_kinds())
+    }
+
+    /// Entity kinds owned by a specific registered pack.
+    ///
+    /// Returns `None` if no pack with `name` is registered. The slice is
+    /// the pack's `ENTITY_KINDS` constant — `'static` lifetime, no allocation.
+    pub fn pack_entity_kinds(&self, name: &str) -> Option<&'static [&'static str]> {
+        self.packs
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.entity_kinds())
+    }
+
+    /// Verbs declared by a specific registered pack.
+    ///
+    /// Returns `None` if no pack with `name` is registered. Each `VerbDef`
+    /// carries name + description — sufficient for introspection clients
+    /// like `kkernel pack handler` (ADR-076).
+    pub fn pack_verbs(&self, name: &str) -> Option<&'static [VerbDef]> {
+        self.packs
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.verbs())
+    }
+
     /// All pack-declared edge endpoint rules across registered packs (ADR-031).
     ///
     /// Order follows topological pack registration; duplicates are *not* deduplicated —
