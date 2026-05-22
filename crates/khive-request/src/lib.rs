@@ -338,7 +338,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_op(&mut self) -> Result<ParsedOp, DslError> {
-        let tool = self.parse_identifier()?;
+        let mut tool = self.parse_identifier()?;
+        // One-level dotted verbs: brain.state, recall.candidates
+        if self.peek() == Some('.') {
+            self.advance(1);
+            let sub = self.parse_identifier()?;
+            tool = format!("{tool}.{sub}");
+        }
         self.expect_char('(')?;
         self.skip_ws();
         let mut args: Map<String, Value> = Map::new();
@@ -681,10 +687,26 @@ mod tests {
     // ── Identifier grammar ────────────────────────────────────────────────────
 
     #[test]
-    fn dotted_tool_name_rejected_as_unexpected_char() {
-        // The parser reads "brain" as identifier then hits '.' expecting '('.
-        let err = parse_request("brain.state()").unwrap_err();
-        assert!(matches!(err, DslError::UnexpectedChar { .. }));
+    fn dotted_tool_name_parsed() {
+        let v = ops("brain.state()");
+        assert_eq!(v[0].tool, "brain.state");
+        assert!(v[0].args.is_empty());
+    }
+
+    #[test]
+    fn dotted_tool_with_args() {
+        let v = ops(r#"recall.candidates(query="test", limit=5)"#);
+        assert_eq!(v[0].tool, "recall.candidates");
+        assert_eq!(v[0].args["query"], json!("test"));
+        assert_eq!(v[0].args["limit"], json!(5));
+    }
+
+    #[test]
+    fn dotted_tool_in_batch() {
+        let v = ops(r#"[brain.state(), recall.fuse(query="x")]"#);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].tool, "brain.state");
+        assert_eq!(v[1].tool, "recall.fuse");
     }
 
     #[test]
