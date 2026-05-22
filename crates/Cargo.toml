@@ -17,7 +17,6 @@ members = [
     "khive-pack-brain",
     "khive-mcp",
     "khive-vcs",
-    "khive-merge",
 ]
 
 [workspace.package]
@@ -27,6 +26,8 @@ authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
 repository = "https://github.com/ohdearquant/khive"
 homepage = "https://khive.ai"
+keywords = ["knowledge-graph", "semantic-search", "mcp", "ai-tools", "graph-database"]
+categories = ["database", "command-line-utilities"]
 
 [workspace.dependencies]
 inventory = "0.3"
@@ -40,10 +41,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 async-trait = "0.1"
-axum = { version = "0.7", features = ["macros"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 lattice-embed = "0.1.2"
 parking_lot = "0.12"

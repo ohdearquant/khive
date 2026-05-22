@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "GQL and SPARQL parsers with SQL compiler for knowledge graph queries."
 
 [dependencies]

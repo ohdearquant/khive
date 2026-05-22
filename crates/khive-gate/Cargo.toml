@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Pluggable authorization gate trait + default AllowAllGate impl for khive verb dispatch."
 
 [dependencies]

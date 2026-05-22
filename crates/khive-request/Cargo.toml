@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Request DSL — parses verb-dispatch strings (function-call, JSON, and future LNDL / pipe / bash-style syntaxes) into a transport-agnostic ParsedRequest AST"
 
 [dependencies]

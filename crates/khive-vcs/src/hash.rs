@@ -248,4 +248,118 @@ mod tests {
             snapshot_id_for_archive(&with_edge).unwrap()
         );
     }
+
+    #[test]
+    fn canonical_json_for_empty_archive_is_known_string() {
+        let json = canonical_json(&empty_archive()).unwrap();
+        // serde_json::Map uses BTreeMap by default: keys sort alphabetically,
+        // so "edges" precedes "entities".
+        assert_eq!(json, r#"{"edges":[],"entities":[]}"#);
+    }
+
+    #[test]
+    fn tags_sorted_lexicographically_same_hash() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let mut e1 = make_entity(id, "Alpha");
+        e1.tags = vec!["z".into(), "a".into(), "m".into()];
+        let mut e2 = make_entity(id, "Alpha");
+        e2.tags = vec!["a".into(), "m".into(), "z".into()];
+
+        let mut a1 = empty_archive();
+        a1.entities = vec![e1];
+        let mut a2 = empty_archive();
+        a2.entities = vec![e2];
+
+        assert_eq!(canonical_json(&a1).unwrap(), canonical_json(&a2).unwrap());
+        assert_eq!(
+            snapshot_id_for_archive(&a1).unwrap(),
+            snapshot_id_for_archive(&a2).unwrap()
+        );
+    }
+
+    #[test]
+    fn property_key_order_independent_hash() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let mut e1 = make_entity(id, "Alpha");
+        e1.properties = Some(serde_json::json!({"z_key": 1, "a_key": 2}));
+        let mut e2 = make_entity(id, "Alpha");
+        e2.properties = Some(serde_json::json!({"a_key": 2, "z_key": 1}));
+
+        let mut a1 = empty_archive();
+        a1.entities = vec![e1];
+        let mut a2 = empty_archive();
+        a2.entities = vec![e2];
+
+        assert_eq!(canonical_json(&a1).unwrap(), canonical_json(&a2).unwrap());
+        assert_eq!(
+            snapshot_id_for_archive(&a1).unwrap(),
+            snapshot_id_for_archive(&a2).unwrap()
+        );
+    }
+
+    #[test]
+    fn edge_order_independent_hash() {
+        let uid1 = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let uid2 = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let uid3 = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let edge_id1 = Uuid::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let edge_id2 = Uuid::parse_str("00000000-0000-0000-0000-000000000020").unwrap();
+        let edge1 = ExportedEdge {
+            edge_id: edge_id1,
+            source: uid1,
+            target: uid2,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+        };
+        let edge2 = ExportedEdge {
+            edge_id: edge_id2,
+            source: uid2,
+            target: uid3,
+            relation: EdgeRelation::Extends,
+            weight: 0.5,
+        };
+
+        let mut a1 = empty_archive();
+        a1.edges = vec![edge1.clone(), edge2.clone()];
+        let mut a2 = empty_archive();
+        a2.edges = vec![edge2, edge1]; // reversed
+
+        assert_eq!(
+            snapshot_id_for_archive(&a1).unwrap(),
+            snapshot_id_for_archive(&a2).unwrap()
+        );
+    }
+
+    #[test]
+    fn non_finite_edge_weight_rejected() {
+        let uid1 = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let uid2 = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let mut archive = empty_archive();
+        archive.edges = vec![ExportedEdge {
+            edge_id: Uuid::new_v4(),
+            source: uid1,
+            target: uid2,
+            relation: EdgeRelation::Extends,
+            weight: f64::NAN,
+        }];
+        let err = snapshot_id_for_archive(&archive).unwrap_err();
+        assert!(matches!(err, VcsError::Internal(ref msg) if msg.contains("not finite")));
+    }
+
+    #[test]
+    fn different_entity_name_changes_hash() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let e1 = make_entity(id, "Alpha");
+        let e2 = make_entity(id, "Beta");
+
+        let mut a1 = empty_archive();
+        a1.entities = vec![e1];
+        let mut a2 = empty_archive();
+        a2.entities = vec![e2];
+
+        assert_ne!(
+            snapshot_id_for_archive(&a1).unwrap(),
+            snapshot_id_for_archive(&a2).unwrap()
+        );
+    }
 }

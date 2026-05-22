@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "GTD verb pack — task lifecycle (assign/next/complete/transition) over the notes substrate"
 
 [dependencies]

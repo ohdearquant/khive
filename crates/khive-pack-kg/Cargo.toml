@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "KG verb pack — entity/note CRUD, graph traversal, hybrid search for research knowledge graphs"
 
 [dependencies]

@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Rego (Open Policy Agent) backend for khive-gate, powered by regorus."
 
 [dependencies]

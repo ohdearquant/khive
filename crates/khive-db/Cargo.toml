@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "SQLite storage backend: entities, edges, notes, events, FTS5, sqlite-vec vectors."
 
 [dependencies]
