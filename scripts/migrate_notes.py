@@ -6,27 +6,26 @@ substrate. Populates the FTS index. Vector embeddings are left to the
 runtime (generated on first search).
 
 Usage:
-    uv run python scripts/migrate_notes.py [--dry-run]
+    uv run python scripts/migrate_notes.py <source.db> [--dry-run]
+    uv run python scripts/migrate_notes.py ~/.khive/khive.db.backup --dry-run
 """
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
 
-INTERNAL_DB = Path.home() / ".khive" / "khive.db.backup.20260522"
 OSS_DB = Path.home() / ".khive" / "khive-graph.db"
 
 
-def migrate(dry_run: bool = False):
-    if not INTERNAL_DB.exists():
-        print(f"ERROR: internal DB not found at {INTERNAL_DB}")
+def migrate(source_db: Path, dry_run: bool = False):
+    if not source_db.exists():
+        print(f"ERROR: source DB not found at {source_db}")
         sys.exit(1)
     if not OSS_DB.exists():
         print(f"ERROR: OSS DB not found at {OSS_DB}")
         sys.exit(1)
 
-    src = sqlite3.connect(str(INTERNAL_DB))
+    src = sqlite3.connect(str(source_db))
     dst = sqlite3.connect(str(OSS_DB))
     dst.execute("PRAGMA journal_mode=WAL")
     dst.execute("PRAGMA foreign_keys=OFF")
@@ -100,5 +99,9 @@ def migrate(dry_run: bool = False):
 
 
 if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if not args:
+        print("Usage: uv run python scripts/migrate_notes.py <source.db> [--dry-run]")
+        sys.exit(1)
     dry_run = "--dry-run" in sys.argv
-    migrate(dry_run=dry_run)
+    migrate(Path(args[0]), dry_run=dry_run)
