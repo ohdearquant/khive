@@ -249,6 +249,61 @@ mod tests {
     }
 
     #[test]
+    fn beta_posterior_default_has_uniform_prior() {
+        let p = BetaPosterior::default();
+        assert!((p.alpha - 1.0).abs() < 1e-12);
+        assert!((p.beta - 1.0).abs() < 1e-12);
+        assert!((p.mean() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn entity_posteriors_from_snapshot_rebuilds_map() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let mut snapshot = HashMap::new();
+        snapshot.insert(id1, BetaPosterior::new(3.0, 2.0));
+        snapshot.insert(id2, BetaPosterior::new(5.0, 1.0));
+
+        let ep = EntityPosteriors::from_snapshot(snapshot, 100);
+        assert_eq!(ep.len(), 2);
+        let p1 = ep.get(&id1).unwrap();
+        assert!((p1.alpha - 3.0).abs() < 1e-12);
+        let p2 = ep.get(&id2).unwrap();
+        assert!((p2.alpha - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn brain_state_from_snapshot_roundtrip() {
+        let mut params = HashMap::new();
+        params.insert(
+            "recall::relevance_weight".into(),
+            BetaPosterior::new(7.0, 3.0),
+        );
+        let mut state = BrainState::new(params, 100);
+        state.total_events = 55;
+        state.exploration_epoch = 2;
+        let id = Uuid::new_v4();
+        state
+            .entity_posteriors
+            .get_or_insert(id, || BetaPosterior::new(4.0, 6.0))
+            .update_success();
+
+        let snap1 = state.to_snapshot();
+        let restored = BrainState::from_snapshot(snap1.clone(), 100);
+        let snap2 = restored.to_snapshot();
+
+        assert_eq!(snap2.total_events, 55);
+        assert_eq!(snap2.exploration_epoch, 2);
+        let p = &snap2.parameters["recall::relevance_weight"];
+        assert!((p.alpha - 7.0).abs() < 1e-12);
+        assert!((p.beta - 3.0).abs() < 1e-12);
+        let ep = snap2.entity_posteriors.get(&id).unwrap();
+        // default 4+1=5 alpha (update_success on 4.0), beta stays 6.0
+        assert!((ep.alpha - 5.0).abs() < 1e-12);
+        assert!((ep.beta - 6.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn reset_posteriors_preserves_event_count() {
         let mut params = HashMap::new();
         params.insert("test".into(), BetaPosterior::new(7.0, 3.0));

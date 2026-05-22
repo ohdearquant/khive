@@ -298,3 +298,94 @@ impl PackRuntime for BrainPack {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_runtime::VerbRegistryBuilder;
+    use serde_json::json;
+
+    fn make_pack() -> BrainPack {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        BrainPack::new(rt)
+    }
+
+    fn empty_registry() -> VerbRegistry {
+        VerbRegistryBuilder::new()
+            .build()
+            .expect("empty registry builds successfully")
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_verb_returns_invalid_input() {
+        let pack = make_pack();
+        let registry = empty_registry();
+        let err = pack
+            .dispatch("brain.unknown", json!({}), &registry)
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("brain.unknown"),
+                "expected verb name in error: {msg}"
+            );
+        } else {
+            panic!("expected InvalidInput, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_reset_returns_true_and_increments_epoch() {
+        let pack = make_pack();
+        let registry = empty_registry();
+        let result = pack
+            .dispatch("brain.reset", json!({}), &registry)
+            .await
+            .unwrap();
+        assert_eq!(result["reset"], json!(true));
+        assert_eq!(result["exploration_epoch"], json!(1u64));
+    }
+
+    #[tokio::test]
+    async fn dispatch_emit_invalid_signal_returns_invalid_input() {
+        let pack = make_pack();
+        let registry = empty_registry();
+        let target = "00000000-0000-0000-0000-000000000001";
+        let err = pack
+            .dispatch(
+                "brain.emit",
+                json!({"target_id": target, "signal": "bad_signal"}),
+                &registry,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("bad_signal"),
+                "expected signal name in error: {msg}"
+            );
+            assert!(
+                msg.contains("valid"),
+                "expected hint about valid values: {msg}"
+            );
+        } else {
+            panic!("expected InvalidInput, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_state_returns_snapshot_fields() {
+        let pack = make_pack();
+        let registry = empty_registry();
+        let result = pack
+            .dispatch("brain.state", json!({}), &registry)
+            .await
+            .unwrap();
+        assert!(result.get("total_events").is_some(), "missing total_events");
+        assert!(
+            result.get("exploration_epoch").is_some(),
+            "missing exploration_epoch"
+        );
+        assert!(result.get("parameters").is_some(), "missing parameters");
+    }
+}

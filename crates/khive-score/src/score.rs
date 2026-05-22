@@ -280,4 +280,65 @@ mod tests {
         assert_eq!(neg / 0, DeterministicScore::NEG_INF);
         assert_eq!(DeterministicScore::ZERO / 0, DeterministicScore::ZERO);
     }
+
+    #[test]
+    fn raw_scale_known_value() {
+        assert_eq!(
+            DeterministicScore::from_f64(1.0).to_raw(),
+            4_294_967_296_i64
+        );
+    }
+
+    #[test]
+    fn display_formatting() {
+        let s = format!("{}", DeterministicScore::from_f64(0.1234567));
+        assert_eq!(s, "0.123457");
+        assert_eq!(format!("{}", DeterministicScore::MAX), "+Inf");
+        assert_eq!(format!("{}", DeterministicScore::NEG_INF), "-Inf");
+    }
+
+    #[test]
+    fn debug_formatting() {
+        assert_eq!(
+            format!("{:?}", DeterministicScore::MAX),
+            "DeterministicScore(+Inf)"
+        );
+        assert_eq!(
+            format!("{:?}", DeterministicScore::NEG_INF),
+            "DeterministicScore(-Inf)"
+        );
+        let s = format!("{:?}", DeterministicScore::from_f64(0.5));
+        assert!(
+            s.starts_with("DeterministicScore(0.5"),
+            "unexpected debug output: {s}"
+        );
+    }
+
+    #[test]
+    fn add_saturates_at_max() {
+        assert_eq!(
+            DeterministicScore::MAX + DeterministicScore::from_raw(1),
+            DeterministicScore::MAX
+        );
+    }
+
+    #[test]
+    fn sub_saturates_at_neg_inf() {
+        assert_eq!(
+            DeterministicScore::NEG_INF - DeterministicScore::from_raw(1),
+            DeterministicScore::NEG_INF
+        );
+    }
+
+    #[test]
+    fn mul_i64_saturates_at_max() {
+        let large = DeterministicScore::from_raw(i64::MAX / 2);
+        assert_eq!(large * 3_i64, DeterministicScore::MAX);
+    }
+
+    #[test]
+    fn mul_f64_nan_yields_zero() {
+        let s = DeterministicScore::from_f64(1.0);
+        assert_eq!(s * f64::NAN, DeterministicScore::ZERO);
+    }
 }

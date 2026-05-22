@@ -195,4 +195,60 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn feedback_not_useful_is_negative_entity_signal() {
+        let id = Uuid::new_v4();
+        let sig = BrainSignal::Feedback {
+            target_id: id,
+            signal: FeedbackSignal::NotUseful,
+        };
+        assert_eq!(entity_signal(&sig), Some((id, false)));
+    }
+
+    #[test]
+    fn feedback_wrong_is_negative_entity_signal() {
+        let id = Uuid::new_v4();
+        let sig = BrainSignal::Feedback {
+            target_id: id,
+            signal: FeedbackSignal::Wrong,
+        };
+        assert_eq!(entity_signal(&sig), Some((id, false)));
+    }
+
+    #[test]
+    fn brain_emit_invalid_signal_data_is_irrelevant() {
+        let id = Uuid::new_v4();
+        let mut e = make_event("brain.emit", EventOutcome::Success, Some(id));
+        e.data = Some(serde_json::json!({"signal": "bad_value"}));
+        assert!(matches!(interpret(&e), BrainSignal::Irrelevant));
+    }
+
+    #[test]
+    fn note_accessed_via_get_verb_is_positive_entity_signal() {
+        let id = Uuid::new_v4();
+        let e = make_event("get", EventOutcome::Success, Some(id));
+        match interpret(&e) {
+            BrainSignal::NoteAccessed { target_id } => {
+                assert_eq!(target_id, id);
+                assert_eq!(
+                    entity_signal(&BrainSignal::NoteAccessed { target_id }),
+                    Some((id, true))
+                );
+            }
+            other => panic!("expected NoteAccessed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn note_accessed_via_remember_verb_is_positive_entity_signal() {
+        let id = Uuid::new_v4();
+        let e = make_event("remember", EventOutcome::Success, Some(id));
+        match interpret(&e) {
+            BrainSignal::NoteAccessed { target_id } => {
+                assert_eq!(target_id, id);
+            }
+            other => panic!("expected NoteAccessed, got {other:?}"),
+        }
+    }
 }

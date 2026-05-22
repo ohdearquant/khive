@@ -109,4 +109,27 @@ mod tests {
         let zero_key = QuantKey::new(0.0, 1);
         assert_eq!(nan_key.quantized_score(), zero_key.quantized_score());
     }
+
+    #[test]
+    fn clamp_high_score() {
+        let key = QuantKey::new(f32::MAX, 0);
+        assert_eq!(key.quantized_score(), i32::MAX);
+    }
+
+    #[test]
+    fn clamp_low_score() {
+        let key = QuantKey::new(f32::MIN, 0);
+        assert_eq!(key.quantized_score(), i32::MIN);
+    }
+
+    #[test]
+    fn from_f64_roundtrip_approx() {
+        let key = QuantKey::from_f64(0.5, 7);
+        assert!(
+            (key.score() - 0.5_f32).abs() < 1e-5,
+            "score was {}",
+            key.score()
+        );
+        assert_eq!(key.id_prefix(), 7);
+    }
 }

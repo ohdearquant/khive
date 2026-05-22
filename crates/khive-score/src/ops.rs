@@ -216,4 +216,48 @@ mod tests {
         assert_eq!(r1, r2);
         assert_eq!(r2, r3);
     }
+
+    #[test]
+    fn avg_scores_checked_empty_returns_zero_no_flag() {
+        let (mean, flag) = avg_scores_checked(&[]);
+        assert_eq!(mean, DeterministicScore::ZERO);
+        assert!(!flag);
+    }
+
+    #[test]
+    fn avg_scores_checked_near_saturation_sets_flag() {
+        let (_, flag) = avg_scores_checked(&[DeterministicScore::MAX, DeterministicScore::MAX]);
+        assert!(flag);
+    }
+
+    #[test]
+    fn max_score_empty_returns_neg_inf() {
+        assert_eq!(max_score(&[]), DeterministicScore::NEG_INF);
+    }
+
+    #[test]
+    fn min_score_empty_returns_max() {
+        assert_eq!(min_score(&[]), DeterministicScore::MAX);
+    }
+
+    #[test]
+    fn rrf_score_zero_denominator_returns_zero() {
+        assert_eq!(rrf_score(0, 0), DeterministicScore::ZERO);
+    }
+
+    #[test]
+    fn rrf_score_overflow_returns_zero() {
+        assert_eq!(rrf_score(usize::MAX, 1), DeterministicScore::ZERO);
+    }
+
+    #[test]
+    fn weighted_sum_empty_returns_zero() {
+        assert_eq!(weighted_sum(&[], &[]).unwrap(), DeterministicScore::ZERO);
+    }
+
+    #[test]
+    fn weighted_sum_rejects_infinite_weight() {
+        let err = weighted_sum(&[s(1.0)], &[f64::INFINITY]).unwrap_err();
+        assert_eq!(err, ScoreError::NonFiniteWeight { index: 0 });
+    }
 }
