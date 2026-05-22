@@ -1,6 +1,6 @@
 {
   "name": "@khive/cli",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "khive — research knowledge graph CLI",
   "license": "Apache-2.0",
   "tasks": {

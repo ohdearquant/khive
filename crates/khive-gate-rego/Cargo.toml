@@ -11,11 +11,11 @@ categories.workspace = true
 description = "Rego (Open Policy Agent) backend for khive-gate, powered by regorus."
 
 [dependencies]
-khive-gate = { version = "0.1.4", path = "../khive-gate" }
+khive-gate = { version = "0.2.0", path = "../khive-gate" }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
 regorus = "0.10"
 
 [dev-dependencies]
-khive-types = { version = "0.1.4", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.2.0", path = "../khive-types", features = ["serde"] }

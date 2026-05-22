@@ -11,7 +11,7 @@ categories.workspace = true
 description = "Cognitive primitives — Fold, Anchor, Objective, Selector"
 
 [dependencies]
-khive-score = { version = "0.1.4", path = "../khive-score" }
+khive-score = { version = "0.2.0", path = "../khive-score" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

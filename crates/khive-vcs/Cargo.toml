@@ -9,8 +9,8 @@ homepage.workspace = true
 description = "KG versioning — snapshots, branches, and remote sync (ADR-042)"
 
 [dependencies]
-khive-runtime = { version = "0.1.4", path = "../khive-runtime" }
-khive-storage = { version = "0.1.4", path = "../khive-storage" }
+khive-runtime = { version = "0.2.0", path = "../khive-runtime" }
+khive-storage = { version = "0.2.0", path = "../khive-storage" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
