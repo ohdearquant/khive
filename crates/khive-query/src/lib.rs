@@ -26,7 +26,7 @@ pub mod validate;
 pub use ast::{GqlQuery, ReturnItem};
 pub use compilers::sql::{compile, CompileOptions, CompiledQuery};
 pub use error::QueryError;
-pub use validate::{validate, MAX_DEPTH};
+pub use validate::{validate, validate_with_warnings, MAX_DEPTH};
 
 /// Which query language the input is written in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

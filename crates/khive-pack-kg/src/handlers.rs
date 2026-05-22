@@ -11,7 +11,7 @@ use uuid::Uuid;
 use khive_runtime::{
     EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
 };
-use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
+use khive_storage::types::{Direction, NeighborQuery, TraversalOptions, TraversalRequest};
 use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
 
 use crate::vocab::{EntityKind, NoteKind};
@@ -275,6 +275,7 @@ struct NeighborsParams {
     node_id: String,
     direction: Option<String>,
     limit: Option<u32>,
+    min_weight: Option<f64>,
     relations: Option<Vec<String>>,
 }
 
@@ -285,6 +286,8 @@ struct TraverseParams {
     max_depth: Option<usize>,
     direction: Option<String>,
     relations: Option<Vec<String>>,
+    min_weight: Option<f64>,
+    limit: Option<u32>,
     include_roots: Option<bool>,
 }
 
@@ -939,17 +942,12 @@ impl KgPack {
                     |s| canonical_entity_kind(s, registry),
                     "entity_kind",
                 )?;
-                let query_vector = if self.runtime.config().embedding_model.is_some() {
-                    Some(self.runtime.embed(&p.query).await?)
-                } else {
-                    None
-                };
                 let hits = self
                     .runtime
                     .hybrid_search(
                         p.namespace.as_deref(),
                         &p.query,
-                        query_vector,
+                        None,
                         limit,
                         kind_filter.as_deref(),
                     )
@@ -974,17 +972,12 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
-                let query_vector = if self.runtime.config().embedding_model.is_some() {
-                    Some(self.runtime.embed(&p.query).await?)
-                } else {
-                    None
-                };
                 let hits = self
                     .runtime
                     .search_notes(
                         p.namespace.as_deref(),
                         &p.query,
-                        query_vector,
+                        None,
                         limit,
                         kind_filter.as_deref(),
                     )
@@ -995,6 +988,8 @@ impl KgPack {
                         serde_json::json!({
                             "note_id": h.note_id.to_string(),
                             "score": h.score.to_f64(),
+                            "title": h.title,
+                            "snippet": h.snippet,
                         })
                     })
                     .collect();
@@ -1040,12 +1035,15 @@ impl KgPack {
             .transpose()?;
         let hits = self
             .runtime
-            .neighbors(
+            .neighbors_with_query(
                 p.namespace.as_deref(),
                 node_id,
-                direction,
-                p.limit,
-                relations,
+                NeighborQuery {
+                    direction,
+                    relations,
+                    limit: p.limit,
+                    min_weight: p.min_weight,
+                },
             )
             .await?;
         to_json(&hits)
@@ -1070,8 +1068,8 @@ impl KgPack {
             max_depth: p.max_depth.unwrap_or(3),
             direction,
             relations,
-            min_weight: None,
-            limit: None,
+            min_weight: p.min_weight,
+            limit: p.limit,
         };
         let request = TraversalRequest {
             roots,
@@ -1087,7 +1085,10 @@ impl KgPack {
 
     pub(crate) async fn handle_query(&self, params: Value) -> Result<Value, RuntimeError> {
         let p: QueryParams = deser(params)?;
-        let rows = self.runtime.query(p.namespace.as_deref(), &p.query).await?;
-        to_json(&rows)
+        let result = self
+            .runtime
+            .query_with_metadata(p.namespace.as_deref(), &p.query)
+            .await?;
+        to_json(&result)
     }
 }

@@ -34,6 +34,15 @@ pub const MAX_DEPTH: usize = 10;
 /// Canonicalizes edge relation strings to their snake_case form (closed set).
 /// Node kind strings pass through unchanged (pack-agnostic).
 pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
+    validate_with_warnings(query).map(|_| ())
+}
+
+/// Validate and normalise an AST in place, returning any warnings generated.
+///
+/// Currently warns when `max_hops` is clamped to [`MAX_DEPTH`].
+pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, QueryError> {
+    let mut warnings = Vec::new();
+
     // Pattern variables are bindings — the same variable name appearing twice
     // would mean "same node/edge" and require alias-equality predicates in
     // SQL. Until that is implemented, reject repeated bindings explicitly so
@@ -103,10 +112,13 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
                         edge.min_hops, MAX_DEPTH
                     )));
                 }
-                // Clamp max_hops to the depth cap — the lower bound is
-                // still satisfiable, so this only narrows the search.
+                // Clamp max_hops to the depth cap; report the narrowing to callers.
                 if edge.max_hops > MAX_DEPTH {
+                    let requested = edge.max_hops;
                     edge.max_hops = MAX_DEPTH;
+                    warnings.push(format!(
+                        "Query depth capped at {MAX_DEPTH} hops (requested {requested})"
+                    ));
                 }
             }
         }
@@ -141,7 +153,7 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
         validate_condition(cond, is_edge)?;
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -220,6 +232,19 @@ mod tests {
         let edge = q.pattern.edges().next().unwrap();
         assert_eq!(edge.max_hops, MAX_DEPTH);
         assert!(edge.min_hops <= edge.max_hops);
+    }
+
+    #[test]
+    fn warns_when_clamping_depth_above_max() {
+        let mut q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
+        let warnings = validate_with_warnings(&mut q).unwrap();
+        assert_eq!(q.pattern.edges().next().unwrap().max_hops, MAX_DEPTH);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Query depth capped at 10")),
+            "warnings: {warnings:?}"
+        );
     }
 
     #[test]

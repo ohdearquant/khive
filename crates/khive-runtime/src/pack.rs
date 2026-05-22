@@ -530,6 +530,18 @@ impl VerbRegistry {
         self.packs.iter().flat_map(|p| p.verbs().iter()).collect()
     }
 
+    /// All verb definitions paired with the name of the pack that owns them.
+    ///
+    /// Useful for building catalogs that attribute each verb to its source pack.
+    /// The pack name has the same lifetime as `&self`; the `VerbDef` reference
+    /// is `'static`.
+    pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static VerbDef)> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.verbs().iter().map(move |v| (p.name(), v)))
+            .collect()
+    }
+
     /// Merged set of note kinds across all registered packs (deduplicated,
     /// first-seen order preserved).
     pub fn all_note_kinds(&self) -> Vec<&'static str> {
@@ -816,6 +828,25 @@ mod tests {
         let reg = build_registry();
         let verbs: Vec<&str> = reg.all_verbs().iter().map(|v| v.name).collect();
         assert_eq!(verbs, vec!["create", "list", "notify", "create"]);
+    }
+
+    #[test]
+    fn all_verbs_with_names_pairs_pack_name() {
+        let reg = build_registry();
+        let pairs: Vec<(&str, &str)> = reg
+            .all_verbs_with_names()
+            .iter()
+            .map(|(pack, v)| (*pack, v.name))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("alpha", "create"),
+                ("alpha", "list"),
+                ("beta", "notify"),
+                ("beta", "create"),
+            ]
+        );
     }
 
     #[test]
