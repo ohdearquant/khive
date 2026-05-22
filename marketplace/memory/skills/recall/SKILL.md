@@ -40,7 +40,7 @@ When a hit matters, carry forward its `note_id` in your notes or response so it 
 
 ### 4. Adjust thresholds only after the first pass
 
-Recall scores are decay-aware hybrid scores (combining vector similarity, FTS rank, salience, and temporal decay), not raw cosine similarity. Typical scores range from 0.01 to 0.10 — a `min_score` of 0.4 would filter out everything. Start without `min_score` and inspect the returned scores before setting a threshold:
+Recall scores are decay-aware hybrid scores (combining RRF fusion, salience with decay, and temporal recency — weighted 0.70 / 0.20 / 0.10 by default). Recent notes with normal salience typically score 0.10–0.25; older or low-salience notes may drop to 0.02–0.08. Start without `min_score` and inspect the returned scores before setting a threshold:
 
 ```
 request(ops="recall(query=\"memory pack source_id annotates\", limit=5)")

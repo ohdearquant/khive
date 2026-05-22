@@ -79,7 +79,7 @@ def migrate(source_db: Path, dry_run: bool = False):
             "INSERT INTO fts_notes_local (subject_id, kind, title, body, tags, "
             "namespace, metadata, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (note_id, kind, title, body, tags_str, namespace, properties or "", str(updated_at)),
+            (note_id, kind, title, body, tags_str, namespace, properties or "", updated_at),
         )
 
         inserted += 1
