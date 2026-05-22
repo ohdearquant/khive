@@ -17,8 +17,6 @@
 //! into one keeps tool-list latency low and frees agent context budget while
 //! preserving expressiveness through the DSL.
 
-use std::collections::HashMap;
-
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{Implementation, ServerCapabilities, ServerInfo},
@@ -30,6 +28,51 @@ use khive_request::{parse_request, DslError, ParsedOp};
 use khive_runtime::{KhiveRuntime, PackRegistry, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 
 use crate::tools::request::RequestParams;
+
+/// Build a sorted, human-readable verb catalog from `(pack_name, verb_name, description)` triples.
+///
+/// When multiple packs register the same verb name, each pack's description is
+/// emitted on its own continuation line with a `[pack]` prefix so the caller can
+/// see every contributing pack. A `tracing::warn!` is emitted once per duplicate.
+fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>) -> String {
+    let mut by_verb: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for (pack_name, verb_name, description) in verbs {
+        by_verb
+            .entry(verb_name)
+            .or_default()
+            .push((pack_name, description));
+    }
+    let mut out = String::new();
+    for (name, pack_descs) in &by_verb {
+        if pack_descs.len() > 1 {
+            let packs: Vec<&str> = pack_descs.iter().map(|(p, _)| p.as_str()).collect();
+            tracing::warn!(
+                verb = %name,
+                packs = ?packs,
+                "verb registered by multiple packs; all descriptions included in catalog"
+            );
+        }
+        out.push_str("  ");
+        out.push_str(name);
+        out.push_str(" — ");
+        if pack_descs.len() == 1 {
+            out.push_str(&pack_descs[0].1);
+        } else {
+            for (i, (pack, desc)) in pack_descs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("\n    ");
+                }
+                out.push('[');
+                out.push_str(pack);
+                out.push_str("] ");
+                out.push_str(desc);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
 
 /// MCP server that dispatches all verbs through a [`VerbRegistry`].
 #[derive(Clone)]
@@ -178,22 +221,12 @@ impl KhiveMcpServer {
     /// The list is rebuilt from the runtime registry so it always reflects which
     /// packs are actually loaded.
     fn verb_catalog(&self) -> String {
-        let mut by_verb: HashMap<&str, &str> = HashMap::new();
-        for v in self.registry.all_verbs() {
-            // first registered pack's description wins on collision
-            by_verb.entry(v.name).or_insert(v.description);
-        }
-        let mut entries: Vec<(&&str, &&str)> = by_verb.iter().collect();
-        entries.sort_by_key(|(n, _)| **n);
-        let mut out = String::new();
-        for (name, desc) in entries {
-            out.push_str("  ");
-            out.push_str(name);
-            out.push_str(" — ");
-            out.push_str(desc);
-            out.push('\n');
-        }
-        out
+        let verbs = self
+            .registry
+            .all_verbs_with_names()
+            .into_iter()
+            .map(|(pack, v)| (pack.to_owned(), v.name.to_owned(), v.description.to_owned()));
+        build_verb_catalog(verbs)
     }
 
     /// Run a parsed batch in parallel, gathering per-op results in input order.
@@ -318,5 +351,54 @@ impl ServerHandler for KhiveMcpServer {
             meta: None,
             next_cursor: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_verb_catalog;
+
+    fn t(pack: &str, verb: &str, desc: &str) -> (String, String, String) {
+        (pack.to_owned(), verb.to_owned(), desc.to_owned())
+    }
+
+    #[test]
+    fn single_pack_verbs_unchanged() {
+        let catalog = build_verb_catalog([
+            t("kg", "create", "Create an entity or note."),
+            t("kg", "list", "List entities."),
+        ]);
+        assert_eq!(
+            catalog,
+            "  create — Create an entity or note.\n  list — List entities.\n"
+        );
+    }
+
+    #[test]
+    fn duplicate_verb_concatenates_descriptions_with_pack_attribution() {
+        let catalog = build_verb_catalog([
+            t("kg", "create", "Create an entity or note."),
+            t("gtd", "create", "Create a task."),
+        ]);
+        // Both pack descriptions must appear with attribution.
+        assert!(catalog.contains("[kg] Create an entity or note."));
+        assert!(catalog.contains("[gtd] Create a task."));
+        // The verb name must appear exactly once in the catalog header.
+        assert_eq!(catalog.matches("  create — ").count(), 1);
+    }
+
+    #[test]
+    fn catalog_is_sorted_alphabetically() {
+        let catalog = build_verb_catalog([
+            t("kg", "search", "Search."),
+            t("kg", "assign", "Assign."),
+            t("kg", "list", "List."),
+        ]);
+        let names: Vec<&str> = catalog
+            .lines()
+            .filter(|l| l.starts_with("  "))
+            .map(|l| l.trim_start().split(' ').next().unwrap())
+            .collect();
+        assert_eq!(names, vec!["assign", "list", "search"]);
     }
 }

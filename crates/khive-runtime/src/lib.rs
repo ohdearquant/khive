@@ -43,7 +43,7 @@ pub use objectives::{
     GraphProximityObjective, RetrievalCandidate, RrfFusionObjective, TextRelevanceObjective,
     VectorSimilarityObjective,
 };
-pub use operations::Resolved;
+pub use operations::{NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
     KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
     VerbRegistryBuilder,

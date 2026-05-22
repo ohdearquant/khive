@@ -353,12 +353,14 @@ mod tests {
     #[test]
     fn default_config_packs_falls_back_to_kg() {
         let prior = std::env::var("KHIVE_PACKS").ok();
+        // SAFETY: test function runs single-threaded; no other threads read or write KHIVE_PACKS.
         unsafe {
             std::env::remove_var("KHIVE_PACKS");
         }
         let cfg = RuntimeConfig::default();
         assert_eq!(cfg.packs, vec!["kg".to_string()]);
         if let Some(v) = prior {
+            // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {
                 std::env::set_var("KHIVE_PACKS", v);
             }
@@ -377,6 +379,7 @@ mod tests {
         let cfg = RuntimeConfig::default();
         assert_eq!(cfg.embedding_model, Some(EmbeddingModel::AllMiniLmL6V2));
         if let Some(v) = prior {
+            // SAFETY: single-threaded test cleanup; restores KHIVE_EMBEDDING_MODEL to its prior value.
             unsafe {
                 std::env::set_var("KHIVE_EMBEDDING_MODEL", v);
             }

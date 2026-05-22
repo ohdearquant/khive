@@ -301,9 +301,17 @@ impl GraphStore for SqlGraphStore {
             .map(|v| serde_json::to_string(v).unwrap_or_default());
         self.with_writer("upsert_edge", move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO graph_edges \
+                "INSERT INTO graph_edges \
                  (namespace, id, source_id, target_id, relation, weight, created_at, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(namespace, id) DO UPDATE SET \
+                     source_id = excluded.source_id, \
+                     target_id = excluded.target_id, \
+                     relation = excluded.relation, \
+                     weight = excluded.weight, \
+                     created_at = excluded.created_at, \
+                     metadata = excluded.metadata \
+                 ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
                 rusqlite::params![
                     namespace,
                     id_str,
@@ -340,9 +348,17 @@ impl GraphStore for SqlGraphStore {
                     .as_ref()
                     .map(|v| serde_json::to_string(v).unwrap_or_default());
                 match conn.execute(
-                    "INSERT OR REPLACE INTO graph_edges \
+                    "INSERT INTO graph_edges \
                      (namespace, id, source_id, target_id, relation, weight, created_at, metadata) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(namespace, id) DO UPDATE SET \
+                         source_id = excluded.source_id, \
+                         target_id = excluded.target_id, \
+                         relation = excluded.relation, \
+                         weight = excluded.weight, \
+                         created_at = excluded.created_at, \
+                         metadata = excluded.metadata \
+                     ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
                     rusqlite::params![
                         &namespace,
                         id_str,
@@ -756,6 +772,7 @@ const GRAPH_DDL: &str = "\
         metadata TEXT,\
         PRIMARY KEY (namespace, id)\
     );\
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique_triple ON graph_edges(namespace, source_id, target_id, relation);\
     CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_source ON graph_edges(namespace, source_id);\
     CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_target ON graph_edges(namespace, target_id);\
     CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_relation ON graph_edges(namespace, relation);\
@@ -1011,5 +1028,44 @@ mod tests {
         assert_eq!(summary.failed, 0);
 
         assert_eq!(store.count_edges(EdgeFilter::default()).await.unwrap(), 10);
+    }
+
+    // ---- #229 deduplication test ----
+
+    #[tokio::test]
+    async fn graph_duplicate_edges_ignored() {
+        let store = setup_memory_store();
+
+        let src = Uuid::new_v4();
+        let tgt = Uuid::new_v4();
+
+        // Two edges with the same (source_id, target_id, relation) triple but different IDs.
+        let edge1 = Edge {
+            id: Uuid::new_v4().into(),
+            source_id: src,
+            target_id: tgt,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+            created_at: Utc::now(),
+            metadata: None,
+        };
+        let edge2 = Edge {
+            id: Uuid::new_v4().into(),
+            source_id: src,
+            target_id: tgt,
+            relation: EdgeRelation::Extends,
+            weight: 0.5,
+            created_at: Utc::now(),
+            metadata: None,
+        };
+
+        store.upsert_edge(edge1).await.unwrap();
+        store.upsert_edge(edge2).await.unwrap();
+
+        assert_eq!(
+            store.count_edges(EdgeFilter::default()).await.unwrap(),
+            1,
+            "duplicate (source, target, relation) triple must be ignored; only one edge must exist"
+        );
     }
 }

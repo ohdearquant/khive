@@ -8,7 +8,6 @@ use uuid::Uuid;
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
-    VectorSearchRequest,
 };
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
@@ -84,15 +83,15 @@ impl KhiveRuntime {
             })
             .await?;
 
-        let vector_hits = if let Some(vec) = query_vector {
-            self.vectors(namespace)?
-                .search(VectorSearchRequest {
-                    query_embedding: vec,
-                    top_k: candidates,
-                    namespace: Some(ns.clone()),
-                    kind: Some(SubstrateKind::Entity),
-                })
-                .await?
+        let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
+            self.vector_search(
+                namespace,
+                query_vector,
+                Some(query_text),
+                candidates,
+                Some(SubstrateKind::Entity),
+            )
+            .await?
         } else {
             Vec::new()
         };

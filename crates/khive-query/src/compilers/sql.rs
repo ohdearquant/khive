@@ -11,7 +11,7 @@
 
 use crate::ast::*;
 use crate::error::QueryError;
-use crate::validate::validate;
+use crate::validate::{validate_with_warnings, MAX_DEPTH};
 use khive_storage::types::SqlValue;
 
 #[derive(Debug)]
@@ -19,6 +19,7 @@ pub struct CompiledQuery {
     pub sql: String,
     pub params: Vec<SqlValue>,
     pub return_vars: Vec<ReturnItem>,
+    pub warnings: Vec<String>,
 }
 
 pub struct CompileOptions {
@@ -44,13 +45,15 @@ pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery,
 
     // Validate edge relations + structural rules before emitting SQL.
     let mut query = query.clone();
-    validate(&mut query)?;
+    let warnings = validate_with_warnings(&mut query)?;
 
-    if query.pattern.has_variable_length() {
-        compile_variable_length(&query, opts)
+    let mut compiled = if query.pattern.has_variable_length() {
+        compile_variable_length(&query, opts)?
     } else {
-        compile_fixed_length(&query, opts)
-    }
+        compile_fixed_length(&query, opts)?
+    };
+    compiled.warnings = warnings;
+    Ok(compiled)
 }
 
 fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<SqlValue>) -> String {
@@ -335,6 +338,7 @@ fn compile_fixed_length(
         sql,
         params,
         return_vars: query.return_items.clone(),
+        warnings: Vec::new(),
     })
 }
 
@@ -368,7 +372,7 @@ fn compile_variable_length(
     let end = &nodes[1];
 
     // MAJ-2: depth cap — always parameterized, never injected as literal
-    let max_depth = edge.max_hops.min(10);
+    let max_depth = edge.max_hops.min(MAX_DEPTH);
     let min_depth = edge.min_hops;
 
     // Build start-node conditions
@@ -680,6 +684,7 @@ fn compile_variable_length(
         sql,
         params,
         return_vars: query.return_items.clone(),
+        warnings: Vec::new(),
     })
 }
 
@@ -956,6 +961,41 @@ mod tests {
         use crate::parsers::sparql;
         let err = sparql::parse("SELECT ?a ?b WHERE { ?a :extends* ?b . }").unwrap_err();
         assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
+    }
+
+    /// Regression guard for ISSUE #231.
+    ///
+    /// Verifies the full SPARQL subject→predicate→object direction contract:
+    ///   ?a :extends ?b  must compile so that ?a binds `source_id` and ?b binds `target_id`.
+    ///
+    /// A swap (subject→target_id, object→source_id) would cause a query for
+    /// A–extends→B to return rows where B–extends→A, silently returning wrong results.
+    #[test]
+    fn sparql_subject_object_direction_compiles_outbound() {
+        use crate::parsers::sparql;
+
+        let q = sparql::parse("SELECT ?a ?b WHERE { ?a :extends ?b . }").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+
+        assert!(
+            compiled
+                .sql
+                .contains("JOIN graph_edges e0 ON e0.source_id = n0.id"),
+            "SPARQL subject must bind graph_edges.source_id; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled
+                .sql
+                .contains("JOIN entities n1 ON n1.id = e0.target_id"),
+            "SPARQL object must bind graph_edges.target_id; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("e0.relation = ?1"),
+            "SPARQL predicate must bind graph_edges.relation; sql: {}",
+            compiled.sql
+        );
     }
 
     #[test]

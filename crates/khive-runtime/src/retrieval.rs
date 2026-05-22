@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::error::RuntimeResult;
+use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::KhiveRuntime;
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::types::{
@@ -73,6 +73,48 @@ impl KhiveRuntime {
         Ok(service.embed(texts, model).await?)
     }
 
+    /// Search vectors using either a caller-provided embedding or query text.
+    ///
+    /// Existing callers pass `query_embedding: Some(vec)` to avoid re-embedding.
+    /// Text callers pass `query_embedding: None, query_text: Some(...)` and the
+    /// runtime embeds internally.
+    pub async fn vector_search(
+        &self,
+        namespace: Option<&str>,
+        query_embedding: Option<Vec<f32>>,
+        query_text: Option<&str>,
+        top_k: u32,
+        kind: Option<SubstrateKind>,
+    ) -> RuntimeResult<Vec<VectorSearchHit>> {
+        let embedding = match query_embedding {
+            Some(vec) => vec,
+            None => {
+                let text = query_text.ok_or_else(|| {
+                    RuntimeError::InvalidInput(
+                        "vector search requires query_embedding or query_text".into(),
+                    )
+                })?;
+                if text.trim().is_empty() {
+                    return Err(RuntimeError::InvalidInput(
+                        "query_text must not be empty".into(),
+                    ));
+                }
+                self.embed(text).await?
+            }
+        };
+
+        let ns = self.ns(namespace).to_string();
+        Ok(self
+            .vectors(namespace)?
+            .search(VectorSearchRequest {
+                query_embedding: embedding,
+                top_k,
+                namespace: Some(ns),
+                kind,
+            })
+            .await?)
+    }
+
     /// Hybrid search: text (FTS5) + vector retrieval fused via Reciprocal Rank Fusion.
     ///
     /// - Always performs text search over `query_text`.
@@ -112,15 +154,15 @@ impl KhiveRuntime {
             })
             .await?;
 
-        let vector_hits = if let Some(vec) = query_vector {
-            self.vectors(namespace)?
-                .search(VectorSearchRequest {
-                    query_embedding: vec,
-                    top_k: candidates,
-                    namespace: Some(ns.clone()),
-                    kind: Some(SubstrateKind::Entity),
-                })
-                .await?
+        let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
+            self.vector_search(
+                namespace,
+                query_vector,
+                Some(query_text),
+                candidates,
+                Some(SubstrateKind::Entity),
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -406,6 +448,38 @@ mod tests {
             .block_on(rt.embed_batch(&texts));
         let embeddings = result.unwrap();
         assert_eq!(embeddings.len(), texts.len());
+    }
+
+    #[test]
+    fn vector_search_requires_embedding_or_text() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(rt.vector_search(None, None, None, 10, Some(SubstrateKind::Entity)));
+        match result {
+            Err(crate::RuntimeError::InvalidInput(msg)) => {
+                assert!(msg.contains("query_embedding or query_text"), "msg: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_search_text_without_model_returns_unconfigured() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(rt.vector_search(
+                None,
+                None,
+                Some("attention"),
+                10,
+                Some(SubstrateKind::Entity),
+            ));
+        match result {
+            Err(crate::RuntimeError::Unconfigured(s)) => assert_eq!(s, "embedding_model"),
+            other => panic!("expected Unconfigured, got {other:?}"),
+        }
     }
 
     #[test]

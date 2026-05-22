@@ -3,14 +3,15 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page,
-    PageRequest, SortOrder, SqlStatement, TextDocument, TextFilter, TextQueryMode,
-    TextSearchRequest, TraversalRequest, VectorSearchRequest,
+    PageRequest, SortOrder, SqlRow, SqlStatement, TextDocument, TextFilter, TextQueryMode,
+    TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, SubstrateKind};
@@ -30,11 +31,33 @@ std::thread_local! {
     static LINK_FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// A note search result with UUID and salience-weighted RRF score.
+/// A note search result with UUID, salience-weighted RRF score, and display text.
 #[derive(Clone, Debug)]
 pub struct NoteSearchHit {
     pub note_id: Uuid,
     pub score: DeterministicScore,
+    pub title: Option<String>,
+    pub snippet: Option<String>,
+}
+
+fn text_preview(text: &str, max_chars: usize) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(max_chars).collect())
+    }
+}
+
+fn note_title(note: &Note) -> Option<String> {
+    note.name
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| text_preview(&note.content, 80))
+}
+
+fn note_snippet(note: &Note) -> Option<String> {
+    text_preview(&note.content, 200)
 }
 
 /// Result of resolving a UUID to its substrate kind.
@@ -424,12 +447,26 @@ impl KhiveRuntime {
         limit: Option<u32>,
         relations: Option<Vec<EdgeRelation>>,
     ) -> RuntimeResult<Vec<NeighborHit>> {
-        let query = NeighborQuery {
-            direction,
-            relations,
-            limit,
-            min_weight: None,
-        };
+        self.neighbors_with_query(
+            namespace,
+            node_id,
+            NeighborQuery {
+                direction,
+                relations,
+                limit,
+                min_weight: None,
+            },
+        )
+        .await
+    }
+
+    /// Get neighbors with full query control (includes `min_weight`).
+    pub async fn neighbors_with_query(
+        &self,
+        namespace: Option<&str>,
+        node_id: Uuid,
+        query: NeighborQuery,
+    ) -> RuntimeResult<Vec<NeighborHit>> {
         Ok(self.graph(namespace)?.neighbors(node_id, query).await?)
     }
 
@@ -689,30 +726,43 @@ impl KhiveRuntime {
             .await?;
 
         // Vector search filtered to notes.
-        let vector_hits = if let Some(vec) = query_vector {
-            self.vectors(namespace)?
-                .search(VectorSearchRequest {
-                    query_embedding: vec,
-                    top_k: candidates,
-                    namespace: Some(ns.clone()),
-                    kind: Some(SubstrateKind::Note),
-                })
-                .await?
+        let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
+            self.vector_search(
+                namespace,
+                query_vector,
+                Some(query_text),
+                candidates,
+                Some(SubstrateKind::Note),
+            )
+            .await?
         } else {
             vec![]
         };
 
         // RRF fusion.
-        let mut buckets: HashMap<Uuid, DeterministicScore> = HashMap::new();
+        #[derive(Default)]
+        struct Bucket {
+            score: DeterministicScore,
+            title: Option<String>,
+            snippet: Option<String>,
+        }
+
+        let mut buckets: HashMap<Uuid, Bucket> = HashMap::new();
         for (i, hit) in text_hits.into_iter().enumerate() {
             let rank = i + 1;
             let entry = buckets.entry(hit.subject_id).or_default();
-            *entry = *entry + rrf_score(rank, RRF_K);
+            entry.score = entry.score + rrf_score(rank, RRF_K);
+            if entry.title.is_none() {
+                entry.title = hit.title;
+            }
+            if entry.snippet.is_none() {
+                entry.snippet = hit.snippet;
+            }
         }
         for (i, hit) in vector_hits.into_iter().enumerate() {
             let rank = i + 1;
             let entry = buckets.entry(hit.subject_id).or_default();
-            *entry = *entry + rrf_score(rank, RRF_K);
+            entry.score = entry.score + rrf_score(rank, RRF_K);
         }
 
         let candidate_ids: Vec<Uuid> = buckets.keys().copied().collect();
@@ -767,13 +817,15 @@ impl KhiveRuntime {
         // Apply salience weighting and collect final hits.
         let mut hits: Vec<NoteSearchHit> = buckets
             .into_iter()
-            .filter_map(|(id, rrf)| {
+            .filter_map(|(id, bucket)| {
                 let note = alive_notes.get(&id)?;
                 let weight = 0.5 + 0.5 * note.salience;
-                let weighted = DeterministicScore::from_f64(rrf.to_f64() * weight);
+                let weighted = DeterministicScore::from_f64(bucket.score.to_f64() * weight);
                 Some(NoteSearchHit {
                     note_id: id,
                     score: weighted,
+                    title: bucket.title.or_else(|| note_title(note)),
+                    snippet: bucket.snippet.or_else(|| note_snippet(note)),
                 })
             })
             .collect();
@@ -899,8 +951,7 @@ impl KhiveRuntime {
     /// On hard delete, cascades to remove all incident edges (both inbound and
     /// outbound) and cleans up FTS and vector indexes, preventing dangling
     /// references for `annotates` edges that target this note (ADR-002, ADR-024).
-    /// Soft delete leaves edges and indexes in place — queries filter by
-    /// `deleted_at IS NULL`.
+    /// Soft delete also cleans FTS and vector indexes; edges are left in place.
     ///
     /// Returns `false` without deleting if the note does not exist or belongs to
     /// a different namespace (ADR-007 namespace isolation).
@@ -944,12 +995,38 @@ impl KhiveRuntime {
                     graph.delete_edge(LinkId::from(hit.edge_id)).await?;
                 }
             }
-            self.remove_from_indexes(namespace, id).await?;
+            let ns_str = ns.to_string();
+            self.text_for_notes(namespace)?
+                .delete_document(&ns_str, id)
+                .await?;
+            if self.config().embedding_model.is_some() {
+                self.vectors(namespace)?.delete(id).await?;
+            }
         }
 
-        Ok(note_store.delete_note(id, mode).await?)
+        let deleted = note_store.delete_note(id, mode).await?;
+        if !hard && deleted {
+            let ns_str = ns.to_string();
+            self.text_for_notes(namespace)?
+                .delete_document(&ns_str, id)
+                .await?;
+            if self.config().embedding_model.is_some() {
+                self.vectors(namespace)?.delete(id).await?;
+            }
+        }
+        Ok(deleted)
     }
+}
 
+/// Result of a GQL/SPARQL query with optional validation warnings.
+#[derive(Clone, Debug, Serialize)]
+pub struct QueryResult {
+    pub rows: Vec<SqlRow>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl KhiveRuntime {
     // ---- Query operations ----
 
     /// Execute a GQL or SPARQL query string, returning raw SQL rows.
@@ -957,11 +1034,16 @@ impl KhiveRuntime {
     /// The query is compiled to SQL with the namespace scope applied.
     /// GQL syntax: `MATCH (a:concept)-[e:extends]->(b) RETURN a, b LIMIT 10`
     /// SPARQL syntax: `SELECT ?a WHERE { ?a :kind "concept" . }`
-    pub async fn query(
+    pub async fn query(&self, namespace: Option<&str>, query: &str) -> RuntimeResult<Vec<SqlRow>> {
+        Ok(self.query_with_metadata(namespace, query).await?.rows)
+    }
+
+    /// Execute a GQL/SPARQL query, returning rows and any validation warnings.
+    pub async fn query_with_metadata(
         &self,
         namespace: Option<&str>,
         query: &str,
-    ) -> RuntimeResult<Vec<khive_storage::types::SqlRow>> {
+    ) -> RuntimeResult<QueryResult> {
         let ns = self.ns(namespace);
         let ast = khive_query::parse_auto(query)?;
         let opts = khive_query::CompileOptions {
@@ -969,20 +1051,22 @@ impl KhiveRuntime {
             ..Default::default()
         };
         let compiled = khive_query::compile(&ast, &opts)?;
+        let warnings = compiled.warnings;
         let mut reader = self.sql().reader().await?;
         let stmt = SqlStatement {
             sql: compiled.sql,
             params: compiled.params,
             label: None,
         };
-        Ok(reader.query_all(stmt).await?)
+        let rows = reader.query_all(stmt).await?;
+        Ok(QueryResult { rows, warnings })
     }
 
     /// Delete an entity by ID (soft delete by default).
     ///
     /// On hard delete, cascades to remove all incident edges (both inbound and
-    /// outbound) to prevent dangling references. Soft delete leaves edges in
-    /// place — queries already filter by `deleted_at IS NULL`.
+    /// outbound) to prevent dangling references. Soft delete also cleans FTS
+    /// and vector indexes; edges are left in place.
     ///
     /// Returns `false` without deleting if the entity exists but belongs to a
     /// different namespace (ADR-007 namespace isolation).
@@ -1027,7 +1111,11 @@ impl KhiveRuntime {
             self.remove_from_indexes(namespace, id).await?;
         }
 
-        Ok(self.entities(namespace)?.delete_entity(id, mode).await?)
+        let deleted = self.entities(namespace)?.delete_entity(id, mode).await?;
+        if !hard && deleted {
+            self.remove_from_indexes(namespace, id).await?;
+        }
+        Ok(deleted)
     }
 
     /// Count entities in a namespace, optionally filtered.
@@ -1173,6 +1261,7 @@ mod tests {
     use super::*;
     use crate::curation::EdgeListFilter;
     use crate::runtime::KhiveRuntime;
+    use khive_storage::types::TraversalOptions;
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
@@ -1762,6 +1851,15 @@ mod tests {
             .unwrap();
 
         assert!(!results.is_empty(), "search should return the indexed note");
+        let hit = &results[0];
+        assert!(
+            hit.title.is_some(),
+            "note hit title should be populated (falls back to content)"
+        );
+        assert!(
+            hit.snippet.is_some(),
+            "note hit snippet should be populated"
+        );
     }
 
     #[tokio::test]
@@ -3462,6 +3560,107 @@ mod tests {
         assert!(
             edges_from_t2.is_empty(),
             "no second annotates edge must exist; got {edges_from_t2:?}"
+        );
+    }
+
+    // ---- #232 soft-delete index cleanup tests ----
+
+    #[tokio::test]
+    async fn soft_delete_entity_removes_indexes() {
+        let rt = rt();
+        let entity = rt
+            .create_entity(
+                None,
+                "concept",
+                "QuantumEntanglement",
+                Some("unique FTS term xzqjwv for soft delete test"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let ns = rt.ns(None).to_string();
+
+        let before = rt
+            .text(None)
+            .unwrap()
+            .search(TextSearchRequest {
+                query: "xzqjwv".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(TextFilter {
+                    namespaces: vec![ns.clone()],
+                    ..Default::default()
+                }),
+                top_k: 10,
+                snippet_chars: 100,
+            })
+            .await
+            .unwrap();
+        assert!(
+            before.iter().any(|h| h.subject_id == entity.id),
+            "entity must be in FTS before soft-delete"
+        );
+
+        let deleted = rt.delete_entity(None, entity.id, false).await.unwrap();
+        assert!(deleted, "soft delete must return true");
+
+        let after = rt
+            .text(None)
+            .unwrap()
+            .search(TextSearchRequest {
+                query: "xzqjwv".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(TextFilter {
+                    namespaces: vec![ns],
+                    ..Default::default()
+                }),
+                top_k: 10,
+                snippet_chars: 100,
+            })
+            .await
+            .unwrap();
+        assert!(
+            after.iter().all(|h| h.subject_id != entity.id),
+            "soft-deleted entity must be removed from FTS index"
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_delete_note_removes_indexes() {
+        let rt = rt();
+        let note = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "SpectralDecomposition unique term yvwkqz for soft delete test",
+                0.7,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let before = rt
+            .search_notes(None, "yvwkqz", None, 10, None)
+            .await
+            .unwrap();
+        assert!(
+            before.iter().any(|h| h.note_id == note.id),
+            "note must be in FTS before soft-delete"
+        );
+
+        let deleted = rt.delete_note(None, note.id, false).await.unwrap();
+        assert!(deleted, "soft delete must return true");
+
+        let after = rt
+            .search_notes(None, "yvwkqz", None, 10, None)
+            .await
+            .unwrap();
+        assert!(
+            after.iter().all(|h| h.note_id != note.id),
+            "soft-deleted note must be removed from FTS index"
         );
     }
 }

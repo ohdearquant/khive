@@ -13,6 +13,10 @@ pub fn ensure_extensions_loaded() {
     use std::sync::Once;
     static INIT: Once = Once::new();
 
+    // SAFETY: `sqlite3_vec_init` is a static function that satisfies the
+    // 3-arg xEntryPoint ABI after transmute (the standard SQLite auto-extension
+    // pattern). `INIT.call_once` guarantees a single registration, preventing
+    // duplicate auto-extension entries. The function pointer is `'static`.
     INIT.call_once(|| unsafe {
         // sqlite-vec exports sqlite3_vec_init as `extern "C" fn()` for
         // auto_extension registration. sqlite3_auto_extension expects

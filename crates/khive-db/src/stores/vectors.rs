@@ -32,6 +32,10 @@ use crate::pool::ConnectionPool;
 /// Safe: f32 has no alignment requirements beyond what &[u8] needs, the byte
 /// length is exactly the input slice size, and the lifetime is tied to input.
 fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
+    // SAFETY: `data` is a valid &[f32] so the pointer is non-null, well-aligned, and
+    // live for the call duration. u8 alignment is 1 (satisfied by any allocation).
+    // size_of_val gives the exact byte count. The returned slice borrows `data`
+    // so its lifetime cannot outlive the input reference.
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
