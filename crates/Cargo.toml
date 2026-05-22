@@ -21,6 +21,7 @@ members = [
     "khive-mcp",
     "khive-vcs",
     "kkernel",
+    "khive-retrieval",
 ]
 # khive-merge excluded — forward-deployed (ADR-043) but not yet compilable
 # against restructured khive-vcs. Will be re-added when ADR-043 integrates.

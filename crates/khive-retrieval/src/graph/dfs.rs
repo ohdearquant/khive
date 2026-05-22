@@ -1,0 +1,135 @@
+//! DFS (Depth-First Search) traversal.
+//!
+//! # Formal Verification
+//!
+//! This implementation corresponds to the formal proofs in
+//! `proofs/Lion/Retrieval/Graph.lean`. Key theorems:
+//!
+//! - `dfs_terminates_bound`: DFS bounded by |V| vertices
+//! - `visited_mono`: visited set grows monotonically
+//! - `reachable_trans`: reachability is transitive
+
+use std::collections::HashSet;
+
+use super::compat::{EntityRef, Link, LinkStore, StorageContext};
+
+use crate::error::Result;
+
+use super::helpers::{get_edge_weight, get_neighbor_entity, get_neighbors, matches_link_type};
+use super::types::{PathNode, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_RESULTS};
+
+/// Perform DFS traversal from a starting entity.
+///
+/// DFS explores as far as possible along each branch before backtracking.
+/// This makes it ideal for:
+///
+/// - Deep chain exploration
+/// - Path existence checking
+/// - Exhaustive graph exploration with limited results
+///
+/// # Arguments
+///
+/// * `store` - The link store to query
+/// * `ctx` - Storage context for namespace isolation
+/// * `start` - Starting entity reference
+/// * `options` - Traversal options (depth, direction, filters)
+///
+/// # Returns
+///
+/// Vector of [`PathNode`] in DFS pre-order (parent before children).
+///
+/// # Complexity
+///
+/// - Time: O(V + E) where V = vertices, E = edges
+/// - Space: O(V) for visited set + O(h) stack where h = max depth
+///
+/// # Example
+///
+/// ```ignore
+/// let options = TraversalOptions::new(5)
+///     .with_direction(Direction::Out);
+///
+/// let nodes = dfs_traverse(&store, &ctx, start_ref, &options).await?;
+/// ```
+///
+/// **PROOF CORRESPONDENCE**: `Lion.Retrieval.Graph.dfs_terminates_bound`
+/// Each vertex visited at most once; |visited| bounded by |V|; stack pops exceed pushes eventually.
+pub async fn dfs_traverse<S: LinkStore>(
+    store: &S,
+    ctx: &StorageContext,
+    start: EntityRef,
+    options: &TraversalOptions,
+) -> Result<Vec<PathNode>> {
+    let max_depth = options.max_depth.min(MAX_TRAVERSAL_DEPTH);
+    let limit = options
+        .limit
+        .unwrap_or(MAX_TRAVERSAL_RESULTS)
+        .min(MAX_TRAVERSAL_RESULTS);
+    let min_weight = options.min_weight.unwrap_or(f64::NEG_INFINITY);
+
+    // **PROOF CORRESPONDENCE**: `Lion.Retrieval.Graph.visited_mono`
+    // Visited set only grows (insert-only); never shrinks during traversal.
+    // EntityRef implements Hash + Eq, enabling direct use as HashMap key.
+    let mut visited: HashSet<EntityRef> = HashSet::new();
+    let mut results: Vec<PathNode> = Vec::new();
+
+    // Stack: (entity_ref, depth, path_weight, via_link)
+    let mut stack: Vec<(EntityRef, usize, f64, Option<Link>)> = Vec::new();
+    stack.push((start, 0, 0.0, None));
+
+    while let Some((current, depth, path_weight, via_link)) = stack.pop() {
+        // Skip if already visited (EntityRef implements Hash + Eq)
+        if visited.contains(&current) {
+            continue;
+        }
+
+        // Mark as visited and add to results
+        visited.insert(current.clone());
+        results.push(PathNode {
+            entity_id: current.clone(),
+            depth,
+            via_link,
+            path_weight,
+        });
+
+        // Check result limit
+        if results.len() >= limit {
+            break;
+        }
+
+        // Check depth limit before exploring children
+        if depth >= max_depth {
+            continue;
+        }
+
+        // Get neighbors and push to stack (reverse order for consistent traversal)
+        let links = get_neighbors(store, ctx, &current, &options.direction).await?;
+
+        // Push in reverse order so first neighbor is processed first
+        for link in links.into_iter().rev() {
+            // Filter by link type
+            if !matches_link_type(&link, &options.link_types) {
+                continue;
+            }
+
+            // Get edge weight and filter
+            let edge_weight = get_edge_weight(&link);
+            if edge_weight < min_weight {
+                continue;
+            }
+
+            // Determine neighbor entity
+            let neighbor = get_neighbor_entity(&link, &current, &options.direction);
+
+            // Skip if already visited (EntityRef implements Hash + Eq)
+            if visited.contains(&neighbor) {
+                continue;
+            }
+
+            let new_weight = path_weight + edge_weight;
+            stack.push((neighbor, depth + 1, new_weight, Some(link)));
+        }
+    }
+
+    Ok(results)
+}
