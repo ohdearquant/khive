@@ -276,7 +276,9 @@ struct LinkParams {
 #[derive(Deserialize)]
 struct NeighborsParams {
     namespace: Option<String>,
-    node_id: String,
+    /// Accepts either `id` (canonical, ADR-148 normalized) or `node_id` (legacy).
+    #[serde(alias = "node_id")]
+    id: String,
     direction: Option<String>,
     limit: Option<u32>,
     min_weight: Option<f64>,
@@ -286,6 +288,9 @@ struct NeighborsParams {
 #[derive(Deserialize)]
 struct TraverseParams {
     namespace: Option<String>,
+    /// Accepts either `roots` (legacy) or `ids` (normalized). Each entry may
+    /// be a full UUID or an 8-char prefix; resolved via `resolve_uuid_async`.
+    #[serde(alias = "ids")]
     roots: Vec<String>,
     max_depth: Option<usize>,
     direction: Option<String>,
@@ -1115,7 +1120,7 @@ impl KgPack {
 
     pub(crate) async fn handle_neighbors(&self, params: Value) -> Result<Value, RuntimeError> {
         let p: NeighborsParams = deser(params)?;
-        let node_id = resolve_uuid_async(&p.node_id, &self.runtime, p.namespace.as_deref()).await?;
+        let node_id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
         let direction = parse_direction(p.direction.as_deref());
         let relations: Option<Vec<EdgeRelation>> = p
             .relations

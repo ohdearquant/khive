@@ -519,7 +519,8 @@ async fn gtd_assign_creates_depends_on_edge_between_two_tasks() -> anyhow::Resul
     .await?;
 
     let hits = neighbors.as_array().expect("neighbors returns array");
-    let targets: Vec<&str> = hits.iter().filter_map(|h| h["node_id"].as_str()).collect();
+    // #148: response uses canonical `id` (legacy `node_id` accepted as alias on input only).
+    let targets: Vec<&str> = hits.iter().filter_map(|h| h["id"].as_str()).collect();
     assert!(
         targets.iter().any(|t| *t == blocker_full),
         "task→task depends_on edge missing — got targets {targets:?}"
