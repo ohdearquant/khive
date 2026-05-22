@@ -1277,7 +1277,6 @@ mod tests {
     use super::*;
     use crate::curation::EdgeListFilter;
     use crate::runtime::KhiveRuntime;
-    use khive_storage::types::TraversalOptions;
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
