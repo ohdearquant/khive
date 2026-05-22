@@ -504,7 +504,7 @@ fn props_match(entity_props: Option<&Value>, filter: &Value) -> bool {
     };
     required
         .iter()
-        .all(|(k, v)| actual.get(k).map_or(false, |av| av == v))
+        .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
 }
 
 // ---- Handler implementations ----
@@ -980,7 +980,7 @@ impl KgPack {
                 // When a properties filter is active, pull extra candidates so
                 // that filtering doesn't leave fewer results than `limit`.
                 let props_filter = p.properties.as_ref().and_then(|v| {
-                    if v.as_object().map_or(false, |m| !m.is_empty()) {
+                    if v.as_object().is_some_and(|m| !m.is_empty()) {
                         Some(v)
                     } else {
                         None
