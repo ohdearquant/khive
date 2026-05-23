@@ -1,156 +1,254 @@
-# ADR-006: Deterministic Scoring (i64 Fixed-Point with 2^32 Scale)
+# ADR-006: Deterministic Scoring
 
 **Status**: accepted\
-**Date**: 2026-05-15\
+**Date**: 2026-05-23\
 **Authors**: Ocean, lambda:khive
 
 ## Context
 
-Hybrid search combines vector similarity, BM25 keyword scores, and reranking weights. Each subsystem
-returns `f64` scores. We then need to:
+khive ranks search results, fuses retrieval signals, and caches scores in SQL. Every ranking
+decision must be deterministic: the same inputs produce the same output on every platform,
+every run, every CPU architecture. Floating-point arithmetic does not guarantee this — IEEE
+754 allows intermediate precision, fused multiply-add reordering, and platform-specific
+rounding.
 
-1. Sort results by combined score.
-2. Reproduce the same ordering across platforms (different CPUs, different OSes, different runs).
-3. Cache scores in SQL columns and recover them with bit-exact equality.
+The scoring system must satisfy:
 
-Three things break determinism with raw `f64`:
-
-1. **NaN ordering is undefined.** Sorting NaN values gives implementation-defined results. Different
-   sorts on the same data can return different orders.
-2. **Floating-point arithmetic is non-associative.** Summing `0.1 + 0.2 + 0.3` can give different
-   results depending on order — and parallel reduction trees give different results than sequential
-   sums.
-3. **SQLite stores f64 as REAL but bit-conversion is unreliable across drivers.** Round-tripping a
-   score through `f64 → SQL REAL → f64` doesn't always produce bit-identical results.
-
-For a hybrid search system to be reproducible (essential for evaluation, debugging, and caching),
-scores need a deterministic representation.
+1. **Bit-exact reproducibility.** Two runs of the same query over the same data produce the
+   same ranked output, byte-for-byte.
+2. **SQL round-trip.** Scores cached as `INTEGER` in SQLite recover the exact original value.
+   No lossy float→int→float conversion.
+3. **Cross-backend comparability.** Scores from different backends (hot, cold, lore) are
+   comparable without re-normalization when fused by the SubstrateCoordinator.
+4. **Metric-aware conversion.** Vector indexes compute distances in f32. The scoring contract
+   must define how distances become similarity scores deterministically, per distance metric.
 
 ## Decision
 
-**`DeterministicScore`: i64 fixed-point with 2^32 scale.**
+### `DeterministicScore`: i64 fixed-point
+
+`DeterministicScore` is a 64-bit signed integer with a fixed scale factor of 2^32.
+
+```text
+DeterministicScore(raw: i64)
+
+Logical value = raw / 2^32
+Range: approximately [-2^31, +2^31) with 2^-32 precision
+SQL storage: INTEGER (i64, native SQLite affinity)
+Ordering: standard integer comparison (no float comparison edge cases)
+```
+
+Arithmetic is saturating: overflow clamps to `i64::MAX`, underflow clamps to `i64::MIN`.
+NaN and infinity inputs to `from_f32`/`from_f64` are mapped to deterministic sentinel
+values (NaN → 0, +inf → `i64::MAX`, -inf → `i64::MIN`).
+
+### Canonical implementation: `ruvector-core`
+
+`ruvector-core` is the authoritative owner of `DeterministicScore` and related deterministic
+fusion primitives. `khive-score` is a compatibility crate that re-exports the canonical
+types and functions. It contains no independent scoring implementation.
 
 ```rust
-pub struct DeterministicScore(i64);
+// khive-score/src/lib.rs — re-export shim only
+pub use ruvector_core::{
+    DeterministicScore,
+    deterministic_rrf,
+    deterministic_rrf_with_k,
+    weighted_sum,
+    Ranked,
+};
+```
 
-const SCALE: i64 = 1 << 32; // 4,294,967,296
+This prevents drift between two byte-identical implementations. Changes to the scoring
+contract are made in `ruvector-core` and flow to khive through the re-export.
+
+### Normative invariants
+
+The implementation MUST satisfy:
+
+1. **Total order**: antisymmetry, transitivity, totality over all `DeterministicScore` values.
+2. **Saturating arithmetic**: add, subtract, and accumulation saturate at `i64::MIN`/`i64::MAX`.
+   No wrapping, no panic.
+3. **Deterministic NaN/infinity handling**: `from_f32(NaN) == from_f64(NaN) == DeterministicScore(0)`.
+   Positive infinity maps to `i64::MAX`, negative infinity to `i64::MIN`.
+4. **SQL INTEGER bit-exact round-trip**: `DeterministicScore(x).to_sql().from_sql() == DeterministicScore(x)`.
+5. **Metric-aware f32 conversion**: distance-to-similarity conversion at vector search result
+   boundaries uses the metric-specific monotonic transform defined below.
+
+If the implementation changes representation, arithmetic strategy, or conversion semantics,
+it must preserve these invariants or amend this ADR.
+
+### f32 boundary: metric-aware conversion
+
+Vector indexes compute distances in f32. Those distances are not exposed as khive scores.
+At the search result boundary, the backend converts `(distance, metric)` into a
+similarity-valued `DeterministicScore`:
+
+```rust
+pub enum DistanceMetric {
+    Cosine,
+    Dot,
+    Euclidean,
+    Manhattan,
+}
 
 impl DeterministicScore {
-    pub fn from_f64(x: f64) -> Self { ... }  // NaN → 0, ±Inf → ±i64::MAX
-    pub fn to_f64(self) -> f64 { (self.0 as f64) / SCALE as f64 }
+    pub fn similarity_from_distance(distance: f32, metric: DistanceMetric) -> Self {
+        let d = sanitize_distance(distance) as f64;
+        let similarity = match metric {
+            DistanceMetric::Cosine => 1.0 - d,
+            DistanceMetric::Dot => -d,
+            DistanceMetric::Euclidean | DistanceMetric::Manhattan => {
+                1.0 / (1.0 + d.max(0.0))
+            }
+        };
+        Self::from_f64(similarity)
+    }
 }
 ```
 
-Where:
+This prevents each caller from inventing its own conversion rule. The conversion is the
+single boundary where f32 enters the deterministic scoring world.
 
-- The i64 value is `round(score * 2^32)`.
-- Range: roughly `±2.1 billion` (i64::MAX / 2^32).
-- Precision: ~9 decimal digits.
-- NaN maps to 0 (so NaN scores deterministically rank as "neutral").
-- ±Infinity maps to `±i64::MAX` (so infinite scores rank as max/min).
+### RRF fusion: K = 60
 
-Used in:
+Reciprocal Rank Fusion defaults to K = 60 (the standard default from the original Cormack
+et al. paper). Overrides are allowed only through explicit APIs.
 
-- `VectorSearchHit.score: DeterministicScore`
-- `TextSearchHit.score: DeterministicScore`
-- Any cached score in SQL (column type: `INTEGER`, not `REAL`).
+```rust
+pub const DEFAULT_RRF_K: usize = 60;
+
+pub fn deterministic_rrf(results: &[RankedList]) -> Vec<RankedHit> {
+    deterministic_rrf_with_k(results, DEFAULT_RRF_K)
+}
+
+pub fn deterministic_rrf_with_k(results: &[RankedList], k: usize) -> Vec<RankedHit> {
+    assert!(k > 0);
+    // i128 accumulation for overflow safety, then saturate to i64
+    // ...
+}
+```
+
+Overrides must be documented because they change ranking behavior and evaluation
+comparability. Silent drift between K values across retrieval surfaces is a correctness bug.
+
+RRF fusion is commutative with respect to source-list order: the output is the same
+regardless of the order in which source lists are provided.
+
+### Normalization contract
+
+`DeterministicScore` is a dimensionless fixed-point carrier. It can represent raw BM25,
+cosine similarity, dot products, RRF scores, normalized weights, or any other scalar. The
+type does not imply normalization.
+
+Fusion functions have their own contracts:
+
+- `weighted_sum` requires normalized, comparable inputs — typically in `[0, 1]` — unless
+  the caller documents another shared scale. Mixing raw BM25 scores with cosine similarities
+  in a weighted sum produces nonsense.
+- `deterministic_rrf` is rank-based and does not require score normalization. It consumes
+  position ordinals, not raw score magnitudes.
+
+Raw score storage as `DeterministicScore` is allowed. Callers must not mix raw incomparable
+score domains in weighted arithmetic.
+
+### i128 intermediates
+
+The Rust reference implementation uses i128 intermediates to implement saturating
+add/subtract/accumulation safely. This is an implementation detail, not a normative
+requirement. Other implementations may use another method if they preserve the same
+saturating semantics.
+
+### `QuantKey` deprecation
+
+`QuantKey` is not part of the deterministic scoring contract. It uses a different scale and
+width than `DeterministicScore` and is not safe for persistent score storage, SQL cache keys,
+cross-backend result exchange, or public ranking APIs.
+
+Existing `QuantKey` code is deprecated from the public contract. Future use requires a
+performance ADR with benchmarks showing material speedup over `Ranked<T>` /
+`DeterministicScore` sorting on representative khive retrieval workloads.
 
 ## Rationale
 
-### Why i64 (not i32 or i128)?
+### Why fixed-point (not floating-point)?
 
-- **i32 + 2^32 scale** = ±0.5 range. Too narrow — scores like RRF accumulators can exceed 1.0.
-- **i64 + 2^32 scale** = ±2.1 billion range, ~9 decimal digits precision. Plenty for normalized
-  scores.
-- **i128** = unnecessary precision, doesn't fit cleanly into SQLite INTEGER (8-byte limit).
+IEEE 754 float arithmetic is not associative. `(a + b) + c != a + (b + c)` in general.
+Different compilers, optimization levels, and CPU architectures produce different results
+for the same computation. A score computed on one machine may not equal the same score
+computed on another. Fixed-point integer arithmetic is fully deterministic.
 
-### Why 2^32 (not 2^16 or 2^48)?
+### Why i64 with 2^32 scale?
 
-- **2^16** = 4 decimal digits. Too coarse for cosine similarity (need 6+ digits).
-- **2^32** = ~9 decimal digits. Matches f64's natural precision for values in [0, 1].
-- **2^48** = wastes range; very few use cases need 14-digit precision.
+i64 provides ~9.2 quintillion distinct values. 2^32 scale gives ~32 bits of integer range
+and ~32 bits of fractional precision — sufficient for score magnitudes used in retrieval
+ranking. SQL `INTEGER` is native i64 in SQLite, so no type conversion is needed.
 
-### Why this is deterministic
+### Why ruvector-core as canonical?
 
-1. **Integer sort is unambiguous.** No NaN comparison issues.
-2. **Integer arithmetic is associative.** `a + b + c == c + b + a` always.
-3. **SQL INTEGER round-trips bit-exact.** Same byte representation in/out.
-4. **NaN/Inf are mapped to fixed values.** No platform-specific NaN bit patterns leak through.
+The implementations are byte-identical today. Every future change must be applied twice if
+both exist independently. `DeterministicScore` is the foundation of deterministic ranking —
+divergence between two copies is a correctness risk, not a convenience issue.
 
-### Why store as INTEGER in SQL
+`khive-score` remains as a re-export shim for downstream compatibility. It may be deleted
+entirely once all khive crates reference `ruvector-core` directly.
 
-SQLite stores INTEGER as int64 with bit-exact roundtrip. Storing f64 as REAL involves IEEE-754
-encoding/decoding with edge-case behavior in different drivers. INTEGER is unambiguous.
+### `khive-fusion` disposition
 
-### Why round (not truncate)?
+`khive-fusion` is a thin wrapper that delegates to `ruvector-core` fusion primitives. It
+does not contain independent fusion implementations. If fusion functions are added, they
+belong in `ruvector-core` (canonical) and are re-exported through `khive-fusion`.
 
-Rounding minimizes representation error. Truncating biases scores toward zero. Banker's rounding
-(round-half-to-even) avoids systemic bias for ties, which matters in evaluation.
+### Why metric-aware conversion?
 
-## Alternatives Considered
+HNSW returns distances. BM25 returns relevance scores. Cosine distance and Euclidean distance
+require different monotonic transforms to become similarity scores. If each caller invents its
+own transform, the same raw distance produces different `DeterministicScore` values depending
+on the code path. The `similarity_from_distance` function is the single conversion point.
 
-| Alternative             | Pros                   | Cons                                                         | Why rejected        |
-| ----------------------- | ---------------------- | ------------------------------------------------------------ | ------------------- |
-| Raw `f64`               | Simple, fast           | NaN sorts, non-associative arithmetic, REAL roundtrip issues | Determinism failure |
-| `OrderedFloat<f64>`     | Resolves NaN ordering  | Doesn't fix arithmetic non-associativity or REAL roundtrip   | Half-measure        |
-| `rust_decimal::Decimal` | Exact decimal math     | 16-byte, slow, doesn't fit SQL INTEGER                       | Overkill            |
-| i32 with 2^16 scale     | Smaller representation | Precision too low for similarity scores                      | Insufficient        |
+### Why K = 60?
+
+K = 60 is the standard RRF default from the original Cormack et al. paper and is the
+value used in production. The explicit override API (`deterministic_rrf_with_k`) allows
+tuning for specific workloads. Callers experimenting with alternative K values must
+document the rationale.
+
+### Why deprecate QuantKey?
+
+`QuantKey` is a relative-order optimization for hot-loop sorting. It does not preserve
+absolute score values and uses a different scale than `DeterministicScore`. Exposing it as a
+public scoring primitive risks callers persisting or comparing `QuantKey` values across
+contexts where only `DeterministicScore` is correct.
 
 ## Consequences
 
 ### Positive
 
 - Bit-exact reproducibility across platforms and runs.
-- Sorting is unambiguous (no NaN edge cases).
-- SQL caching round-trips perfectly.
-- Comparison is just integer comparison — fast.
+- SQL `INTEGER` caching with zero-loss round-trip.
+- Single conversion point for f32 distances → deterministic scores.
+- Single canonical implementation in `ruvector-core`.
+- Fusion contracts (RRF rank-based, weighted_sum requires normalization) prevent misuse.
 
 ### Negative
 
-- Conversion between `f64` and `DeterministicScore` at every boundary. Mitigated: only at
-  search/rank boundaries, not in hot loops.
-- ~9 digit precision limit. Mitigated: matches f64's effective precision for normalized similarity
-  scores.
-- Range limit (±2.1 billion). Mitigated: well above any realistic score range.
+- khive gains a dependency on `ruvector-core`. Acceptable given RuVector is the canonical
+  vector substrate.
+- `QuantKey` deprecation may require updating hot-path sorting in retrieval code.
+- K = 60 is the standard default. Callers who need a different K must use the explicit
+  `deterministic_rrf_with_k` API and document the rationale.
 
 ### Neutral
 
-- Developers must remember to convert at boundaries. Mitigated: trait return types use
-  `DeterministicScore` directly.
-
-## QuantKey: 8-byte sort key
-
-For sort-only operations (no need for the score value, just the order), `QuantKey<T>` packs the
-deterministic score + a tiebreaker UUID prefix into 8 bytes. Allows hash-map-friendly sort without
-full DeterministicScore comparison.
-
-```rust
-pub struct QuantKey<T> { /* 8 bytes: top 4 = score, bottom 4 = id prefix */ }
-```
-
-Used in hot loops where sort throughput matters.
+- `DeterministicScore` representation (i64, 2^32 scale) is unchanged.
+- `deterministic_rrf` algorithm is unchanged.
+- Score values stored in existing SQLite databases remain valid.
 
 ## Implementation
 
-In `khive-score`:
-
-```
-crates/khive-score/src/
-├── score.rs         // DeterministicScore + ops
-├── comparator.rs    // Ranked<T>, cmp_desc_then_id, cmp_asc_then_id
-├── ops.rs           // sum_scores, avg_scores, rrf_score, weighted_sum
-└── quantkey.rs      // QuantKey<T>
-```
-
-20 tests verifying:
-
-- NaN → 0
-- ±Inf → ±i64::MAX
-- f64 round-trip within precision tolerance
-- Sort orderings
-- RRF and weighted-sum determinism
-
-## References
-
-- ADR-005: Storage Capability Traits (uses DeterministicScore in search hits)
-- `crates/khive-score/`: implementation
+- `ruvector-core`: canonical `DeterministicScore`, `deterministic_rrf`,
+  `deterministic_rrf_with_k`, `weighted_sum`, `Ranked<T>`, `DistanceMetric`,
+  `similarity_from_distance`.
+- `khive-score/src/lib.rs`: `pub use ruvector_core::*` re-exports only.
+- SQL column type: `INTEGER` (i64). No schema migration needed.
+- `QuantKey`: marked `#[deprecated]` with note pointing to this ADR.

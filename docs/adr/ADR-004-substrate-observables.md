@@ -1,37 +1,30 @@
-# ADR-004: Substrate Model — Three Observables (Note, Entity, Event)
+# ADR-004: Substrate Observables
 
 **Status**: accepted\
-**Date**: 2026-05-15\
+**Date**: 2026-05-22\
 **Authors**: Ocean, lambda:khive
 
 ## Context
 
-A knowledge graph platform needs a small set of primitive data shapes from which everything else is
-composed. Without explicit primitives, every service invents its own row format and the system
-fragments into incompatible schemas.
+khive organizes persistent records into substrates — categories of data with distinct
+lifecycle, mutability, and query semantics. The original ADR-004 defined three substrates
+(Note, Entity, Event) with a closed `SubstrateKind` enum. Since then:
 
-The challenge: pick the right primitives. Too few (e.g., "just blobs and edges") and every service
-reinvents structure. Too many and the system becomes a typology zoo where agents don't know which to
-use.
-
-We need primitives that:
-
-1. Cover the full range of research KG operations (knowledge, dialog, audit).
-2. Are agent-comprehensible — clear semantics for which to use when.
-3. Map cleanly to SQL tables for storage efficiency.
-4. Support both immutable (event log) and mutable (notes, entities) data.
+1. **Pack expansion**: GTD tasks, memories, and brain feedback all use the Note substrate.
+   `salience` and `decay_factor` sit on every Note regardless of kind — meaningless for
+   a `decision` note.
+2. **Link identity gap**: The `Link` struct has no `namespace`, `created_at`, `updated_at`,
+   or `deleted_at`. ADR-002 allows `annotates` targeting edges, and ADR-003 places namespace
+   enforcement in the runtime. Both require Link records to be namespace-addressable.
+3. **Brain pack**: Brain feedback signals have scoring implications (decay, salience) and
+   must be mutable — these are Note semantics, not Event semantics. But brain profiles and
+   state snapshots are durable versioned artifacts (ADR-001: Artifact entities).
+4. **NoteKindSpec**: ADR-001's EntityTypeRegistry pattern (closed base enum, governed
+   pack-extensible subtype layer, runtime validation) is the right precedent for note kinds.
 
 ## Decision
 
-**Three substrate observables, each backed by its own SQL table:**
-
-| Substrate  | Mutability              | What it represents                   | Examples                                           |
-| ---------- | ----------------------- | ------------------------------------ | -------------------------------------------------- |
-| **Note**   | Mutable + soft-delete   | Temporal-referential records         | Observations, insights, questions, decisions, refs |
-| **Entity** | Mutable + soft-delete   | Graph nodes (typed, with properties) | Concepts, documents, projects, people              |
-| **Event**  | Immutable (append-only) | Operation log                        | Verb invocations, audit trail                      |
-
-Defined in `khive-types`:
+### Three substrates
 
 ```rust
 pub enum SubstrateKind {
@@ -39,131 +32,364 @@ pub enum SubstrateKind {
     Entity = 1,
     Event = 2,
 }
+
 pub const SUBSTRATE_COUNT: usize = 3;
+```
+
+**Note** — mutable, soft-deletable temporal/cognitive records. Single polymorphic table
+discriminated by `kind`. Packs extend meaning through `NoteKindSpec`.
+
+**Entity** — mutable, soft-deletable graph nodes. Edges/Links are addressable records
+within the Entity substrate's graph layer, not a fourth substrate.
+
+**Event** — immutable, append-only operation audit records.
+
+### Link is addressable, not a substrate
+
+Edge/Link records are not promoted to a fourth substrate. They remain inside the Entity
+substrate's graph layer. However, Link records gain namespace identity for validation,
+annotation targeting, and cascade behavior.
+
+```rust
+pub struct Link {
+    pub id: Id128,
+    pub namespace: Namespace,
+    pub source: Id128,
+    pub target: Id128,
+    pub relation: EdgeRelation,
+    pub properties: BTreeMap<String, PropertyValue>,
+    pub weight: f64,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub deleted_at: Option<Timestamp>,
+}
+```
+
+This does not create `SubstrateKind::Edge`, an `EdgeStore` trait family, or an independent
+agent-facing edge verb surface.
+
+**Promotion trigger**: Edge becomes a fourth substrate only if agents need direct
+first-class access to edge records: `get(edge_id)` returning a namespaced Link, edge-local
+lifecycle/versioning, edge-owned properties beyond metadata, or pack-owned edge behavior
+that cannot be expressed through `link`, `unlink`, and `annotates`. If promoted, the new
+variant appends as `Edge = 3` — never inserted at position 2 (Event already occupies it).
+
+**Migration**: `graph_edges` table gains `namespace`, `created_at`, `updated_at`,
+`deleted_at` columns in a new versioned migration. Existing rows backfill `namespace`
+from the source entity's namespace, `created_at` from the current timestamp, `updated_at`
+from `created_at`, and `deleted_at` as NULL.
+
+### Note as polymorphic type
+
+Note remains a single polymorphic table. All note kinds (KG observations, GTD tasks,
+memory notes, brain feedback, future kinds) share the same SQL table, discriminated by
+`kind`. Packs register kinds and add semantics through `NoteKindSpec`.
+
+Separate tables per kind would fragment search — the `search` verb must be able to answer
+"find all notes about RoPE" across kinds without unioning across tables.
+
+### NoteKindSpec
+
+Each pack-added note kind declares a `NoteKindSpec` at registration time. This mirrors
+the `EntityTypeRegistry` pattern from ADR-001: closed base enum, governed pack-extensible
+subtype layer, runtime validation, boot-time collision checks.
+
+```rust
+pub struct NoteKindSpec {
+    pub kind: &'static str,
+    pub aliases: &'static [&'static str],
+    pub required_fields: &'static [&'static str],
+    pub lifecycle: NoteLifecycleSpec,
+    pub search_profile: SearchProfile,
+    pub fields: &'static [KindField],
+}
+
+pub struct NoteLifecycleSpec {
+    pub field: &'static str,
+    pub initial: &'static str,
+    pub terminal: &'static [&'static str],
+    pub transitions: &'static [(&'static str, &'static str)],
+}
+
+pub struct KindField {
+    pub name: &'static str,
+    pub ty: FieldType,
+    pub required: bool,
+    pub storage: FieldStorage,
+}
+
+pub enum FieldStorage {
+    BaseColumn,
+    Properties,
+}
+```
+
+**Phase 1**: Introduce `NoteKindSpec` as the runtime contract. Packs declare their note
+kinds with lifecycle, search profile, and field declarations. Runtime validates note
+creation against the registered spec.
+
+**Phase 2**: Migrate kind-specific base Note fields (`salience`, `decay_factor`,
+`expires_at`) into declared fields. This is a separate schema migration ADR.
+
+### Base Note shape (interim)
+
+`salience` and `decay_factor` become `Option<f64>`. Non-memory kinds store `None`.
+
+```rust
+pub struct Note {
+    pub header: Header,
+    pub kind: String,
+    pub status: NoteStatus,
+    pub content: String,
+    pub properties: BTreeMap<String, PropertyValue>,
+    pub tags: Vec<String>,
+    pub salience: Option<f64>,
+    pub decay_factor: Option<f64>,
+    pub expires_at: Option<Timestamp>,
+    pub deleted_at: Option<Timestamp>,
+}
+```
+
+**Long-term target**: `salience`, `decay_factor`, `expires_at`, and future kind-specific
+fields are declared by `NoteKindSpec` rather than hardcoded on the base Note struct. The
+full migration is deferred to a schema ADR.
+
+### NoteStatus and kind lifecycle
+
+`NoteStatus` is the universal visibility signal: is this note live in ordinary namespace
+queries?
+
+```rust
+pub enum NoteStatus {
+    Active,
+    Archived,
+}
+```
+
+Kind lifecycle is separate. Each pack declares its own lifecycle via `NoteKindSpec`. The
+lifecycle state is stored in a kind-declared field (e.g., `kind_status`), not in
+`NoteStatus` and not in `properties["status"]`.
+
+Example — GTD pack:
+
+```rust
+NoteKindSpec {
+    kind: "task",
+    lifecycle: NoteLifecycleSpec {
+        field: "kind_status",
+        initial: "inbox",
+        terminal: &["done", "cancelled"],
+        transitions: &[
+            ("inbox", "next"),
+            ("next", "active"),
+            ("active", "done"),
+            ("active", "waiting"),
+            ("waiting", "active"),
+            ("next", "someday"),
+            ("someday", "next"),
+            ("*", "cancelled"),
+        ],
+    },
+    // ...
+}
+```
+
+**Why `kind_status`, not `properties["status"]`**: The current GTD use of
+`properties["status"]` collides semantically with `Note.status` (`NoteStatus`). A query
+for "active notes" returns completed tasks because their `NoteStatus` is still `Active`.
+Using a distinct field name (`kind_status`) avoids the collision and makes the two
+concepts independently queryable.
+
+### Event ordering invariant — weakly monotonic timestamps + UUID tiebreaker
+
+Event `created_at` is **weakly monotonic**. Equal timestamps within the same microsecond
+are legal — strict monotonicity would require coordination across threads, processes,
+clocks, and storage backends that the substrate does not promise.
+
+The canonical total order on events is:
+
+```text
+(created_at ASC, event_id ASC)   for replay / catch-up
+(created_at DESC, event_id DESC) for newest-first listing
+```
+
+`event_id` is compared by canonical UUID byte order. It does not encode true insertion
+order; it provides a deterministic tiebreaker when `created_at` ties. Replay consumers
+that need lossless catch-up persist a compound cursor:
+
+```rust
+pub struct EventCursor {
+    pub created_at: Timestamp,
+    pub event_id:   Uuid,
+}
+```
+
+This invariant is consumed by:
+
+- ADR-022 §3b — list/replay query shape and the composite index `idx_events_ns_created_id`.
+- ADR-017 — `PackEventConsumer` cursor persistence (state + cursor must be atomic).
+- ADR-024 / ADR-032 — `Fold<Event, State>` deterministic replay: same canonical-order
+  events + same `FoldContext` ⇒ same final state.
+
+A monotonic append-sequence counter (`event_seq`) is NOT in v1. The timestamp+id pair
+gives deterministic replay order; a true commit-order counter is a different invariant
+(causal happened-before) and not required.
+
+### Event substrate observable fields
+
+The substrate defines the abstract Event; its concrete column set on the storage
+side is the union of the fields added across ADRs that touch the events table.
+The canonical v1 set:
+
+| Field        | Type            | Added by   | Purpose                                         |
+| ------------ | --------------- | ---------- | ----------------------------------------------- |
+| `id`         | `Uuid`          | ADR-004    | Event identity (UUIDv7)                         |
+| `namespace`  | `String`        | ADR-004    | Tenant isolation                                |
+| `verb`       | `String`        | ADR-004    | The verb that produced the event                |
+| `actor`      | `String`        | ADR-004    | Caller identity (agent, user, system)           |
+| `substrate`  | `SubstrateKind` | ADR-004    | The substrate the verb acted on                 |
+| `payload`    | `JSON`          | ADR-004    | Verb-specific JSON; structure per ADR-022 §3a   |
+| `created_at` | `Timestamp`     | ADR-004    | Weakly-monotonic event time                     |
+| `session_id` | `Option<Uuid>`  | ADR-041 §7 | Optional session grouping for implicit ordering |
+
+Profile-served events additionally carry `served_by_profile_id: Option<String>`
+inside `payload` (ADR-032 §3). Provenance observations linking an event to
+specific entities live in the sibling `event_observations` projection table
+(ADR-041 §2), NOT in the events row itself.
+
+### Event vs Note boundary
+
+Decision rule:
+
+```text
+If the record is an append-only audit fact about a system operation, it is an Event.
+
+If the record is a semantic/cognitive record that may be searched, weighted, decayed,
+revised, archived, or used in scoring, it is a Note.
+
+The operation that creates or updates a Note may still emit an Event, but the Event
+records the operation, not the domain payload.
+```
+
+| Record                                      | Substrate                    | Why                         |
+| ------------------------------------------- | ---------------------------- | --------------------------- |
+| `create(entity)` was invoked                | Event                        | Append-only operation audit |
+| `link(a, relation, b)` succeeded            | Event                        | Append-only operation audit |
+| Brain confidence update with decay/salience | Note                         | Mutable, scored, decayable  |
+| Memory observation about entity X           | Note                         | Searchable, weighted        |
+| Durable brain profile snapshot              | Entity (Artifact)            | Versioned, durable state    |
+| New brain profile derived from prior        | Entity + `derived_from` edge | Provenance chain            |
+| Operation that wrote the profile            | Event                        | Audit fact                  |
+
+Brain feedback signals with scoring implications are Notes (kind=`memory` or a
+brain-specific kind). The operation audit that a feedback signal was recorded is an Event.
+Brain profiles and state snapshots are Artifact entities (ADR-001) linked through
+provenance edges (ADR-002: `derived_from`, `supersedes`).
+
+### Search vs Recall
+
+Two verbs, distinct semantics:
+
+**`search`** — structural retrieval over notes/entities using the common index. Accepts
+filters (`kind`, `tags`, `entity_type`, time range). Ranking uses lexical/vector score
+and recency. Does not apply kind-specific cognitive semantics (no decay, no salience
+weighting, no brain posterior adjustment).
+
+**`recall`** — memory-specific retrieval. Applies salience, decay, recency, and
+memory-pack scoring rules. The ranking is decay-weighted.
+
+`NoteKindSpec.search_profile` is introduced as a declarative contract for future adaptive
+ranking, but v0 `search` remains kind-blind.
+
+```text
+Need "find all records about RoPE"?         → use search
+Need "what should memory surface about RoPE now?" → use recall
 ```
 
 ## Rationale
 
-### Why these three?
+### Why three substrates (not four)?
 
-Each observable answers a distinct epistemological question:
+Edge/Link records have different lifecycle semantics than entities — they are relational,
+not independently identifiable to agents. Adding a fourth substrate means a new store
+trait family, new verb surface, new VCS snapshot dimension, and new substrate-kind dispatch
+in the coordinator. The benefit (direct `get(edge_id)` from agents) is not a current
+requirement. Adding namespace identity to Link fixes the practical gap without the
+substrate-level complexity.
 
-- **Note** → "What did the agent observe or conclude at time T?" (temporal state)
-- **Entity** → "What things exist in the world and how do they relate?" (graph state)
-- **Event** → "What happened?" (history state)
+### Why not collapse Event into Note?
 
-Removing any of these forces conflation. Storing decisions as entities loses temporal semantics.
-Storing observations as events loses mutability.
+Events must be trustworthy by construction. The append-only, immutable guarantee is
+compile-time: Event has no `update` path, no `soft_delete`, no `status` field. Making
+events a "special immutable note kind" loses this structural guarantee — the
+enforcement becomes runtime convention rather than type-system property.
 
-### Why Note as a polymorphic type?
+### Why polymorphic Note (not per-kind tables)?
 
-The Note table holds observations, insights, questions, decisions, and references — discriminated by
-`NoteKind` (see ADR-019). These all share:
+Fragmenting notes into per-kind tables (one for tasks, one for memories, one for
+observations) breaks unified search. The `search` verb would need to union across N
+tables whose count grows with each new pack. A single polymorphic table with `kind`
+discrimination preserves the unified index while allowing kind-specific semantics
+through `NoteKindSpec`.
 
-- Temporal nature (created_at, decay_factor, salience, expires_at)
-- Soft-delete support
-- Content as a polymorphic JSON blob plus a free-form `properties` map
+### Why NoteKindSpec mirrors EntityTypeRegistry?
 
-Splitting them into separate tables would duplicate schema for marginal benefit. The polymorphism is
-honest — these ARE the same kind of thing (temporal records about the world).
+Both solve the same problem: closed base enum + governed pack-extensible subtype layer.
+ADR-001's EntityTypeRegistry validates entity_type at write time in the runtime layer.
+NoteKindSpec does the same for note kinds. Using the same pattern means pack authors
+learn one extension mechanism, and the runtime has one validation shape to enforce.
 
-### Why Entity separate from Note?
+### Why separate NoteStatus from kind lifecycle?
 
-Entities and notes share a `Header` (id, namespace, timestamps) but differ fundamentally:
+`NoteStatus` answers: "Is this note visible/live in ordinary namespace queries?"
+Kind lifecycle answers: "What domain state is this note in?"
 
-- Entities have **a type** (concept/document/dataset/...) and **edges to other entities**. The graph
-  structure is the point.
-- Notes have **a kind** (observation/insight/decision/...) and **content**. The temporal record is
-  the point.
+These are different questions with different consumers. A completed GTD task
+(`kind_status = "done"`) may still be `NoteStatus::Active` because it should appear
+in search results and remain linkable. An archived note (`NoteStatus::Archived`) should
+not appear in ordinary queries regardless of its kind lifecycle state.
 
-A research paper might exist as both: an Entity (Document kind, with edges to concepts) AND have a
-Note (observation captured while reading it). They're not the same thing.
-
-### Why Event immutable?
-
-Events are the audit trail. If they were mutable, they'd be useless for:
-
-- Reconstructing what an agent did
-- Detecting compromise
-- Replaying state derivation
-
-The cost of "I can't fix a typo in an event" is far lower than the value of "events are trustworthy
-by construction."
-
-### Why exactly 3 (not 4+)?
-
-We considered separate substrates for:
-
-- **Document** (papers, citations) → folded into Entity with `EntityKind::Document`
-- **Relation/Edge** → stored in the entity layer's `graph_edges` table, not a primary substrate
-  (edges have no namespace-level existence apart from the entities they connect)
-- **Message** (inter-agent communication) → out of scope for the open-source substrate; if a
-  deployment needs messaging it can layer on top of `notes` with a `kind="observation"` and
-  sender/recipient properties, or live in a separate service.
-
-Each fold was deliberate: the primitives stay at 3, and the discriminators (`EntityKind`,
-`NoteKind`) handle the variation.
+Conflating the two (as the current `properties["status"]` does for GTD) means queries
+for "active notes" return completed tasks.
 
 ## Alternatives Considered
 
-| Alternative                                                    | Pros                       | Cons                                                           | Why rejected            |
-| -------------------------------------------------------------- | -------------------------- | -------------------------------------------------------------- | ----------------------- |
-| Just "blobs + edges" (RDF-style)                               | Maximum flexibility        | Every service reinvents structure                              | Loses too much semantic |
-| Separate tables per kind (memories, tasks, journals, ...)      | Type-safe SQL              | Schema explosion, joins everywhere                             | Cost > benefit          |
-| Adding "Atom" as a 5th substrate (immutable content-addressed) | Captures provenance neatly | Atoms are an internal detail, not a primary observable for OSS | Defer; can add later    |
-| Merging Note and Event                                         | Fewer tables               | Loses immutability guarantee for Event                         | Auditability matters    |
+| Alternative                                | Why rejected                                                                                                                                      |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Edge as fourth substrate                   | No concrete requirement for agent-addressable edges. Complexity cost (new store trait, verb surface, VCS dimension) not justified.                |
+| Collapse Event into Note                   | Loses compile-time immutability guarantee. Append-only enforcement becomes runtime convention.                                                    |
+| Per-kind Note tables                       | Fragments unified search. Union across N tables grows with each pack.                                                                             |
+| NoteKindSpec as optional                   | Current `salience` pollution on decision notes is the direct consequence. Without a spec, every new kind-specific field lands on the base struct. |
+| salience/decay_factor removal now          | Wide breaking change across all crates. Option<f64> is semantically honest without the migration cost.                                            |
+| NoteStatus expanded to include kind states | NoteStatus becomes a runtime-validated string instead of a compile-time enum. Type regression.                                                    |
+| Brain feedback as Events                   | Brain confidence updates need decay, salience, and mutability. Event substrate is append-only and unscored. Wrong semantics.                      |
+| Single search verb with kind-aware scoring | Hardens kind-specific logic into the search executor. Maintenance burden grows with each new kind. Two-verb model is explicit.                    |
 
 ## Consequences
 
 ### Positive
 
-- Three trait families (`NoteStore`, `EntityStore` via `GraphStore`, `EventStore`).
-- Agents know exactly which substrate to use — clear semantics per primitive.
-- Storage is efficient — no synthetic union tables.
-- Adding new "kinds" (NoteKind, EntityKind) is a schema-free change.
+- Substrate model stays simple: three substrates, no renumbering.
+- Link records become namespace-addressable, fixing the annotation and validation gap.
+- NoteKindSpec gives pack authors a governed extension mechanism for note kinds.
+- Event vs Note boundary has a crisp, testable decision rule.
+- search/recall separation is explicit and teachable for agents.
+- `Option<f64>` for salience/decay makes the semantics honest without a wide migration.
 
 ### Negative
 
-- Cross-substrate queries (e.g., "show me the note about entity X") require join logic at the
-  service layer. Mitigated: the entity service handles this; storage stays primitive.
+- Link struct change is a breaking change in khive-types + schema migration.
+  Mitigated: backfill strategy is deterministic (namespace from source entity).
+- NoteKindSpec is a new trait surface that must be stable.
+  Mitigated: mirrors the proven EntityTypeRegistry pattern.
+- `kind_status` field requires GTD pack to migrate from `properties["status"]`.
+  Mitigated: one-time migration, eliminates a real semantic collision.
+- Deferred field migration means `salience: Option<f64>` is transitional — the base
+  Note struct still carries kind-specific fields.
+  Mitigated: documented as interim, with clear long-term target.
 
 ### Neutral
 
-- The discriminator enums (`NoteKind`, `EntityKind`, `EventOutcome`) are part of the public API and
-  require ADRs to extend. This is appropriate friction.
-
-## Implementation
-
-In `khive-types`:
-
-```
-crates/khive-types/src/
-├── note.rs       // Note, NoteKind, NoteStatus
-├── entity.rs     // Entity, EntityKind, Link, PropertyValue
-├── event.rs      // Event, EventOutcome, EventBuilder
-└── substrate.rs  // SubstrateKind enum + dispatch helpers
-```
-
-In `khive-storage`:
-
-```
-crates/khive-storage/src/
-├── note.rs       // NoteStore trait + storage-level Note
-├── graph.rs      // GraphStore trait (Entity edges)
-└── event.rs      // EventStore trait + storage-level Event
-```
-
-In `khive-db`:
-
-- Substrates back onto four SQL tables: `entities` and `graph_edges` (Entity substrate), `notes`,
-  and `events`.
-- Schema is applied via versioned migrations (see ADR-022).
-- Namespace is a caller-supplied parameter at the storage layer; enforcement happens at the
-  service/runtime layer (see ADR-007).
-
-## References
-
-- ADR-001: Entity Kind Taxonomy
-- ADR-002: Edge Ontology
-- `crates/khive-types/src/substrate.rs`: SubstrateKind enum
-- `crates/khive-storage/`: trait definitions
+- `SubstrateKind` enum values unchanged. No serialization migration.
+- Event substrate scope unchanged (operation audit only).
+- MCP wire protocol unchanged — substrate changes are internal.
