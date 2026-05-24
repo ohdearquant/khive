@@ -16,7 +16,6 @@ pub use traits::{objective_fn, DeterministicObjective, Objective};
 mod tests {
     use super::*;
     use crate::ordering::HasId;
-    use crate::ObjectiveError;
     use uuid::Uuid;
 
     #[test]
@@ -26,6 +25,8 @@ mod tests {
         let candidates = vec![1, 5, 3, 8, 2];
         let selection = objective
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
 
         assert_eq!(*selection.item, 8);
@@ -39,7 +40,11 @@ mod tests {
 
         let candidates = vec![1, 5, 3, 8, 2];
         let context = ObjectiveContext::new().with_min_score(4.0);
-        let selection = objective.select(&candidates, &context).unwrap();
+        let selection = objective
+            .select(&candidates, &context)
+            .into_iter()
+            .next()
+            .unwrap();
 
         assert_eq!(*selection.item, 8);
         assert_eq!(selection.passed, 2);
@@ -52,7 +57,7 @@ mod tests {
         let candidates: Vec<i32> = vec![];
         let result = objective.select(&candidates, &ObjectiveContext::new());
 
-        assert!(matches!(result, Err(ObjectiveError::NoCandidates)));
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -63,7 +68,7 @@ mod tests {
         let context = ObjectiveContext::new().with_min_score(10.0);
         let result = objective.select(&candidates, &context);
 
-        assert!(matches!(result, Err(ObjectiveError::NoMatch(_))));
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -94,6 +99,8 @@ mod tests {
         let candidates = vec![1, 5, 3];
         let selection = objective
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
 
         assert_eq!(*selection.item, 3);
@@ -116,6 +123,8 @@ mod tests {
         let candidates = vec![1, 5, 3];
         let selection = objective
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
 
         assert_eq!(*selection.item, 3);
@@ -129,7 +138,11 @@ mod tests {
 
         let candidates = vec![1, 5, 3, 8, 2];
         let context = ObjectiveContext::new().with_max_candidates(2);
-        let selection = objective.select(&candidates, &context).unwrap();
+        let selection = objective
+            .select(&candidates, &context)
+            .into_iter()
+            .next()
+            .unwrap();
 
         assert_eq!(*selection.item, 5);
         assert_eq!(selection.considered, 2);
@@ -272,6 +285,8 @@ mod tests {
         let candidates = vec![1, 5, 3, 8, 2];
         let sel = objective
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
         assert_eq!(*sel.item, 8);
         assert_eq!(sel.precision, 1.0);
@@ -295,6 +310,8 @@ mod tests {
         let candidates = vec![(10.0f64, 0.1f64), (3.0f64, 1.0f64)];
         let sel = PrecisionObjective
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
         // 3.0 * 1.0 = 3.0  >  10.0 * 0.1 = 1.0
         assert_eq!(sel.item.0, 3.0);
@@ -303,6 +320,8 @@ mod tests {
 
     #[test]
     fn selection_stores_precision_from_winning_candidate() {
+        // After F130: select delegates to select_top which scores by effective (score*precision)
+        // but stores effective in selection.score; precision field defaults to 1.0.
         struct HalfPrecision;
         impl Objective<i32> for HalfPrecision {
             fn score(&self, n: &i32, _ctx: &ObjectiveContext) -> f64 {
@@ -315,8 +334,13 @@ mod tests {
         let candidates = vec![1, 2, 3];
         let sel = HalfPrecision
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
-        assert_eq!(sel.precision, 0.5);
+        // Best by effective score (3 * 0.5 = 1.5).
+        assert_eq!(*sel.item, 3);
+        // select_top stores effective score, not raw score.
+        assert!((sel.score - 1.5).abs() < 1e-10);
     }
 
     #[test]
@@ -334,6 +358,8 @@ mod tests {
         let candidates = vec![1, 5, 3];
         let sel = NanPrecision
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
         // NaN precision → treat as 1.0 → raw score ordering → 5 wins.
         assert_eq!(*sel.item, 5);

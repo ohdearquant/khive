@@ -9,7 +9,7 @@
 //! - Sum is permutation invariant (order-independent)
 //! - Ties broken by ID for deterministic cross-platform ordering
 
-use khive_score::DeterministicScore;
+use khive_score::{rrf_score, DeterministicScore};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -79,26 +79,21 @@ pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
 
     // Estimate capacity as sum of all source lengths (upper bound on unique IDs)
     let estimated_capacity: usize = sources.iter().map(|s| s.len()).sum();
-    let mut combined: HashMap<Id, f64> = HashMap::with_capacity(estimated_capacity);
+    let mut combined: HashMap<Id, DeterministicScore> = HashMap::with_capacity(estimated_capacity);
 
     for results in sources {
         for (rank_0_indexed, (id, _score)) in results.into_iter().enumerate() {
             // rank is 1-indexed per ADR-002
             let rank_1_indexed = rank_0_indexed + 1;
-            let rrf_contribution = 1.0 / (k + rank_1_indexed) as f64;
-
-            *combined.entry(id).or_insert(0.0) += rrf_contribution;
+            let contribution = rrf_score(rank_1_indexed, k);
+            let entry = combined.entry(id).or_insert(DeterministicScore::ZERO);
+            *entry = *entry + contribution;
         }
     }
 
-    // Convert to DeterministicScore and sort descending
-    // Permutation invariant: reordering sources yields same totals.
-    // The sum of contributions is permutation-invariant: reordering sources
-    // produces the same total score for each document.
-    let mut fused: Vec<(Id, DeterministicScore)> = combined
-        .into_iter()
-        .map(|(id, score)| (id, DeterministicScore::from_f64(score)))
-        .collect();
+    // Sort descending by fixed-point score; permutation-invariant since DeterministicScore
+    // addition is order-independent (i128 accumulation in Add impl).
+    let mut fused: Vec<(Id, DeterministicScore)> = combined.into_iter().collect();
 
     // Sort by score descending, then by ID ascending for deterministic tie-breaking
     // This ensures cross-platform consistency when scores are equal

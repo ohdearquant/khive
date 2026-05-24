@@ -20,7 +20,10 @@ use khive_storage::{Event, EventStore, SubstrateKind};
 use khive_types::{EventOutcome, Namespace};
 use serde_json::Value;
 
-pub use khive_types::{EdgeEndpointRule, EndpointKind, VerbDef};
+pub use khive_types::{EdgeEndpointRule, EndpointKind, HandlerDef, Visibility};
+// Backward-compat re-export.
+#[allow(deprecated)]
+pub use khive_types::VerbDef;
 
 /// Hook called after every successful verb dispatch (Issue #158).
 ///
@@ -65,8 +68,8 @@ pub trait PackRuntime: Send + Sync {
     /// Entity kinds this pack owns — must equal `<Self as Pack>::ENTITY_KINDS`.
     fn entity_kinds(&self) -> &'static [&'static str];
 
-    /// Verbs this pack handles — must equal `<Self as Pack>::VERBS`.
-    fn verbs(&self) -> &'static [VerbDef];
+    /// Handlers this pack registers — must equal `<Self as Pack>::HANDLERS`.
+    fn handlers(&self) -> &'static [HandlerDef];
 
     /// Pack-extensible edge endpoint rules — must equal `<Self as Pack>::EDGE_RULES`.
     /// Defaults to empty so existing packs that don't extend the edge contract
@@ -535,7 +538,7 @@ impl VerbRegistry {
         }
 
         for pack in self.packs.iter() {
-            if pack.verbs().iter().any(|v| v.name == verb) {
+            if pack.handlers().iter().any(|v| v.name == verb) {
                 let result = pack.dispatch(verb, params, self).await;
 
                 // Post-dispatch hook: fires on success, opt-in (Issue #158).
@@ -553,7 +556,7 @@ impl VerbRegistry {
         let available: Vec<&str> = self
             .packs
             .iter()
-            .flat_map(|p| p.verbs().iter().map(|v| v.name))
+            .flat_map(|p| p.handlers().iter().map(|v| v.name))
             .collect();
         Err(RuntimeError::InvalidInput(format!(
             "unknown verb {verb:?}; available: {}",
@@ -579,24 +582,27 @@ impl VerbRegistry {
         None
     }
 
-    /// All verb definitions across all registered packs.
+    /// All handler definitions across all registered packs.
     ///
-    /// Returned with `'static` lifetime since pack verbs are `&'static [VerbDef]`
+    /// Returned with `'static` lifetime since pack handlers are `&'static [HandlerDef]`
     /// constants — callers can keep the slice references beyond the registry's
     /// borrow.
-    pub fn all_verbs(&self) -> Vec<&'static VerbDef> {
-        self.packs.iter().flat_map(|p| p.verbs().iter()).collect()
-    }
-
-    /// All verb definitions paired with the name of the pack that owns them.
-    ///
-    /// Useful for building catalogs that attribute each verb to its source pack.
-    /// The pack name has the same lifetime as `&self`; the `VerbDef` reference
-    /// is `'static`.
-    pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static VerbDef)> {
+    pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
         self.packs
             .iter()
-            .flat_map(|p| p.verbs().iter().map(move |v| (p.name(), v)))
+            .flat_map(|p| p.handlers().iter())
+            .collect()
+    }
+
+    /// All handler definitions paired with the name of the pack that owns them.
+    ///
+    /// Useful for building catalogs that attribute each handler to its source pack.
+    /// The pack name has the same lifetime as `&self`; the `HandlerDef` reference
+    /// is `'static`.
+    pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
             .collect()
     }
 
@@ -657,16 +663,16 @@ impl VerbRegistry {
             .map(|p| p.entity_kinds())
     }
 
-    /// Verbs declared by a specific registered pack.
+    /// Handlers declared by a specific registered pack.
     ///
-    /// Returns `None` if no pack with `name` is registered. Each `VerbDef`
-    /// carries name + description — sufficient for introspection clients
-    /// like `kkernel pack handler` (ADR-076).
-    pub fn pack_verbs(&self, name: &str) -> Option<&'static [VerbDef]> {
+    /// Returns `None` if no pack with `name` is registered. Each `HandlerDef`
+    /// carries name + description + visibility — sufficient for introspection
+    /// clients like `kkernel pack handler` (ADR-076).
+    pub fn pack_verbs(&self, name: &str) -> Option<&'static [HandlerDef]> {
         self.packs
             .iter()
             .find(|p| p.name() == name)
-            .map(|p| p.verbs())
+            .map(|p| p.handlers())
     }
 
     /// All pack-declared edge endpoint rules across registered packs (ADR-031).
@@ -801,14 +807,16 @@ mod tests {
         const NAME: &'static str = "alpha";
         const NOTE_KINDS: &'static [&'static str] = &["memo", "log"];
         const ENTITY_KINDS: &'static [&'static str] = &["widget"];
-        const VERBS: &'static [VerbDef] = &[
-            VerbDef {
+        const HANDLERS: &'static [HandlerDef] = &[
+            HandlerDef {
                 name: "create",
                 description: "create a widget",
+                visibility: Visibility::Verb,
             },
-            VerbDef {
+            HandlerDef {
                 name: "list",
                 description: "list widgets",
+                visibility: Visibility::Verb,
             },
         ];
     }
@@ -824,8 +832,8 @@ mod tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             AlphaPack::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            AlphaPack::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            AlphaPack::HANDLERS
         }
         async fn dispatch(
             &self,
@@ -843,14 +851,16 @@ mod tests {
         const NAME: &'static str = "beta";
         const NOTE_KINDS: &'static [&'static str] = &["log", "alert"];
         const ENTITY_KINDS: &'static [&'static str] = &["widget", "gadget"];
-        const VERBS: &'static [VerbDef] = &[
-            VerbDef {
+        const HANDLERS: &'static [HandlerDef] = &[
+            HandlerDef {
                 name: "notify",
                 description: "send alert",
+                visibility: Visibility::Verb,
             },
-            VerbDef {
+            HandlerDef {
                 name: "create",
                 description: "create a gadget",
+                visibility: Visibility::Verb,
             },
         ];
     }
@@ -866,8 +876,8 @@ mod tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             BetaPack::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            BetaPack::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            BetaPack::HANDLERS
         }
         async fn dispatch(
             &self,
@@ -1525,9 +1535,10 @@ mod tests {
             const NAME: &'static str = "tracked";
             const NOTE_KINDS: &'static [&'static str] = &[];
             const ENTITY_KINDS: &'static [&'static str] = &[];
-            const VERBS: &'static [VerbDef] = &[VerbDef {
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
                 name: "guarded",
                 description: "a guarded verb",
+                visibility: Visibility::Verb,
             }];
         }
 
@@ -1542,8 +1553,8 @@ mod tests {
             fn entity_kinds(&self) -> &'static [&'static str] {
                 Self::ENTITY_KINDS
             }
-            fn verbs(&self) -> &'static [VerbDef] {
-                Self::VERBS
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
             }
             async fn dispatch(
                 &self,
@@ -2204,14 +2215,14 @@ mod dep_tests {
         const NAME: &'static str = "kg_dep";
         const NOTE_KINDS: &'static [&'static str] = &["observation"];
         const ENTITY_KINDS: &'static [&'static str] = &["concept"];
-        const VERBS: &'static [VerbDef] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
     }
 
     impl Pack for MemoryDepPack {
         const NAME: &'static str = "memory_dep";
         const NOTE_KINDS: &'static [&'static str] = &["memory"];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const VERBS: &'static [VerbDef] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
         const REQUIRES: &'static [&'static str] = &["kg_dep"];
     }
 
@@ -2219,7 +2230,7 @@ mod dep_tests {
         const NAME: &'static str = "pack_a";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const VERBS: &'static [VerbDef] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
         const REQUIRES: &'static [&'static str] = &["pack_b"];
     }
 
@@ -2227,7 +2238,7 @@ mod dep_tests {
         const NAME: &'static str = "pack_b";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const VERBS: &'static [VerbDef] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
         const REQUIRES: &'static [&'static str] = &["pack_a"];
     }
 
@@ -2242,8 +2253,8 @@ mod dep_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             Self::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            Self::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
         }
         async fn dispatch(
             &self,
@@ -2268,8 +2279,8 @@ mod dep_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             Self::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            Self::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
         }
         fn requires(&self) -> &'static [&'static str] {
             Self::REQUIRES
@@ -2297,8 +2308,8 @@ mod dep_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             Self::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            Self::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
         }
         fn requires(&self) -> &'static [&'static str] {
             Self::REQUIRES
@@ -2326,8 +2337,8 @@ mod dep_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             Self::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            Self::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
         }
         fn requires(&self) -> &'static [&'static str] {
             Self::REQUIRES
@@ -2412,14 +2423,14 @@ mod dep_tests {
             const NAME: &'static str = "no_deps_a";
             const NOTE_KINDS: &'static [&'static str] = &[];
             const ENTITY_KINDS: &'static [&'static str] = &[];
-            const VERBS: &'static [VerbDef] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
         }
 
         impl Pack for NoDepsB {
             const NAME: &'static str = "no_deps_b";
             const NOTE_KINDS: &'static [&'static str] = &[];
             const ENTITY_KINDS: &'static [&'static str] = &[];
-            const VERBS: &'static [VerbDef] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
         }
 
         #[async_trait]
@@ -2433,8 +2444,8 @@ mod dep_tests {
             fn entity_kinds(&self) -> &'static [&'static str] {
                 Self::ENTITY_KINDS
             }
-            fn verbs(&self) -> &'static [VerbDef] {
-                Self::VERBS
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
             }
             async fn dispatch(
                 &self,
@@ -2457,8 +2468,8 @@ mod dep_tests {
             fn entity_kinds(&self) -> &'static [&'static str] {
                 Self::ENTITY_KINDS
             }
-            fn verbs(&self) -> &'static [VerbDef] {
-                Self::VERBS
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
             }
             async fn dispatch(
                 &self,
@@ -2495,9 +2506,10 @@ mod hook_tests {
         const NAME: &'static str = "simple";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const VERBS: &'static [VerbDef] = &[VerbDef {
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
             name: "ping",
             description: "ping",
+            visibility: Visibility::Verb,
         }];
     }
 
@@ -2512,8 +2524,8 @@ mod hook_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             SimplePack::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            SimplePack::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            SimplePack::HANDLERS
         }
         async fn dispatch(
             &self,

@@ -14,7 +14,7 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{DispatchHook, KhiveRuntime, RuntimeError, VerbRegistry};
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
-use khive_types::{Pack, VerbDef};
+use khive_types::{HandlerDef, Pack, Visibility};
 
 use crate::fold::EventFold;
 use crate::state::BrainState;
@@ -31,30 +31,35 @@ impl Pack for BrainPack {
     const NAME: &'static str = "brain";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const VERBS: &'static [VerbDef] = &BRAIN_VERBS;
+    const HANDLERS: &'static [HandlerDef] = &BRAIN_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
-static BRAIN_VERBS: [VerbDef; 5] = [
-    VerbDef {
+static BRAIN_HANDLERS: [HandlerDef; 5] = [
+    HandlerDef {
         name: "brain.state",
         description: "Return current BrainState snapshot for inspection",
+        visibility: Visibility::Verb,
     },
-    VerbDef {
+    HandlerDef {
         name: "brain.config",
         description: "Return projected config for a named pack parameter",
+        visibility: Visibility::Verb,
     },
-    VerbDef {
+    HandlerDef {
         name: "brain.events",
         description: "List recent brain-relevant events for debugging",
+        visibility: Visibility::Verb,
     },
-    VerbDef {
+    HandlerDef {
         name: "brain.reset",
         description: "Reset posteriors to priors (preserves event history)",
+        visibility: Visibility::Verb,
     },
-    VerbDef {
+    HandlerDef {
         name: "brain.emit",
         description: "Manually emit a feedback event for a specific entity",
+        visibility: Visibility::Verb,
     },
 ];
 
@@ -62,7 +67,7 @@ impl BrainPack {
     pub fn new(runtime: KhiveRuntime) -> Self {
         let fold = EventFold::new(ENTITY_CACHE_CAPACITY);
         let ctx = FoldContext::new();
-        let state = fold.initial(&ctx);
+        let state = fold.init(&ctx);
         Self {
             runtime,
             state: Mutex::new(state),
@@ -236,7 +241,7 @@ impl BrainPack {
             &mut *state,
             BrainState::new(std::collections::HashMap::new(), 0),
         );
-        *state = self.fold.step(current, &event, &ctx);
+        *state = self.fold.reduce(current, &event, &ctx);
 
         Ok(json!({
             "emitted": true,
@@ -281,8 +286,8 @@ impl PackRuntime for BrainPack {
         <BrainPack as Pack>::ENTITY_KINDS
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        &BRAIN_VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        &BRAIN_HANDLERS
     }
 
     fn requires(&self) -> &'static [&'static str] {
@@ -328,7 +333,7 @@ impl DispatchHook for BrainPack {
             &mut *state,
             BrainState::new(std::collections::HashMap::new(), 0),
         );
-        *state = self.fold.step(current, event, &ctx);
+        *state = self.fold.reduce(current, event, &ctx);
     }
 }
 

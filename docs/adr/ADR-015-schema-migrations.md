@@ -38,6 +38,7 @@ The canonical ledger of database schema migration versions. Migration versions a
 |      V6 | ADR-046    | event_sourced_proposals_index      | v1      |
 |      V7 | ADR-041    | event_observations_and_session_id  | v1      |
 |      V8 | ADR-022    | events_namespace_ts_id_idx         | v1      |
+|      V9 | ADR-004/029 | edge_lifecycle_and_target_backend | v1      |
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 

@@ -186,13 +186,15 @@ def main():
         assert edge1["relation"] == "variant_of"
         print(f"  [ok] link — QLoRA variant_of LoRA")
 
+        # ADR-002: introduced_by direction is concept → document (a concept
+        # was introduced by a paper). Reverse the source/target accordingly.
         call_verb(proc, "link", {
-            "source_id": paper_id,
-            "target_id": lora_id,
+            "source_id": lora_id,
+            "target_id": paper_id,
             "relation": "introduced_by",
             "weight": 1.0,
         })
-        print(f"  [ok] link — paper introduced_by LoRA")
+        print(f"  [ok] link — LoRA introduced_by paper")
 
         # 7. Get edge via get (auto-detects kind)
         edge_id = edge1["id"]
@@ -200,13 +202,19 @@ def main():
         assert fetched_edge["kind"] == "edge", f"expected kind=edge, got: {fetched_edge}"
         print(f"  [ok] get edge — wrapped response kind={fetched_edge['kind']}")
 
-        # 8. Neighbors
-        nbrs = call_verb(proc, "neighbors", {
+        # 8. Neighbors — LoRA has 1 inbound (QLoRA variant_of) and 1 outbound
+        # (LoRA introduced_by paper, per ADR-002 direction).
+        nbrs_in = call_verb(proc, "neighbors", {
             "node_id": lora_id,
             "direction": "in",
         })
-        assert len(nbrs) == 2, f"expected 2 inbound neighbors, got {len(nbrs)}"
-        print(f"  [ok] neighbors — {len(nbrs)} inbound to LoRA")
+        assert len(nbrs_in) == 1, f"expected 1 inbound neighbor, got {len(nbrs_in)}"
+        nbrs_out = call_verb(proc, "neighbors", {
+            "node_id": lora_id,
+            "direction": "out",
+        })
+        assert len(nbrs_out) == 1, f"expected 1 outbound neighbor, got {len(nbrs_out)}"
+        print(f"  [ok] neighbors — 1 inbound + 1 outbound to LoRA")
 
         # 9. Edge list
         edges = call_verb(proc, "list", {"kind": "edge", "source_id": qlora_id})

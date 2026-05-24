@@ -10,14 +10,16 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
+    EdgeListFilter, EntityPatch, KhiveRuntime, LinkSpec, MergeStrategy, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{
     Direction, NeighborQuery, PageRequest, TraversalOptions, TraversalRequest,
 };
 use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
 
-use crate::vocab::{EntityKind, NoteKind};
+use khive_types::EntityKind;
+
+use crate::vocab::NoteKind;
 use crate::KgPack;
 
 // ---- Kind canonicalization (ADR-030) ----
@@ -185,6 +187,7 @@ fn reconcile_specific(
 struct CreateParams {
     kind: String,
     namespace: Option<String>,
+    entity_type: Option<String>,
     name: Option<String>,
     description: Option<String>,
     content: Option<String>,
@@ -207,6 +210,7 @@ struct ListParams {
     limit: Option<u32>,
     offset: Option<u32>,
     entity_kind: Option<String>,
+    entity_type: Option<String>,
     source_id: Option<String>,
     target_id: Option<String>,
     relations: Option<Vec<String>>,
@@ -257,20 +261,44 @@ struct SearchParams {
     query: String,
     limit: Option<u32>,
     entity_kind: Option<String>,
+    entity_type: Option<String>,
     note_kind: Option<String>,
     properties: Option<Value>,
+}
+
+/// One entry in a bulk-link request (F205 / ADR-038).
+#[derive(Deserialize)]
+struct BulkLinkEntry {
+    source_id: String,
+    target_id: String,
+    relation: String,
+    weight: Option<f64>,
+    metadata: Option<Value>,
+    dependency_kind: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct LinkParams {
     namespace: Option<String>,
-    source_id: String,
-    target_id: String,
-    relation: String,
+    // Singleton fields (required unless `links` is provided).
+    source_id: Option<String>,
+    target_id: Option<String>,
+    relation: Option<String>,
     weight: Option<f64>,
+    /// Edge metadata (open JSON; governed keys validated by runtime).
+    metadata: Option<Value>,
+    /// Shortcut for `metadata.dependency_kind` on `depends_on` edges.
+    dependency_kind: Option<String>,
     /// When `true`, output uses full UUIDs and ISO 8601 timestamps instead of
     /// the default 8-char short IDs and YYYY/MM/DD date format.
     verbose: Option<bool>,
+    // Bulk link fields (ADR-038).
+    /// Multiple edges to create in one call.
+    links: Option<Vec<BulkLinkEntry>>,
+    /// When `true` (default), the entire batch is atomic — any failure rolls
+    /// back all writes. When `false`, errors are collected and returned as
+    /// warnings while successful entries are committed individually.
+    atomic: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -415,13 +443,36 @@ fn parse_direction(s: Option<&str>) -> Direction {
     }
 }
 
+/// Merge `dependency_kind` shortcut into `metadata` for `depends_on` edges.
+///
+/// When `dependency_kind` is provided separately and `metadata` does not already
+/// carry the key, the value is injected into the metadata object. This allows
+/// callers to write `dependency_kind: "build"` instead of the full
+/// `metadata: { "dependency_kind": "build" }` form.
+fn merge_entry_metadata(
+    metadata: Option<Value>,
+    dependency_kind: Option<String>,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(dk) = dependency_kind else {
+        return Ok(metadata);
+    };
+    let mut obj = metadata.unwrap_or_else(|| serde_json::json!({}));
+    let map = obj
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError::InvalidInput("metadata must be a JSON object".into()))?;
+    map.entry("dependency_kind".to_string())
+        .or_insert_with(|| serde_json::json!(dk));
+    Ok(Some(obj))
+}
+
 fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
     s.parse::<EdgeRelation>().map_err(|_| {
-        RuntimeError::InvalidInput(format!(
-            "unknown relation {s:?}; valid: contains | part_of | instance_of | extends | \
-             variant_of | introduced_by | supersedes | depends_on | enables | implements | \
-             competes_with | composed_with | annotates"
-        ))
+        let valid = EdgeRelation::ALL
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        RuntimeError::InvalidInput(format!("unknown relation {s:?}; valid: {valid}"))
     })
 }
 
@@ -548,7 +599,7 @@ impl KgPack {
                 )?
                 .ok_or_else(|| {
                     RuntimeError::InvalidInput(
-                        "kind=entity requires a specific kind: either kind=<concept|document|dataset|project|person|org> directly, or kind=entity + entity_kind=<…>".into(),
+                        "kind=entity requires a specific kind: either kind=<concept|document|dataset|project|person|org|artifact|service> directly, or kind=entity + entity_kind=<…>".into(),
                     )
                 })?;
                 let hook = registry.find_kind_hook(&canonical);
@@ -617,6 +668,7 @@ impl KgPack {
                     .create_entity(
                         p.namespace.as_deref(),
                         &canonical,
+                        p.entity_type.as_deref(),
                         &name,
                         p.description.as_deref(),
                         p.properties,
@@ -737,6 +789,7 @@ impl KgPack {
                     .list_entities(
                         p.namespace.as_deref(),
                         kind_filter.as_deref(),
+                        p.entity_type.as_deref(),
                         limit,
                         offset,
                     )
@@ -930,7 +983,10 @@ impl KgPack {
         }
 
         if self.runtime.get_edge(ns, id).await?.is_some() {
-            let deleted = self.runtime.delete_edge(ns, id).await?;
+            let deleted = self
+                .runtime
+                .delete_edge(ns, id, p.hard.unwrap_or(false))
+                .await?;
             return to_json(&serde_json::json!({ "deleted": deleted, "id": p.id }));
         }
 
@@ -1004,6 +1060,7 @@ impl KgPack {
                         None,
                         search_limit,
                         kind_filter.as_deref(),
+                        p.entity_type.as_deref(),
                     )
                     .await?;
 
@@ -1129,15 +1186,146 @@ impl KgPack {
     pub(crate) async fn handle_link(&self, params: Value) -> Result<Value, RuntimeError> {
         let p: LinkParams = deser(params)?;
         let verbose = p.verbose.unwrap_or(false);
-        let source =
-            resolve_uuid_async(&p.source_id, &self.runtime, p.namespace.as_deref()).await?;
-        let target =
-            resolve_uuid_async(&p.target_id, &self.runtime, p.namespace.as_deref()).await?;
+        let ns = p.namespace.as_deref();
+
+        if let Some(entries) = p.links {
+            let attempted = entries.len();
+            if attempted > 1000 {
+                return Err(RuntimeError::InvalidInput(
+                    "bulk link limited to 1000 entries per request".into(),
+                ));
+            }
+            let atomic = p.atomic.unwrap_or(true);
+            if atomic {
+                let mut specs = Vec::with_capacity(attempted);
+                let mut seen = std::collections::HashSet::new();
+                let mut skipped = 0usize;
+                for entry in entries {
+                    let source = resolve_uuid_async(&entry.source_id, &self.runtime, ns).await?;
+                    let target = resolve_uuid_async(&entry.target_id, &self.runtime, ns).await?;
+                    let relation = parse_relation(&entry.relation)?;
+                    let (source, target) = if relation.is_symmetric() && target < source {
+                        (target, source)
+                    } else {
+                        (source, target)
+                    };
+                    let key = format!("{source}::{target}::{}", relation.as_str());
+                    if !seen.insert(key) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let weight = entry.weight.unwrap_or(1.0).clamp(0.0, 1.0);
+                    let metadata = merge_entry_metadata(entry.metadata, entry.dependency_kind)?;
+                    specs.push(LinkSpec {
+                        namespace: p.namespace.clone(),
+                        source_id: source,
+                        target_id: target,
+                        relation,
+                        weight,
+                        metadata,
+                    });
+                }
+                let edges = self.runtime.link_many(specs).await?;
+                let mut resp = serde_json::json!({
+                    "attempted": attempted,
+                    "created": edges.len(),
+                    "skipped": skipped,
+                    "failed": 0,
+                });
+                if verbose {
+                    resp["edges"] = serde_json::to_value(&edges)
+                        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+                }
+                return to_json(&resp);
+            } else {
+                let mut results: Vec<Value> = Vec::new();
+                let mut error_list: Vec<Value> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                let mut skipped = 0usize;
+                for (idx, entry) in entries.into_iter().enumerate() {
+                    let source = match resolve_uuid_async(&entry.source_id, &self.runtime, ns).await
+                    {
+                        Ok(id) => id,
+                        Err(e) => {
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                            continue;
+                        }
+                    };
+                    let target = match resolve_uuid_async(&entry.target_id, &self.runtime, ns).await
+                    {
+                        Ok(id) => id,
+                        Err(e) => {
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                            continue;
+                        }
+                    };
+                    let relation = match parse_relation(&entry.relation) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                            continue;
+                        }
+                    };
+                    let (source, target) = if relation.is_symmetric() && target < source {
+                        (target, source)
+                    } else {
+                        (source, target)
+                    };
+                    let key = format!("{source}::{target}::{}", relation.as_str());
+                    if !seen.insert(key) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let weight = entry.weight.unwrap_or(1.0).clamp(0.0, 1.0);
+                    let metadata = match merge_entry_metadata(entry.metadata, entry.dependency_kind)
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                            continue;
+                        }
+                    };
+                    match self
+                        .runtime
+                        .link(ns, source, target, relation, weight, metadata)
+                        .await
+                    {
+                        Ok(edge) => results.push(to_json(&edge)?),
+                        Err(e) => error_list.push(json!({"index": idx, "error": format!("{e}")})),
+                    }
+                }
+                let mut resp = serde_json::json!({
+                    "attempted": attempted,
+                    "created": results.len(),
+                    "skipped": skipped,
+                    "failed": error_list.len(),
+                    "errors": error_list,
+                });
+                if verbose {
+                    resp["edges"] = serde_json::Value::Array(results);
+                }
+                return to_json(&resp);
+            }
+        }
+
+        // Singleton path.
+        let source_id_str = p.source_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("link requires source_id (or links for bulk)".into())
+        })?;
+        let target_id_str = p.target_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("link requires target_id (or links for bulk)".into())
+        })?;
+        let relation_str = p.relation.ok_or_else(|| {
+            RuntimeError::InvalidInput("link requires relation (or links for bulk)".into())
+        })?;
+        let source = resolve_uuid_async(&source_id_str, &self.runtime, ns).await?;
+        let target = resolve_uuid_async(&target_id_str, &self.runtime, ns).await?;
         let weight = p.weight.unwrap_or(1.0).clamp(0.0, 1.0);
-        let relation = parse_relation(&p.relation)?;
+        let relation = parse_relation(&relation_str)?;
+        let metadata = merge_entry_metadata(p.metadata, p.dependency_kind)?;
         let edge = self
             .runtime
-            .link(p.namespace.as_deref(), source, target, relation, weight)
+            .link(ns, source, target, relation, weight, metadata)
             .await?;
         let raw = to_json(&edge)?;
         Ok(format_edge_output(raw, verbose))
@@ -1212,5 +1400,26 @@ impl KgPack {
             .query_with_metadata(p.namespace.as_deref(), &p.query)
             .await?;
         to_json(&result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_relation;
+
+    // F009 (CRIT): error text must be derived from EdgeRelation::ALL, not a hardcoded list.
+    // ADR-002 mandates 15 relations; error text must include derived_from and precedes.
+    #[test]
+    fn parse_relation_error_lists_all_relations() {
+        let err = parse_relation("not_a_relation").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("derived_from"),
+            "F009: parse_relation error must list derived_from (ADR-002); got: {msg}"
+        );
+        assert!(
+            msg.contains("precedes"),
+            "F009: parse_relation error must list precedes (ADR-002); got: {msg}"
+        );
     }
 }
