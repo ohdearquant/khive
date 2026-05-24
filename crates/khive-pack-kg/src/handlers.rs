@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -236,8 +236,10 @@ struct UpdateParams {
     name: Option<Value>,
     description: Option<Value>,
     content: Option<String>,
-    salience: Option<Value>,
-    decay_factor: Option<Value>,
+    #[serde(default, deserialize_with = "tri_f64")]
+    salience: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "tri_f64")]
+    decay_factor: Option<Option<f64>>,
     properties: Option<Value>,
     tags: Option<Vec<String>>,
     relation: Option<String>,
@@ -672,19 +674,10 @@ fn optional_string_patch(
     }
 }
 
-/// Tri-state f64 patch: absent → None (don't touch), null → Some(None) (clear), number → Some(Some(v)) (set).
-fn f64_patch(v: Option<Value>, field: &str) -> Result<Option<Option<f64>>, RuntimeError> {
-    match v {
-        None => Ok(None),
-        Some(Value::Null) => Ok(Some(None)),
-        Some(Value::Number(n)) => n
-            .as_f64()
-            .map(|f| Some(Some(f)))
-            .ok_or_else(|| RuntimeError::InvalidInput(format!("{field} is not a valid f64"))),
-        Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "{field} must be null or a number, got: {other}"
-        ))),
-    }
+/// Serde deserializer for tri-state nullable f64:
+/// field absent → outer None, field = null → Some(None), field = number → Some(Some(v)).
+fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
+    Ok(Some(Option::deserialize(d)?))
 }
 
 // ---- Handler implementations ----
@@ -1087,8 +1080,8 @@ impl KgPack {
                 let patch = NotePatch::new(
                     optional_string_patch(p.name, "name")?,
                     p.content,
-                    f64_patch(p.salience, "salience")?,
-                    f64_patch(p.decay_factor, "decay_factor")?,
+                    p.salience,
+                    p.decay_factor,
                     p.properties,
                 );
                 to_json(&self.runtime.update_note(ns, id, patch).await?)
