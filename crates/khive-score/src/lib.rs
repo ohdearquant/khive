@@ -8,7 +8,6 @@
 
 mod comparator;
 mod ops;
-mod quantkey;
 mod score;
 
 pub use comparator::{cmp_asc_then_id, cmp_desc_then_id, Ranked};

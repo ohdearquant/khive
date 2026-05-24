@@ -19,7 +19,14 @@ impl DeterministicScore {
     const SCALE: f64 = 4_294_967_296.0; // 2^32
 
     pub const MAX: Self = Self(i64::MAX);
-    pub const NEG_INF: Self = Self(i64::MIN);
+    /// Reserved raw sentinel at `i64::MIN`. Public arithmetic and float conversion
+    /// never produce this value — see `NEG_INF` for the lowest reachable score.
+    /// Lean proof: `MIN` is the reserved NaN sentinel; runtime values are
+    /// `RuntimeValid` (NEG_INF ≤ x ≤ MAX) and disjoint from `MIN`.
+    pub const MIN: Self = Self(i64::MIN);
+    /// Lowest reachable runtime score (= `i64::MIN + 1`). Underflow clamps here,
+    /// `-Infinity` maps here. Distinct from `MIN`, which is reserved.
+    pub const NEG_INF: Self = Self(i64::MIN + 1);
     pub const ZERO: Self = Self(0);
 
     #[inline]
@@ -67,20 +74,24 @@ impl DeterministicScore {
 
     #[inline]
     pub const fn is_infinite(self) -> bool {
-        self.0 == i64::MAX || self.0 == Self::NEG_INF.0
+        self.0 == Self::MAX.0 || self.0 == Self::NEG_INF.0
     }
 
+    /// Saturating arithmetic clamps to `[NEG_INF, MAX]`. Per the Lean proof,
+    /// the reserved `MIN` (i64::MIN) sentinel is never produced.
     #[inline]
     fn from_arithmetic_raw(raw: i128) -> Self {
-        if raw >= i64::MAX as i128 {
+        if raw >= Self::MAX.0 as i128 {
             Self::MAX
-        } else if raw <= i64::MIN as i128 {
+        } else if raw <= Self::NEG_INF.0 as i128 {
             Self::NEG_INF
         } else {
             Self(raw as i64)
         }
     }
 
+    /// Float conversion: NaN → ZERO, +Inf → MAX, -Inf → NEG_INF, finite → clamped
+    /// to `[NEG_INF, MAX]`. Reserved `MIN` is never produced.
     #[inline]
     fn from_rounded_arithmetic(raw: f64) -> Self {
         if raw.is_nan() {
@@ -89,9 +100,9 @@ impl DeterministicScore {
             Self::MAX
         } else if !raw.is_finite() {
             Self::NEG_INF
-        } else if raw >= i64::MAX as f64 {
+        } else if raw >= Self::MAX.0 as f64 {
             Self::MAX
-        } else if raw <= i64::MIN as f64 {
+        } else if raw <= Self::NEG_INF.0 as f64 {
             Self::NEG_INF
         } else {
             Self(raw as i64)
@@ -342,25 +353,37 @@ mod tests {
         assert_eq!(s * f64::NAN, DeterministicScore::ZERO);
     }
 
-    // F032: NEG_INF sentinel must equal i64::MIN exactly
+    // NEG_INF = i64::MIN + 1; MIN (i64::MIN) is reserved sentinel (Lean: `MIN`)
     #[test]
-    fn neg_inf_is_i64_min() {
-        assert_eq!(DeterministicScore::NEG_INF.to_raw(), i64::MIN);
+    fn neg_inf_is_i64_min_plus_one() {
+        assert_eq!(DeterministicScore::NEG_INF.to_raw(), i64::MIN + 1);
     }
 
     #[test]
-    fn neg_infinity_maps_to_i64_min() {
-        assert_eq!(
-            DeterministicScore::from_f64(f64::NEG_INFINITY).to_raw(),
-            i64::MIN
-        );
+    fn min_sentinel_is_i64_min() {
+        assert_eq!(DeterministicScore::MIN.to_raw(), i64::MIN);
     }
 
     #[test]
-    fn saturation_below_i64_min_clamps_to_neg_inf() {
+    fn min_sentinel_distinct_from_neg_inf() {
+        assert_ne!(DeterministicScore::MIN, DeterministicScore::NEG_INF);
+        assert!(DeterministicScore::MIN < DeterministicScore::NEG_INF);
+    }
+
+    #[test]
+    fn neg_infinity_maps_to_neg_inf() {
         assert_eq!(
-            DeterministicScore::from_raw(i64::MIN) - DeterministicScore::from_raw(1),
+            DeterministicScore::from_f64(f64::NEG_INFINITY),
             DeterministicScore::NEG_INF
         );
+    }
+
+    #[test]
+    fn underflow_clamps_to_neg_inf_not_min() {
+        // Arithmetic must clamp at NEG_INF (= i64::MIN + 1), never produce MIN.
+        let result =
+            DeterministicScore::from_raw(i64::MIN + 1) - DeterministicScore::from_raw(1);
+        assert_eq!(result, DeterministicScore::NEG_INF);
+        assert_ne!(result, DeterministicScore::MIN);
     }
 }

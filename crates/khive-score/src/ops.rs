@@ -133,9 +133,10 @@ pub fn weighted_sum(
         let w = DeterministicScore::from_f64(weight);
         acc += (score.to_raw() as i128 * w.to_raw() as i128) / SCALE_RAW;
     }
-    Ok(DeterministicScore::from_raw(
-        acc.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
-    ))
+    Ok(DeterministicScore::from_raw(acc.clamp(
+        DeterministicScore::NEG_INF.to_raw() as i128,
+        DeterministicScore::MAX.to_raw() as i128,
+    ) as i64))
 }
 
 #[cfg(test)]
