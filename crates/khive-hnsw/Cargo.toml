@@ -13,6 +13,7 @@ description = "HNSW (Hierarchical Navigable Small World) vector index with INT8 
 [dependencies]
 khive-score = { version = "0.2.0", path = "../khive-score" }
 khive-types = { version = "0.2.0", path = "../khive-types" }
+khive-fold = { version = "0.2.0", path = "../khive-fold", optional = true }
 lattice-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,7 +25,9 @@ rayon = "1.10"
 ulid = "1.1"
 
 [dev-dependencies]
+blake3 = "1"
 proptest = "1"
+uuid = { workspace = true }
 
 [features]
-checkpoint = []
+checkpoint = ["dep:khive-fold"]

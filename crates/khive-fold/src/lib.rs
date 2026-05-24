@@ -33,6 +33,10 @@ mod error;
 mod fold;
 mod result;
 
+// ── Checkpoint protocol ─────────────────────────────────────────────────
+
+pub mod checkpoint;
+
 pub use compose::{filter, map, DualFold, FilterFold, MapFold, SequentialFold};
 pub use context::{FoldContext, SharedJson};
 pub use error::{FoldError, FoldResult, FoldResult as FoldResultType};
@@ -41,6 +45,10 @@ pub use fold::{
     Fold, FoldFailure, SumI64Fold, TryFold,
 };
 pub use result::FoldOutcome;
+
+// ── Checkpoint re-exports ────────────────────────────────────────────────
+
+pub use checkpoint::{Checkpoint, CheckpointStore, InMemoryCheckpointStore};
 
 // ── Anchor primitive ────────────────────────────────────────────────────
 
