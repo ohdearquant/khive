@@ -1954,3 +1954,118 @@ async fn link_output_returns_full_uuids_and_iso_dates() {
         "created_at must be ISO 8601; got: {created_at:?}"
     );
 }
+
+// ── Bulk link: entry limit, dedup, and response shape ────────────────────────
+
+// Fix 2: >1000 entries must return InvalidInput immediately.
+#[tokio::test]
+async fn bulk_link_over_1000_entries_returns_error() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "BulkA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "BulkB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let entries: Vec<Value> = (0..1001)
+        .map(|_| {
+            json!({
+                "source_id": a_id,
+                "target_id": b_id,
+                "relation": "extends",
+            })
+        })
+        .collect();
+
+    let err = pack
+        .dispatch("link", json!({"links": entries}))
+        .await
+        .expect_err("1001 entries must return an error");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput for >1000 bulk entries, got {err:?}"
+    );
+}
+
+// Fix 3: duplicate entries in a bulk request must be deduplicated (skipped count > 0).
+// Fix 4: response shape must have attempted/created/skipped/failed keys.
+#[tokio::test]
+async fn bulk_link_dedup_and_response_shape() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DedupA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DedupB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+    let c = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DedupC", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let c_id = c.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // 3 entries: A->B extends, A->B extends (dup), A->C extends.
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [
+                    {"source_id": a_id, "target_id": b_id, "relation": "extends"},
+                    {"source_id": a_id, "target_id": b_id, "relation": "extends"},
+                    {"source_id": a_id, "target_id": c_id, "relation": "extends"},
+                ],
+                "atomic": true,
+            }),
+        )
+        .await
+        .expect("bulk link must succeed");
+
+    assert_eq!(
+        result.get("attempted").and_then(Value::as_u64),
+        Some(3),
+        "attempted must be 3; got {result:?}"
+    );
+    assert_eq!(
+        result.get("created").and_then(Value::as_u64),
+        Some(2),
+        "created must be 2 (one dup skipped); got {result:?}"
+    );
+    assert_eq!(
+        result.get("skipped").and_then(Value::as_u64),
+        Some(1),
+        "skipped must be 1; got {result:?}"
+    );
+    assert_eq!(
+        result.get("failed").and_then(Value::as_u64),
+        Some(0),
+        "failed must be 0; got {result:?}"
+    );
+    assert!(
+        result.get("edges").and_then(Value::as_array).is_some(),
+        "edges array must be present; got {result:?}"
+    );
+}

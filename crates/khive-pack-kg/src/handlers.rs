@@ -1181,13 +1181,31 @@ impl KgPack {
         let ns = p.namespace.as_deref();
 
         if let Some(entries) = p.links {
+            let attempted = entries.len();
+            if attempted > 1000 {
+                return Err(RuntimeError::InvalidInput(
+                    "bulk link limited to 1000 entries per request".into(),
+                ));
+            }
             let atomic = p.atomic.unwrap_or(true);
             if atomic {
-                let mut specs = Vec::with_capacity(entries.len());
+                let mut specs = Vec::with_capacity(attempted);
+                let mut seen = std::collections::HashSet::new();
+                let mut skipped = 0usize;
                 for entry in entries {
                     let source = resolve_uuid_async(&entry.source_id, &self.runtime, ns).await?;
                     let target = resolve_uuid_async(&entry.target_id, &self.runtime, ns).await?;
                     let relation = parse_relation(&entry.relation)?;
+                    let (source, target) = if relation.is_symmetric() && target < source {
+                        (target, source)
+                    } else {
+                        (source, target)
+                    };
+                    let key = format!("{source}::{target}::{}", relation.as_str());
+                    if !seen.insert(key) {
+                        skipped += 1;
+                        continue;
+                    }
                     let weight = entry.weight.unwrap_or(1.0).clamp(0.0, 1.0);
                     let metadata = merge_entry_metadata(entry.metadata, entry.dependency_kind)?;
                     specs.push(LinkSpec {
@@ -1200,16 +1218,24 @@ impl KgPack {
                     });
                 }
                 let edges = self.runtime.link_many(specs).await?;
-                return to_json(&edges);
+                return to_json(&serde_json::json!({
+                    "attempted": attempted,
+                    "created": edges.len(),
+                    "skipped": skipped,
+                    "failed": 0,
+                    "edges": edges,
+                }));
             } else {
                 let mut results: Vec<Value> = Vec::new();
-                let mut errors: Vec<String> = Vec::new();
-                for entry in entries {
+                let mut error_list: Vec<Value> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                let mut skipped = 0usize;
+                for (idx, entry) in entries.into_iter().enumerate() {
                     let source = match resolve_uuid_async(&entry.source_id, &self.runtime, ns).await
                     {
                         Ok(id) => id,
                         Err(e) => {
-                            errors.push(format!("{}->{}: {e}", entry.source_id, entry.target_id));
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
                             continue;
                         }
                     };
@@ -1217,23 +1243,33 @@ impl KgPack {
                     {
                         Ok(id) => id,
                         Err(e) => {
-                            errors.push(format!("{}->{}: {e}", entry.source_id, entry.target_id));
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
                             continue;
                         }
                     };
                     let relation = match parse_relation(&entry.relation) {
                         Ok(r) => r,
                         Err(e) => {
-                            errors.push(format!("{}->{}: {e}", entry.source_id, entry.target_id));
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
                             continue;
                         }
                     };
+                    let (source, target) = if relation.is_symmetric() && target < source {
+                        (target, source)
+                    } else {
+                        (source, target)
+                    };
+                    let key = format!("{source}::{target}::{}", relation.as_str());
+                    if !seen.insert(key) {
+                        skipped += 1;
+                        continue;
+                    }
                     let weight = entry.weight.unwrap_or(1.0).clamp(0.0, 1.0);
                     let metadata = match merge_entry_metadata(entry.metadata, entry.dependency_kind)
                     {
                         Ok(m) => m,
                         Err(e) => {
-                            errors.push(format!("{}->{}: {e}", entry.source_id, entry.target_id));
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
                             continue;
                         }
                     };
@@ -1243,12 +1279,16 @@ impl KgPack {
                         .await
                     {
                         Ok(edge) => results.push(to_json(&edge)?),
-                        Err(e) => errors.push(format!("{source}->{target}: {e}")),
+                        Err(e) => error_list.push(json!({"index": idx, "error": format!("{e}")})),
                     }
                 }
                 return to_json(&serde_json::json!({
+                    "attempted": attempted,
+                    "created": results.len(),
+                    "skipped": skipped,
+                    "failed": error_list.len(),
                     "edges": results,
-                    "errors": errors,
+                    "errors": error_list,
                 }));
             }
         }

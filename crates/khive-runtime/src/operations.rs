@@ -165,6 +165,13 @@ fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &st
         ("service", EdgeRelation::CompetesWith, "service"),
         ("concept", EdgeRelation::ComposedWith, "concept"),
         ("project", EdgeRelation::ComposedWith, "project"),
+        // Versioning (Supersedes — same entity-kind pairs per ADR-002)
+        ("concept", EdgeRelation::Supersedes, "concept"),
+        ("document", EdgeRelation::Supersedes, "document"),
+        ("dataset", EdgeRelation::Supersedes, "dataset"),
+        ("project", EdgeRelation::Supersedes, "project"),
+        ("person", EdgeRelation::Supersedes, "person"),
+        ("org", EdgeRelation::Supersedes, "org"),
     ];
     RULES.iter().any(|(src, rel, tgt)| {
         *rel == relation && (*src == "*" || *src == src_kind) && *tgt == tgt_kind
@@ -461,7 +468,16 @@ impl KhiveRuntime {
                 }
             };
             match (&src, &tgt) {
-                (Resolved::Entity(_), Resolved::Entity(_)) => {}
+                (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
+                    if !base_entity_rule_allows(&src_e.kind, EdgeRelation::Supersedes, &tgt_e.kind)
+                    {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "({}) -[supersedes]-> ({}) is not in the ADR-002 base endpoint \
+                             allowlist; supersedes requires same-kind entity endpoints",
+                            src_e.kind, tgt_e.kind
+                        )));
+                    }
+                }
                 (Resolved::Note(_), Resolved::Note(_)) => {}
                 (Resolved::Event(_), _) => {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -4120,6 +4136,55 @@ mod tests {
             1,
             "F012: CompetesWith is symmetric; A->B and B->A must deduplicate to one canonical row; \
              found {count} rows (canonicalization not yet implemented)"
+        );
+    }
+
+    // Fix 1: Supersedes entity→entity — same kind (concept→concept) must be allowed.
+    #[tokio::test]
+    async fn f010_supersedes_same_kind_entity_allowed() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "OldV", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "NewV", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "concept->concept Supersedes must be allowed by ADR-002 allowlist, got {result:?}"
+        );
+    }
+
+    // Fix 1: Supersedes entity→entity — cross-kind (concept→document) must be rejected.
+    #[tokio::test]
+    async fn f010_supersedes_cross_kind_entity_rejected() {
+        let rt = rt();
+        let concept = rt
+            .create_entity(None, "concept", "MyConcept", None, None, vec![])
+            .await
+            .unwrap();
+        let doc = rt
+            .create_entity(None, "document", "MyDoc", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(
+                None,
+                concept.id,
+                doc.id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "concept->document Supersedes must be rejected by ADR-002 allowlist, got {result:?}"
         );
     }
 }
