@@ -170,6 +170,24 @@ const V1_UP: &str = "\
 /// V4 note: Deduplicates existing graph_edges rows that share the same
 /// (namespace, source_id, target_id, relation) triple, keeping the earliest
 /// rowid, then adds a unique index enforcing the constraint going forward.
+///
+/// V5 note: `ENTITIES_DDL` in `stores/entity.rs` already includes `entity_type TEXT`
+/// so that in-process schema creation has the column from the start.  When
+/// `run_migrations` is called on such a DB, the V5 `ALTER TABLE` would fail with
+/// "duplicate column name".  The migration runner handles this by checking column
+/// existence before applying V5 — see `run_migrations`.
+///
+/// V9 note: Adds lifecycle columns (updated_at, deleted_at) and backend routing
+/// metadata (target_backend) to graph_edges. Uses table rebuild to work around
+/// SQLite's limited ALTER TABLE support. Backfills updated_at = created_at for
+/// existing rows and sets deleted_at = NULL, target_backend = NULL.
+///
+/// V10 note: Adds event observability + provenance columns (kind, payload,
+/// payload_schema_version, profile_state_version, session_id, aggregate_kind,
+/// aggregate_id) and the event_observations table. The DDL is computed at runtime
+/// via `build_v10_event_observability_sql` so that running migrations on a DB
+/// already bootstrapped by `ensure_events_schema` does not fail with "duplicate
+/// column name".
 const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     DELETE FROM graph_edges \
     WHERE rowid NOT IN (\
@@ -181,11 +199,53 @@ const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     ON graph_edges(namespace, source_id, target_id, relation);\
 ";
 
-// V5 adds event observability + provenance columns and the event_observations table.
-// The DDL is computed at runtime via `build_v5_event_observability_sql` so that
+const V5_ADD_ENTITY_TYPE_TO_ENTITIES: &str = "\
+    ALTER TABLE entities ADD COLUMN entity_type TEXT NULL;\
+    CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type \
+    ON entities(namespace, kind, entity_type);\
+";
+
+const V9_EDGE_LIFECYCLE_AND_TARGET_BACKEND: &str = "\
+    DROP INDEX IF EXISTS idx_graph_edges_unique_triple;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_source;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_target;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_relation;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_src_rel;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_tgt_rel;\
+    CREATE TABLE graph_edges_new (\
+        namespace TEXT NOT NULL,\
+        id TEXT NOT NULL,\
+        source_id TEXT NOT NULL,\
+        target_id TEXT NOT NULL,\
+        relation TEXT NOT NULL,\
+        weight REAL NOT NULL DEFAULT 1.0,\
+        created_at INTEGER NOT NULL,\
+        updated_at INTEGER NOT NULL,\
+        deleted_at INTEGER,\
+        metadata TEXT,\
+        target_backend TEXT,\
+        PRIMARY KEY (namespace, id)\
+    );\
+    INSERT INTO graph_edges_new \
+        (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, metadata, target_backend) \
+    SELECT namespace, id, source_id, target_id, relation, weight, created_at, created_at, NULL, metadata, NULL \
+    FROM graph_edges;\
+    DROP TABLE graph_edges;\
+    ALTER TABLE graph_edges_new RENAME TO graph_edges;\
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique_triple ON graph_edges(namespace, source_id, target_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_source ON graph_edges(namespace, source_id);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_target ON graph_edges(namespace, target_id);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_relation ON graph_edges(namespace, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_src_rel ON graph_edges(namespace, source_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_tgt_rel ON graph_edges(namespace, target_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_target_backend ON graph_edges(target_backend) WHERE target_backend IS NOT NULL;\
+";
+
+// V10 adds event observability + provenance columns and the event_observations table.
+// The DDL is computed at runtime via `build_v10_event_observability_sql` so that
 // running migrations on a database already bootstrapped by `ensure_events_schema`
 // (which includes the new columns) does not fail with "duplicate column name".
-const V5_EVENT_OBSERVABILITY_PROVENANCE: &str = "__v5_computed_at_runtime__";
+const V10_EVENT_OBSERVABILITY_PROVENANCE: &str = "__v10_computed_at_runtime__";
 
 pub const MIGRATIONS: &[VersionedMigration] = &[
     VersionedMigration {
@@ -210,8 +270,36 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
     VersionedMigration {
         version: 5,
+        name: "add_entity_type_to_entities",
+        up: V5_ADD_ENTITY_TYPE_TO_ENTITIES,
+    },
+    // V6–V8 slots are reserved in the ADR-015 migration ledger for other ADRs
+    // (ADR-043, ADR-046, ADR-041 respectively).  These no-op migrations hold the
+    // slot open so the contiguity check passes while those ADRs are implemented.
+    VersionedMigration {
+        version: 6,
+        name: "reserved_adr043_embedding_pipeline_extensions",
+        up: "SELECT 1;",
+    },
+    VersionedMigration {
+        version: 7,
+        name: "reserved_adr046_event_sourced_proposals_index",
+        up: "SELECT 1;",
+    },
+    VersionedMigration {
+        version: 8,
+        name: "reserved_adr041_event_observations_and_session_id",
+        up: "SELECT 1;",
+    },
+    VersionedMigration {
+        version: 9,
+        name: "edge_lifecycle_and_target_backend",
+        up: V9_EDGE_LIFECYCLE_AND_TARGET_BACKEND,
+    },
+    VersionedMigration {
+        version: 10,
         name: "event_observability_provenance",
-        up: V5_EVENT_OBSERVABILITY_PROVENANCE,
+        up: V10_EVENT_OBSERVABILITY_PROVENANCE,
     },
 ];
 
@@ -302,13 +390,40 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             }
         }
 
+        // V5 adds `entity_type` to entities.  ENTITIES_DDL already includes the
+        // column so in-process DBs created via ensure_entities_schema already have
+        // it.  Same idempotency pattern as V2.
+        if migration.version == 5 {
+            let col_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('entities') WHERE name = 'entity_type'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if col_exists {
+                let now = chrono::Utc::now().timestamp_micros();
+                conn.execute(
+                    "INSERT OR IGNORE INTO _schema_migrations (version, name, applied_at) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![migration.version, migration.name, now],
+                )
+                .map_err(|e| SqliteError::Migration {
+                    version: migration.version,
+                    error: e.to_string(),
+                })?;
+                applied_version = migration.version;
+                continue;
+            }
+        }
+
         let tx = conn.transaction().map_err(|e| SqliteError::Migration {
             version: migration.version,
             error: e.to_string(),
         })?;
 
-        let up_sql = if migration.version == 5 {
-            build_v5_event_observability_sql(&tx).map_err(|e| SqliteError::Migration {
+        let up_sql = if migration.version == 10 {
+            build_v10_event_observability_sql(&tx).map_err(|e| SqliteError::Migration {
                 version: migration.version,
                 error: e.to_string(),
             })?
@@ -355,7 +470,7 @@ fn table_has_column(
     )
 }
 
-fn build_v5_event_observability_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
+fn build_v10_event_observability_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
     let mut sql = String::new();
     for (column, ddl) in [
         (
@@ -430,17 +545,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 5);
+        assert_eq!(version, 10);
 
-        // Verify the tracking table has rows for V1 through V5.
+        // Verify the tracking table has rows for V1..V10.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 10);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -462,7 +577,28 @@ mod tests {
             .unwrap();
         assert_eq!(col_count, 1, "V2 must add name column to notes");
 
-        // Verify V5 added event observability columns to events.
+        // Verify V5 added entity_type column to entities.
+        let et_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entities') WHERE name = 'entity_type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(et_count, 1, "V5 must add entity_type column to entities");
+
+        // Verify V5 added the kind+entity_type index.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_entities_kind_entity_type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1, "V5 must create idx_entities_kind_entity_type");
+
+        // Verify V10 added event observability columns to events.
         for col in [
             "kind",
             "payload",
@@ -479,7 +615,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert!(exists, "V5 must add events.{col}");
+            assert!(exists, "V10 must add events.{col}");
         }
 
         // Verify event_observations table exists.
@@ -490,9 +626,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(obs_tbl, 1, "V5 must create event_observations table");
+        assert_eq!(obs_tbl, 1, "V10 must create event_observations table");
 
-        // Verify V5 indexes exist.
+        // Verify V10 indexes exist.
         for idx in [
             "idx_events_ns_created_id",
             "idx_events_session",
@@ -507,7 +643,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert!(exists, "V5 must create index {idx}");
+            assert!(exists, "V10 must create index {idx}");
         }
     }
 
@@ -516,54 +652,88 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 5);
-        assert_eq!(v2, 5);
+        assert_eq!(v1, 10);
+        assert_eq!(v2, 10);
 
-        // Should still have exactly five rows in the tracking table (V1–V5).
+        // Should still have exactly ten rows in the tracking table (V1..V10).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 10);
+    }
+
+    // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
+    // ADR-009 requires target_backend for backend routing.
+    #[test]
+    fn migration_v9_adds_target_backend_index() {
+        let mut conn = open_memory();
+        let version = run_migrations(&mut conn).expect("migrations should succeed");
+        assert_eq!(
+            version, 10,
+            "F052: latest migration must be V10 (event observability)"
+        );
+        let col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('graph_edges') WHERE name = 'target_backend'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            col, 1,
+            "F052: graph_edges must have target_backend column after V9 migration"
+        );
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_graph_edges_target_backend'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx, 1,
+            "F052: idx_graph_edges_target_backend partial index must exist after V9 migration"
+        );
     }
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v6 = VersionedMigration {
-            version: 6,
+        let bad_v11 = VersionedMigration {
+            version: 11,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1–V5) so the DB is at V5.
-        run_migrations(&mut conn).expect("V1–V5 should apply cleanly");
+        // Apply all real migrations (V1..V10) so the DB is at V10.
+        run_migrations(&mut conn).expect("V1..V10 should apply cleanly");
 
-        // Now manually drive the bad V6 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v6);
+        // Now manually drive the bad V11 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v11);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V5 — no V6 row in tracking.
-        let v6_count: i64 = conn
+        // DB should still be at V10 — no V11 row in tracking.
+        let v11_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 6",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 11",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v6_count, 0, "V6 must not be recorded after rollback");
+        assert_eq!(v11_count, 0, "V11 must not be recorded after rollback");
 
-        // V1 through V5 should still be there.
+        // V1..V10 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(applied_count, 5, "V1 through V5 must still be recorded");
+        assert_eq!(applied_count, 10, "V1..V10 must still be recorded");
     }
 
     #[test]
@@ -587,9 +757,11 @@ mod tests {
         assert!(has_name, "NOTES_DDL should include name column");
 
         // Now run versioned migrations — V2 should detect the existing column
-        // and skip the ALTER TABLE without error. V5 adds event observability schema.
+        // and skip the ALTER TABLE without error. V4 adds the unique triple index.
+        // V5 should detect entity_type already present via ENTITIES_DDL and skip.
+        // V9 rebuilds graph_edges with lifecycle columns. V10 adds event observability.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 5);
+        assert_eq!(version, 10);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -602,6 +774,45 @@ mod tests {
         assert_eq!(
             v2_count, 1,
             "V2 must be recorded even when column pre-exists"
+        );
+
+        // V5 should be recorded as applied (skipped but tracked).
+        let v5_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v5_count, 1,
+            "V5 must be recorded even when entity_type column pre-exists"
+        );
+
+        // V9 (edge lifecycle + target_backend) must be recorded.
+        let v9_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 9",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v9_count, 1,
+            "V9 must be recorded after store-DDL + migrations"
+        );
+
+        // V10 (event observability) must be recorded.
+        let v10_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v10_count, 1,
+            "V10 must be recorded after store-DDL + migrations"
         );
     }
 
@@ -616,16 +827,16 @@ mod tests {
         ensure_events_schema(&conn).expect("store DDL should create events");
 
         let version = run_migrations(&mut conn).expect("migrations after events store DDL");
-        assert_eq!(version, 5, "must reach V5 even when events DDL ran first");
+        assert_eq!(version, 10, "must reach V10 even when events DDL ran first");
 
-        let v5_count: i64 = conn
+        let v10_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 5",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 10",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v5_count, 1, "V5 must be recorded");
+        assert_eq!(v10_count, 1, "V10 must be recorded");
     }
 
     /// Helper: apply a single migration in a transaction, recording it in the

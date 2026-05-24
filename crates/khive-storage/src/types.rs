@@ -297,12 +297,16 @@ impl fmt::Display for LinkId {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Edge {
     pub id: LinkId,
+    pub namespace: String,
     pub source_id: Uuid,
     pub target_id: Uuid,
     pub relation: EdgeRelation,
     pub weight: f64,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
     pub metadata: Option<Value>,
+    pub target_backend: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

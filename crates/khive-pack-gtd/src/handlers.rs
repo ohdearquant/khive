@@ -368,6 +368,7 @@ impl GtdPack {
                     dep_uuid,
                     EdgeRelation::DependsOn,
                     1.0,
+                    None,
                 )
                 .await
             {

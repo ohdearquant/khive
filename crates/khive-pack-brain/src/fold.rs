@@ -20,7 +20,7 @@ impl EventFold {
 }
 
 impl Fold<Event, BrainState> for EventFold {
-    fn initial(&self, _context: &FoldContext) -> BrainState {
+    fn init(&self, _context: &FoldContext) -> BrainState {
         BrainState::new(
             [
                 (
@@ -42,7 +42,7 @@ impl Fold<Event, BrainState> for EventFold {
         )
     }
 
-    fn step(&self, mut state: BrainState, event: &Event, _ctx: &FoldContext) -> BrainState {
+    fn reduce(&self, mut state: BrainState, event: &Event, _ctx: &FoldContext) -> BrainState {
         let signal = interpret(event);
 
         state.total_events += 1;
@@ -95,7 +95,7 @@ mod tests {
     fn initial_state_has_recall_priors() {
         let fold = EventFold::new(100);
         let ctx = FoldContext::new();
-        let state = fold.initial(&ctx);
+        let state = fold.init(&ctx);
         assert!(state.parameters.contains_key("recall::relevance_weight"));
         let p = &state.parameters["recall::relevance_weight"];
         assert!((p.alpha - 7.0).abs() < 1e-12);
@@ -106,11 +106,11 @@ mod tests {
     fn recall_hit_updates_global_and_entity() {
         let fold = EventFold::new(100);
         let ctx = FoldContext::new();
-        let mut state = fold.initial(&ctx);
+        let mut state = fold.init(&ctx);
 
         let id = Uuid::new_v4();
         let event = make_event("recall", EventOutcome::Success, Some(id));
-        state = fold.step(state, &event, &ctx);
+        state = fold.reduce(state, &event, &ctx);
 
         assert_eq!(state.total_events, 1);
         let p = &state.parameters["recall::relevance_weight"];
@@ -123,10 +123,10 @@ mod tests {
     fn recall_miss_updates_global_only() {
         let fold = EventFold::new(100);
         let ctx = FoldContext::new();
-        let mut state = fold.initial(&ctx);
+        let mut state = fold.init(&ctx);
 
         let event = make_event("recall", EventOutcome::Success, None);
-        state = fold.step(state, &event, &ctx);
+        state = fold.reduce(state, &event, &ctx);
 
         let p = &state.parameters["recall::relevance_weight"];
         assert!((p.beta - 4.0).abs() < 1e-12); // 3 + 1 failure
@@ -137,10 +137,10 @@ mod tests {
     fn irrelevant_event_increments_counter_only() {
         let fold = EventFold::new(100);
         let ctx = FoldContext::new();
-        let mut state = fold.initial(&ctx);
+        let mut state = fold.init(&ctx);
 
         let event = make_event("link", EventOutcome::Success, Some(Uuid::new_v4()));
-        state = fold.step(state, &event, &ctx);
+        state = fold.reduce(state, &event, &ctx);
 
         assert_eq!(state.total_events, 1);
         let p = &state.parameters["recall::relevance_weight"];
@@ -151,12 +151,12 @@ mod tests {
     fn feedback_not_useful_increments_entity_beta() {
         let fold = EventFold::new(100);
         let ctx = FoldContext::new();
-        let mut state = fold.initial(&ctx);
+        let mut state = fold.init(&ctx);
 
         let id = Uuid::new_v4();
         let mut event = make_event("brain.emit", EventOutcome::Success, Some(id));
-        event.payload = serde_json::json!({"signal": "not_useful"});
-        state = fold.step(state, &event, &ctx);
+        event.data = Some(serde_json::json!({"signal": "not_useful"}));
+        state = fold.reduce(state, &event, &ctx);
 
         assert_eq!(state.total_events, 1);
         let ep = state.entity_posteriors.get(&id).unwrap();
@@ -178,14 +178,14 @@ mod tests {
             make_event("recall", EventOutcome::Success, Some(id)),
         ];
 
-        let mut s1 = fold.initial(&ctx);
+        let mut s1 = fold.init(&ctx);
         for e in &events {
-            s1 = fold.step(s1, e, &ctx);
+            s1 = fold.reduce(s1, e, &ctx);
         }
 
-        let mut s2 = fold.initial(&ctx);
+        let mut s2 = fold.init(&ctx);
         for e in &events {
-            s2 = fold.step(s2, e, &ctx);
+            s2 = fold.reduce(s2, e, &ctx);
         }
 
         let snap1 = s1.to_snapshot();

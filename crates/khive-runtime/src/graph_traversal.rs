@@ -329,14 +329,14 @@ mod tests {
     async fn bfs_max_depth_zero_returns_only_root() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -356,29 +356,29 @@ mod tests {
     async fn bfs_depth_one_returns_root_and_neighbors() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, c.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         // Add a node two hops away — it must NOT appear.
         let d = rt
-            .create_entity(None, "concept", "D", None, None, vec![])
+            .create_entity(None, "concept", None, "D", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, b.id, d.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, d.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -405,15 +405,15 @@ mod tests {
     async fn bfs_direction_out_only() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         // Edge goes B -> A; traversing Out from A should find nothing.
-        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -434,15 +434,15 @@ mod tests {
     async fn bfs_direction_in_only() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         // Edge goes B -> A; traversing In from A should find B.
-        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -463,21 +463,21 @@ mod tests {
     async fn bfs_relation_filter() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(None, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
@@ -499,21 +499,21 @@ mod tests {
     async fn shortest_path_connected_nodes() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -528,11 +528,11 @@ mod tests {
     async fn shortest_path_unreachable_returns_none() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         // No edges between them.
@@ -545,7 +545,7 @@ mod tests {
     async fn shortest_path_same_node() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
 
@@ -560,14 +560,14 @@ mod tests {
     async fn shortest_path_max_depth_zero_adjacent() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -583,21 +583,21 @@ mod tests {
     async fn shortest_path_max_depth_one_two_hop_chain() {
         let rt = rt().await;
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 

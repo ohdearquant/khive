@@ -10,12 +10,34 @@
 
 use crate::edge::EdgeRelation;
 
-/// Verb metadata for discovery and documentation.
+/// Visibility tier for a handler (ADR-023).
+///
+/// `Verb` entries appear on the MCP wire and are invokable by agents.
+/// `Subhandler` entries are internal — callable by the operator via CLI
+/// but not surfaced as top-level MCP verbs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    /// Externally invokable via MCP `request` tool.
+    Verb,
+    /// Internal — operator-only via `kkernel call <pack> <handler>`.
+    Subhandler,
+}
+
+/// Handler metadata for discovery and documentation (ADR-023).
+///
+/// Replaces the previous `VerbDef`. Every entry carries a `visibility` tag
+/// so the registry can separate the MCP-exposed surface from internal handlers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerbDef {
+pub struct HandlerDef {
     pub name: &'static str,
     pub description: &'static str,
+    pub visibility: Visibility,
 }
+
+/// Backward-compatible type alias.  Existing code that names `VerbDef` still
+/// compiles; new code should use `HandlerDef` directly (ADR-023).
+#[deprecated(since = "0.2.0", note = "Use HandlerDef instead (ADR-023)")]
+pub type VerbDef = HandlerDef;
 
 /// Match spec for one end of an [`EdgeEndpointRule`] (ADR-031).
 ///
@@ -76,9 +98,12 @@ pub trait Pack {
     /// Entity kinds this pack contributes to the runtime vocabulary.
     const ENTITY_KINDS: &'static [&'static str];
 
-    /// Verbs this pack handles. The runtime routes verb calls to the pack
-    /// that declares them.
-    const VERBS: &'static [VerbDef];
+    /// Handlers this pack registers (ADR-023).
+    ///
+    /// The runtime routes verb calls to the pack that declares them.
+    /// Only entries with `visibility: Visibility::Verb` are surfaced on the
+    /// MCP wire; `Visibility::Subhandler` entries are internal.
+    const HANDLERS: &'static [HandlerDef];
 
     /// Additional edge endpoint rules this pack contributes (ADR-031).
     ///
@@ -104,9 +129,10 @@ mod tests {
         const NAME: &'static str = "test";
         const NOTE_KINDS: &'static [&'static str] = &["memo"];
         const ENTITY_KINDS: &'static [&'static str] = &["widget"];
-        const VERBS: &'static [VerbDef] = &[VerbDef {
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
             name: "do_thing",
             description: "does a thing",
+            visibility: Visibility::Verb,
         }];
     }
 
@@ -115,7 +141,8 @@ mod tests {
         assert_eq!(TestPack::NAME, "test");
         assert_eq!(TestPack::NOTE_KINDS, &["memo"]);
         assert_eq!(TestPack::ENTITY_KINDS, &["widget"]);
-        assert_eq!(TestPack::VERBS.len(), 1);
-        assert_eq!(TestPack::VERBS[0].name, "do_thing");
+        assert_eq!(TestPack::HANDLERS.len(), 1);
+        assert_eq!(TestPack::HANDLERS[0].name, "do_thing");
+        assert_eq!(TestPack::HANDLERS[0].visibility, Visibility::Verb);
     }
 }
