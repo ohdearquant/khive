@@ -106,10 +106,12 @@ impl VectorSearch for StorageVectorSearch {
         top_k: usize,
     ) -> Result<Vec<(Uuid, DeterministicScore)>> {
         let request = VectorSearchRequest {
-            query_embedding: embedding.to_vec(),
+            query_vectors: vec![embedding.to_vec()],
             top_k: top_k as u32,
             namespace: None,
             kind: None,
+            filter: None,
+            backend_hints: None,
         };
 
         let hits = self
@@ -206,11 +208,11 @@ mod tests {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
         store
-            .insert(id1, SubstrateKind::Entity, "test", vec![1.0, 0.0, 0.0])
+            .insert(id1, SubstrateKind::Entity, "local", "content", vec![vec![1.0, 0.0, 0.0]])
             .await
             .unwrap();
         store
-            .insert(id2, SubstrateKind::Entity, "test", vec![0.0, 1.0, 0.0])
+            .insert(id2, SubstrateKind::Entity, "local", "content", vec![vec![0.0, 1.0, 0.0]])
             .await
             .unwrap();
 
@@ -236,8 +238,9 @@ mod tests {
                 .insert(
                     Uuid::new_v4(),
                     SubstrateKind::Entity,
-                    "test",
-                    vec![1.0, 0.0, 0.0],
+                    "local",
+                    "content",
+                    vec![vec![1.0, 0.0, 0.0]],
                 )
                 .await
                 .unwrap();
@@ -267,7 +270,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         store
-            .insert(id, SubstrateKind::Entity, "test", vec![1.0, 0.0, 0.0])
+            .insert(id, SubstrateKind::Entity, "local", "content", vec![vec![1.0, 0.0, 0.0]])
             .await
             .unwrap();
 
@@ -413,7 +416,7 @@ mod tests {
 
         // Insert into both stores
         vec_store
-            .insert(id, SubstrateKind::Note, "test", vec![1.0, 0.0, 0.0])
+            .insert(id, SubstrateKind::Note, "local", "content", vec![vec![1.0, 0.0, 0.0]])
             .await
             .unwrap();
         text_store

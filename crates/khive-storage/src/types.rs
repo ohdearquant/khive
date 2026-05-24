@@ -125,6 +125,12 @@ pub struct VectorStoreCapabilities {
     pub supports_update: bool,
     /// Supports orphan sweep (deleting vectors with no live subject).
     pub supports_orphan_sweep: bool,
+    /// Supports multiple named fields per subject (e.g. `entity.title` and
+    /// `entity.body` stored as separate vectors). sqlite-vec backends use a
+    /// `subject_id PRIMARY KEY` table and therefore only support one vector
+    /// per subject per namespace — this field is `false` for those backends.
+    #[serde(default)]
+    pub supports_multi_field: bool,
     /// Maximum supported embedding dimension, or `None` if unbounded.
     pub max_dimensions: Option<u32>,
     /// Index algorithms available in this backend.
@@ -145,9 +151,7 @@ pub struct VectorMetadataFilter {
 impl VectorMetadataFilter {
     /// Returns `true` when no predicates are set (filter is a no-op).
     pub fn is_empty(&self) -> bool {
-        self.namespaces.is_empty()
-            && self.kinds.is_empty()
-            && self.property_filters.is_empty()
+        self.namespaces.is_empty() && self.kinds.is_empty() && self.property_filters.is_empty()
     }
 }
 

@@ -11,6 +11,7 @@ use khive_storage::types::{
     BatchWriteSummary, SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector,
 };
 use khive_storage::{SparseStore, StorageCapability};
+use khive_types::SubstrateKind;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
@@ -174,8 +175,9 @@ impl SqliteSparseStore {
 
     async fn upsert_sparse_vector(
         &self,
-        namespace: &str,
         subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
         field: &str,
         vector: SparseVector,
     ) -> Result<(), StorageError> {
@@ -183,6 +185,7 @@ impl SqliteSparseStore {
         let ns = namespace.to_string();
         let field = field.to_string();
         let id_str = subject_id.to_string();
+        let kind_str = kind.to_string();
 
         self.with_writer("sparse_upsert", move |conn| {
             let indices_json = serde_json::to_string(&vector.indices).map_err(|e| {
@@ -197,15 +200,24 @@ impl SqliteSparseStore {
             let sql = format!(
                 "INSERT INTO {table} \
                  (subject_id, namespace, kind, field, indices_json, values_blob, updated_at) \
-                 VALUES (?1, ?2, '', ?3, ?4, ?5, ?6) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(subject_id, namespace, field) DO UPDATE SET \
+                 kind = excluded.kind, \
                  indices_json = excluded.indices_json, \
                  values_blob = excluded.values_blob, \
                  updated_at = excluded.updated_at"
             );
             conn.execute(
                 &sql,
-                rusqlite::params![&id_str, &ns, &field, &indices_json, values_blob, now],
+                rusqlite::params![
+                    &id_str,
+                    &ns,
+                    &kind_str,
+                    &field,
+                    &indices_json,
+                    values_blob,
+                    now
+                ],
             )?;
             Ok(())
         })
@@ -243,10 +255,8 @@ impl SqliteSparseStore {
                     || record.vector.indices.windows(2).any(|w| w[0] >= w[1])
                 {
                     if first_error.is_empty() {
-                        first_error = format!(
-                            "invalid sparse vector for subject {}",
-                            record.subject_id
-                        );
+                        first_error =
+                            format!("invalid sparse vector for subject {}", record.subject_id);
                     }
                     failed += 1;
                     continue;
@@ -300,17 +310,13 @@ impl SqliteSparseStore {
         .await
     }
 
-    async fn delete_sparse_subject(
-        &self,
-        subject_id: Uuid,
-    ) -> Result<bool, StorageError> {
+    async fn delete_sparse_subject(&self, subject_id: Uuid) -> Result<bool, StorageError> {
         let table = self.table_name.clone();
         let namespace = self.namespace.clone();
         let id_str = subject_id.to_string();
 
         self.with_writer("sparse_delete", move |conn| {
-            let sql =
-                format!("DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2");
+            let sql = format!("DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2");
             let deleted = conn.execute(&sql, rusqlite::params![&id_str, &namespace])?;
             Ok(deleted > 0)
         })
@@ -396,7 +402,12 @@ impl SqliteSparseStore {
                 }
 
                 // Sparse dot product using merge of sorted index arrays.
-                let score = sparse_dot_product(&query.indices, &query.values, &stored_indices, &stored_values);
+                let score = sparse_dot_product(
+                    &query.indices,
+                    &query.values,
+                    &stored_indices,
+                    &stored_values,
+                );
                 scored.push((subject_id, score));
             }
 
@@ -433,12 +444,7 @@ impl SqliteSparseStore {
 }
 
 /// Sparse dot product via merge of two sorted index arrays.
-fn sparse_dot_product(
-    q_idx: &[u32],
-    q_val: &[f32],
-    s_idx: &[u32],
-    s_val: &[f32],
-) -> f64 {
+fn sparse_dot_product(q_idx: &[u32], q_val: &[f32], s_idx: &[u32], s_val: &[f32]) -> f64 {
     let mut dot = 0.0f64;
     let mut qi = 0;
     let mut si = 0;
@@ -460,13 +466,14 @@ fn sparse_dot_product(
 impl SparseStore for SqliteSparseStore {
     async fn insert_sparse(
         &self,
-        namespace: &str,
         subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
         field: &str,
         vector: SparseVector,
     ) -> Result<(), StorageError> {
         validate_sparse_vector(&vector, "sparse_insert")?;
-        self.upsert_sparse_vector(namespace, subject_id, field, vector)
+        self.upsert_sparse_vector(subject_id, kind, namespace, field, vector)
             .await
     }
 
@@ -523,7 +530,13 @@ mod tests {
         let store = make_store("test_count");
         let id = Uuid::new_v4();
         store
-            .insert_sparse("ns:test", id, "body", sv(vec![0, 2], vec![1.0, 0.5]))
+            .insert_sparse(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                sv(vec![0, 2], vec![1.0, 0.5]),
+            )
             .await
             .unwrap();
         assert_eq!(store.count().await.unwrap(), 1);
@@ -535,11 +548,23 @@ mod tests {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
         store
-            .insert_sparse("ns:test", id1, "body", sv(vec![0, 1], vec![1.0, 0.0]))
+            .insert_sparse(
+                id1,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                sv(vec![0, 1], vec![1.0, 0.0]),
+            )
             .await
             .unwrap();
         store
-            .insert_sparse("ns:test", id2, "body", sv(vec![0, 1], vec![0.0, 1.0]))
+            .insert_sparse(
+                id2,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                sv(vec![0, 1], vec![0.0, 1.0]),
+            )
             .await
             .unwrap();
 
@@ -563,7 +588,13 @@ mod tests {
         let store = make_store("test_delete");
         let id = Uuid::new_v4();
         store
-            .insert_sparse("ns:test", id, "body", sv(vec![1], vec![1.0]))
+            .insert_sparse(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                sv(vec![1], vec![1.0]),
+            )
             .await
             .unwrap();
         assert_eq!(store.count().await.unwrap(), 1);
@@ -578,8 +609,9 @@ mod tests {
         let store = make_store("test_mismatch");
         let result = store
             .insert_sparse(
-                "ns:test",
                 Uuid::new_v4(),
+                SubstrateKind::Entity,
+                "ns:test",
                 "body",
                 SparseVector {
                     indices: vec![0, 1],
@@ -595,8 +627,9 @@ mod tests {
         let store = make_store("test_nonfinite");
         let result = store
             .insert_sparse(
-                "ns:test",
                 Uuid::new_v4(),
+                SubstrateKind::Entity,
+                "ns:test",
                 "body",
                 sv(vec![0], vec![f32::NAN]),
             )
@@ -609,8 +642,9 @@ mod tests {
         let store = make_store("test_dup_idx");
         let result = store
             .insert_sparse(
-                "ns:test",
                 Uuid::new_v4(),
+                SubstrateKind::Entity,
+                "ns:test",
                 "body",
                 sv(vec![0, 0], vec![1.0, 2.0]),
             )
@@ -623,8 +657,9 @@ mod tests {
         let store = make_store("test_empty");
         let result = store
             .insert_sparse(
-                "ns:test",
                 Uuid::new_v4(),
+                SubstrateKind::Entity,
+                "ns:test",
                 "body",
                 sv(vec![], vec![]),
             )
@@ -637,7 +672,13 @@ mod tests {
         let store = make_store("test_ns_iso");
         let id = Uuid::new_v4();
         store
-            .insert_sparse("ns:a", id, "body", sv(vec![0], vec![1.0]))
+            .insert_sparse(
+                id,
+                SubstrateKind::Entity,
+                "ns:a",
+                "body",
+                sv(vec![0], vec![1.0]),
+            )
             .await
             .unwrap();
 

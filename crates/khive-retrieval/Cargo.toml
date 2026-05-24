@@ -46,8 +46,9 @@ policy = ["khive-gate"]
 checkpoint = ["khive-fold"]
 # SQLite-based persistence for HNSW and BM25 indexes
 persist = ["rusqlite", "tracing", "rand"]
-# Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits
-storage-adapters = ["khive-storage"]
+# Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits.
+# Enables the vectors feature on khive-db so sqlite-vec is loaded for tests.
+storage-adapters = ["khive-storage", "khive-db/vectors"]
 # Native cross-encoder reranking (deferred until khive-inference is ported)
 native-rerank = []
 # Native embedding service (delegated to lattice-embed; reserved for future feature-gating)

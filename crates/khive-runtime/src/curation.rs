@@ -246,7 +246,13 @@ impl KhiveRuntime {
         if self.config().embedding_model.is_some() {
             let vector = self.embed(&body).await?;
             self.vectors(namespace)?
-                .insert(entity.id, SubstrateKind::Entity, &ns, "entity.body", vec![vector])
+                .insert(
+                    entity.id,
+                    SubstrateKind::Entity,
+                    &ns,
+                    "entity.body",
+                    vec![vector],
+                )
                 .await?;
         }
 

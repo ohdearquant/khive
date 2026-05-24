@@ -3,6 +3,8 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use khive_types::SubstrateKind;
+
 use crate::types::{
     BatchWriteSummary, SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector,
     StorageResult,
@@ -12,16 +14,14 @@ use crate::types::{
 pub trait SparseStore: Send + Sync + 'static {
     async fn insert_sparse(
         &self,
-        namespace: &str,
         subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
         field: &str,
         vector: SparseVector,
     ) -> StorageResult<()>;
 
-    async fn insert_batch(
-        &self,
-        records: Vec<SparseRecord>,
-    ) -> StorageResult<BatchWriteSummary>;
+    async fn insert_batch(&self, records: Vec<SparseRecord>) -> StorageResult<BatchWriteSummary>;
 
     async fn delete(&self, subject_id: Uuid) -> StorageResult<bool>;
 

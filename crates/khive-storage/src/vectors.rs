@@ -50,6 +50,7 @@ pub trait VectorStore: Send + Sync + 'static {
             supports_quantization: false,
             supports_update: false,
             supports_orphan_sweep: false,
+            supports_multi_field: false,
             // sqlite-vec 0.1.9 enforces SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192.
             // The baseline uses the same value so generic callers that have not
             // overridden capabilities() report the correct ceiling.
@@ -112,17 +113,15 @@ pub trait VectorStore: Send + Sync + 'static {
         vectors: Vec<Vec<f32>>,
     ) -> StorageResult<()> {
         self.delete(subject_id).await?;
-        self.insert(subject_id, kind, namespace, field, vectors).await
+        self.insert(subject_id, kind, namespace, field, vectors)
+            .await
     }
 
     /// Remove vectors with no live subject (orphan sweep, ADR-044).
     ///
     /// Default returns [`StorageError::Unsupported`]. Backends that implement
     /// deletion must set `supports_orphan_sweep = true` and override this method.
-    async fn orphan_sweep(
-        &self,
-        config: &OrphanSweepConfig,
-    ) -> StorageResult<OrphanSweepResult> {
+    async fn orphan_sweep(&self, config: &OrphanSweepConfig) -> StorageResult<OrphanSweepResult> {
         let _ = config;
         Err(StorageError::Unsupported {
             capability: StorageCapability::Vectors,
@@ -364,7 +363,11 @@ mod tests {
         assert_eq!(batched.len(), 2, "should return one result set per request");
         for inner in &batched {
             assert!(inner.is_ok(), "each inner result should be Ok");
-            assert_eq!(inner.as_ref().unwrap().len(), 1, "each Ok should have one hit");
+            assert_eq!(
+                inner.as_ref().unwrap().len(),
+                1,
+                "each Ok should have one hit"
+            );
         }
     }
 
@@ -457,7 +460,13 @@ mod tests {
         let store = TestVectorStore::new();
         let id = Uuid::new_v4();
         let result = store
-            .update(id, SubstrateKind::Entity, "ns:test", "body", vec![vec![0.1, 0.2]])
+            .update(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.1, 0.2]],
+            )
             .await;
         assert!(result.is_ok());
         assert!(
@@ -475,7 +484,13 @@ mod tests {
         let store = TestVectorStore::with_fail_delete();
         let id = Uuid::new_v4();
         let result = store
-            .update(id, SubstrateKind::Entity, "ns:test", "body", vec![vec![0.1, 0.2]])
+            .update(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.1, 0.2]],
+            )
             .await;
         assert!(result.is_err());
         assert!(
@@ -493,7 +508,13 @@ mod tests {
         let store = TestVectorStore::with_fail_insert();
         let id = Uuid::new_v4();
         let result = store
-            .update(id, SubstrateKind::Entity, "ns:test", "body", vec![vec![0.1, 0.2]])
+            .update(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.1, 0.2]],
+            )
             .await;
         assert!(result.is_err());
         assert!(

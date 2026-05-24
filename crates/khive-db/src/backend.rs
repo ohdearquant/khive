@@ -305,8 +305,7 @@ impl StorageBackend {
         }
 
         let writer = self.pool.try_writer()?;
-        sparse::ensure_sparse_schema(writer.conn(), model_key)
-            .map_err(|e| SqliteError::Rusqlite(e))?;
+        sparse::ensure_sparse_schema(writer.conn(), model_key).map_err(SqliteError::Rusqlite)?;
 
         Ok(Arc::new(sparse::SqliteSparseStore::new(
             Arc::clone(&self.pool),

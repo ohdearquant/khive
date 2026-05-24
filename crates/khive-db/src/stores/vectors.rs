@@ -334,6 +334,13 @@ impl VectorStore for SqliteVecStore {
         &self,
         request: VectorSearchRequest,
     ) -> Result<Vec<VectorSearchHit>, StorageError> {
+        if request.filter.as_ref().is_some_and(|f| !f.is_empty()) {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_search".into(),
+                message: "use search_with_filter for filtered queries".into(),
+            });
+        }
         if request.query_vectors.len() != 1 {
             return Err(StorageError::Unsupported {
                 capability: StorageCapability::Vectors,
@@ -354,7 +361,11 @@ impl VectorStore for SqliteVecStore {
 
         if query_embedding.len() == dims {
             if let Some(idx) = non_finite_index(&query_embedding) {
-                return Err(non_finite_vector_error("vec_search", idx, query_embedding[idx]));
+                return Err(non_finite_vector_error(
+                    "vec_search",
+                    idx,
+                    query_embedding[idx],
+                ));
             }
         }
 
@@ -467,6 +478,11 @@ impl VectorStore for SqliteVecStore {
             supports_quantization: false,
             supports_update: false,
             supports_orphan_sweep: false,
+            // sqlite-vec uses subject_id as PRIMARY KEY — only one vector per
+            // subject per namespace is stored. Callers must use a single canonical
+            // field (e.g. "content") and are not permitted to store both
+            // "entity.title" and "entity.body" as separate vectors in one table.
+            supports_multi_field: false,
             // sqlite-vec 0.1.9 rejects dimensions > SQLITE_VEC_VEC0_MAX_DIMENSIONS (8192).
             // Reporting 8192 lets callers know that 4097–8192 dimensional models are
             // supported. The previous value of 4096 was the K_MAX (neighbors per query)
