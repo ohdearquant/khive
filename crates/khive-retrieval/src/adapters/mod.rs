@@ -208,11 +208,23 @@ mod tests {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
         store
-            .insert(id1, SubstrateKind::Entity, "local", "content", vec![vec![1.0, 0.0, 0.0]])
+            .insert(
+                id1,
+                SubstrateKind::Entity,
+                "local",
+                "content",
+                vec![vec![1.0, 0.0, 0.0]],
+            )
             .await
             .unwrap();
         store
-            .insert(id2, SubstrateKind::Entity, "local", "content", vec![vec![0.0, 1.0, 0.0]])
+            .insert(
+                id2,
+                SubstrateKind::Entity,
+                "local",
+                "content",
+                vec![vec![0.0, 1.0, 0.0]],
+            )
             .await
             .unwrap();
 
@@ -270,7 +282,13 @@ mod tests {
 
         let id = Uuid::new_v4();
         store
-            .insert(id, SubstrateKind::Entity, "local", "content", vec![vec![1.0, 0.0, 0.0]])
+            .insert(
+                id,
+                SubstrateKind::Entity,
+                "local",
+                "content",
+                vec![vec![1.0, 0.0, 0.0]],
+            )
             .await
             .unwrap();
 
@@ -416,7 +434,13 @@ mod tests {
 
         // Insert into both stores
         vec_store
-            .insert(id, SubstrateKind::Note, "local", "content", vec![vec![1.0, 0.0, 0.0]])
+            .insert(
+                id,
+                SubstrateKind::Note,
+                "local",
+                "content",
+                vec![vec![1.0, 0.0, 0.0]],
+            )
             .await
             .unwrap();
         text_store

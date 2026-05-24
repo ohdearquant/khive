@@ -68,18 +68,25 @@ pub trait VectorStore: Send + Sync + 'static {
     ///
     /// Callers must check `capabilities().supports_filter` before calling; the
     /// runtime layer is responsible for post-filtering when native pushdown is absent.
+    ///
+    /// A backend that claims `supports_filter = true` but does not override this
+    /// method will trigger a `debug_assert` at runtime (ADR-044 §4).
     async fn search_with_filter(
         &self,
-        request: VectorSearchRequest,
-        filter: VectorMetadataFilter,
+        request: &VectorSearchRequest,
+        filter: &VectorMetadataFilter,
     ) -> StorageResult<Vec<VectorSearchHit>> {
         if filter.is_empty() {
-            return self.search(request).await;
+            return self.search(request.clone()).await;
         }
+        debug_assert!(
+            !self.capabilities().supports_filter,
+            "backend claims supports_filter=true but did not override search_with_filter"
+        );
         Err(StorageError::Unsupported {
             capability: StorageCapability::Vectors,
             operation: "search_with_filter".into(),
-            message: "filter pushdown not supported by this backend".into(),
+            message: "filter pushdown not supported; set supports_filter=true only when overriding this method".into(),
         })
     }
 
@@ -304,7 +311,7 @@ mod tests {
             backend_hints: None,
         };
         let filter = VectorMetadataFilter::default(); // all fields empty
-        let result = store.search_with_filter(req, filter).await;
+        let result = store.search_with_filter(&req, &filter).await;
         assert!(result.is_ok());
         let hits = result.unwrap();
         // search() on TestVectorStore returns exactly one hit
@@ -327,7 +334,7 @@ mod tests {
             kinds: vec![],
             property_filters: vec![],
         };
-        let result = store.search_with_filter(req, filter).await;
+        let result = store.search_with_filter(&req, &filter).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(

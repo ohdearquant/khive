@@ -202,7 +202,9 @@ pub struct VectorSearchRequest {
 /// Configuration for an orphan-sweep pass (ADR-044).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrphanSweepConfig {
-    /// If set, only sweep rows whose subject_id is NOT in this allowlist.
+    /// Optional allowlist of subject IDs to check. `None` = scan all rows.
+    /// `Some(ids)` restricts the sweep to only those IDs; rows not in the list
+    /// are untouched even if orphaned (ADR-044 §5).
     pub subject_id_allowlist: Option<Vec<Uuid>>,
     pub namespaces: Vec<String>,
     pub substrate_kinds: Vec<SubstrateKind>,

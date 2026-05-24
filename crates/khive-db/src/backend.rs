@@ -22,6 +22,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
+
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
@@ -247,7 +249,34 @@ impl StorageBackend {
         // Ensure sqlite-vec is registered before creating vec0 tables.
         crate::extension::ensure_extensions_loaded();
 
-        // Create the vec0 virtual table. Idempotent.
+        let table = format!("vec_{}", model_key);
+        let writer = self.pool.try_writer()?;
+
+        // Detect old-schema vec0 tables that predate the `field` column (ADR-044).
+        // vec0 virtual tables do not support ALTER TABLE, so we must drop and recreate
+        // the table if it exists without the `field` column. Vector data is a cache —
+        // callers can re-embed from the source record after the table is rebuilt.
+        let old_schema_sql: Option<String> = writer
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                rusqlite::params![&table],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(SqliteError::Rusqlite)?;
+
+        if let Some(create_sql) = old_schema_sql {
+            // If the existing DDL does not mention `field`, it predates ADR-044.
+            // Drop and recreate so callers can insert with the new shape.
+            if !create_sql.contains("field") {
+                let drop_ddl = format!("DROP TABLE IF EXISTS {}", table);
+                writer.conn().execute_batch(&drop_ddl)?;
+            }
+        }
+
+        // Create the vec0 virtual table with the full ADR-044 schema. Idempotent
+        // on fresh databases and after the old-schema rebuild above.
         let ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
              subject_id TEXT PRIMARY KEY, \
@@ -258,7 +287,6 @@ impl StorageBackend {
              )",
             model_key, dimensions
         );
-        let writer = self.pool.try_writer()?;
         writer.conn().execute_batch(&ddl)?;
 
         Ok(Arc::new(vectors::SqliteVecStore::new(
