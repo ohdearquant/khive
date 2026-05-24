@@ -29,7 +29,11 @@ pub mod vector;
 pub use edge::{EdgeCategory, EdgeRelation};
 pub use entity::{Entity, EntityKind, Link, PropertyValue};
 pub use error::{TypeError, UnknownVariant};
-pub use event::{Event, EventBuilder, EventOutcome};
+pub use event::{
+    AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
+    ProposalAppliedPayload, ProposalChangeset, ProposalCreatedPayload, ProposalDecision,
+    ProposalReviewedPayload, ProposalWithdrawnPayload, RerankExecutedPayload,
+};
 pub use header::Header;
 pub use id::{Id128, ParseIdError};
 pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};

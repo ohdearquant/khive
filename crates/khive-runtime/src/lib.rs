@@ -40,11 +40,12 @@ pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
     GateRef, GateRequest, Obligation,
 };
+pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use objectives::{
     GraphProximityObjective, RetrievalCandidate, RrfFusionObjective, TextRelevanceObjective,
     VectorSimilarityObjective,
 };
-pub use operations::{NoteSearchHit, QueryResult, Resolved};
+pub use operations::{NamespaceToken, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
     DispatchHook, KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
     VerbRegistryBuilder,

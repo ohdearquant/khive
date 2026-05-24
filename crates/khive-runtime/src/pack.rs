@@ -16,29 +16,23 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use khive_gate::{ActorRef, AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
-use khive_storage::{Event, EventStore, SubstrateKind};
-use khive_types::{EventOutcome, Namespace};
+use khive_storage::{Event, EventStore, EventView, SubstrateKind};
+use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{EdgeEndpointRule, EndpointKind, VerbDef};
 
 /// Hook called after every successful verb dispatch (Issue #158).
 ///
-/// Packs that want to observe real-time dispatch outcomes (e.g. brain pack
-/// updating its posteriors) implement this trait and register it via
-/// [`VerbRegistryBuilder::with_dispatch_hook`]. The hook is opt-in: when no
-/// hook is registered, dispatch incurs zero overhead.
-///
-/// The hook receives the synthesized `Event` that was built from the dispatch
-/// outcome — same representation used by the EventStore audit path — so brain
-/// pack's `EventFold` can process it without extra conversion.
+/// Packs observe enriched event views so provenance-aware consumers can use
+/// `view.observations` while legacy folds can still consume `view.event`.
 #[async_trait]
 pub trait DispatchHook: Send + Sync {
-    /// Called with the dispatch-outcome event after a successful pack dispatch.
+    /// Called with the dispatch-outcome event view after a successful pack dispatch.
     ///
     /// Errors are logged via `tracing::warn!` and never propagated to the
-    /// caller — the dispatch has already succeeded.
-    async fn on_dispatch(&self, event: &Event);
+    /// caller; the dispatch has already succeeded.
+    async fn on_dispatch(&self, view: &EventView);
 }
 
 use crate::error::{
@@ -494,11 +488,12 @@ impl VerbRegistry {
                     let storage_event = Event::new(
                         gate_req.namespace.as_str(),
                         verb,
+                        EventKind::Audit,
                         SubstrateKind::Event,
                         format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
                     )
                     .with_outcome(outcome)
-                    .with_data(audit_data);
+                    .with_payload(audit_data);
                     if let Err(store_err) = store.append_event(storage_event).await {
                         tracing::warn!(
                             verb,
@@ -540,11 +535,20 @@ impl VerbRegistry {
 
                 // Post-dispatch hook: fires on success, opt-in (Issue #158).
                 if let (Ok(_), Some(hook)) = (&result, &self.dispatch_hook) {
-                    let dispatch_event =
-                        Event::new(ns_str.as_str(), verb, SubstrateKind::Event, pack.name())
-                            .with_outcome(EventOutcome::Success);
+                    let dispatch_event = Event::new(
+                        ns_str.as_str(),
+                        verb,
+                        EventKind::Audit,
+                        SubstrateKind::Event,
+                        pack.name(),
+                    )
+                    .with_outcome(EventOutcome::Success);
+                    let dispatch_view = EventView {
+                        event: dispatch_event,
+                        observations: Vec::new(),
+                    };
                     let hook = Arc::clone(hook);
-                    hook.on_dispatch(&dispatch_event).await;
+                    hook.on_dispatch(&dispatch_view).await;
                 }
 
                 return result;
@@ -1802,14 +1806,11 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Denied);
 
-        // The data field must hold the full AuditEvent envelope (ADR-033 contract).
-        let data = ev
-            .data
-            .as_ref()
-            .expect("Event.data must be Some — full AuditEvent envelope must be persisted");
+        // The payload field must hold the full AuditEvent envelope (ADR-033 contract).
+        let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
-            .expect("Event.data must deserialize to AuditEvent");
+            .expect("Event.payload must deserialize to AuditEvent");
 
         assert_eq!(
             audit.deny_reason.as_deref(),
@@ -1870,13 +1871,10 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Success);
 
-        let data = ev
-            .data
-            .as_ref()
-            .expect("Event.data must be Some — AuditEvent envelope must be persisted on allow");
+        let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
-            .expect("Event.data must deserialize to AuditEvent");
+            .expect("Event.payload must deserialize to AuditEvent");
 
         assert_eq!(audit.gate_impl, "ObligationGate");
         assert_eq!(
@@ -1954,16 +1952,13 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Denied);
 
-        // Event.data must hold the full AuditEvent serialized as JSON text and
+        // Event.payload must hold the full AuditEvent serialized as JSON text and
         // parsed back. If the SQL path was lossy, this deserialization would fail
         // or the field assertions below would fail.
-        let data = ev
-            .data
-            .as_ref()
-            .expect("Event.data must be Some — SqlEventStore must persist AuditEvent envelope");
+        let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
-            .expect("Event.data must deserialize to AuditEvent after SQL round-trip");
+            .expect("Event.payload must deserialize to AuditEvent after SQL round-trip");
 
         assert_eq!(
             audit.deny_reason.as_deref(),
@@ -2051,10 +2046,7 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Success);
 
-        let data = ev
-            .data
-            .as_ref()
-            .expect("Event.data must be Some — SqlEventStore must persist AuditEvent envelope");
+        let data = &ev.payload;
 
         // Layer 1: raw JSON check — obligations must be a non-empty array in
         // the persisted TEXT. If the SQL path dropped the field, the default
@@ -2148,14 +2140,11 @@ mod tests {
             "ev.namespace must match the dispatch namespace"
         );
 
-        // ev.data must hold the full AuditEvent envelope (ADR-033 / ADR-035 contract).
-        let data = ev
-            .data
-            .as_ref()
-            .expect("ev.data must be Some — full AuditEvent envelope required by ADR-035");
+        // ev.payload must hold the full AuditEvent envelope (ADR-033 / ADR-035 contract).
+        let data = &ev.payload;
 
-        let audit: khive_gate::AuditEvent =
-            serde_json::from_value(data.clone()).expect("ev.data must deserialize to AuditEvent");
+        let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
+            .expect("ev.payload must deserialize to AuditEvent");
 
         assert_eq!(
             audit.decision,
@@ -2534,9 +2523,9 @@ mod hook_tests {
 
     #[async_trait]
     impl DispatchHook for CountingHook {
-        async fn on_dispatch(&self, event: &Event) {
+        async fn on_dispatch(&self, view: &EventView) {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_verb.lock().unwrap() = event.verb.clone();
+            *self.last_verb.lock().unwrap() = view.event.verb.clone();
         }
     }
 
@@ -2638,8 +2627,8 @@ mod hook_tests {
 
         #[async_trait]
         impl DispatchHook for NsCapturingHook {
-            async fn on_dispatch(&self, event: &Event) {
-                *self.ns.lock().unwrap() = event.namespace.clone();
+            async fn on_dispatch(&self, view: &EventView) {
+                *self.ns.lock().unwrap() = view.event.namespace.clone();
             }
         }
 

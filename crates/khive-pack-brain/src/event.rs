@@ -58,9 +58,8 @@ pub fn interpret(event: &Event) -> BrainSignal {
                 None => return BrainSignal::Irrelevant,
             };
             let signal = event
-                .data
-                .as_ref()
-                .and_then(|d| d.get("signal"))
+                .payload
+                .get("signal")
                 .and_then(|s| serde_json::from_value::<FeedbackSignal>(s.clone()).ok());
             match signal {
                 Some(s) => BrainSignal::Feedback {
@@ -104,10 +103,10 @@ pub fn is_recall_positive(signal: &BrainSignal) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_types::SubstrateKind;
+    use khive_types::{EventKind, SubstrateKind};
 
     fn make_event(verb: &str, outcome: EventOutcome, target: Option<Uuid>) -> Event {
-        let mut e = Event::new("test", verb, SubstrateKind::Note, "brain");
+        let mut e = Event::new("test", verb, EventKind::Audit, SubstrateKind::Note, "brain");
         e.outcome = outcome;
         e.target_id = target;
         e
@@ -145,7 +144,7 @@ mod tests {
     fn brain_emit_with_feedback() {
         let id = Uuid::new_v4();
         let mut e = make_event("brain.emit", EventOutcome::Success, Some(id));
-        e.data = Some(serde_json::json!({"signal": "useful"}));
+        e.payload = serde_json::json!({"signal": "useful"});
         match interpret(&e) {
             BrainSignal::Feedback { target_id, signal } => {
                 assert_eq!(target_id, id);
@@ -220,7 +219,7 @@ mod tests {
     fn brain_emit_invalid_signal_data_is_irrelevant() {
         let id = Uuid::new_v4();
         let mut e = make_event("brain.emit", EventOutcome::Success, Some(id));
-        e.data = Some(serde_json::json!({"signal": "bad_value"}));
+        e.payload = serde_json::json!({"signal": "bad_value"});
         assert!(matches!(interpret(&e), BrainSignal::Irrelevant));
     }
 

@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 
 use khive_fold::{Fold, FoldContext};
 use khive_runtime::pack::PackRuntime;
+use khive_runtime::EventView;
 use khive_runtime::{DispatchHook, KhiveRuntime, RuntimeError, VerbRegistry};
-use khive_storage::event::{Event, EventFilter};
+use khive_storage::event::EventFilter;
 use khive_storage::types::PageRequest;
 use khive_types::{Pack, VerbDef};
 
@@ -150,9 +151,9 @@ impl BrainPack {
                 "get".into(),
                 "remember".into(),
             ],
-            namespaces: vec![ns],
             ..EventFilter::default()
         };
+        let _ = ns;
         let page = store
             .query_events(filter, PageRequest { offset: 0, limit })
             .await
@@ -169,6 +170,7 @@ impl BrainPack {
                     "target_id": e.target_id.map(|t| t.to_string()),
                     "duration_us": e.duration_us,
                     "created_at": e.created_at,
+                    "payload": e.payload,
                 })
             })
             .collect();
@@ -217,11 +219,12 @@ impl BrainPack {
         let event = khive_storage::event::Event::new(
             self.runtime.ns(p.namespace.as_deref()).to_string(),
             "brain.emit",
+            khive_types::EventKind::FeedbackExplicit,
             khive_types::SubstrateKind::Event,
             "brain",
         )
         .with_target(target)
-        .with_data(json!({"signal": signal}));
+        .with_payload(json!({"signal": signal}));
 
         let store = self.runtime.events(p.namespace.as_deref())?;
         store
@@ -319,7 +322,7 @@ impl PackRuntime for BrainPack {
 /// not load the brain pack are unaffected.
 #[async_trait]
 impl DispatchHook for BrainPack {
-    async fn on_dispatch(&self, event: &Event) {
+    async fn on_dispatch(&self, view: &EventView) {
         let ctx = FoldContext::new();
         let mut state = self.state.lock().unwrap();
         // Replace state with fold result. BrainState is not Clone, so we
@@ -328,7 +331,7 @@ impl DispatchHook for BrainPack {
             &mut *state,
             BrainState::new(std::collections::HashMap::new(), 0),
         );
-        *state = self.fold.step(current, event, &ctx);
+        *state = self.fold.step(current, &view.event, &ctx);
     }
 }
 

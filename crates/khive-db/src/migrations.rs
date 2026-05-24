@@ -181,6 +181,12 @@ const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     ON graph_edges(namespace, source_id, target_id, relation);\
 ";
 
+// V5 adds event observability + provenance columns and the event_observations table.
+// The DDL is computed at runtime via `build_v5_event_observability_sql` so that
+// running migrations on a database already bootstrapped by `ensure_events_schema`
+// (which includes the new columns) does not fail with "duplicate column name".
+const V5_EVENT_OBSERVABILITY_PROVENANCE: &str = "__v5_computed_at_runtime__";
+
 pub const MIGRATIONS: &[VersionedMigration] = &[
     VersionedMigration {
         version: 1,
@@ -201,6 +207,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 4,
         name: "dedupe_graph_edge_triples",
         up: V4_DEDUPE_GRAPH_EDGE_TRIPLES,
+    },
+    VersionedMigration {
+        version: 5,
+        name: "event_observability_provenance",
+        up: V5_EVENT_OBSERVABILITY_PROVENANCE,
     },
 ];
 
@@ -296,7 +307,16 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             error: e.to_string(),
         })?;
 
-        tx.execute_batch(migration.up)
+        let up_sql = if migration.version == 5 {
+            build_v5_event_observability_sql(&tx).map_err(|e| SqliteError::Migration {
+                version: migration.version,
+                error: e.to_string(),
+            })?
+        } else {
+            migration.up.to_string()
+        };
+
+        tx.execute_batch(&up_sql)
             .map_err(|e| SqliteError::Migration {
                 version: migration.version,
                 error: e.to_string(),
@@ -323,6 +343,77 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     Ok(applied_version)
 }
 
+fn table_has_column(
+    conn: &Connection,
+    table: &'static str,
+    column: &'static str,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+        rusqlite::params![table, column],
+        |row| row.get(0),
+    )
+}
+
+fn build_v5_event_observability_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
+    let mut sql = String::new();
+    for (column, ddl) in [
+        (
+            "kind",
+            "ALTER TABLE events ADD COLUMN kind TEXT NOT NULL DEFAULT 'audit';",
+        ),
+        (
+            "payload",
+            "ALTER TABLE events ADD COLUMN payload TEXT NOT NULL DEFAULT '{}';",
+        ),
+        (
+            "payload_schema_version",
+            "ALTER TABLE events ADD COLUMN payload_schema_version INTEGER NOT NULL DEFAULT 1;",
+        ),
+        (
+            "profile_state_version",
+            "ALTER TABLE events ADD COLUMN profile_state_version INTEGER;",
+        ),
+        (
+            "session_id",
+            "ALTER TABLE events ADD COLUMN session_id TEXT;",
+        ),
+        (
+            "aggregate_kind",
+            "ALTER TABLE events ADD COLUMN aggregate_kind TEXT;",
+        ),
+        (
+            "aggregate_id",
+            "ALTER TABLE events ADD COLUMN aggregate_id TEXT;",
+        ),
+    ] {
+        if !table_has_column(conn, "events", column)? {
+            sql.push_str(ddl);
+        }
+    }
+    // Migrate legacy data column into payload if both exist.
+    if table_has_column(conn, "events", "data")? && table_has_column(conn, "events", "payload")? {
+        sql.push_str("UPDATE events SET payload = data WHERE data IS NOT NULL AND data <> '';");
+    }
+    sql.push_str(
+        "CREATE TABLE IF NOT EXISTS event_observations (\
+            event_id TEXT NOT NULL,\
+            entity_id TEXT NOT NULL,\
+            referent_kind TEXT NOT NULL,\
+            role TEXT NOT NULL,\
+            position INTEGER NOT NULL,\
+            PRIMARY KEY (event_id, role, position)\
+        );\
+        CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);\
+        CREATE INDEX IF NOT EXISTS idx_events_session ON events(namespace, session_id, created_at, id);\
+        CREATE INDEX IF NOT EXISTS idx_events_ns_created_id ON events(namespace, created_at DESC, id DESC);\
+        CREATE INDEX IF NOT EXISTS idx_events_payload_proposal_id ON events(json_extract(payload, '$.proposal_id'));\
+        CREATE INDEX IF NOT EXISTS idx_event_obs_entity ON event_observations(entity_id, role);\
+        CREATE INDEX IF NOT EXISTS idx_event_obs_event_role ON event_observations(event_id, role);",
+    );
+    Ok(sql)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -339,17 +430,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
-        // Verify the tracking table has rows for V1, V2, V3, and V4.
+        // Verify the tracking table has rows for V1 through V5.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -370,6 +461,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(col_count, 1, "V2 must add name column to notes");
+
+        // Verify V5 added event observability columns to events.
+        for col in [
+            "kind",
+            "payload",
+            "payload_schema_version",
+            "profile_state_version",
+            "session_id",
+            "aggregate_kind",
+            "aggregate_id",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('events') WHERE name = ?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "V5 must add events.{col}");
+        }
+
+        // Verify event_observations table exists.
+        let obs_tbl: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='event_observations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_tbl, 1, "V5 must create event_observations table");
+
+        // Verify V5 indexes exist.
+        for idx in [
+            "idx_events_ns_created_id",
+            "idx_events_session",
+            "idx_events_payload_proposal_id",
+            "idx_event_obs_entity",
+            "idx_event_obs_event_role",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "V5 must create index {idx}");
+        }
     }
 
     #[test]
@@ -377,57 +516,54 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 4);
-        assert_eq!(v2, 4);
+        assert_eq!(v1, 5);
+        assert_eq!(v2, 5);
 
-        // Should still have exactly four rows in the tracking table (V1 + V2 + V3 + V4).
+        // Should still have exactly five rows in the tracking table (V1–V5).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
     }
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v5 = VersionedMigration {
-            version: 5,
+        let bad_v6 = VersionedMigration {
+            version: 6,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1 + V2 + V3 + V4) so the DB is at V4.
-        run_migrations(&mut conn).expect("V1+V2+V3+V4 should apply cleanly");
+        // Apply all real migrations (V1–V5) so the DB is at V5.
+        run_migrations(&mut conn).expect("V1–V5 should apply cleanly");
 
-        // Now manually drive the bad V5 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v5);
+        // Now manually drive the bad V6 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v6);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V4 — no V5 row in tracking.
-        let v5_count: i64 = conn
+        // DB should still be at V5 — no V6 row in tracking.
+        let v6_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 5",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 6",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v5_count, 0, "V5 must not be recorded after rollback");
+        assert_eq!(v6_count, 0, "V6 must not be recorded after rollback");
 
-        // V1, V2, V3, and V4 should still be there.
+        // V1 through V5 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            applied_count, 4,
-            "V1, V2, V3, and V4 must still be recorded"
-        );
+        assert_eq!(applied_count, 5, "V1 through V5 must still be recorded");
     }
 
     #[test]
@@ -451,9 +587,9 @@ mod tests {
         assert!(has_name, "NOTES_DDL should include name column");
 
         // Now run versioned migrations — V2 should detect the existing column
-        // and skip the ALTER TABLE without error. V4 adds the unique triple index.
+        // and skip the ALTER TABLE without error. V5 adds event observability schema.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -467,6 +603,29 @@ mod tests {
             v2_count, 1,
             "V2 must be recorded even when column pre-exists"
         );
+    }
+
+    #[test]
+    fn store_ddl_then_event_migration_is_idempotent() {
+        use crate::stores::event::ensure_events_schema;
+
+        let mut conn = open_memory();
+
+        // Simulate the StorageBackend path: ensure_events_schema creates the
+        // events table WITH the new columns. Running V5 on top must not fail.
+        ensure_events_schema(&conn).expect("store DDL should create events");
+
+        let version = run_migrations(&mut conn).expect("migrations after events store DDL");
+        assert_eq!(version, 5, "must reach V5 even when events DDL ran first");
+
+        let v5_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 5",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v5_count, 1, "V5 must be recorded");
     }
 
     /// Helper: apply a single migration in a transaction, recording it in the

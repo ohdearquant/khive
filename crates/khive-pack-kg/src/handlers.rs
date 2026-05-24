@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
+    EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, NamespaceToken, RuntimeError,
+    VerbRegistry,
 };
 use khive_storage::types::{
     Direction, NeighborQuery, PageRequest, TraversalOptions, TraversalRequest,
@@ -816,10 +817,12 @@ impl KgPack {
                         let page = self
                             .runtime
                             .list_events(
-                                p.namespace.as_deref(),
+                                &NamespaceToken::new(self.runtime.ns(p.namespace.as_deref())),
                                 filter.clone(),
-                                batch_size,
-                                raw_offset,
+                                PageRequest {
+                                    limit: batch_size,
+                                    offset: raw_offset.into(),
+                                },
                             )
                             .await?;
                         let batch_len = page.items.len() as u32;
@@ -851,7 +854,14 @@ impl KgPack {
                 } else {
                     let page = self
                         .runtime
-                        .list_events(p.namespace.as_deref(), filter, limit, offset)
+                        .list_events(
+                            &NamespaceToken::new(self.runtime.ns(p.namespace.as_deref())),
+                            filter,
+                            PageRequest {
+                                limit,
+                                offset: offset.into(),
+                            },
+                        )
                         .await?;
                     to_json(&page.items)
                 }

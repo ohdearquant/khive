@@ -60,6 +60,24 @@ fn note_snippet(note: &Note) -> Option<String> {
     text_preview(&note.content, 200)
 }
 
+/// Runtime-local namespace proof until ADR-007 auth tokens are wired through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceToken {
+    namespace: khive_types::Namespace,
+}
+
+impl NamespaceToken {
+    pub fn new(namespace: impl Into<String>) -> Self {
+        Self {
+            namespace: khive_types::Namespace::new(namespace.into()),
+        }
+    }
+
+    pub fn namespace(&self) -> &str {
+        self.namespace.as_str()
+    }
+}
+
 /// Result of resolving a UUID to its substrate kind.
 #[derive(Clone, Debug)]
 pub enum Resolved {
@@ -210,26 +228,17 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// List events in a namespace, optionally filtered.
+    /// List events in the namespace proven by the caller token.
     pub async fn list_events(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         filter: EventFilter,
-        limit: u32,
-        offset: u32,
+        page: PageRequest,
     ) -> RuntimeResult<Page<Event>> {
-        let limit = limit.clamp(1, 1000);
-        let page = self
-            .events(namespace)?
-            .query_events(
-                filter,
-                PageRequest {
-                    offset: offset.into(),
-                    limit,
-                },
-            )
-            .await?;
-        Ok(page)
+        self.events(Some(token.namespace()))?
+            .query_events(filter, page)
+            .await
+            .map_err(Into::into)
     }
 
     // ---- Edge operations ----
@@ -2065,11 +2074,17 @@ mod tests {
     #[tokio::test]
     async fn resolve_finds_event_by_full_uuid() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "actor",
+        );
         let event_id = event.id;
         rt.events(None).unwrap().append_event(event).await.unwrap();
 
@@ -2083,11 +2098,17 @@ mod tests {
     #[tokio::test]
     async fn resolve_prefix_finds_event() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "actor",
+        );
         let event_id = event.id;
         rt.events(None).unwrap().append_event(event).await.unwrap();
 
@@ -2564,7 +2585,7 @@ mod tests {
     #[tokio::test]
     async fn link_note_to_event_annotates_succeeds() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let note = rt
@@ -2582,7 +2603,13 @@ mod tests {
 
         // Build an event directly via the store (no runtime create_event exists).
         let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
         rt.events(None).unwrap().append_event(event).await.unwrap();
 
@@ -2599,11 +2626,17 @@ mod tests {
     #[tokio::test]
     async fn create_note_annotates_event_succeeds() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
         rt.events(None).unwrap().append_event(event).await.unwrap();
 
@@ -2770,11 +2803,17 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_event_source_returns_invalid_input() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
         rt.events(None).unwrap().append_event(event).await.unwrap();
 
@@ -2799,11 +2838,17 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_event_target_returns_invalid_input() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
         rt.events(None).unwrap().append_event(event).await.unwrap();
 
