@@ -213,6 +213,11 @@ impl KhiveRuntime {
         strategy: EntityDedupMergePolicy,
         dry_run: bool,
     ) -> RuntimeResult<MergeSummary> {
+        if into_id == from_id {
+            return Err(RuntimeError::InvalidInput(
+                "cannot merge an entity into itself".into(),
+            ));
+        }
         let ns = self.ns(namespace).to_string();
         let sanitized_ns: String = ns
             .chars()
@@ -415,6 +420,11 @@ impl KhiveRuntime {
         content_strategy: ContentMergeStrategy,
         dry_run: bool,
     ) -> RuntimeResult<MergeSummary> {
+        if into_id == from_id {
+            return Err(RuntimeError::InvalidInput(
+                "cannot merge a note into itself".into(),
+            ));
+        }
         let ns = self.ns(namespace).to_string();
         let sanitized_ns: String = ns
             .chars()
@@ -1615,6 +1625,23 @@ mod tests {
             .unwrap();
         assert_eq!(c_neighbors.len(), 1);
         assert_eq!(c_neighbors[0].node_id, d.id);
+    }
+
+    #[tokio::test]
+    async fn merge_entity_self_merge_rejected() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let err = rt
+            .merge_entity(None, a.id, a.id, EntityDedupMergePolicy::PreferInto, false)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("cannot merge an entity into itself"),
+            "expected self-merge rejection, got: {err:?}"
+        );
     }
 
     #[tokio::test]
