@@ -1346,21 +1346,20 @@ impl KhiveRuntime {
             }
         }
         if deleted {
-            if let Ok(event_store) = self.events(namespace) {
-                let ns_str = ns.to_string();
-                let event = khive_storage::event::Event::new(
-                    ns_str,
-                    "delete",
-                    EventKind::NoteDeleted,
-                    SubstrateKind::Note,
-                    "",
-                )
-                .with_target(id)
-                .with_payload(serde_json::json!({"id": id, "hard": hard}));
-                if let Err(e) = event_store.append_event(event).await {
-                    tracing::warn!(error = %e, "delete_note: event store write failed (non-fatal)");
-                }
-            }
+            let event_store = self.events(namespace)?;
+            let ns_str = ns.to_string();
+            let event = khive_storage::event::Event::new(
+                ns_str.clone(),
+                "delete",
+                EventKind::NoteDeleted,
+                SubstrateKind::Note,
+                "",
+            )
+            .with_target(id)
+            .with_payload(serde_json::json!({"id": id, "namespace": ns_str, "hard": hard}));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("delete_note: event store write failed: {e}"))
+            })?;
         }
         Ok(deleted)
     }
@@ -1466,21 +1465,20 @@ impl KhiveRuntime {
             self.remove_from_indexes(namespace, id).await?;
         }
         if deleted {
-            if let Ok(event_store) = self.events(namespace) {
-                let ns = entity.namespace.clone();
-                let event = khive_storage::event::Event::new(
-                    ns,
-                    "delete",
-                    EventKind::EntityDeleted,
-                    SubstrateKind::Entity,
-                    "",
-                )
-                .with_target(id)
-                .with_payload(serde_json::json!({"id": id, "hard": hard}));
-                if let Err(e) = event_store.append_event(event).await {
-                    tracing::warn!(error = %e, "delete_entity: event store write failed (non-fatal)");
-                }
-            }
+            let event_store = self.events(namespace)?;
+            let ns = entity.namespace.clone();
+            let event = khive_storage::event::Event::new(
+                ns.clone(),
+                "delete",
+                EventKind::EntityDeleted,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(id)
+            .with_payload(serde_json::json!({"id": id, "namespace": ns, "hard": hard}));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("delete_entity: event store write failed: {e}"))
+            })?;
         }
         Ok(deleted)
     }
@@ -1559,33 +1557,37 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
 
+        let mut changed_fields: Vec<&'static str> = Vec::new();
         if let Some(r) = relation {
             // Validate before mutating — use the existing endpoints with the new relation.
             self.validate_edge_relation_endpoints(namespace, edge.source_id, edge.target_id, r)
                 .await?;
             edge.relation = r;
+            changed_fields.push("relation");
         }
         if let Some(w) = weight {
             edge.weight = w.clamp(0.0, 1.0);
+            changed_fields.push("weight");
         }
 
         graph.upsert_edge(edge.clone()).await?;
 
-        if let Ok(event_store) = self.events(namespace) {
-            let ns = self.ns(namespace).to_string();
-            let event = khive_storage::event::Event::new(
-                ns,
-                "update",
-                EventKind::EdgeUpdated,
-                SubstrateKind::Entity,
-                "",
-            )
-            .with_target(edge_id)
-            .with_payload(serde_json::json!({"id": edge_id}));
-            if let Err(e) = event_store.append_event(event).await {
-                tracing::warn!(error = %e, "update_edge: event store write failed (non-fatal)");
-            }
-        }
+        let event_store = self.events(namespace)?;
+        let ns = self.ns(namespace).to_string();
+        let event = khive_storage::event::Event::new(
+            ns.clone(),
+            "update",
+            EventKind::EdgeUpdated,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(edge_id)
+        .with_payload(
+            serde_json::json!({"id": edge_id, "namespace": ns, "changed_fields": changed_fields}),
+        );
+        event_store.append_event(event).await.map_err(|e| {
+            RuntimeError::Internal(format!("update_edge: event store write failed: {e}"))
+        })?;
 
         Ok(edge)
     }
@@ -1641,21 +1643,20 @@ impl KhiveRuntime {
 
         let deleted = graph.delete_edge(LinkId::from(edge_id), mode).await?;
         if deleted {
-            if let Ok(event_store) = self.events(namespace) {
-                let ns = self.ns(namespace).to_string();
-                let event = khive_storage::event::Event::new(
-                    ns,
-                    "delete",
-                    EventKind::EdgeDeleted,
-                    SubstrateKind::Entity,
-                    "",
-                )
-                .with_target(edge_id)
-                .with_payload(serde_json::json!({"id": edge_id, "hard": hard}));
-                if let Err(e) = event_store.append_event(event).await {
-                    tracing::warn!(error = %e, "delete_edge: event store write failed (non-fatal)");
-                }
-            }
+            let event_store = self.events(namespace)?;
+            let ns = self.ns(namespace).to_string();
+            let event = khive_storage::event::Event::new(
+                ns.clone(),
+                "delete",
+                EventKind::EdgeDeleted,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(edge_id)
+            .with_payload(serde_json::json!({"id": edge_id, "namespace": ns, "hard": hard}));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("delete_edge: event store write failed: {e}"))
+            })?;
         }
         Ok(deleted)
     }

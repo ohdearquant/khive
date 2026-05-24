@@ -229,6 +229,8 @@ struct ListParams {
     event_kind: Option<String>,
     event_kinds: Option<Vec<String>>,
     session_id: Option<String>,
+    observed: Option<Vec<String>>,
+    selected: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -550,6 +552,28 @@ fn event_filter_from_params(
         })
         .transpose()?;
 
+    let observed = p
+        .observed
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid observed id {s:?}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let selected = p
+        .selected
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid selected id {s:?}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok((
         EventFilter {
             verbs,
@@ -559,6 +583,8 @@ fn event_filter_from_params(
             before: p.until,
             kinds,
             session_id,
+            observed,
+            selected,
             ..EventFilter::default()
         },
         outcome,
