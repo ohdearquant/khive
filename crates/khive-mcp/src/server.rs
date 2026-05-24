@@ -148,9 +148,11 @@ impl KhiveMcpServer {
             let default_namespace = recovered_runtime.config().default_namespace.clone();
             let mut builder = VerbRegistryBuilder::new();
             builder.with_gate(gate);
-            builder.with_default_namespace(default_namespace);
+            builder.with_default_namespace(default_namespace.as_str());
             // ADR-035: wire the EventStore for the fallback path too.
-            if let Ok(event_store) = recovered_runtime.events(None) {
+            if let Ok(event_store) =
+                recovered_runtime.events(&khive_runtime::NamespaceToken::local())
+            {
                 builder.with_event_store(event_store);
             }
             // Fallback: register the kg pack through the inventory registry so
@@ -177,9 +179,9 @@ impl KhiveMcpServer {
         let default_namespace = runtime.config().default_namespace.clone();
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(gate);
-        builder.with_default_namespace(default_namespace);
+        builder.with_default_namespace(default_namespace.as_str());
         // ADR-035: wire the EventStore into the registry for audit persistence.
-        if let Ok(event_store) = runtime.events(None) {
+        if let Ok(event_store) = runtime.events(&khive_runtime::NamespaceToken::local()) {
             builder.with_event_store(event_store);
         }
         if let Err(unknown) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {

@@ -159,7 +159,7 @@ mod tests {
         let entity = Entity {
             header: Header::new(
                 Id128::from_u128(1),
-                Namespace::default(),
+                Namespace::local(),
                 Timestamp::from_secs(1700000000),
             ),
             kind: EntityKind::Person,

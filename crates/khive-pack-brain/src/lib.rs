@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use khive_fold::{Fold, FoldContext};
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{DispatchHook, KhiveRuntime, RuntimeError, VerbRegistry};
+use khive_runtime::{DispatchHook, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
 use khive_types::{Pack, VerbDef};
@@ -129,19 +129,22 @@ impl BrainPack {
         }
     }
 
-    async fn handle_events(&self, params: Value) -> Result<Value, RuntimeError> {
+    async fn handle_events(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         struct EventsParams {
-            namespace: Option<String>,
             limit: Option<u32>,
         }
         let p: EventsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         let limit = p.limit.unwrap_or(20).min(100);
-        let ns = self.runtime.ns(p.namespace.as_deref()).to_string();
+        let ns = token.namespace().as_str().to_string();
 
-        let store = self.runtime.events(p.namespace.as_deref())?;
+        let store = self.runtime.events(token)?;
         let filter = EventFilter {
             verbs: vec![
                 "recall".into(),
@@ -188,12 +191,15 @@ impl BrainPack {
         }))
     }
 
-    async fn handle_emit(&self, params: Value) -> Result<Value, RuntimeError> {
+    async fn handle_emit(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         struct EmitParams {
             target_id: String,
             signal: String,
-            namespace: Option<String>,
         }
         let p: EmitParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
@@ -215,7 +221,7 @@ impl BrainPack {
         };
 
         let event = khive_storage::event::Event::new(
-            self.runtime.ns(p.namespace.as_deref()).to_string(),
+            token.namespace().as_str().to_string(),
             "brain.emit",
             khive_types::SubstrateKind::Event,
             "brain",
@@ -223,7 +229,7 @@ impl BrainPack {
         .with_target(target)
         .with_data(json!({"signal": signal}));
 
-        let store = self.runtime.events(p.namespace.as_deref())?;
+        let store = self.runtime.events(token)?;
         store
             .append_event(event.clone())
             .await
@@ -294,13 +300,14 @@ impl PackRuntime for BrainPack {
         verb: &str,
         params: Value,
         _registry: &VerbRegistry,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
             "brain.state" => self.handle_state(params).await,
             "brain.config" => self.handle_config(params).await,
-            "brain.events" => self.handle_events(params).await,
+            "brain.events" => self.handle_events(token, params).await,
             "brain.reset" => self.handle_reset(params).await,
-            "brain.emit" => self.handle_emit(params).await,
+            "brain.emit" => self.handle_emit(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "brain pack does not handle verb {verb:?}"
             ))),
@@ -354,7 +361,12 @@ mod tests {
         let pack = make_pack();
         let registry = empty_registry();
         let err = pack
-            .dispatch("brain.unknown", json!({}), &registry)
+            .dispatch(
+                "brain.unknown",
+                json!({}),
+                &registry,
+                &NamespaceToken::local(),
+            )
             .await
             .unwrap_err();
         if let RuntimeError::InvalidInput(msg) = &err {
@@ -372,7 +384,12 @@ mod tests {
         let pack = make_pack();
         let registry = empty_registry();
         let result = pack
-            .dispatch("brain.reset", json!({}), &registry)
+            .dispatch(
+                "brain.reset",
+                json!({}),
+                &registry,
+                &NamespaceToken::local(),
+            )
             .await
             .unwrap();
         assert_eq!(result["reset"], json!(true));
@@ -389,6 +406,7 @@ mod tests {
                 "brain.emit",
                 json!({"target_id": target, "signal": "bad_signal"}),
                 &registry,
+                &NamespaceToken::local(),
             )
             .await
             .unwrap_err();
@@ -411,7 +429,12 @@ mod tests {
         let pack = make_pack();
         let registry = empty_registry();
         let result = pack
-            .dispatch("brain.state", json!({}), &registry)
+            .dispatch(
+                "brain.state",
+                json!({}),
+                &registry,
+                &NamespaceToken::local(),
+            )
             .await
             .unwrap();
         assert!(result.get("total_events").is_some(), "missing total_events");

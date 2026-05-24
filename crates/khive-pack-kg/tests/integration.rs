@@ -43,7 +43,9 @@ fn pack() -> Fixture {
 
 fn pack_with_events() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let event_store = rt.events(None).expect("event store must be available");
+    let event_store = rt
+        .events(&khive_runtime::NamespaceToken::local())
+        .expect("event store must be available");
     let mut builder = VerbRegistryBuilder::new();
     builder.with_event_store(event_store);
     builder.register(KgPack::new(rt));
@@ -1234,6 +1236,7 @@ impl PackRuntime for FakeMemoryPack {
         verb: &str,
         _params: Value,
         _registry: &VerbRegistry,
+        _token: &khive_runtime::NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         Err(RuntimeError::InvalidInput(format!(
             "FakeMemoryPack does not handle verb {verb:?}"

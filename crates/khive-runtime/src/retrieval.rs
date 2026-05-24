@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::runtime::KhiveRuntime;
+use crate::runtime::{KhiveRuntime, NamespaceToken};
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
@@ -80,7 +80,7 @@ impl KhiveRuntime {
     /// runtime embeds internally.
     pub async fn vector_search(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         query_embedding: Option<Vec<f32>>,
         query_text: Option<&str>,
         top_k: u32,
@@ -103,9 +103,9 @@ impl KhiveRuntime {
             }
         };
 
-        let ns = self.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_owned();
         Ok(self
-            .vectors(namespace)?
+            .vectors(token)?
             .search(VectorSearchRequest {
                 query_embedding: embedding,
                 top_k,
@@ -131,7 +131,7 @@ impl KhiveRuntime {
     /// higher-ranked candidates are wrong-kind or soft-deleted.
     pub async fn hybrid_search(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         query_text: &str,
         query_vector: Option<Vec<f32>>,
         limit: u32,
@@ -139,9 +139,9 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
-        let ns = self.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_owned();
         let text_hits = self
-            .text(namespace)?
+            .text(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
                 mode: TextQueryMode::Plain,
@@ -156,7 +156,7 @@ impl KhiveRuntime {
 
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
             self.vector_search(
-                namespace,
+                token,
                 query_vector,
                 Some(query_text),
                 candidates,
@@ -177,9 +177,9 @@ impl KhiveRuntime {
         if !fused.is_empty() {
             let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
             let alive_page = self
-                .entities(namespace)?
+                .entities(token)?
                 .query_entities(
-                    self.ns(namespace),
+                    token.namespace().as_str(),
                     EntityFilter {
                         ids: candidate_ids,
                         kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
@@ -225,13 +225,13 @@ impl KhiveRuntime {
     /// thousands of vectors) this is well within latency budgets.
     pub async fn knn(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         query_vector: Vec<f32>,
         top_k: u32,
     ) -> RuntimeResult<Vec<VectorSearchHit>> {
-        let ns = self.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_owned();
         Ok(self
-            .vectors(namespace)?
+            .vectors(token)?
             .search(VectorSearchRequest {
                 query_embedding: query_vector,
                 top_k,
@@ -248,15 +248,15 @@ impl KhiveRuntime {
     /// Returns hits sorted by similarity (highest first), truncated to `top_k`.
     pub async fn rerank(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         query_vector: &[f32],
         candidate_ids: &[Uuid],
         top_k: u32,
     ) -> RuntimeResult<Vec<VectorSearchHit>> {
         let candidate_set: HashSet<Uuid> = candidate_ids.iter().copied().collect();
-        let ns = self.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_owned();
         let all_hits = self
-            .vectors(namespace)?
+            .vectors(token)?
             .search(VectorSearchRequest {
                 query_embedding: query_vector.to_vec(),
                 top_k: candidate_ids.len() as u32,
@@ -337,8 +337,9 @@ fn rrf_fuse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{KhiveRuntime, RuntimeConfig};
+    use crate::runtime::{KhiveRuntime, NamespaceToken, RuntimeConfig};
     use khive_storage::types::{TextSearchHit, VectorSearchHit};
+    use khive_types::namespace::Namespace;
     use lattice_embed::EmbeddingModel;
 
     fn text_hit(id: Uuid, rank: u32, title: &str) -> TextSearchHit {
@@ -455,7 +456,7 @@ mod tests {
     fn embed_batch_count_matches_input() {
         let config = RuntimeConfig {
             db_path: None,
-            default_namespace: "test".to_string(),
+            default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             packs: vec!["kg".to_string()],
             ..RuntimeConfig::default()
@@ -472,9 +473,10 @@ mod tests {
     #[test]
     fn vector_search_requires_embedding_or_text() {
         let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
         let result = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(rt.vector_search(None, None, None, 10, Some(SubstrateKind::Entity)));
+            .block_on(rt.vector_search(&tok, None, None, 10, Some(SubstrateKind::Entity)));
         match result {
             Err(crate::RuntimeError::InvalidInput(msg)) => {
                 assert!(msg.contains("query_embedding or query_text"), "msg: {msg}");
@@ -486,10 +488,11 @@ mod tests {
     #[test]
     fn vector_search_text_without_model_returns_unconfigured() {
         let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
         let result = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(rt.vector_search(
-                None,
+                &tok,
                 None,
                 Some("attention"),
                 10,
@@ -507,7 +510,7 @@ mod tests {
         let model = EmbeddingModel::AllMiniLmL6V2;
         let config = RuntimeConfig {
             db_path: None,
-            default_namespace: "test".to_string(),
+            default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: Some(model),
             packs: vec!["kg".to_string()],
             ..RuntimeConfig::default()
@@ -526,8 +529,9 @@ mod tests {
     #[tokio::test]
     async fn hybrid_search_entity_hit_has_title() {
         let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
         rt.create_entity(
-            None,
+            &tok,
             "concept",
             "FlashAttention",
             Some("IO-aware exact attention using tiling"),
@@ -538,7 +542,7 @@ mod tests {
         .unwrap();
 
         let hits = rt
-            .hybrid_search(None, "FlashAttention", None, 10, None)
+            .hybrid_search(&tok, "FlashAttention", None, 10, None)
             .await
             .unwrap();
 

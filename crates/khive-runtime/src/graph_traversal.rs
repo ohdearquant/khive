@@ -20,7 +20,7 @@ use khive_storage::types::{Direction, Edge, LinkId, NeighborQuery};
 use khive_storage::EdgeRelation;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::runtime::KhiveRuntime;
+use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 /// A node in a traversal path.
 #[derive(Debug, Clone)]
@@ -64,11 +64,11 @@ impl KhiveRuntime {
     /// Nodes already visited are skipped so the result set is deduplicated.
     pub async fn bfs_traverse(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         start: Uuid,
         options: TraversalOptions,
     ) -> RuntimeResult<Vec<PathNode>> {
-        let graph = self.graph(namespace)?;
+        let graph = self.graph(token)?;
         let limit = options.max_results.unwrap_or(usize::MAX);
 
         let mut visited: HashSet<Uuid> = HashSet::new();
@@ -134,7 +134,7 @@ impl KhiveRuntime {
     /// For `from == to` returns `Some` with a single-node path immediately.
     pub async fn shortest_path(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         from: Uuid,
         to: Uuid,
         max_depth: usize,
@@ -147,7 +147,7 @@ impl KhiveRuntime {
             }]));
         }
 
-        let graph = self.graph(namespace)?;
+        let graph = self.graph(token)?;
 
         // Forward map: node -> (depth, parent, edge_id that reached this node)
         let mut fwd: HashMap<Uuid, (usize, Option<Uuid>, Option<Uuid>)> = HashMap::new();
@@ -318,7 +318,7 @@ impl KhiveRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::KhiveRuntime;
+    use crate::runtime::{KhiveRuntime, NamespaceToken};
     use khive_storage::EdgeRelation;
 
     async fn rt() -> KhiveRuntime {
@@ -328,15 +328,16 @@ mod tests {
     #[tokio::test]
     async fn bfs_max_depth_zero_returns_only_root() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
 
@@ -344,7 +345,7 @@ mod tests {
             max_depth: 0,
             ..Default::default()
         };
-        let nodes = rt.bfs_traverse(None, a.id, opts).await.unwrap();
+        let nodes = rt.bfs_traverse(&tok, a.id, opts).await.unwrap();
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].entity_id, a.id);
@@ -355,30 +356,31 @@ mod tests {
     #[tokio::test]
     async fn bfs_depth_one_returns_root_and_neighbors() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, c.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
         // Add a node two hops away — it must NOT appear.
         let d = rt
-            .create_entity(None, "concept", "D", None, None, vec![])
+            .create_entity(&tok, "concept", "D", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, b.id, d.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, b.id, d.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
 
@@ -386,7 +388,7 @@ mod tests {
             max_depth: 1,
             ..Default::default()
         };
-        let nodes = rt.bfs_traverse(None, a.id, opts).await.unwrap();
+        let nodes = rt.bfs_traverse(&tok, a.id, opts).await.unwrap();
 
         let ids: HashSet<Uuid> = nodes.iter().map(|n| n.entity_id).collect();
         assert!(ids.contains(&a.id));
@@ -404,16 +406,17 @@ mod tests {
     #[tokio::test]
     async fn bfs_direction_out_only() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
         // Edge goes B -> A; traversing Out from A should find nothing.
-        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, b.id, a.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
 
@@ -422,7 +425,7 @@ mod tests {
             direction: Direction::Out,
             ..Default::default()
         };
-        let nodes = rt.bfs_traverse(None, a.id, opts).await.unwrap();
+        let nodes = rt.bfs_traverse(&tok, a.id, opts).await.unwrap();
         assert_eq!(
             nodes.len(),
             1,
@@ -433,16 +436,17 @@ mod tests {
     #[tokio::test]
     async fn bfs_direction_in_only() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
         // Edge goes B -> A; traversing In from A should find B.
-        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, b.id, a.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
 
@@ -451,7 +455,7 @@ mod tests {
             direction: Direction::In,
             ..Default::default()
         };
-        let nodes = rt.bfs_traverse(None, a.id, opts).await.unwrap();
+        let nodes = rt.bfs_traverse(&tok, a.id, opts).await.unwrap();
         let ids: HashSet<Uuid> = nodes.iter().map(|n| n.entity_id).collect();
         assert!(
             ids.contains(&b.id),
@@ -462,22 +466,23 @@ mod tests {
     #[tokio::test]
     async fn bfs_relation_filter() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(&tok, a.id, c.id, EdgeRelation::DependsOn, 1.0)
             .await
             .unwrap();
 
@@ -486,7 +491,7 @@ mod tests {
             relations: Some(vec![EdgeRelation::Extends]),
             ..Default::default()
         };
-        let nodes = rt.bfs_traverse(None, a.id, opts).await.unwrap();
+        let nodes = rt.bfs_traverse(&tok, a.id, opts).await.unwrap();
         let ids: HashSet<Uuid> = nodes.iter().map(|n| n.entity_id).collect();
         assert!(ids.contains(&b.id), "B reachable via 'extends'");
         assert!(
@@ -498,26 +503,27 @@ mod tests {
     #[tokio::test]
     async fn shortest_path_connected_nodes() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
-        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, b.id, c.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
 
-        let path = rt.shortest_path(None, a.id, c.id, 10).await.unwrap();
+        let path = rt.shortest_path(&tok, a.id, c.id, 10).await.unwrap();
         let path = path.expect("path should exist");
         assert_eq!(path.len(), 3, "A -> B -> C = 3 nodes");
         assert_eq!(path[0].entity_id, a.id);
@@ -527,29 +533,31 @@ mod tests {
     #[tokio::test]
     async fn shortest_path_unreachable_returns_none() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
         // No edges between them.
 
-        let path = rt.shortest_path(None, a.id, b.id, 5).await.unwrap();
+        let path = rt.shortest_path(&tok, a.id, b.id, 5).await.unwrap();
         assert!(path.is_none());
     }
 
     #[tokio::test]
     async fn shortest_path_same_node() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
 
-        let path = rt.shortest_path(None, a.id, a.id, 5).await.unwrap();
+        let path = rt.shortest_path(&tok, a.id, a.id, 5).await.unwrap();
         let path = path.expect("trivial path should always exist");
         assert_eq!(path.len(), 1);
         assert_eq!(path[0].entity_id, a.id);
@@ -559,20 +567,21 @@ mod tests {
     #[tokio::test]
     async fn shortest_path_max_depth_zero_adjacent() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
 
         // max_depth=0 means only the trivial from==to case succeeds.
-        let path = rt.shortest_path(None, a.id, b.id, 0).await.unwrap();
+        let path = rt.shortest_path(&tok, a.id, b.id, 0).await.unwrap();
         assert!(
             path.is_none(),
             "1-hop path should not be returned at max_depth=0"
@@ -582,33 +591,34 @@ mod tests {
     #[tokio::test]
     async fn shortest_path_max_depth_one_two_hop_chain() {
         let rt = rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
-        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, b.id, c.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
 
         // max_depth=1 should find A->B but not A->B->C.
-        let one_hop = rt.shortest_path(None, a.id, b.id, 1).await.unwrap();
+        let one_hop = rt.shortest_path(&tok, a.id, b.id, 1).await.unwrap();
         assert!(
             one_hop.is_some(),
             "1-hop path should be found at max_depth=1"
         );
 
-        let two_hop = rt.shortest_path(None, a.id, c.id, 1).await.unwrap();
+        let two_hop = rt.shortest_path(&tok, a.id, c.id, 1).await.unwrap();
         assert!(
             two_hop.is_none(),
             "2-hop path should not be returned at max_depth=1"

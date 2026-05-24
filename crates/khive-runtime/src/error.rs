@@ -116,6 +116,13 @@ pub enum RuntimeError {
     /// `kind`, `code`, `details`, and `retry_hint` without information loss.
     #[error("{0}")]
     Khive(khive_types::KhiveError),
+
+    /// Record exists but belongs to a different namespace than the provided token.
+    ///
+    /// Externally reported as "not found in this namespace" to avoid leaking
+    /// cross-namespace existence information (ADR-007 timing-oracle mitigation).
+    #[error("not found in this namespace")]
+    NamespaceMismatch { id: uuid::Uuid },
 }
 
 impl From<khive_types::KhiveError> for RuntimeError {

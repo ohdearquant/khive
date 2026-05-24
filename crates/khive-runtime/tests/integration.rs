@@ -3,7 +3,7 @@
 //! Tests cover entity CRUD, graph operations, note memory, GQL query,
 //! and namespace isolation using an in-memory runtime.
 
-use khive_runtime::{KhiveRuntime, RuntimeConfig};
+use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig};
 use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
 use khive_storage::EdgeRelation;
 use uuid::Uuid;
@@ -19,10 +19,11 @@ fn rt() -> KhiveRuntime {
 #[tokio::test]
 async fn entity_create_and_get_roundtrip() {
     let rt = rt();
+    let tok = NamespaceToken::local();
 
     let entity = rt
         .create_entity(
-            None,
+            &tok,
             "concept",
             "LoRA",
             Some("Low-Rank Adaptation"),
@@ -32,9 +33,7 @@ async fn entity_create_and_get_roundtrip() {
         .await
         .unwrap();
 
-    let fetched = rt.get_entity(None, entity.id).await.unwrap();
-    assert!(fetched.is_some());
-    let fetched = fetched.unwrap();
+    let fetched = rt.get_entity(&tok, entity.id).await.unwrap();
     assert_eq!(fetched.id, entity.id);
     assert_eq!(fetched.name, "LoRA");
     assert_eq!(fetched.kind, "concept");
@@ -44,11 +43,12 @@ async fn entity_create_and_get_roundtrip() {
 #[tokio::test]
 async fn entity_create_with_properties_and_tags() {
     let rt = rt();
+    let research_tok = NamespaceToken::for_namespace(Namespace::parse("research").unwrap());
 
     let props = serde_json::json!({"domain": "fine-tuning", "type": "technique"});
     let entity = rt
         .create_entity(
-            Some("research"),
+            &research_tok,
             "concept",
             "QLoRA",
             Some("Quantized LoRA"),
@@ -58,11 +58,7 @@ async fn entity_create_with_properties_and_tags() {
         .await
         .unwrap();
 
-    let fetched = rt
-        .get_entity(Some("research"), entity.id)
-        .await
-        .unwrap()
-        .unwrap();
+    let fetched = rt.get_entity(&research_tok, entity.id).await.unwrap();
     assert_eq!(fetched.properties, Some(props));
     assert_eq!(fetched.tags, vec!["fine-tuning", "quantization"]);
 }
@@ -70,15 +66,16 @@ async fn entity_create_with_properties_and_tags() {
 #[tokio::test]
 async fn entity_list_by_kind() {
     let rt = rt();
+    let tok = NamespaceToken::local();
 
-    rt.create_entity(None, "concept", "FlashAttention", None, None, vec![])
+    rt.create_entity(&tok, "concept", "FlashAttention", None, None, vec![])
         .await
         .unwrap();
-    rt.create_entity(None, "concept", "GQA", None, None, vec![])
+    rt.create_entity(&tok, "concept", "GQA", None, None, vec![])
         .await
         .unwrap();
     rt.create_entity(
-        None,
+        &tok,
         "document",
         "Attention Is All You Need",
         None,
@@ -89,7 +86,7 @@ async fn entity_list_by_kind() {
     .unwrap();
 
     let concepts = rt
-        .list_entities(None, Some("concept"), 50, 0)
+        .list_entities(&tok, Some("concept"), 50, 0)
         .await
         .unwrap();
     assert_eq!(concepts.len(), 2);
@@ -97,50 +94,53 @@ async fn entity_list_by_kind() {
     assert!(concepts.iter().any(|e| e.name == "GQA"));
 
     let docs = rt
-        .list_entities(None, Some("document"), 50, 0)
+        .list_entities(&tok, Some("document"), 50, 0)
         .await
         .unwrap();
     assert_eq!(docs.len(), 1);
     assert_eq!(docs[0].name, "Attention Is All You Need");
 
-    let all = rt.list_entities(None, None, 50, 0).await.unwrap();
+    let all = rt.list_entities(&tok, None, 50, 0).await.unwrap();
     assert_eq!(all.len(), 3);
 }
 
 #[tokio::test]
 async fn entity_delete_soft() {
     let rt = rt();
+    let tok = NamespaceToken::local();
 
     let entity = rt
-        .create_entity(None, "concept", "to-delete", None, None, vec![])
+        .create_entity(&tok, "concept", "to-delete", None, None, vec![])
         .await
         .unwrap();
 
-    let deleted = rt.delete_entity(None, entity.id, false).await.unwrap();
+    let deleted = rt.delete_entity(&tok, entity.id, false).await.unwrap();
     assert!(deleted);
 
-    let fetched = rt.get_entity(None, entity.id).await.unwrap();
-    assert!(fetched.is_none());
+    // Soft-deleted entity is not found via get_entity
+    let fetched = rt.get_entity(&tok, entity.id).await;
+    assert!(fetched.is_err());
 }
 
 #[tokio::test]
 async fn entity_count_by_kind() {
     let rt = rt();
+    let tok = NamespaceToken::local();
 
     for _ in 0..3 {
-        rt.create_entity(None, "concept", "concept-X", None, None, vec![])
+        rt.create_entity(&tok, "concept", "concept-X", None, None, vec![])
             .await
             .unwrap();
     }
     for _ in 0..2 {
-        rt.create_entity(None, "document", "doc-Y", None, None, vec![])
+        rt.create_entity(&tok, "document", "doc-Y", None, None, vec![])
             .await
             .unwrap();
     }
 
-    let concept_count = rt.count_entities(None, Some("concept")).await.unwrap();
-    let doc_count = rt.count_entities(None, Some("document")).await.unwrap();
-    let total = rt.count_entities(None, None).await.unwrap();
+    let concept_count = rt.count_entities(&tok, Some("concept")).await.unwrap();
+    let doc_count = rt.count_entities(&tok, Some("document")).await.unwrap();
+    let total = rt.count_entities(&tok, None).await.unwrap();
 
     assert_eq!(concept_count, 3);
     assert_eq!(doc_count, 2);
@@ -154,22 +154,23 @@ async fn entity_count_by_kind() {
 #[tokio::test]
 async fn link_and_neighbors() {
     let rt = rt();
+    let tok = NamespaceToken::local();
 
     let lora = rt
-        .create_entity(None, "concept", "LoRA", None, None, vec![])
+        .create_entity(&tok, "concept", "LoRA", None, None, vec![])
         .await
         .unwrap();
     let qlora = rt
-        .create_entity(None, "concept", "QLoRA", None, None, vec![])
+        .create_entity(&tok, "concept", "QLoRA", None, None, vec![])
         .await
         .unwrap();
 
-    rt.link(None, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0)
+    rt.link(&tok, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0)
         .await
         .unwrap();
 
     let hits = rt
-        .neighbors(None, qlora.id, Direction::Out, None, None)
+        .neighbors(&tok, qlora.id, Direction::Out, None, None)
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
@@ -180,24 +181,25 @@ async fn link_and_neighbors() {
 #[tokio::test]
 async fn traverse_multi_hop() {
     let rt = rt();
+    let tok = NamespaceToken::local();
 
     let a = rt
-        .create_entity(None, "concept", "A", None, None, vec![])
+        .create_entity(&tok, "concept", "A", None, None, vec![])
         .await
         .unwrap();
     let b = rt
-        .create_entity(None, "concept", "B", None, None, vec![])
+        .create_entity(&tok, "concept", "B", None, None, vec![])
         .await
         .unwrap();
     let c = rt
-        .create_entity(None, "concept", "C", None, None, vec![])
+        .create_entity(&tok, "concept", "C", None, None, vec![])
         .await
         .unwrap();
 
-    rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+    rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
         .await
         .unwrap();
-    rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0)
+    rt.link(&tok, b.id, c.id, EdgeRelation::Extends, 1.0)
         .await
         .unwrap();
 
@@ -212,7 +214,7 @@ async fn traverse_multi_hop() {
         include_roots: false,
     };
 
-    let paths = rt.traverse(None, request).await.unwrap();
+    let paths = rt.traverse(&tok, request).await.unwrap();
     assert!(!paths.is_empty());
 
     // All traversed nodes should be reachable from a
@@ -231,9 +233,10 @@ async fn traverse_multi_hop() {
 #[tokio::test]
 async fn create_note_and_list_notes() {
     let rt = rt();
+    let tok = NamespaceToken::local();
 
     rt.create_note(
-        None,
+        &tok,
         "observation",
         None,
         "LoRA is a fine-tuning technique",
@@ -244,7 +247,7 @@ async fn create_note_and_list_notes() {
     .await
     .unwrap();
     rt.create_note(
-        None,
+        &tok,
         "observation",
         None,
         "QLoRA uses quantization",
@@ -255,7 +258,7 @@ async fn create_note_and_list_notes() {
     .await
     .unwrap();
     rt.create_note(
-        None,
+        &tok,
         "question",
         None,
         "Review LoRA paper",
@@ -267,22 +270,23 @@ async fn create_note_and_list_notes() {
     .unwrap();
 
     let observations = rt
-        .list_notes(None, Some("observation"), 50, 0)
+        .list_notes(&tok, Some("observation"), 50, 0)
         .await
         .unwrap();
     assert_eq!(observations.len(), 2);
 
-    let questions = rt.list_notes(None, Some("question"), 50, 0).await.unwrap();
+    let questions = rt.list_notes(&tok, Some("question"), 50, 0).await.unwrap();
     assert_eq!(questions.len(), 1);
     assert_eq!(questions[0].content, "Review LoRA paper");
 
-    let all = rt.list_notes(None, None, 50, 0).await.unwrap();
+    let all = rt.list_notes(&tok, None, 50, 0).await.unwrap();
     assert_eq!(all.len(), 3);
 }
 
 #[tokio::test]
 async fn create_all_note_kinds() {
     let rt = rt();
+    let tok = NamespaceToken::local();
     for kind in [
         "observation",
         "insight",
@@ -290,11 +294,11 @@ async fn create_all_note_kinds() {
         "decision",
         "reference",
     ] {
-        rt.create_note(None, kind, None, "content", 0.5, None, vec![])
+        rt.create_note(&tok, kind, None, "content", 0.5, None, vec![])
             .await
             .unwrap();
     }
-    let all = rt.list_notes(None, None, 50, 0).await.unwrap();
+    let all = rt.list_notes(&tok, None, 50, 0).await.unwrap();
     assert_eq!(all.len(), 5);
 }
 
@@ -305,24 +309,25 @@ async fn create_all_note_kinds() {
 #[tokio::test]
 async fn query_via_gql() {
     let rt = rt();
+    let tok = NamespaceToken::local();
 
     // Set up entities and edges
     let lora = rt
-        .create_entity(None, "concept", "LoRA", None, None, vec![])
+        .create_entity(&tok, "concept", "LoRA", None, None, vec![])
         .await
         .unwrap();
     let qlora = rt
-        .create_entity(None, "concept", "QLoRA", None, None, vec![])
+        .create_entity(&tok, "concept", "QLoRA", None, None, vec![])
         .await
         .unwrap();
-    rt.link(None, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0)
+    rt.link(&tok, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0)
         .await
         .unwrap();
 
     // Run a GQL traversal query
     let rows = rt
         .query(
-            None,
+            &tok,
             "MATCH (a:concept)-[e:variant_of]->(b:concept) RETURN a, e, b LIMIT 10",
         )
         .await
@@ -341,19 +346,21 @@ async fn query_via_gql() {
 #[tokio::test]
 async fn namespace_isolation() {
     let rt = rt();
+    let ns_a_tok = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+    let ns_b_tok = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
 
-    rt.create_entity(Some("ns_a"), "concept", "EntityA", None, None, vec![])
+    rt.create_entity(&ns_a_tok, "concept", "EntityA", None, None, vec![])
         .await
         .unwrap();
-    rt.create_entity(Some("ns_b"), "concept", "EntityB", None, None, vec![])
+    rt.create_entity(&ns_b_tok, "concept", "EntityB", None, None, vec![])
         .await
         .unwrap();
 
-    let a_entities = rt.list_entities(Some("ns_a"), None, 50, 0).await.unwrap();
+    let a_entities = rt.list_entities(&ns_a_tok, None, 50, 0).await.unwrap();
     assert_eq!(a_entities.len(), 1);
     assert_eq!(a_entities[0].name, "EntityA");
 
-    let b_entities = rt.list_entities(Some("ns_b"), None, 50, 0).await.unwrap();
+    let b_entities = rt.list_entities(&ns_b_tok, None, 50, 0).await.unwrap();
     assert_eq!(b_entities.len(), 1);
     assert_eq!(b_entities[0].name, "EntityB");
 }
@@ -365,9 +372,10 @@ async fn namespace_isolation() {
 #[tokio::test]
 async fn create_entity_indexes_into_text_search() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let tok = NamespaceToken::local();
     let entity = rt
         .create_entity(
-            None,
+            &tok,
             "concept",
             "FlashAttention",
             Some("efficient attention mechanism"),
@@ -377,7 +385,7 @@ async fn create_entity_indexes_into_text_search() {
         .await
         .unwrap();
     let hits = rt
-        .hybrid_search(None, "FlashAttention", None, 10, None)
+        .hybrid_search(&tok, "FlashAttention", None, 10, None)
         .await
         .unwrap();
     assert!(
@@ -390,8 +398,9 @@ async fn create_entity_indexes_into_text_search() {
 async fn create_entity_no_embedding_model_does_not_propagate_vector_error() {
     // KhiveRuntime::memory() has embedding_model: None — vector indexing is silently skipped.
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let tok = NamespaceToken::local();
     let result = rt
-        .create_entity(None, "concept", "SilentVectorSkip", None, None, vec![])
+        .create_entity(&tok, "concept", "SilentVectorSkip", None, None, vec![])
         .await;
     assert!(
         result.is_ok(),
@@ -407,9 +416,10 @@ async fn create_entity_no_embedding_model_does_not_propagate_vector_error() {
 #[tokio::test]
 async fn hybrid_search_excludes_soft_deleted_entities() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let tok = NamespaceToken::local();
     let entity = rt
         .create_entity(
-            None,
+            &tok,
             "concept",
             "SoftDeleteMe",
             Some("entity that will be soft-deleted"),
@@ -421,7 +431,7 @@ async fn hybrid_search_excludes_soft_deleted_entities() {
 
     // Confirm the entity is visible before deletion.
     let hits_before = rt
-        .hybrid_search(None, "SoftDeleteMe", None, 10, None)
+        .hybrid_search(&tok, "SoftDeleteMe", None, 10, None)
         .await
         .unwrap();
     assert!(
@@ -429,10 +439,10 @@ async fn hybrid_search_excludes_soft_deleted_entities() {
         "entity should appear in hybrid_search before soft-delete"
     );
 
-    rt.delete_entity(None, entity.id, false).await.unwrap(); // soft delete
+    rt.delete_entity(&tok, entity.id, false).await.unwrap(); // soft delete
 
     let hits_after = rt
-        .hybrid_search(None, "SoftDeleteMe", None, 10, None)
+        .hybrid_search(&tok, "SoftDeleteMe", None, 10, None)
         .await
         .unwrap();
     assert!(
@@ -445,9 +455,10 @@ async fn hybrid_search_excludes_soft_deleted_entities() {
 #[tokio::test]
 async fn hybrid_search_excludes_hard_deleted_entities() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let tok = NamespaceToken::local();
     let entity = rt
         .create_entity(
-            None,
+            &tok,
             "concept",
             "HardDeleteMe",
             Some("entity that will be hard-deleted"),
@@ -458,7 +469,7 @@ async fn hybrid_search_excludes_hard_deleted_entities() {
         .unwrap();
 
     let hits_before = rt
-        .hybrid_search(None, "HardDeleteMe", None, 10, None)
+        .hybrid_search(&tok, "HardDeleteMe", None, 10, None)
         .await
         .unwrap();
     assert!(
@@ -466,12 +477,12 @@ async fn hybrid_search_excludes_hard_deleted_entities() {
         "entity should appear in hybrid_search before hard-delete"
     );
 
-    rt.delete_entity(None, entity.id, true).await.unwrap(); // hard delete
+    rt.delete_entity(&tok, entity.id, true).await.unwrap(); // hard delete
 
     // Hard-deleted rows are gone from the entity store; the FTS/vector indexes may still
     // have stale entries. The soft-delete filter sees no alive entity and drops the hit.
     let hits_after = rt
-        .hybrid_search(None, "HardDeleteMe", None, 10, None)
+        .hybrid_search(&tok, "HardDeleteMe", None, 10, None)
         .await
         .unwrap();
     assert!(
@@ -486,9 +497,10 @@ async fn list_notes_excludes_soft_deleted() {
     use khive_storage::types::DeleteMode;
 
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let tok = NamespaceToken::local();
     let note = rt
         .create_note(
-            None,
+            &tok,
             "observation",
             None,
             "soft-delete-test",
@@ -499,19 +511,19 @@ async fn list_notes_excludes_soft_deleted() {
         .await
         .unwrap();
 
-    let notes_before = rt.list_notes(None, None, 50, 0).await.unwrap();
+    let notes_before = rt.list_notes(&tok, None, 50, 0).await.unwrap();
     assert!(
         notes_before.iter().any(|n| n.id == note.id),
         "note should appear before soft-delete"
     );
 
-    rt.notes(None)
+    rt.notes(&tok)
         .unwrap()
         .delete_note(note.id, DeleteMode::Soft)
         .await
         .unwrap();
 
-    let notes_after = rt.list_notes(None, None, 50, 0).await.unwrap();
+    let notes_after = rt.list_notes(&tok, None, 50, 0).await.unwrap();
     assert!(
         !notes_after.iter().any(|n| n.id == note.id),
         "soft-deleted note must not appear in list"
@@ -530,13 +542,14 @@ async fn file_backed_runtime_persists() {
     {
         let config = RuntimeConfig {
             db_path: Some(path.clone()),
-            default_namespace: "local".to_string(),
+            default_namespace: Namespace::local(),
             embedding_model: None,
             gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
             packs: vec!["kg".to_string()],
         };
         let rt = KhiveRuntime::new(config).unwrap();
-        rt.create_entity(None, "concept", "Persistent", None, None, vec![])
+        let tok = NamespaceToken::local();
+        rt.create_entity(&tok, "concept", "Persistent", None, None, vec![])
             .await
             .unwrap();
     }
@@ -545,13 +558,14 @@ async fn file_backed_runtime_persists() {
     {
         let config = RuntimeConfig {
             db_path: Some(path.clone()),
-            default_namespace: "local".to_string(),
+            default_namespace: Namespace::local(),
             embedding_model: None,
             gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
             packs: vec!["kg".to_string()],
         };
         let rt = KhiveRuntime::new(config).unwrap();
-        let entities = rt.list_entities(None, None, 50, 0).await.unwrap();
+        let tok = NamespaceToken::local();
+        let entities = rt.list_entities(&tok, None, 50, 0).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "Persistent");
     }

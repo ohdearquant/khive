@@ -69,7 +69,8 @@ async fn main() -> anyhow::Result<()> {
 
     let config = RuntimeConfig {
         db_path,
-        default_namespace: args.namespace,
+        default_namespace: khive_runtime::Namespace::parse(&args.namespace)
+            .unwrap_or_else(|_| khive_runtime::Namespace::local()),
         embedding_model,
         packs,
         ..RuntimeConfig::default()

@@ -40,6 +40,7 @@ pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
     GateRef, GateRequest, Obligation,
 };
+pub use khive_types::namespace::Namespace;
 pub use objectives::{
     GraphProximityObjective, RetrievalCandidate, RrfFusionObjective, TextRelevanceObjective,
     VectorSimilarityObjective,
@@ -52,4 +53,4 @@ pub use pack::{
 pub use portability::{ImportSummary, KgArchive};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
-pub use runtime::{parse_pack_list, KhiveRuntime, RuntimeConfig};
+pub use runtime::{parse_pack_list, KhiveRuntime, NamespaceToken, RuntimeConfig};

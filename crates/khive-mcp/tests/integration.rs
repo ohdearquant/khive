@@ -5,7 +5,8 @@
 use async_trait::async_trait;
 use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{
-    KhiveRuntime, PackRuntime, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+    KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig, RuntimeError,
+    VerbRegistry, VerbRegistryBuilder,
 };
 use khive_types::{Details, ErrorCode as KhiveErrorCode, ErrorDomain, KhiveError, Pack, VerbDef};
 use rmcp::{
@@ -17,7 +18,7 @@ use serde_json::{json, Value};
 fn make_server() -> KhiveMcpServer {
     let config = RuntimeConfig {
         db_path: None,
-        default_namespace: "test".to_string(),
+        default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         packs: vec!["kg".to_string(), "gtd".to_string()],
         ..RuntimeConfig::default()
@@ -330,7 +331,7 @@ async fn unknown_verb_returns_per_op_failure_not_invalid_params() -> anyhow::Res
 async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
     let config = RuntimeConfig {
         db_path: None,
-        default_namespace: "test".to_string(),
+        default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         packs: vec!["kg".to_string()],
         ..RuntimeConfig::default()
@@ -352,7 +353,7 @@ async fn pack_gtd_auto_loads_kg_via_transitive_requires() {
     // so that kg verbs (e.g. "create") are present alongside gtd verbs (e.g. "assign").
     let config = RuntimeConfig {
         db_path: None,
-        default_namespace: "test".to_string(),
+        default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         packs: vec!["gtd".to_string()],
         ..RuntimeConfig::default()
@@ -941,6 +942,7 @@ impl PackRuntime for ErrorInjectPack {
         _verb: &str,
         _params: serde_json::Value,
         _registry: &VerbRegistry,
+        _token: &NamespaceToken,
     ) -> Result<serde_json::Value, RuntimeError> {
         let err = KhiveError::unavailable("downstream service offline")
             .with_code(KhiveErrorCode::new(ErrorDomain::Runtime, 10))

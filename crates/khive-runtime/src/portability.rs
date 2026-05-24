@@ -24,7 +24,7 @@ use khive_storage::types::{EdgeFilter, LinkId, PageRequest};
 use khive_storage::{EdgeRelation, EntityFilter};
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::runtime::KhiveRuntime;
+use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 // ── Archive types ─────────────────────────────────────────────────────────────
 
@@ -96,12 +96,12 @@ impl KhiveRuntime {
     /// Edge collection: all entity IDs in the namespace are gathered first;
     /// `query_edges` is then called with those IDs as `source_ids`. This
     /// captures every edge whose source entity belongs to the namespace.
-    pub async fn export_kg(&self, namespace: Option<&str>) -> RuntimeResult<KgArchive> {
-        let ns = self.ns(namespace).to_string();
+    pub async fn export_kg(&self, token: &NamespaceToken) -> RuntimeResult<KgArchive> {
+        let ns = token.namespace().as_str().to_owned();
 
         // 1. Collect all entities in the namespace.
         let entity_page = self
-            .entities(Some(&ns))?
+            .entities(token)?
             .query_entities(
                 &ns,
                 EntityFilter::default(),
@@ -143,7 +143,7 @@ impl KhiveRuntime {
                 ..Default::default()
             };
             let edge_page = self
-                .graph(Some(&ns))?
+                .graph(token)?
                 .query_edges(
                     filter,
                     Vec::new(),
@@ -180,8 +180,8 @@ impl KhiveRuntime {
     }
 
     /// Export to a JSON string (convenience wrapper around `export_kg`).
-    pub async fn export_kg_json(&self, namespace: Option<&str>) -> RuntimeResult<String> {
-        let archive = self.export_kg(namespace).await?;
+    pub async fn export_kg_json(&self, token: &NamespaceToken) -> RuntimeResult<String> {
+        let archive = self.export_kg(token).await?;
         serde_json::to_string(&archive).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
     }
 
@@ -196,7 +196,7 @@ impl KhiveRuntime {
     pub async fn import_kg(
         &self,
         archive: &KgArchive,
-        target_namespace: Option<&str>,
+        token: &NamespaceToken,
     ) -> RuntimeResult<ImportSummary> {
         // Format validation.
         if archive.format != "khive-kg" {
@@ -212,10 +212,10 @@ impl KhiveRuntime {
             )));
         }
 
-        let ns = target_namespace.unwrap_or(&archive.namespace).to_string();
+        let ns = token.namespace().as_str().to_owned();
 
         // Import entities.
-        let store = self.entities(Some(&ns))?;
+        let store = self.entities(token)?;
         let mut entities_imported = 0usize;
         for ee in &archive.entities {
             let created_micros = ee.created_at.timestamp_micros();
@@ -235,7 +235,7 @@ impl KhiveRuntime {
             store.upsert_entity(entity.clone()).await?;
             // Index into FTS5 (and vector store if a model is configured) so that
             // imported entities are visible to hybrid_search immediately.
-            self.reindex_entity(Some(&ns), &entity).await?;
+            self.reindex_entity(token, &entity).await?;
             entities_imported += 1;
         }
 
@@ -246,11 +246,15 @@ impl KhiveRuntime {
         // such edges would leave dangling references in the graph store. We
         // therefore check each endpoint with `get_entity` (namespace-scoped,
         // fail-closed) and skip any edge whose source or target is absent.
-        let graph = self.graph(Some(&ns))?;
+        let graph = self.graph(token)?;
         let mut edges_imported = 0usize;
         let mut edges_skipped = 0usize;
         for ee in &archive.edges {
-            let source_ok = self.get_entity(Some(&ns), ee.source).await?.is_some();
+            let source_ok = match self.get_entity(token, ee.source).await {
+                Ok(_) => true,
+                Err(RuntimeError::NotFound(_) | RuntimeError::NamespaceMismatch { .. }) => false,
+                Err(e) => return Err(e),
+            };
             if !source_ok {
                 tracing::warn!(
                     source = %ee.source,
@@ -261,7 +265,11 @@ impl KhiveRuntime {
                 edges_skipped += 1;
                 continue;
             }
-            let target_ok = self.get_entity(Some(&ns), ee.target).await?.is_some();
+            let target_ok = match self.get_entity(token, ee.target).await {
+                Ok(_) => true,
+                Err(RuntimeError::NotFound(_) | RuntimeError::NamespaceMismatch { .. }) => false,
+                Err(e) => return Err(e),
+            };
             if !target_ok {
                 tracing::warn!(
                     source = %ee.source,
@@ -296,11 +304,11 @@ impl KhiveRuntime {
     pub async fn import_kg_json(
         &self,
         json: &str,
-        target_namespace: Option<&str>,
+        token: &NamespaceToken,
     ) -> RuntimeResult<ImportSummary> {
         let archive: KgArchive =
             serde_json::from_str(json).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        self.import_kg(&archive, target_namespace).await
+        self.import_kg(&archive, token).await
     }
 }
 
@@ -309,7 +317,8 @@ impl KhiveRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::KhiveRuntime;
+    use crate::runtime::{KhiveRuntime, NamespaceToken};
+    use crate::Namespace;
     use khive_storage::EdgeRelation;
 
     async fn make_rt() -> KhiveRuntime {
@@ -320,9 +329,10 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_entities_and_edges() {
         let src = make_rt().await;
+        let tok = NamespaceToken::local();
         let e1 = src
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 "FlashAttention",
                 Some("fast attention"),
@@ -332,35 +342,33 @@ mod tests {
             .await
             .unwrap();
         let e2 = src
-            .create_entity(None, "concept", "FlashAttention-2", None, None, vec![])
+            .create_entity(&tok, "concept", "FlashAttention-2", None, None, vec![])
             .await
             .unwrap();
         let e3 = src
-            .create_entity(None, "person", "Tri Dao", None, None, vec!["author".into()])
+            .create_entity(&tok, "person", "Tri Dao", None, None, vec!["author".into()])
             .await
             .unwrap();
-        src.link(None, e2.id, e1.id, EdgeRelation::Extends, 1.0)
+        src.link(&tok, e2.id, e1.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
-        src.link(None, e1.id, e3.id, EdgeRelation::IntroducedBy, 0.9)
+        src.link(&tok, e1.id, e3.id, EdgeRelation::IntroducedBy, 0.9)
             .await
             .unwrap();
 
-        let archive = src.export_kg(None).await.unwrap();
+        let archive = src.export_kg(&tok).await.unwrap();
         assert_eq!(archive.entities.len(), 3);
         assert_eq!(archive.edges.len(), 2);
         assert_eq!(archive.format, "khive-kg");
         assert_eq!(archive.version, "0.1");
 
         let dst = make_rt().await;
-        let summary = dst.import_kg(&archive, None).await.unwrap();
+        let summary = dst.import_kg(&archive, &tok).await.unwrap();
         assert_eq!(summary.entities_imported, 3);
         assert_eq!(summary.edges_imported, 2);
 
         // Spot-check: the imported entity is retrievable.
-        let got = dst.get_entity(None, e1.id).await.unwrap();
-        assert!(got.is_some());
-        let got = got.unwrap();
+        let got = dst.get_entity(&tok, e1.id).await.unwrap();
         assert_eq!(got.name, "FlashAttention");
         assert_eq!(got.description.as_deref(), Some("fast attention"));
     }
@@ -369,9 +377,10 @@ mod tests {
     #[tokio::test]
     async fn json_roundtrip() {
         let src = make_rt().await;
+        let tok = NamespaceToken::local();
         let e1 = src
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 "LoRA",
                 Some("low-rank adaptation"),
@@ -381,22 +390,22 @@ mod tests {
             .await
             .unwrap();
         let e2 = src
-            .create_entity(None, "concept", "QLoRA", None, None, vec![])
+            .create_entity(&tok, "concept", "QLoRA", None, None, vec![])
             .await
             .unwrap();
-        src.link(None, e2.id, e1.id, EdgeRelation::VariantOf, 0.9)
+        src.link(&tok, e2.id, e1.id, EdgeRelation::VariantOf, 0.9)
             .await
             .unwrap();
 
-        let json_str = src.export_kg_json(None).await.unwrap();
+        let json_str = src.export_kg_json(&tok).await.unwrap();
         assert!(json_str.contains("khive-kg"));
 
         let dst = make_rt().await;
-        let summary = dst.import_kg_json(&json_str, None).await.unwrap();
+        let summary = dst.import_kg_json(&json_str, &tok).await.unwrap();
         assert_eq!(summary.entities_imported, 2);
         assert_eq!(summary.edges_imported, 1);
 
-        let got = dst.get_entity(None, e1.id).await.unwrap().unwrap();
+        let got = dst.get_entity(&tok, e1.id).await.unwrap();
         assert_eq!(got.tags, vec!["fine-tuning"]);
     }
 
@@ -409,29 +418,31 @@ mod tests {
     #[tokio::test]
     async fn namespace_targeting() {
         let src = make_rt().await;
-        src.create_entity(Some("a"), "concept", "Sinkhorn", None, None, vec![])
+        let tok_a = NamespaceToken::for_namespace(Namespace::parse("a").unwrap());
+        let tok_b = NamespaceToken::for_namespace(Namespace::parse("b").unwrap());
+        src.create_entity(&tok_a, "concept", "Sinkhorn", None, None, vec![])
             .await
             .unwrap();
 
-        let archive = src.export_kg(Some("a")).await.unwrap();
+        let archive = src.export_kg(&tok_a).await.unwrap();
         assert_eq!(archive.namespace, "a");
 
         // Import into a fresh runtime, targeting namespace "b".
         let dst = make_rt().await;
-        let summary = dst.import_kg(&archive, Some("b")).await.unwrap();
+        let summary = dst.import_kg(&archive, &tok_b).await.unwrap();
         assert_eq!(summary.entities_imported, 1);
 
         // Entity is in "b" on the destination runtime.
-        let in_b = dst.list_entities(Some("b"), None, 100, 0).await.unwrap();
+        let in_b = dst.list_entities(&tok_b, None, 100, 0).await.unwrap();
         assert_eq!(in_b.len(), 1);
         assert_eq!(in_b[0].name, "Sinkhorn");
 
         // Namespace "a" on the source runtime is unchanged.
-        let in_a = src.list_entities(Some("a"), None, 100, 0).await.unwrap();
+        let in_a = src.list_entities(&tok_a, None, 100, 0).await.unwrap();
         assert_eq!(in_a.len(), 1);
 
         // Namespace "a" on the destination runtime has nothing (only "b" was written).
-        let dst_a = dst.list_entities(Some("a"), None, 100, 0).await.unwrap();
+        let dst_a = dst.list_entities(&tok_a, None, 100, 0).await.unwrap();
         assert_eq!(dst_a.len(), 0);
     }
 
@@ -439,6 +450,7 @@ mod tests {
     #[tokio::test]
     async fn format_validation_rejects_wrong_format() {
         let rt = make_rt().await;
+        let tok = NamespaceToken::local();
         let bad = KgArchive {
             format: "wrong".to_string(),
             version: "0.1".to_string(),
@@ -447,7 +459,7 @@ mod tests {
             entities: vec![],
             edges: vec![],
         };
-        let err = rt.import_kg(&bad, None).await.unwrap_err();
+        let err = rt.import_kg(&bad, &tok).await.unwrap_err();
         assert!(matches!(err, RuntimeError::InvalidInput(_)));
     }
 
@@ -455,6 +467,7 @@ mod tests {
     #[tokio::test]
     async fn import_unsupported_archive_version_returns_error() {
         let rt = make_rt().await;
+        let tok = NamespaceToken::local();
         let bad = KgArchive {
             format: "khive-kg".to_string(),
             version: "999.0".to_string(),
@@ -463,7 +476,7 @@ mod tests {
             entities: vec![],
             edges: vec![],
         };
-        let err = rt.import_kg(&bad, None).await.unwrap_err();
+        let err = rt.import_kg(&bad, &tok).await.unwrap_err();
         assert!(
             matches!(err, RuntimeError::InvalidInput(_)),
             "expected InvalidInput, got {err:?}"
@@ -506,9 +519,10 @@ mod tests {
         let phantom_source = Uuid::parse_str("deadbeef-dead-4ead-dead-deadbeefcafe").unwrap();
 
         let rt = make_rt().await;
+        let tok = NamespaceToken::local();
         // Create an entity that will be the real target.
         let real = rt
-            .create_entity(None, "concept", "Real", None, None, vec![])
+            .create_entity(&tok, "concept", "Real", None, None, vec![])
             .await
             .unwrap();
 
@@ -538,7 +552,7 @@ mod tests {
         };
 
         let dst = make_rt().await;
-        let summary = dst.import_kg(&archive, None).await.unwrap();
+        let summary = dst.import_kg(&archive, &tok).await.unwrap();
         assert_eq!(summary.entities_imported, 1);
         assert_eq!(
             summary.edges_imported, 0,
@@ -559,8 +573,9 @@ mod tests {
         let phantom_target = Uuid::parse_str("cafebabe-cafe-4abe-cafe-cafebabecafe").unwrap();
 
         let rt = make_rt().await;
+        let tok = NamespaceToken::local();
         let real = rt
-            .create_entity(None, "concept", "Source", None, None, vec![])
+            .create_entity(&tok, "concept", "Source", None, None, vec![])
             .await
             .unwrap();
 
@@ -589,7 +604,7 @@ mod tests {
         };
 
         let dst = make_rt().await;
-        let summary = dst.import_kg(&archive, None).await.unwrap();
+        let summary = dst.import_kg(&archive, &tok).await.unwrap();
         assert_eq!(summary.entities_imported, 1);
         assert_eq!(
             summary.edges_imported, 0,
@@ -610,16 +625,17 @@ mod tests {
         let phantom = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
 
         let src = make_rt().await;
+        let tok = NamespaceToken::local();
         let a = src
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", "A", None, None, vec![])
             .await
             .unwrap();
         let b = src
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", "B", None, None, vec![])
             .await
             .unwrap();
         let c = src
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", "C", None, None, vec![])
             .await
             .unwrap();
 
@@ -690,7 +706,7 @@ mod tests {
         };
 
         let dst = make_rt().await;
-        let summary = dst.import_kg(&archive, None).await.unwrap();
+        let summary = dst.import_kg(&archive, &tok).await.unwrap();
         assert_eq!(summary.entities_imported, 3);
         assert_eq!(
             summary.edges_imported, 2,
@@ -706,21 +722,22 @@ mod tests {
     #[tokio::test]
     async fn import_all_valid_edges_reports_zero_skipped() {
         let src = make_rt().await;
+        let tok = NamespaceToken::local();
         let e1 = src
-            .create_entity(None, "concept", "E1", None, None, vec![])
+            .create_entity(&tok, "concept", "E1", None, None, vec![])
             .await
             .unwrap();
         let e2 = src
-            .create_entity(None, "concept", "E2", None, None, vec![])
+            .create_entity(&tok, "concept", "E2", None, None, vec![])
             .await
             .unwrap();
-        src.link(None, e1.id, e2.id, EdgeRelation::VariantOf, 0.7)
+        src.link(&tok, e1.id, e2.id, EdgeRelation::VariantOf, 0.7)
             .await
             .unwrap();
 
-        let archive = src.export_kg(None).await.unwrap();
+        let archive = src.export_kg(&tok).await.unwrap();
         let dst = make_rt().await;
-        let summary = dst.import_kg(&archive, None).await.unwrap();
+        let summary = dst.import_kg(&archive, &tok).await.unwrap();
         assert_eq!(summary.edges_imported, 1);
         assert_eq!(
             summary.edges_skipped, 0,
@@ -734,21 +751,22 @@ mod tests {
     #[tokio::test]
     async fn export_kg_preserves_edge_id() {
         let rt = make_rt().await;
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "Alpha", None, None, vec![])
+            .create_entity(&tok, "concept", "Alpha", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "Beta", None, None, vec![])
+            .create_entity(&tok, "concept", "Beta", None, None, vec![])
             .await
             .unwrap();
         let stored_edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
         let stored_id: Uuid = stored_edge.id.into();
 
-        let archive = rt.export_kg(None).await.unwrap();
+        let archive = rt.export_kg(&tok).await.unwrap();
         assert_eq!(archive.edges.len(), 1);
         assert_eq!(
             archive.edges[0].edge_id, stored_id,
@@ -760,26 +778,27 @@ mod tests {
     #[tokio::test]
     async fn import_kg_persists_edge_id() {
         let src = make_rt().await;
+        let tok = NamespaceToken::local();
         let a = src
-            .create_entity(None, "concept", "Alpha", None, None, vec![])
+            .create_entity(&tok, "concept", "Alpha", None, None, vec![])
             .await
             .unwrap();
         let b = src
-            .create_entity(None, "concept", "Beta", None, None, vec![])
+            .create_entity(&tok, "concept", "Beta", None, None, vec![])
             .await
             .unwrap();
         let stored_edge = src
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
         let original_id: Uuid = stored_edge.id.into();
 
-        let archive = src.export_kg(None).await.unwrap();
+        let archive = src.export_kg(&tok).await.unwrap();
         let dst = make_rt().await;
-        dst.import_kg(&archive, None).await.unwrap();
+        dst.import_kg(&archive, &tok).await.unwrap();
 
         // The imported edge must carry the same UUID as the original.
-        let imported_edge = dst.get_edge(None, original_id).await.unwrap();
+        let imported_edge = dst.get_edge(&tok, original_id).await.unwrap();
         assert!(
             imported_edge.is_some(),
             "imported edge must be retrievable by the original edge_id"
@@ -837,14 +856,15 @@ mod tests {
 
         // Import into a fresh runtime and verify the generated ID is persisted.
         let rt = make_rt().await;
-        let summary = rt.import_kg(&archive, None).await.unwrap();
+        let tok = NamespaceToken::local();
+        let summary = rt.import_kg(&archive, &tok).await.unwrap();
         assert_eq!(summary.entities_imported, 2);
         assert_eq!(
             summary.edges_imported, 1,
             "edge must be imported when both endpoints exist"
         );
 
-        let stored = rt.get_edge(None, generated_id).await.unwrap();
+        let stored = rt.get_edge(&tok, generated_id).await.unwrap();
         assert!(
             stored.is_some(),
             "imported edge must be retrievable by the generated edge_id"
@@ -856,7 +876,7 @@ mod tests {
         );
 
         // Re-export and verify the same UUID appears in the archive.
-        let re_archive = rt.export_kg(None).await.unwrap();
+        let re_archive = rt.export_kg(&tok).await.unwrap();
         assert_eq!(re_archive.edges.len(), 1);
         assert_eq!(
             re_archive.edges[0].edge_id, generated_id,
@@ -872,22 +892,23 @@ mod tests {
     async fn export_import_export_edge_id_equality() {
         // Build a graph on the source runtime.
         let src = make_rt().await;
+        let tok = NamespaceToken::local();
         let a = src
-            .create_entity(None, "concept", "NodeA", None, None, vec![])
+            .create_entity(&tok, "concept", "NodeA", None, None, vec![])
             .await
             .unwrap();
         let b = src
-            .create_entity(None, "concept", "NodeB", None, None, vec![])
+            .create_entity(&tok, "concept", "NodeB", None, None, vec![])
             .await
             .unwrap();
         let stored = src
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0)
             .await
             .unwrap();
         let original_edge_id: Uuid = stored.id.into();
 
         // First export.
-        let archive1 = src.export_kg(None).await.unwrap();
+        let archive1 = src.export_kg(&tok).await.unwrap();
         assert_eq!(archive1.edges.len(), 1);
         assert_eq!(
             archive1.edges[0].edge_id, original_edge_id,
@@ -896,10 +917,10 @@ mod tests {
 
         // Import into a fresh runtime.
         let dst = make_rt().await;
-        dst.import_kg(&archive1, None).await.unwrap();
+        dst.import_kg(&archive1, &tok).await.unwrap();
 
         // Second export from the destination runtime.
-        let archive2 = dst.export_kg(None).await.unwrap();
+        let archive2 = dst.export_kg(&tok).await.unwrap();
         assert_eq!(archive2.edges.len(), 1);
 
         // Find the edge by (source, target, relation) and assert the ID is unchanged.

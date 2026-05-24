@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::fusion::fuse_with_strategy;
-use khive_runtime::{RuntimeError, SearchHit, SearchSource, VerbRegistry};
+use khive_runtime::{NamespaceToken, RuntimeError, SearchHit, SearchSource, VerbRegistry};
 use khive_storage::types::{
     TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
     VectorSearchRequest,
@@ -35,7 +35,6 @@ fn validate_memory_type(mt: &str) -> Result<(), RuntimeError> {
 #[derive(Deserialize)]
 struct RememberParams {
     content: String,
-    namespace: Option<String>,
     memory_type: Option<String>,
     #[serde(alias = "salience")]
     importance: Option<f64>,
@@ -49,7 +48,6 @@ struct RememberParams {
 #[derive(Deserialize)]
 struct RecallParams {
     query: String,
-    namespace: Option<String>,
     limit: Option<u32>,
     memory_type: Option<String>,
     min_score: Option<f64>,
@@ -162,13 +160,13 @@ impl MemoryPack {
     async fn collect_recall_candidates(
         &self,
         query: &str,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         candidate_limit: u32,
     ) -> Result<RecallCandidateSet, RuntimeError> {
-        let ns = self.runtime.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_string();
         let text_hits = self
             .runtime
-            .text_for_notes(namespace)?
+            .text_for_notes(token)?
             .search(TextSearchRequest {
                 query: query.to_string(),
                 mode: TextQueryMode::Plain,
@@ -184,7 +182,7 @@ impl MemoryPack {
         let vector_hits = if self.runtime.config().embedding_model.is_some() {
             let vec = self.runtime.embed(query).await?;
             self.runtime
-                .vectors(namespace)?
+                .vectors(token)?
                 .search(VectorSearchRequest {
                     query_embedding: vec,
                     top_k: candidate_limit,
@@ -205,7 +203,7 @@ impl MemoryPack {
 
     async fn load_memory_candidate_notes(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         text_hits: &[TextSearchHit],
         vector_hits: &[VectorSearchHit],
     ) -> Result<(HashSet<Uuid>, HashMap<Uuid, khive_storage::note::Note>), RuntimeError> {
@@ -224,7 +222,7 @@ impl MemoryPack {
             ids
         };
 
-        let note_store = self.runtime.notes(namespace)?;
+        let note_store = self.runtime.notes(token)?;
         let batch = note_store.get_notes_batch(&candidate_ids).await?;
         let mut memory_ids = HashSet::new();
         let mut notes_by_id = HashMap::new();
@@ -238,7 +236,11 @@ impl MemoryPack {
         Ok((memory_ids, notes_by_id))
     }
 
-    pub(crate) async fn handle_remember(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_remember(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: RememberParams = deser(params)?;
         if p.content.trim().is_empty() {
             return Err(RuntimeError::InvalidInput(
@@ -278,7 +280,7 @@ impl MemoryPack {
         let note = self
             .runtime
             .create_note_with_decay(
-                p.namespace.as_deref(),
+                token,
                 "memory",
                 None,
                 &p.content,
@@ -300,6 +302,7 @@ impl MemoryPack {
 
     pub(crate) async fn handle_recall(
         &self,
+        token: &NamespaceToken,
         params: Value,
         _registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
@@ -315,14 +318,10 @@ impl MemoryPack {
         let limit = p.limit.unwrap_or(10).min(100);
         let candidate_limit = recall_candidate_count(&cfg, limit);
         let candidates = self
-            .collect_recall_candidates(&p.query, p.namespace.as_deref(), candidate_limit)
+            .collect_recall_candidates(&p.query, token, candidate_limit)
             .await?;
         let (memory_ids, mut notes_by_id) = self
-            .load_memory_candidate_notes(
-                p.namespace.as_deref(),
-                &candidates.text_hits,
-                &candidates.vector_hits,
-            )
+            .load_memory_candidate_notes(token, &candidates.text_hits, &candidates.vector_hits)
             .await?;
 
         let fused = fuse_candidates(
@@ -423,6 +422,7 @@ impl MemoryPack {
 
     pub(crate) async fn handle_recall_candidates(
         &self,
+        token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: RecallParams = deser(params)?;
@@ -432,7 +432,7 @@ impl MemoryPack {
         let limit = p.limit.unwrap_or(10).min(100);
         let candidate_limit = recall_candidate_count(&cfg, limit);
         let candidates = self
-            .collect_recall_candidates(&p.query, p.namespace.as_deref(), candidate_limit)
+            .collect_recall_candidates(&p.query, token, candidate_limit)
             .await?;
 
         let text_candidates: Vec<Value> = candidates
@@ -470,6 +470,7 @@ impl MemoryPack {
 
     pub(crate) async fn handle_recall_fuse(
         &self,
+        token: &NamespaceToken,
         params: Value,
         _registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
@@ -484,14 +485,10 @@ impl MemoryPack {
         let limit = p.limit.unwrap_or(10).min(100);
         let candidate_limit = recall_candidate_count(&cfg, limit);
         let candidates = self
-            .collect_recall_candidates(&p.query, p.namespace.as_deref(), candidate_limit)
+            .collect_recall_candidates(&p.query, token, candidate_limit)
             .await?;
         let (memory_ids, notes_by_id) = self
-            .load_memory_candidate_notes(
-                p.namespace.as_deref(),
-                &candidates.text_hits,
-                &candidates.vector_hits,
-            )
+            .load_memory_candidate_notes(token, &candidates.text_hits, &candidates.vector_hits)
             .await?;
 
         let fused = fuse_candidates(
@@ -582,7 +579,6 @@ mod tests {
     fn effective_config_uses_defaults() {
         let p = RecallParams {
             query: "test".to_string(),
-            namespace: None,
             limit: None,
             memory_type: None,
             min_score: None,
@@ -599,7 +595,6 @@ mod tests {
     fn effective_config_legacy_overrides() {
         let p = RecallParams {
             query: "test".to_string(),
-            namespace: None,
             limit: None,
             memory_type: None,
             min_score: Some(0.5),
@@ -615,7 +610,6 @@ mod tests {
     fn effective_config_explicit_config_wins() {
         let p = RecallParams {
             query: "test".to_string(),
-            namespace: None,
             limit: None,
             memory_type: None,
             min_score: Some(0.1),

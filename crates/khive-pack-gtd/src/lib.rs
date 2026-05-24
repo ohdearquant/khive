@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, KindHook, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, Pack, VerbDef};
 
 use crate::hook::TaskHook;
@@ -151,13 +151,14 @@ impl PackRuntime for GtdPack {
         verb: &str,
         params: Value,
         _registry: &VerbRegistry,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "assign" => self.handle_assign(params).await,
-            "next" => self.handle_next(params).await,
-            "complete" => self.handle_complete(params).await,
-            "tasks" => self.handle_tasks(params).await,
-            "transition" => self.handle_transition(params).await,
+            "assign" => self.handle_assign(token, params).await,
+            "next" => self.handle_next(token, params).await,
+            "complete" => self.handle_complete(token, params).await,
+            "tasks" => self.handle_tasks(token, params).await,
+            "transition" => self.handle_transition(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "gtd pack does not handle verb {verb:?}"
             ))),
