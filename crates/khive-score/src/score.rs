@@ -381,8 +381,7 @@ mod tests {
     #[test]
     fn underflow_clamps_to_neg_inf_not_min() {
         // Arithmetic must clamp at NEG_INF (= i64::MIN + 1), never produce MIN.
-        let result =
-            DeterministicScore::from_raw(i64::MIN + 1) - DeterministicScore::from_raw(1);
+        let result = DeterministicScore::from_raw(i64::MIN + 1) - DeterministicScore::from_raw(1);
         assert_eq!(result, DeterministicScore::NEG_INF);
         assert_ne!(result, DeterministicScore::MIN);
     }
