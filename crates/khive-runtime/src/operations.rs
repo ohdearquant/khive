@@ -4082,11 +4082,11 @@ mod tests {
     async fn link_extends_document_to_document_returns_invalid_input() {
         let rt = rt();
         let d1 = rt
-            .create_entity(None, "document", "DocA", None, None, vec![])
+            .create_entity(None, "document", None, "DocA", None, None, vec![])
             .await
             .unwrap();
         let d2 = rt
-            .create_entity(None, "document", "DocB", None, None, vec![])
+            .create_entity(None, "document", None, "DocB", None, None, vec![])
             .await
             .unwrap();
         let result = rt
@@ -4104,11 +4104,11 @@ mod tests {
     async fn link_extends_concept_to_concept_succeeds() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "CA", None, None, vec![])
+            .create_entity(None, "concept", None, "CA", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "CB", None, None, vec![])
+            .create_entity(None, "concept", None, "CB", None, None, vec![])
             .await
             .unwrap();
         let result = rt
@@ -4127,11 +4127,11 @@ mod tests {
         use khive_storage::EdgeFilter;
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "ConceptP", None, None, vec![])
+            .create_entity(None, "concept", None, "ConceptP", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "ConceptQ", None, None, vec![])
+            .create_entity(None, "concept", None, "ConceptQ", None, None, vec![])
             .await
             .unwrap();
         // Link A->B then B->A with the same symmetric relation.
@@ -4160,11 +4160,11 @@ mod tests {
     async fn f010_supersedes_same_kind_entity_allowed() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "OldV", None, None, vec![])
+            .create_entity(None, "concept", None, "OldV", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "NewV", None, None, vec![])
+            .create_entity(None, "concept", None, "NewV", None, None, vec![])
             .await
             .unwrap();
         let result = rt
@@ -4181,11 +4181,11 @@ mod tests {
     async fn f010_supersedes_cross_kind_entity_rejected() {
         let rt = rt();
         let concept = rt
-            .create_entity(None, "concept", "MyConcept", None, None, vec![])
+            .create_entity(None, "concept", None, "MyConcept", None, None, vec![])
             .await
             .unwrap();
         let doc = rt
-            .create_entity(None, "document", "MyDoc", None, None, vec![])
+            .create_entity(None, "document", None, "MyDoc", None, None, vec![])
             .await
             .unwrap();
         let result = rt
