@@ -563,6 +563,7 @@ fn merge_entity_sql(
     let from_entity = read_merge_entity(conn, from_id, &namespace)?;
 
     // --- Collect edges incident to from_id ---
+    #[allow(dead_code)]
     struct EdgeRow {
         id: Uuid,
         source_id: Uuid,
@@ -676,16 +677,17 @@ fn merge_entity_sql(
                 continue;
             }
 
+            let now_ts = chrono::Utc::now().timestamp();
             conn.execute(
                 "INSERT INTO graph_edges \
-                 (namespace, id, source_id, target_id, relation, weight, created_at, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(namespace, id) DO UPDATE SET \
                      source_id = excluded.source_id, \
                      target_id = excluded.target_id, \
                      relation = excluded.relation, \
                      weight = excluded.weight, \
-                     created_at = excluded.created_at, \
+                     updated_at = excluded.updated_at, \
                      metadata = excluded.metadata \
                  ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
                 rusqlite::params![
@@ -696,6 +698,9 @@ fn merge_entity_sql(
                     &edge.relation,
                     edge.weight,
                     edge.created_at,
+                    now_ts,
+                    edge.deleted_at,
+                    edge.target_backend,
                     edge.metadata,
                 ],
             )?;
@@ -950,6 +955,7 @@ fn merge_note_sql(
     let from_str = from_id.to_string();
 
     // Collect edges incident to from_id.
+    #[allow(dead_code)]
     struct EdgeRow {
         id: Uuid,
         source_id: Uuid,
@@ -957,6 +963,9 @@ fn merge_note_sql(
         relation: String,
         weight: f64,
         created_at: i64,
+        updated_at: i64,
+        deleted_at: Option<i64>,
+        target_backend: Option<String>,
         metadata: Option<String>,
     }
     let parse_id =
@@ -965,7 +974,7 @@ fn merge_note_sql(
     let mut outbound: Vec<EdgeRow> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT id, source_id, target_id, relation, weight, created_at, metadata \
+            "SELECT id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata \
              FROM graph_edges WHERE namespace = ?1 AND source_id = ?2",
         )?;
         let mut rows = stmt.query(rusqlite::params![&namespace, &from_str])?;
@@ -977,14 +986,17 @@ fn merge_note_sql(
                 relation: row.get(3)?,
                 weight: row.get(4)?,
                 created_at: row.get(5)?,
-                metadata: row.get(6)?,
+                updated_at: row.get(6)?,
+                deleted_at: row.get(7)?,
+                target_backend: row.get(8)?,
+                metadata: row.get(9)?,
             });
         }
     }
     let mut inbound: Vec<EdgeRow> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT id, source_id, target_id, relation, weight, created_at, metadata \
+            "SELECT id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata \
              FROM graph_edges WHERE namespace = ?1 AND target_id = ?2",
         )?;
         let mut rows = stmt.query(rusqlite::params![&namespace, &from_str])?;
@@ -996,7 +1008,10 @@ fn merge_note_sql(
                 relation: row.get(3)?,
                 weight: row.get(4)?,
                 created_at: row.get(5)?,
-                metadata: row.get(6)?,
+                updated_at: row.get(6)?,
+                deleted_at: row.get(7)?,
+                target_backend: row.get(8)?,
+                metadata: row.get(9)?,
             });
         }
     }
@@ -1074,16 +1089,17 @@ fn merge_note_sql(
                 )?;
                 continue;
             }
+            let now_ts = chrono::Utc::now().timestamp();
             conn.execute(
                 "INSERT INTO graph_edges \
-                 (namespace, id, source_id, target_id, relation, weight, created_at, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(namespace, id) DO UPDATE SET \
                      source_id = excluded.source_id, \
                      target_id = excluded.target_id, \
                      relation = excluded.relation, \
                      weight = excluded.weight, \
-                     created_at = excluded.created_at, \
+                     updated_at = excluded.updated_at, \
                      metadata = excluded.metadata \
                  ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
                 rusqlite::params![
@@ -1094,6 +1110,9 @@ fn merge_note_sql(
                     &edge.relation,
                     edge.weight,
                     edge.created_at,
+                    now_ts,
+                    edge.deleted_at,
+                    edge.target_backend,
                     edge.metadata,
                 ],
             )?;
@@ -1837,11 +1856,11 @@ mod tests {
     async fn merge_entity_tombstones_source_with_provenance() {
         let rt = rt();
         let into = rt
-            .create_entity(None, "concept", "Into", None, None, vec![])
+            .create_entity(None, "concept", None, "Into", None, None, vec![])
             .await
             .unwrap();
         let from = rt
-            .create_entity(None, "concept", "From", None, None, vec![])
+            .create_entity(None, "concept", None, "From", None, None, vec![])
             .await
             .unwrap();
         let from_id = from.id;
@@ -2031,15 +2050,15 @@ mod tests {
         use khive_storage::EdgeRelation;
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 0.5)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 0.5, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();

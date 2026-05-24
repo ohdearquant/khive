@@ -989,7 +989,7 @@ mod tests {
             // "memo" is already declared by AlphaPack — must be rejected at build.
             const NOTE_KINDS: &'static [&'static str] = &["memo"];
             const ENTITY_KINDS: &'static [&'static str] = &[];
-            const VERBS: &'static [VerbDef] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
         }
 
         #[async_trait]
@@ -1003,8 +1003,8 @@ mod tests {
             fn entity_kinds(&self) -> &'static [&'static str] {
                 Self::ENTITY_KINDS
             }
-            fn verbs(&self) -> &'static [VerbDef] {
-                Self::VERBS
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
             }
             async fn dispatch(
                 &self,
