@@ -109,13 +109,14 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
     let id_str: String = row.get(0)?;
     let namespace: String = row.get(1)?;
     let kind: String = row.get(2)?;
-    let name: String = row.get(3)?;
-    let description: Option<String> = row.get(4)?;
-    let properties_str: Option<String> = row.get(5)?;
-    let tags_str: String = row.get(6)?;
-    let created_at: i64 = row.get(7)?;
-    let updated_at: i64 = row.get(8)?;
-    let deleted_at: Option<i64> = row.get(9)?;
+    let entity_type: Option<String> = row.get(3)?;
+    let name: String = row.get(4)?;
+    let description: Option<String> = row.get(5)?;
+    let properties_str: Option<String> = row.get(6)?;
+    let tags_str: String = row.get(7)?;
+    let created_at: i64 = row.get(8)?;
+    let updated_at: i64 = row.get(9)?;
+    let deleted_at: Option<i64> = row.get(10)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -123,7 +124,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         .map(|s| {
             serde_json::from_str(&s).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    5,
+                    6,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -132,13 +133,14 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         .transpose()?;
 
     let tags: Vec<String> = serde_json::from_str(&tags_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
     })?;
 
     Ok(Entity {
         id,
         namespace,
         kind,
+        entity_type,
         name,
         description,
         properties,
@@ -189,6 +191,18 @@ fn build_entity_where(
         conditions.push(format!("kind IN ({})", placeholders.join(", ")));
     }
 
+    if !filter.entity_types.is_empty() {
+        let placeholders: Vec<String> = filter
+            .entity_types
+            .iter()
+            .map(|t| {
+                params.push(Box::new(t.clone()));
+                format!("?{}", params.len())
+            })
+            .collect();
+        conditions.push(format!("entity_type IN ({})", placeholders.join(", ")));
+    }
+
     if let Some(ref prefix) = filter.name_prefix {
         params.push(Box::new(format!("{}%", prefix)));
         conditions.push(format!("name LIKE ?{}", params.len()));
@@ -231,13 +245,14 @@ impl EntityStore for SqlEntityStore {
         self.with_writer("upsert_entity", move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO entities \
-                 (id, namespace, kind, name, description, properties, tags, \
+                 (id, namespace, kind, entity_type, name, description, properties, tags, \
                   created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     id_str,
                     namespace,
                     entity.kind,
+                    entity.entity_type,
                     entity.name,
                     entity.description,
                     properties_str,
@@ -275,13 +290,14 @@ impl EntityStore for SqlEntityStore {
 
                 match conn.execute(
                     "INSERT OR REPLACE INTO entities \
-                     (id, namespace, kind, name, description, properties, tags, \
+                     (id, namespace, kind, entity_type, name, description, properties, tags, \
                       created_at, updated_at, deleted_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     rusqlite::params![
                         id_str,
                         &entity.namespace,
                         entity.kind,
+                        entity.entity_type,
                         entity.name,
                         entity.description,
                         properties_str,
@@ -320,7 +336,7 @@ impl EntityStore for SqlEntityStore {
 
         self.with_reader("get_entity", move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, namespace, kind, name, description, properties, tags, \
+                "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
                  created_at, updated_at, deleted_at \
                  FROM entities WHERE id = ?1 AND deleted_at IS NULL",
             )?;
@@ -388,7 +404,7 @@ impl EntityStore for SqlEntityStore {
             let offset_idx = data_params.len();
 
             let data_sql = format!(
-                "SELECT id, namespace, kind, name, description, properties, tags, \
+                "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
                  created_at, updated_at, deleted_at \
                  FROM entities{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
@@ -441,6 +457,7 @@ const ENTITIES_DDL: &str = "\
         id TEXT PRIMARY KEY,\
         namespace TEXT NOT NULL,\
         kind TEXT NOT NULL,\
+        entity_type TEXT,\
         name TEXT NOT NULL,\
         description TEXT,\
         properties TEXT,\
@@ -451,6 +468,7 @@ const ENTITIES_DDL: &str = "\
     );\
     CREATE INDEX IF NOT EXISTS idx_entities_namespace ON entities(namespace);\
     CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(namespace, kind);\
+    CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type ON entities(namespace, kind, entity_type);\
     CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(namespace, name);\
     CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC);\
 ";
@@ -491,6 +509,7 @@ mod tests {
             id: Uuid::new_v4(),
             namespace: namespace.to_string(),
             kind: kind.to_string(),
+            entity_type: None,
             name: name.to_string(),
             description: None,
             properties: None,
@@ -836,6 +855,7 @@ mod tests {
             id: shared_id,
             namespace: "ns_a".to_string(),
             kind: "concept".to_string(),
+            entity_type: None,
             name: "SharedInA".to_string(),
             description: None,
             properties: None,
@@ -856,6 +876,7 @@ mod tests {
             id: shared_id,
             namespace: "ns_b".to_string(),
             kind: "concept".to_string(),
+            entity_type: None,
             name: "SharedInB".to_string(),
             description: None,
             properties: None,

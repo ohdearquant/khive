@@ -502,10 +502,13 @@ fn triples_to_ast(
     let mut elements: Vec<PatternElement> = Vec::new();
 
     let first_var = &ordered_edges[0].0;
+    let mut first_props = node_props.get(first_var).cloned().unwrap_or_default();
+    let first_entity_type = first_props.remove("entity_type");
     elements.push(PatternElement::Node(NodePattern {
         variable: Some(first_var.clone()),
         kind: node_kinds.get(first_var).cloned(),
-        properties: node_props.get(first_var).cloned().unwrap_or_default(),
+        entity_type: first_entity_type,
+        properties: first_props,
     }));
 
     for (_, tgt, rel, min_hops, max_hops) in &ordered_edges {
@@ -516,10 +519,13 @@ fn triples_to_ast(
             min_hops: *min_hops,
             max_hops: *max_hops,
         }));
+        let mut tgt_props = node_props.get(tgt).cloned().unwrap_or_default();
+        let tgt_entity_type = tgt_props.remove("entity_type");
         elements.push(PatternElement::Node(NodePattern {
             variable: Some(tgt.clone()),
             kind: node_kinds.get(tgt).cloned(),
-            properties: node_props.get(tgt).cloned().unwrap_or_default(),
+            entity_type: tgt_entity_type,
+            properties: tgt_props,
         }));
     }
 

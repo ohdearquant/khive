@@ -170,6 +170,12 @@ const V1_UP: &str = "\
 /// V4 note: Deduplicates existing graph_edges rows that share the same
 /// (namespace, source_id, target_id, relation) triple, keeping the earliest
 /// rowid, then adds a unique index enforcing the constraint going forward.
+///
+/// V5 note: `ENTITIES_DDL` in `stores/entity.rs` already includes `entity_type TEXT`
+/// so that in-process schema creation has the column from the start.  When
+/// `run_migrations` is called on such a DB, the V5 `ALTER TABLE` would fail with
+/// "duplicate column name".  The migration runner handles this by checking column
+/// existence before applying V5 — see `run_migrations`.
 const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     DELETE FROM graph_edges \
     WHERE rowid NOT IN (\
@@ -179,6 +185,12 @@ const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     );\
     CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique_triple \
     ON graph_edges(namespace, source_id, target_id, relation);\
+";
+
+const V5_ADD_ENTITY_TYPE_TO_ENTITIES: &str = "\
+    ALTER TABLE entities ADD COLUMN entity_type TEXT NULL;\
+    CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type \
+    ON entities(namespace, kind, entity_type);\
 ";
 
 pub const MIGRATIONS: &[VersionedMigration] = &[
@@ -201,6 +213,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 4,
         name: "dedupe_graph_edge_triples",
         up: V4_DEDUPE_GRAPH_EDGE_TRIPLES,
+    },
+    VersionedMigration {
+        version: 5,
+        name: "add_entity_type_to_entities",
+        up: V5_ADD_ENTITY_TYPE_TO_ENTITIES,
     },
 ];
 
@@ -291,6 +308,33 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             }
         }
 
+        // V5 adds `entity_type` to entities.  ENTITIES_DDL already includes the
+        // column so in-process DBs created via ensure_entities_schema already have
+        // it.  Same idempotency pattern as V2.
+        if migration.version == 5 {
+            let col_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('entities') WHERE name = 'entity_type'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if col_exists {
+                let now = chrono::Utc::now().timestamp_micros();
+                conn.execute(
+                    "INSERT OR IGNORE INTO _schema_migrations (version, name, applied_at) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![migration.version, migration.name, now],
+                )
+                .map_err(|e| SqliteError::Migration {
+                    version: migration.version,
+                    error: e.to_string(),
+                })?;
+                applied_version = migration.version;
+                continue;
+            }
+        }
+
         let tx = conn.transaction().map_err(|e| SqliteError::Migration {
             version: migration.version,
             error: e.to_string(),
@@ -339,17 +383,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
-        // Verify the tracking table has rows for V1, V2, V3, and V4.
+        // Verify the tracking table has rows for V1..V5.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -370,6 +414,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(col_count, 1, "V2 must add name column to notes");
+
+        // Verify V5 added entity_type column to entities.
+        let et_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entities') WHERE name = 'entity_type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(et_count, 1, "V5 must add entity_type column to entities");
+
+        // Verify V5 added the kind+entity_type index.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_entities_kind_entity_type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1, "V5 must create idx_entities_kind_entity_type");
     }
 
     #[test]
@@ -377,57 +442,54 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 4);
-        assert_eq!(v2, 4);
+        assert_eq!(v1, 5);
+        assert_eq!(v2, 5);
 
-        // Should still have exactly four rows in the tracking table (V1 + V2 + V3 + V4).
+        // Should still have exactly five rows in the tracking table (V1..V5).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
     }
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v5 = VersionedMigration {
-            version: 5,
+        let bad_v6 = VersionedMigration {
+            version: 6,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1 + V2 + V3 + V4) so the DB is at V4.
-        run_migrations(&mut conn).expect("V1+V2+V3+V4 should apply cleanly");
+        // Apply all real migrations (V1..V5) so the DB is at V5.
+        run_migrations(&mut conn).expect("V1..V5 should apply cleanly");
 
-        // Now manually drive the bad V5 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v5);
+        // Now manually drive the bad V6 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v6);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V4 — no V5 row in tracking.
-        let v5_count: i64 = conn
+        // DB should still be at V5 — no V6 row in tracking.
+        let v6_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 5",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 6",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v5_count, 0, "V5 must not be recorded after rollback");
+        assert_eq!(v6_count, 0, "V6 must not be recorded after rollback");
 
-        // V1, V2, V3, and V4 should still be there.
+        // V1..V5 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            applied_count, 4,
-            "V1, V2, V3, and V4 must still be recorded"
-        );
+        assert_eq!(applied_count, 5, "V1..V5 must still be recorded");
     }
 
     #[test]
@@ -452,8 +514,9 @@ mod tests {
 
         // Now run versioned migrations — V2 should detect the existing column
         // and skip the ALTER TABLE without error. V4 adds the unique triple index.
+        // V5 should detect entity_type already present via ENTITIES_DDL and skip.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -466,6 +529,19 @@ mod tests {
         assert_eq!(
             v2_count, 1,
             "V2 must be recorded even when column pre-exists"
+        );
+
+        // V5 should be recorded as applied (skipped but tracked).
+        let v5_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v5_count, 1,
+            "V5 must be recorded even when entity_type column pre-exists"
         );
     }
 

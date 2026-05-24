@@ -9,18 +9,16 @@ use core::str::FromStr;
 
 use crate::{EdgeRelation, Header, Id128, Timestamp};
 
-/// Taxonomy for entity classification in a research knowledge graph (ADR-001).
+/// 8 closed base kinds for graph-node classification (ADR-001).
 ///
-/// 6 kinds, chosen for agent reliability: agents classify these correctly
-/// with unambiguous signals. Finer distinctions (algorithm vs technique,
-/// model vs architecture) live in `properties` — they don't enable useful
-/// queries with the 13-relation edge ontology and cause 20-30% misclassification.
+/// Governed subtype values live in `Entity::entity_type`; `properties` remain
+/// metadata and must not carry ontology type strings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum EntityKind {
     /// Algorithms, techniques, architectures, theories, models, research gaps.
-    /// The default / residual bucket. Use `properties.type` for finer grain.
+    /// The default / residual bucket.
     #[default]
     Concept,
     /// Papers, preprints, technical reports, blog posts, books.
@@ -36,16 +34,22 @@ pub enum EntityKind {
     Person,
     /// Labs, companies, institutions.
     Org,
+    /// Built artifacts: binaries, model checkpoints, Docker images, packages.
+    Artifact,
+    /// Running or deployable services: APIs, hosted endpoints, SaaS products.
+    Service,
 }
 
 impl EntityKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Concept,
         Self::Document,
         Self::Dataset,
         Self::Project,
         Self::Person,
         Self::Org,
+        Self::Artifact,
+        Self::Service,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -56,6 +60,8 @@ impl EntityKind {
             Self::Project => "project",
             Self::Person => "person",
             Self::Org => "org",
+            Self::Artifact => "artifact",
+            Self::Service => "service",
         }
     }
 }
@@ -66,7 +72,9 @@ impl fmt::Display for EntityKind {
     }
 }
 
-const ENTITY_KIND_VALID: &[&str] = &["concept", "document", "dataset", "project", "person", "org"];
+const ENTITY_KIND_VALID: &[&str] = &[
+    "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
+];
 
 impl FromStr for EntityKind {
     type Err = crate::error::UnknownVariant;
@@ -79,6 +87,8 @@ impl FromStr for EntityKind {
             "project" | "repo" | "crate" | "library" | "lib" => Ok(Self::Project),
             "person" | "author" | "researcher" => Ok(Self::Person),
             "org" | "organization" | "organisation" | "lab" | "company" => Ok(Self::Org),
+            "artifact" | "art" => Ok(Self::Artifact),
+            "service" | "svc" => Ok(Self::Service),
             other => Err(crate::error::UnknownVariant::new(
                 "entity_kind",
                 other,
@@ -95,6 +105,9 @@ pub struct Entity {
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub header: Header,
     pub kind: EntityKind,
+    /// Pack-governed subtype token (e.g. `"paper"`, `"snapshot"`). Never stored
+    /// raw in `properties` — queries compile this to `entities.entity_type = ?`.
+    pub entity_type: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub properties: BTreeMap<String, PropertyValue>,
@@ -163,6 +176,7 @@ mod tests {
                 Timestamp::from_secs(1700000000),
             ),
             kind: EntityKind::Person,
+            entity_type: Some("researcher".into()),
             name: "Ocean".into(),
             description: None,
             properties: props,
@@ -171,6 +185,7 @@ mod tests {
         };
         assert_eq!(entity.kind, EntityKind::Person);
         assert_eq!(entity.kind.name(), "person");
+        assert_eq!(entity.entity_type.as_deref(), Some("researcher"));
         assert_eq!(entity.properties.len(), 2);
     }
 
@@ -199,6 +214,36 @@ mod tests {
         assert_eq!(EntityKind::from_str("repo").unwrap(), EntityKind::Project);
         assert_eq!(EntityKind::from_str("author").unwrap(), EntityKind::Person);
         assert_eq!(EntityKind::from_str("lab").unwrap(), EntityKind::Org);
+        assert_eq!(EntityKind::from_str("art").unwrap(), EntityKind::Artifact);
+        assert_eq!(EntityKind::from_str("svc").unwrap(), EntityKind::Service);
+    }
+
+    #[test]
+    fn entity_kind_artifact_and_service_roundtrip() {
+        assert_eq!(EntityKind::Artifact.name(), "artifact");
+        assert_eq!(EntityKind::Service.name(), "service");
+        assert_eq!(
+            EntityKind::from_str("artifact").unwrap(),
+            EntityKind::Artifact
+        );
+        assert_eq!(
+            EntityKind::from_str("service").unwrap(),
+            EntityKind::Service
+        );
+    }
+
+    #[test]
+    fn entity_kind_all_has_eight_variants() {
+        assert_eq!(EntityKind::ALL.len(), 8);
+        assert!(EntityKind::ALL.contains(&EntityKind::Artifact));
+        assert!(EntityKind::ALL.contains(&EntityKind::Service));
+    }
+
+    #[test]
+    fn entity_kind_unknown_valid_list_includes_new_kinds() {
+        let err = EntityKind::from_str("gadget").unwrap_err();
+        assert!(err.valid.contains(&"artifact"));
+        assert!(err.valid.contains(&"service"));
     }
 
     #[test]

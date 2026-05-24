@@ -162,6 +162,7 @@ mod tests {
         ExportedEntity {
             id,
             kind: "concept".into(),
+            entity_type: None,
             name: name.into(),
             description: None,
             properties: None,

@@ -14,7 +14,8 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry};
 use khive_types::{Pack, VerbDef};
 
-pub use vocab::{EntityKind, NoteKind};
+pub use khive_types::EntityKind;
+pub use vocab::NoteKind;
 
 /// KG pack vocabulary declaration.
 pub struct KgPack {
@@ -30,8 +31,9 @@ impl Pack for KgPack {
         "decision",
         "reference",
     ];
-    const ENTITY_KINDS: &'static [&'static str] =
-        &["concept", "document", "dataset", "project", "person", "org"];
+    const ENTITY_KINDS: &'static [&'static str] = &[
+        "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
+    ];
     const VERBS: &'static [VerbDef] = &KG_VERBS;
 }
 

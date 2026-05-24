@@ -213,6 +213,7 @@ impl Parser {
             return Ok(NodePattern {
                 variable,
                 kind,
+                entity_type: None,
                 properties,
             });
         }
@@ -245,10 +246,15 @@ impl Parser {
             properties = self.parse_props()?;
         }
 
+        // Lift entity_type out of properties so the SQL compiler targets the
+        // dedicated column instead of json_extract(properties, '$.entity_type').
+        let entity_type = properties.remove("entity_type");
+
         self.expect_char(')')?;
         Ok(NodePattern {
             variable,
             kind,
+            entity_type,
             properties,
         })
     }
