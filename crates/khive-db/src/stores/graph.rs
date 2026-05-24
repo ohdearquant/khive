@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, Edge, EdgeFilter, EdgeSortField, GraphPath, NeighborHit, NeighborQuery,
-    Page, PageRequest, PathNode, SortDirection, SortOrder, TraversalRequest,
+    BatchWriteSummary, DeleteMode, Edge, EdgeFilter, EdgeSortField, GraphPath, NeighborHit,
+    NeighborQuery, Page, PageRequest, PathNode, SortDirection, SortOrder, TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -155,31 +155,51 @@ impl SqlGraphStore {
 // =============================================================================
 
 fn read_edge(row: &rusqlite::Row<'_>) -> Result<Edge, rusqlite::Error> {
-    let id_str: String = row.get(0)?;
-    let source_str: String = row.get(1)?;
-    let target_str: String = row.get(2)?;
-    let relation_str: String = row.get(3)?;
-    let weight: f64 = row.get(4)?;
-    let created_micros: i64 = row.get(5)?;
-    let metadata_str: Option<String> = row.get(6)?;
+    let namespace: String = row.get(0)?;
+    let id_str: String = row.get(1)?;
+    let source_str: String = row.get(2)?;
+    let target_str: String = row.get(3)?;
+    let relation_str: String = row.get(4)?;
+    let weight: f64 = row.get(5)?;
+    let created_micros: i64 = row.get(6)?;
+    let updated_micros: i64 = row.get(7)?;
+    let deleted_micros: Option<i64> = row.get(8)?;
+    let metadata_str: Option<String> = row.get(9)?;
+    let target_backend: Option<String> = row.get(10)?;
 
     let id = parse_uuid(&id_str)?;
     let source_id = parse_uuid(&source_str)?;
     let target_id = parse_uuid(&target_str)?;
     let created_at = micros_to_datetime(created_micros);
     let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
     })?;
-    let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+    let metadata = match metadata_str {
+        Some(s) => {
+            let v = serde_json::from_str(&s).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Some(v)
+        }
+        None => None,
+    };
 
     Ok(Edge {
         id: id.into(),
+        namespace,
         source_id,
         target_id,
         relation,
         weight,
         created_at,
+        updated_at: micros_to_datetime(updated_micros),
+        deleted_at: deleted_micros.map(micros_to_datetime),
         metadata,
+        target_backend,
     })
 }
 
@@ -199,7 +219,10 @@ fn build_edge_filter_sql(
     namespace: &str,
     filter: &EdgeFilter,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-    let mut conditions: Vec<String> = vec!["namespace = ?1".to_string()];
+    let mut conditions: Vec<String> = vec![
+        "namespace = ?1".to_string(),
+        "deleted_at IS NULL".to_string(),
+    ];
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(namespace.to_string())];
 
     if !filter.ids.is_empty() {
@@ -291,6 +314,16 @@ fn edge_sort_col(field: &EdgeSortField) -> &'static str {
 impl GraphStore for SqlGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> Result<(), StorageError> {
         let namespace = self.namespace.clone();
+        if edge.namespace != namespace {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Graph,
+                operation: "upsert_edge".into(),
+                message: format!(
+                    "edge namespace {:?} does not match store namespace {:?}",
+                    edge.namespace, namespace
+                ),
+            });
+        }
         let id_str = Uuid::from(edge.id).to_string();
         let src_str = edge.source_id.to_string();
         let tgt_str = edge.target_id.to_string();
@@ -298,20 +331,30 @@ impl GraphStore for SqlGraphStore {
         let metadata_str = edge
             .metadata
             .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StorageError::driver(StorageCapability::Graph, "upsert_edge", e))?;
         self.with_writer("upsert_edge", move |conn| {
             conn.execute(
                 "INSERT INTO graph_edges \
-                 (namespace, id, source_id, target_id, relation, weight, created_at, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 (namespace, id, source_id, target_id, relation, weight, \
+                  created_at, updated_at, deleted_at, metadata, target_backend) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(namespace, id) DO UPDATE SET \
                      source_id = excluded.source_id, \
                      target_id = excluded.target_id, \
                      relation = excluded.relation, \
                      weight = excluded.weight, \
-                     created_at = excluded.created_at, \
-                     metadata = excluded.metadata \
-                 ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
+                     updated_at = excluded.updated_at, \
+                     deleted_at = NULL, \
+                     metadata = excluded.metadata, \
+                     target_backend = excluded.target_backend \
+                 ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
+                     weight = excluded.weight, \
+                     updated_at = excluded.updated_at, \
+                     deleted_at = NULL, \
+                     metadata = excluded.metadata, \
+                     target_backend = excluded.target_backend",
                 rusqlite::params![
                     namespace,
                     id_str,
@@ -320,7 +363,10 @@ impl GraphStore for SqlGraphStore {
                     relation_str,
                     edge.weight,
                     edge.created_at.timestamp_micros(),
+                    edge.updated_at.timestamp_micros(),
+                    edge.deleted_at.map(|t| t.timestamp_micros()),
                     metadata_str,
+                    edge.target_backend,
                 ],
             )?;
             Ok(())
@@ -332,11 +378,23 @@ impl GraphStore for SqlGraphStore {
         let attempted = edges.len() as u64;
         let namespace = self.namespace.clone();
 
+        // Validate namespaces before acquiring writer.
+        for edge in &edges {
+            if edge.namespace != namespace {
+                return Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Graph,
+                    operation: "upsert_edges".into(),
+                    message: format!(
+                        "edge namespace {:?} does not match store namespace {:?}",
+                        edge.namespace, namespace
+                    ),
+                });
+            }
+        }
+
         self.with_writer("upsert_edges", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let mut affected = 0u64;
-            let mut failed = 0u64;
-            let mut first_error = String::new();
 
             for edge in &edges {
                 let id_str = Uuid::from(edge.id).to_string();
@@ -346,19 +404,29 @@ impl GraphStore for SqlGraphStore {
                 let metadata_str = edge
                     .metadata
                     .as_ref()
-                    .map(|v| serde_json::to_string(v).unwrap_or_default());
-                match conn.execute(
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                if let Err(e) = conn.execute(
                     "INSERT INTO graph_edges \
-                     (namespace, id, source_id, target_id, relation, weight, created_at, metadata) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     (namespace, id, source_id, target_id, relation, weight, \
+                      created_at, updated_at, deleted_at, metadata, target_backend) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                      ON CONFLICT(namespace, id) DO UPDATE SET \
                          source_id = excluded.source_id, \
                          target_id = excluded.target_id, \
                          relation = excluded.relation, \
                          weight = excluded.weight, \
-                         created_at = excluded.created_at, \
-                         metadata = excluded.metadata \
-                     ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
+                         updated_at = excluded.updated_at, \
+                         deleted_at = NULL, \
+                         metadata = excluded.metadata, \
+                         target_backend = excluded.target_backend \
+                     ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
+                         weight = excluded.weight, \
+                         updated_at = excluded.updated_at, \
+                         deleted_at = NULL, \
+                         metadata = excluded.metadata, \
+                         target_backend = excluded.target_backend",
                     rusqlite::params![
                         &namespace,
                         id_str,
@@ -367,17 +435,16 @@ impl GraphStore for SqlGraphStore {
                         relation_str,
                         edge.weight,
                         edge.created_at.timestamp_micros(),
+                        edge.updated_at.timestamp_micros(),
+                        edge.deleted_at.map(|t| t.timestamp_micros()),
                         metadata_str,
+                        edge.target_backend.as_deref(),
                     ],
                 ) {
-                    Ok(_) => affected += 1,
-                    Err(e) => {
-                        if first_error.is_empty() {
-                            first_error = e.to_string();
-                        }
-                        failed += 1;
-                    }
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
                 }
+                affected += 1;
             }
 
             if let Err(e) = conn.execute_batch("COMMIT") {
@@ -387,8 +454,8 @@ impl GraphStore for SqlGraphStore {
             Ok(BatchWriteSummary {
                 attempted,
                 affected,
-                failed,
-                first_error,
+                failed: 0,
+                first_error: String::new(),
             })
         })
         .await
@@ -400,8 +467,9 @@ impl GraphStore for SqlGraphStore {
 
         self.with_reader("get_edge", move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, source_id, target_id, relation, weight, created_at, metadata \
-                 FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                "SELECT namespace, id, source_id, target_id, relation, weight, \
+                        created_at, updated_at, deleted_at, metadata, target_backend \
+                 FROM graph_edges WHERE namespace = ?1 AND id = ?2 AND deleted_at IS NULL",
             )?;
             let mut rows = stmt.query(rusqlite::params![namespace, id_str])?;
             match rows.next()? {
@@ -412,16 +480,23 @@ impl GraphStore for SqlGraphStore {
         .await
     }
 
-    async fn delete_edge(&self, id: LinkId) -> Result<bool, StorageError> {
+    async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> Result<bool, StorageError> {
         let namespace = self.namespace.clone();
         let id_str = Uuid::from(id).to_string();
 
         self.with_writer("delete_edge", move |conn| {
-            let deleted = conn.execute(
-                "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
-                rusqlite::params![namespace, id_str],
-            )?;
-            Ok(deleted > 0)
+            let affected = match mode {
+                DeleteMode::Soft => conn.execute(
+                    "UPDATE graph_edges SET deleted_at = ?3, updated_at = ?3 \
+                     WHERE namespace = ?1 AND id = ?2 AND deleted_at IS NULL",
+                    rusqlite::params![namespace, id_str, chrono::Utc::now().timestamp_micros(),],
+                )?,
+                DeleteMode::Hard => conn.execute(
+                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                    rusqlite::params![namespace, id_str],
+                )?,
+            };
+            Ok(affected > 0)
         })
         .await
     }
@@ -469,7 +544,8 @@ impl GraphStore for SqlGraphStore {
             let offset_idx = all_params.len();
 
             let data_sql = format!(
-                "SELECT id, source_id, target_id, relation, weight, created_at, metadata \
+                "SELECT namespace, id, source_id, target_id, relation, weight, \
+                        created_at, updated_at, deleted_at, metadata, target_backend \
                  FROM graph_edges{}{} LIMIT ?{} OFFSET ?{}",
                 where_clause, order_clause, limit_idx, offset_idx,
             );
@@ -518,9 +594,11 @@ impl GraphStore for SqlGraphStore {
 
         self.with_reader("neighbors", move |conn| {
             let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight \
-                            FROM graph_edges WHERE namespace = ?1 AND source_id = ?2";
+                            FROM graph_edges \
+                            WHERE namespace = ?1 AND source_id = ?2 AND deleted_at IS NULL";
             let base_in = "SELECT source_id AS node_id, id AS edge_id, relation, weight \
-                           FROM graph_edges WHERE namespace = ?1 AND target_id = ?2";
+                           FROM graph_edges \
+                           WHERE namespace = ?1 AND target_id = ?2 AND deleted_at IS NULL";
 
             let sql = match query.direction {
                 Direction::Out => base_out.to_string(),
@@ -685,6 +763,7 @@ impl GraphStore for SqlGraphStore {
                          FROM graph_edges e \
                          JOIN traversal t ON {join_condition} \
                          WHERE e.namespace = ?1 \
+                           AND e.deleted_at IS NULL \
                            AND t.depth < ?3 \
                            AND (',' || t.path || ',') NOT LIKE '%,' || {next_node} || ',%'{rel_cond}{wt_cond} \
                      ) \
@@ -775,7 +854,10 @@ const GRAPH_DDL: &str = "\
         relation TEXT NOT NULL,\
         weight REAL NOT NULL DEFAULT 1.0,\
         created_at INTEGER NOT NULL,\
+        updated_at INTEGER NOT NULL,\
+        deleted_at INTEGER,\
         metadata TEXT,\
+        target_backend TEXT,\
         PRIMARY KEY (namespace, id)\
     );\
     CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique_triple ON graph_edges(namespace, source_id, target_id, relation);\
@@ -784,6 +866,7 @@ const GRAPH_DDL: &str = "\
     CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_relation ON graph_edges(namespace, relation);\
     CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_src_rel ON graph_edges(namespace, source_id, relation);\
     CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_tgt_rel ON graph_edges(namespace, target_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_target_backend ON graph_edges(target_backend) WHERE target_backend IS NOT NULL;\
 ";
 
 pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
@@ -812,14 +895,19 @@ mod tests {
     }
 
     fn make_edge(source: Uuid, target: Uuid, relation: EdgeRelation, weight: f64) -> Edge {
+        let now = Utc::now();
         Edge {
             id: Uuid::new_v4().into(),
+            namespace: "default".to_string(),
             source_id: source,
             target_id: target,
             relation,
             weight,
-            created_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
             metadata: None,
+            target_backend: None,
         }
     }
 
@@ -829,14 +917,19 @@ mod tests {
 
         let src = Uuid::new_v4();
         let tgt = Uuid::new_v4();
+        let now = Utc::now();
         let edge = Edge {
             id: Uuid::new_v4().into(),
+            namespace: "default".to_string(),
             source_id: src,
             target_id: tgt,
             relation: EdgeRelation::Extends,
             weight: 0.8,
-            created_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
             metadata: None,
+            target_backend: None,
         };
         let edge_id = edge.id;
 
@@ -846,6 +939,7 @@ mod tests {
         assert!(fetched.is_some());
         let fetched = fetched.unwrap();
         assert_eq!(fetched.id, edge_id);
+        assert_eq!(fetched.namespace, "default");
         assert_eq!(fetched.source_id, src);
         assert_eq!(fetched.target_id, tgt);
         assert_eq!(fetched.relation, EdgeRelation::Extends);
@@ -862,12 +956,12 @@ mod tests {
         store.upsert_edge(edge).await.unwrap();
         assert!(store.get_edge(edge_id).await.unwrap().is_some());
 
-        let deleted = store.delete_edge(edge_id).await.unwrap();
+        let deleted = store.delete_edge(edge_id, DeleteMode::Hard).await.unwrap();
         assert!(deleted);
 
         assert!(store.get_edge(edge_id).await.unwrap().is_none());
 
-        let deleted_again = store.delete_edge(edge_id).await.unwrap();
+        let deleted_again = store.delete_edge(edge_id, DeleteMode::Hard).await.unwrap();
         assert!(!deleted_again);
     }
 
@@ -976,14 +1070,19 @@ mod tests {
         let src = Uuid::new_v4();
         let tgt = Uuid::new_v4();
         let meta = serde_json::json!({"note": "important link", "confidence": 0.95});
+        let now = Utc::now();
         let edge = Edge {
             id: Uuid::new_v4().into(),
+            namespace: "default".to_string(),
             source_id: src,
             target_id: tgt,
             relation: EdgeRelation::Implements,
             weight: 0.9,
-            created_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
             metadata: Some(meta.clone()),
+            target_backend: None,
         };
         let edge_id = edge.id;
 
@@ -1046,23 +1145,32 @@ mod tests {
         let tgt = Uuid::new_v4();
 
         // Two edges with the same (source_id, target_id, relation) triple but different IDs.
+        let now = Utc::now();
         let edge1 = Edge {
             id: Uuid::new_v4().into(),
+            namespace: "default".to_string(),
             source_id: src,
             target_id: tgt,
             relation: EdgeRelation::Extends,
             weight: 1.0,
-            created_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
             metadata: None,
+            target_backend: None,
         };
         let edge2 = Edge {
             id: Uuid::new_v4().into(),
+            namespace: "default".to_string(),
             source_id: src,
             target_id: tgt,
             relation: EdgeRelation::Extends,
             weight: 0.5,
-            created_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
             metadata: None,
+            target_backend: None,
         };
 
         store.upsert_edge(edge1).await.unwrap();
@@ -1072,6 +1180,62 @@ mod tests {
             store.count_edges(EdgeFilter::default()).await.unwrap(),
             1,
             "duplicate (source, target, relation) triple must be ignored; only one edge must exist"
+        );
+    }
+
+    // F053 (CRIT): natural-key conflict must DO UPDATE (refresh weight/metadata), not DO NOTHING.
+    // ADR-009 requires the second upsert to overwrite weight=0.5; current code keeps weight=1.0.
+    #[tokio::test]
+    async fn graph_duplicate_edges_refresh_existing_row() {
+        let store = setup_memory_store();
+        let src = Uuid::new_v4();
+        let tgt = Uuid::new_v4();
+
+        let now = Utc::now();
+        let edge1 = Edge {
+            id: Uuid::new_v4().into(),
+            namespace: "default".to_string(),
+            source_id: src,
+            target_id: tgt,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        };
+        let edge2 = Edge {
+            id: Uuid::new_v4().into(),
+            namespace: "default".to_string(),
+            source_id: src,
+            target_id: tgt,
+            relation: EdgeRelation::Extends,
+            weight: 0.5,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        };
+
+        store.upsert_edge(edge1).await.unwrap();
+        store.upsert_edge(edge2).await.unwrap();
+
+        let edges = store
+            .query_edges(EdgeFilter::default(), vec![], PageRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            edges.items.len(),
+            1,
+            "duplicate natural key must collapse to one row"
+        );
+        assert!(
+            (edges.items[0].weight - 0.5).abs() < 0.001,
+            "F053: natural-key conflict must DO UPDATE (weight=0.5 from second upsert); \
+             current DO NOTHING keeps stale weight={}",
+            edges.items[0].weight
         );
     }
 }

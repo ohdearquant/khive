@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, KindHook, RuntimeError, VerbRegistry};
-use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, Pack, VerbDef};
+use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack, Visibility};
 
 use crate::hook::TaskHook;
 
@@ -37,7 +37,7 @@ impl Pack for GtdPack {
     const NAME: &'static str = "gtd";
     const NOTE_KINDS: &'static [&'static str] = &["task"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const VERBS: &'static [VerbDef] = &GTD_VERBS;
+    const HANDLERS: &'static [HandlerDef] = &GTD_HANDLERS;
     const EDGE_RULES: &'static [EdgeEndpointRule] = &GTD_EDGE_RULES;
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
@@ -55,31 +55,36 @@ static GTD_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
 //   Directive — attempts to get hearer to do something
 //   Assertive — retrieves/presents state of affairs
 //   Declaration — changes institutional status by fiat
-static GTD_VERBS: [VerbDef; 5] = [
+static GTD_HANDLERS: [HandlerDef; 5] = [
     // Directive: directs an actor to perform work
-    VerbDef {
+    HandlerDef {
         name: "assign",
         description: "Create a GTD task (note with kind=task)",
+        visibility: Visibility::Verb,
     },
     // Assertive: retrieves actionable tasks
-    VerbDef {
+    HandlerDef {
         name: "next",
         description: "List actionable tasks (status=next or active) by priority",
+        visibility: Visibility::Verb,
     },
     // Declaration: declares a task done
-    VerbDef {
+    HandlerDef {
         name: "complete",
         description: "Mark a task done with an optional result note",
+        visibility: Visibility::Verb,
     },
     // Assertive: retrieves filtered task listing
-    VerbDef {
+    HandlerDef {
         name: "tasks",
         description: "List tasks filtered by status, assignee, priority",
+        visibility: Visibility::Verb,
     },
     // Declaration: changes task lifecycle status
-    VerbDef {
+    HandlerDef {
         name: "transition",
         description: "Explicit GTD status transition with lifecycle validation",
+        visibility: Visibility::Verb,
     },
 ];
 
@@ -127,8 +132,8 @@ impl PackRuntime for GtdPack {
         <GtdPack as Pack>::ENTITY_KINDS
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        &GTD_VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        &GTD_HANDLERS
     }
 
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] {

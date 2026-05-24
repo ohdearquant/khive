@@ -176,6 +176,11 @@ const V1_UP: &str = "\
 /// `run_migrations` is called on such a DB, the V5 `ALTER TABLE` would fail with
 /// "duplicate column name".  The migration runner handles this by checking column
 /// existence before applying V5 — see `run_migrations`.
+///
+/// V9 note: Adds lifecycle columns (updated_at, deleted_at) and backend routing
+/// metadata (target_backend) to graph_edges. Uses table rebuild to work around
+/// SQLite's limited ALTER TABLE support. Backfills updated_at = created_at for
+/// existing rows and sets deleted_at = NULL, target_backend = NULL.
 const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     DELETE FROM graph_edges \
     WHERE rowid NOT IN (\
@@ -191,6 +196,42 @@ const V5_ADD_ENTITY_TYPE_TO_ENTITIES: &str = "\
     ALTER TABLE entities ADD COLUMN entity_type TEXT NULL;\
     CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type \
     ON entities(namespace, kind, entity_type);\
+";
+
+const V9_EDGE_LIFECYCLE_AND_TARGET_BACKEND: &str = "\
+    DROP INDEX IF EXISTS idx_graph_edges_unique_triple;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_source;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_target;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_relation;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_src_rel;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_tgt_rel;\
+    CREATE TABLE graph_edges_new (\
+        namespace TEXT NOT NULL,\
+        id TEXT NOT NULL,\
+        source_id TEXT NOT NULL,\
+        target_id TEXT NOT NULL,\
+        relation TEXT NOT NULL,\
+        weight REAL NOT NULL DEFAULT 1.0,\
+        created_at INTEGER NOT NULL,\
+        updated_at INTEGER NOT NULL,\
+        deleted_at INTEGER,\
+        metadata TEXT,\
+        target_backend TEXT,\
+        PRIMARY KEY (namespace, id)\
+    );\
+    INSERT INTO graph_edges_new \
+        (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, metadata, target_backend) \
+    SELECT namespace, id, source_id, target_id, relation, weight, created_at, created_at, NULL, metadata, NULL \
+    FROM graph_edges;\
+    DROP TABLE graph_edges;\
+    ALTER TABLE graph_edges_new RENAME TO graph_edges;\
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique_triple ON graph_edges(namespace, source_id, target_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_source ON graph_edges(namespace, source_id);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_target ON graph_edges(namespace, target_id);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_relation ON graph_edges(namespace, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_src_rel ON graph_edges(namespace, source_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_tgt_rel ON graph_edges(namespace, target_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_target_backend ON graph_edges(target_backend) WHERE target_backend IS NOT NULL;\
 ";
 
 pub const MIGRATIONS: &[VersionedMigration] = &[
@@ -218,6 +259,29 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 5,
         name: "add_entity_type_to_entities",
         up: V5_ADD_ENTITY_TYPE_TO_ENTITIES,
+    },
+    // V6–V8 slots are reserved in the ADR-015 migration ledger for other ADRs
+    // (ADR-043, ADR-046, ADR-041 respectively).  These no-op migrations hold the
+    // slot open so the contiguity check passes while those ADRs are implemented.
+    VersionedMigration {
+        version: 6,
+        name: "reserved_adr043_embedding_pipeline_extensions",
+        up: "SELECT 1;",
+    },
+    VersionedMigration {
+        version: 7,
+        name: "reserved_adr046_event_sourced_proposals_index",
+        up: "SELECT 1;",
+    },
+    VersionedMigration {
+        version: 8,
+        name: "reserved_adr041_event_observations_and_session_id",
+        up: "SELECT 1;",
+    },
+    VersionedMigration {
+        version: 9,
+        name: "edge_lifecycle_and_target_backend",
+        up: V9_EDGE_LIFECYCLE_AND_TARGET_BACKEND,
     },
 ];
 
@@ -383,17 +447,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 5);
+        assert_eq!(version, 9);
 
-        // Verify the tracking table has rows for V1..V5.
+        // Verify the tracking table has rows for V1..V9.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 9);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -442,54 +506,88 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 5);
-        assert_eq!(v2, 5);
+        assert_eq!(v1, 9);
+        assert_eq!(v2, 9);
 
-        // Should still have exactly five rows in the tracking table (V1..V5).
+        // Should still have exactly nine rows in the tracking table (V1..V9).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 9);
+    }
+
+    // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
+    // ADR-009 requires target_backend for backend routing.
+    #[test]
+    fn migration_v9_adds_target_backend_index() {
+        let mut conn = open_memory();
+        let version = run_migrations(&mut conn).expect("migrations should succeed");
+        assert_eq!(
+            version, 9,
+            "F052: latest migration must be V9 (edge lifecycle + target_backend)"
+        );
+        let col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('graph_edges') WHERE name = 'target_backend'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            col, 1,
+            "F052: graph_edges must have target_backend column after V6 migration"
+        );
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_graph_edges_target_backend'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx, 1,
+            "F052: idx_graph_edges_target_backend partial index must exist after V6 migration"
+        );
     }
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v6 = VersionedMigration {
-            version: 6,
+        let bad_v10 = VersionedMigration {
+            version: 10,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1..V5) so the DB is at V5.
-        run_migrations(&mut conn).expect("V1..V5 should apply cleanly");
+        // Apply all real migrations (V1..V9) so the DB is at V9.
+        run_migrations(&mut conn).expect("V1..V9 should apply cleanly");
 
-        // Now manually drive the bad V6 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v6);
+        // Now manually drive the bad V10 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v10);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V5 — no V6 row in tracking.
-        let v6_count: i64 = conn
+        // DB should still be at V9 — no V10 row in tracking.
+        let v10_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 6",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 10",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v6_count, 0, "V6 must not be recorded after rollback");
+        assert_eq!(v10_count, 0, "V10 must not be recorded after rollback");
 
-        // V1..V5 should still be there.
+        // V1..V9 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(applied_count, 5, "V1..V5 must still be recorded");
+        assert_eq!(applied_count, 9, "V1..V9 must still be recorded");
     }
 
     #[test]
@@ -515,8 +613,9 @@ mod tests {
         // Now run versioned migrations — V2 should detect the existing column
         // and skip the ALTER TABLE without error. V4 adds the unique triple index.
         // V5 should detect entity_type already present via ENTITIES_DDL and skip.
+        // V9 rebuilds graph_edges with lifecycle columns.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 5);
+        assert_eq!(version, 9);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -542,6 +641,19 @@ mod tests {
         assert_eq!(
             v5_count, 1,
             "V5 must be recorded even when entity_type column pre-exists"
+        );
+
+        // V9 (edge lifecycle + target_backend) must be recorded.
+        let v9_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 9",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v9_count, 1,
+            "V9 must be recorded after store-DDL + migrations"
         );
     }
 

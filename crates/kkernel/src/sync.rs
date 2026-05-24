@@ -251,12 +251,16 @@ async fn upsert_edges(
                 .unwrap_or_else(chrono::Utc::now);
         let edge = Edge {
             id: LinkId::from(r.edge_id),
+            namespace: namespace.to_string(),
             source_id: r.source,
             target_id: r.target,
             relation,
             weight: r.weight,
             created_at,
+            updated_at: created_at,
+            deleted_at: None,
             metadata: None,
+            target_backend: None,
         };
         graph
             .upsert_edge(edge)

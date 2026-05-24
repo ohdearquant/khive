@@ -435,8 +435,10 @@ def test_edge_cascade_hard_delete(proc: subprocess.Popen) -> None:
     e1 = _tool(proc, "link", {
         "source_id": hub["id"], "target_id": spoke1["id"], "relation": "extends",
     })
+    # ADR-002: depends_on is restricted to Project/Service/Artifact endpoints, not Concept.
+    # Use `enables` (valid concept-to-concept) for this contract.
     e2 = _tool(proc, "link", {
-        "source_id": spoke2["id"], "target_id": hub["id"], "relation": "depends_on",
+        "source_id": spoke2["id"], "target_id": hub["id"], "relation": "enables",
     })
     e1_id = e1["id"]
     e2_id = e2["id"]
@@ -673,10 +675,12 @@ def test_merge_semantics(proc: subprocess.Popen) -> None:
     # Create edges incident on "gone":
     #   third → gone (inbound edge to gone)
     #   gone → kept  (outbound edge from gone, which would become a self-loop after merge — should be dropped)
+    # ADR-002: depends_on is restricted to Project/Service/Artifact endpoints, not Concept.
+    # Use `enables` (valid concept-to-concept) for this contract.
     e_inbound = _tool(proc, "link", {
         "source_id": third["id"],
         "target_id": gone["id"],
-        "relation": "depends_on",
+        "relation": "enables",
         "weight": 0.7,
     })
     e_self_loop = _tool(proc, "link", {

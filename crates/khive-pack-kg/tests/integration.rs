@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
-use khive_runtime::pack::{PackRuntime, VerbDef};
+use khive_runtime::pack::{HandlerDef, PackRuntime};
 use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use khive_types::Pack;
 use serde_json::{json, Value};
@@ -27,7 +27,7 @@ impl Fixture {
         self.registry.dispatch(verb, args).await
     }
 
-    fn verbs(&self) -> Vec<&'static VerbDef> {
+    fn verbs(&self) -> Vec<&'static HandlerDef> {
         self.registry.all_verbs()
     }
 }
@@ -874,7 +874,7 @@ async fn neighbors_enriches_with_name_and_kind() {
     let tgt = pack
         .dispatch(
             "create",
-            json!({"kind": "entity", "name": "GQA", "entity_kind": "project"}),
+            json!({"kind": "entity", "name": "GQA", "entity_kind": "concept"}),
         )
         .await
         .unwrap();
@@ -905,7 +905,7 @@ async fn neighbors_enriches_with_name_and_kind() {
     );
     assert_eq!(
         hit.get("kind").and_then(Value::as_str),
-        Some("project"),
+        Some("concept"),
         "neighbor hit must carry entity kind (#162); hit={hit}"
     );
 }
@@ -1203,7 +1203,7 @@ impl Pack for FakeMemoryPack {
     const NAME: &'static str = "memory";
     const NOTE_KINDS: &'static [&'static str] = &["memory"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const VERBS: &'static [VerbDef] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[];
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
@@ -1221,8 +1221,8 @@ impl PackRuntime for FakeMemoryPack {
         FakeMemoryPack::ENTITY_KINDS
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        FakeMemoryPack::VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        FakeMemoryPack::HANDLERS
     }
 
     fn requires(&self) -> &'static [&'static str] {
@@ -1952,5 +1952,185 @@ async fn link_output_returns_full_uuids_and_iso_dates() {
     assert!(
         created_at.contains('T'),
         "created_at must be ISO 8601; got: {created_at:?}"
+    );
+}
+
+// ── Bulk link: entry limit, dedup, and response shape ────────────────────────
+
+// Fix 2: >1000 entries must return InvalidInput immediately.
+#[tokio::test]
+async fn bulk_link_over_1000_entries_returns_error() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "BulkA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "BulkB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let entries: Vec<Value> = (0..1001)
+        .map(|_| {
+            json!({
+                "source_id": a_id,
+                "target_id": b_id,
+                "relation": "extends",
+            })
+        })
+        .collect();
+
+    let err = pack
+        .dispatch("link", json!({"links": entries}))
+        .await
+        .expect_err("1001 entries must return an error");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput for >1000 bulk entries, got {err:?}"
+    );
+}
+
+// Fix 3: duplicate entries in a bulk request must be deduplicated (skipped count > 0).
+// Fix 4: response shape must have attempted/created/skipped/failed keys.
+#[tokio::test]
+async fn bulk_link_dedup_and_response_shape() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DedupA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DedupB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+    let c = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DedupC", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let c_id = c.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // 3 entries: A->B extends, A->B extends (dup), A->C extends.
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [
+                    {"source_id": a_id, "target_id": b_id, "relation": "extends"},
+                    {"source_id": a_id, "target_id": b_id, "relation": "extends"},
+                    {"source_id": a_id, "target_id": c_id, "relation": "extends"},
+                ],
+                "atomic": true,
+            }),
+        )
+        .await
+        .expect("bulk link must succeed");
+
+    assert_eq!(
+        result.get("attempted").and_then(Value::as_u64),
+        Some(3),
+        "attempted must be 3; got {result:?}"
+    );
+    assert_eq!(
+        result.get("created").and_then(Value::as_u64),
+        Some(2),
+        "created must be 2 (one dup skipped); got {result:?}"
+    );
+    assert_eq!(
+        result.get("skipped").and_then(Value::as_u64),
+        Some(1),
+        "skipped must be 1; got {result:?}"
+    );
+    assert_eq!(
+        result.get("failed").and_then(Value::as_u64),
+        Some(0),
+        "failed must be 0; got {result:?}"
+    );
+    // ADR-038: edges key must be absent when verbose is not set (F205).
+    assert!(
+        result.get("edges").is_none(),
+        "edges must be absent without verbose=true (ADR-038 F205); got {result:?}"
+    );
+}
+
+// F205: bulk link with verbose=true must include edges array; without verbose it must be absent.
+#[tokio::test]
+async fn bulk_link_verbose_controls_edges_key() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "VerbA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "VerbB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // Without verbose: no edges key.
+    let result_no_verbose = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [{"source_id": a_id, "target_id": b_id, "relation": "extends"}],
+            }),
+        )
+        .await
+        .expect("bulk link must succeed");
+    assert!(
+        result_no_verbose.get("edges").is_none(),
+        "edges must be absent without verbose=true (ADR-038 F205); got {result_no_verbose:?}"
+    );
+
+    // With verbose=true: edges key present.
+    let c = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "VerbC", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let c_id = c.get("id").and_then(Value::as_str).unwrap().to_string();
+    let result_verbose = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [{"source_id": a_id, "target_id": c_id, "relation": "extends"}],
+                "verbose": true,
+            }),
+        )
+        .await
+        .expect("bulk link with verbose must succeed");
+    assert!(
+        result_verbose
+            .get("edges")
+            .and_then(Value::as_array)
+            .is_some(),
+        "edges must be present with verbose=true (ADR-038 F205); got {result_verbose:?}"
     );
 }

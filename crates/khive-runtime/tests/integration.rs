@@ -167,7 +167,7 @@ async fn link_and_neighbors() {
         .await
         .unwrap();
 
-    rt.link(None, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0)
+    rt.link(None, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0, None)
         .await
         .unwrap();
 
@@ -197,10 +197,10 @@ async fn traverse_multi_hop() {
         .await
         .unwrap();
 
-    rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+    rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
         .await
         .unwrap();
-    rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0)
+    rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0, None)
         .await
         .unwrap();
 
@@ -318,7 +318,7 @@ async fn query_via_gql() {
         .create_entity(None, "concept", None, "QLoRA", None, None, vec![])
         .await
         .unwrap();
-    rt.link(None, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0)
+    rt.link(None, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0, None)
         .await
         .unwrap();
 

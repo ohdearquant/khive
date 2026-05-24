@@ -336,7 +336,7 @@ mod tests {
             .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -367,10 +367,10 @@ mod tests {
             .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, c.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         // Add a node two hops away — it must NOT appear.
@@ -378,7 +378,7 @@ mod tests {
             .create_entity(None, "concept", None, "D", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, b.id, d.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, d.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -413,7 +413,7 @@ mod tests {
             .await
             .unwrap();
         // Edge goes B -> A; traversing Out from A should find nothing.
-        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -442,7 +442,7 @@ mod tests {
             .await
             .unwrap();
         // Edge goes B -> A; traversing In from A should find B.
-        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, a.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -474,10 +474,10 @@ mod tests {
             .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(None, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
@@ -510,10 +510,10 @@ mod tests {
             .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -567,7 +567,7 @@ mod tests {
             .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -594,10 +594,10 @@ mod tests {
             .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, b.id, c.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 

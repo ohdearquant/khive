@@ -7,7 +7,9 @@ use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{
     KhiveRuntime, PackRuntime, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
-use khive_types::{Details, ErrorCode as KhiveErrorCode, ErrorDomain, KhiveError, Pack, VerbDef};
+use khive_types::{
+    Details, ErrorCode as KhiveErrorCode, ErrorDomain, HandlerDef, KhiveError, Pack, Visibility,
+};
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult, ClientInfo, ErrorCode},
     ClientHandler, ServerHandler, ServiceError, ServiceExt,
@@ -912,9 +914,10 @@ impl khive_types::Pack for ErrorInjectPack {
     const NAME: &'static str = "error-inject";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const VERBS: &'static [VerbDef] = &[VerbDef {
+    const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
         name: "always_fail",
         description: "always returns a KhiveError::unavailable with code + details",
+        visibility: Visibility::Verb,
     }];
 }
 
@@ -932,8 +935,8 @@ impl PackRuntime for ErrorInjectPack {
         &[]
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        ErrorInjectPack::VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        ErrorInjectPack::HANDLERS
     }
 
     async fn dispatch(

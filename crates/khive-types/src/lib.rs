@@ -35,7 +35,9 @@ pub use id::{Id128, ParseIdError};
 pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};
 pub use namespace::Namespace;
 pub use note::{Note, NoteKind, NoteStatus};
-pub use pack::{EdgeEndpointRule, EndpointKind, Pack, VerbDef};
+#[allow(deprecated)]
+pub use pack::VerbDef;
+pub use pack::{EdgeEndpointRule, EndpointKind, HandlerDef, Pack, Visibility};
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;
