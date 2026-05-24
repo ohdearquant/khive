@@ -54,7 +54,11 @@ impl<T: Send + Sync> RegisteredObjective<T> {
         candidates: &'a [T],
         context: &ObjectiveContext,
     ) -> ObjectiveResult<Selection<&'a T>> {
-        self.objective.select(candidates, context)
+        self.objective
+            .select(candidates, context)
+            .into_iter()
+            .next()
+            .ok_or_else(|| ObjectiveError::NoMatch("No candidate selected".into()))
     }
 }
 
@@ -179,7 +183,11 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         context: &ObjectiveContext,
     ) -> ObjectiveResult<Selection<&'a T>> {
         let objective = self.get(name)?;
-        objective.select(candidates, context)
+        objective
+            .select(candidates, context)
+            .into_iter()
+            .next()
+            .ok_or_else(|| ObjectiveError::NoMatch("No candidate selected".into()))
     }
 
     pub fn select_default<'a>(
@@ -188,7 +196,11 @@ impl<T: Send + Sync> ObjectiveRegistry<T> {
         context: &ObjectiveContext,
     ) -> ObjectiveResult<Selection<&'a T>> {
         let objective = self.get_default()?;
-        objective.select(candidates, context)
+        objective
+            .select(candidates, context)
+            .into_iter()
+            .next()
+            .ok_or_else(|| ObjectiveError::NoMatch("No candidate selected".into()))
     }
 }
 

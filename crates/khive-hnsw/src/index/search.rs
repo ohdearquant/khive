@@ -5,7 +5,7 @@ use khive_score::DeterministicScore;
 
 use super::HnswIndex;
 use crate::config::DistanceMetric;
-use crate::distance::{cosine_distance_from_parts, distance_to_similarity, OrderedF32};
+use crate::distance::{cosine_distance_from_parts, score_from_distance, OrderedF32};
 use crate::error::{Result, RetrievalError};
 use crate::metrics::{self, MetricEvent, MetricValue};
 use crate::search_context::HnswSearchContext;
@@ -350,10 +350,9 @@ impl HnswIndex {
             .take(k)
             .map(|(dist, iid)| {
                 let true_dist = if is_l2 { dist.max(0.0).sqrt() } else { *dist };
-                let similarity = distance_to_similarity(true_dist, self.config.metric);
                 (
                     self.external_id(*iid),
-                    DeterministicScore::from_f32(similarity),
+                    score_from_distance(true_dist, self.config.metric),
                 )
             })
             .collect();
@@ -382,7 +381,7 @@ impl HnswIndex {
         let metric = self.config.metric;
         let n = self.nodes.len();
 
-        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(n);
+        let mut scored: Vec<(usize, DeterministicScore)> = Vec::with_capacity(n);
         let mut i = 0usize;
 
         while i + 4 <= n {
@@ -403,7 +402,7 @@ impl HnswIndex {
                 hnsw_distance_batch4_from_dots(metric, dots, query_norm, query_is_unit, norms);
             for (j, &dist) in dists.iter().enumerate() {
                 if !self.is_tombstoned(i + j) {
-                    scored.push((i + j, distance_to_similarity(dist, metric)));
+                    scored.push((i + j, score_from_distance(dist, metric)));
                 }
             }
             i += 4;
@@ -422,7 +421,7 @@ impl HnswIndex {
                         _ => unreachable!(),
                     }
                 };
-                scored.push((i, distance_to_similarity(dist, metric)));
+                scored.push((i, score_from_distance(dist, metric)));
             }
             i += 1;
         }
@@ -433,16 +432,14 @@ impl HnswIndex {
 
         let effective_k = k.min(scored.len());
         if scored.len() > effective_k {
-            scored.select_nth_unstable_by(effective_k - 1, |(_, a), (_, b)| {
-                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            scored.select_nth_unstable_by(effective_k - 1, |(_, a), (_, b)| b.cmp(a));
             scored.truncate(effective_k);
         }
-        scored.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|(_, a), (_, b)| b.cmp(a));
 
         Ok(scored
             .into_iter()
-            .map(|(iid, sim)| (self.external_id(iid), DeterministicScore::from_f32(sim)))
+            .map(|(iid, score)| (self.external_id(iid), score))
             .collect())
     }
 

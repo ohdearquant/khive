@@ -13,14 +13,12 @@ use crate::{FoldContext, FoldOutcome};
 /// - S: The derived state type
 ///
 /// Folds are deterministic: same entries + same context = same state.
-pub trait Fold<L, S> {
+pub trait Fold<L, S>: Send + Sync {
     /// Get the initial state before any entries are processed.
-    fn initial(&self, context: &FoldContext) -> S;
+    fn init(&self, context: &FoldContext) -> S;
 
     /// Process a single entry and return the new state.
-    ///
-    /// This is the core step function: state' = step(state, entry, context)
-    fn step(&self, state: S, entry: &L, context: &FoldContext) -> S;
+    fn reduce(&self, state: S, entry: &L, context: &FoldContext) -> S;
 
     /// Finalize the state after all entries are processed.
     ///
@@ -39,18 +37,15 @@ pub trait Fold<L, S> {
         I: IntoIterator<Item = &'a L>,
         L: 'a,
     {
-        let started_at = chrono::Utc::now();
-        let mut state = self.initial(context);
+        let mut state = self.init(context);
         let mut count = 0;
 
         for entry in entries {
-            state = self.step(state, entry, context);
+            state = self.reduce(state, entry, context);
             count += 1;
         }
 
-        state = self.finalize(state, context);
-
-        FoldOutcome::with_timing(state, count, context.clone(), started_at)
+        FoldOutcome::new(self.finalize(state, context), count)
     }
 
     /// Derive state with a filter.
@@ -66,20 +61,17 @@ pub trait Fold<L, S> {
         L: 'a,
         F: Fn(&L) -> bool,
     {
-        let started_at = chrono::Utc::now();
-        let mut state = self.initial(context);
+        let mut state = self.init(context);
         let mut count = 0;
 
         for entry in entries {
             if filter(entry) {
-                state = self.step(state, entry, context);
+                state = self.reduce(state, entry, context);
                 count += 1;
             }
         }
 
-        state = self.finalize(state, context);
-
-        FoldOutcome::with_timing(state, count, context.clone(), started_at)
+        FoldOutcome::new(self.finalize(state, context), count)
     }
 }
 
@@ -107,13 +99,13 @@ where
     T: Fold<L, S> + ?Sized,
 {
     #[inline]
-    fn initial(&self, context: &FoldContext) -> S {
-        (**self).initial(context)
+    fn init(&self, context: &FoldContext) -> S {
+        (**self).init(context)
     }
 
     #[inline]
-    fn step(&self, state: S, entry: &L, context: &FoldContext) -> S {
-        (**self).step(state, entry, context)
+    fn reduce(&self, state: S, entry: &L, context: &FoldContext) -> S {
+        (**self).reduce(state, entry, context)
     }
 
     #[inline]
@@ -137,13 +129,13 @@ where
     T: Fold<L, S> + ?Sized,
 {
     #[inline]
-    fn initial(&self, context: &FoldContext) -> S {
-        (**self).initial(context)
+    fn init(&self, context: &FoldContext) -> S {
+        (**self).init(context)
     }
 
     #[inline]
-    fn step(&self, state: S, entry: &L, context: &FoldContext) -> S {
-        (**self).step(state, entry, context)
+    fn reduce(&self, state: S, entry: &L, context: &FoldContext) -> S {
+        (**self).reduce(state, entry, context)
     }
 
     #[inline]
@@ -197,17 +189,19 @@ where
 
 impl<L, S, I, St, F> Fold<L, S> for FnFold<L, S, I, St, F>
 where
-    I: Fn(&FoldContext) -> S,
-    St: Fn(S, &L, &FoldContext) -> S,
-    F: Fn(S, &FoldContext) -> S,
+    L: Send + Sync,
+    S: Send + Sync,
+    I: Fn(&FoldContext) -> S + Send + Sync,
+    St: Fn(S, &L, &FoldContext) -> S + Send + Sync,
+    F: Fn(S, &FoldContext) -> S + Send + Sync,
 {
     #[inline]
-    fn initial(&self, context: &FoldContext) -> S {
+    fn init(&self, context: &FoldContext) -> S {
         (self.initial_fn)(context)
     }
 
     #[inline]
-    fn step(&self, state: S, entry: &L, context: &FoldContext) -> S {
+    fn reduce(&self, state: S, entry: &L, context: &FoldContext) -> S {
         (self.step_fn)(state, entry, context)
     }
 
@@ -219,9 +213,11 @@ where
 
 impl<L, S, I, St, F> TryFold<L, S> for FnFold<L, S, I, St, F>
 where
-    I: Fn(&FoldContext) -> S,
-    St: Fn(S, &L, &FoldContext) -> S,
-    F: Fn(S, &FoldContext) -> S,
+    L: Send + Sync,
+    S: Send + Sync,
+    I: Fn(&FoldContext) -> S + Send + Sync,
+    St: Fn(S, &L, &FoldContext) -> S + Send + Sync,
+    F: Fn(S, &FoldContext) -> S + Send + Sync,
 {
     #[inline]
     fn try_step(&self, state: S, entry: &L, context: &FoldContext) -> Result<S, FoldFailure> {
@@ -232,8 +228,10 @@ where
 /// Create a fold from just initial and step functions (no finalize).
 pub fn fold_fn<L, S, I, St>(initial: I, step: St) -> impl Fold<L, S>
 where
-    I: Fn(&FoldContext) -> S,
-    St: Fn(S, &L, &FoldContext) -> S,
+    L: Send + Sync,
+    S: Send + Sync,
+    I: Fn(&FoldContext) -> S + Send + Sync,
+    St: Fn(S, &L, &FoldContext) -> S + Send + Sync,
 {
     FnFold::new(initial, step, |s, _| s)
 }
@@ -262,12 +260,12 @@ impl<L> Default for CountFold<L> {
 
 impl<L> Fold<L, usize> for CountFold<L> {
     #[inline]
-    fn initial(&self, _context: &FoldContext) -> usize {
+    fn init(&self, _context: &FoldContext) -> usize {
         0
     }
 
     #[inline]
-    fn step(&self, state: usize, _entry: &L, _context: &FoldContext) -> usize {
+    fn reduce(&self, state: usize, _entry: &L, _context: &FoldContext) -> usize {
         state.saturating_add(1)
     }
 }
@@ -280,7 +278,7 @@ impl<L> TryFold<L, usize> for CountFold<L> {
         entry: &L,
         context: &FoldContext,
     ) -> Result<usize, FoldFailure> {
-        Ok(self.step(state, entry, context))
+        Ok(self.reduce(state, entry, context))
     }
 }
 
@@ -306,12 +304,12 @@ impl<L> FilterCountFold<L> {
 
 impl<L> Fold<L, usize> for FilterCountFold<L> {
     #[inline]
-    fn initial(&self, _context: &FoldContext) -> usize {
+    fn init(&self, _context: &FoldContext) -> usize {
         0
     }
 
     #[inline]
-    fn step(&self, state: usize, entry: &L, _context: &FoldContext) -> usize {
+    fn reduce(&self, state: usize, entry: &L, _context: &FoldContext) -> usize {
         if (self.predicate)(entry) {
             state.saturating_add(1)
         } else {
@@ -328,7 +326,7 @@ impl<L> TryFold<L, usize> for FilterCountFold<L> {
         entry: &L,
         context: &FoldContext,
     ) -> Result<usize, FoldFailure> {
-        Ok(self.step(state, entry, context))
+        Ok(self.reduce(state, entry, context))
     }
 }
 
@@ -354,12 +352,12 @@ impl<L> SumI64Fold<L> {
 
 impl<L> Fold<L, i64> for SumI64Fold<L> {
     #[inline]
-    fn initial(&self, _context: &FoldContext) -> i64 {
+    fn init(&self, _context: &FoldContext) -> i64 {
         0
     }
 
     #[inline]
-    fn step(&self, state: i64, entry: &L, _context: &FoldContext) -> i64 {
+    fn reduce(&self, state: i64, entry: &L, _context: &FoldContext) -> i64 {
         state.saturating_add((self.project)(entry))
     }
 }
@@ -367,7 +365,7 @@ impl<L> Fold<L, i64> for SumI64Fold<L> {
 impl<L> TryFold<L, i64> for SumI64Fold<L> {
     #[inline]
     fn try_step(&self, state: i64, entry: &L, context: &FoldContext) -> Result<i64, FoldFailure> {
-        Ok(self.step(state, entry, context))
+        Ok(self.reduce(state, entry, context))
     }
 }
 
@@ -393,12 +391,12 @@ impl<L> AnyFold<L> {
 
 impl<L> Fold<L, bool> for AnyFold<L> {
     #[inline]
-    fn initial(&self, _context: &FoldContext) -> bool {
+    fn init(&self, _context: &FoldContext) -> bool {
         false
     }
 
     #[inline]
-    fn step(&self, state: bool, entry: &L, _context: &FoldContext) -> bool {
+    fn reduce(&self, state: bool, entry: &L, _context: &FoldContext) -> bool {
         state || (self.predicate)(entry)
     }
 }
@@ -406,7 +404,7 @@ impl<L> Fold<L, bool> for AnyFold<L> {
 impl<L> TryFold<L, bool> for AnyFold<L> {
     #[inline]
     fn try_step(&self, state: bool, entry: &L, context: &FoldContext) -> Result<bool, FoldFailure> {
-        Ok(self.step(state, entry, context))
+        Ok(self.reduce(state, entry, context))
     }
 }
 
@@ -502,16 +500,16 @@ impl<L> CommonFold<L> {
     ) -> Result<CommonFoldState, FoldFailure> {
         match (self, state) {
             (Self::Count(inner), CommonFoldState::Count(count)) => {
-                Ok(CommonFoldState::Count(inner.step(count, entry, context)))
+                Ok(CommonFoldState::Count(inner.reduce(count, entry, context)))
             }
             (Self::FilterCount(inner), CommonFoldState::Count(count)) => {
-                Ok(CommonFoldState::Count(inner.step(count, entry, context)))
+                Ok(CommonFoldState::Count(inner.reduce(count, entry, context)))
             }
             (Self::SumI64(inner), CommonFoldState::SumI64(sum)) => {
-                Ok(CommonFoldState::SumI64(inner.step(sum, entry, context)))
+                Ok(CommonFoldState::SumI64(inner.reduce(sum, entry, context)))
             }
             (Self::Any(inner), CommonFoldState::Any(any)) => {
-                Ok(CommonFoldState::Any(inner.step(any, entry, context)))
+                Ok(CommonFoldState::Any(inner.reduce(any, entry, context)))
             }
             (kind, state) => Err(FoldFailure::StateMismatch {
                 expected: kind.expected_state_kind(),
@@ -523,7 +521,7 @@ impl<L> CommonFold<L> {
 
 impl<L> Fold<L, CommonFoldState> for CommonFold<L> {
     #[inline]
-    fn initial(&self, _context: &FoldContext) -> CommonFoldState {
+    fn init(&self, _context: &FoldContext) -> CommonFoldState {
         match self {
             Self::Count(_) | Self::FilterCount(_) => CommonFoldState::Count(0),
             Self::SumI64(_) => CommonFoldState::SumI64(0),
@@ -536,7 +534,7 @@ impl<L> Fold<L, CommonFoldState> for CommonFold<L> {
     /// Panics if `state` does not match the variant expected by `self`.
     /// Use [`TryFold::try_step`] to handle the mismatch as an error instead.
     #[inline]
-    fn step(&self, state: CommonFoldState, entry: &L, context: &FoldContext) -> CommonFoldState {
+    fn reduce(&self, state: CommonFoldState, entry: &L, context: &FoldContext) -> CommonFoldState {
         self.try_step(state, entry, context)
             .unwrap_or_else(|err| panic!("{err}"))
     }
@@ -615,17 +613,17 @@ mod tests {
         let entry = 1;
 
         let count = CountFold::new();
-        assert_eq!(count.step(usize::MAX, &entry, &context), usize::MAX);
+        assert_eq!(count.reduce(usize::MAX, &entry, &context), usize::MAX);
 
         let filtered = FilterCountFold::new(|_: &i32| true);
-        assert_eq!(filtered.step(usize::MAX, &entry, &context), usize::MAX);
+        assert_eq!(filtered.reduce(usize::MAX, &entry, &context), usize::MAX);
     }
 
     #[test]
     fn sum_i64_fold_saturates_on_overflow() {
         let context = FoldContext::new();
         let fold = SumI64Fold::new(|value: &i64| *value);
-        assert_eq!(fold.step(i64::MAX, &1, &context), i64::MAX);
+        assert_eq!(fold.reduce(i64::MAX, &1, &context), i64::MAX);
     }
 
     #[test]
@@ -648,5 +646,16 @@ mod tests {
         let entries = [1, 2, 7, 9];
         let result = fold.derive(entries.iter(), &FoldContext::new());
         assert!(result.state);
+    }
+
+    #[test]
+    fn fold_is_deterministic_no_timing() {
+        // Same inputs must produce equal FoldOutcome (PartialEq holds).
+        let fold = fold_fn(|_ctx| 0usize, |c, _: &i32, _ctx| c + 1);
+        let entries = [1, 2, 3];
+        let ctx = FoldContext::new();
+        let a = fold.derive(entries.iter(), &ctx);
+        let b = fold.derive(entries.iter(), &ctx);
+        assert_eq!(a, b);
     }
 }

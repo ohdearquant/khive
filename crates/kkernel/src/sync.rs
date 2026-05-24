@@ -214,6 +214,7 @@ async fn upsert_entities(
             id: r.id,
             namespace: namespace.to_string(),
             kind: r.kind,
+            entity_type: None,
             name: r.name,
             description: r.description,
             properties: r.properties,

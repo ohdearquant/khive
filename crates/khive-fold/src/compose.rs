@@ -126,16 +126,18 @@ where
 
 impl<L, S, F, P> Fold<L, S> for FilterFold<L, S, F, P>
 where
+    L: Send + Sync,
+    S: Send + Sync,
     F: Fold<L, S>,
-    P: Fn(&L) -> bool,
+    P: Fn(&L) -> bool + Send + Sync,
 {
-    fn initial(&self, context: &FoldContext) -> S {
-        self.inner.initial(context)
+    fn init(&self, context: &FoldContext) -> S {
+        self.inner.init(context)
     }
 
-    fn step(&self, state: S, entry: &L, context: &FoldContext) -> S {
+    fn reduce(&self, state: S, entry: &L, context: &FoldContext) -> S {
         if (self.predicate)(entry) {
-            self.inner.step(state, entry, context)
+            self.inner.reduce(state, entry, context)
         } else {
             state
         }
@@ -174,16 +176,19 @@ where
 
 impl<L1, L2, S, F, M> Fold<L1, S> for MapFold<L1, L2, S, F, M>
 where
+    L1: Send + Sync,
+    L2: Send + Sync,
+    S: Send + Sync,
     F: Fold<L2, S>,
-    M: Fn(&L1) -> L2,
+    M: Fn(&L1) -> L2 + Send + Sync,
 {
-    fn initial(&self, context: &FoldContext) -> S {
-        self.inner.initial(context)
+    fn init(&self, context: &FoldContext) -> S {
+        self.inner.init(context)
     }
 
-    fn step(&self, state: S, entry: &L1, context: &FoldContext) -> S {
+    fn reduce(&self, state: S, entry: &L1, context: &FoldContext) -> S {
         let mapped = (self.mapper)(entry);
-        self.inner.step(state, &mapped, context)
+        self.inner.reduce(state, &mapped, context)
     }
 
     fn finalize(&self, state: S, context: &FoldContext) -> S {

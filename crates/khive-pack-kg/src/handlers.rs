@@ -17,7 +17,9 @@ use khive_storage::types::{
 };
 use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
 
-use crate::vocab::{EntityKind, NoteKind};
+use khive_types::EntityKind;
+
+use crate::vocab::NoteKind;
 use crate::KgPack;
 
 // ---- Kind canonicalization (ADR-030) ----
@@ -185,6 +187,7 @@ fn reconcile_specific(
 struct CreateParams {
     kind: String,
     namespace: Option<String>,
+    entity_type: Option<String>,
     name: Option<String>,
     description: Option<String>,
     content: Option<String>,
@@ -207,6 +210,7 @@ struct ListParams {
     limit: Option<u32>,
     offset: Option<u32>,
     entity_kind: Option<String>,
+    entity_type: Option<String>,
     source_id: Option<String>,
     target_id: Option<String>,
     relations: Option<Vec<String>>,
@@ -257,6 +261,7 @@ struct SearchParams {
     query: String,
     limit: Option<u32>,
     entity_kind: Option<String>,
+    entity_type: Option<String>,
     note_kind: Option<String>,
     properties: Option<Value>,
 }
@@ -594,7 +599,7 @@ impl KgPack {
                 )?
                 .ok_or_else(|| {
                     RuntimeError::InvalidInput(
-                        "kind=entity requires a specific kind: either kind=<concept|document|dataset|project|person|org> directly, or kind=entity + entity_kind=<…>".into(),
+                        "kind=entity requires a specific kind: either kind=<concept|document|dataset|project|person|org|artifact|service> directly, or kind=entity + entity_kind=<…>".into(),
                     )
                 })?;
                 let hook = registry.find_kind_hook(&canonical);
@@ -663,6 +668,7 @@ impl KgPack {
                     .create_entity(
                         p.namespace.as_deref(),
                         &canonical,
+                        p.entity_type.as_deref(),
                         &name,
                         p.description.as_deref(),
                         p.properties,
@@ -783,6 +789,7 @@ impl KgPack {
                     .list_entities(
                         p.namespace.as_deref(),
                         kind_filter.as_deref(),
+                        p.entity_type.as_deref(),
                         limit,
                         offset,
                     )
@@ -1053,6 +1060,7 @@ impl KgPack {
                         None,
                         search_limit,
                         kind_filter.as_deref(),
+                        p.entity_type.as_deref(),
                     )
                     .await?;
 
