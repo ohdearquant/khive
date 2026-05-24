@@ -1604,7 +1604,8 @@ impl KgPack {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_relation;
+    use super::{parse_relation, UpdateParams};
+    use serde_json::json;
 
     // F009 (CRIT): error text must be derived from EdgeRelation::ALL, not a hardcoded list.
     // ADR-002 mandates 15 relations; error text must include derived_from and precedes.
@@ -1619,6 +1620,68 @@ mod tests {
         assert!(
             msg.contains("precedes"),
             "F009: parse_relation error must list precedes (ADR-002); got: {msg}"
+        );
+    }
+
+    // ADR-014: wire-level tri-state nullable f64 for `update`.
+    //   absent  → outer None (preserve existing value)
+    //   null    → Some(None) (clear the value)
+    //   number  → Some(Some(v)) (set to v)
+    //
+    // Regression for round-3 finding: the previous `Option<Value>` representation
+    // collapsed absent and null into the same `None`, so JSON null could not
+    // distinguish "clear" from "preserve" through the MCP wire surface.
+    #[test]
+    fn update_params_tri_state_salience() {
+        let absent: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note"})).unwrap();
+        assert_eq!(
+            absent.salience, None,
+            "absent salience key must deserialize to outer None (preserve)"
+        );
+
+        let cleared: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note", "salience": null})).unwrap();
+        assert_eq!(
+            cleared.salience,
+            Some(None),
+            "salience=null must deserialize to Some(None) (clear)"
+        );
+
+        let set: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note", "salience": 0.5})).unwrap();
+        assert_eq!(
+            set.salience,
+            Some(Some(0.5)),
+            "salience=0.5 must deserialize to Some(Some(0.5)) (set)"
+        );
+    }
+
+    #[test]
+    fn update_params_tri_state_decay_factor() {
+        let absent: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note"})).unwrap();
+        assert_eq!(
+            absent.decay_factor, None,
+            "absent decay_factor key must deserialize to outer None (preserve)"
+        );
+
+        let cleared: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note", "decay_factor": null}))
+                .unwrap();
+        assert_eq!(
+            cleared.decay_factor,
+            Some(None),
+            "decay_factor=null must deserialize to Some(None) (clear)"
+        );
+
+        let set: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note", "decay_factor": 0.6}))
+                .unwrap();
+        assert_eq!(
+            set.decay_factor,
+            Some(Some(0.6)),
+            "decay_factor=0.6 must deserialize to Some(Some(0.6)) (set)"
         );
     }
 }
