@@ -107,11 +107,15 @@ pub struct Entity {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Link {
     pub id: Id128,
+    pub namespace: String,
     pub source: Id128,
     pub target: Id128,
     pub relation: EdgeRelation,
     pub properties: BTreeMap<String, PropertyValue>,
     pub weight: f64,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub deleted_at: Option<Timestamp>,
 }
 
 /// Property values stored on entities, links, and notes.
@@ -220,13 +224,18 @@ mod tests {
 
     #[test]
     fn link_construction() {
+        let ts = Timestamp::from_secs(1700000000);
         let link = Link {
             id: Id128::from_u128(100),
+            namespace: "default".into(),
             source: Id128::from_u128(1),
             target: Id128::from_u128(2),
             relation: EdgeRelation::Extends,
             properties: BTreeMap::new(),
             weight: 1.0,
+            created_at: ts,
+            updated_at: ts,
+            deleted_at: None,
         };
         assert_eq!(link.relation, EdgeRelation::Extends);
     }

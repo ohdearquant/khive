@@ -874,7 +874,7 @@ async fn neighbors_enriches_with_name_and_kind() {
     let tgt = pack
         .dispatch(
             "create",
-            json!({"kind": "entity", "name": "GQA", "entity_kind": "project"}),
+            json!({"kind": "entity", "name": "GQA", "entity_kind": "concept"}),
         )
         .await
         .unwrap();
@@ -905,7 +905,7 @@ async fn neighbors_enriches_with_name_and_kind() {
     );
     assert_eq!(
         hit.get("kind").and_then(Value::as_str),
-        Some("project"),
+        Some("concept"),
         "neighbor hit must carry entity kind (#162); hit={hit}"
     );
 }

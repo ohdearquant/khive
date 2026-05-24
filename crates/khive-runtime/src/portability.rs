@@ -272,14 +272,19 @@ impl KhiveRuntime {
                 edges_skipped += 1;
                 continue;
             }
+            let now = Utc::now();
             let edge = khive_storage::types::Edge {
                 id: LinkId::from(ee.edge_id),
+                namespace: ns.clone(),
                 source_id: ee.source,
                 target_id: ee.target,
                 relation: ee.relation,
                 weight: ee.weight,
-                created_at: Utc::now(),
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
                 metadata: None,
+                target_backend: None,
             };
             graph.upsert_edge(edge).await?;
             edges_imported += 1;
@@ -339,10 +344,10 @@ mod tests {
             .create_entity(None, "person", "Tri Dao", None, None, vec!["author".into()])
             .await
             .unwrap();
-        src.link(None, e2.id, e1.id, EdgeRelation::Extends, 1.0)
+        src.link(None, e2.id, e1.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        src.link(None, e1.id, e3.id, EdgeRelation::IntroducedBy, 0.9)
+        src.link(None, e1.id, e3.id, EdgeRelation::IntroducedBy, 0.9, None)
             .await
             .unwrap();
 
@@ -384,7 +389,7 @@ mod tests {
             .create_entity(None, "concept", "QLoRA", None, None, vec![])
             .await
             .unwrap();
-        src.link(None, e2.id, e1.id, EdgeRelation::VariantOf, 0.9)
+        src.link(None, e2.id, e1.id, EdgeRelation::VariantOf, 0.9, None)
             .await
             .unwrap();
 
@@ -714,7 +719,7 @@ mod tests {
             .create_entity(None, "concept", "E2", None, None, vec![])
             .await
             .unwrap();
-        src.link(None, e1.id, e2.id, EdgeRelation::VariantOf, 0.7)
+        src.link(None, e1.id, e2.id, EdgeRelation::VariantOf, 0.7, None)
             .await
             .unwrap();
 
@@ -743,7 +748,7 @@ mod tests {
             .await
             .unwrap();
         let stored_edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let stored_id: Uuid = stored_edge.id.into();
@@ -769,7 +774,7 @@ mod tests {
             .await
             .unwrap();
         let stored_edge = src
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let original_id: Uuid = stored_edge.id.into();
@@ -881,7 +886,7 @@ mod tests {
             .await
             .unwrap();
         let stored = src
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let original_edge_id: Uuid = stored.id.into();

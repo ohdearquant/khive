@@ -194,7 +194,7 @@ impl KindHook for TaskHook {
                     }
                 };
                 if let Err(e) = runtime
-                    .link(namespace, id, target, EdgeRelation::DependsOn, 1.0)
+                    .link(namespace, id, target, EdgeRelation::DependsOn, 1.0, None)
                     .await
                 {
                     tracing::warn!(

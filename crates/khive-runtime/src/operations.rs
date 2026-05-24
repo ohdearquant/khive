@@ -107,6 +107,158 @@ fn pack_rule_allows(
     })
 }
 
+/// ADR-002 base endpoint allowlist for entity→entity relations.
+///
+/// Returns `true` if `(src_kind, relation, tgt_kind)` is an explicitly listed
+/// triple in the ADR-002 base contract. `"*"` as `src_kind` means "any entity
+/// kind" (used for `instance_of` whose source is unrestricted).
+///
+/// Pack rules (via `EDGE_RULES`) are additive — they cannot remove rows here.
+fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &str) -> bool {
+    const RULES: &[(&str, EdgeRelation, &str)] = &[
+        // Structure
+        ("concept", EdgeRelation::Contains, "concept"),
+        ("project", EdgeRelation::Contains, "project"),
+        ("project", EdgeRelation::Contains, "artifact"),
+        ("org", EdgeRelation::Contains, "project"),
+        ("org", EdgeRelation::Contains, "service"),
+        ("concept", EdgeRelation::PartOf, "concept"),
+        ("project", EdgeRelation::PartOf, "project"),
+        ("project", EdgeRelation::PartOf, "org"),
+        ("*", EdgeRelation::InstanceOf, "concept"),
+        ("service", EdgeRelation::InstanceOf, "project"),
+        // Derivation
+        ("concept", EdgeRelation::Extends, "concept"),
+        ("concept", EdgeRelation::VariantOf, "concept"),
+        ("artifact", EdgeRelation::VariantOf, "artifact"),
+        ("concept", EdgeRelation::IntroducedBy, "document"),
+        ("concept", EdgeRelation::IntroducedBy, "person"),
+        ("artifact", EdgeRelation::IntroducedBy, "document"),
+        // Provenance
+        ("artifact", EdgeRelation::DerivedFrom, "dataset"),
+        ("artifact", EdgeRelation::DerivedFrom, "document"),
+        ("artifact", EdgeRelation::DerivedFrom, "project"),
+        ("artifact", EdgeRelation::DerivedFrom, "artifact"),
+        // Temporal
+        ("document", EdgeRelation::Precedes, "document"),
+        ("dataset", EdgeRelation::Precedes, "dataset"),
+        ("artifact", EdgeRelation::Precedes, "artifact"),
+        ("service", EdgeRelation::Precedes, "service"),
+        ("project", EdgeRelation::Precedes, "project"),
+        // Dependency
+        ("project", EdgeRelation::DependsOn, "project"),
+        ("service", EdgeRelation::DependsOn, "project"),
+        ("service", EdgeRelation::DependsOn, "service"),
+        ("service", EdgeRelation::DependsOn, "artifact"),
+        ("service", EdgeRelation::DependsOn, "dataset"),
+        ("artifact", EdgeRelation::DependsOn, "project"),
+        ("artifact", EdgeRelation::DependsOn, "service"),
+        ("concept", EdgeRelation::Enables, "concept"),
+        ("service", EdgeRelation::Enables, "concept"),
+        ("dataset", EdgeRelation::Enables, "concept"),
+        // Implementation
+        ("project", EdgeRelation::Implements, "concept"),
+        ("service", EdgeRelation::Implements, "concept"),
+        // Lateral
+        ("concept", EdgeRelation::CompetesWith, "concept"),
+        ("project", EdgeRelation::CompetesWith, "project"),
+        ("service", EdgeRelation::CompetesWith, "service"),
+        ("concept", EdgeRelation::ComposedWith, "concept"),
+        ("project", EdgeRelation::ComposedWith, "project"),
+    ];
+    RULES.iter().any(|(src, rel, tgt)| {
+        *rel == relation && (*src == "*" || *src == src_kind) && *tgt == tgt_kind
+    })
+}
+
+/// Canonical endpoint order for symmetric relations (F012).
+///
+/// For `competes_with` and `composed_with`, normalises direction so that
+/// `source_uuid < target_uuid` (lexicographic on the UUID bytes). This
+/// collapses A→B and B→A into a single canonical row, preventing duplicates.
+fn canonical_edge_endpoints(
+    relation: EdgeRelation,
+    source_id: Uuid,
+    target_id: Uuid,
+) -> (Uuid, Uuid) {
+    if relation.is_symmetric() && target_id < source_id {
+        (target_id, source_id)
+    } else {
+        (source_id, target_id)
+    }
+}
+
+/// Infer the default `dependency_kind` from endpoint entity kinds (ADR-002).
+fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'static str> {
+    match (src_kind, tgt_kind) {
+        ("project", "project") => Some("build"),
+        ("service", "service") => Some("runtime"),
+        ("service", "dataset") => Some("data"),
+        ("service", "artifact") => Some("artifact"),
+        ("artifact", "project") | ("artifact", "service") => Some("tooling"),
+        _ => None,
+    }
+}
+
+/// Merge an inferred `dependency_kind` into `depends_on` edge metadata.
+///
+/// If `metadata` already carries a `dependency_kind` key the existing value is
+/// preserved. If the key is absent and the endpoint pair has a known default,
+/// the inferred value is added. Returns `metadata` unchanged for all other
+/// cases (no matching default, or metadata already has the key).
+fn merge_dependency_kind(
+    src_kind: &str,
+    tgt_kind: &str,
+    metadata: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if let Some(ref m) = metadata {
+        if m.get("dependency_kind").is_some() {
+            return metadata;
+        }
+    }
+    let inferred = infer_dependency_kind(src_kind, tgt_kind)?;
+    let mut obj = metadata.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(o) = obj.as_object_mut() {
+        o.insert("dependency_kind".to_string(), serde_json::json!(inferred));
+    }
+    Some(obj)
+}
+
+/// Valid `dependency_kind` values for `depends_on` edges (ADR-002).
+const VALID_DEPENDENCY_KINDS: &[&str] = &["build", "runtime", "data", "artifact", "tooling"];
+
+/// Validate governed edge metadata keys (ADR-002 §Edge Metadata).
+///
+/// Currently enforces:
+/// - `dependency_kind` is only valid on `depends_on` edges.
+/// - `dependency_kind`, when present, must be one of the five governed values.
+fn validate_edge_metadata(
+    relation: EdgeRelation,
+    metadata: Option<&serde_json::Value>,
+) -> RuntimeResult<()> {
+    let Some(meta) = metadata else {
+        return Ok(());
+    };
+    if let Some(dk) = meta.get("dependency_kind") {
+        if relation != EdgeRelation::DependsOn {
+            return Err(RuntimeError::InvalidInput(format!(
+                "dependency_kind is only valid on depends_on edges (got {})",
+                relation.as_str()
+            )));
+        }
+        let dk_str = dk
+            .as_str()
+            .ok_or_else(|| RuntimeError::InvalidInput("dependency_kind must be a string".into()))?;
+        if !VALID_DEPENDENCY_KINDS.contains(&dk_str) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "unknown dependency_kind {dk_str:?}; valid: {}",
+                VALID_DEPENDENCY_KINDS.join(" | ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl KhiveRuntime {
     // ---- Entity operations ----
 
@@ -335,12 +487,13 @@ impl KhiveRuntime {
                 }
             }
         } else {
-            // All 11 entity-default relations: ADR-002 base contract is
-            // entity→entity. ADR-031 allows packs to extend allowed endpoint
-            // pairs additively (e.g. GTD lets `depends_on` span task→task).
+            // All 13 base relations: ADR-002 contract is entity→entity with
+            // kind-level restrictions (see base allowlist). ADR-031 allows packs
+            // to extend the allowlist additively via EDGE_RULES.
             //
-            // Strategy: resolve both endpoints once, consult pack rules; on
-            // miss, fall through to the original base-rule error messages.
+            // Strategy: resolve both endpoints once, consult pack rules first;
+            // on miss, enforce the ADR-002 substrate check then the kind-level
+            // base allowlist.
             let src_res = self.resolve(namespace, source_id).await?;
             let tgt_res = self.resolve(namespace, target_id).await?;
 
@@ -353,9 +506,9 @@ impl KhiveRuntime {
                 return Ok(());
             }
 
-            // Base-rule check. Same error messages as the pre-ADR-031 surface.
-            match src_res {
-                Some(Resolved::Entity(_)) => {}
+            // Substrate check: both endpoints must be entities.
+            let src_kind = match src_res {
+                Some(Resolved::Entity(e)) => e.kind,
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "link source {source_id} must be an entity for relation {relation:?} \
@@ -373,9 +526,9 @@ impl KhiveRuntime {
                         "link source {source_id} not found in namespace"
                     )));
                 }
-            }
-            match tgt_res {
-                Some(Resolved::Entity(_)) => {}
+            };
+            let tgt_kind = match tgt_res {
+                Some(Resolved::Entity(e)) => e.kind,
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "link target {target_id} must be an entity for relation {relation:?} \
@@ -393,6 +546,13 @@ impl KhiveRuntime {
                         "link target {target_id} not found in namespace"
                     )));
                 }
+            };
+            if !base_entity_rule_allows(&src_kind, relation, &tgt_kind) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "({src_kind}) -[{}]-> ({tgt_kind}) is not in the ADR-002 base endpoint \
+                     allowlist; use pack EDGE_RULES to extend the allowlist",
+                    relation.as_str()
+                )));
             }
         }
         Ok(())
@@ -403,6 +563,13 @@ impl KhiveRuntime {
     /// Enforces the ADR-002/ADR-019/ADR-024 three-case relation contract via
     /// `validate_edge_relation_endpoints`. See that method for the full contract.
     ///
+    /// For symmetric relations (`competes_with`, `composed_with`) the endpoint
+    /// pair is canonicalised to `source_uuid < target_uuid` so that A→B and B→A
+    /// deduplicate to one row (F012).
+    ///
+    /// `metadata` is validated against governed keys (ADR-002 §Edge Metadata);
+    /// `dependency_kind` is inferred for `depends_on` edges when absent (F013).
+    ///
     /// A record that exists but belongs to a different namespace is treated as not found
     /// (fail-closed; no cross-namespace existence leak).
     pub async fn link(
@@ -412,17 +579,38 @@ impl KhiveRuntime {
         target_id: Uuid,
         relation: EdgeRelation,
         weight: f64,
+        metadata: Option<serde_json::Value>,
     ) -> RuntimeResult<Edge> {
         self.validate_edge_relation_endpoints(namespace, source_id, target_id, relation)
             .await?;
+        let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
+        let metadata = if relation == EdgeRelation::DependsOn {
+            match (
+                self.resolve(namespace, source_id).await?,
+                self.resolve(namespace, target_id).await?,
+            ) {
+                (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
+                    merge_dependency_kind(&src_e.kind, &tgt_e.kind, metadata)
+                }
+                _ => metadata,
+            }
+        } else {
+            metadata
+        };
+        validate_edge_metadata(relation, metadata.as_ref())?;
+        let now = chrono::Utc::now();
         let edge = Edge {
             id: LinkId::from(Uuid::new_v4()),
+            namespace: self.ns(namespace).to_string(),
             source_id,
             target_id,
             relation,
             weight,
-            created_at: chrono::Utc::now(),
-            metadata: None,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata,
+            target_backend: None,
         };
         self.graph(namespace)?.upsert_edge(edge.clone()).await?;
         Ok(edge)
@@ -700,8 +888,15 @@ impl KhiveRuntime {
             let link_result = if let Some(e) = injected_err {
                 Err(e)
             } else {
-                self.link(Some(ns), note.id, target_id, EdgeRelation::Annotates, 1.0)
-                    .await
+                self.link(
+                    Some(ns),
+                    note.id,
+                    target_id,
+                    EdgeRelation::Annotates,
+                    1.0,
+                    None,
+                )
+                .await
             };
 
             match link_result {
@@ -709,7 +904,7 @@ impl KhiveRuntime {
                 Err(e) => {
                     // Best-effort compensation — ignore cleanup errors.
                     for edge_id in created_edges {
-                        let _ = self.delete_edge(Some(ns), edge_id).await;
+                        let _ = self.delete_edge(Some(ns), edge_id, true).await;
                     }
                     if let Ok(store) = self.notes(Some(ns)) {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
@@ -1055,7 +1250,9 @@ impl KhiveRuntime {
                     )
                     .await?;
                 for hit in hits {
-                    graph.delete_edge(LinkId::from(hit.edge_id)).await?;
+                    graph
+                        .delete_edge(LinkId::from(hit.edge_id), DeleteMode::Hard)
+                        .await?;
                 }
             }
             let ns_str = ns.to_string();
@@ -1168,7 +1365,9 @@ impl KhiveRuntime {
                     )
                     .await?;
                 for hit in hits {
-                    graph.delete_edge(LinkId::from(hit.edge_id)).await?;
+                    graph
+                        .delete_edge(LinkId::from(hit.edge_id), DeleteMode::Hard)
+                        .await?;
                 }
             }
             self.remove_from_indexes(namespace, id).await?;
@@ -1279,8 +1478,18 @@ impl KhiveRuntime {
     /// If `edge_id` does not refer to an edge (e.g. the caller passes an entity or
     /// note UUID by mistake), this method returns `Ok(false)` immediately with no
     /// side effects — it does **not** cascade inbound edges of the non-edge record.
-    pub async fn delete_edge(&self, namespace: Option<&str>, edge_id: Uuid) -> RuntimeResult<bool> {
+    pub async fn delete_edge(
+        &self,
+        namespace: Option<&str>,
+        edge_id: Uuid,
+        hard: bool,
+    ) -> RuntimeResult<bool> {
         let graph = self.graph(namespace)?;
+        let mode = if hard {
+            DeleteMode::Hard
+        } else {
+            DeleteMode::Soft
+        };
 
         // Guard: verify `edge_id` is actually an edge before touching anything.
         // Without this check, passing an entity/note UUID would delete all inbound
@@ -1303,10 +1512,12 @@ impl KhiveRuntime {
             )
             .await?;
         for hit in inbound {
-            graph.delete_edge(LinkId::from(hit.edge_id)).await?;
+            graph
+                .delete_edge(LinkId::from(hit.edge_id), DeleteMode::Hard)
+                .await?;
         }
 
-        Ok(graph.delete_edge(LinkId::from(edge_id)).await?)
+        Ok(graph.delete_edge(LinkId::from(edge_id), mode).await?)
     }
 
     /// Count edges matching `filter`.
@@ -1317,6 +1528,82 @@ impl KhiveRuntime {
     ) -> RuntimeResult<u64> {
         Ok(self.graph(namespace)?.count_edges(filter.into()).await?)
     }
+
+    /// Validate and construct an edge from a [`LinkSpec`] without writing to storage.
+    ///
+    /// Applies the full ADR-002 contract (endpoint validation, symmetric
+    /// canonicalization, `dependency_kind` inference and metadata validation).
+    /// Returns the constructed `Edge` on success; the caller is responsible for
+    /// persisting it (e.g. via `upsert_edge` or `link_many`).
+    pub async fn build_edge(&self, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        let ns = spec.namespace.as_deref();
+        self.validate_edge_relation_endpoints(ns, spec.source_id, spec.target_id, spec.relation)
+            .await?;
+        let (source_id, target_id) =
+            canonical_edge_endpoints(spec.relation, spec.source_id, spec.target_id);
+        let metadata = if spec.relation == EdgeRelation::DependsOn {
+            match (
+                self.resolve(ns, source_id).await?,
+                self.resolve(ns, target_id).await?,
+            ) {
+                (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
+                    merge_dependency_kind(&src_e.kind, &tgt_e.kind, spec.metadata.clone())
+                }
+                _ => spec.metadata.clone(),
+            }
+        } else {
+            spec.metadata.clone()
+        };
+        validate_edge_metadata(spec.relation, metadata.as_ref())?;
+        let now = chrono::Utc::now();
+        Ok(Edge {
+            id: LinkId::from(Uuid::new_v4()),
+            namespace: self.ns(ns).to_string(),
+            source_id,
+            target_id,
+            relation: spec.relation,
+            weight: spec.weight,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata,
+            target_backend: None,
+        })
+    }
+
+    /// Validate and atomically upsert a batch of edges.
+    ///
+    /// All edges are validated and constructed with `build_edge` before any
+    /// write. If validation fails for any entry the entire batch is rejected
+    /// (no writes occur). On success, all edges are persisted in a single
+    /// atomic transaction via `upsert_edges`.
+    ///
+    /// All specs must share the same namespace; the namespace of the first
+    /// spec is used as the graph store scope.
+    pub async fn link_many(&self, specs: Vec<LinkSpec>) -> RuntimeResult<Vec<Edge>> {
+        if specs.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut edges = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            edges.push(self.build_edge(spec).await?);
+        }
+        let ns = specs[0].namespace.as_deref();
+        self.graph(ns)?.upsert_edges(edges.clone()).await?;
+        Ok(edges)
+    }
+}
+
+/// Fully specified edge creation request — input to [`KhiveRuntime::build_edge`]
+/// and [`KhiveRuntime::link_many`].
+#[derive(Clone, Debug)]
+pub struct LinkSpec {
+    pub namespace: Option<String>,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relation: EdgeRelation,
+    pub weight: f64,
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -1341,7 +1628,7 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
@@ -1365,7 +1652,7 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
@@ -1394,7 +1681,7 @@ mod tests {
             .unwrap();
         // Create a valid note→entity annotates edge.
         let edge = rt
-            .link(None, note.id, entity.id, EdgeRelation::Annotates, 1.0)
+            .link(None, note.id, entity.id, EdgeRelation::Annotates, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
@@ -1431,7 +1718,7 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
@@ -1459,7 +1746,7 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
@@ -1488,7 +1775,7 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
@@ -1514,7 +1801,7 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
@@ -1542,10 +1829,10 @@ mod tests {
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(None, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
@@ -1578,10 +1865,10 @@ mod tests {
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, c.id, d.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, c.id, d.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -1607,12 +1894,12 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
-        let deleted = rt.delete_edge(None, edge_id).await.unwrap();
+        let deleted = rt.delete_edge(None, edge_id, true).await.unwrap();
         assert!(deleted);
 
         let fetched = rt.get_edge(None, edge_id).await.unwrap();
@@ -1635,10 +1922,10 @@ mod tests {
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(None, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
@@ -1840,10 +2127,10 @@ mod tests {
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(None, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
@@ -1870,10 +2157,10 @@ mod tests {
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(None, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
@@ -2112,7 +2399,7 @@ mod tests {
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, phantom, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, phantom, b.id, EdgeRelation::Extends, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2135,7 +2422,7 @@ mod tests {
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, a.id, phantom, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, phantom, EdgeRelation::Extends, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2161,7 +2448,7 @@ mod tests {
             .unwrap();
 
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 0.8)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 0.8, None)
             .await
             .unwrap();
         assert_eq!(edge.source_id, a.id);
@@ -2286,7 +2573,7 @@ mod tests {
 
         // Linking from ns-a: target b lives in ns-b — must be treated as not found.
         let result = rt
-            .link(Some("ns-a"), a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(Some("ns-a"), a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await;
         assert!(
             matches!(result, Err(RuntimeError::NotFound(_))),
@@ -2300,7 +2587,7 @@ mod tests {
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, phantom, phantom, EdgeRelation::Extends, 1.0)
+            .link(None, phantom, phantom, EdgeRelation::Extends, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2328,7 +2615,7 @@ mod tests {
             .unwrap();
         // Create a real edge between a and b, capture its UUID.
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
@@ -2340,7 +2627,7 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, note.id, edge_uuid, EdgeRelation::Annotates, 1.0)
+            .link(None, note.id, edge_uuid, EdgeRelation::Annotates, 1.0, None)
             .await;
         assert!(
             result.is_ok(),
@@ -2360,7 +2647,7 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
@@ -2451,13 +2738,13 @@ mod tests {
             .unwrap();
         // Create a real edge; capture its UUID as the bad target.
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         let result = rt
-            .link(None, a.id, edge_uuid, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, edge_uuid, EdgeRelation::Extends, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2486,7 +2773,7 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, note.id, entity.id, EdgeRelation::DependsOn, 1.0)
+            .link(None, note.id, entity.id, EdgeRelation::DependsOn, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2513,7 +2800,7 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, a.id, b.id, EdgeRelation::Annotates, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Annotates, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2540,14 +2827,14 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         // An existing edge used as an annotates source: wrong kind, not absent.
         let result = rt
-            .link(None, edge_uuid, a.id, EdgeRelation::Annotates, 1.0)
+            .link(None, edge_uuid, a.id, EdgeRelation::Annotates, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2587,7 +2874,7 @@ mod tests {
         rt.events(None).unwrap().append_event(event).await.unwrap();
 
         let result = rt
-            .link(None, note.id, event_id, EdgeRelation::Annotates, 1.0)
+            .link(None, note.id, event_id, EdgeRelation::Annotates, 1.0, None)
             .await;
         assert!(
             result.is_ok(),
@@ -2676,6 +2963,7 @@ mod tests {
                 old_note.id,
                 EdgeRelation::Supersedes,
                 1.0,
+                None,
             )
             .await;
         assert!(
@@ -2703,6 +2991,7 @@ mod tests {
                 old_entity.id,
                 EdgeRelation::Supersedes,
                 1.0,
+                None,
             )
             .await;
         assert!(
@@ -2724,7 +3013,14 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, note.id, entity.id, EdgeRelation::Supersedes, 1.0)
+            .link(
+                None,
+                note.id,
+                entity.id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2752,7 +3048,14 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, entity.id, note.id, EdgeRelation::Supersedes, 1.0)
+            .link(
+                None,
+                entity.id,
+                note.id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2784,7 +3087,14 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, event_id, entity.id, EdgeRelation::Supersedes, 1.0)
+            .link(
+                None,
+                event_id,
+                entity.id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2813,7 +3123,14 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, entity.id, event_id, EdgeRelation::Supersedes, 1.0)
+            .link(
+                None,
+                entity.id,
+                event_id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2837,13 +3154,13 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         let result = rt
-            .link(None, edge_uuid, a.id, EdgeRelation::Supersedes, 1.0)
+            .link(None, edge_uuid, a.id, EdgeRelation::Supersedes, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2867,13 +3184,13 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         let result = rt
-            .link(None, a.id, edge_uuid, EdgeRelation::Supersedes, 1.0)
+            .link(None, a.id, edge_uuid, EdgeRelation::Supersedes, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2903,7 +3220,7 @@ mod tests {
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, phantom, note.id, EdgeRelation::Supersedes, 1.0)
+            .link(None, phantom, note.id, EdgeRelation::Supersedes, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2931,7 +3248,7 @@ mod tests {
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, note.id, phantom, EdgeRelation::Supersedes, 1.0)
+            .link(None, note.id, phantom, EdgeRelation::Supersedes, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2977,6 +3294,7 @@ mod tests {
                 note_a.id,
                 EdgeRelation::Supersedes,
                 1.0,
+                None,
             )
             .await;
         assert!(
@@ -3007,7 +3325,7 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, note.id, entity.id, EdgeRelation::Extends, 1.0)
+            .link(None, note.id, entity.id, EdgeRelation::Extends, 1.0, None)
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
@@ -3028,7 +3346,7 @@ mod tests {
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
@@ -3047,7 +3365,7 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, note.id, edge_uuid, EdgeRelation::Annotates, 1.0)
+            .link(None, note.id, edge_uuid, EdgeRelation::Annotates, 1.0, None)
             .await;
         assert!(
             result.is_ok(),
@@ -3112,7 +3430,7 @@ mod tests {
         let edge_id: Uuid = before_edges[0].edge_id;
 
         // Execute the same cleanup sequence that `create_note_inner`'s Err branch runs.
-        rt.delete_edge(None, edge_id).await.unwrap();
+        rt.delete_edge(None, edge_id, true).await.unwrap();
         rt.delete_note(None, note.id, true /* hard */)
             .await
             .unwrap();
@@ -3278,7 +3596,7 @@ mod tests {
             .unwrap();
         // Create an edge to annotate.
         let base_edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let base_edge_uuid: Uuid = base_edge.id.into();
@@ -3314,7 +3632,7 @@ mod tests {
         );
 
         // Delete the base edge.
-        let deleted = rt.delete_edge(None, base_edge_uuid).await.unwrap();
+        let deleted = rt.delete_edge(None, base_edge_uuid, true).await.unwrap();
         assert!(deleted, "edge delete must return true");
 
         // The annotates edge targeting base_edge must be gone.
@@ -3497,7 +3815,7 @@ mod tests {
         let annotates_edge_id: Uuid = before[0].edge_id;
 
         // Call delete_edge with the entity UUID (NOT an edge UUID).
-        let result = rt.delete_edge(None, entity.id).await;
+        let result = rt.delete_edge(None, entity.id, true).await;
         assert!(
             result.is_ok(),
             "delete_edge must not error on a non-edge UUID"
@@ -3723,6 +4041,85 @@ mod tests {
         assert!(
             after.iter().all(|h| h.note_id != note.id),
             "soft-deleted note must be removed from FTS index"
+        );
+    }
+
+    // F010 (CRIT): ADR-002 base endpoint allowlist — unlisted triples must fail closed.
+    // Document->Document Extends is not in the ADR-002 table; current generic fallthrough accepts it.
+    #[tokio::test]
+    async fn link_extends_document_to_document_returns_invalid_input() {
+        let rt = rt();
+        let d1 = rt
+            .create_entity(None, "document", "DocA", None, None, vec![])
+            .await
+            .unwrap();
+        let d2 = rt
+            .create_entity(None, "document", "DocB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, d1.id, d2.id, EdgeRelation::Extends, 1.0, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "F010: document->document Extends must be rejected by ADR-002 allowlist; \
+             current generic entity fallthrough incorrectly accepts it"
+        );
+    }
+
+    // F010 happy path: Concept->Concept Extends is in the ADR-002 allowlist and must succeed.
+    #[tokio::test]
+    async fn link_extends_concept_to_concept_succeeds() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "CA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "CB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "F010: concept->concept Extends must be allowed (ADR-002 allowlist)"
+        );
+    }
+
+    // F012 (CRIT): CompetesWith is symmetric; reversed pair must deduplicate to one canonical row.
+    // Current code stores both directions as distinct rows (no canonicalization).
+    #[tokio::test]
+    async fn link_symmetric_relation_canonicalizes_endpoint_order() {
+        use khive_storage::EdgeFilter;
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", "ConceptP", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", "ConceptQ", None, None, vec![])
+            .await
+            .unwrap();
+        // Link A->B then B->A with the same symmetric relation.
+        rt.link(None, a.id, b.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        rt.link(None, b.id, a.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        let count = rt
+            .graph(None)
+            .unwrap()
+            .count_edges(EdgeFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            count,
+            1,
+            "F012: CompetesWith is symmetric; A->B and B->A must deduplicate to one canonical row; \
+             found {count} rows (canonicalization not yet implemented)"
         );
     }
 }
