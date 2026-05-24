@@ -38,13 +38,17 @@ impl<T> RegisteredObjective<T> {
         self.objective.score(candidate, context)
     }
 
-    /// Select from candidates
+    /// Select from candidates, returning the best match or an error.
     pub fn select<'a>(
         &self,
         candidates: &'a [T],
         context: &ObjectiveContext,
     ) -> ObjectiveResult<Selection<&'a T>> {
-        self.objective.select(candidates, context)
+        self.objective
+            .select(candidates, context)
+            .into_iter()
+            .next()
+            .ok_or_else(|| ObjectiveError::NoMatch("No candidate selected".into()))
     }
 }
 
@@ -166,7 +170,7 @@ impl<T> ObjectiveRegistry<T> {
         Ok(objective.score(candidate, context))
     }
 
-    /// Select using a named objective
+    /// Select using a named objective, returning the best match or an error.
     pub fn select<'a>(
         &self,
         name: &str,
@@ -177,7 +181,7 @@ impl<T> ObjectiveRegistry<T> {
         objective.select(candidates, context)
     }
 
-    /// Select using the default objective
+    /// Select using the default objective, returning the best match or an error.
     pub fn select_default<'a>(
         &self,
         candidates: &'a [T],

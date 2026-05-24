@@ -62,7 +62,7 @@ impl BrainPack {
     pub fn new(runtime: KhiveRuntime) -> Self {
         let fold = EventFold::new(ENTITY_CACHE_CAPACITY);
         let ctx = FoldContext::new();
-        let state = fold.initial(&ctx);
+        let state = fold.init(&ctx);
         Self {
             runtime,
             state: Mutex::new(state),
@@ -236,7 +236,7 @@ impl BrainPack {
             &mut *state,
             BrainState::new(std::collections::HashMap::new(), 0),
         );
-        *state = self.fold.step(current, &event, &ctx);
+        *state = self.fold.reduce(current, &event, &ctx);
 
         Ok(json!({
             "emitted": true,
@@ -328,7 +328,7 @@ impl DispatchHook for BrainPack {
             &mut *state,
             BrainState::new(std::collections::HashMap::new(), 0),
         );
-        *state = self.fold.step(current, event, &ctx);
+        *state = self.fold.reduce(current, event, &ctx);
     }
 }
 

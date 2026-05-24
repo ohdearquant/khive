@@ -168,67 +168,17 @@ pub trait Objective<T>: Send + Sync {
         scored
     }
 
-    /// Select the best candidate from a list.
+    /// Select candidates from a list, returning all that pass in score-descending order.
     ///
-    /// Ranking uses `score * precision` so that unreliable high-scores do not
-    /// dominate over lower-scoring but precise candidates (ADR-059). When all
-    /// precisions are 1.0 (the default), ranking is identical to raw score order.
-    fn select<'a>(
-        &self,
-        candidates: &'a [T],
-        context: &ObjectiveContext,
-    ) -> ObjectiveResult<Selection<&'a T>> {
+    /// Returns an empty vector when no candidates pass the threshold or the input is empty.
+    /// Delegates to `select_top` using the full considered limit so callers get a ranked
+    /// list rather than a single item. Use `.into_iter().next()` for single-best access.
+    fn select<'a>(&self, candidates: &'a [T], context: &ObjectiveContext) -> Vec<Selection<&'a T>> {
         if candidates.is_empty() {
-            return Err(ObjectiveError::NoCandidates);
+            return Vec::new();
         }
-
-        let considered_limit = considered_limit(candidates.len(), context);
-
-        let mut considered = 0usize;
-        let mut passed = 0usize;
-        let mut has_best = false;
-        let mut best_index = 0usize;
-        let mut best_score = 0.0f64;
-        let mut best_precision = 1.0f64;
-        let mut best_det = DeterministicScore::ZERO;
-
-        for (index, candidate) in candidates.iter().take(considered_limit).enumerate() {
-            considered += 1;
-
-            let score = self.score(candidate, context);
-            if !self.passes_score(score, context) {
-                continue;
-            }
-
-            passed += 1;
-
-            let precision = self.precision(candidate, context);
-            let effective = score
-                * if precision.is_finite() {
-                    precision
-                } else {
-                    1.0
-                };
-            let det = DeterministicScore::from_f64(effective);
-            if !has_best || det > best_det {
-                has_best = true;
-                best_index = index;
-                best_score = score;
-                best_precision = precision;
-                best_det = det;
-            }
-        }
-
-        if has_best {
-            Ok(
-                Selection::new(&candidates[best_index], best_score, best_index)
-                    .with_precision(best_precision)
-                    .with_considered(considered)
-                    .with_passed(passed),
-            )
-        } else {
-            Err(ObjectiveError::NoMatch("No candidate passed".into()))
-        }
+        let n = considered_limit(candidates.len(), context);
+        self.select_top(candidates, n, context)
     }
 
     /// Select the top N candidates.
@@ -243,10 +193,6 @@ pub trait Objective<T>: Send + Sync {
     ) -> Vec<Selection<&'a T>> {
         if n == 0 || candidates.is_empty() {
             return Vec::new();
-        }
-
-        if n == 1 {
-            return self.select(candidates, context).ok().into_iter().collect();
         }
 
         let considered_limit = considered_limit(candidates.len(), context);

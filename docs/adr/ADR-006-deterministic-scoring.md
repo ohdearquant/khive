@@ -38,39 +38,37 @@ SQL storage: INTEGER (i64, native SQLite affinity)
 Ordering: standard integer comparison (no float comparison edge cases)
 ```
 
-Arithmetic is saturating: overflow clamps to `i64::MAX`, underflow clamps to `i64::MIN`.
+Arithmetic is saturating: overflow clamps to `MAX` (= `i64::MAX`), underflow clamps to
+`NEG_INF` (= `i64::MIN + 1`). The raw value `i64::MIN` is a reserved sentinel (`MIN`)
+that is not produced by any public arithmetic or float-conversion path. This makes
+runtime-reachable scores disjoint from the sentinel — see the `DeterministicScore` total-order
+formal proof at `lean-proofs/Score/DeterministicScore.lean` (`MIN` vs `NEG_INF`, `RuntimeValid`).
+
 NaN and infinity inputs to `from_f32`/`from_f64` are mapped to deterministic sentinel
-values (NaN → 0, +inf → `i64::MAX`, -inf → `i64::MIN`).
+values (NaN → `ZERO`, `+∞` → `MAX`, `-∞` → `NEG_INF`).
 
-### Canonical implementation: `ruvector-core`
+### Canonical implementation (current phase)
 
-`ruvector-core` is the authoritative owner of `DeterministicScore` and related deterministic
-fusion primitives. `khive-score` is a compatibility crate that re-exports the canonical
-types and functions. It contains no independent scoring implementation.
+`khive-score` is the current canonical owner of `DeterministicScore` and the related
+deterministic fusion primitives (`deterministic_rrf`, `weighted_sum`, `Ranked<T>`,
+`DistanceMetric`, `similarity_from_distance`). It is a self-contained Rust crate.
 
-```rust
-// khive-score/src/lib.rs — re-export shim only
-pub use ruvector_core::{
-    DeterministicScore,
-    deterministic_rrf,
-    deterministic_rrf_with_k,
-    weighted_sum,
-    Ranked,
-};
-```
-
-This prevents drift between two byte-identical implementations. Changes to the scoring
-contract are made in `ruvector-core` and flow to khive through the re-export.
+The long-term plan is to host these primitives in `ruvector-core` upstream so multiple
+ecosystems share a single implementation. That migration is deferred until `ruvector-core`
+ships our contributions; `khive-score` will become a re-export shim at that point. Until
+then, the formal contract is the one defined in this ADR and proved in
+`lean-proofs/Score/DeterministicScore.lean`.
 
 ### Normative invariants
 
 The implementation MUST satisfy:
 
 1. **Total order**: antisymmetry, transitivity, totality over all `DeterministicScore` values.
-2. **Saturating arithmetic**: add, subtract, and accumulation saturate at `i64::MIN`/`i64::MAX`.
-   No wrapping, no panic.
-3. **Deterministic NaN/infinity handling**: `from_f32(NaN) == from_f64(NaN) == DeterministicScore(0)`.
-   Positive infinity maps to `i64::MAX`, negative infinity to `i64::MIN`.
+2. **Saturating arithmetic**: add, subtract, and accumulation saturate at `NEG_INF`
+   (= `i64::MIN + 1`) and `MAX` (= `i64::MAX`). No wrapping, no panic. The reserved
+   `MIN` (= `i64::MIN`) sentinel is never produced by public arithmetic.
+3. **Deterministic NaN/infinity handling**: `from_f32(NaN) == from_f64(NaN) == ZERO`.
+   `+∞` maps to `MAX`, `-∞` maps to `NEG_INF`. `MIN` is never produced.
 4. **SQL INTEGER bit-exact round-trip**: `DeterministicScore(x).to_sql().from_sql() == DeterministicScore(x)`.
 5. **Metric-aware f32 conversion**: distance-to-similarity conversion at vector search result
    boundaries uses the metric-specific monotonic transform defined below.
@@ -159,15 +157,17 @@ add/subtract/accumulation safely. This is an implementation detail, not a normat
 requirement. Other implementations may use another method if they preserve the same
 saturating semantics.
 
-### `QuantKey` deprecation
+### `QuantKey` removal
 
-`QuantKey` is not part of the deterministic scoring contract. It uses a different scale and
-width than `DeterministicScore` and is not safe for persistent score storage, SQL cache keys,
-cross-backend result exchange, or public ranking APIs.
+`QuantKey` was an 8-byte packed sort-key optimization (i32 quantized score + u32 ID prefix)
+intended for hot-loop sorting. It is **not** part of the deterministic scoring contract
+(different scale, lossy precision, not safe for storage or cross-backend exchange) and is
+not modelled in the Lean proof.
 
-Existing `QuantKey` code is deprecated from the public contract. Future use requires a
-performance ADR with benchmarks showing material speedup over `Ranked<T>` /
-`DeterministicScore` sorting on representative khive retrieval workloads.
+`QuantKey` has been **removed entirely** from `khive-score`. There is no deprecation
+period. If a future workload demonstrates a material speedup over `Ranked<T>` /
+`DeterministicScore` sorting on representative retrieval traces, a new optimization can
+be introduced behind a fresh ADR.
 
 ## Rationale
 
@@ -213,12 +213,14 @@ value used in production. The explicit override API (`deterministic_rrf_with_k`)
 tuning for specific workloads. Callers experimenting with alternative K values must
 document the rationale.
 
-### Why deprecate QuantKey?
+### Why remove QuantKey?
 
-`QuantKey` is a relative-order optimization for hot-loop sorting. It does not preserve
-absolute score values and uses a different scale than `DeterministicScore`. Exposing it as a
-public scoring primitive risks callers persisting or comparing `QuantKey` values across
-contexts where only `DeterministicScore` is correct.
+`QuantKey` was a relative-order optimization for hot-loop sorting. It did not preserve
+absolute score values and used a different scale than `DeterministicScore`. Keeping it as
+deprecated code added a second sort-key concept readers had to learn before reaching for
+the one that matters. khive is early enough that a clean delete is preferable to a
+deprecation period; reintroduce as a private optimization (or a new ADR) only if a real
+workload demonstrates need.
 
 ## Consequences
 
@@ -232,9 +234,11 @@ contexts where only `DeterministicScore` is correct.
 
 ### Negative
 
-- khive gains a dependency on `ruvector-core`. Acceptable given RuVector is the canonical
-  vector substrate.
-- `QuantKey` deprecation may require updating hot-path sorting in retrieval code.
+- `khive-score` remains a self-contained Rust crate in this phase. The ruvector-core
+  migration is deferred until upstream ships and is not a blocker for code aligned to
+  this ADR.
+- `QuantKey` was removed; any hot-path retrieval sort that used it now uses `Ranked<T>`
+  / `DeterministicScore` ordering directly.
 - K = 60 is the standard default. Callers who need a different K must use the explicit
   `deterministic_rrf_with_k` API and document the rationale.
 
@@ -246,9 +250,19 @@ contexts where only `DeterministicScore` is correct.
 
 ## Implementation
 
-- `ruvector-core`: canonical `DeterministicScore`, `deterministic_rrf`,
-  `deterministic_rrf_with_k`, `weighted_sum`, `Ranked<T>`, `DistanceMetric`,
-  `similarity_from_distance`.
-- `khive-score/src/lib.rs`: `pub use ruvector_core::*` re-exports only.
+- `khive-score`: self-contained canonical implementation of `DeterministicScore`,
+  `deterministic_rrf`, `deterministic_rrf_with_k`, `weighted_sum`, `Ranked<T>`,
+  `DistanceMetric`, `similarity_from_distance`. Constants: `MAX` (i64::MAX), `NEG_INF`
+  (i64::MIN + 1), `ZERO` (0), `MIN` (i64::MIN, reserved sentinel).
 - SQL column type: `INTEGER` (i64). No schema migration needed.
-- `QuantKey`: marked `#[deprecated]` with note pointing to this ADR.
+- `QuantKey`: removed (file deleted, all re-exports dropped). Use `Ranked<T>` and
+  `DeterministicScore` ordering for sort hot paths.
+- Formal model: `lean-proofs/Score/DeterministicScore.lean` (51 theorems, complete).
+  Future Rust changes must preserve the proven invariants or amend both the ADR and
+  the Lean proof in the same PR.
+
+### Future: ruvector-core migration
+
+When `ruvector-core` ships with our contributions, `khive-score` will become a
+re-export shim of those types. That migration is its own ADR / PR and is out of scope
+here. The Lean proof remains the source of truth across the migration.
