@@ -6,11 +6,12 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "KG versioning — snapshots, branches, and remote sync (ADR-042)"
+description = "KG versioning — git-native core types, canonical hash, and NDJSON-to-SQLite sync (ADR-010/ADR-020)"
 
 [dependencies]
 khive-runtime = { version = "0.2.0", path = "../khive-runtime" }
 khive-storage = { version = "0.2.0", path = "../khive-storage" }
+khive-types = { version = "0.2.0", path = "../khive-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -19,6 +20,8 @@ chrono = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 tokio = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile = "3"
