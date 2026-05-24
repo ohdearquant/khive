@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, KindHook, Namespace, NamespaceToken, Resolved, RuntimeError};
+use khive_runtime::{KhiveRuntime, KindHook, Namespace, Resolved, RuntimeError};
 use khive_storage::EdgeRelation;
 
 use crate::handlers::resolve_uuid;
@@ -74,8 +74,8 @@ impl KindHook for TaskHook {
             .get("namespace")
             .and_then(Value::as_str)
             .and_then(|s| Namespace::parse(s).ok())
-            .map(NamespaceToken::for_namespace)
-            .unwrap_or_else(NamespaceToken::local);
+            .map(|ns| runtime.authorize(ns))
+            .unwrap_or_else(|| runtime.authorize(Namespace::local()));
 
         // Resolve depends_on entries (full UUID or 8+ hex prefix) to canonical
         // UUID strings — matches the shape gtd's `assign` produces. Also
@@ -189,8 +189,8 @@ impl KindHook for TaskHook {
                 .get("namespace")
                 .and_then(Value::as_str)
                 .and_then(|s| Namespace::parse(s).ok())
-                .map(NamespaceToken::for_namespace)
-                .unwrap_or_else(NamespaceToken::local);
+                .map(|ns| runtime.authorize(ns))
+                .unwrap_or_else(|| runtime.authorize(Namespace::local()));
             for entry in arr {
                 let Some(raw) = entry.as_str() else { continue };
                 let target = match Uuid::parse_str(raw) {

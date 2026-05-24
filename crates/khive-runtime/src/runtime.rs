@@ -44,17 +44,21 @@ impl NamespaceToken {
 
     /// Convenience constructor for the local namespace with an anonymous actor.
     ///
-    /// Suitable for OSS / local-dev use and in-crate tests. In multi-tenant
-    /// deployments the gate mints the token via dispatch; callers should not
-    /// use this in authenticated contexts.
-    pub fn local() -> Self {
+    /// Only callable from within `khive-runtime`. External callers must use
+    /// [`KhiveRuntime::authorize`] to mint tokens.
+    // Used only in #[cfg(test)] blocks within this crate's src/ files.
+    #[allow(dead_code)]
+    pub(crate) fn local() -> Self {
         Self::mint_authorized(Namespace::local(), ActorRef::anonymous())
     }
 
     /// Convenience constructor for a specific namespace with an anonymous actor.
     ///
-    /// Intended for tests and OSS use that need to operate in a named namespace.
-    pub fn for_namespace(ns: Namespace) -> Self {
+    /// Only callable from within `khive-runtime`. External callers must use
+    /// [`KhiveRuntime::authorize`] to mint tokens.
+    // Used only in #[cfg(test)] blocks within this crate's src/ files.
+    #[allow(dead_code)]
+    pub(crate) fn for_namespace(ns: Namespace) -> Self {
         Self::mint_authorized(ns, ActorRef::anonymous())
     }
 
@@ -254,6 +258,16 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Arc<dyn khive_storage::TextSearch>> {
         let key = format!("notes_{}", sanitize_key(token.namespace().as_str()));
         Ok(self.backend.text(&key)?)
+    }
+
+    /// Mint an authorization token for the given namespace.
+    ///
+    /// This is the official OSS API for obtaining a [`NamespaceToken`]. In
+    /// local / single-user mode (the default) this always succeeds — there is
+    /// no multi-tenant gate to consult. Multi-tenant deployments replace the
+    /// gate with a policy-backed impl; this method would then enforce it.
+    pub fn authorize(&self, ns: Namespace) -> NamespaceToken {
+        NamespaceToken::mint_authorized(ns, ActorRef::anonymous())
     }
 
     /// Install the pack-aggregated edge endpoint rules (ADR-031).

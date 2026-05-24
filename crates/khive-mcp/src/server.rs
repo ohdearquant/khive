@@ -150,8 +150,8 @@ impl KhiveMcpServer {
             builder.with_gate(gate);
             builder.with_default_namespace(default_namespace.as_str());
             // ADR-035: wire the EventStore for the fallback path too.
-            if let Ok(event_store) =
-                recovered_runtime.events(&khive_runtime::NamespaceToken::local())
+            if let Ok(event_store) = recovered_runtime
+                .events(&recovered_runtime.authorize(khive_runtime::Namespace::local()))
             {
                 builder.with_event_store(event_store);
             }
@@ -181,7 +181,9 @@ impl KhiveMcpServer {
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace.as_str());
         // ADR-035: wire the EventStore into the registry for audit persistence.
-        if let Ok(event_store) = runtime.events(&khive_runtime::NamespaceToken::local()) {
+        if let Ok(event_store) =
+            runtime.events(&runtime.authorize(khive_runtime::Namespace::local()))
+        {
             builder.with_event_store(event_store);
         }
         if let Err(unknown) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {

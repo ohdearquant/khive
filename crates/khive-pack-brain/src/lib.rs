@@ -342,12 +342,13 @@ impl DispatchHook for BrainPack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_runtime::VerbRegistryBuilder;
+    use khive_runtime::{Namespace, VerbRegistryBuilder};
     use serde_json::json;
 
-    fn make_pack() -> BrainPack {
+    fn make_pack() -> (BrainPack, KhiveRuntime) {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        BrainPack::new(rt)
+        let pack = BrainPack::new(rt.clone());
+        (pack, rt)
     }
 
     fn empty_registry() -> VerbRegistry {
@@ -358,14 +359,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unknown_verb_returns_invalid_input() {
-        let pack = make_pack();
+        let (pack, rt) = make_pack();
         let registry = empty_registry();
         let err = pack
             .dispatch(
                 "brain.unknown",
                 json!({}),
                 &registry,
-                &NamespaceToken::local(),
+                &rt.authorize(Namespace::local()),
             )
             .await
             .unwrap_err();
@@ -381,14 +382,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_reset_returns_true_and_increments_epoch() {
-        let pack = make_pack();
+        let (pack, rt) = make_pack();
         let registry = empty_registry();
         let result = pack
             .dispatch(
                 "brain.reset",
                 json!({}),
                 &registry,
-                &NamespaceToken::local(),
+                &rt.authorize(Namespace::local()),
             )
             .await
             .unwrap();
@@ -398,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_emit_invalid_signal_returns_invalid_input() {
-        let pack = make_pack();
+        let (pack, rt) = make_pack();
         let registry = empty_registry();
         let target = "00000000-0000-0000-0000-000000000001";
         let err = pack
@@ -406,7 +407,7 @@ mod tests {
                 "brain.emit",
                 json!({"target_id": target, "signal": "bad_signal"}),
                 &registry,
-                &NamespaceToken::local(),
+                &rt.authorize(Namespace::local()),
             )
             .await
             .unwrap_err();
@@ -426,14 +427,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_state_returns_snapshot_fields() {
-        let pack = make_pack();
+        let (pack, rt) = make_pack();
         let registry = empty_registry();
         let result = pack
             .dispatch(
                 "brain.state",
                 json!({}),
                 &registry,
-                &NamespaceToken::local(),
+                &rt.authorize(Namespace::local()),
             )
             .await
             .unwrap();

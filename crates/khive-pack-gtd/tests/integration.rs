@@ -3,9 +3,7 @@
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::VerbDef;
-use khive_runtime::{
-    KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry, VerbRegistryBuilder,
-};
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use serde_json::{json, Value};
 
 fn rt() -> KhiveRuntime {
@@ -213,7 +211,7 @@ async fn complete_rejects_non_task_notes() {
     let runtime = rt();
     let note = runtime
         .create_note(
-            &NamespaceToken::local(),
+            &runtime.authorize(Namespace::local()),
             "observation",
             None,
             "hello",
@@ -336,7 +334,9 @@ async fn assign_creates_depends_on_edge_between_tasks() {
     let dep_uuid = uuid::Uuid::parse_str(dep_full).unwrap();
     let blocker_uuid = uuid::Uuid::parse_str(blocker_full).unwrap();
 
-    let graph = rt.graph(&NamespaceToken::local()).expect("graph store");
+    let graph = rt
+        .graph(&rt.authorize(Namespace::local()))
+        .expect("graph store");
     let neighbors = graph
         .neighbors(
             dep_uuid,
@@ -369,7 +369,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
     // the task is never persisted (ADR-030: no failure after successful write).
     let other = rt
         .create_note(
-            &NamespaceToken::local(),
+            &rt.authorize(Namespace::local()),
             "observation",
             None,
             "an observation",
@@ -395,7 +395,9 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
     );
 
     // Atomicity: the rejected `assign` must not leave a task row behind.
-    let notes = rt.notes(&NamespaceToken::local()).expect("note store");
+    let notes = rt
+        .notes(&rt.authorize(Namespace::local()))
+        .expect("note store");
     let page = notes
         .query_notes(
             "local",

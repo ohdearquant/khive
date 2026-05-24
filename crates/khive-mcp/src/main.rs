@@ -67,10 +67,12 @@ async fn main() -> anyhow::Result<()> {
         args.pack
     };
 
+    let default_namespace = khive_runtime::Namespace::parse(&args.namespace)
+        .map_err(|e| anyhow::anyhow!("invalid --namespace {:?}: {e}", args.namespace))?;
+
     let config = RuntimeConfig {
         db_path,
-        default_namespace: khive_runtime::Namespace::parse(&args.namespace)
-            .unwrap_or_else(|_| khive_runtime::Namespace::local()),
+        default_namespace,
         embedding_model,
         packs,
         ..RuntimeConfig::default()
