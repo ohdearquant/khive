@@ -155,7 +155,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         let mut event = make_event("brain.emit", EventOutcome::Success, Some(id));
-        event.data = Some(serde_json::json!({"signal": "not_useful"}));
+        event.payload = serde_json::json!({"signal": "not_useful"});
         state = fold.reduce(state, &event, &ctx);
 
         assert_eq!(state.total_events, 1);
