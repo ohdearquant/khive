@@ -840,6 +840,50 @@ mod tests {
         assert!(!names.contains(&"E2"));
     }
 
+    #[tokio::test]
+    async fn test_entity_type_roundtrip() {
+        let store = setup_memory_store();
+
+        let entity =
+            Entity::new("default", "document", "ResearchPaper").with_entity_type(Some("paper"));
+        let id = entity.id;
+
+        store.upsert_entity(entity).await.unwrap();
+
+        let fetched = store.get_entity(id).await.unwrap().unwrap();
+        assert_eq!(fetched.entity_type, Some("paper".to_string()));
+        assert_eq!(fetched.kind, "document");
+        assert_eq!(fetched.name, "ResearchPaper");
+    }
+
+    #[tokio::test]
+    async fn test_query_by_kind_and_entity_type() {
+        let store = setup_memory_store_ns("et_ns");
+
+        let typed =
+            Entity::new("et_ns", "person", "Researcher").with_entity_type(Some("researcher"));
+        let untyped = make_entity("et_ns", "person", "Generic");
+
+        store.upsert_entity(typed).await.unwrap();
+        store.upsert_entity(untyped).await.unwrap();
+
+        let result = store
+            .query_entities(
+                "et_ns",
+                EntityFilter {
+                    entity_types: vec!["researcher".to_string()],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].name, "Researcher");
+        assert_eq!(result.items[0].entity_type, Some("researcher".to_string()));
+    }
+
     /// UUID is globally unique (id TEXT PRIMARY KEY). Upserting the same UUID in a
     /// different namespace overwrites the row (INSERT OR REPLACE). get_entity by ID
     /// returns whichever namespace currently owns that UUID.

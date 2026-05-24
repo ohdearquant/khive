@@ -1078,4 +1078,31 @@ mod tests {
             compiled.sql
         );
     }
+
+    #[test]
+    fn entity_type_compiles_as_direct_column_not_json_extract() {
+        // entity_type in a NodePattern must become `alias.entity_type = ?N` in the WHERE
+        // clause — a direct column reference, not json_extract from the properties blob.
+        let q = gql::parse("MATCH (n:document {entity_type: 'paper'})-[:extends]->(m) RETURN n")
+            .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains(".entity_type = ?"),
+            "entity_type must compile to a direct column comparison; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("json_extract"),
+            "entity_type must NOT use json_extract; sql: {}",
+            compiled.sql
+        );
+        let has_paper_param = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, SqlValue::Text(s) if s == "paper"));
+        assert!(
+            has_paper_param,
+            "entity_type value 'paper' must appear as a bound parameter"
+        );
+    }
 }

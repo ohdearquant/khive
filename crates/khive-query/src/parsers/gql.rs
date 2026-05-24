@@ -573,4 +573,19 @@ mod tests {
         let nodes: Vec<_> = q.pattern.nodes().collect();
         assert_eq!(nodes.len(), 3);
     }
+
+    #[test]
+    fn node_pattern_entity_type_lifted_from_properties() {
+        let q = parse("MATCH (n:document {entity_type: 'paper'}) RETURN n").unwrap();
+        let nodes: Vec<_> = q.pattern.nodes().collect();
+        assert_eq!(
+            nodes[0].entity_type.as_deref(),
+            Some("paper"),
+            "entity_type must be lifted into NodePattern.entity_type"
+        );
+        assert!(
+            !nodes[0].properties.contains_key("entity_type"),
+            "entity_type must be removed from the properties map after lifting"
+        );
+    }
 }
