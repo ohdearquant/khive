@@ -111,6 +111,8 @@ pub fn rrf_score(rank: usize, k: usize) -> DeterministicScore {
     DeterministicScore::from_f64(1.0 / (denominator as f64))
 }
 
+const SCALE_RAW: i128 = 4_294_967_296; // 2^32 — matches DeterministicScore::SCALE
+
 #[inline]
 pub fn weighted_sum(
     scores: &[DeterministicScore],
@@ -123,14 +125,17 @@ pub fn weighted_sum(
             second_len: weights.len(),
         });
     }
-    let mut acc = DeterministicScore::ZERO;
+    let mut acc = 0i128;
     for (index, (&score, &weight)) in scores.iter().zip(weights.iter()).enumerate() {
         if !weight.is_finite() {
             return Err(ScoreError::NonFiniteWeight { index });
         }
-        acc = acc + score * weight;
+        let w = DeterministicScore::from_f64(weight);
+        acc += (score.to_raw() as i128 * w.to_raw() as i128) / SCALE_RAW;
     }
-    Ok(acc)
+    Ok(DeterministicScore::from_raw(
+        acc.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+    ))
 }
 
 #[cfg(test)]

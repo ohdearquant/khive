@@ -3,6 +3,9 @@
 //! Packs a 32-bit quantized score + 32-bit ID prefix into 8 bytes
 //! per ADR-006. NaN → 0 (neutral), matching DeterministicScore.
 
+// The entire module is deprecated infrastructure; suppress lint noise within the file.
+#![allow(deprecated, dead_code)]
+
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
@@ -10,8 +13,12 @@ use std::hash::{Hash, Hasher};
 ///
 /// For sort-only operations where the full DeterministicScore is not needed.
 /// Score descending, lower ID prefix wins ties.
+#[deprecated(
+    since = "0.2.0",
+    note = "QuantKey is outside the ADR-006 public scoring contract"
+)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct QuantKey {
+pub(crate) struct QuantKey {
     q: i32,
     id_prefix: u32,
 }
@@ -73,6 +80,7 @@ impl PartialOrd for QuantKey {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::collections::BinaryHeap;

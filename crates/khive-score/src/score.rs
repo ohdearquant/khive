@@ -19,7 +19,7 @@ impl DeterministicScore {
     const SCALE: f64 = 4_294_967_296.0; // 2^32
 
     pub const MAX: Self = Self(i64::MAX);
-    pub const NEG_INF: Self = Self(i64::MIN + 1);
+    pub const NEG_INF: Self = Self(i64::MIN);
     pub const ZERO: Self = Self(0);
 
     #[inline]
@@ -74,7 +74,7 @@ impl DeterministicScore {
     fn from_arithmetic_raw(raw: i128) -> Self {
         if raw >= i64::MAX as i128 {
             Self::MAX
-        } else if raw <= Self::NEG_INF.0 as i128 {
+        } else if raw <= i64::MIN as i128 {
             Self::NEG_INF
         } else {
             Self(raw as i64)
@@ -340,5 +340,27 @@ mod tests {
     fn mul_f64_nan_yields_zero() {
         let s = DeterministicScore::from_f64(1.0);
         assert_eq!(s * f64::NAN, DeterministicScore::ZERO);
+    }
+
+    // F032: NEG_INF sentinel must equal i64::MIN exactly
+    #[test]
+    fn neg_inf_is_i64_min() {
+        assert_eq!(DeterministicScore::NEG_INF.to_raw(), i64::MIN);
+    }
+
+    #[test]
+    fn neg_infinity_maps_to_i64_min() {
+        assert_eq!(
+            DeterministicScore::from_f64(f64::NEG_INFINITY).to_raw(),
+            i64::MIN
+        );
+    }
+
+    #[test]
+    fn saturation_below_i64_min_clamps_to_neg_inf() {
+        assert_eq!(
+            DeterministicScore::from_raw(i64::MIN) - DeterministicScore::from_raw(1),
+            DeterministicScore::NEG_INF
+        );
     }
 }

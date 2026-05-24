@@ -30,7 +30,7 @@
 //! // result1 == result2
 //! ```
 
-use khive_score::DeterministicScore;
+use khive_score::{weighted_sum, DeterministicScore};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -39,32 +39,29 @@ use std::hash::Hash;
 ///
 /// When all scores are equal (or the source has one element) every entry
 /// receives 1.0 so it still contributes to the weighted combination.
+const SCORE_SCALE: i128 = 4_294_967_296; // 2^32 — represents 1.0 in DeterministicScore
+
 fn min_max_normalize_source<Id>(
     source: Vec<(Id, DeterministicScore)>,
 ) -> Vec<(Id, DeterministicScore)> {
     if source.is_empty() {
         return source;
     }
-    let min = source
-        .iter()
-        .map(|(_, s)| s.to_f64())
-        .fold(f64::INFINITY, f64::min);
-    let max = source
-        .iter()
-        .map(|(_, s)| s.to_f64())
-        .fold(f64::NEG_INFINITY, f64::max);
-    let span = max - min;
-    if span <= f64::EPSILON {
+    let min = source.iter().map(|(_, s)| s.to_raw()).min().unwrap();
+    let max = source.iter().map(|(_, s)| s.to_raw()).max().unwrap();
+    let span = (max as i128) - (min as i128);
+    if span <= 0 {
         return source
             .into_iter()
-            .map(|(id, _)| (id, DeterministicScore::from_f64(1.0)))
+            .map(|(id, _)| (id, DeterministicScore::from_raw(SCORE_SCALE as i64)))
             .collect();
     }
     source
         .into_iter()
         .map(|(id, s)| {
-            let normalized = (s.to_f64() - min) / span;
-            (id, DeterministicScore::from_f64(normalized))
+            let numerator = (s.to_raw() as i128 - min as i128) * SCORE_SCALE;
+            let normalized_raw = (numerator / span).clamp(0, i64::MAX as i128);
+            (id, DeterministicScore::from_raw(normalized_raw as i64))
         })
         .collect()
 }
@@ -128,7 +125,7 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
 
     // Estimate capacity
     let estimated_capacity: usize = sources.iter().map(|s| s.len()).sum();
-    let mut combined: HashMap<Id, f64> = HashMap::with_capacity(estimated_capacity);
+    let mut combined: HashMap<Id, DeterministicScore> = HashMap::with_capacity(estimated_capacity);
 
     for (source_idx, results) in sources.into_iter().enumerate() {
         // Sources beyond the weights array get weight 0.0 (silently ignored).
@@ -139,15 +136,17 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
         // to their configured weights (#2496/#2639).
         let norm_results = min_max_normalize_source(results);
         for (id, score) in norm_results {
-            *combined.entry(id).or_insert(0.0) += score.to_f64() * weight;
+            // weighted_sum converts weight to DeterministicScore internally and
+            // accumulates in i128 — no float arithmetic in the hot path.
+            let w = weighted_sum(&[score], &[weight])
+                .expect("single score and weight have matching lengths");
+            let entry = combined.entry(id).or_insert(DeterministicScore::ZERO);
+            *entry = *entry + w;
         }
     }
 
-    // Convert and sort by score descending, then by ID ascending for determinism
-    let mut fused: Vec<(Id, DeterministicScore)> = combined
-        .into_iter()
-        .map(|(id, score)| (id, DeterministicScore::from_f64(score)))
-        .collect();
+    // Sort by score descending, then by ID ascending for deterministic tie-breaking.
+    let mut fused: Vec<(Id, DeterministicScore)> = combined.into_iter().collect();
 
     fused.sort_by(
         |(id_a, score_a), (id_b, score_b)| match score_b.cmp(score_a) {
