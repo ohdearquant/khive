@@ -9,7 +9,6 @@
 //! - [`canonical_f64`]/[`canonical_f32`]: Normalize floating-point values for comparison
 //! - [`cmp_desc_score_then_id`]: Deterministic comparator (f64 + Uuid) with UUID tie-breaking
 //! - [`ScoredEntry`]: Ord-implementing wrapper for heap operations, backed by [`DeterministicScore`]
-//! - [`QuantKey`]: Re-exported from `khive-score` — 8-byte packed sort key (i32 score + u32 ID prefix)
 //! - [`DeterministicScore`]: Re-exported from `khive-score` — i64 fixed-point score
 //! - [`Ranked`]: Re-exported from `khive-score` — score + generic `Ord` ID pair for heaps
 
@@ -24,7 +23,6 @@ pub use has_id::HasId;
 pub use scored_entry::ScoredEntry;
 
 // Re-exports from khive-score
-pub use khive_score::QuantKey;
 pub use khive_score::{cmp_asc_then_id, cmp_desc_then_id, DeterministicScore, Ranked};
 
 #[cfg(test)]
@@ -299,59 +297,6 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(entry1);
         assert!(set.contains(&entry2));
-    }
-
-    // ------------------------------------------------------------------------
-    // QuantKey Tests (score's QuantKey: i32+u32 packed, NaN→0)
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn test_quant_key_precision() {
-        let a = QuantKey::new(0.123456, 1);
-        let b = QuantKey::new(0.123457, 2);
-        assert_ne!(
-            a.quantized_score(),
-            b.quantized_score(),
-            "1e-6 difference should be distinguishable"
-        );
-    }
-
-    #[test]
-    fn test_quant_key_rounding() {
-        let a = QuantKey::new(0.12345642, 1);
-        let b = QuantKey::new(0.12345647, 2);
-        assert_eq!(
-            a.quantized_score(),
-            b.quantized_score(),
-            "Sub-1e-6 differences should round same"
-        );
-    }
-
-    #[test]
-    fn test_quant_key_nan_maps_to_zero() {
-        let nan = QuantKey::new(f32::NAN, 1);
-        let zero = QuantKey::new(0.0, 1);
-        assert_eq!(
-            nan.quantized_score(),
-            zero.quantized_score(),
-            "NaN maps to 0 in score's QuantKey"
-        );
-    }
-
-    #[test]
-    fn test_quant_key_heap_order() {
-        use std::collections::BinaryHeap;
-
-        let mut heap: BinaryHeap<QuantKey> = BinaryHeap::new();
-        heap.push(QuantKey::new(0.95, 3));
-        heap.push(QuantKey::new(0.95, 1));
-        heap.push(QuantKey::new(0.95, 2));
-        heap.push(QuantKey::new(0.87, 4));
-
-        assert_eq!(heap.pop().unwrap().id_prefix(), 1);
-        assert_eq!(heap.pop().unwrap().id_prefix(), 2);
-        assert_eq!(heap.pop().unwrap().id_prefix(), 3);
-        assert_eq!(heap.pop().unwrap().id_prefix(), 4);
     }
 
     // ------------------------------------------------------------------------
