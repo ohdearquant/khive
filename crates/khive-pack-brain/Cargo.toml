@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Brain pack — event-driven auto-tuning via meta-fold (ADR-064)"
+description = "Brain pack — profile-oriented orchestration via Fold + Objective (ADR-032)"
 
 [dependencies]
 khive-types = { version = "0.2.0", path = "../khive-types", features = ["serde"] }

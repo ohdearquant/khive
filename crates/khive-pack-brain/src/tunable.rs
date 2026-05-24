@@ -3,13 +3,16 @@ use khive_runtime::RuntimeError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::state::{BetaPosterior, BrainState};
+use crate::state::{BalancedRecallState, BetaPosterior};
 
 /// Packs that want auto-tuning implement this trait.
+///
 /// The brain discovers tunable packs at startup via the PackRegistry.
+/// `project_config` now receives a `BalancedRecallState` — the v1 profile
+/// state — rather than the old flat `BrainState` scalar map.
 pub trait PackTunable: PackRuntime {
     fn parameter_space(&self) -> ParameterSpace;
-    fn project_config(&self, state: &BrainState) -> Value;
+    fn project_config(&self, state: &BalancedRecallState) -> Value;
     fn apply_config(&self, config: Value) -> Result<(), RuntimeError>;
 }
 
