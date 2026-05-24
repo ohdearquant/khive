@@ -1133,7 +1133,7 @@ impl KgPack {
                 to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
             }
             KindSpec::Edge => {
-                let deleted = self.runtime.delete_edge(ns, id).await?;
+                let deleted = self.runtime.delete_edge(ns, id, p.hard.unwrap_or(false)).await?;
                 to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": "edge" }))
             }
             KindSpec::Event => Err(immutable_event_error()),
