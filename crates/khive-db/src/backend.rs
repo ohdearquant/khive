@@ -256,20 +256,35 @@ impl StorageBackend {
         // vec0 virtual tables do not support ALTER TABLE, so we must drop and recreate
         // the table if it exists without the `field` column. Vector data is a cache —
         // callers can re-embed from the source record after the table is rebuilt.
-        let old_schema_sql: Option<String> = writer
+        // Use pragma_table_info to check columns directly; substring matching on the
+        // CREATE DDL is fragile (a model_key containing "field" would false-match).
+        let table_exists: bool = writer
             .conn()
             .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
                 rusqlite::params![&table],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(SqliteError::Rusqlite)?;
+            .map_err(SqliteError::Rusqlite)?
+            .is_some();
 
-        if let Some(create_sql) = old_schema_sql {
-            // If the existing DDL does not mention `field`, it predates ADR-044.
-            // Drop and recreate so callers can insert with the new shape.
-            if !create_sql.contains("field") {
+        if table_exists {
+            let has_field: bool = {
+                let pragma = format!("PRAGMA table_xinfo({})", table);
+                let mut stmt = writer.conn().prepare(&pragma)?;
+                let mut rows = stmt.query([])?;
+                let mut found = false;
+                while let Some(row) = rows.next()? {
+                    let name: String = row.get(1)?;
+                    if name == "field" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if !has_field {
                 let drop_ddl = format!("DROP TABLE IF EXISTS {}", table);
                 writer.conn().execute_batch(&drop_ddl)?;
             }
