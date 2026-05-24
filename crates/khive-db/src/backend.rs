@@ -518,17 +518,20 @@ mod tests {
                 id,
                 khive_types::SubstrateKind::Entity,
                 "local",
-                vec![1.0, 0.0, 0.0],
+                "content",
+                vec![vec![1.0, 0.0, 0.0]],
             )
             .await
             .unwrap();
 
         let hits = store
             .search(khive_storage::types::VectorSearchRequest {
-                query_embedding: vec![1.0, 0.0, 0.0],
+                query_vectors: vec![vec![1.0, 0.0, 0.0]],
                 top_k: 1,
                 namespace: None,
                 kind: None,
+                filter: None,
+                backend_hints: None,
             })
             .await
             .unwrap();
@@ -552,7 +555,8 @@ mod tests {
                 id,
                 khive_types::SubstrateKind::Entity,
                 "local",
-                vec![1.0, 0.0, 0.0],
+                "content",
+                vec![vec![1.0, 0.0, 0.0]],
             )
             .await
             .unwrap();
