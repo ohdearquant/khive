@@ -59,6 +59,9 @@ pub enum PatternElement {
 pub struct NodePattern {
     pub variable: Option<String>,
     pub kind: Option<String>,
+    /// Governed subtype within the kind (e.g. "researcher" within "person").
+    /// Compiled to `entity_type = ?` — a direct column, not a property extraction.
+    pub entity_type: Option<String>,
     pub properties: HashMap<String, String>,
 }
 

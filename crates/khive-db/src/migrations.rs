@@ -170,6 +170,17 @@ const V1_UP: &str = "\
 /// V4 note: Deduplicates existing graph_edges rows that share the same
 /// (namespace, source_id, target_id, relation) triple, keeping the earliest
 /// rowid, then adds a unique index enforcing the constraint going forward.
+///
+/// V5 note: `ENTITIES_DDL` in `stores/entity.rs` already includes `entity_type TEXT`
+/// so that in-process schema creation has the column from the start.  When
+/// `run_migrations` is called on such a DB, the V5 `ALTER TABLE` would fail with
+/// "duplicate column name".  The migration runner handles this by checking column
+/// existence before applying V5 — see `run_migrations`.
+///
+/// V9 note: Adds lifecycle columns (updated_at, deleted_at) and backend routing
+/// metadata (target_backend) to graph_edges. Uses table rebuild to work around
+/// SQLite's limited ALTER TABLE support. Backfills updated_at = created_at for
+/// existing rows and sets deleted_at = NULL, target_backend = NULL.
 const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     DELETE FROM graph_edges \
     WHERE rowid NOT IN (\
@@ -181,7 +192,49 @@ const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     ON graph_edges(namespace, source_id, target_id, relation);\
 ";
 
-/// V5: Add `status` column to notes; make `salience` and `decay_factor` nullable.
+const V5_ADD_ENTITY_TYPE_TO_ENTITIES: &str = "\
+    ALTER TABLE entities ADD COLUMN entity_type TEXT NULL;\
+    CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type \
+    ON entities(namespace, kind, entity_type);\
+";
+
+const V9_EDGE_LIFECYCLE_AND_TARGET_BACKEND: &str = "\
+    DROP INDEX IF EXISTS idx_graph_edges_unique_triple;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_source;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_target;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_relation;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_src_rel;\
+    DROP INDEX IF EXISTS idx_graph_edges_ns_tgt_rel;\
+    CREATE TABLE graph_edges_new (\
+        namespace TEXT NOT NULL,\
+        id TEXT NOT NULL,\
+        source_id TEXT NOT NULL,\
+        target_id TEXT NOT NULL,\
+        relation TEXT NOT NULL,\
+        weight REAL NOT NULL DEFAULT 1.0,\
+        created_at INTEGER NOT NULL,\
+        updated_at INTEGER NOT NULL,\
+        deleted_at INTEGER,\
+        metadata TEXT,\
+        target_backend TEXT,\
+        PRIMARY KEY (namespace, id)\
+    );\
+    INSERT INTO graph_edges_new \
+        (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, metadata, target_backend) \
+    SELECT namespace, id, source_id, target_id, relation, weight, created_at, created_at, NULL, metadata, NULL \
+    FROM graph_edges;\
+    DROP TABLE graph_edges;\
+    ALTER TABLE graph_edges_new RENAME TO graph_edges;\
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique_triple ON graph_edges(namespace, source_id, target_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_source ON graph_edges(namespace, source_id);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_target ON graph_edges(namespace, target_id);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_relation ON graph_edges(namespace, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_src_rel ON graph_edges(namespace, source_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_tgt_rel ON graph_edges(namespace, target_id, relation);\
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_target_backend ON graph_edges(target_backend) WHERE target_backend IS NOT NULL;\
+";
+
+/// V10: Add `status` column to notes; make `salience` and `decay_factor` nullable.
 ///
 /// SQLite does not support `ALTER COLUMN` to change NOT NULL constraints, so the
 /// salience/decay_factor nullability change is handled by rewriting the column
@@ -196,11 +249,11 @@ const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
 /// (inserts from the application always set these columns or leave them NULL via
 /// the new nullable DDL path). The only structural change this migration makes
 /// is adding the `status` column with a sensible default.
-const V5_NOTE_STATUS_AND_NULLABLE_METRICS: &str = "\
+const V10_NOTE_STATUS_AND_NULLABLE_METRICS: &str = "\
     ALTER TABLE notes ADD COLUMN status TEXT NOT NULL DEFAULT 'active';\
 ";
 
-/// V6: Add merge tombstone columns to entities.
+/// V11: Add merge tombstone columns to entities.
 ///
 /// `merged_into` stores the UUID of the entity this one was merged into.
 /// `merge_event_id` is an opaque event ID for auditing. Both are nullable;
@@ -211,13 +264,13 @@ const V5_NOTE_STATUS_AND_NULLABLE_METRICS: &str = "\
 /// ENTITIES_DDL in stores/entity.rs already includes these columns for new
 /// databases (created via `CREATE TABLE IF NOT EXISTS`). The migration handles
 /// the upgrade path for existing production databases.
-const V6_ENTITY_TOMBSTONE_COLUMNS: &str = "\
+const V11_ENTITY_TOMBSTONE_COLUMNS: &str = "\
     ALTER TABLE entities ADD COLUMN merged_into TEXT;\
     ALTER TABLE entities ADD COLUMN merge_event_id TEXT;\
     CREATE INDEX IF NOT EXISTS idx_entities_merged_into ON entities(namespace, merged_into);\
 ";
 
-/// V7: Make `salience` and `decay_factor` nullable in the notes table.
+/// V12: Make `salience` and `decay_factor` nullable in the notes table.
 ///
 /// V1 created notes with `salience REAL NOT NULL DEFAULT 0.5` and
 /// `decay_factor REAL NOT NULL DEFAULT 0.0`. SQLite does not support
@@ -226,9 +279,9 @@ const V6_ENTITY_TOMBSTONE_COLUMNS: &str = "\
 /// schema that `NOTES_DDL` in stores/note.rs uses for fresh databases.
 ///
 /// On databases bootstrapped via `NOTES_DDL` (all test paths and new
-/// installs), salience/decay_factor are already nullable — the V7 idempotency
-/// check detects this and skips the rebuild, recording V7 as applied.
-const V7_NULLABLE_NOTE_METRICS: &str = "\
+/// installs), salience/decay_factor are already nullable — the V12 idempotency
+/// check detects this and skips the rebuild, recording V12 as applied.
+const V12_NULLABLE_NOTE_METRICS: &str = "\
     CREATE TABLE notes_new (\
         id TEXT PRIMARY KEY,\
         namespace TEXT NOT NULL,\
@@ -281,18 +334,46 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
     VersionedMigration {
         version: 5,
-        name: "note_status_and_nullable_metrics",
-        up: V5_NOTE_STATUS_AND_NULLABLE_METRICS,
+        name: "add_entity_type_to_entities",
+        up: V5_ADD_ENTITY_TYPE_TO_ENTITIES,
     },
+    // V6–V8 slots are reserved in the ADR-015 migration ledger for other ADRs
+    // (ADR-043, ADR-046, ADR-041 respectively).  These no-op migrations hold the
+    // slot open so the contiguity check passes while those ADRs are implemented.
     VersionedMigration {
         version: 6,
-        name: "entity_tombstone_columns",
-        up: V6_ENTITY_TOMBSTONE_COLUMNS,
+        name: "reserved_adr043_embedding_pipeline_extensions",
+        up: "SELECT 1;",
     },
     VersionedMigration {
         version: 7,
+        name: "reserved_adr046_event_sourced_proposals_index",
+        up: "SELECT 1;",
+    },
+    VersionedMigration {
+        version: 8,
+        name: "reserved_adr041_event_observations_and_session_id",
+        up: "SELECT 1;",
+    },
+    VersionedMigration {
+        version: 9,
+        name: "edge_lifecycle_and_target_backend",
+        up: V9_EDGE_LIFECYCLE_AND_TARGET_BACKEND,
+    },
+    VersionedMigration {
+        version: 10,
+        name: "note_status_and_nullable_metrics",
+        up: V10_NOTE_STATUS_AND_NULLABLE_METRICS,
+    },
+    VersionedMigration {
+        version: 11,
+        name: "entity_tombstone_columns",
+        up: V11_ENTITY_TOMBSTONE_COLUMNS,
+    },
+    VersionedMigration {
+        version: 12,
         name: "nullable_note_metrics",
-        up: V7_NULLABLE_NOTE_METRICS,
+        up: V12_NULLABLE_NOTE_METRICS,
     },
 ];
 
@@ -383,11 +464,38 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             }
         }
 
-        // V5 adds `status` to notes.  NOTES_DDL in stores/note.rs already includes
-        // `status`, so when a fresh schema is created via the store path (e.g. in
-        // tests or StorageBackend::notes()), the column exists before V5 runs.
-        // Detect and skip idempotently, recording the migration as applied.
+        // V5 adds `entity_type` to entities.  ENTITIES_DDL already includes the
+        // column so in-process DBs created via ensure_entities_schema already have
+        // it.  Same idempotency pattern as V2.
         if migration.version == 5 {
+            let col_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('entities') WHERE name = 'entity_type'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if col_exists {
+                let now = chrono::Utc::now().timestamp_micros();
+                conn.execute(
+                    "INSERT OR IGNORE INTO _schema_migrations (version, name, applied_at) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![migration.version, migration.name, now],
+                )
+                .map_err(|e| SqliteError::Migration {
+                    version: migration.version,
+                    error: e.to_string(),
+                })?;
+                applied_version = migration.version;
+                continue;
+            }
+        }
+
+        // V10 adds `status` to notes.  NOTES_DDL in stores/note.rs already includes
+        // `status`, so when a fresh schema is created via the store path (e.g. in
+        // tests or StorageBackend::notes()), the column exists before V10 runs.
+        // Detect and skip idempotently, recording the migration as applied.
+        if migration.version == 10 {
             let col_exists: bool = conn
                 .query_row(
                     "SELECT COUNT(*) > 0 FROM pragma_table_info('notes') WHERE name = 'status'",
@@ -411,11 +519,11 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             }
         }
 
-        // V6 adds `merged_into` and `merge_event_id` to entities. ENTITIES_DDL in
+        // V11 adds `merged_into` and `merge_event_id` to entities. ENTITIES_DDL in
         // stores/entity.rs already includes these columns for databases created via
         // the store path (e.g. in tests or StorageBackend::entities()). Detect and
         // skip idempotently, recording the migration as applied.
-        if migration.version == 6 {
+        if migration.version == 11 {
             let col_exists: bool = conn
                 .query_row(
                     "SELECT COUNT(*) > 0 FROM pragma_table_info('entities') WHERE name = 'merged_into'",
@@ -439,11 +547,11 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             }
         }
 
-        // V7 rebuilds the notes table to make salience/decay_factor nullable.
+        // V12 rebuilds the notes table to make salience/decay_factor nullable.
         // NOTES_DDL in stores/note.rs already declares them nullable for databases
         // created via the store path. If salience is already nullable (notnull=0),
-        // skip the rebuild and record V7 as applied.
-        if migration.version == 7 {
+        // skip the rebuild and record V12 as applied.
+        if migration.version == 12 {
             let already_nullable: bool = conn
                 .query_row(
                     "SELECT COUNT(*) > 0 FROM pragma_table_info('notes') \
@@ -467,6 +575,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
                 continue;
             }
         }
+
 
         let tx = conn.transaction().map_err(|e| SqliteError::Migration {
             version: migration.version,
@@ -516,17 +625,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 7);
+        assert_eq!(version, 12);
 
-        // Verify the tracking table has rows for V1 through V7.
+        // Verify the tracking table has rows for V1 through V12.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 7);
+        assert_eq!(count, 12);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -548,7 +657,28 @@ mod tests {
             .unwrap();
         assert_eq!(col_count, 1, "V2 must add name column to notes");
 
-        // Verify V5 added the status column to notes.
+        // Verify V5 added entity_type column to entities.
+        let et_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entities') WHERE name = 'entity_type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(et_count, 1, "V5 must add entity_type column to entities");
+
+        // Verify V5 added the kind+entity_type index.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_entities_kind_entity_type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1, "V5 must create idx_entities_kind_entity_type");
+
+        // Verify V10 added the status column to notes.
         let status_col: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('notes') WHERE name = 'status'",
@@ -556,9 +686,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(status_col, 1, "V5 must add status column to notes");
+        assert_eq!(status_col, 1, "V10 must add status column to notes");
 
-        // Verify V6 added merged_into column to entities.
+        // Verify V11 added merged_into column to entities.
         let merged_into_col: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('entities') WHERE name = 'merged_into'",
@@ -568,10 +698,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             merged_into_col, 1,
-            "V6 must add merged_into column to entities"
+            "V11 must add merged_into column to entities"
         );
 
-        // Verify V7 made salience nullable (notnull=0).
+        // Verify V12 made salience nullable (notnull=0).
         let salience_notnull: i64 = conn
             .query_row(
                 "SELECT \"notnull\" FROM pragma_table_info('notes') WHERE name = 'salience'",
@@ -579,7 +709,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(salience_notnull, 0, "V7 must make salience nullable");
+        assert_eq!(salience_notnull, 0, "V12 must make salience nullable");
     }
 
     #[test]
@@ -587,54 +717,88 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 7);
-        assert_eq!(v2, 7);
+        assert_eq!(v1, 12);
+        assert_eq!(v2, 12);
 
-        // Should still have exactly seven rows in the tracking table (V1 through V7).
+        // Should still have exactly twelve rows in the tracking table (V1..V12).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 7);
+        assert_eq!(count, 12);
+    }
+
+    // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
+    // ADR-009 requires target_backend for backend routing.
+    #[test]
+    fn migration_v9_adds_target_backend_index() {
+        let mut conn = open_memory();
+        let version = run_migrations(&mut conn).expect("migrations should succeed");
+        assert_eq!(
+            version, 12,
+            "F052: latest migration must be V12 (nullable note metrics)"
+        );
+        let col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('graph_edges') WHERE name = 'target_backend'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            col, 1,
+            "F052: graph_edges must have target_backend column after V9 migration"
+        );
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_graph_edges_target_backend'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx, 1,
+            "F052: idx_graph_edges_target_backend partial index must exist after V9 migration"
+        );
     }
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v8 = VersionedMigration {
-            version: 8,
+        let bad_v13 = VersionedMigration {
+            version: 13,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1 through V7) so the DB is at V7.
-        run_migrations(&mut conn).expect("V1-V7 should apply cleanly");
+        // Apply all real migrations (V1..V12) so the DB is at V12.
+        run_migrations(&mut conn).expect("V1..V12 should apply cleanly");
 
-        // Now manually drive the bad V8 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v8);
+        // Now manually drive the bad V13 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v13);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V7 — no V8 row in tracking.
-        let v8_count: i64 = conn
+        // DB should still be at V12 — no V13 row in tracking.
+        let v13_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 8",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 13",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v8_count, 0, "V8 must not be recorded after rollback");
+        assert_eq!(v13_count, 0, "V13 must not be recorded after rollback");
 
-        // V1 through V7 should still be there.
+        // V1..V12 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(applied_count, 7, "V1 through V7 must still be recorded");
+        assert_eq!(applied_count, 12, "V1..V12 must still be recorded");
     }
 
     #[test]
@@ -662,11 +826,12 @@ mod tests {
         assert!(has_name, "NOTES_DDL should include name column");
 
         // Now run versioned migrations — V2 should detect the existing name column
-        // and skip; V5 should detect the existing status column and skip; V6 should
-        // detect the existing merged_into column and skip; V7 should detect that
-        // salience is already nullable and skip; V4 adds the unique triple index.
+        // and skip; V5 should detect entity_type already present via ENTITIES_DDL and skip;
+        // V9 rebuilds graph_edges with lifecycle columns; V10 should detect the existing
+        // status column and skip; V11 should detect the existing merged_into column and skip;
+        // V12 should detect that salience is already nullable and skip.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 7);
+        assert_eq!(version, 12);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -691,41 +856,67 @@ mod tests {
             .unwrap();
         assert_eq!(
             v5_count, 1,
-            "V5 must be recorded even when status column pre-exists via NOTES_DDL"
+            "V5 must be recorded even when entity_type column pre-exists"
         );
 
-        // V6 should be recorded as applied (skipped but tracked).
-        let v6_count: i64 = conn
+        // V9 (edge lifecycle + target_backend) must be recorded.
+        let v9_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 6",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 9",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
-            v6_count, 1,
-            "V6 must be recorded even when merged_into column pre-exists via ENTITIES_DDL"
+            v9_count, 1,
+            "V9 must be recorded after store-DDL + migrations"
         );
 
-        // V7 should be recorded as applied (skipped but tracked — NOTES_DDL already
+        // V10 should be recorded as applied (skipped but tracked).
+        let v10_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v10_count, 1,
+            "V10 must be recorded even when status column pre-exists via NOTES_DDL"
+        );
+
+        // V11 should be recorded as applied (skipped but tracked).
+        let v11_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 11",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v11_count, 1,
+            "V11 must be recorded even when merged_into column pre-exists via ENTITIES_DDL"
+        );
+
+        // V12 should be recorded as applied (skipped but tracked — NOTES_DDL already
         // creates salience as nullable).
-        let v7_count: i64 = conn
+        let v12_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 7",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 12",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
-            v7_count, 1,
-            "V7 must be recorded even when salience is already nullable via NOTES_DDL"
+            v12_count, 1,
+            "V12 must be recorded even when salience is already nullable via NOTES_DDL"
         );
     }
 
-    /// Verify that V7 rebuilds a V1-era notes table so salience/decay_factor
+    /// Verify that V12 rebuilds a V1-era notes table so salience/decay_factor
     /// accept NULL, unblocking `create_note` with `salience=None` on migrated DBs.
     #[test]
-    fn v1_to_v7_allows_null_salience() {
+    fn v1_to_v12_allows_null_salience() {
         let mut conn = open_memory();
 
         // Bootstrap the schema tracking table and create the full V1-era schema.
@@ -791,11 +982,11 @@ mod tests {
         )
         .unwrap();
 
-        // Run V2-V7 migrations.
+        // Run V2-V12 migrations.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 7);
+        assert_eq!(version, 12);
 
-        // After V7, salience must be nullable (notnull=0).
+        // After V12, salience must be nullable (notnull=0).
         let notnull: i64 = conn
             .query_row(
                 "SELECT \"notnull\" FROM pragma_table_info('notes') WHERE name = 'salience'",
@@ -803,7 +994,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(notnull, 0, "salience must be nullable after V7");
+        assert_eq!(notnull, 0, "salience must be nullable after V12");
 
         // Inserting a note without salience must succeed.
         conn.execute(
@@ -811,7 +1002,7 @@ mod tests {
              VALUES ('test-id', 'ns', 'observation', 'active', '', 1, 1)",
             [],
         )
-        .expect("inserting note with NULL salience must succeed after V7");
+        .expect("inserting note with NULL salience must succeed after V12");
 
         let stored_salience: Option<f64> = conn
             .query_row(

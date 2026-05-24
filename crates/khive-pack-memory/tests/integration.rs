@@ -332,7 +332,7 @@ async fn test_remember_decay_factor_clamped() {
 
 #[test]
 fn test_memory_dotted_verbs_registered() {
-    let names: Vec<&str> = MemoryPack::VERBS.iter().map(|v| v.name).collect();
+    let names: Vec<&str> = MemoryPack::HANDLERS.iter().map(|v| v.name).collect();
     assert!(names.contains(&"recall.candidates"));
     assert!(names.contains(&"recall.fuse"));
     assert!(names.contains(&"recall.score"));

@@ -17,7 +17,7 @@
 //! let entity = rt.create_entity(None, "concept", "LoRA", None, None, vec![]).await?;
 //!
 //! // Link two entities (EdgeRelation is the typed relation):
-//! let edge = rt.link(None, entity.id, other_id, EdgeRelation::Extends, 1.0).await?;
+//! let edge = rt.link(None, entity.id, other_id, EdgeRelation::Extends, 1.0, None).await?;
 //! ```
 
 pub mod curation;
@@ -47,7 +47,7 @@ pub use objectives::{
     GraphProximityObjective, RetrievalCandidate, RrfFusionObjective, TextRelevanceObjective,
     VectorSimilarityObjective,
 };
-pub use operations::{NoteSearchHit, QueryResult, Resolved};
+pub use operations::{LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
     DispatchHook, KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
     VerbRegistryBuilder,

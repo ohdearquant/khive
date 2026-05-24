@@ -126,6 +126,11 @@ fn compile_fixed_length(
                     where_parts.push(format!("{alias}.kind = ?{}", params.len()));
                 }
 
+                if let Some(ref et) = np.entity_type {
+                    params.push(SqlValue::Text(et.clone()));
+                    where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
+                }
+
                 for (key, val) in &np.properties {
                     params.push(SqlValue::Text(val.clone()));
                     if key == "name" {
@@ -179,7 +184,9 @@ fn compile_fixed_length(
                     format!("{e_alias}.{target_join}")
                 };
 
-                join_parts.push(format!("JOIN graph_edges {e_alias} ON {source_join}"));
+                join_parts.push(format!(
+                    "JOIN graph_edges {e_alias} ON {source_join} AND {e_alias}.deleted_at IS NULL"
+                ));
 
                 let ens_filter = namespace_filter(&e_alias, opts, &mut params);
                 if !ens_filter.is_empty() {
@@ -232,6 +239,7 @@ fn compile_fixed_length(
             VarKind::Node => {
                 if cond.property == "name"
                     || cond.property == "kind"
+                    || cond.property == "entity_type"
                     || cond.property == "namespace"
                 {
                     format!("{alias}.{}", cond.property)
@@ -299,7 +307,8 @@ fn compile_fixed_length(
                     VarKind::Node => {
                         select_parts.push(format!(
                             "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                             {alias}.kind AS {var}_kind, {alias}.name AS {var}_name, \
+                             {alias}.kind AS {var}_kind, {alias}.entity_type AS {var}_entity_type, \
+                             {alias}.name AS {var}_name, \
                              {alias}.properties AS {var}_properties, \
                              {alias}.created_at AS {var}_created_at, \
                              {alias}.updated_at AS {var}_updated_at"
@@ -386,6 +395,10 @@ fn compile_variable_length(
         params.push(SqlValue::Text(kind.clone()));
         start_conditions.push(format!("s.kind = ?{}", params.len()));
     }
+    if let Some(ref et) = start.entity_type {
+        params.push(SqlValue::Text(et.clone()));
+        start_conditions.push(format!("s.entity_type = ?{}", params.len()));
+    }
     for (key, val) in &start.properties {
         params.push(SqlValue::Text(val.clone()));
         if key == "name" {
@@ -458,6 +471,10 @@ fn compile_variable_length(
         params.push(SqlValue::Text(kind.clone()));
         end_conditions.push(format!("r.kind = ?{}", params.len()));
     }
+    if let Some(ref et) = end.entity_type {
+        params.push(SqlValue::Text(et.clone()));
+        end_conditions.push(format!("r.entity_type = ?{}", params.len()));
+    }
     for (key, val) in &end.properties {
         params.push(SqlValue::Text(val.clone()));
         if key == "name" {
@@ -485,14 +502,16 @@ fn compile_variable_length(
             )));
         };
 
-        let col_expr = if cond.property == "name" || cond.property == "kind" {
-            format!("{col_alias}.{}", cond.property)
-        } else {
-            format!(
-                "json_extract({col_alias}.properties, '$.{}')",
-                cond.property.replace('\'', "''")
-            )
-        };
+        let col_expr =
+            if cond.property == "name" || cond.property == "kind" || cond.property == "entity_type"
+            {
+                format!("{col_alias}.{}", cond.property)
+            } else {
+                format!(
+                    "json_extract({col_alias}.properties, '$.{}')",
+                    cond.property.replace('\'', "''")
+                )
+            };
 
         let op_str = match cond.op {
             CompareOp::Eq => "=",
@@ -597,7 +616,8 @@ fn compile_variable_length(
                             has_start = true;
                             select_parts.push(format!(
                                 "s.id AS {var}_id, s.namespace AS {var}_namespace, \
-                                 s.kind AS {var}_kind, s.name AS {var}_name, \
+                                 s.kind AS {var}_kind, s.entity_type AS {var}_entity_type, \
+                                 s.name AS {var}_name, \
                                  s.properties AS {var}_properties, \
                                  s.created_at AS {var}_created_at, \
                                  s.updated_at AS {var}_updated_at"
@@ -605,7 +625,8 @@ fn compile_variable_length(
                         } else {
                             select_parts.push(format!(
                                 "r.id AS {var}_id, r.namespace AS {var}_namespace, \
-                                 r.kind AS {var}_kind, r.name AS {var}_name, \
+                                 r.kind AS {var}_kind, r.entity_type AS {var}_entity_type, \
+                                 r.name AS {var}_name, \
                                  r.properties AS {var}_properties, \
                                  r.created_at AS {var}_created_at, \
                                  r.updated_at AS {var}_updated_at"
@@ -647,7 +668,7 @@ fn compile_variable_length(
              SELECT s.id, {seed_next}, 1, s.id || ',' || {seed_next}, e.weight, \
                     e.id, e.relation, e.weight \
              FROM entities s \
-             JOIN graph_edges e ON {seed_join}{e_ns_filter}{relation_condition} \
+             JOIN graph_edges e ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              WHERE {start_where} \
              UNION ALL \
              SELECT t.start_id, {recurse_next}, t.depth + 1, \
@@ -655,7 +676,7 @@ fn compile_variable_length(
                     t.total_weight + e.weight, \
                     e.id, e.relation, e.weight \
              FROM traverse t \
-             JOIN graph_edges e ON {recurse_join}{e_ns_filter}{relation_condition} \
+             JOIN graph_edges e ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              WHERE t.depth < ?{depth_param} \
                AND (',' || t.path || ',') NOT LIKE '%,' || {recurse_next} || ',%' \
          ) \
@@ -698,6 +719,7 @@ const NODE_COLUMNS: &[&str] = &[
     "id",
     "name",
     "kind",
+    "entity_type",
     "namespace",
     "description",
     "properties",
@@ -1056,6 +1078,33 @@ mod tests {
             compiled.sql.contains(".weight AS e_weight"),
             "sql: {}",
             compiled.sql
+        );
+    }
+
+    #[test]
+    fn entity_type_compiles_as_direct_column_not_json_extract() {
+        // entity_type in a NodePattern must become `alias.entity_type = ?N` in the WHERE
+        // clause — a direct column reference, not json_extract from the properties blob.
+        let q = gql::parse("MATCH (n:document {entity_type: 'paper'})-[:extends]->(m) RETURN n")
+            .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains(".entity_type = ?"),
+            "entity_type must compile to a direct column comparison; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("json_extract"),
+            "entity_type must NOT use json_extract; sql: {}",
+            compiled.sql
+        );
+        let has_paper_param = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, SqlValue::Text(s) if s == "paper"));
+        assert!(
+            has_paper_param,
+            "entity_type value 'paper' must appear as a bound parameter"
         );
     }
 }

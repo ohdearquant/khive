@@ -64,7 +64,7 @@ pub struct SelectorWeights {
 ///
 /// An implementation collapses N inputs into a subset that fits a budget,
 /// using weights and an optional query for relevance context.
-pub trait Selector<T> {
+pub trait Selector<T>: Send + Sync {
     fn select(
         &self,
         inputs: Vec<SelectorInput<T>>,

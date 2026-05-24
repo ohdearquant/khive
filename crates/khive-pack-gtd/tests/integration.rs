@@ -2,7 +2,7 @@
 
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
-use khive_runtime::pack::VerbDef;
+use khive_runtime::pack::HandlerDef;
 use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use serde_json::{json, Value};
 
@@ -21,7 +21,7 @@ impl Fixture {
         self.registry.dispatch(verb, args).await
     }
 
-    fn verbs(&self) -> Vec<&'static VerbDef> {
+    fn verbs(&self) -> Vec<&'static HandlerDef> {
         self.registry.all_verbs()
     }
 

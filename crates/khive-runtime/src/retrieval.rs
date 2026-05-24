@@ -129,6 +129,7 @@ impl KhiveRuntime {
     /// The fused candidate set is kept untruncated until after the alive + kind filter so
     /// that right-kind hits ranked below `limit` in the raw fusion still surface when
     /// higher-ranked candidates are wrong-kind or soft-deleted.
+    #[allow(clippy::too_many_arguments)]
     pub async fn hybrid_search(
         &self,
         namespace: Option<&str>,
@@ -136,6 +137,7 @@ impl KhiveRuntime {
         query_vector: Option<Vec<f32>>,
         limit: u32,
         entity_kind: Option<&str>,
+        entity_type: Option<&str>,
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
@@ -183,6 +185,7 @@ impl KhiveRuntime {
                     EntityFilter {
                         ids: candidate_ids,
                         kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
+                        entity_types: entity_type.map(|t| vec![t.to_string()]).unwrap_or_default(),
                         ..EntityFilter::default()
                     },
                     PageRequest {
@@ -529,6 +532,7 @@ mod tests {
         rt.create_entity(
             None,
             "concept",
+            None,
             "FlashAttention",
             Some("IO-aware exact attention using tiling"),
             None,
@@ -538,7 +542,7 @@ mod tests {
         .unwrap();
 
         let hits = rt
-            .hybrid_search(None, "FlashAttention", None, 10, None)
+            .hybrid_search(None, "FlashAttention", None, 10, None, None)
             .await
             .unwrap();
 

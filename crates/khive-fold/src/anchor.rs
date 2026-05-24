@@ -76,7 +76,7 @@ impl AnchorGraph {
 }
 
 /// The Anchor primitive.
-pub trait Anchor {
+pub trait Anchor: Send + Sync {
     /// Trace the causal chain from a starting anchor to its sources.
     fn trace(
         &self,
@@ -91,7 +91,7 @@ pub trait Anchor {
         graph: &AnchorGraph,
         outcome: &AnchorRef,
         max_depth: usize,
-    ) -> Result<Vec<(AnchorRef, f32)>, FoldError>;
+    ) -> Result<Vec<(AnchorRef, f64)>, FoldError>;
 }
 
 /// A BFS-based anchor implementation.
@@ -143,7 +143,7 @@ impl Anchor for BfsAnchor {
         graph: &AnchorGraph,
         outcome: &AnchorRef,
         max_depth: usize,
-    ) -> Result<Vec<(AnchorRef, f32)>, FoldError> {
+    ) -> Result<Vec<(AnchorRef, f64)>, FoldError> {
         if graph.find_node(outcome.id).is_none() {
             return Err(FoldError::AnchorNotFound(outcome.id.to_string()));
         }
@@ -153,7 +153,7 @@ impl Anchor for BfsAnchor {
         let mut queue = std::collections::VecDeque::new();
 
         visited.insert(outcome.id);
-        queue.push_back((outcome.id, 0usize, 1.0f32));
+        queue.push_back((outcome.id, 0usize, 1.0f64));
 
         while let Some((current_id, depth, weight)) = queue.pop_front() {
             if current_id != outcome.id {
@@ -163,7 +163,7 @@ impl Anchor for BfsAnchor {
             }
 
             if depth < max_depth {
-                let predecessors: Vec<(Uuid, f32)> = graph
+                let predecessors: Vec<(Uuid, f64)> = graph
                     .incoming(current_id)
                     .filter(|(id, _)| visited.insert(*id))
                     .map(|(id, _)| (id, weight * 0.5))
@@ -284,6 +284,21 @@ mod tests {
         // intermediate should be credited with weight > 0
         let inter_credit = credits.iter().find(|(r, _)| r.id == intermediate.id);
         assert!(inter_credit.is_some());
-        assert!(inter_credit.unwrap().1 > 0.0);
+        assert!(inter_credit.unwrap().1 > 0.0f64);
+    }
+
+    #[test]
+    fn credit_weights_are_f64() {
+        let mut graph = AnchorGraph::new();
+        let source = make_ref(10, "source");
+        let outcome = make_ref(11, "outcome");
+        graph.add_node(source.clone());
+        graph.add_node(outcome.clone());
+        graph.add_edge(source.id, outcome.id, "causes");
+
+        let credits: Vec<(AnchorRef, f64)> = BfsAnchor.credit(&graph, &outcome, 2).unwrap();
+        assert!(!credits.is_empty());
+        let w: f64 = credits[0].1;
+        assert!(w > 0.0f64 && w <= 1.0f64);
     }
 }

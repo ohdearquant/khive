@@ -48,6 +48,9 @@ pub struct ExportedEntity {
     pub id: Uuid,
     /// Pack-owned kind string (e.g. `"concept"`, `"person"`).
     pub kind: String,
+    /// Pack-governed subtype token (e.g. `"paper"`, `"snapshot"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -123,6 +126,7 @@ impl KhiveRuntime {
                 ExportedEntity {
                     id: e.id,
                     kind: e.kind.to_string(),
+                    entity_type: e.entity_type,
                     name: e.name,
                     description: e.description,
                     properties: e.properties,
@@ -224,6 +228,7 @@ impl KhiveRuntime {
                 id: ee.id,
                 namespace: ns.clone(),
                 kind: ee.kind.clone(),
+                entity_type: ee.entity_type.clone(),
                 name: ee.name.clone(),
                 description: ee.description.clone(),
                 properties: ee.properties.clone(),
@@ -274,14 +279,19 @@ impl KhiveRuntime {
                 edges_skipped += 1;
                 continue;
             }
+            let now = Utc::now();
             let edge = khive_storage::types::Edge {
                 id: LinkId::from(ee.edge_id),
+                namespace: ns.clone(),
                 source_id: ee.source,
                 target_id: ee.target,
                 relation: ee.relation,
                 weight: ee.weight,
-                created_at: Utc::now(),
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
                 metadata: None,
+                target_backend: None,
             };
             graph.upsert_edge(edge).await?;
             edges_imported += 1;
@@ -326,6 +336,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "FlashAttention",
                 Some("fast attention"),
                 None,
@@ -334,17 +345,33 @@ mod tests {
             .await
             .unwrap();
         let e2 = src
-            .create_entity(None, "concept", "FlashAttention-2", None, None, vec![])
+            .create_entity(
+                None,
+                "concept",
+                None,
+                "FlashAttention-2",
+                None,
+                None,
+                vec![],
+            )
             .await
             .unwrap();
         let e3 = src
-            .create_entity(None, "person", "Tri Dao", None, None, vec!["author".into()])
+            .create_entity(
+                None,
+                "person",
+                None,
+                "Tri Dao",
+                None,
+                None,
+                vec!["author".into()],
+            )
             .await
             .unwrap();
-        src.link(None, e2.id, e1.id, EdgeRelation::Extends, 1.0)
+        src.link(None, e2.id, e1.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        src.link(None, e1.id, e3.id, EdgeRelation::IntroducedBy, 0.9)
+        src.link(None, e1.id, e3.id, EdgeRelation::IntroducedBy, 0.9, None)
             .await
             .unwrap();
 
@@ -375,6 +402,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "LoRA",
                 Some("low-rank adaptation"),
                 Some(serde_json::json!({"year": "2021"})),
@@ -383,10 +411,10 @@ mod tests {
             .await
             .unwrap();
         let e2 = src
-            .create_entity(None, "concept", "QLoRA", None, None, vec![])
+            .create_entity(None, "concept", None, "QLoRA", None, None, vec![])
             .await
             .unwrap();
-        src.link(None, e2.id, e1.id, EdgeRelation::VariantOf, 0.9)
+        src.link(None, e2.id, e1.id, EdgeRelation::VariantOf, 0.9, None)
             .await
             .unwrap();
 
@@ -411,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn namespace_targeting() {
         let src = make_rt().await;
-        src.create_entity(Some("a"), "concept", "Sinkhorn", None, None, vec![])
+        src.create_entity(Some("a"), "concept", None, "Sinkhorn", None, None, vec![])
             .await
             .unwrap();
 
@@ -424,16 +452,25 @@ mod tests {
         assert_eq!(summary.entities_imported, 1);
 
         // Entity is in "b" on the destination runtime.
-        let in_b = dst.list_entities(Some("b"), None, 100, 0).await.unwrap();
+        let in_b = dst
+            .list_entities(Some("b"), None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(in_b.len(), 1);
         assert_eq!(in_b[0].name, "Sinkhorn");
 
         // Namespace "a" on the source runtime is unchanged.
-        let in_a = src.list_entities(Some("a"), None, 100, 0).await.unwrap();
+        let in_a = src
+            .list_entities(Some("a"), None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(in_a.len(), 1);
 
         // Namespace "a" on the destination runtime has nothing (only "b" was written).
-        let dst_a = dst.list_entities(Some("a"), None, 100, 0).await.unwrap();
+        let dst_a = dst
+            .list_entities(Some("a"), None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(dst_a.len(), 0);
     }
 
@@ -510,7 +547,7 @@ mod tests {
         let rt = make_rt().await;
         // Create an entity that will be the real target.
         let real = rt
-            .create_entity(None, "concept", "Real", None, None, vec![])
+            .create_entity(None, "concept", None, "Real", None, None, vec![])
             .await
             .unwrap();
 
@@ -523,6 +560,7 @@ mod tests {
             entities: vec![ExportedEntity {
                 id: real.id,
                 kind: "concept".to_string(),
+                entity_type: None,
                 name: "Real".to_string(),
                 description: None,
                 properties: None,
@@ -562,7 +600,7 @@ mod tests {
 
         let rt = make_rt().await;
         let real = rt
-            .create_entity(None, "concept", "Source", None, None, vec![])
+            .create_entity(None, "concept", None, "Source", None, None, vec![])
             .await
             .unwrap();
 
@@ -574,6 +612,7 @@ mod tests {
             entities: vec![ExportedEntity {
                 id: real.id,
                 kind: "concept".to_string(),
+                entity_type: None,
                 name: "Source".to_string(),
                 description: None,
                 properties: None,
@@ -613,15 +652,15 @@ mod tests {
 
         let src = make_rt().await;
         let a = src
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = src
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = src
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
 
@@ -635,6 +674,7 @@ mod tests {
                 ExportedEntity {
                     id: a.id,
                     kind: "concept".to_string(),
+                    entity_type: None,
                     name: "A".to_string(),
                     description: None,
                     properties: None,
@@ -645,6 +685,7 @@ mod tests {
                 ExportedEntity {
                     id: b.id,
                     kind: "concept".to_string(),
+                    entity_type: None,
                     name: "B".to_string(),
                     description: None,
                     properties: None,
@@ -655,6 +696,7 @@ mod tests {
                 ExportedEntity {
                     id: c.id,
                     kind: "concept".to_string(),
+                    entity_type: None,
                     name: "C".to_string(),
                     description: None,
                     properties: None,
@@ -709,14 +751,14 @@ mod tests {
     async fn import_all_valid_edges_reports_zero_skipped() {
         let src = make_rt().await;
         let e1 = src
-            .create_entity(None, "concept", "E1", None, None, vec![])
+            .create_entity(None, "concept", None, "E1", None, None, vec![])
             .await
             .unwrap();
         let e2 = src
-            .create_entity(None, "concept", "E2", None, None, vec![])
+            .create_entity(None, "concept", None, "E2", None, None, vec![])
             .await
             .unwrap();
-        src.link(None, e1.id, e2.id, EdgeRelation::VariantOf, 0.7)
+        src.link(None, e1.id, e2.id, EdgeRelation::VariantOf, 0.7, None)
             .await
             .unwrap();
 
@@ -737,15 +779,15 @@ mod tests {
     async fn export_kg_preserves_edge_id() {
         let rt = make_rt().await;
         let a = rt
-            .create_entity(None, "concept", "Alpha", None, None, vec![])
+            .create_entity(None, "concept", None, "Alpha", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "Beta", None, None, vec![])
+            .create_entity(None, "concept", None, "Beta", None, None, vec![])
             .await
             .unwrap();
         let stored_edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let stored_id: Uuid = stored_edge.id.into();
@@ -763,15 +805,15 @@ mod tests {
     async fn import_kg_persists_edge_id() {
         let src = make_rt().await;
         let a = src
-            .create_entity(None, "concept", "Alpha", None, None, vec![])
+            .create_entity(None, "concept", None, "Alpha", None, None, vec![])
             .await
             .unwrap();
         let b = src
-            .create_entity(None, "concept", "Beta", None, None, vec![])
+            .create_entity(None, "concept", None, "Beta", None, None, vec![])
             .await
             .unwrap();
         let stored_edge = src
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let original_id: Uuid = stored_edge.id.into();
@@ -875,15 +917,15 @@ mod tests {
         // Build a graph on the source runtime.
         let src = make_rt().await;
         let a = src
-            .create_entity(None, "concept", "NodeA", None, None, vec![])
+            .create_entity(None, "concept", None, "NodeA", None, None, vec![])
             .await
             .unwrap();
         let b = src
-            .create_entity(None, "concept", "NodeB", None, None, vec![])
+            .create_entity(None, "concept", None, "NodeB", None, None, vec![])
             .await
             .unwrap();
         let stored = src
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let original_edge_id: Uuid = stored.id.into();

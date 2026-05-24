@@ -1,6 +1,6 @@
 //! KG-pack vocabulary — pack-owned entity and note vocabulary.
 //!
-//! These enums validate and canonicalize kind strings at the pack boundary.
+//! Entity kind validation now uses `khive_types::EntityKind` directly.
 //! The runtime accepts any String — validation is the pack's responsibility.
 
 use core::fmt;
@@ -143,28 +143,6 @@ impl std::str::FromStr for NoteKind {
 mod tests {
     use super::*;
     use std::str::FromStr;
-
-    #[test]
-    fn entity_kind_roundtrip() {
-        for kind in EntityKind::ALL {
-            let parsed = EntityKind::from_str(kind.name()).unwrap();
-            assert_eq!(parsed, kind);
-        }
-    }
-
-    #[test]
-    fn entity_kind_aliases() {
-        assert_eq!(EntityKind::from_str("paper").unwrap(), EntityKind::Document);
-        assert_eq!(EntityKind::from_str("repo").unwrap(), EntityKind::Project);
-        assert_eq!(EntityKind::from_str("lab").unwrap(), EntityKind::Org);
-    }
-
-    #[test]
-    fn entity_kind_unknown_errors_with_valid_list() {
-        let err = EntityKind::from_str("gadget").unwrap_err();
-        assert_eq!(err.domain, "entity_kind");
-        assert!(err.valid.contains(&"concept"));
-    }
 
     #[test]
     fn note_kind_roundtrip() {

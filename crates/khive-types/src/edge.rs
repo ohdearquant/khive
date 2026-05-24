@@ -8,7 +8,7 @@ use core::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// The 6 structural categories that group the 13 canonical edge relations.
+/// The 8 structural categories that group the 15 canonical edge relations.
 ///
 /// Exposed via [`EdgeRelation::category`] for query planners and UI rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -19,6 +19,10 @@ pub enum EdgeCategory {
     Structure,
     /// Intellectual lineage: `extends`, `variant_of`, `introduced_by`, `supersedes`
     Derivation,
+    /// Data/artifact origin: `derived_from`
+    Provenance,
+    /// Time ordering: `precedes`
+    Temporal,
     /// Build/runtime needs: `depends_on`, `enables`
     Dependency,
     /// Code ↔ concept: `implements`
@@ -29,7 +33,7 @@ pub enum EdgeCategory {
     Annotation,
 }
 
-/// Closed set of 13 canonical edge relations (ADR-002, ADR-021).
+/// Closed set of 15 canonical edge relations (ADR-002).
 ///
 /// No `Default` — every edge requires an explicit relation.
 /// Wire format: snake_case strings (e.g. `"part_of"`, `"introduced_by"`).
@@ -46,6 +50,10 @@ pub enum EdgeRelation {
     VariantOf,
     IntroducedBy,
     Supersedes,
+    // Provenance
+    DerivedFrom,
+    // Temporal
+    Precedes,
     // Dependency
     DependsOn,
     Enables,
@@ -59,8 +67,8 @@ pub enum EdgeRelation {
 }
 
 impl EdgeRelation {
-    /// All 13 canonical relations in ADR-002 table order.
-    pub const ALL: [Self; 13] = [
+    /// All 15 canonical relations in ADR-002 table order.
+    pub const ALL: [Self; 15] = [
         Self::Contains,
         Self::PartOf,
         Self::InstanceOf,
@@ -68,6 +76,8 @@ impl EdgeRelation {
         Self::VariantOf,
         Self::IntroducedBy,
         Self::Supersedes,
+        Self::DerivedFrom,
+        Self::Precedes,
         Self::DependsOn,
         Self::Enables,
         Self::Implements,
@@ -76,6 +86,30 @@ impl EdgeRelation {
         Self::Annotates,
     ];
 
+    /// Valid snake_case names for all 15 canonical relations.
+    pub const VALID_NAMES: &'static [&'static str] = &[
+        "contains",
+        "part_of",
+        "instance_of",
+        "extends",
+        "variant_of",
+        "introduced_by",
+        "supersedes",
+        "derived_from",
+        "precedes",
+        "depends_on",
+        "enables",
+        "implements",
+        "competes_with",
+        "composed_with",
+        "annotates",
+    ];
+
+    /// `true` for symmetric relations: edge direction has no semantic meaning.
+    pub const fn is_symmetric(&self) -> bool {
+        matches!(self, Self::CompetesWith | Self::ComposedWith)
+    }
+
     /// The category this relation belongs to.
     pub const fn category(&self) -> EdgeCategory {
         match self {
@@ -83,6 +117,8 @@ impl EdgeRelation {
             Self::Extends | Self::VariantOf | Self::IntroducedBy | Self::Supersedes => {
                 EdgeCategory::Derivation
             }
+            Self::DerivedFrom => EdgeCategory::Provenance,
+            Self::Precedes => EdgeCategory::Temporal,
             Self::DependsOn | Self::Enables => EdgeCategory::Dependency,
             Self::Implements => EdgeCategory::Implementation,
             Self::CompetesWith | Self::ComposedWith => EdgeCategory::Lateral,
@@ -100,6 +136,8 @@ impl EdgeRelation {
             Self::VariantOf => "variant_of",
             Self::IntroducedBy => "introduced_by",
             Self::Supersedes => "supersedes",
+            Self::DerivedFrom => "derived_from",
+            Self::Precedes => "precedes",
             Self::DependsOn => "depends_on",
             Self::Enables => "enables",
             Self::Implements => "implements",
@@ -115,22 +153,6 @@ impl fmt::Display for EdgeRelation {
         f.write_str(self.as_str())
     }
 }
-
-const EDGE_RELATION_VALID: &[&str] = &[
-    "contains",
-    "part_of",
-    "instance_of",
-    "extends",
-    "variant_of",
-    "introduced_by",
-    "supersedes",
-    "depends_on",
-    "enables",
-    "implements",
-    "competes_with",
-    "composed_with",
-    "annotates",
-];
 
 impl FromStr for EdgeRelation {
     type Err = crate::error::UnknownVariant;
@@ -156,6 +178,8 @@ impl FromStr for EdgeRelation {
             "variant_of" | "variantof" => Ok(Self::VariantOf),
             "introduced_by" | "introducedby" => Ok(Self::IntroducedBy),
             "supersedes" => Ok(Self::Supersedes),
+            "derived_from" | "derivedfrom" => Ok(Self::DerivedFrom),
+            "precedes" => Ok(Self::Precedes),
             "depends_on" | "dependson" => Ok(Self::DependsOn),
             "enables" => Ok(Self::Enables),
             "implements" => Ok(Self::Implements),
@@ -165,7 +189,7 @@ impl FromStr for EdgeRelation {
             _ => Err(crate::error::UnknownVariant::new(
                 "edge_relation",
                 s,
-                EDGE_RELATION_VALID,
+                Self::VALID_NAMES,
             )),
         }
     }
@@ -177,8 +201,20 @@ mod tests {
     use alloc::string::ToString;
 
     #[test]
-    fn all_has_thirteen_variants() {
-        assert_eq!(EdgeRelation::ALL.len(), 13);
+    fn all_has_fifteen_variants() {
+        assert_eq!(EdgeRelation::ALL.len(), 15);
+    }
+
+    #[test]
+    fn all_eight_categories_covered() {
+        let mut cats = alloc::vec::Vec::new();
+        for r in EdgeRelation::ALL {
+            let c = r.category();
+            if !cats.contains(&c) {
+                cats.push(c);
+            }
+        }
+        assert_eq!(cats.len(), 8, "all 8 categories must be represented");
     }
 
     #[test]
@@ -243,7 +279,12 @@ mod tests {
             msg.contains("contains"),
             "error should list valid relations"
         );
-        assert!(msg.contains("annotates"), "error should list all 13");
+        assert!(
+            msg.contains("derived_from"),
+            "error should list derived_from"
+        );
+        assert!(msg.contains("precedes"), "error should list precedes");
+        assert!(msg.contains("annotates"), "error should list all 15");
     }
 
     #[test]
@@ -271,6 +312,12 @@ mod tests {
             EdgeCategory::Implementation
         );
 
+        assert_eq!(
+            EdgeRelation::DerivedFrom.category(),
+            EdgeCategory::Provenance
+        );
+        assert_eq!(EdgeRelation::Precedes.category(), EdgeCategory::Temporal);
+
         assert_eq!(EdgeRelation::CompetesWith.category(), EdgeCategory::Lateral);
         assert_eq!(EdgeRelation::ComposedWith.category(), EdgeCategory::Lateral);
 
@@ -278,15 +325,33 @@ mod tests {
     }
 
     #[test]
-    fn all_categories_covered() {
-        let mut cats = alloc::vec::Vec::new();
-        for r in EdgeRelation::ALL {
-            let c = r.category();
-            if !cats.contains(&c) {
-                cats.push(c);
-            }
-        }
-        assert_eq!(cats.len(), 6, "all 6 categories must be represented");
+    fn from_str_new_relations() {
+        assert_eq!(
+            "derived_from".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::DerivedFrom
+        );
+        assert_eq!(
+            "derived-from".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::DerivedFrom
+        );
+        assert_eq!(
+            "derivedfrom".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::DerivedFrom
+        );
+        assert_eq!(
+            "precedes".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::Precedes
+        );
+    }
+
+    #[test]
+    fn is_symmetric_only_for_lateral_peer_relations() {
+        assert!(EdgeRelation::CompetesWith.is_symmetric());
+        assert!(EdgeRelation::ComposedWith.is_symmetric());
+        assert!(!EdgeRelation::DependsOn.is_symmetric());
+        assert!(!EdgeRelation::DerivedFrom.is_symmetric());
+        assert!(!EdgeRelation::Precedes.is_symmetric());
+        assert!(!EdgeRelation::Extends.is_symmetric());
     }
 
     #[cfg(feature = "serde")]
@@ -297,5 +362,15 @@ mod tests {
         assert_eq!(json, "\"introduced_by\"");
         let parsed: EdgeRelation = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, rel);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_new_relations_roundtrip() {
+        for rel in [EdgeRelation::DerivedFrom, EdgeRelation::Precedes] {
+            let json = serde_json::to_string(&rel).unwrap();
+            let parsed: EdgeRelation = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, rel);
+        }
     }
 }
