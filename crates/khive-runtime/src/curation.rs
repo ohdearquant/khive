@@ -234,7 +234,13 @@ impl KhiveRuntime {
         }
 
         let event_store = self.events(namespace)?;
-        let policy_str = format!("{strategy:?}").to_ascii_lowercase();
+        // Mirror the wire-level strategy spelling from MergeParams so consumers
+        // can round-trip the policy string back into a request.
+        let policy_str = match strategy {
+            MergeStrategy::PreferInto => "prefer_into",
+            MergeStrategy::PreferFrom => "prefer_from",
+            MergeStrategy::Union => "union",
+        };
         let event = khive_storage::event::Event::new(
             updated_entity.namespace.clone(),
             "merge",
