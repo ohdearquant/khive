@@ -184,7 +184,9 @@ fn compile_fixed_length(
                     format!("{e_alias}.{target_join}")
                 };
 
-                join_parts.push(format!("JOIN graph_edges {e_alias} ON {source_join}"));
+                join_parts.push(format!(
+                    "JOIN graph_edges {e_alias} ON {source_join} AND {e_alias}.deleted_at IS NULL"
+                ));
 
                 let ens_filter = namespace_filter(&e_alias, opts, &mut params);
                 if !ens_filter.is_empty() {
@@ -666,7 +668,7 @@ fn compile_variable_length(
              SELECT s.id, {seed_next}, 1, s.id || ',' || {seed_next}, e.weight, \
                     e.id, e.relation, e.weight \
              FROM entities s \
-             JOIN graph_edges e ON {seed_join}{e_ns_filter}{relation_condition} \
+             JOIN graph_edges e ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              WHERE {start_where} \
              UNION ALL \
              SELECT t.start_id, {recurse_next}, t.depth + 1, \
@@ -674,7 +676,7 @@ fn compile_variable_length(
                     t.total_weight + e.weight, \
                     e.id, e.relation, e.weight \
              FROM traverse t \
-             JOIN graph_edges e ON {recurse_join}{e_ns_filter}{relation_condition} \
+             JOIN graph_edges e ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
              WHERE t.depth < ?{depth_param} \
                AND (',' || t.path || ',') NOT LIKE '%,' || {recurse_next} || ',%' \
          ) \

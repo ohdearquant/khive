@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
-use khive_runtime::pack::{PackRuntime, VerbDef};
+use khive_runtime::pack::{HandlerDef, PackRuntime};
 use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use khive_types::Pack;
 use serde_json::{json, Value};
@@ -27,7 +27,7 @@ impl Fixture {
         self.registry.dispatch(verb, args).await
     }
 
-    fn verbs(&self) -> Vec<&'static VerbDef> {
+    fn verbs(&self) -> Vec<&'static HandlerDef> {
         self.registry.all_verbs()
     }
 }
@@ -1203,7 +1203,7 @@ impl Pack for FakeMemoryPack {
     const NAME: &'static str = "memory";
     const NOTE_KINDS: &'static [&'static str] = &["memory"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const VERBS: &'static [VerbDef] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[];
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
@@ -1221,8 +1221,8 @@ impl PackRuntime for FakeMemoryPack {
         FakeMemoryPack::ENTITY_KINDS
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        FakeMemoryPack::VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        FakeMemoryPack::HANDLERS
     }
 
     fn requires(&self) -> &'static [&'static str] {
@@ -2064,8 +2064,73 @@ async fn bulk_link_dedup_and_response_shape() {
         Some(0),
         "failed must be 0; got {result:?}"
     );
+    // ADR-038: edges key must be absent when verbose is not set (F205).
     assert!(
-        result.get("edges").and_then(Value::as_array).is_some(),
-        "edges array must be present; got {result:?}"
+        result.get("edges").is_none(),
+        "edges must be absent without verbose=true (ADR-038 F205); got {result:?}"
+    );
+}
+
+// F205: bulk link with verbose=true must include edges array; without verbose it must be absent.
+#[tokio::test]
+async fn bulk_link_verbose_controls_edges_key() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "VerbA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "VerbB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // Without verbose: no edges key.
+    let result_no_verbose = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [{"source_id": a_id, "target_id": b_id, "relation": "extends"}],
+            }),
+        )
+        .await
+        .expect("bulk link must succeed");
+    assert!(
+        result_no_verbose.get("edges").is_none(),
+        "edges must be absent without verbose=true (ADR-038 F205); got {result_no_verbose:?}"
+    );
+
+    // With verbose=true: edges key present.
+    let c = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "VerbC", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let c_id = c.get("id").and_then(Value::as_str).unwrap().to_string();
+    let result_verbose = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [{"source_id": a_id, "target_id": c_id, "relation": "extends"}],
+                "verbose": true,
+            }),
+        )
+        .await
+        .expect("bulk link with verbose must succeed");
+    assert!(
+        result_verbose
+            .get("edges")
+            .and_then(Value::as_array)
+            .is_some(),
+        "edges must be present with verbose=true (ADR-038 F205); got {result_verbose:?}"
     );
 }

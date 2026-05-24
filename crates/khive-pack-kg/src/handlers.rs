@@ -1226,13 +1226,17 @@ impl KgPack {
                     });
                 }
                 let edges = self.runtime.link_many(specs).await?;
-                return to_json(&serde_json::json!({
+                let mut resp = serde_json::json!({
                     "attempted": attempted,
                     "created": edges.len(),
                     "skipped": skipped,
                     "failed": 0,
-                    "edges": edges,
-                }));
+                });
+                if verbose {
+                    resp["edges"] = serde_json::to_value(&edges)
+                        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+                }
+                return to_json(&resp);
             } else {
                 let mut results: Vec<Value> = Vec::new();
                 let mut error_list: Vec<Value> = Vec::new();
@@ -1290,14 +1294,17 @@ impl KgPack {
                         Err(e) => error_list.push(json!({"index": idx, "error": format!("{e}")})),
                     }
                 }
-                return to_json(&serde_json::json!({
+                let mut resp = serde_json::json!({
                     "attempted": attempted,
                     "created": results.len(),
                     "skipped": skipped,
                     "failed": error_list.len(),
-                    "edges": results,
                     "errors": error_list,
-                }));
+                });
+                if verbose {
+                    resp["edges"] = serde_json::Value::Array(results);
+                }
+                return to_json(&resp);
             }
         }
 

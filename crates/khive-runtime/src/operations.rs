@@ -49,6 +49,31 @@ fn text_preview(text: &str, max_chars: usize) -> Option<String> {
     }
 }
 
+/// ADR-002: symmetric relations (`competes_with`, `composed_with`) are stored
+/// with a canonical source (lower UUID wins), so a directed `Out` or `In` query
+/// may miss results. When the relations filter is non-empty and contains **only**
+/// symmetric relations, override direction to `Both` so callers always see all
+/// edges for these relations regardless of storage canonicalization.
+fn normalize_symmetric_direction(
+    direction: Direction,
+    relations: Option<&[EdgeRelation]>,
+) -> Direction {
+    let Some(rels) = relations else {
+        return direction;
+    };
+    if rels.is_empty() {
+        return direction;
+    }
+    let all_symmetric = rels
+        .iter()
+        .all(|r| matches!(r, EdgeRelation::CompetesWith | EdgeRelation::ComposedWith));
+    if all_symmetric {
+        Direction::Both
+    } else {
+        direction
+    }
+}
+
 fn note_title(note: &Note) -> Option<String> {
     note.name
         .clone()
@@ -165,13 +190,12 @@ fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &st
         ("service", EdgeRelation::CompetesWith, "service"),
         ("concept", EdgeRelation::ComposedWith, "concept"),
         ("project", EdgeRelation::ComposedWith, "project"),
-        // Versioning (Supersedes — same entity-kind pairs per ADR-002)
+        // Versioning (Supersedes — ADR-002:190-194: Concept/Document/Artifact/Service/Dataset only)
         ("concept", EdgeRelation::Supersedes, "concept"),
         ("document", EdgeRelation::Supersedes, "document"),
+        ("artifact", EdgeRelation::Supersedes, "artifact"),
+        ("service", EdgeRelation::Supersedes, "service"),
         ("dataset", EdgeRelation::Supersedes, "dataset"),
-        ("project", EdgeRelation::Supersedes, "project"),
-        ("person", EdgeRelation::Supersedes, "person"),
-        ("org", EdgeRelation::Supersedes, "org"),
     ];
     RULES.iter().any(|(src, rel, tgt)| {
         *rel == relation && (*src == "*" || *src == src_kind) && *tgt == tgt_kind
@@ -593,6 +617,11 @@ impl KhiveRuntime {
     /// `metadata` is validated against governed keys (ADR-002 §Edge Metadata);
     /// `dependency_kind` is inferred for `depends_on` edges when absent (F013).
     ///
+    /// ADR-009 invariant: `target_backend` is always `None` for locally-routed
+    /// edges written through this path. The `validate_edge_relation_endpoints`
+    /// call above already ensures both endpoints exist in the local namespace,
+    /// so setting `target_backend = None` is the only valid choice (F161).
+    ///
     /// A record that exists but belongs to a different namespace is treated as not found
     /// (fail-closed; no cross-namespace existence leak).
     pub async fn link(
@@ -658,6 +687,10 @@ impl KhiveRuntime {
     ///
     /// Pass `relations: Some(vec![EdgeRelation::Annotates])` to retrieve only
     /// annotation edges, enabling cross-substrate navigation as described in ADR-024.
+    ///
+    /// ADR-002: symmetric relations (`competes_with`, `composed_with`) are stored
+    /// with the canonical source as the lower UUID. Direction normalization is
+    /// applied in `neighbors_with_query` so both callers see correct results.
     pub async fn neighbors(
         &self,
         namespace: Option<&str>,
@@ -680,12 +713,18 @@ impl KhiveRuntime {
     }
 
     /// Get neighbors with full query control (includes `min_weight`).
+    ///
+    /// Applies symmetric-relation direction normalization (ADR-002): if the
+    /// relations filter contains only symmetric relations the direction is
+    /// overridden to `Both` so edges stored in canonical order are always found.
     pub async fn neighbors_with_query(
         &self,
         namespace: Option<&str>,
         node_id: Uuid,
-        query: NeighborQuery,
+        mut query: NeighborQuery,
     ) -> RuntimeResult<Vec<NeighborHit>> {
+        query.direction =
+            normalize_symmetric_direction(query.direction, query.relations.as_deref());
         let mut hits = self.graph(namespace)?.neighbors(node_id, query).await?;
         self.enrich_neighbor_hits(namespace, &mut hits).await;
         Ok(hits)
@@ -4155,6 +4194,148 @@ mod tests {
         );
     }
 
+    // F010 (ADR-002): Supersedes — positive tests for all 5 allowed entity kinds.
+    #[tokio::test]
+    async fn f010_supersedes_document_to_document_allowed() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "document", None, "DocA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "document", None, "DocB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "document->document Supersedes must be allowed (ADR-002:191), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_artifact_to_artifact_allowed() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "artifact", None, "ArtA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "artifact", None, "ArtB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "artifact->artifact Supersedes must be allowed (ADR-002:192), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_service_to_service_allowed() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "service", None, "SvcA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "service", None, "SvcB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "service->service Supersedes must be allowed (ADR-002:193), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_dataset_to_dataset_allowed() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "dataset", None, "DataA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "dataset", None, "DataB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "dataset->dataset Supersedes must be allowed (ADR-002:194), got {result:?}"
+        );
+    }
+
+    // F010 (ADR-002): Supersedes — negative tests for rejected entity kinds.
+    #[tokio::test]
+    async fn f010_supersedes_project_to_project_rejected() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "project", None, "ProjA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "project", None, "ProjB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "project->project Supersedes must be rejected (not in ADR-002 allowlist), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_person_to_person_rejected() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "person", None, "Alice", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "person", None, "Bob", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "person->person Supersedes must be rejected (not in ADR-002 allowlist), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_org_to_org_rejected() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "org", None, "OrgA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "org", None, "OrgB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(None, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "org->org Supersedes must be rejected (not in ADR-002 allowlist), got {result:?}"
+        );
+    }
+
     // Fix 1: Supersedes entity→entity — same kind (concept→concept) must be allowed.
     #[tokio::test]
     async fn f010_supersedes_same_kind_entity_allowed() {
@@ -4173,6 +4354,125 @@ mod tests {
         assert!(
             result.is_ok(),
             "concept->concept Supersedes must be allowed by ADR-002 allowlist, got {result:?}"
+        );
+    }
+
+    // F161: ADR-009 target_backend invariant — all edges written through link() must have
+    // target_backend = None because validate_edge_relation_endpoints already ensured the
+    // target exists locally.
+    #[tokio::test]
+    async fn f161_link_always_writes_null_target_backend() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        assert!(
+            edge.target_backend.is_none(),
+            "ADR-009: target_backend must be None for locally-routed edges (F161); got {:?}",
+            edge.target_backend
+        );
+    }
+
+    // F161: link_many must also write null target_backend for all local edges.
+    #[tokio::test]
+    async fn f161_link_many_always_writes_null_target_backend() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let c = rt
+            .create_entity(None, "concept", None, "C", None, None, vec![])
+            .await
+            .unwrap();
+        let specs = vec![
+            LinkSpec {
+                namespace: None,
+                source_id: a.id,
+                target_id: b.id,
+                relation: EdgeRelation::Extends,
+                weight: 1.0,
+                metadata: None,
+            },
+            LinkSpec {
+                namespace: None,
+                source_id: a.id,
+                target_id: c.id,
+                relation: EdgeRelation::Enables,
+                weight: 1.0,
+                metadata: None,
+            },
+        ];
+        let edges = rt.link_many(specs).await.unwrap();
+        for edge in &edges {
+            assert!(
+                edge.target_backend.is_none(),
+                "ADR-009: target_backend must be None for locally-routed edges in link_many (F161); got {:?}",
+                edge.target_backend
+            );
+        }
+    }
+
+    // F012: symmetric relation neighbors — competes_with queried from the non-canonical
+    // endpoint must still return results when direction=Out is requested.
+    #[tokio::test]
+    async fn f012_symmetric_neighbors_visible_from_both_endpoints() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        // Link A→B competes_with; if A.id > B.id the edge is stored as B→A (canonical).
+        rt.link(None, a.id, b.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        // Both endpoints should see the edge regardless of direction=Out.
+        let from_a = rt
+            .neighbors(
+                None,
+                a.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::CompetesWith]),
+            )
+            .await
+            .unwrap();
+        let from_b = rt
+            .neighbors(
+                None,
+                b.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::CompetesWith]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            from_a.len(),
+            1,
+            "node A must see competes_with neighbor from Direction::Out (F012); got {from_a:?}"
+        );
+        assert_eq!(
+            from_b.len(),
+            1,
+            "node B must see competes_with neighbor from Direction::Out (F012); got {from_b:?}"
         );
     }
 
