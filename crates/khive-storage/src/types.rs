@@ -108,7 +108,7 @@ pub enum VectorIndexKind {
     Flat,
 }
 
-/// Backend capability declaration for vector stores (ADR-041).
+/// Backend capability declaration for vector stores (ADR-041, ADR-044).
 ///
 /// Returned by [`VectorStore::capabilities`]. Higher-level retrieval policy
 /// (hybrid search, HyDE fan-out, etc.) introspects this struct at construction
@@ -123,33 +123,51 @@ pub struct VectorStoreCapabilities {
     pub supports_quantization: bool,
     /// Supports in-place update without a delete+insert round-trip.
     pub supports_update: bool,
+    /// Supports orphan sweep (deleting vectors with no live subject).
+    pub supports_orphan_sweep: bool,
     /// Maximum supported embedding dimension, or `None` if unbounded.
     pub max_dimensions: Option<u32>,
     /// Index algorithms available in this backend.
     pub index_kinds: Vec<VectorIndexKind>,
 }
 
-/// A typed predicate for backend-pushable metadata filtering (ADR-041).
-///
-/// Intentionally minimal: namespace isolation and kind scoping cover the v0.2
-/// hybrid-search cases. Range predicates and compound logic are deferred to a
-/// future retrieval ADR. Adding fields is non-breaking (serde defaults); removing
-/// fields is not.
+/// A typed predicate for backend-pushable metadata filtering (ADR-041, ADR-044).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VectorMetadataFilter {
     /// Restrict to these namespaces.
     pub namespaces: Vec<String>,
     /// Restrict to these substrate kinds.
     pub kinds: Vec<SubstrateKind>,
-    /// Arbitrary key=value metadata predicates (equality only).
-    pub properties: Vec<(String, serde_json::Value)>,
+    /// Typed property predicates (ADR-044).
+    pub property_filters: Vec<PropertyFilter>,
 }
 
 impl VectorMetadataFilter {
     /// Returns `true` when no predicates are set (filter is a no-op).
     pub fn is_empty(&self) -> bool {
-        self.namespaces.is_empty() && self.kinds.is_empty() && self.properties.is_empty()
+        self.namespaces.is_empty()
+            && self.kinds.is_empty()
+            && self.property_filters.is_empty()
     }
+}
+
+/// A single typed metadata predicate (ADR-044).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PropertyFilter {
+    pub key: String,
+    pub op: PropertyOp,
+    pub value: serde_json::Value,
+}
+
+/// Comparison operators for [`PropertyFilter`] (ADR-044).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyOp {
+    Eq,
+    Ne,
+    In,
+    Range,
+    Exists,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,16 +175,80 @@ pub struct VectorRecord {
     pub subject_id: Uuid,
     pub kind: SubstrateKind,
     pub namespace: String,
-    pub embedding: Vec<f32>,
+    /// Which embedding field this record represents (e.g. `"entity.body"`).
+    pub field: String,
+    /// One or many dense vectors; sqlite-vec backends enforce `vectors.len() == 1`.
+    pub vectors: Vec<Vec<f32>>,
     pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorSearchRequest {
-    pub query_embedding: Vec<f32>,
+    /// One or many query vectors; sqlite-vec backends enforce `query_vectors.len() == 1`.
+    pub query_vectors: Vec<Vec<f32>>,
     pub top_k: u32,
     pub namespace: Option<String>,
     pub kind: Option<SubstrateKind>,
+    /// Optional metadata filter for backends that support pushdown.
+    pub filter: Option<VectorMetadataFilter>,
+    /// Backend-specific hints (opaque JSON blob, ignored by default).
+    pub backend_hints: Option<serde_json::Value>,
+}
+
+/// Configuration for an orphan-sweep pass (ADR-044).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OrphanSweepConfig {
+    /// If set, only sweep rows whose subject_id is NOT in this allowlist.
+    pub subject_id_allowlist: Option<Vec<Uuid>>,
+    pub namespaces: Vec<String>,
+    pub substrate_kinds: Vec<SubstrateKind>,
+    pub max_delete: u32,
+    pub dry_run: bool,
+}
+
+/// Result of an orphan-sweep pass (ADR-044).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OrphanSweepResult {
+    pub scanned: u64,
+    pub deleted: u64,
+    pub would_delete: u64,
+    pub max_delete_hit: bool,
+}
+
+// -- Sparse vector types (ADR-031) --
+
+/// A sparse vector represented as parallel indices and values arrays.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SparseVector {
+    /// Dimension indices (must be strictly increasing).
+    pub indices: Vec<u32>,
+    /// Corresponding non-zero values (must be finite).
+    pub values: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SparseRecord {
+    pub subject_id: Uuid,
+    pub kind: SubstrateKind,
+    pub namespace: String,
+    pub field: String,
+    pub vector: SparseVector,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SparseSearchRequest {
+    pub query: SparseVector,
+    pub top_k: u32,
+    pub namespace: Option<String>,
+    pub kind: Option<SubstrateKind>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SparseSearchHit {
+    pub subject_id: Uuid,
+    pub score: khive_score::DeterministicScore,
+    pub rank: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

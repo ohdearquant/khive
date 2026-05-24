@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
-use crate::stores::{entity, event, graph, note, text, vectors};
+use crate::stores::{entity, event, graph, note, sparse, text, vectors};
 
 /// Concrete storage backend providing capability traits.
 pub struct StorageBackend {
@@ -253,6 +253,7 @@ impl StorageBackend {
              subject_id TEXT PRIMARY KEY, \
              namespace TEXT NOT NULL, \
              kind TEXT NOT NULL, \
+             field TEXT NOT NULL, \
              embedding float[{}] distance_metric=cosine\
              )",
             model_key, dimensions
@@ -265,6 +266,52 @@ impl StorageBackend {
             self.is_file_backed,
             model_key.to_string(),
             dimensions,
+            namespace.trim().to_string(),
+        )?))
+    }
+
+    /// Get a SparseStore for a specific model key, scoped to the default namespace.
+    ///
+    /// Creates the sparse table if it does not already exist.
+    pub fn sparse(
+        &self,
+        model_key: &str,
+    ) -> Result<Arc<dyn khive_storage::SparseStore>, SqliteError> {
+        self.sparse_for_namespace(model_key, "local")
+    }
+
+    /// Get a SparseStore for a specific model key with an explicit default namespace.
+    ///
+    /// The `model_key` must contain only ASCII alphanumeric/underscore characters.
+    pub fn sparse_for_namespace(
+        &self,
+        model_key: &str,
+        namespace: &str,
+    ) -> Result<Arc<dyn khive_storage::SparseStore>, SqliteError> {
+        if model_key.is_empty()
+            || !model_key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(SqliteError::InvalidData(format!(
+                "invalid model_key '{}': must be non-empty and contain only alphanumeric/underscore characters",
+                model_key
+            )));
+        }
+        if namespace.trim().is_empty() {
+            return Err(SqliteError::InvalidData(
+                "sparse store namespace must be non-empty".to_string(),
+            ));
+        }
+
+        let writer = self.pool.try_writer()?;
+        sparse::ensure_sparse_schema(writer.conn(), model_key)
+            .map_err(|e| SqliteError::Rusqlite(e))?;
+
+        Ok(Arc::new(sparse::SqliteSparseStore::new(
+            Arc::clone(&self.pool),
+            self.is_file_backed,
+            model_key.to_string(),
             namespace.trim().to_string(),
         )?))
     }

@@ -16,6 +16,7 @@ pub mod error;
 pub mod event;
 pub mod graph;
 pub mod note;
+pub mod sparse;
 pub mod sql;
 pub mod text;
 pub mod types;
@@ -28,6 +29,7 @@ pub use error::StorageError;
 pub use event::{Event, EventFilter, EventStore};
 pub use graph::GraphStore;
 pub use note::{Note, NoteStore};
+pub use sparse::SparseStore;
 pub use sql::{SqlAccess, SqlReader, SqlTransaction, SqlWriter};
 pub use text::TextSearch;
 pub use types::StorageResult;
@@ -35,11 +37,13 @@ pub use vectors::VectorStore;
 
 pub use types::{
     BatchWriteSummary, DeleteMode, Direction, Edge, EdgeFilter, EdgeSortField, GraphPath,
-    IndexRebuildScope, LinkId, NeighborHit, NeighborQuery, Page, PageRequest, PathNode,
-    SortDirection, SortOrder, SqlIsolation, SqlRow, SqlStatement, SqlTxOptions, SqlValue,
-    TextDocument, TextFilter, TextIndexStats, TextQueryMode, TextSearchHit, TextSearchRequest,
-    TimeRange, TraversalOptions, TraversalRequest, VectorIndexKind, VectorMetadataFilter,
-    VectorRecord, VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
+    IndexRebuildScope, LinkId, NeighborHit, NeighborQuery, OrphanSweepConfig, OrphanSweepResult,
+    Page, PageRequest, PathNode, PropertyFilter, PropertyOp, SortDirection, SortOrder, SqlIsolation,
+    SqlRow, SqlStatement, SqlTxOptions, SqlValue, SparseRecord, SparseSearchHit,
+    SparseSearchRequest, SparseVector, TextDocument, TextFilter, TextIndexStats, TextQueryMode,
+    TextSearchHit, TextSearchRequest, TimeRange, TraversalOptions, TraversalRequest,
+    VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
+    VectorStoreCapabilities, VectorStoreInfo,
 };
 
 pub use khive_types::{EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind};
