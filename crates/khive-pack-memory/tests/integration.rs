@@ -321,16 +321,13 @@ async fn test_remember_decay_factor_clamped() {
         .expect("get note")
         .expect("note exists");
 
+    let df = note.decay_factor.unwrap_or(0.0);
     assert!(
-        note.decay_factor <= 1.0,
+        df <= 1.0,
         "decay_factor must be <= 1.0 after clamping, got {}",
-        note.decay_factor
+        df
     );
-    assert!(
-        note.decay_factor >= 0.0,
-        "decay_factor must be >= 0.0, got {}",
-        note.decay_factor
-    );
+    assert!(df >= 0.0, "decay_factor must be >= 0.0, got {}", df);
 }
 
 #[test]
@@ -563,7 +560,7 @@ async fn test_recall_excludes_non_memory_notes() {
             "observation",
             None,
             &format!("observation {i} about attention mechanisms in neural networks"),
-            0.5,
+            Some(0.5),
             None,
             vec![],
         )

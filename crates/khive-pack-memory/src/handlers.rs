@@ -282,7 +282,7 @@ impl MemoryPack {
                 "memory",
                 None,
                 &p.content,
-                importance,
+                Some(importance),
                 decay_factor,
                 properties,
                 annotates,
@@ -356,14 +356,16 @@ impl MemoryPack {
                     continue;
                 }
             }
-            if note.salience < cfg.min_salience {
+            let salience = note.salience.unwrap_or(0.5);
+            let decay_factor = note.decay_factor.unwrap_or(0.01);
+            if salience < cfg.min_salience {
                 continue;
             }
 
             let age_micros = (now_micros - note.created_at).max(0) as f64;
             let age_days = age_micros / (1_000_000.0 * 86_400.0);
             let (final_score, breakdown) =
-                compute_score(&cfg, relevance, note.salience, note.decay_factor, age_days);
+                compute_score(&cfg, relevance, salience, decay_factor, age_days);
 
             if final_score < cfg.min_score {
                 continue;

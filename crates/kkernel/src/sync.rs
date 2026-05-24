@@ -221,6 +221,8 @@ async fn upsert_entities(
             created_at,
             updated_at,
             deleted_at: None,
+            merged_into: None,
+            merge_event_id: None,
         };
         store
             .upsert_entity(entity)

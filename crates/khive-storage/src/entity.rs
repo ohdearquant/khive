@@ -21,6 +21,10 @@ pub struct Entity {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    /// When this entity was tombstoned by a merge, the `into` entity's ID.
+    pub merged_into: Option<Uuid>,
+    /// Opaque event ID for the merge that tombstoned this entity.
+    pub merge_event_id: Option<Uuid>,
 }
 
 impl Entity {
@@ -41,6 +45,8 @@ impl Entity {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            merged_into: None,
+            merge_event_id: None,
         }
     }
 

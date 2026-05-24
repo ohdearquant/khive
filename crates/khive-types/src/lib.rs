@@ -34,7 +34,7 @@ pub use header::Header;
 pub use id::{Id128, ParseIdError};
 pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};
 pub use namespace::Namespace;
-pub use note::{Note, NoteKind, NoteStatus};
+pub use note::{Note, NoteStatus};
 pub use pack::{EdgeEndpointRule, EndpointKind, Pack, VerbDef};
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;

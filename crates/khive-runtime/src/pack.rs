@@ -326,6 +326,8 @@ impl VerbRegistryBuilder {
             .map(|idx| slots[idx].take().expect("topological index must exist"))
             .collect();
 
+        validate_unique_note_kinds(&ordered_packs)?;
+
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
             gate: self.gate,
@@ -334,6 +336,26 @@ impl VerbRegistryBuilder {
             dispatch_hook: self.dispatch_hook,
         })
     }
+}
+
+/// Validate that no two packs declare the same note kind (F073).
+///
+/// Boot-time duplicate detection prevents pack configuration errors from
+/// silently corrupting note kind routing. Returns an error naming the
+/// duplicate kind and the two packs that claim it.
+fn validate_unique_note_kinds(packs: &[Box<dyn PackRuntime>]) -> Result<(), RuntimeError> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for pack in packs {
+        for &kind in pack.note_kinds() {
+            if let Some(first_pack) = seen.insert(kind, pack.name()) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "duplicate note kind {kind:?}: claimed by both {first_pack:?} and {:?}",
+                    pack.name()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn find_pack_dependency_cycle(
@@ -841,7 +863,7 @@ mod tests {
 
     impl Pack for BetaPack {
         const NAME: &'static str = "beta";
-        const NOTE_KINDS: &'static [&'static str] = &["log", "alert"];
+        const NOTE_KINDS: &'static [&'static str] = &["alert"];
         const ENTITY_KINDS: &'static [&'static str] = &["widget", "gadget"];
         const VERBS: &'static [VerbDef] = &[
             VerbDef {
@@ -942,10 +964,64 @@ mod tests {
     }
 
     #[test]
-    fn note_kinds_are_deduplicated() {
+    fn note_kinds_are_ordered() {
         let reg = build_registry();
         let kinds = reg.all_note_kinds();
         assert_eq!(kinds, vec!["memo", "log", "alert"]);
+    }
+
+    #[test]
+    fn note_kind_duplicate_rejected_at_build_time() {
+        struct DupPack;
+
+        impl khive_types::Pack for DupPack {
+            const NAME: &'static str = "dup";
+            // "memo" is already declared by AlphaPack — must be rejected at build.
+            const NOTE_KINDS: &'static [&'static str] = &["memo"];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const VERBS: &'static [VerbDef] = &[];
+        }
+
+        #[async_trait]
+        impl PackRuntime for DupPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn verbs(&self) -> &'static [VerbDef] {
+                Self::VERBS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+            ) -> Result<Value, RuntimeError> {
+                Ok(Value::Null)
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.register(DupPack);
+        let err = builder
+            .build()
+            .err()
+            .expect("duplicate note kind must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memo"),
+            "error must name the duplicate kind: {msg}"
+        );
+        assert!(
+            msg.contains("alpha") || msg.contains("dup"),
+            "error must name one of the conflicting packs: {msg}"
+        );
     }
 
     #[test]

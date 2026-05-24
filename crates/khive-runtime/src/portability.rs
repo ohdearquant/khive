@@ -231,6 +231,8 @@ impl KhiveRuntime {
                 created_at: created_micros,
                 updated_at: updated_micros,
                 deleted_at: None,
+                merged_into: None,
+                merge_event_id: None,
             };
             store.upsert_entity(entity.clone()).await?;
             // Index into FTS5 (and vector store if a model is configured) so that

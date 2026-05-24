@@ -1,4 +1,4 @@
-//! KG-pack vocabulary — closed enums for the 6 entity kinds and 5 note kinds.
+//! KG-pack vocabulary — pack-owned entity and note vocabulary.
 //!
 //! These enums validate and canonicalize kind strings at the pack boundary.
 //! The runtime accepts any String — validation is the pack's responsibility.
@@ -73,7 +73,7 @@ impl std::str::FromStr for EntityKind {
     }
 }
 
-/// Closed taxonomy for note classification (ADR-019).
+/// KG pack note kinds. Public note kind validation is canonical-only per ADR-013.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NoteKind {
     #[default]
@@ -129,11 +129,11 @@ impl std::str::FromStr for NoteKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "observation" | "obs" => Ok(Self::Observation),
-            "insight" | "finding" => Ok(Self::Insight),
-            "question" | "q" => Ok(Self::Question),
-            "decision" | "choice" => Ok(Self::Decision),
-            "reference" | "ref" | "citation" => Ok(Self::Reference),
+            "observation" => Ok(Self::Observation),
+            "insight" => Ok(Self::Insight),
+            "question" => Ok(Self::Question),
+            "decision" => Ok(Self::Decision),
+            "reference" => Ok(Self::Reference),
             other => Err(UnknownVariant::new("note_kind", other, Self::NAMES)),
         }
     }
@@ -175,8 +175,13 @@ mod tests {
     }
 
     #[test]
-    fn note_kind_aliases() {
-        assert_eq!(NoteKind::from_str("obs").unwrap(), NoteKind::Observation);
-        assert_eq!(NoteKind::from_str("ref").unwrap(), NoteKind::Reference);
+    fn note_kind_aliases_rejected() {
+        // Aliases were removed per ADR-013 — only canonical names are accepted.
+        assert!(NoteKind::from_str("obs").is_err());
+        assert!(NoteKind::from_str("finding").is_err());
+        assert!(NoteKind::from_str("q").is_err());
+        assert!(NoteKind::from_str("choice").is_err());
+        assert!(NoteKind::from_str("ref").is_err());
+        assert!(NoteKind::from_str("citation").is_err());
     }
 }

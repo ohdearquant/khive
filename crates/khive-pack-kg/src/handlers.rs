@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
+    ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
+    KhiveRuntime, MergeSummary, NotePatch, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{
     Direction, NeighborQuery, PageRequest, TraversalOptions, TraversalRequest,
@@ -227,10 +228,15 @@ struct ListParams {
 struct UpdateParams {
     namespace: Option<String>,
     id: String,
-    name: Option<String>,
+    kind: String,
+    name: Option<Value>,
     description: Option<Value>,
+    content: Option<String>,
+    salience: Option<f64>,
+    decay_factor: Option<f64>,
     properties: Option<Value>,
     tags: Option<Vec<String>>,
+    kind_status: Option<String>,
     relation: Option<String>,
     weight: Option<f64>,
 }
@@ -239,6 +245,7 @@ struct UpdateParams {
 struct DeleteParams {
     namespace: Option<String>,
     id: String,
+    kind: String,
     hard: Option<bool>,
 }
 
@@ -247,7 +254,12 @@ struct MergeParams {
     namespace: Option<String>,
     into_id: String,
     from_id: String,
+    kind: Option<String>,
     strategy: Option<String>,
+    content_strategy: Option<String>,
+    dry_run: Option<bool>,
+    #[allow(dead_code)]
+    verbose: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -258,6 +270,7 @@ struct SearchParams {
     limit: Option<u32>,
     entity_kind: Option<String>,
     note_kind: Option<String>,
+    include_superseded: Option<bool>,
     properties: Option<Value>,
 }
 
@@ -512,6 +525,103 @@ fn props_match(entity_props: Option<&Value>, filter: &Value) -> bool {
         .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
 }
 
+// ---- Handler helpers ----
+
+fn parse_entity_policy(s: &str) -> Result<EntityDedupMergePolicy, RuntimeError> {
+    match s {
+        "prefer_into" => Ok(EntityDedupMergePolicy::PreferInto),
+        "prefer_from" => Ok(EntityDedupMergePolicy::PreferFrom),
+        "union" => Ok(EntityDedupMergePolicy::Union),
+        other => Err(RuntimeError::InvalidInput(format!(
+            "unknown strategy {other:?}; use prefer_into | prefer_from | union"
+        ))),
+    }
+}
+
+fn parse_content_strategy(s: &str) -> Result<ContentMergeStrategy, RuntimeError> {
+    match s {
+        "append" => Ok(ContentMergeStrategy::Append),
+        "prefer_into" => Ok(ContentMergeStrategy::PreferInto),
+        "prefer_from" => Ok(ContentMergeStrategy::PreferFrom),
+        other => Err(RuntimeError::InvalidInput(format!(
+            "unknown content_strategy {other:?}; use append | prefer_into | prefer_from"
+        ))),
+    }
+}
+
+async fn ensure_entity_kind(
+    runtime: &KhiveRuntime,
+    namespace: Option<&str>,
+    id: Uuid,
+    expected_kind: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let entity = runtime
+        .get_entity(namespace, id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
+    if let Some(k) = expected_kind {
+        if entity.kind != k {
+            return Err(RuntimeError::NotFound(format!("{k} {id}")));
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_note_kind(
+    runtime: &KhiveRuntime,
+    namespace: Option<&str>,
+    id: Uuid,
+    expected_kind: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let note = runtime
+        .notes(namespace)?
+        .get_note(id)
+        .await
+        .map_err(RuntimeError::Storage)?
+        .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+    if let Some(k) = expected_kind {
+        if note.kind != k {
+            return Err(RuntimeError::NotFound(format!("{k} {id}")));
+        }
+    }
+    Ok(())
+}
+
+fn description_patch(v: Option<Value>) -> Result<Option<Option<String>>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "description must be null or a string, got: {other}"
+        ))),
+    }
+}
+
+fn string_value(v: Option<Value>, field: &str) -> Result<Option<String>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{field} must be a string, got: {other}"
+        ))),
+    }
+}
+
+fn optional_string_patch(
+    v: Option<Value>,
+    field: &str,
+) -> Result<Option<Option<String>>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{field} must be null or a string, got: {other}"
+        ))),
+    }
+}
+
 // ---- Handler implementations ----
 
 impl KgPack {
@@ -633,7 +743,6 @@ impl KgPack {
                 let content = p.content.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=note requires 'content'".into())
                 })?;
-                let salience = p.salience.unwrap_or(0.5);
                 let mut annotates = Vec::new();
                 for s in p.annotates.unwrap_or_default() {
                     annotates
@@ -646,7 +755,7 @@ impl KgPack {
                         &canonical,
                         p.name.as_deref(),
                         &content,
-                        salience,
+                        p.salience,
                         p.properties,
                         annotates,
                     )
@@ -859,110 +968,193 @@ impl KgPack {
         }
     }
 
-    pub(crate) async fn handle_update(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_update(
+        &self,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
         let p: UpdateParams = deser(params)?;
         let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
         let ns = p.namespace.as_deref();
+        let spec = resolve_kind_spec(&p.kind, registry)?;
 
-        if self
-            .runtime
-            .events(ns)?
-            .get_event(id)
-            .await
-            .map_err(RuntimeError::Storage)?
-            .is_some()
-        {
-            return Err(immutable_event_error());
-        }
-
-        if self.runtime.get_entity(ns, id).await?.is_some() {
-            let description = match p.description {
-                None => None,
-                Some(Value::Null) => Some(None),
-                Some(Value::String(s)) => Some(Some(s)),
-                Some(other) => {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "description must be null or a string, got: {other}"
-                    )))
+        match spec {
+            KindSpec::Entity { specific } => {
+                let entity = self.runtime.get_entity(ns, id).await?;
+                if entity
+                    .as_ref()
+                    .is_none_or(|e| specific.as_ref().is_some_and(|k| e.kind != *k))
+                {
+                    return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
                 }
-            };
-            let patch = EntityPatch {
-                name: p.name,
-                description,
-                properties: p.properties,
-                tags: p.tags,
-            };
-            let entity = self.runtime.update_entity(ns, id, patch).await?;
-            return to_json(&entity);
+                let patch = EntityPatch {
+                    name: string_value(p.name, "name")?,
+                    description: description_patch(p.description)?,
+                    properties: p.properties,
+                    tags: p.tags,
+                };
+                to_json(&self.runtime.update_entity(ns, id, patch).await?)
+            }
+            KindSpec::Edge => {
+                let relation = p.relation.as_deref().map(parse_relation).transpose()?;
+                let patch = EdgePatch {
+                    relation,
+                    weight: p.weight,
+                    properties: p.properties,
+                };
+                to_json(&self.runtime.update_edge(ns, id, patch).await?)
+            }
+            KindSpec::Note { specific } => {
+                let note = self
+                    .runtime
+                    .notes(ns)?
+                    .get_note(id)
+                    .await
+                    .map_err(RuntimeError::Storage)?;
+                if note
+                    .as_ref()
+                    .is_none_or(|n| specific.as_ref().is_some_and(|k| n.kind != *k))
+                {
+                    return Err(RuntimeError::NotFound(format!("note {}", p.id)));
+                }
+                let patch = NotePatch {
+                    name: optional_string_patch(p.name, "name")?,
+                    content: p.content,
+                    salience: p.salience.map(Some),
+                    decay_factor: p.decay_factor.map(Some),
+                    properties: p.properties,
+                    kind_status: p.kind_status,
+                };
+                to_json(&self.runtime.update_note(ns, id, patch).await?)
+            }
+            KindSpec::Event => Err(immutable_event_error()),
         }
-
-        if self.runtime.get_edge(ns, id).await?.is_some() {
-            let relation = p.relation.as_deref().map(parse_relation).transpose()?;
-            let edge = self.runtime.update_edge(ns, id, relation, p.weight).await?;
-            return to_json(&edge);
-        }
-
-        Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
     }
 
-    pub(crate) async fn handle_delete(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_delete(
+        &self,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
         let p: DeleteParams = deser(params)?;
         let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
         let ns = p.namespace.as_deref();
+        let spec = resolve_kind_spec(&p.kind, registry)?;
 
-        if self
-            .runtime
-            .events(ns)?
-            .get_event(id)
-            .await
-            .map_err(RuntimeError::Storage)?
-            .is_some()
-        {
-            return Err(immutable_event_error());
+        match spec {
+            KindSpec::Entity { specific } => {
+                if let Some(ref expected) = specific {
+                    let entity = self.runtime.get_entity(ns, id).await?;
+                    if entity.as_ref().is_none_or(|e| e.kind != *expected) {
+                        return Err(RuntimeError::NotFound(format!("{} {}", expected, p.id)));
+                    }
+                }
+                let deleted = self
+                    .runtime
+                    .delete_entity(ns, id, p.hard.unwrap_or(false))
+                    .await?;
+                if !deleted {
+                    return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
+                }
+                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
+            }
+            KindSpec::Note { specific } => {
+                if let Some(ref expected) = specific {
+                    let note = self
+                        .runtime
+                        .notes(ns)?
+                        .get_note(id)
+                        .await
+                        .map_err(RuntimeError::Storage)?;
+                    if note.as_ref().is_none_or(|n| n.kind != *expected) {
+                        return Err(RuntimeError::NotFound(format!("{} {}", expected, p.id)));
+                    }
+                }
+                let deleted = self
+                    .runtime
+                    .delete_note(ns, id, p.hard.unwrap_or(false))
+                    .await?;
+                if !deleted {
+                    return Err(RuntimeError::NotFound(format!("note {}", p.id)));
+                }
+                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
+            }
+            KindSpec::Edge => {
+                let deleted = self.runtime.delete_edge(ns, id).await?;
+                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": "edge" }))
+            }
+            KindSpec::Event => Err(immutable_event_error()),
         }
-
-        if self.runtime.get_entity(ns, id).await?.is_some() {
-            let deleted = self
-                .runtime
-                .delete_entity(ns, id, p.hard.unwrap_or(false))
-                .await?;
-            return to_json(&serde_json::json!({ "deleted": deleted, "id": p.id }));
-        }
-
-        if self.runtime.get_edge(ns, id).await?.is_some() {
-            let deleted = self.runtime.delete_edge(ns, id).await?;
-            return to_json(&serde_json::json!({ "deleted": deleted, "id": p.id }));
-        }
-
-        let deleted_note = self
-            .runtime
-            .delete_note(ns, id, p.hard.unwrap_or(false))
-            .await?;
-        if deleted_note {
-            return to_json(&serde_json::json!({ "deleted": true, "id": p.id }));
-        }
-
-        Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
     }
 
-    pub(crate) async fn handle_merge(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_merge(
+        &self,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
         let p: MergeParams = deser(params)?;
         let into_id = resolve_uuid_async(&p.into_id, &self.runtime, p.namespace.as_deref()).await?;
         let from_id = resolve_uuid_async(&p.from_id, &self.runtime, p.namespace.as_deref()).await?;
-        let strategy = match p.strategy.as_deref().unwrap_or("prefer_into") {
-            "prefer_into" => MergeStrategy::PreferInto,
-            "prefer_from" => MergeStrategy::PreferFrom,
-            "union" => MergeStrategy::Union,
-            other => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "unknown strategy {other:?}; use prefer_into | prefer_from | union"
-                )))
+        let raw_kind = p.kind.as_deref().unwrap_or("entity");
+        let spec = resolve_kind_spec(raw_kind, registry)?;
+        let policy = parse_entity_policy(p.strategy.as_deref().unwrap_or("prefer_into"))?;
+        let content_strategy =
+            parse_content_strategy(p.content_strategy.as_deref().unwrap_or("append"))?;
+        let dry_run = p.dry_run.unwrap_or(false);
+
+        let summary: MergeSummary = match spec {
+            KindSpec::Entity { specific } => {
+                ensure_entity_kind(
+                    &self.runtime,
+                    p.namespace.as_deref(),
+                    into_id,
+                    specific.as_deref(),
+                )
+                .await?;
+                ensure_entity_kind(
+                    &self.runtime,
+                    p.namespace.as_deref(),
+                    from_id,
+                    specific.as_deref(),
+                )
+                .await?;
+                self.runtime
+                    .merge_entity(p.namespace.as_deref(), into_id, from_id, policy, dry_run)
+                    .await?
             }
+            KindSpec::Note { specific } => {
+                ensure_note_kind(
+                    &self.runtime,
+                    p.namespace.as_deref(),
+                    into_id,
+                    specific.as_deref(),
+                )
+                .await?;
+                ensure_note_kind(
+                    &self.runtime,
+                    p.namespace.as_deref(),
+                    from_id,
+                    specific.as_deref(),
+                )
+                .await?;
+                self.runtime
+                    .merge_note(
+                        p.namespace.as_deref(),
+                        into_id,
+                        from_id,
+                        policy,
+                        content_strategy,
+                        dry_run,
+                    )
+                    .await?
+            }
+            KindSpec::Edge => {
+                return Err(RuntimeError::InvalidInput(
+                    "merge(kind=\"edge\") is unsupported".into(),
+                ))
+            }
+            KindSpec::Event => return Err(immutable_event_error()),
         };
-        let summary = self
-            .runtime
-            .merge_entity(p.namespace.as_deref(), into_id, from_id, strategy)
-            .await?;
         to_json(&summary)
     }
 
@@ -1085,6 +1277,7 @@ impl KgPack {
                         None,
                         limit,
                         kind_filter.as_deref(),
+                        p.include_superseded.unwrap_or(false),
                     )
                     .await?;
 

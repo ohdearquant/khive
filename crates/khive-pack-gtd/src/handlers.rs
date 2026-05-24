@@ -346,7 +346,7 @@ impl GtdPack {
                 "task",
                 Some(p.title.as_str()),
                 &content,
-                salience,
+                Some(salience),
                 Some(props),
                 Vec::new(),
             )
