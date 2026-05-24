@@ -493,7 +493,7 @@ def test_edge_cascade_hard_delete(proc: subprocess.Popen) -> None:
     })
     e_soft_id = e_soft["id"]
 
-    del_soft = _tool(proc, "delete", {"id": hub_soft["id"]})  # hard=False by default
+    del_soft = _tool(proc, "delete", {"id": hub_soft["id"], "kind": "entity"})  # hard=False by default
     assert del_soft["deleted"] is True
 
     # Edge should still be retrievable after soft delete

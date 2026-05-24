@@ -106,7 +106,28 @@ pub struct NotePatch {
     pub salience: Option<Option<f64>>,
     pub decay_factor: Option<Option<f64>>,
     pub properties: Option<Value>,
-    pub kind_status: Option<String>,
+    pub(crate) kind_status: Option<String>,
+}
+
+impl NotePatch {
+    /// Construct a `NotePatch` from the public fields only.
+    /// Use this from external crates; `kind_status` is set to `None`.
+    pub fn new(
+        name: Option<Option<String>>,
+        content: Option<String>,
+        salience: Option<Option<f64>>,
+        decay_factor: Option<Option<f64>>,
+        properties: Option<Value>,
+    ) -> Self {
+        Self {
+            name,
+            content,
+            salience,
+            decay_factor,
+            properties,
+            kind_status: None,
+        }
+    }
 }
 
 /// Filter for `list_edges` / `count_edges`.

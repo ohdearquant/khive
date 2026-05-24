@@ -576,7 +576,6 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             }
         }
 
-
         let tx = conn.transaction().map_err(|e| SqliteError::Migration {
             version: migration.version,
             error: e.to_string(),

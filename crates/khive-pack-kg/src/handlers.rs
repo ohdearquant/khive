@@ -1084,14 +1084,13 @@ impl KgPack {
                 {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
-                let patch = NotePatch {
-                    name: optional_string_patch(p.name, "name")?,
-                    content: p.content,
-                    salience: f64_patch(p.salience, "salience")?,
-                    decay_factor: f64_patch(p.decay_factor, "decay_factor")?,
-                    properties: p.properties,
-                    kind_status: None,
-                };
+                let patch = NotePatch::new(
+                    optional_string_patch(p.name, "name")?,
+                    p.content,
+                    f64_patch(p.salience, "salience")?,
+                    f64_patch(p.decay_factor, "decay_factor")?,
+                    p.properties,
+                );
                 to_json(&self.runtime.update_note(ns, id, patch).await?)
             }
             KindSpec::Event => Err(immutable_event_error()),
