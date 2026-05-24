@@ -236,11 +236,10 @@ struct UpdateParams {
     name: Option<Value>,
     description: Option<Value>,
     content: Option<String>,
-    salience: Option<f64>,
-    decay_factor: Option<f64>,
+    salience: Option<Value>,
+    decay_factor: Option<Value>,
     properties: Option<Value>,
     tags: Option<Vec<String>>,
-    kind_status: Option<String>,
     relation: Option<String>,
     weight: Option<f64>,
 }
@@ -673,6 +672,21 @@ fn optional_string_patch(
     }
 }
 
+/// Tri-state f64 patch: absent → None (don't touch), null → Some(None) (clear), number → Some(Some(v)) (set).
+fn f64_patch(v: Option<Value>, field: &str) -> Result<Option<Option<f64>>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .map(|f| Some(Some(f)))
+            .ok_or_else(|| RuntimeError::InvalidInput(format!("{field} is not a valid f64"))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{field} must be null or a number, got: {other}"
+        ))),
+    }
+}
+
 // ---- Handler implementations ----
 
 impl KgPack {
@@ -1073,10 +1087,10 @@ impl KgPack {
                 let patch = NotePatch {
                     name: optional_string_patch(p.name, "name")?,
                     content: p.content,
-                    salience: p.salience.map(Some),
-                    decay_factor: p.decay_factor.map(Some),
+                    salience: f64_patch(p.salience, "salience")?,
+                    decay_factor: f64_patch(p.decay_factor, "decay_factor")?,
                     properties: p.properties,
-                    kind_status: p.kind_status,
+                    kind_status: None,
                 };
                 to_json(&self.runtime.update_note(ns, id, patch).await?)
             }
@@ -1133,7 +1147,10 @@ impl KgPack {
                 to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
             }
             KindSpec::Edge => {
-                let deleted = self.runtime.delete_edge(ns, id, p.hard.unwrap_or(false)).await?;
+                let deleted = self
+                    .runtime
+                    .delete_edge(ns, id, p.hard.unwrap_or(false))
+                    .await?;
                 to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": "edge" }))
             }
             KindSpec::Event => Err(immutable_event_error()),

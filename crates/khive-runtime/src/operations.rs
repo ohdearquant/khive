@@ -998,7 +998,7 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Note>> {
-        let notes = self
+        let page = self
             .notes(namespace)?
             .query_notes(
                 self.ns(namespace),
@@ -1009,7 +1009,7 @@ impl KhiveRuntime {
                 },
             )
             .await?;
-        Ok(notes)
+        Ok(page.items)
     }
 
     /// Search notes using a hybrid FTS5 + vector pipeline with salience weighting.

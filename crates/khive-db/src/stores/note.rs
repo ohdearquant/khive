@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::note::Note;
-use khive_storage::types::{BatchWriteSummary, DeleteMode, PageRequest};
+use khive_storage::types::{BatchWriteSummary, DeleteMode, Page, PageRequest};
 use khive_storage::NoteStore;
 use khive_storage::StorageCapability;
 
@@ -364,11 +364,20 @@ impl NoteStore for SqlNoteStore {
         namespace: &str,
         kind: Option<&str>,
         page: PageRequest,
-    ) -> Result<Vec<Note>, StorageError> {
+    ) -> Result<Page<Note>, StorageError> {
         let namespace = namespace.to_string();
         let kind = kind.map(|k| k.to_string());
 
         self.with_reader("query_notes", move |conn| {
+            let (count_sql, count_params) = build_note_where(&namespace, kind.as_deref());
+            let total: i64 = {
+                let sql = format!("SELECT COUNT(*) FROM notes{}", count_sql);
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    count_params.iter().map(|p| p.as_ref()).collect();
+                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
+            };
+
             let (where_sql, mut data_params) = build_note_where(&namespace, kind.as_deref());
             data_params.push(Box::new(page.limit as i64));
             data_params.push(Box::new(page.offset as i64));
@@ -393,7 +402,10 @@ impl NoteStore for SqlNoteStore {
                 items.push(row?);
             }
 
-            Ok(items)
+            Ok(Page {
+                items,
+                total: Some(total as u64),
+            })
         })
         .await
     }
@@ -574,19 +586,21 @@ mod tests {
             .await
             .unwrap();
 
-        let notes_a = store
+        let page_a = store
             .query_notes("ns_a", None, PageRequest::default())
             .await
             .unwrap();
-        assert_eq!(notes_a.len(), 1);
-        assert_eq!(notes_a[0].content, "A");
+        assert_eq!(page_a.items.len(), 1);
+        assert_eq!(page_a.items[0].content, "A");
+        assert_eq!(page_a.total, Some(1));
 
-        let notes_b = store
+        let page_b = store
             .query_notes("ns_b", None, PageRequest::default())
             .await
             .unwrap();
-        assert_eq!(notes_b.len(), 1);
-        assert_eq!(notes_b[0].content, "B");
+        assert_eq!(page_b.items.len(), 1);
+        assert_eq!(page_b.items[0].content, "B");
+        assert_eq!(page_b.total, Some(1));
 
         let count_a = store.count_notes("ns_a", None).await.unwrap();
         let count_b = store.count_notes("ns_b", None).await.unwrap();

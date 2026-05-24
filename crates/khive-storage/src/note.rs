@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::types::{BatchWriteSummary, DeleteMode, PageRequest, StorageResult};
+use crate::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, StorageResult};
 
 /// A storage-level note record. Flat, SQL-friendly representation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,7 +81,7 @@ pub trait NoteStore: Send + Sync + 'static {
         namespace: &str,
         kind: Option<&str>,
         page: PageRequest,
-    ) -> StorageResult<Vec<Note>>;
+    ) -> StorageResult<Page<Note>>;
     async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
 
     async fn get_notes_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
