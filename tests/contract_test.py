@@ -411,7 +411,7 @@ def test_gql_property_projection(proc: subprocess.Popen) -> None:
     )
     # Error must contain the compiler's fixed-format valid-column list.  If the
     # columns change, this assertion will catch the drift.
-    assert "Valid: id, name, kind, namespace, description, properties, created_at, updated_at" in err_text, (
+    assert "Valid: id, name, kind, entity_type, namespace, description, properties, created_at, updated_at" in err_text, (
         f"Error text must contain the full valid-column list emitted by the compiler: {err_text!r}"
     )
 

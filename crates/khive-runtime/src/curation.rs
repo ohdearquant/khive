@@ -280,7 +280,7 @@ fn read_merge_entity(
 ) -> Result<Entity, SqliteError> {
     let id_str = id.to_string();
     let mut stmt = conn.prepare(
-        "SELECT id, namespace, kind, name, description, properties, tags, \
+        "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
          created_at, updated_at, deleted_at \
          FROM entities WHERE id = ?1 AND deleted_at IS NULL",
     )?;
@@ -292,13 +292,14 @@ fn read_merge_entity(
     let id_s: String = row.get(0)?;
     let ns: String = row.get(1)?;
     let kind: String = row.get(2)?;
-    let name: String = row.get(3)?;
-    let description: Option<String> = row.get(4)?;
-    let properties_str: Option<String> = row.get(5)?;
-    let tags_str: String = row.get(6)?;
-    let created_at: i64 = row.get(7)?;
-    let updated_at: i64 = row.get(8)?;
-    let deleted_at: Option<i64> = row.get(9)?;
+    let entity_type: Option<String> = row.get(3)?;
+    let name: String = row.get(4)?;
+    let description: Option<String> = row.get(5)?;
+    let properties_str: Option<String> = row.get(6)?;
+    let tags_str: String = row.get(7)?;
+    let created_at: i64 = row.get(8)?;
+    let updated_at: i64 = row.get(9)?;
+    let deleted_at: Option<i64> = row.get(10)?;
 
     if ns != namespace {
         return Err(SqliteError::InvalidData(format!(
@@ -319,6 +320,7 @@ fn read_merge_entity(
         id: entity_id,
         namespace: ns,
         kind,
+        entity_type,
         name,
         description,
         properties,
@@ -557,6 +559,7 @@ fn merge_entity_sql(
         id: into_id,
         namespace,
         kind: into_entity.kind,
+        entity_type: into_entity.entity_type,
         name: merged_name,
         description: merged_description,
         properties: merged_props,
@@ -742,6 +745,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "OriginalName",
                 Some("orig desc"),
                 Some(serde_json::json!({"k":"v"})),
@@ -774,6 +778,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "ClearDesc",
                 Some("has description"),
                 None,
@@ -804,7 +809,7 @@ mod tests {
     async fn update_entity_reindexes_when_name_changes() {
         let rt = rt();
         let entity = rt
-            .create_entity(None, "concept", "OldName", None, None, vec![])
+            .create_entity(None, "concept", None, "OldName", None, None, vec![])
             .await
             .unwrap();
 
@@ -847,6 +852,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "MergeProps",
                 None,
                 Some(serde_json::json!({
@@ -884,7 +890,7 @@ mod tests {
     async fn update_entity_skips_reindex_when_only_properties_change() {
         let rt = rt();
         let entity = rt
-            .create_entity(None, "concept", "StableIndexed", None, None, vec![])
+            .create_entity(None, "concept", None, "StableIndexed", None, None, vec![])
             .await
             .unwrap();
 
@@ -915,19 +921,19 @@ mod tests {
     async fn merge_entity_rewires_edges() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
         let d = rt
-            .create_entity(None, "concept", "D", None, None, vec![])
+            .create_entity(None, "concept", None, "D", None, None, vec![])
             .await
             .unwrap();
 
@@ -971,6 +977,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "Into",
                 None,
                 Some(serde_json::json!({"a": 1})),
@@ -982,6 +989,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "From",
                 None,
                 Some(serde_json::json!({"a": 2, "b": 3})),
@@ -1008,6 +1016,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "Into",
                 None,
                 Some(serde_json::json!({"a": 1})),
@@ -1019,6 +1028,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "From",
                 None,
                 Some(serde_json::json!({"a": 2, "b": 3})),
@@ -1045,6 +1055,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "Into",
                 None,
                 Some(serde_json::json!({"a": 1})),
@@ -1056,6 +1067,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "From",
                 None,
                 Some(serde_json::json!({"a": 2, "b": 3})),
@@ -1082,6 +1094,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "Into",
                 None,
                 None,
@@ -1093,6 +1106,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "From",
                 None,
                 None,
@@ -1115,11 +1129,11 @@ mod tests {
     async fn merge_entity_drops_self_loops() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
 

@@ -14,6 +14,8 @@ pub struct Entity {
     pub id: Uuid,
     pub namespace: String,
     pub kind: String,
+    /// Pack-governed subtype token. Maps to `entities.entity_type` column.
+    pub entity_type: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub properties: Option<Value>,
@@ -34,6 +36,7 @@ impl Entity {
             id: Uuid::new_v4(),
             namespace: namespace.into(),
             kind: kind.into(),
+            entity_type: None,
             name: name.into(),
             description: None,
             properties: None,
@@ -42,6 +45,11 @@ impl Entity {
             updated_at: now,
             deleted_at: None,
         }
+    }
+
+    pub fn with_entity_type(mut self, t: Option<impl Into<String>>) -> Self {
+        self.entity_type = t.map(Into::into);
+        self
     }
 
     pub fn with_description(mut self, d: impl Into<String>) -> Self {
@@ -65,6 +73,8 @@ impl Entity {
 pub struct EntityFilter {
     pub ids: Vec<Uuid>,
     pub kinds: Vec<String>,
+    /// Filter by exact `entity_type` value. Multiple values are ORed.
+    pub entity_types: Vec<String>,
     pub name_prefix: Option<String>,
     pub tags_any: Vec<String>,
 }

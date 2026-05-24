@@ -111,17 +111,19 @@ impl KhiveRuntime {
     // ---- Entity operations ----
 
     /// Create and persist a new entity.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_entity(
         &self,
         namespace: Option<&str>,
         kind: &str,
+        entity_type: Option<&str>,
         name: &str,
         description: Option<&str>,
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
         let ns = self.ns(namespace);
-        let mut entity = Entity::new(ns, kind, name);
+        let mut entity = Entity::new(ns, kind, name).with_entity_type(entity_type);
         if let Some(d) = description {
             entity = entity.with_description(d);
         }
@@ -181,17 +183,22 @@ impl KhiveRuntime {
         Ok(Some(entity))
     }
 
-    /// List entities in a namespace, optionally filtered by kind.
+    /// List entities in a namespace, optionally filtered by kind and entity_type.
     pub async fn list_entities(
         &self,
         namespace: Option<&str>,
         kind: Option<&str>,
+        entity_type: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Entity>> {
         let filter = EntityFilter {
             kinds: match kind {
                 Some(k) => vec![k.to_string()],
+                None => vec![],
+            },
+            entity_types: match entity_type {
+                Some(t) => vec![t.to_string()],
                 None => vec![],
             },
             ..Default::default()
@@ -1333,11 +1340,11 @@ mod tests {
     async fn update_edge_changes_weight() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -1357,11 +1364,11 @@ mod tests {
     async fn update_edge_changes_relation() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -1389,7 +1396,7 @@ mod tests {
             .await
             .unwrap();
         let entity = rt
-            .create_entity(None, "concept", "E", None, None, vec![])
+            .create_entity(None, "concept", None, "E", None, None, vec![])
             .await
             .unwrap();
         // Create a valid note→entity annotates edge.
@@ -1423,11 +1430,11 @@ mod tests {
     async fn update_edge_entity_to_entity_set_annotates_returns_invalid_input() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -1451,11 +1458,11 @@ mod tests {
     async fn update_edge_entity_to_entity_set_supersedes_succeeds() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -1480,11 +1487,11 @@ mod tests {
     async fn update_edge_weight_only_skips_validation() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -1506,11 +1513,11 @@ mod tests {
     async fn update_edge_same_class_relation_change_succeeds() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -1530,15 +1537,15 @@ mod tests {
     async fn list_edges_filters_by_relation() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
 
@@ -1562,19 +1569,19 @@ mod tests {
     async fn list_edges_filters_by_source() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
         let d = rt
-            .create_entity(None, "concept", "D", None, None, vec![])
+            .create_entity(None, "concept", None, "D", None, None, vec![])
             .await
             .unwrap();
 
@@ -1599,11 +1606,11 @@ mod tests {
     async fn delete_edge_removes_from_storage() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -1623,15 +1630,15 @@ mod tests {
     async fn count_edges_matches_filter() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
 
@@ -1665,7 +1672,7 @@ mod tests {
     async fn get_entity_namespace_isolation() {
         let rt = rt();
         let entity = rt
-            .create_entity(Some("ns-a"), "concept", "Alpha", None, None, vec![])
+            .create_entity(Some("ns-a"), "concept", None, "Alpha", None, None, vec![])
             .await
             .unwrap();
 
@@ -1685,7 +1692,7 @@ mod tests {
     async fn delete_entity_namespace_isolation() {
         let rt = rt();
         let entity = rt
-            .create_entity(Some("ns-a"), "concept", "Beta", None, None, vec![])
+            .create_entity(Some("ns-a"), "concept", None, "Beta", None, None, vec![])
             .await
             .unwrap();
 
@@ -1777,7 +1784,7 @@ mod tests {
     async fn create_note_creates_annotates_edges() {
         let rt = rt();
         let entity = rt
-            .create_entity(None, "concept", "FlashAttention", None, None, vec![])
+            .create_entity(None, "concept", None, "FlashAttention", None, None, vec![])
             .await
             .unwrap();
 
@@ -1828,15 +1835,15 @@ mod tests {
     async fn neighbors_without_relation_filter_returns_all() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
 
@@ -1858,15 +1865,15 @@ mod tests {
     async fn neighbors_with_relation_filter_returns_subset() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(None, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
 
@@ -1962,7 +1969,7 @@ mod tests {
     async fn resolve_returns_entity() {
         let rt = rt();
         let entity = rt
-            .create_entity(None, "concept", "LoRA", None, None, vec![])
+            .create_entity(None, "concept", None, "LoRA", None, None, vec![])
             .await
             .unwrap();
 
@@ -2008,7 +2015,7 @@ mod tests {
     async fn resolve_prefix_finds_entity_in_own_namespace() {
         let rt = rt();
         let entity = rt
-            .create_entity(None, "concept", "PrefixTest", None, None, vec![])
+            .create_entity(None, "concept", None, "PrefixTest", None, None, vec![])
             .await
             .unwrap();
         let prefix = &entity.id.to_string()[..8];
@@ -2021,7 +2028,15 @@ mod tests {
     async fn resolve_prefix_invisible_across_namespaces() {
         let rt = rt();
         let entity = rt
-            .create_entity(Some("ns_a"), "concept", "Invisible", None, None, vec![])
+            .create_entity(
+                Some("ns_a"),
+                "concept",
+                None,
+                "Invisible",
+                None,
+                None,
+                vec![],
+            )
             .await
             .unwrap();
         let prefix = &entity.id.to_string()[..8];
@@ -2106,7 +2121,7 @@ mod tests {
     async fn link_phantom_source_returns_not_found() {
         let rt = rt();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let phantom = Uuid::new_v4();
@@ -2129,7 +2144,7 @@ mod tests {
     async fn link_phantom_target_returns_not_found() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let phantom = Uuid::new_v4();
@@ -2152,11 +2167,11 @@ mod tests {
     async fn link_real_entities_succeeds() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
 
@@ -2195,7 +2210,7 @@ mod tests {
     async fn create_note_annotates_real_entity_succeeds() {
         let rt = rt();
         let entity = rt
-            .create_entity(None, "concept", "RealTarget", None, None, vec![])
+            .create_entity(None, "concept", None, "RealTarget", None, None, vec![])
             .await
             .unwrap();
 
@@ -2231,11 +2246,11 @@ mod tests {
     async fn create_note_multi_annotates_creates_all_edges() {
         let rt = rt();
         let t1 = rt
-            .create_entity(None, "concept", "Target1", None, None, vec![])
+            .create_entity(None, "concept", None, "Target1", None, None, vec![])
             .await
             .unwrap();
         let t2 = rt
-            .create_entity(None, "concept", "Target2", None, None, vec![])
+            .create_entity(None, "concept", None, "Target2", None, None, vec![])
             .await
             .unwrap();
 
@@ -2276,11 +2291,11 @@ mod tests {
     async fn link_target_in_different_namespace_returns_not_found() {
         let rt = rt();
         let a = rt
-            .create_entity(Some("ns-a"), "concept", "A", None, None, vec![])
+            .create_entity(Some("ns-a"), "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(Some("ns-b"), "concept", "B", None, None, vec![])
+            .create_entity(Some("ns-b"), "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
 
@@ -2319,11 +2334,11 @@ mod tests {
     async fn link_note_to_edge_annotates_succeeds() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         // Create a real edge between a and b, capture its UUID.
@@ -2352,11 +2367,11 @@ mod tests {
     async fn create_note_annotates_real_edge_succeeds() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -2442,11 +2457,11 @@ mod tests {
     async fn link_entity_to_edge_uuid_non_annotates_returns_invalid_input() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         // Create a real edge; capture its UUID as the bad target.
@@ -2481,7 +2496,7 @@ mod tests {
             .await
             .unwrap();
         let entity = rt
-            .create_entity(None, "concept", "E", None, None, vec![])
+            .create_entity(None, "concept", None, "E", None, None, vec![])
             .await
             .unwrap();
 
@@ -2504,11 +2519,11 @@ mod tests {
     async fn link_entity_as_annotates_source_returns_invalid_input() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
 
@@ -2532,11 +2547,11 @@ mod tests {
     async fn link_edge_as_annotates_source_returns_invalid_input() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -2688,11 +2703,11 @@ mod tests {
     async fn link_supersedes_entity_to_entity_succeeds() {
         let rt = rt();
         let old_entity = rt
-            .create_entity(None, "concept", "OldConcept", None, None, vec![])
+            .create_entity(None, "concept", None, "OldConcept", None, None, vec![])
             .await
             .unwrap();
         let new_entity = rt
-            .create_entity(None, "concept", "NewConcept", None, None, vec![])
+            .create_entity(None, "concept", None, "NewConcept", None, None, vec![])
             .await
             .unwrap();
 
@@ -2719,7 +2734,7 @@ mod tests {
             .await
             .unwrap();
         let entity = rt
-            .create_entity(None, "concept", "SomeEntity", None, None, vec![])
+            .create_entity(None, "concept", None, "SomeEntity", None, None, vec![])
             .await
             .unwrap();
 
@@ -2743,7 +2758,7 @@ mod tests {
     async fn link_supersedes_entity_to_note_returns_invalid_input() {
         let rt = rt();
         let entity = rt
-            .create_entity(None, "concept", "SomeEntity", None, None, vec![])
+            .create_entity(None, "concept", None, "SomeEntity", None, None, vec![])
             .await
             .unwrap();
         let note = rt
@@ -2779,7 +2794,7 @@ mod tests {
         rt.events(None).unwrap().append_event(event).await.unwrap();
 
         let entity = rt
-            .create_entity(None, "concept", "SomeEntity", None, None, vec![])
+            .create_entity(None, "concept", None, "SomeEntity", None, None, vec![])
             .await
             .unwrap();
 
@@ -2808,7 +2823,7 @@ mod tests {
         rt.events(None).unwrap().append_event(event).await.unwrap();
 
         let entity = rt
-            .create_entity(None, "concept", "SomeEntity", None, None, vec![])
+            .create_entity(None, "concept", None, "SomeEntity", None, None, vec![])
             .await
             .unwrap();
 
@@ -2829,11 +2844,11 @@ mod tests {
     async fn link_supersedes_edge_source_returns_invalid_input() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -2859,11 +2874,11 @@ mod tests {
     async fn link_supersedes_edge_target_returns_invalid_input() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -3002,7 +3017,7 @@ mod tests {
             .await
             .unwrap();
         let entity = rt
-            .create_entity(None, "concept", "E", None, None, vec![])
+            .create_entity(None, "concept", None, "E", None, None, vec![])
             .await
             .unwrap();
 
@@ -3020,11 +3035,11 @@ mod tests {
     async fn link_annotates_note_to_edge_still_succeeds_after_fix() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
@@ -3072,7 +3087,7 @@ mod tests {
     async fn create_note_multi_annotates_compensation_cleanup_restores_pristine_state() {
         let rt = rt();
         let t1 = rt
-            .create_entity(None, "concept", "T1", None, None, vec![])
+            .create_entity(None, "concept", None, "T1", None, None, vec![])
             .await
             .unwrap();
 
@@ -3152,7 +3167,7 @@ mod tests {
     async fn annotated_entity_hard_delete_cascades_annotate_edge() {
         let rt = rt();
         let entity = rt
-            .create_entity(None, "concept", "E", None, None, vec![])
+            .create_entity(None, "concept", None, "E", None, None, vec![])
             .await
             .unwrap();
         let note = rt
@@ -3269,11 +3284,11 @@ mod tests {
     async fn annotated_edge_delete_cascades_annotate_edge() {
         let rt = rt();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(None, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(None, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         // Create an edge to annotate.
@@ -3338,11 +3353,11 @@ mod tests {
     async fn mixed_multi_annotates_partial_target_hard_delete_leaves_remaining_edges() {
         let rt = rt();
         let t1 = rt
-            .create_entity(None, "concept", "T1", None, None, vec![])
+            .create_entity(None, "concept", None, "T1", None, None, vec![])
             .await
             .unwrap();
         let t2 = rt
-            .create_entity(None, "concept", "T2", None, None, vec![])
+            .create_entity(None, "concept", None, "T2", None, None, vec![])
             .await
             .unwrap();
 
@@ -3466,7 +3481,7 @@ mod tests {
 
         // Create an entity that has an inbound annotates edge.
         let entity = rt
-            .create_entity(None, "concept", "Target", None, None, vec![])
+            .create_entity(None, "concept", None, "Target", None, None, vec![])
             .await
             .unwrap();
         let note = rt
@@ -3543,11 +3558,11 @@ mod tests {
     async fn create_note_multi_annotates_second_link_failure_rolls_back_partial_write() {
         let rt = rt();
         let t1 = rt
-            .create_entity(None, "concept", "T1", None, None, vec![])
+            .create_entity(None, "concept", None, "T1", None, None, vec![])
             .await
             .unwrap();
         let t2 = rt
-            .create_entity(None, "concept", "T2", None, None, vec![])
+            .create_entity(None, "concept", None, "T2", None, None, vec![])
             .await
             .unwrap();
 
@@ -3634,6 +3649,7 @@ mod tests {
             .create_entity(
                 None,
                 "concept",
+                None,
                 "QuantumEntanglement",
                 Some("unique FTS term xzqjwv for soft delete test"),
                 None,

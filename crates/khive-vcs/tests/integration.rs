@@ -34,6 +34,7 @@ fn make_entity(id: Uuid, name: &str) -> ExportedEntity {
     ExportedEntity {
         id,
         kind: "concept".into(),
+        entity_type: None,
         name: name.into(),
         description: None,
         properties: None,
