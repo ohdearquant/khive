@@ -801,7 +801,7 @@ impl KhiveRuntime {
         kind: &str,
         name: Option<&str>,
         content: &str,
-        salience: f64,
+        salience: Option<f64>,
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
@@ -819,7 +819,7 @@ impl KhiveRuntime {
         kind: &str,
         name: Option<&str>,
         content: &str,
-        salience: f64,
+        salience: Option<f64>,
         decay_factor: f64,
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
@@ -844,7 +844,7 @@ impl KhiveRuntime {
         kind: &str,
         name: Option<&str>,
         content: &str,
-        salience: f64,
+        salience: Option<f64>,
         decay_factor: Option<f64>,
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
@@ -860,7 +860,10 @@ impl KhiveRuntime {
             }
         }
 
-        let mut note = Note::new(ns, kind, content).with_salience(salience);
+        let mut note = Note::new(ns, kind, content);
+        if let Some(s) = salience {
+            note = note.with_salience(s);
+        }
         if let Some(df) = decay_factor {
             note = note.with_decay(df);
         }
@@ -1025,6 +1028,7 @@ impl KhiveRuntime {
         query_vector: Option<Vec<f32>>,
         limit: u32,
         note_kind: Option<&str>,
+        include_superseded: bool,
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
         const RRF_K: usize = 60;
         let candidates = limit.saturating_mul(4).max(limit);
@@ -1110,9 +1114,10 @@ impl KhiveRuntime {
             }
         }
 
-        // Drop superseded notes: any note targeted by a `supersedes` edge is
-        // obsolete and excluded from default search (ADR-019, ADR-024).
-        if !alive_notes.is_empty() {
+        // Drop superseded notes unless include_superseded is true: any note targeted
+        // by a `supersedes` edge is obsolete and excluded from default search
+        // (ADR-013, ADR-024).
+        if !include_superseded && !alive_notes.is_empty() {
             let graph = self.graph(namespace)?;
             let mut superseded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
             for &note_id in alive_notes.keys() {
@@ -1139,7 +1144,8 @@ impl KhiveRuntime {
             .into_iter()
             .filter_map(|(id, bucket)| {
                 let note = alive_notes.get(&id)?;
-                let weight = 0.5 + 0.5 * note.salience;
+                let salience = note.salience.unwrap_or(0.5);
+                let weight = 0.5 + 0.5 * salience;
                 let weighted = DeterministicScore::from_f64(bucket.score.to_f64() * weight);
                 Some(NoteSearchHit {
                     note_id: id,
@@ -1507,8 +1513,7 @@ impl KhiveRuntime {
         &self,
         namespace: Option<&str>,
         edge_id: Uuid,
-        relation: Option<EdgeRelation>,
-        weight: Option<f64>,
+        patch: crate::curation::EdgePatch,
     ) -> RuntimeResult<Edge> {
         let graph = self.graph(namespace)?;
         let mut edge = graph
@@ -1516,14 +1521,17 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
 
-        if let Some(r) = relation {
+        if let Some(r) = patch.relation {
             // Validate before mutating — use the existing endpoints with the new relation.
             self.validate_edge_relation_endpoints(namespace, edge.source_id, edge.target_id, r)
                 .await?;
             edge.relation = r;
         }
-        if let Some(w) = weight {
+        if let Some(w) = patch.weight {
             edge.weight = w.clamp(0.0, 1.0);
+        }
+        if let Some(props) = patch.properties {
+            edge.metadata = Some(props);
         }
 
         graph.upsert_edge(edge.clone()).await?;
@@ -1696,7 +1704,14 @@ mod tests {
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, None, Some(0.5))
+            .update_edge(
+                None,
+                edge_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.5),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!((updated.weight - 0.5).abs() < 0.001);
@@ -1720,7 +1735,14 @@ mod tests {
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::VariantOf), None)
+            .update_edge(
+                None,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::VariantOf),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
@@ -1734,7 +1756,7 @@ mod tests {
     async fn update_edge_annotates_note_to_entity_set_supersedes_returns_invalid_input() {
         let rt = rt();
         let note = rt
-            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
+            .create_note(None, "observation", None, "a note", Some(0.5), None, vec![])
             .await
             .unwrap();
         let entity = rt
@@ -1750,7 +1772,14 @@ mod tests {
 
         // Attempt to change relation to Supersedes (crossing substrates → invalid).
         let result = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::Supersedes), None)
+            .update_edge(
+                None,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::Supersedes),
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
@@ -1786,7 +1815,14 @@ mod tests {
         let edge_id: Uuid = edge.id.into();
 
         let result = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::Annotates), None)
+            .update_edge(
+                None,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::Annotates),
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
@@ -1814,7 +1850,14 @@ mod tests {
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::Supersedes), None)
+            .update_edge(
+                None,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::Supersedes),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::Supersedes);
@@ -1843,7 +1886,14 @@ mod tests {
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, None, Some(0.3))
+            .update_edge(
+                None,
+                edge_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.3),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::Extends);
@@ -1869,7 +1919,14 @@ mod tests {
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::VariantOf), None)
+            .update_edge(
+                None,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::VariantOf),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
@@ -2071,7 +2128,7 @@ mod tests {
                 "observation",
                 None,
                 "FlashAttention reduces memory by using tiling",
-                0.8,
+                Some(0.8),
                 None,
                 vec![],
             )
@@ -2112,7 +2169,7 @@ mod tests {
                 "insight",
                 None,
                 "FlashAttention is IO-aware",
-                0.9,
+                Some(0.9),
                 Some(props.clone()),
                 vec![],
             )
@@ -2136,7 +2193,7 @@ mod tests {
                 "observation",
                 None,
                 "FlashAttention uses SRAM tiling for memory efficiency",
-                0.9,
+                Some(0.9),
                 None,
                 vec![entity.id],
             )
@@ -2249,7 +2306,7 @@ mod tests {
             "observation",
             None,
             "GQA reduces KV cache memory for large models",
-            0.8,
+            Some(0.8),
             None,
             vec![],
         )
@@ -2257,7 +2314,7 @@ mod tests {
         .unwrap();
 
         let results = rt
-            .search_notes(None, "GQA KV cache", None, 10, None)
+            .search_notes(None, "GQA KV cache", None, 10, None, false)
             .await
             .unwrap();
 
@@ -2282,7 +2339,7 @@ mod tests {
                 "observation",
                 None,
                 "RoPE positional encoding rotary embeddings",
-                0.7,
+                Some(0.7),
                 None,
                 vec![],
             )
@@ -2297,7 +2354,7 @@ mod tests {
             .unwrap();
 
         let results = rt
-            .search_notes(None, "RoPE rotary positional", None, 10, None)
+            .search_notes(None, "RoPE rotary positional", None, 10, None, false)
             .await
             .unwrap();
 
@@ -2331,7 +2388,7 @@ mod tests {
                 "observation",
                 None,
                 "LoRA fine-tunes LLMs with low-rank adapters",
-                0.85,
+                Some(0.85),
                 None,
                 vec![],
             )
@@ -2537,7 +2594,7 @@ mod tests {
                 "observation",
                 None,
                 "some content",
-                0.5,
+                Some(0.5),
                 None,
                 vec![phantom],
             )
@@ -2562,7 +2619,7 @@ mod tests {
                 "observation",
                 None,
                 "content",
-                0.5,
+                Some(0.5),
                 None,
                 vec![entity.id],
             )
@@ -2602,7 +2659,7 @@ mod tests {
                 "observation",
                 None,
                 "content",
-                0.5,
+                Some(0.5),
                 None,
                 vec![t1.id, t2.id],
             )
@@ -2692,7 +2749,15 @@ mod tests {
 
         // Create a note and annotate the edge itself (edge is a valid substrate target per ADR-024).
         let note = rt
-            .create_note(None, "observation", None, "edge note", 0.5, None, vec![])
+            .create_note(
+                None,
+                "observation",
+                None,
+                "edge note",
+                Some(0.5),
+                None,
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2728,7 +2793,7 @@ mod tests {
                 "observation",
                 None,
                 "annotating an edge",
-                0.5,
+                Some(0.5),
                 None,
                 vec![edge_uuid],
             )
@@ -2762,7 +2827,7 @@ mod tests {
                 "observation",
                 None,
                 "should not persist",
-                0.5,
+                Some(0.5),
                 None,
                 vec![phantom],
             )
@@ -2781,7 +2846,7 @@ mod tests {
 
         // FTS must not contain the content either.
         let search_hits = rt
-            .search_notes(None, "should not persist", None, 10, None)
+            .search_notes(None, "should not persist", None, 10, None, false)
             .await
             .unwrap();
         assert!(
@@ -2834,7 +2899,7 @@ mod tests {
     async fn link_note_as_source_non_annotates_returns_invalid_input() {
         let rt = rt();
         let note = rt
-            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
+            .create_note(None, "observation", None, "a note", Some(0.5), None, vec![])
             .await
             .unwrap();
         let entity = rt
@@ -2930,7 +2995,7 @@ mod tests {
                 "observation",
                 None,
                 "observing an event",
-                0.6,
+                Some(0.6),
                 None,
                 vec![],
             )
@@ -2970,7 +3035,7 @@ mod tests {
                 "observation",
                 None,
                 "note annotating an event",
-                0.5,
+                Some(0.5),
                 None,
                 vec![event_id],
             )
@@ -3007,7 +3072,7 @@ mod tests {
                 "observation",
                 None,
                 "old observation",
-                0.7,
+                Some(0.7),
                 None,
                 vec![],
             )
@@ -3019,7 +3084,7 @@ mod tests {
                 "observation",
                 None,
                 "revised observation superseding the old one",
-                0.9,
+                Some(0.9),
                 None,
                 vec![],
             )
@@ -3074,7 +3139,7 @@ mod tests {
     async fn link_supersedes_note_to_entity_returns_invalid_input() {
         let rt = rt();
         let note = rt
-            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
+            .create_note(None, "observation", None, "a note", Some(0.5), None, vec![])
             .await
             .unwrap();
         let entity = rt
@@ -3113,7 +3178,7 @@ mod tests {
             .await
             .unwrap();
         let note = rt
-            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
+            .create_note(None, "observation", None, "a note", Some(0.5), None, vec![])
             .await
             .unwrap();
 
@@ -3281,7 +3346,7 @@ mod tests {
                 "observation",
                 None,
                 "existing note",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -3309,7 +3374,7 @@ mod tests {
                 "observation",
                 None,
                 "existing note",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -3337,7 +3402,7 @@ mod tests {
                 "observation",
                 None,
                 "note in ns-a",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -3349,7 +3414,7 @@ mod tests {
                 "observation",
                 None,
                 "note in ns-b",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -3383,7 +3448,7 @@ mod tests {
                 "observation",
                 None,
                 "a note that cannot be an extends source",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -3427,7 +3492,7 @@ mod tests {
                 "observation",
                 None,
                 "annotating an edge",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -3472,7 +3537,7 @@ mod tests {
                 "observation",
                 None,
                 "partial note",
-                0.5,
+                Some(0.5),
                 None,
                 vec![t1.id],
             )
@@ -3512,7 +3577,7 @@ mod tests {
             "compensation must remove the note row; got {after_notes:?}"
         );
         let search_hits = rt
-            .search_notes(None, "partial note", None, 10, None)
+            .search_notes(None, "partial note", None, 10, None, false)
             .await
             .unwrap();
         assert!(
@@ -3549,7 +3614,7 @@ mod tests {
                 "observation",
                 None,
                 "note about entity",
-                0.5,
+                Some(0.5),
                 None,
                 vec![entity.id],
             )
@@ -3599,7 +3664,15 @@ mod tests {
         let rt = rt();
         // note_target is the thing being annotated (a note itself).
         let note_target = rt
-            .create_note(None, "observation", None, "target note", 0.5, None, vec![])
+            .create_note(
+                None,
+                "observation",
+                None,
+                "target note",
+                Some(0.5),
+                None,
+                vec![],
+            )
             .await
             .unwrap();
         // note_source annotates note_target.
@@ -3609,7 +3682,7 @@ mod tests {
                 "insight",
                 None,
                 "annotation",
-                0.5,
+                Some(0.5),
                 None,
                 vec![note_target.id],
             )
@@ -3678,7 +3751,7 @@ mod tests {
                 "observation",
                 None,
                 "note about edge",
-                0.5,
+                Some(0.5),
                 None,
                 vec![base_edge_uuid],
             )
@@ -3741,7 +3814,7 @@ mod tests {
                 "observation",
                 None,
                 "multi-target note",
-                0.5,
+                Some(0.5),
                 None,
                 vec![t1.id, t2.id],
             )
@@ -3793,7 +3866,7 @@ mod tests {
     async fn annotated_note_soft_delete_preserves_annotate_edge() {
         let rt = rt();
         let note_target = rt
-            .create_note(None, "observation", None, "target", 0.5, None, vec![])
+            .create_note(None, "observation", None, "target", Some(0.5), None, vec![])
             .await
             .unwrap();
         let note_source = rt
@@ -3802,7 +3875,7 @@ mod tests {
                 "insight",
                 None,
                 "annotation",
-                0.5,
+                Some(0.5),
                 None,
                 vec![note_target.id],
             )
@@ -3863,7 +3936,7 @@ mod tests {
                 "observation",
                 None,
                 "annotates the entity",
-                0.5,
+                Some(0.5),
                 None,
                 vec![entity.id],
             )
@@ -3948,7 +4021,7 @@ mod tests {
                 "observation",
                 None,
                 "rollback target",
-                0.5,
+                Some(0.5),
                 None,
                 vec![t1.id, t2.id],
             )
@@ -3974,7 +4047,7 @@ mod tests {
 
         // FTS must have no hit for the content.
         let hits = rt
-            .search_notes(None, "rollback target", None, 10, None)
+            .search_notes(None, "rollback target", None, 10, None, false)
             .await
             .unwrap();
         assert!(
@@ -4086,7 +4159,7 @@ mod tests {
                 "observation",
                 None,
                 "SpectralDecomposition unique term yvwkqz for soft delete test",
-                0.7,
+                Some(0.7),
                 None,
                 vec![],
             )
@@ -4094,7 +4167,7 @@ mod tests {
             .unwrap();
 
         let before = rt
-            .search_notes(None, "yvwkqz", None, 10, None)
+            .search_notes(None, "yvwkqz", None, 10, None, false)
             .await
             .unwrap();
         assert!(
@@ -4106,7 +4179,7 @@ mod tests {
         assert!(deleted, "soft delete must return true");
 
         let after = rt
-            .search_notes(None, "yvwkqz", None, 10, None)
+            .search_notes(None, "yvwkqz", None, 10, None, false)
             .await
             .unwrap();
         assert!(

@@ -46,10 +46,10 @@ pub struct EntityPatch {
     pub tags: Option<Vec<String>>,
 }
 
-/// Strategy used when merging two entities.
+/// Policy used when deduplicating two entities.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MergeStrategy {
+pub enum EntityDedupMergePolicy {
     /// `into` values win on conflict. Tags are unioned. Properties from `from` fill in
     /// keys that `into` doesn't have. This is the default.
     #[default]
@@ -60,7 +60,17 @@ pub enum MergeStrategy {
     Union,
 }
 
-/// Result returned by `merge_entity`.
+/// Strategy for merging note content when two notes are combined.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentMergeStrategy {
+    #[default]
+    Append,
+    PreferInto,
+    PreferFrom,
+}
+
+/// Result returned by `merge_entity` / `merge_note`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MergeSummary {
     pub kept_id: Uuid,
@@ -68,6 +78,56 @@ pub struct MergeSummary {
     pub edges_rewired: usize,
     pub properties_merged: usize,
     pub tags_unioned: usize,
+    pub content_appended: bool,
+    pub dry_run: bool,
+}
+
+/// Patch for `update_edge`. Only `Some(_)` fields are applied; `None` means "leave unchanged".
+///
+/// For `properties` — replacement semantics (not deep merge): `Some(value)` replaces
+/// the entire metadata object. `None` leaves metadata unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct EdgePatch {
+    pub relation: Option<EdgeRelation>,
+    pub weight: Option<f64>,
+    pub properties: Option<Value>,
+}
+
+/// Patch for `update_note`. Only `Some(_)` fields are applied; `None` means "leave unchanged".
+///
+/// For `salience`/`decay_factor`:
+/// - `None` (outer) — leave unchanged
+/// - `Some(None)` — clear the value
+/// - `Some(Some(v))` — set to v
+#[derive(Clone, Debug, Default)]
+pub struct NotePatch {
+    pub name: Option<Option<String>>,
+    pub content: Option<String>,
+    pub salience: Option<Option<f64>>,
+    pub decay_factor: Option<Option<f64>>,
+    pub properties: Option<Value>,
+    pub(crate) kind_status: Option<String>,
+}
+
+impl NotePatch {
+    /// Construct a `NotePatch` from the public fields only.
+    /// Use this from external crates; `kind_status` is set to `None`.
+    pub fn new(
+        name: Option<Option<String>>,
+        content: Option<String>,
+        salience: Option<Option<f64>>,
+        decay_factor: Option<Option<f64>>,
+        properties: Option<Value>,
+    ) -> Self {
+        Self {
+            name,
+            content,
+            salience,
+            decay_factor,
+            properties,
+            kind_status: None,
+        }
+    }
 }
 
 /// Filter for `list_edges` / `count_edges`.
@@ -133,8 +193,11 @@ impl KhiveRuntime {
             entity.description = desc_patch;
         }
         if let Some(props) = patch.properties {
-            let (merged, _) =
-                merge_properties(&entity.properties, &Some(props), MergeStrategy::PreferFrom);
+            let (merged, _) = merge_properties(
+                &entity.properties,
+                &Some(props),
+                EntityDedupMergePolicy::PreferFrom,
+            );
             entity.properties = merged;
         }
         if let Some(tags) = patch.tags {
@@ -155,7 +218,9 @@ impl KhiveRuntime {
     ///
     /// All edges incident to `from_id` are rewired to `into_id`. Self-loops that would
     /// result from the rewire are dropped. Properties and tags are merged per `strategy`.
-    /// `from_id` is hard-deleted and removed from indexes. Returns a summary.
+    /// `from_id` is tombstoned with merge provenance and removed from indexes. Returns a summary.
+    ///
+    /// If `dry_run` is true, computes and returns the planned summary without mutating any rows.
     ///
     /// Atomic: all SQL (entity reads/writes, edge rewires, FTS updates, vec-index delete)
     /// runs on a single pool connection inside one `BEGIN IMMEDIATE` transaction via
@@ -166,8 +231,14 @@ impl KhiveRuntime {
         namespace: Option<&str>,
         into_id: Uuid,
         from_id: Uuid,
-        strategy: MergeStrategy,
+        strategy: EntityDedupMergePolicy,
+        dry_run: bool,
     ) -> RuntimeResult<MergeSummary> {
+        if into_id == from_id {
+            return Err(RuntimeError::InvalidInput(
+                "cannot merge an entity into itself".into(),
+            ));
+        }
         let ns = self.ns(namespace).to_string();
         let sanitized_ns: String = ns
             .chars()
@@ -197,7 +268,9 @@ impl KhiveRuntime {
         let (summary, updated_entity) = tokio::task::spawn_blocking(move || {
             let guard = pool.writer()?;
             guard.transaction(|conn| {
-                merge_entity_sql(conn, ns, fts_table, vec_table, into_id, from_id, strategy)
+                merge_entity_sql(
+                    conn, ns, fts_table, vec_table, into_id, from_id, strategy, dry_run,
+                )
             })
         })
         .await
@@ -205,7 +278,7 @@ impl KhiveRuntime {
 
         // If vectors are configured, reindex into_entity (requires async embedding).
         // FTS and vec-delete were already committed inside the transaction above.
-        if self.config().embedding_model.is_some() {
+        if !dry_run && self.config().embedding_model.is_some() {
             self.reindex_entity(namespace, &updated_entity).await?;
         }
 
@@ -266,6 +339,160 @@ impl KhiveRuntime {
         }
         Ok(())
     }
+
+    /// Re-upsert FTS5 document (and vector if model configured) for the note.
+    pub(crate) async fn reindex_note(
+        &self,
+        namespace: Option<&str>,
+        note: &khive_storage::note::Note,
+    ) -> RuntimeResult<()> {
+        let ns = note.namespace.clone();
+        self.text(namespace)?
+            .upsert_document(TextDocument {
+                subject_id: note.id,
+                kind: SubstrateKind::Note,
+                title: note.name.clone(),
+                body: note.content.clone(),
+                tags: Vec::new(),
+                namespace: ns.clone(),
+                metadata: note.properties.clone(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await?;
+
+        if self.config().embedding_model.is_some() {
+            let vector = self.embed(&note.content).await?;
+            self.vectors(namespace)?
+                .insert(note.id, SubstrateKind::Note, &ns, vector)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Patch-style note update.
+    pub async fn update_note(
+        &self,
+        namespace: Option<&str>,
+        id: Uuid,
+        patch: NotePatch,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let store = self.notes(namespace)?;
+        let mut note = store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+
+        if note.namespace != self.ns(namespace) {
+            return Err(RuntimeError::NotFound(format!("note {id}")));
+        }
+
+        let mut text_changed = false;
+
+        if let Some(name_patch) = patch.name {
+            text_changed |= note.name != name_patch;
+            note.name = name_patch;
+        }
+        if let Some(content) = patch.content {
+            text_changed |= note.content != content;
+            note.content = content;
+        }
+        if let Some(salience_patch) = patch.salience {
+            note.salience = salience_patch.map(|s| s.clamp(0.0, 1.0));
+        }
+        if let Some(decay_patch) = patch.decay_factor {
+            note.decay_factor = decay_patch.map(|d| d.max(0.0));
+        }
+        if let Some(props) = patch.properties {
+            let (merged, _) = merge_properties(
+                &note.properties,
+                &Some(props),
+                EntityDedupMergePolicy::PreferFrom,
+            );
+            note.properties = merged;
+        }
+        if let Some(status) = patch.kind_status {
+            note.status = status;
+        }
+
+        note.updated_at = chrono::Utc::now().timestamp_micros();
+        store.upsert_note(note.clone()).await?;
+
+        if text_changed {
+            self.reindex_note(namespace, &note).await?;
+        }
+
+        Ok(note)
+    }
+
+    /// Merge `from_id` note into `into_id` note.
+    ///
+    /// Both notes must exist in the namespace and have the same `kind`. Content is merged
+    /// per `content_strategy`. Properties are merged per `strategy`. `from_id` is
+    /// tombstoned (status='deleted', deleted_at set). Returns a summary.
+    ///
+    /// If `dry_run` is true, computes and returns the planned summary without mutating
+    /// any rows, edges, or indexes.
+    pub async fn merge_note(
+        &self,
+        namespace: Option<&str>,
+        into_id: Uuid,
+        from_id: Uuid,
+        strategy: EntityDedupMergePolicy,
+        content_strategy: ContentMergeStrategy,
+        dry_run: bool,
+    ) -> RuntimeResult<MergeSummary> {
+        if into_id == from_id {
+            return Err(RuntimeError::InvalidInput(
+                "cannot merge a note into itself".into(),
+            ));
+        }
+        let ns = self.ns(namespace).to_string();
+        let sanitized_ns: String = ns
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let fts_table = format!("fts_entities_{}", sanitized_ns);
+        let vec_table = self.config().embedding_model.map(|model| {
+            let key: String = model
+                .to_string()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            format!("vec_{}", key)
+        });
+
+        let _ = self.notes(namespace)?;
+        let _ = self.graph(namespace)?;
+        let _ = self.text(namespace)?;
+        if self.config().embedding_model.is_some() {
+            let _ = self.vectors(namespace)?;
+        }
+
+        let pool = self.backend().pool_arc();
+        let (summary, updated_note) = tokio::task::spawn_blocking(move || {
+            let guard = pool.writer()?;
+            guard.transaction(|conn| {
+                merge_note_sql(
+                    conn,
+                    ns,
+                    fts_table,
+                    vec_table,
+                    into_id,
+                    from_id,
+                    strategy,
+                    content_strategy,
+                    dry_run,
+                )
+            })
+        })
+        .await
+        .map_err(|e| RuntimeError::Internal(e.to_string()))??;
+
+        if !dry_run && self.config().embedding_model.is_some() {
+            self.reindex_note(namespace, &updated_note).await?;
+        }
+        Ok(summary)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +508,7 @@ fn read_merge_entity(
     let id_str = id.to_string();
     let mut stmt = conn.prepare(
         "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-         created_at, updated_at, deleted_at \
+         created_at, updated_at, deleted_at, merged_into, merge_event_id \
          FROM entities WHERE id = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -300,6 +527,8 @@ fn read_merge_entity(
     let created_at: i64 = row.get(8)?;
     let updated_at: i64 = row.get(9)?;
     let deleted_at: Option<i64> = row.get(10)?;
+    let merged_into_str: Option<String> = row.get(11)?;
+    let merge_event_id_str: Option<String> = row.get(12)?;
 
     if ns != namespace {
         return Err(SqliteError::InvalidData(format!(
@@ -315,6 +544,16 @@ fn read_merge_entity(
         .transpose()?;
     let tags: Vec<String> =
         serde_json::from_str(&tags_str).map_err(|e| SqliteError::InvalidData(e.to_string()))?;
+    let merged_into = merged_into_str
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|e| SqliteError::InvalidData(e.to_string()))?;
+    let merge_event_id = merge_event_id_str
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|e| SqliteError::InvalidData(e.to_string()))?;
 
     Ok(Entity {
         id: entity_id,
@@ -328,14 +567,19 @@ fn read_merge_entity(
         created_at,
         updated_at,
         deleted_at,
+        merged_into,
+        merge_event_id,
     })
 }
 
 /// All merge SQL on one connection inside an already-open `BEGIN IMMEDIATE` transaction.
 ///
 /// Reads both entities, rewires/drops incident edges, merges entity fields, updates FTS,
-/// deletes the `from` vec entry (if `vec_table` is Some), and hard-deletes `from` from
-/// entities.  Returns the updated `into` entity so the caller can do the async vec re-insert.
+/// deletes the `from` vec entry (if `vec_table` is Some), and tombstones `from` with merge
+/// provenance.  Returns the updated `into` entity so the caller can do the async vec re-insert.
+///
+/// When `dry_run` is true, all reads and computations are performed but no writes are issued.
+#[allow(clippy::too_many_arguments)]
 fn merge_entity_sql(
     conn: &rusqlite::Connection,
     namespace: String,
@@ -343,12 +587,14 @@ fn merge_entity_sql(
     vec_table: Option<String>,
     into_id: Uuid,
     from_id: Uuid,
-    strategy: MergeStrategy,
+    strategy: EntityDedupMergePolicy,
+    dry_run: bool,
 ) -> Result<(MergeSummary, Entity), SqliteError> {
     let into_entity = read_merge_entity(conn, into_id, &namespace)?;
     let from_entity = read_merge_entity(conn, from_id, &namespace)?;
 
     // --- Collect edges incident to from_id ---
+    #[allow(dead_code)]
     struct EdgeRow {
         id: Uuid,
         source_id: Uuid,
@@ -424,61 +670,6 @@ fn merge_entity_sql(
         }
     }
 
-    // --- Rewire edges ---
-    let mut edges_rewired = 0usize;
-    for edge in all_edges {
-        let new_src = if edge.source_id == from_id {
-            into_id
-        } else {
-            edge.source_id
-        };
-        let new_tgt = if edge.target_id == from_id {
-            into_id
-        } else {
-            edge.target_id
-        };
-
-        if new_src == new_tgt {
-            conn.execute(
-                "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
-                rusqlite::params![&namespace, edge.id.to_string()],
-            )?;
-            continue;
-        }
-
-        conn.execute(
-            "INSERT INTO graph_edges \
-             (namespace, id, source_id, target_id, relation, weight, \
-              created_at, updated_at, deleted_at, target_backend, metadata) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-             ON CONFLICT(namespace, id) DO UPDATE SET \
-                 source_id = excluded.source_id, \
-                 target_id = excluded.target_id, \
-                 relation = excluded.relation, \
-                 weight = excluded.weight, \
-                 created_at = excluded.created_at, \
-                 updated_at = excluded.updated_at, \
-                 deleted_at = excluded.deleted_at, \
-                 target_backend = excluded.target_backend, \
-                 metadata = excluded.metadata \
-             ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
-            rusqlite::params![
-                &namespace,
-                edge.id.to_string(),
-                new_src.to_string(),
-                new_tgt.to_string(),
-                &edge.relation,
-                edge.weight,
-                edge.created_at,
-                edge.updated_at,
-                edge.deleted_at,
-                edge.target_backend,
-                edge.metadata,
-            ],
-        )?;
-        edges_rewired += 1;
-    }
-
     // --- Merge entity fields ---
     let (merged_props, properties_merged) =
         merge_properties(&into_entity.properties, &from_entity.properties, strategy);
@@ -494,84 +685,149 @@ fn merge_entity_sql(
         .map(|v| serde_json::to_string(v).unwrap_or_default());
     let tags_json = serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string());
 
-    // --- Upsert merged entity ---
-    conn.execute(
-        "INSERT OR REPLACE INTO entities \
-         (id, namespace, kind, name, description, properties, tags, \
-          created_at, updated_at, deleted_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        rusqlite::params![
-            &into_str,
-            &namespace,
-            &into_entity.kind,
-            &merged_name,
-            &merged_description,
-            &props_str,
-            &tags_json,
-            into_entity.created_at,
-            now,
-            into_entity.deleted_at,
-        ],
-    )?;
+    // --- Rewire edges ---
+    let mut edges_rewired = 0usize;
+    if !dry_run {
+        for edge in all_edges {
+            let new_src = if edge.source_id == from_id {
+                into_id
+            } else {
+                edge.source_id
+            };
+            let new_tgt = if edge.target_id == from_id {
+                into_id
+            } else {
+                edge.target_id
+            };
 
-    // --- Reindex into_id in FTS (delete existing, insert updated) ---
-    let fts_body = match &merged_description {
-        Some(d) if !d.is_empty() => format!("{} {}", merged_name, d),
-        _ => merged_name.clone(),
-    };
-    let kind_str = SubstrateKind::Entity.to_string();
+            if new_src == new_tgt {
+                conn.execute(
+                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                    rusqlite::params![&namespace, edge.id.to_string()],
+                )?;
+                continue;
+            }
 
-    conn.execute(
-        &format!(
-            "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-            fts_table
-        ),
-        rusqlite::params![&namespace, &into_str],
-    )?;
-    conn.execute(
-        &format!(
-            "INSERT INTO {} \
-             (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            fts_table
-        ),
-        rusqlite::params![
-            &into_str,
-            &kind_str,
-            &merged_name,
-            &fts_body,
-            &tags_json,
-            &namespace,
-            &props_str,
-            now,
-        ],
-    )?;
+            let now_ts = chrono::Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO graph_edges \
+                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(namespace, id) DO UPDATE SET \
+                     source_id = excluded.source_id, \
+                     target_id = excluded.target_id, \
+                     relation = excluded.relation, \
+                     weight = excluded.weight, \
+                     updated_at = excluded.updated_at, \
+                     metadata = excluded.metadata \
+                 ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
+                rusqlite::params![
+                    &namespace,
+                    edge.id.to_string(),
+                    new_src.to_string(),
+                    new_tgt.to_string(),
+                    &edge.relation,
+                    edge.weight,
+                    edge.created_at,
+                    now_ts,
+                    edge.deleted_at,
+                    edge.target_backend,
+                    edge.metadata,
+                ],
+            )?;
+            edges_rewired += 1;
+        }
 
-    // --- Delete from_id from FTS ---
-    conn.execute(
-        &format!(
-            "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-            fts_table
-        ),
-        rusqlite::params![&namespace, &from_str],
-    )?;
+        // --- Upsert merged entity ---
+        conn.execute(
+            "INSERT OR REPLACE INTO entities \
+             (id, namespace, kind, name, description, properties, tags, \
+              created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                &into_str,
+                &namespace,
+                &into_entity.kind,
+                &merged_name,
+                &merged_description,
+                &props_str,
+                &tags_json,
+                into_entity.created_at,
+                now,
+                into_entity.deleted_at,
+                Option::<String>::None,
+                Option::<String>::None,
+            ],
+        )?;
 
-    // --- Delete from_id from vector index if configured ---
-    if let Some(ref vec_tbl) = vec_table {
+        // --- Reindex into_id in FTS (delete existing, insert updated) ---
+        let fts_body = match &merged_description {
+            Some(d) if !d.is_empty() => format!("{} {}", merged_name, d),
+            _ => merged_name.clone(),
+        };
+        let kind_str = SubstrateKind::Entity.to_string();
+
         conn.execute(
             &format!(
-                "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
-                vec_tbl
+                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
+                fts_table
             ),
-            rusqlite::params![&from_str, &namespace],
+            rusqlite::params![&namespace, &into_str],
+        )?;
+        conn.execute(
+            &format!(
+                "INSERT INTO {} \
+                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                fts_table
+            ),
+            rusqlite::params![
+                &into_str,
+                &kind_str,
+                &merged_name,
+                &fts_body,
+                &tags_json,
+                &namespace,
+                &props_str,
+                now,
+            ],
+        )?;
+
+        // --- Delete from_id from FTS ---
+        conn.execute(
+            &format!(
+                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
+                fts_table
+            ),
+            rusqlite::params![&namespace, &from_str],
+        )?;
+
+        // --- Delete from_id from vector index if configured ---
+        if let Some(ref vec_tbl) = vec_table {
+            conn.execute(
+                &format!(
+                    "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
+                    vec_tbl
+                ),
+                rusqlite::params![&from_str, &namespace],
+            )?;
+        }
+
+        // --- Tombstone from entity (ADR-014: soft-delete with provenance) ---
+        let merge_event_id = Uuid::new_v4();
+        conn.execute(
+            "UPDATE entities \
+             SET deleted_at = ?1, merged_into = ?2, merge_event_id = ?3, updated_at = ?1 \
+             WHERE namespace = ?4 AND id = ?5 AND deleted_at IS NULL",
+            rusqlite::params![
+                now,
+                into_str,
+                merge_event_id.to_string(),
+                &namespace,
+                &from_str,
+            ],
         )?;
     }
-
-    // --- Hard-delete from entity ---
-    conn.execute(
-        "DELETE FROM entities WHERE id = ?1",
-        rusqlite::params![&from_str],
-    )?;
 
     let updated_entity = Entity {
         id: into_id,
@@ -585,6 +841,8 @@ fn merge_entity_sql(
         created_at: into_entity.created_at,
         updated_at: now,
         deleted_at: into_entity.deleted_at,
+        merged_into: None,
+        merge_event_id: None,
     };
 
     Ok((
@@ -594,8 +852,409 @@ fn merge_entity_sql(
             edges_rewired,
             properties_merged,
             tags_unioned,
+            content_appended: false,
+            dry_run,
         },
         updated_entity,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Note merge SQL helpers
+// ---------------------------------------------------------------------------
+
+/// Read one note row by ID within a namespace, returning `SqliteError` on missing/wrong-ns.
+fn read_merge_note(
+    conn: &rusqlite::Connection,
+    id: Uuid,
+    namespace: &str,
+) -> Result<khive_storage::note::Note, SqliteError> {
+    use khive_storage::note::Note;
+    let id_str = id.to_string();
+    let mut stmt = conn.prepare(
+        "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
+         expires_at, properties, created_at, updated_at, deleted_at \
+         FROM notes WHERE id = ?1 AND deleted_at IS NULL",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![id_str])?;
+    let row = rows
+        .next()?
+        .ok_or_else(|| SqliteError::InvalidData(format!("note {id} not found")))?;
+
+    let id_s: String = row.get(0)?;
+    let ns: String = row.get(1)?;
+    let kind: String = row.get(2)?;
+    let status: String = row.get(3)?;
+    let name: Option<String> = row.get(4)?;
+    let content: String = row.get(5)?;
+    let salience: Option<f64> = row.get(6)?;
+    let decay_factor: Option<f64> = row.get(7)?;
+    let expires_at: Option<i64> = row.get(8)?;
+    let properties_str: Option<String> = row.get(9)?;
+    let created_at: i64 = row.get(10)?;
+    let updated_at: i64 = row.get(11)?;
+    let deleted_at: Option<i64> = row.get(12)?;
+
+    if ns != namespace {
+        return Err(SqliteError::InvalidData(format!(
+            "note {id} belongs to namespace '{ns}', not '{namespace}'"
+        )));
+    }
+
+    let note_id = Uuid::parse_str(&id_s).map_err(|e| SqliteError::InvalidData(e.to_string()))?;
+    let properties: Option<serde_json::Value> = properties_str
+        .map(|s| serde_json::from_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string())))
+        .transpose()?;
+
+    Ok(Note {
+        id: note_id,
+        namespace: ns,
+        kind,
+        status,
+        name,
+        content,
+        salience,
+        decay_factor,
+        expires_at,
+        properties,
+        created_at,
+        updated_at,
+        deleted_at,
+    })
+}
+
+fn max_option_f64(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
+fn append_merge_history(props: Option<Value>, entry: Value) -> Result<Option<Value>, SqliteError> {
+    use serde_json::{json, Map};
+    let mut obj: Map<String, Value> = match props {
+        Some(Value::Object(m)) => m,
+        Some(other) => {
+            let mut m = Map::new();
+            m.insert("_value".into(), other);
+            m
+        }
+        None => Map::new(),
+    };
+    let history = obj
+        .entry("_merge_history".to_string())
+        .or_insert_with(|| json!([]));
+    if let Value::Array(arr) = history {
+        arr.push(entry);
+    }
+    Ok(Some(Value::Object(obj)))
+}
+
+/// All note merge SQL on one connection inside a `BEGIN IMMEDIATE` transaction.
+///
+/// Reads both notes (must have same `kind`), rewires/drops incident edges, merges content
+/// per `content_strategy`, tombstones `from`. Returns the updated `into` note for async
+/// re-embedding.
+///
+/// When `dry_run` is true, all reads and computations are performed but no writes are issued.
+#[allow(clippy::too_many_arguments)]
+fn merge_note_sql(
+    conn: &rusqlite::Connection,
+    namespace: String,
+    fts_table: String,
+    vec_table: Option<String>,
+    into_id: Uuid,
+    from_id: Uuid,
+    strategy: EntityDedupMergePolicy,
+    content_strategy: ContentMergeStrategy,
+    dry_run: bool,
+) -> Result<(MergeSummary, khive_storage::note::Note), SqliteError> {
+    let into_note = read_merge_note(conn, into_id, &namespace)?;
+    let from_note = read_merge_note(conn, from_id, &namespace)?;
+
+    if into_note.kind != from_note.kind {
+        return Err(SqliteError::InvalidData(format!(
+            "cannot merge notes of different kinds: {} vs {}",
+            into_note.kind, from_note.kind
+        )));
+    }
+
+    let now = chrono::Utc::now().timestamp_micros();
+    let into_str = into_id.to_string();
+    let from_str = from_id.to_string();
+
+    // Collect edges incident to from_id.
+    #[allow(dead_code)]
+    struct EdgeRow {
+        id: Uuid,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: String,
+        weight: f64,
+        created_at: i64,
+        updated_at: i64,
+        deleted_at: Option<i64>,
+        target_backend: Option<String>,
+        metadata: Option<String>,
+    }
+    let parse_id =
+        |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
+
+    let mut outbound: Vec<EdgeRow> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata \
+             FROM graph_edges WHERE namespace = ?1 AND source_id = ?2",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![&namespace, &from_str])?;
+        while let Some(row) = rows.next()? {
+            outbound.push(EdgeRow {
+                id: parse_id(row.get(0)?)?,
+                source_id: parse_id(row.get(1)?)?,
+                target_id: parse_id(row.get(2)?)?,
+                relation: row.get(3)?,
+                weight: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                deleted_at: row.get(7)?,
+                target_backend: row.get(8)?,
+                metadata: row.get(9)?,
+            });
+        }
+    }
+    let mut inbound: Vec<EdgeRow> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata \
+             FROM graph_edges WHERE namespace = ?1 AND target_id = ?2",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![&namespace, &from_str])?;
+        while let Some(row) = rows.next()? {
+            inbound.push(EdgeRow {
+                id: parse_id(row.get(0)?)?,
+                source_id: parse_id(row.get(1)?)?,
+                target_id: parse_id(row.get(2)?)?,
+                relation: row.get(3)?,
+                weight: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                deleted_at: row.get(7)?,
+                target_backend: row.get(8)?,
+                metadata: row.get(9)?,
+            });
+        }
+    }
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    let mut all_edges: Vec<EdgeRow> = Vec::new();
+    for edge in outbound.into_iter().chain(inbound) {
+        if seen.insert(edge.id) {
+            all_edges.push(edge);
+        }
+    }
+
+    // Merge note fields.
+    let (merged_content, content_appended) = match content_strategy {
+        ContentMergeStrategy::Append => {
+            if from_note.content.is_empty() {
+                (into_note.content.clone(), false)
+            } else {
+                (
+                    format!("{}\n\n---\n\n{}", into_note.content, from_note.content),
+                    true,
+                )
+            }
+        }
+        ContentMergeStrategy::PreferInto => (into_note.content.clone(), false),
+        ContentMergeStrategy::PreferFrom => (from_note.content.clone(), false),
+    };
+
+    let merged_name = match strategy {
+        EntityDedupMergePolicy::PreferFrom => from_note.name.clone().or(into_note.name.clone()),
+        _ => into_note.name.clone().or(from_note.name.clone()),
+    };
+
+    let (merged_props, properties_merged) =
+        merge_properties(&into_note.properties, &from_note.properties, strategy);
+
+    // Append merge history to properties.
+    let merge_history_entry = serde_json::json!({
+        "merged_from": from_id.to_string(),
+        "merged_at": now,
+        "strategy": format!("{:?}", strategy),
+        "content_strategy": format!("{:?}", content_strategy),
+    });
+    let merged_props = append_merge_history(merged_props, merge_history_entry)?;
+
+    let merged_salience = max_option_f64(into_note.salience, from_note.salience);
+    let merged_expires_at = match (into_note.expires_at, from_note.expires_at) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
+    let props_str = merged_props
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+    let mut edges_rewired = 0usize;
+    if !dry_run {
+        // Rewire and upsert.
+        for edge in all_edges {
+            let new_src = if edge.source_id == from_id {
+                into_id
+            } else {
+                edge.source_id
+            };
+            let new_tgt = if edge.target_id == from_id {
+                into_id
+            } else {
+                edge.target_id
+            };
+            if new_src == new_tgt {
+                conn.execute(
+                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                    rusqlite::params![&namespace, edge.id.to_string()],
+                )?;
+                continue;
+            }
+            let now_ts = chrono::Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO graph_edges \
+                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(namespace, id) DO UPDATE SET \
+                     source_id = excluded.source_id, \
+                     target_id = excluded.target_id, \
+                     relation = excluded.relation, \
+                     weight = excluded.weight, \
+                     updated_at = excluded.updated_at, \
+                     metadata = excluded.metadata \
+                 ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
+                rusqlite::params![
+                    &namespace,
+                    edge.id.to_string(),
+                    new_src.to_string(),
+                    new_tgt.to_string(),
+                    &edge.relation,
+                    edge.weight,
+                    edge.created_at,
+                    now_ts,
+                    edge.deleted_at,
+                    edge.target_backend,
+                    edge.metadata,
+                ],
+            )?;
+            edges_rewired += 1;
+        }
+
+        // Upsert merged into-note.
+        conn.execute(
+            "INSERT OR REPLACE INTO notes \
+             (id, namespace, kind, status, name, content, salience, decay_factor, \
+              expires_at, properties, created_at, updated_at, deleted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                &into_str,
+                &namespace,
+                &into_note.kind,
+                &into_note.status,
+                &merged_name,
+                &merged_content,
+                merged_salience,
+                into_note.decay_factor,
+                merged_expires_at,
+                &props_str,
+                into_note.created_at,
+                now,
+                into_note.deleted_at,
+            ],
+        )?;
+
+        // Update FTS for into-note.
+        conn.execute(
+            &format!(
+                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
+                fts_table
+            ),
+            rusqlite::params![&namespace, &into_str],
+        )?;
+        conn.execute(
+            &format!(
+                "INSERT INTO {} \
+                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                fts_table
+            ),
+            rusqlite::params![
+                &into_str,
+                SubstrateKind::Note.to_string(),
+                &merged_name,
+                &merged_content,
+                "[]",
+                &namespace,
+                &props_str,
+                now,
+            ],
+        )?;
+
+        // Delete from-note from FTS.
+        conn.execute(
+            &format!(
+                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
+                fts_table
+            ),
+            rusqlite::params![&namespace, &from_str],
+        )?;
+
+        // Delete from-note from vector index if configured.
+        if let Some(ref vec_tbl) = vec_table {
+            conn.execute(
+                &format!(
+                    "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
+                    vec_tbl
+                ),
+                rusqlite::params![&from_str, &namespace],
+            )?;
+        }
+
+        // Tombstone the from-note.
+        conn.execute(
+            "UPDATE notes SET status = 'deleted', deleted_at = ?1, updated_at = ?1 \
+             WHERE namespace = ?2 AND id = ?3 AND deleted_at IS NULL",
+            rusqlite::params![now, &namespace, &from_str],
+        )?;
+    }
+
+    let updated_note = khive_storage::note::Note {
+        id: into_id,
+        namespace: namespace.clone(),
+        kind: into_note.kind.clone(),
+        status: into_note.status.clone(),
+        name: merged_name,
+        content: merged_content,
+        salience: merged_salience,
+        decay_factor: into_note.decay_factor,
+        expires_at: merged_expires_at,
+        properties: merged_props,
+        created_at: into_note.created_at,
+        updated_at: now,
+        deleted_at: into_note.deleted_at,
+    };
+
+    Ok((
+        MergeSummary {
+            kept_id: into_id,
+            removed_id: from_id,
+            edges_rewired,
+            properties_merged,
+            tags_unioned: 0,
+            content_appended,
+            dry_run,
+        },
+        updated_note,
     ))
 }
 
@@ -603,34 +1262,34 @@ fn merge_entity_sql(
 // Merge helpers (pure functions — easier to unit test)
 // ---------------------------------------------------------------------------
 
-fn merge_string_field(into: &str, from: &str, strategy: MergeStrategy) -> String {
+fn merge_string_field(into: &str, from: &str, strategy: EntityDedupMergePolicy) -> String {
     match strategy {
-        MergeStrategy::PreferInto | MergeStrategy::Union => into.to_string(),
-        MergeStrategy::PreferFrom => from.to_string(),
+        EntityDedupMergePolicy::PreferInto | EntityDedupMergePolicy::Union => into.to_string(),
+        EntityDedupMergePolicy::PreferFrom => from.to_string(),
     }
 }
 
 fn merge_option_string_field(
     into: &Option<String>,
     from: &Option<String>,
-    strategy: MergeStrategy,
+    strategy: EntityDedupMergePolicy,
 ) -> Option<String> {
     match strategy {
-        MergeStrategy::PreferInto => {
+        EntityDedupMergePolicy::PreferInto => {
             if into.is_some() {
                 into.clone()
             } else {
                 from.clone()
             }
         }
-        MergeStrategy::PreferFrom => {
+        EntityDedupMergePolicy::PreferFrom => {
             if from.is_some() {
                 from.clone()
             } else {
                 into.clone()
             }
         }
-        MergeStrategy::Union => {
+        EntityDedupMergePolicy::Union => {
             // Keep into's description; if empty, append from's.
             match (into, from) {
                 (Some(a), _) if !a.is_empty() => Some(a.clone()),
@@ -645,7 +1304,7 @@ fn merge_option_string_field(
 fn merge_properties(
     into: &Option<Value>,
     from: &Option<Value>,
-    strategy: MergeStrategy,
+    strategy: EntityDedupMergePolicy,
 ) -> (Option<Value>, usize) {
     match (into, from) {
         (None, None) => (None, 0),
@@ -662,14 +1321,15 @@ fn merge_properties(
 }
 
 /// Deep-merge two JSON values per strategy. Returns (merged, keys_contributed_by_from).
-fn merge_json(into: &Value, from: &Value, strategy: MergeStrategy) -> (Value, usize) {
+fn merge_json(into: &Value, from: &Value, strategy: EntityDedupMergePolicy) -> (Value, usize) {
     match (into, from, strategy) {
-        (Value::Object(a), Value::Object(b), MergeStrategy::Union) => {
+        (Value::Object(a), Value::Object(b), EntityDedupMergePolicy::Union) => {
             let mut result = a.clone();
             let mut added = 0usize;
             for (k, v_from) in b {
                 if let Some(v_into) = a.get(k) {
-                    let (merged, sub_added) = merge_json(v_into, v_from, MergeStrategy::Union);
+                    let (merged, sub_added) =
+                        merge_json(v_into, v_from, EntityDedupMergePolicy::Union);
                     result.insert(k.clone(), merged);
                     added += sub_added;
                 } else {
@@ -679,7 +1339,7 @@ fn merge_json(into: &Value, from: &Value, strategy: MergeStrategy) -> (Value, us
             }
             (Value::Object(result), added)
         }
-        (Value::Object(a), Value::Object(b), MergeStrategy::PreferInto) => {
+        (Value::Object(a), Value::Object(b), EntityDedupMergePolicy::PreferInto) => {
             let mut result = a.clone();
             let mut added = 0usize;
             for (k, v) in b {
@@ -690,7 +1350,7 @@ fn merge_json(into: &Value, from: &Value, strategy: MergeStrategy) -> (Value, us
             }
             (Value::Object(result), added)
         }
-        (Value::Object(a), Value::Object(b), MergeStrategy::PreferFrom) => {
+        (Value::Object(a), Value::Object(b), EntityDedupMergePolicy::PreferFrom) => {
             let mut result = a.clone();
             let mut added = 0usize;
             for (k, v) in b {
@@ -702,7 +1362,7 @@ fn merge_json(into: &Value, from: &Value, strategy: MergeStrategy) -> (Value, us
             (Value::Object(result), added)
         }
         // Non-object scalars: apply strategy directly.
-        (_into_val, from_val, MergeStrategy::PreferFrom) => (from_val.clone(), 1),
+        (_into_val, from_val, EntityDedupMergePolicy::PreferFrom) => (from_val.clone(), 1),
         _ => (into.clone(), 0),
     }
 }
@@ -964,7 +1624,7 @@ mod tests {
             .unwrap();
 
         let summary = rt
-            .merge_entity(None, d.id, b.id, MergeStrategy::PreferInto)
+            .merge_entity(None, d.id, b.id, EntityDedupMergePolicy::PreferInto, false)
             .await
             .unwrap();
 
@@ -986,6 +1646,23 @@ mod tests {
             .unwrap();
         assert_eq!(c_neighbors.len(), 1);
         assert_eq!(c_neighbors[0].node_id, d.id);
+    }
+
+    #[tokio::test]
+    async fn merge_entity_self_merge_rejected() {
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let err = rt
+            .merge_entity(None, a.id, a.id, EntityDedupMergePolicy::PreferInto, false)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("cannot merge an entity into itself"),
+            "expected self-merge rejection, got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1016,9 +1693,15 @@ mod tests {
             .await
             .unwrap();
 
-        rt.merge_entity(None, into.id, from.id, MergeStrategy::PreferInto)
-            .await
-            .unwrap();
+        rt.merge_entity(
+            None,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            false,
+        )
+        .await
+        .unwrap();
 
         let kept = rt.get_entity(None, into.id).await.unwrap().unwrap();
         let props = kept.properties.unwrap();
@@ -1055,9 +1738,15 @@ mod tests {
             .await
             .unwrap();
 
-        rt.merge_entity(None, into.id, from.id, MergeStrategy::PreferFrom)
-            .await
-            .unwrap();
+        rt.merge_entity(
+            None,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferFrom,
+            false,
+        )
+        .await
+        .unwrap();
 
         let kept = rt.get_entity(None, into.id).await.unwrap().unwrap();
         let props = kept.properties.unwrap();
@@ -1094,7 +1783,7 @@ mod tests {
             .await
             .unwrap();
 
-        rt.merge_entity(None, into.id, from.id, MergeStrategy::Union)
+        rt.merge_entity(None, into.id, from.id, EntityDedupMergePolicy::Union, false)
             .await
             .unwrap();
 
@@ -1133,9 +1822,15 @@ mod tests {
             .await
             .unwrap();
 
-        rt.merge_entity(None, into.id, from.id, MergeStrategy::PreferInto)
-            .await
-            .unwrap();
+        rt.merge_entity(
+            None,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::PreferInto,
+            false,
+        )
+        .await
+        .unwrap();
 
         let kept = rt.get_entity(None, into.id).await.unwrap().unwrap();
         let mut tags = kept.tags.clone();
@@ -1161,7 +1856,7 @@ mod tests {
             .unwrap();
 
         let summary = rt
-            .merge_entity(None, a.id, b.id, MergeStrategy::PreferInto)
+            .merge_entity(None, a.id, b.id, EntityDedupMergePolicy::PreferInto, false)
             .await
             .unwrap();
 
@@ -1195,10 +1890,240 @@ mod tests {
     fn merge_properties_prefer_into_fills_missing_keys() {
         let a = serde_json::json!({"a": 1});
         let b = serde_json::json!({"a": 99, "b": 2});
-        let (merged, added) = merge_properties(&Some(a), &Some(b), MergeStrategy::PreferInto);
+        let (merged, added) =
+            merge_properties(&Some(a), &Some(b), EntityDedupMergePolicy::PreferInto);
         let m = merged.unwrap();
         assert_eq!(m["a"], 1);
         assert_eq!(m["b"], 2);
         assert_eq!(added, 1);
+    }
+
+    // ---- tombstone and note merge tests ----
+
+    #[tokio::test]
+    async fn merge_entity_tombstones_source_with_provenance() {
+        let rt = rt();
+        let into = rt
+            .create_entity(None, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(None, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let from_id = from.id;
+
+        rt.merge_entity(
+            None,
+            into.id,
+            from_id,
+            EntityDedupMergePolicy::PreferInto,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // After merge, get_entity returns None (soft-deleted rows are excluded).
+        assert!(
+            rt.get_entity(None, from_id).await.unwrap().is_none(),
+            "tombstoned source should not be returned by get_entity"
+        );
+
+        // Verify the source row still exists in SQL with provenance.
+        let pool = rt.backend().pool_arc();
+        let (deleted_at, merged_into): (Option<i64>, Option<String>) =
+            tokio::task::spawn_blocking(move || {
+                let guard = pool.writer().unwrap();
+                guard
+                    .conn()
+                    .query_row(
+                        "SELECT deleted_at, merged_into FROM entities WHERE id = ?1",
+                        [from_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+        assert!(
+            deleted_at.is_some(),
+            "tombstoned entity must have deleted_at set"
+        );
+        assert_eq!(
+            merged_into.as_deref(),
+            Some(into.id.to_string().as_str()),
+            "merged_into must point to into_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_note_same_kind_appends_content() {
+        let rt = rt();
+        let into = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "Into content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "From content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let from_id = from.id;
+
+        let summary = rt
+            .merge_note(
+                None,
+                into.id,
+                from_id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.kept_id, into.id);
+        assert_eq!(summary.removed_id, from_id);
+        assert!(summary.content_appended);
+        assert!(!summary.dry_run);
+
+        // Source is no longer findable.
+        let from_store = rt.notes(None).unwrap();
+        assert!(
+            from_store.get_note(from_id).await.unwrap().is_none(),
+            "merged-from note should be soft-deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_note_different_kinds_rejected() {
+        let rt = rt();
+        let into = rt
+            .create_note(None, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(None, "decision", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .merge_note(
+                None,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await;
+        assert!(result.is_err(), "merging different note kinds must fail");
+    }
+
+    #[tokio::test]
+    async fn merge_note_dry_run_leaves_notes_unchanged() {
+        let rt = rt();
+        let into = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "Into content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(
+                None,
+                "observation",
+                None,
+                "From content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let into_id = into.id;
+        let from_id = from.id;
+
+        let summary = rt
+            .merge_note(
+                None,
+                into_id,
+                from_id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(summary.dry_run);
+
+        // Both notes still exist unchanged.
+        let store = rt.notes(None).unwrap();
+        let into_after = store.get_note(into_id).await.unwrap().unwrap();
+        let from_after = store.get_note(from_id).await.unwrap().unwrap();
+        assert_eq!(
+            into_after.content, "Into content",
+            "dry_run must not mutate into-note"
+        );
+        assert_eq!(
+            from_after.content, "From content",
+            "dry_run must not mutate from-note"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_edge_updates_properties() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let a = rt
+            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(None, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(None, a.id, b.id, EdgeRelation::Extends, 0.5, None)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        let updated = rt
+            .update_edge(
+                None,
+                edge_id,
+                EdgePatch {
+                    properties: Some(serde_json::json!({"source": "manual"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.metadata.as_ref().unwrap()["source"], "manual");
+        assert!((updated.weight - 0.5).abs() < 0.001, "weight unchanged");
     }
 }

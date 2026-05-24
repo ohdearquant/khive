@@ -117,6 +117,8 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
     let created_at: i64 = row.get(8)?;
     let updated_at: i64 = row.get(9)?;
     let deleted_at: Option<i64> = row.get(10)?;
+    let merged_into_str: Option<String> = row.get(11)?;
+    let merge_event_id_str: Option<String> = row.get(12)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -136,6 +138,22 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
     })?;
 
+    let merged_into = merged_into_str
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+    let merge_event_id = merge_event_id_str
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
     Ok(Entity {
         id,
         namespace,
@@ -148,6 +166,8 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         created_at,
         updated_at,
         deleted_at,
+        merged_into,
+        merge_event_id,
     })
 }
 
@@ -242,12 +262,15 @@ impl EntityStore for SqlEntityStore {
             .map(|v| serde_json::to_string(v).unwrap_or_default());
         let tags_str = serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
 
+        let merged_into_str = entity.merged_into.map(|u| u.to_string());
+        let merge_event_id_str = entity.merge_event_id.map(|u| u.to_string());
+
         self.with_writer("upsert_entity", move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO entities \
                  (id, namespace, kind, entity_type, name, description, properties, tags, \
-                  created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     id_str,
                     namespace,
@@ -260,6 +283,8 @@ impl EntityStore for SqlEntityStore {
                     entity.created_at,
                     entity.updated_at,
                     entity.deleted_at,
+                    merged_into_str,
+                    merge_event_id_str,
                 ],
             )?;
             Ok(())
@@ -288,11 +313,13 @@ impl EntityStore for SqlEntityStore {
                 let tags_str =
                     serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
 
+                let merged_into_str = entity.merged_into.map(|u| u.to_string());
+                let merge_event_id_str = entity.merge_event_id.map(|u| u.to_string());
                 match conn.execute(
                     "INSERT OR REPLACE INTO entities \
                      (id, namespace, kind, entity_type, name, description, properties, tags, \
-                      created_at, updated_at, deleted_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     rusqlite::params![
                         id_str,
                         &entity.namespace,
@@ -305,6 +332,8 @@ impl EntityStore for SqlEntityStore {
                         entity.created_at,
                         entity.updated_at,
                         entity.deleted_at,
+                        merged_into_str,
+                        merge_event_id_str,
                     ],
                 ) {
                     Ok(_) => affected += 1,
@@ -337,7 +366,7 @@ impl EntityStore for SqlEntityStore {
         self.with_reader("get_entity", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at \
+                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
                  FROM entities WHERE id = ?1 AND deleted_at IS NULL",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -405,7 +434,7 @@ impl EntityStore for SqlEntityStore {
 
             let data_sql = format!(
                 "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at \
+                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
                  FROM entities{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
@@ -464,13 +493,16 @@ const ENTITIES_DDL: &str = "\
         tags TEXT NOT NULL DEFAULT '[]',\
         created_at INTEGER NOT NULL,\
         updated_at INTEGER NOT NULL,\
-        deleted_at INTEGER\
+        deleted_at INTEGER,\
+        merged_into TEXT,\
+        merge_event_id TEXT\
     );\
     CREATE INDEX IF NOT EXISTS idx_entities_namespace ON entities(namespace);\
     CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(namespace, kind);\
     CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type ON entities(namespace, kind, entity_type);\
     CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(namespace, name);\
     CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC);\
+    CREATE INDEX IF NOT EXISTS idx_entities_merged_into ON entities(namespace, merged_into);\
 ";
 
 pub(crate) fn ensure_entities_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
@@ -517,6 +549,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            merged_into: None,
+            merge_event_id: None,
         }
     }
 
@@ -907,6 +941,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            merged_into: None,
+            merge_event_id: None,
         };
         store.upsert_entity(entity_a).await.unwrap();
 
@@ -928,6 +964,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            merged_into: None,
+            merge_event_id: None,
         };
         store.upsert_entity(entity_b).await.unwrap();
 

@@ -450,7 +450,7 @@ def test_edge_cascade_hard_delete(proc: subprocess.Popen) -> None:
     )
 
     # Hard-delete the hub
-    del_result = _tool(proc, "delete", {"id": hub["id"], "hard": True})
+    del_result = _tool(proc, "delete", {"id": hub["id"], "kind": "entity", "hard": True})
     assert del_result["deleted"] is True, f"Hard delete should return deleted=true: {del_result}"
 
     # Both incident edges must be gone — assert via get() AND via list() so the
@@ -493,7 +493,7 @@ def test_edge_cascade_hard_delete(proc: subprocess.Popen) -> None:
     })
     e_soft_id = e_soft["id"]
 
-    del_soft = _tool(proc, "delete", {"id": hub_soft["id"]})  # hard=False by default
+    del_soft = _tool(proc, "delete", {"id": hub_soft["id"], "kind": "entity"})  # hard=False by default
     assert del_soft["deleted"] is True
 
     # Edge should still be retrievable after soft delete
@@ -826,7 +826,7 @@ def test_annotates_source_must_be_note(proc: subprocess.Popen) -> None:
     )
 
     # ---- Hard-delete the target entity cascades the annotates edge ----
-    del_result = _tool(proc, "delete", {"id": concept["id"], "hard": True})
+    del_result = _tool(proc, "delete", {"id": concept["id"], "kind": "entity", "hard": True})
     assert del_result["deleted"] is True
 
     err_edge = _expect_rpc_error(proc, "get", {"id": edge_id})

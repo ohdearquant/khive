@@ -110,15 +110,16 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
     let id_str: String = row.get(0)?;
     let namespace: String = row.get(1)?;
     let kind: String = row.get(2)?;
-    let name: Option<String> = row.get(3)?;
-    let content: String = row.get(4)?;
-    let salience: f64 = row.get(5)?;
-    let decay_factor: f64 = row.get(6)?;
-    let expires_at: Option<i64> = row.get(7)?;
-    let properties_str: Option<String> = row.get(8)?;
-    let created_at: i64 = row.get(9)?;
-    let updated_at: i64 = row.get(10)?;
-    let deleted_at: Option<i64> = row.get(11)?;
+    let status: String = row.get(3)?;
+    let name: Option<String> = row.get(4)?;
+    let content: String = row.get(5)?;
+    let salience: Option<f64> = row.get(6)?;
+    let decay_factor: Option<f64> = row.get(7)?;
+    let expires_at: Option<i64> = row.get(8)?;
+    let properties_str: Option<String> = row.get(9)?;
+    let created_at: i64 = row.get(10)?;
+    let updated_at: i64 = row.get(11)?;
+    let deleted_at: Option<i64> = row.get(12)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -126,7 +127,7 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
         .map(|s| {
             serde_json::from_str(&s).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    8,
+                    9,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -138,6 +139,7 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
         id,
         namespace,
         kind,
+        status,
         name,
         content,
         salience,
@@ -185,6 +187,7 @@ impl NoteStore for SqlNoteStore {
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();
         let kind_str = note.kind.to_string();
+        let status_str = note.status.clone();
         let properties_str = note
             .properties
             .as_ref()
@@ -193,13 +196,14 @@ impl NoteStore for SqlNoteStore {
         self.with_writer("upsert_note", move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO notes \
-                 (id, namespace, kind, name, content, salience, decay_factor, expires_at, \
+                 (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
                   properties, created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     id_str,
                     namespace,
                     kind_str,
+                    status_str,
                     note.name,
                     note.content,
                     note.salience,
@@ -228,6 +232,7 @@ impl NoteStore for SqlNoteStore {
             for note in &notes {
                 let id_str = note.id.to_string();
                 let kind_str = note.kind.to_string();
+                let status_str = note.status.clone();
                 let properties_str = note
                     .properties
                     .as_ref()
@@ -235,13 +240,14 @@ impl NoteStore for SqlNoteStore {
 
                 match conn.execute(
                     "INSERT OR REPLACE INTO notes \
-                     (id, namespace, kind, name, content, salience, decay_factor, expires_at, \
+                     (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
                       properties, created_at, updated_at, deleted_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     rusqlite::params![
                         id_str,
                         &note.namespace,
                         kind_str,
+                        status_str,
                         &note.name,
                         note.content,
                         note.salience,
@@ -282,7 +288,7 @@ impl NoteStore for SqlNoteStore {
 
         self.with_reader("get_note", move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, namespace, kind, name, content, salience, decay_factor, expires_at, \
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
                  FROM notes WHERE id = ?1 AND deleted_at IS NULL",
             )?;
@@ -307,7 +313,7 @@ impl NoteStore for SqlNoteStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT id, namespace, kind, name, content, salience, decay_factor, expires_at, \
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
                  FROM notes WHERE id IN ({placeholders}) AND deleted_at IS NULL"
             );
@@ -334,7 +340,7 @@ impl NoteStore for SqlNoteStore {
                 self.with_writer("delete_note_soft", move |conn| {
                     let now = chrono::Utc::now().timestamp_micros();
                     let deleted = conn.execute(
-                        "UPDATE notes SET deleted_at = ?1 \
+                        "UPDATE notes SET status = 'deleted', deleted_at = ?1 \
                          WHERE id = ?2 AND deleted_at IS NULL",
                         rusqlite::params![now, id_str],
                     )?;
@@ -380,7 +386,7 @@ impl NoteStore for SqlNoteStore {
             let offset_idx = data_params.len();
 
             let data_sql = format!(
-                "SELECT id, namespace, kind, name, content, salience, decay_factor, expires_at, \
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
                  FROM notes{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
@@ -419,53 +425,6 @@ impl NoteStore for SqlNoteStore {
         })
         .await
     }
-
-    async fn upsert_note_if_below_quota(
-        &self,
-        note: Note,
-        max_notes: u64,
-    ) -> Result<bool, StorageError> {
-        let namespace = note.namespace.clone();
-        let id_str = note.id.to_string();
-        let kind_str = note.kind.to_string();
-        let properties_str = note
-            .properties
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
-
-        self.with_writer("upsert_note_if_below_quota", move |conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM notes WHERE namespace = ?1 AND deleted_at IS NULL",
-                [&namespace],
-                |row| row.get(0),
-            )?;
-            if count as u64 >= max_notes {
-                return Ok(false);
-            }
-            conn.execute(
-                "INSERT OR REPLACE INTO notes \
-                 (id, namespace, kind, name, content, salience, decay_factor, expires_at, \
-                  properties, created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                rusqlite::params![
-                    id_str,
-                    namespace,
-                    kind_str,
-                    note.name,
-                    note.content,
-                    note.salience,
-                    note.decay_factor,
-                    note.expires_at,
-                    properties_str,
-                    note.created_at,
-                    note.updated_at,
-                    note.deleted_at,
-                ],
-            )?;
-            Ok(true)
-        })
-        .await
-    }
 }
 
 // =============================================================================
@@ -477,10 +436,11 @@ const NOTES_DDL: &str = "\
         id TEXT PRIMARY KEY,\
         namespace TEXT NOT NULL,\
         kind TEXT NOT NULL,\
+        status TEXT NOT NULL DEFAULT 'active',\
         name TEXT,\
         content TEXT NOT NULL DEFAULT '',\
-        salience REAL NOT NULL DEFAULT 0.5,\
-        decay_factor REAL NOT NULL DEFAULT 0.0,\
+        salience REAL,\
+        decay_factor REAL,\
         expires_at INTEGER,\
         properties TEXT,\
         created_at INTEGER NOT NULL,\
@@ -611,26 +571,6 @@ mod tests {
         assert_eq!(count_ns2, 1);
     }
 
-    #[tokio::test]
-    async fn test_quota() {
-        let pool = setup_pool();
-        let store = SqlNoteStore::new(Arc::clone(&pool), false);
-
-        for _ in 0..3 {
-            let inserted = store
-                .upsert_note_if_below_quota(make_note("quota_ns", "observation", "x"), 3)
-                .await
-                .unwrap();
-            assert!(inserted);
-        }
-
-        let inserted = store
-            .upsert_note_if_below_quota(make_note("quota_ns", "observation", "x"), 3)
-            .await
-            .unwrap();
-        assert!(!inserted);
-    }
-
     /// query_notes and count_notes use the namespace parameter as passed.
     #[tokio::test]
     async fn test_query_and_count_use_caller_namespace() {
@@ -652,6 +592,7 @@ mod tests {
             .unwrap();
         assert_eq!(page_a.items.len(), 1);
         assert_eq!(page_a.items[0].content, "A");
+        assert_eq!(page_a.total, Some(1));
 
         let page_b = store
             .query_notes("ns_b", None, PageRequest::default())
@@ -659,10 +600,43 @@ mod tests {
             .unwrap();
         assert_eq!(page_b.items.len(), 1);
         assert_eq!(page_b.items[0].content, "B");
+        assert_eq!(page_b.total, Some(1));
 
         let count_a = store.count_notes("ns_a", None).await.unwrap();
         let count_b = store.count_notes("ns_b", None).await.unwrap();
         assert_eq!(count_a, 1);
         assert_eq!(count_b, 1);
+    }
+
+    #[tokio::test]
+    async fn test_soft_delete_sets_status_deleted() {
+        let pool = setup_pool();
+        let store = SqlNoteStore::new(Arc::clone(&pool), false);
+        let note = make_note("default", "observation", "to delete");
+        let id = note.id;
+        store.upsert_note(note).await.unwrap();
+        let deleted = store.delete_note(id, DeleteMode::Soft).await.unwrap();
+        assert!(deleted);
+        // Verify directly via raw SQL
+        let writer = pool.writer().unwrap();
+        let status: String = writer
+            .conn()
+            .query_row(
+                "SELECT status FROM notes WHERE id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "deleted");
+    }
+
+    #[tokio::test]
+    async fn test_note_status_field_roundtrip() {
+        let store = setup_memory_store();
+        let note = make_note("default", "observation", "status test");
+        let id = note.id;
+        store.upsert_note(note).await.unwrap();
+        let fetched = store.get_note(id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, "active");
     }
 }

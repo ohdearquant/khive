@@ -32,7 +32,10 @@ pub mod registry;
 pub mod retrieval;
 pub mod runtime;
 
-pub use curation::{EdgeListFilter, EntityPatch, MergeStrategy, MergeSummary};
+pub use curation::{
+    ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
+    MergeSummary, NotePatch,
+};
 pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::{PathNode, TraversalOptions};

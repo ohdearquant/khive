@@ -13,10 +13,11 @@ pub struct Note {
     pub id: Uuid,
     pub namespace: String,
     pub kind: String,
+    pub status: String,
     pub name: Option<String>,
     pub content: String,
-    pub salience: f64,
-    pub decay_factor: f64,
+    pub salience: Option<f64>,
+    pub decay_factor: Option<f64>,
     pub expires_at: Option<i64>,
     pub properties: Option<Value>,
     pub created_at: i64,
@@ -35,10 +36,11 @@ impl Note {
             id: Uuid::new_v4(),
             namespace: namespace.into(),
             kind: kind.into(),
+            status: "active".to_string(),
             name: None,
             content: content.into(),
-            salience: 0.5,
-            decay_factor: 0.0,
+            salience: None,
+            decay_factor: None,
             expires_at: None,
             properties: None,
             created_at: now,
@@ -53,12 +55,12 @@ impl Note {
     }
 
     pub fn with_salience(mut self, s: f64) -> Self {
-        self.salience = s.clamp(0.0, 1.0);
+        self.salience = Some(s.clamp(0.0, 1.0));
         self
     }
 
     pub fn with_decay(mut self, d: f64) -> Self {
-        self.decay_factor = d.max(0.0);
+        self.decay_factor = Some(d.max(0.0));
         self
     }
 
@@ -90,14 +92,5 @@ pub trait NoteStore: Send + Sync + 'static {
             }
         }
         Ok(out)
-    }
-
-    async fn upsert_note_if_below_quota(&self, note: Note, max_notes: u64) -> StorageResult<bool> {
-        let count = self.count_notes(&note.namespace, None).await?;
-        if count >= max_notes {
-            return Ok(false);
-        }
-        self.upsert_note(note).await?;
-        Ok(true)
     }
 }

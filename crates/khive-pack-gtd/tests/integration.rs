@@ -210,7 +210,7 @@ async fn complete_rejects_non_task_notes() {
     // the task-kind guard fires.
     let runtime = rt();
     let note = runtime
-        .create_note(None, "observation", None, "hello", 0.5, None, vec![])
+        .create_note(None, "observation", None, "hello", Some(0.5), None, vec![])
         .await
         .unwrap();
     let pack = pack(runtime);
@@ -363,7 +363,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
             "observation",
             None,
             "an observation",
-            0.5,
+            Some(0.5),
             None,
             vec![],
         )
@@ -386,7 +386,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
 
     // Atomicity: the rejected `assign` must not leave a task row behind.
     let notes = rt.notes(None).expect("note store");
-    let page = notes
+    let task_page = notes
         .query_notes(
             "local",
             Some("task"),
@@ -398,9 +398,10 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
         .await
         .expect("query task notes");
     assert!(
-        page.items.is_empty(),
+        task_page.items.is_empty(),
         "rejected assign must not persist a task; found {:?}",
-        page.items
+        task_page
+            .items
             .iter()
             .filter_map(|n| n.name.clone())
             .collect::<Vec<_>>()

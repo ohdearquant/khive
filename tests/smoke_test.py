@@ -221,14 +221,15 @@ def main():
         assert len(edges) == 1
         print(f"  [ok] list edges")
 
-        # 10. Edge update (auto-detects kind from UUID)
-        updated_edge = call_verb(proc, "update", {"id": edge_id, "weight": 0.95})
+        # 10. Edge update
+        updated_edge = call_verb(proc, "update", {"id": edge_id, "kind": "edge", "weight": 0.95})
         assert abs(updated_edge["weight"] - 0.95) < 0.01
         print(f"  [ok] update edge weight")
 
-        # 11. Entity update (auto-detects kind from UUID)
+        # 11. Entity update
         patched = call_verb(proc, "update", {
             "id": lora_id,
+            "kind": "entity",
             "description": "Low-Rank Adaptation of LLMs",
         })
         assert patched["description"] == "Low-Rank Adaptation of LLMs"
@@ -305,17 +306,17 @@ def main():
         print(f"  [ok] merge entity")
 
         # 19. Entity delete
-        del_result = call_verb(proc, "delete", {"id": qlora_id})
+        del_result = call_verb(proc, "delete", {"id": qlora_id, "kind": "entity"})
         assert del_result["deleted"] is True
         print(f"  [ok] delete entity")
 
         # 20. Edge delete
-        del_edge = call_verb(proc, "delete", {"id": edge_id})
+        del_edge = call_verb(proc, "delete", {"id": edge_id, "kind": "edge"})
         assert del_edge["deleted"] is True
         print(f"  [ok] delete edge")
 
         # 21. Note delete
-        del_note = call_verb(proc, "delete", {"id": note_id})
+        del_note = call_verb(proc, "delete", {"id": note_id, "kind": "note"})
         assert del_note["deleted"] is True
         print(f"  [ok] delete note")
 

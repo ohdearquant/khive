@@ -259,7 +259,8 @@ async fn create_note_no_kind_defaults_to_observation() {
 }
 
 #[tokio::test]
-async fn create_note_alias_obs_works() {
+async fn create_note_alias_obs_rejected() {
+    // Aliases removed per ADR-013 (F071) — only canonical note kind names accepted.
     let pack = pack();
     let result = pack
         .dispatch(
@@ -271,11 +272,16 @@ async fn create_note_alias_obs_works() {
             }),
         )
         .await;
-    assert!(result.is_ok(), "alias 'obs' must succeed: {:?}", result);
+    assert!(
+        result.is_err(),
+        "alias 'obs' must be rejected: {:?}",
+        result
+    );
 }
 
 #[tokio::test]
-async fn create_note_alias_finding_normalizes_to_insight() {
+async fn create_note_alias_finding_rejected() {
+    // Aliases removed per ADR-013 (F071) — only canonical note kind names accepted.
     let pack = pack();
     let result = pack
         .dispatch(
@@ -286,13 +292,11 @@ async fn create_note_alias_finding_normalizes_to_insight() {
                 "note_kind": "finding"
             }),
         )
-        .await
-        .expect("alias 'finding' must succeed");
-    let stored_kind = result.get("kind").and_then(Value::as_str);
-    assert_eq!(
-        stored_kind,
-        Some("insight"),
-        "alias 'finding' must normalize to 'insight'; got: {result}"
+        .await;
+    assert!(
+        result.is_err(),
+        "alias 'finding' must be rejected: {:?}",
+        result
     );
 }
 
@@ -1117,7 +1121,7 @@ async fn soft_delete_entity_not_found_on_get() {
         .to_string();
 
     let del = pack
-        .dispatch("delete", json!({"id": id}))
+        .dispatch("delete", json!({"id": id, "kind": "entity"}))
         .await
         .expect("delete must succeed");
     assert_eq!(
@@ -1139,7 +1143,7 @@ async fn delete_nonexistent_id_returns_not_found() {
     let err = pack
         .dispatch(
             "delete",
-            json!({"id": "00000000-0000-0000-0000-000000000002"}),
+            json!({"id": "00000000-0000-0000-0000-000000000002", "kind": "entity"}),
         )
         .await
         .unwrap_err();
@@ -1560,7 +1564,7 @@ async fn update_event_uuid_returns_immutable_error() {
     let err = pack
         .dispatch(
             "update",
-            json!({"id": event_id, "name": "should-not-apply"}),
+            json!({"id": event_id, "kind": "event", "name": "should-not-apply"}),
         )
         .await
         .unwrap_err();
@@ -1599,7 +1603,7 @@ async fn delete_event_uuid_returns_immutable_error_and_event_persists() {
         .to_string();
 
     let err = pack
-        .dispatch("delete", json!({"id": event_id}))
+        .dispatch("delete", json!({"id": event_id, "kind": "event"}))
         .await
         .unwrap_err();
     assert!(
