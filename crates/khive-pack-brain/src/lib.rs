@@ -225,11 +225,11 @@ impl BrainPack {
             self.runtime.ns(p.namespace.as_deref()).to_string(),
             "brain.emit",
             khive_types::EventKind::FeedbackExplicit,
-            khive_types::SubstrateKind::Event,
+            khive_types::SubstrateKind::Entity,
             "brain",
         )
         .with_target(target)
-        .with_payload(json!({"signal": signal}));
+        .with_payload(json!({"signal": signal, "about_id": target.to_string()}));
 
         let store = self.runtime.events(p.namespace.as_deref())?;
         store

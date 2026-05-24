@@ -13,6 +13,7 @@ use uuid::Uuid;
 use khive_db::SqliteError;
 use khive_storage::types::{EdgeFilter, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
+use khive_types::EventKind;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::KhiveRuntime;
@@ -148,6 +149,21 @@ impl KhiveRuntime {
             self.reindex_entity(namespace, &entity).await?;
         }
 
+        if let Ok(event_store) = self.events(namespace) {
+            let event = khive_storage::event::Event::new(
+                entity.namespace.clone(),
+                "update",
+                EventKind::EntityUpdated,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(entity.id)
+            .with_payload(serde_json::json!({"id": entity.id}));
+            if let Err(e) = event_store.append_event(event).await {
+                tracing::warn!(error = %e, "update_entity: event store write failed (non-fatal)");
+            }
+        }
+
         Ok(entity)
     }
 
@@ -207,6 +223,24 @@ impl KhiveRuntime {
         // FTS and vec-delete were already committed inside the transaction above.
         if self.config().embedding_model.is_some() {
             self.reindex_entity(namespace, &updated_entity).await?;
+        }
+
+        if let Ok(event_store) = self.events(namespace) {
+            let event = khive_storage::event::Event::new(
+                updated_entity.namespace.clone(),
+                "merge",
+                EventKind::EntityMerged,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(summary.kept_id)
+            .with_payload(serde_json::json!({
+                "kept_id": summary.kept_id,
+                "removed_id": summary.removed_id,
+            }));
+            if let Err(e) = event_store.append_event(event).await {
+                tracing::warn!(error = %e, "merge_entity: event store write failed (non-fatal)");
+            }
         }
 
         Ok(summary)

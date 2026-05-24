@@ -14,7 +14,7 @@ use khive_storage::types::{
     TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
-use khive_types::{EdgeEndpointRule, EndpointKind, SubstrateKind};
+use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::KhiveRuntime;
@@ -1345,6 +1345,23 @@ impl KhiveRuntime {
                 self.vectors(namespace)?.delete(id).await?;
             }
         }
+        if deleted {
+            if let Ok(event_store) = self.events(namespace) {
+                let ns_str = ns.to_string();
+                let event = khive_storage::event::Event::new(
+                    ns_str,
+                    "delete",
+                    EventKind::NoteDeleted,
+                    SubstrateKind::Note,
+                    "",
+                )
+                .with_target(id)
+                .with_payload(serde_json::json!({"id": id, "hard": hard}));
+                if let Err(e) = event_store.append_event(event).await {
+                    tracing::warn!(error = %e, "delete_note: event store write failed (non-fatal)");
+                }
+            }
+        }
         Ok(deleted)
     }
 }
@@ -1448,6 +1465,23 @@ impl KhiveRuntime {
         if !hard && deleted {
             self.remove_from_indexes(namespace, id).await?;
         }
+        if deleted {
+            if let Ok(event_store) = self.events(namespace) {
+                let ns = entity.namespace.clone();
+                let event = khive_storage::event::Event::new(
+                    ns,
+                    "delete",
+                    EventKind::EntityDeleted,
+                    SubstrateKind::Entity,
+                    "",
+                )
+                .with_target(id)
+                .with_payload(serde_json::json!({"id": id, "hard": hard}));
+                if let Err(e) = event_store.append_event(event).await {
+                    tracing::warn!(error = %e, "delete_entity: event store write failed (non-fatal)");
+                }
+            }
+        }
         Ok(deleted)
     }
 
@@ -1536,6 +1570,23 @@ impl KhiveRuntime {
         }
 
         graph.upsert_edge(edge.clone()).await?;
+
+        if let Ok(event_store) = self.events(namespace) {
+            let ns = self.ns(namespace).to_string();
+            let event = khive_storage::event::Event::new(
+                ns,
+                "update",
+                EventKind::EdgeUpdated,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(edge_id)
+            .with_payload(serde_json::json!({"id": edge_id}));
+            if let Err(e) = event_store.append_event(event).await {
+                tracing::warn!(error = %e, "update_edge: event store write failed (non-fatal)");
+            }
+        }
+
         Ok(edge)
     }
 
@@ -1588,7 +1639,25 @@ impl KhiveRuntime {
                 .await?;
         }
 
-        Ok(graph.delete_edge(LinkId::from(edge_id), mode).await?)
+        let deleted = graph.delete_edge(LinkId::from(edge_id), mode).await?;
+        if deleted {
+            if let Ok(event_store) = self.events(namespace) {
+                let ns = self.ns(namespace).to_string();
+                let event = khive_storage::event::Event::new(
+                    ns,
+                    "delete",
+                    EventKind::EdgeDeleted,
+                    SubstrateKind::Entity,
+                    "",
+                )
+                .with_target(edge_id)
+                .with_payload(serde_json::json!({"id": edge_id, "hard": hard}));
+                if let Err(e) = event_store.append_event(event).await {
+                    tracing::warn!(error = %e, "delete_edge: event store write failed (non-fatal)");
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// Count edges matching `filter`.
