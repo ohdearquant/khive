@@ -1,43 +1,124 @@
 #!/usr/bin/env node
 
+// khive — per-platform binary shim (ADR-026)
+//
+// Resolves the host platform to the matching @khive/kernel-{platform}
+// optional dependency and execs the kkernel binary from its bin/ directory.
+// Falls back to a local cargo build directory for monorepo development.
+
+"use strict";
+
 const { execFileSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
+// Map os.platform()+os.arch() → @khive/kernel-{platform} package name suffix.
+// Follows the naming established in ADR-026.
 const PLATFORM_MAP = {
-  "darwin-arm64": "khive-darwin-arm64",
-  "darwin-x64": "khive-darwin-x64",
-  "linux-arm64": "khive-linux-arm64",
-  "linux-x64": "khive-linux-x64",
-  "win32-x64": "khive-win32-x64.exe",
+  "darwin-arm64": "darwin-arm64",
+  "darwin-x64": "darwin-x64",
+  "linux-arm64": "linux-arm64",
+  "linux-x64": detectLinuxVariant(), // glibc or musl
+  "win32-x64": "win32-x64",
 };
 
+// Detect whether the Linux runtime links against glibc or musl.
+// Returns "linux-x64-gnu" (glibc) or "linux-x64-musl" (Alpine / musl).
+// Falls back to "linux-x64-gnu" if detection fails.
+function detectLinuxVariant() {
+  try {
+    const ldd = require("child_process")
+      .execFileSync("ldd", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+      .toLowerCase();
+    if (ldd.includes("musl")) return "linux-x64-musl";
+  } catch (_) {
+    // ldd not available or returned non-zero — try /lib/ld-musl-* existence
+    try {
+      const libs = fs.readdirSync("/lib");
+      if (libs.some((f) => f.startsWith("ld-musl-"))) return "linux-x64-musl";
+    } catch (_) {}
+  }
+  return "linux-x64-gnu";
+}
+
+const SUPPORTED_PLATFORMS = Object.keys(PLATFORM_MAP);
+
+function getPlatformKey() {
+  return `${os.platform()}-${os.arch()}`;
+}
+
+// Walk upward from `dir` looking for a `node_modules` directory.
+// Returns the directory that contains node_modules, or null.
+function findNodeModulesRoot(dir) {
+  let current = dir;
+  for (let i = 0; i < 16; i++) {
+    const candidate = path.join(current, "node_modules");
+    if (fs.existsSync(candidate)) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return null;
+}
+
 function getBinaryPath() {
-  const key = `${os.platform()}-${os.arch()}`;
-  const binaryName = PLATFORM_MAP[key];
-  if (!binaryName) {
-    console.error(`Unsupported platform: ${key}`);
-    console.error(`Supported: ${Object.keys(PLATFORM_MAP).join(", ")}`);
+  const platformKey = getPlatformKey();
+  const platformSuffix = PLATFORM_MAP[platformKey];
+  if (!platformSuffix) {
+    console.error(`khive: unsupported platform: ${platformKey}`);
+    console.error(`Supported: ${SUPPORTED_PLATFORMS.join(", ")}`);
+    console.error(
+      "File an issue at https://github.com/ohdearquant/khive/issues if you need this target.",
+    );
     process.exit(1);
   }
 
-  // Check for binary in the package's bin directory
-  const localPath = path.join(__dirname, binaryName);
-  if (fs.existsSync(localPath)) return localPath;
+  const isWindows = os.platform() === "win32";
+  const exe = isWindows ? "kkernel.exe" : "kkernel";
+  const pkgName = `@khive/kernel-${platformSuffix}`;
 
-  // Check if installed globally or via npx
-  const globalPath = path.join(__dirname, "..", "bin", binaryName);
-  if (fs.existsSync(globalPath)) return globalPath;
+  // 1. KKERNEL_BINARY env var override (development / CI)
+  const override = process.env.KKERNEL_BINARY;
+  if (override && fs.existsSync(override)) return override;
 
-  console.error(`Binary not found: ${binaryName}`);
-  console.error("Run 'npm install khive' to download platform binaries.");
+  // 2. npm optional dependency: @khive/kernel-{platform}/bin/kkernel
+  const nmRoot = findNodeModulesRoot(path.join(__dirname, ".."));
+  if (nmRoot) {
+    const candidate = path.join(nmRoot, "node_modules", pkgName, "bin", exe);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  // 3. Dev fallback: look for a cargo build in typical monorepo locations
+  const devCandidates = [];
+  // Walk up from this shim to find a "crates" directory
+  let search = path.join(__dirname, "..");
+  for (let i = 0; i < 8; i++) {
+    const cratesDir = path.join(search, "crates");
+    if (fs.existsSync(cratesDir)) {
+      devCandidates.push(path.join(cratesDir, "target", "release", exe));
+      devCandidates.push(path.join(cratesDir, "target", "debug", exe));
+      break;
+    }
+    const parent = path.dirname(search);
+    if (parent === search) break;
+    search = parent;
+  }
+  for (const c of devCandidates) {
+    if (fs.existsSync(c)) return c;
+  }
+
+  console.error(`khive: ${pkgName} not installed or kkernel binary not found.`);
+  console.error(`Expected: ${pkgName}/bin/${exe}`);
+  console.error(
+    "Run 'npm install -g khive' to install platform binaries, or set KKERNEL_BINARY to point to a local build.",
+  );
   process.exit(1);
 }
 
 try {
   const binary = getBinaryPath();
-  const result = execFileSync(binary, process.argv.slice(2), {
+  execFileSync(binary, process.argv.slice(2), {
     stdio: "inherit",
     env: process.env,
   });

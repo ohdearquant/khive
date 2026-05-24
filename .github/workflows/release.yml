@@ -1,5 +1,10 @@
 name: Release
 
+# Triggered by a version tag push (e.g. v0.2.0).
+# Builds Rust binaries per-platform, publishes each @khive/kernel-{platform}
+# npm subpackage, then publishes the umbrella khive package.
+# Per ADR-026: all subpackage jobs must succeed before the umbrella publishes.
+
 on:
   push:
     tags:
@@ -8,63 +13,145 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  compile:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Build Rust binaries per platform and publish each subpackage.
+  # darwin-arm64 and darwin-x64 run on macOS runners.
+  # linux-x64-gnu runs natively on ubuntu.
+  # linux-x64-musl and linux-arm64 cross-compile via cargo-zigbuild.
+  # win32-x64 runs on Windows.
+  # ─────────────────────────────────────────────────────────────────────────
+  build-platform:
     strategy:
+      fail-fast: true
       matrix:
         include:
-          - os: macos-latest
+          - platform: darwin-arm64
+            os: macos-latest
             target: aarch64-apple-darwin
-            binary: khive-darwin-arm64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            binary: khive-darwin-x64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: khive-linux-x64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            binary: khive-linux-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: khive-win32-x64.exe
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-      - name: Compile
-        run: |
-          deno compile \
-            --allow-read --allow-write --allow-run --allow-env \
-            --target ${{ matrix.target }} \
-            --output npm/bin/${{ matrix.binary }} \
-            cli/main.ts
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.binary }}
-          path: npm/bin/${{ matrix.binary }}
+            cross: false
 
-  publish:
-    needs: compile
-    runs-on: ubuntu-latest
+          - platform: darwin-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+
+          - platform: linux-x64-gnu
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+
+          - platform: linux-x64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+
+          - platform: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+
+          - platform: win32-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
         with:
-          path: npm/bin
-          merge-multiple: true
-      - name: Set version from tag
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild (cross-compile targets only)
+        if: ${{ matrix.cross }}
+        run: pip3 install ziglang && cargo install cargo-zigbuild
+
+      - name: Build binaries (native)
+        if: ${{ !matrix.cross }}
+        working-directory: crates
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p kkernel -p khive-mcp
+
+      - name: Build binaries (zigbuild cross)
+        if: ${{ matrix.cross }}
+        working-directory: crates
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} -p kkernel -p khive-mcp
+
+      - name: Stage binaries into subpackage bin/
+        shell: bash
+        run: |
+          PKG_DIR="npm/kernel-${{ matrix.platform }}/bin"
+          SRC="crates/target/${{ matrix.target }}/release"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp "${SRC}/kkernel.exe"    "${PKG_DIR}/kkernel.exe"
+            cp "${SRC}/khive-mcp.exe" "${PKG_DIR}/khive-mcp.exe"
+          else
+            cp "${SRC}/kkernel"    "${PKG_DIR}/kkernel"
+            cp "${SRC}/khive-mcp" "${PKG_DIR}/khive-mcp"
+            chmod +x "${PKG_DIR}/kkernel" "${PKG_DIR}/khive-mcp"
+          fi
+
+      - name: Set subpackage version from tag
+        shell: bash
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
-          jq --arg v "$VERSION" '.version = $v' npm/package.json > tmp.json
-          mv tmp.json npm/package.json
+          PKG_JSON="npm/kernel-${{ matrix.platform }}/package.json"
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('${PKG_JSON}'));
+            pkg.version = '${VERSION}';
+            fs.writeFileSync('${PKG_JSON}', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
-      - name: Publish
+
+      - name: Publish @khive/kernel-${{ matrix.platform }}
+        working-directory: npm/kernel-${{ matrix.platform }}
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Publish the umbrella khive package after ALL subpackages succeed.
+  # Updates optionalDependencies to pin the exact released version.
+  # ─────────────────────────────────────────────────────────────────────────
+  publish-umbrella:
+    needs: build-platform
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set umbrella version and pin subpackage versions from tag
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('npm/package.json'));
+            pkg.version = '${VERSION}';
+            // Pin each optional dep to the exact same version
+            for (const k of Object.keys(pkg.optionalDependencies || {})) {
+              pkg.optionalDependencies[k] = '${VERSION}';
+            }
+            fs.writeFileSync('npm/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish khive (umbrella)
         working-directory: npm
         run: npm publish --access public
         env:

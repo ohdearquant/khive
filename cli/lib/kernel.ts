@@ -1,10 +1,10 @@
 /**
- * Resolve the path to the `kkernel` Rust binary (ADR-076, ADR-077).
+ * Resolve the path to the `kkernel` Rust binary (ADR-026).
  *
  * Strategy (in order):
  *   1. `KKERNEL_BINARY` env var — explicit override, used in dev and tests.
  *   2. `@khive/kernel-<platform>/bin/kkernel` under node_modules — production
- *      install via npm optional dependencies (ADR-077).
+ *      install via npm optional dependencies (ADR-026).
  *   3. `<repo>/crates/target/release/kkernel` — monorepo dev convenience.
  *   4. `<repo>/crates/target/debug/kkernel` — last-resort dev fallback.
  *
@@ -13,14 +13,37 @@
 
 import { dirname, fromFileUrl, join } from "@std/path";
 
+/**
+ * Detect whether the Linux runtime links against musl (Alpine etc.) or glibc.
+ * Reads /proc/self/maps looking for "musl" or checks /lib/ld-musl-*.
+ * Returns "linux-x64-musl" or "linux-x64-gnu".
+ */
+function linuxVariant(arch: "x86_64" | "aarch64"): string {
+  // arm64 only has a glibc subpackage in v1; musl arm64 is not yet released.
+  if (arch === "aarch64") return "linux-arm64";
+  try {
+    const maps = Deno.readTextFileSync("/proc/self/maps");
+    if (maps.toLowerCase().includes("musl")) return "linux-x64-musl";
+  } catch {
+    // /proc not available (e.g. macOS test env) — fall through
+  }
+  try {
+    for (const entry of Deno.readDirSync("/lib")) {
+      if (entry.name.startsWith("ld-musl-")) return "linux-x64-musl";
+    }
+  } catch {
+    // /lib not readable — fall through
+  }
+  return "linux-x64-gnu";
+}
+
 function platformKey(): string {
   const os = Deno.build.os;
   const arch = Deno.build.arch;
+  if (os === "linux") return linuxVariant(arch as "x86_64" | "aarch64");
   const map: Record<string, string> = {
     "darwin-aarch64": "darwin-arm64",
     "darwin-x86_64": "darwin-x64",
-    "linux-x86_64": "linux-x64-gnu",
-    "linux-aarch64": "linux-arm64",
     "windows-x86_64": "win32-x64",
   };
   const key = `${os}-${arch}`;
@@ -103,7 +126,7 @@ export function kkernelPath(repoRoot?: string): string {
       `  @khive/kernel-${platformKey()}/bin/${exe} (npm install)\n` +
       `  ${candidates.join("\n  ")}\n` +
       `If you're developing locally, run: (cd crates && cargo build --release -p kkernel)\n` +
-      `Supported platforms: darwin-arm64, darwin-x64, linux-x64-gnu, linux-arm64, win32-x64.`,
+      `Supported platforms: darwin-arm64, darwin-x64, linux-x64-gnu, linux-x64-musl, linux-arm64, win32-x64.`,
   );
 }
 
