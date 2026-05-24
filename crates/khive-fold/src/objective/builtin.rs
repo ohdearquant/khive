@@ -1,6 +1,6 @@
 //! Built-in objective functions
 
-use crate::{Objective, ObjectiveContext, ObjectiveError, ObjectiveResult, Selection};
+use crate::{Objective, ObjectiveContext, Selection};
 
 /// Selects candidate with highest score.
 pub struct MaxScoreObjective<T, F>
@@ -122,13 +122,9 @@ where
         }
     }
 
-    fn select<'a>(
-        &self,
-        candidates: &'a [T],
-        context: &ObjectiveContext,
-    ) -> ObjectiveResult<Selection<&'a T>> {
+    fn select<'a>(&self, candidates: &'a [T], context: &ObjectiveContext) -> Vec<Selection<&'a T>> {
         if candidates.is_empty() {
-            return Err(ObjectiveError::NoCandidates);
+            return Vec::new();
         }
 
         let limit = context
@@ -138,15 +134,13 @@ where
 
         for (i, candidate) in candidates.iter().take(limit).enumerate() {
             if (self.predicate)(candidate) {
-                return Ok(Selection::new(candidate, 1.0, i)
+                return vec![Selection::new(candidate, 1.0, i)
                     .with_considered(i + 1)
-                    .with_passed(1));
+                    .with_passed(1)];
             }
         }
 
-        Err(ObjectiveError::NoMatch(
-            "No candidate matched predicate".into(),
-        ))
+        Vec::new()
     }
 
     fn name(&self) -> &str {
@@ -324,6 +318,8 @@ mod tests {
         let candidates = vec![1, 5, 3, 8, 2];
         let selection = objective
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
 
         assert_eq!(*selection.item, 8);
@@ -351,6 +347,8 @@ mod tests {
         let candidates = vec![1, 3, 7, 9, 2];
         let selection = objective
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
 
         assert_eq!(*selection.item, 7);
@@ -366,7 +364,7 @@ mod tests {
         let context = ObjectiveContext::new().with_max_candidates(2);
         let result = objective.select(&candidates, &context);
 
-        assert!(matches!(result, Err(ObjectiveError::NoMatch(_))));
+        assert!(result.is_empty());
     }
 
     #[derive(Clone)]
@@ -487,7 +485,7 @@ mod tests {
         let candidates = vec![1, 5, 3];
         let result = objective.select(&candidates, &ObjectiveContext::new());
 
-        assert!(matches!(result, Err(ObjectiveError::NoMatch(_))));
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -497,6 +495,8 @@ mod tests {
         let candidates = vec![1, 10, 3, 15];
         let selection = objective
             .select(&candidates, &ObjectiveContext::new())
+            .into_iter()
+            .next()
             .unwrap();
 
         assert_eq!(*selection.item, 15);
