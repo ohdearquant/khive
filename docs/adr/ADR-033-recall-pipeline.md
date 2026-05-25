@@ -277,6 +277,43 @@ document its Hoare triple:
 | **Program**       | Stage 1 (`memory.recall_embed`): query → embedding via multi-engine fan-out. Stage 2 (`memory.recall_candidates`): broad recall from FTS5 + vector, `candidate_multiplier × limit` candidates per path. Stage 3 (`memory.recall_fuse`): apply `fusion_strategy` (default RRF) to produce fused hits. Stage 4 (`memory.recall_rerank`, ADR-042 §7): run all rerankers whose weight in `reranker_weights` is > 0; each writes its score to `candidate.rerank_scores[name]`. Stage 5 (`memory.recall_score`): apply `ComposePipeline` with `WeightedObjective` over the three base Objectives plus one `RerankerObjective` per active reranker. Stage 6 (select): truncate to `limit`; apply `budget` via `GreedySelector` if set. |
 | **Postcondition** | Output is a deterministic list of memory notes ordered by composite score, within `limit`. All returned notes are alive (not soft-deleted) and `kind = memory`. Score breakdown is available on request via `memory.recall_score`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
+### 6.1 Per-request knobs (ADR-033 §6 addendum)
+
+The `recall` verb accepts three optional per-request knobs that override the pack-level
+`RecallConfig` for a single call. All knobs are optional; absent or `null` preserves the
+current default behavior.
+
+| Parameter         | Type             | Default          | Semantics                                                                                                                               |
+| ----------------- | ---------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `top_k`           | `usize` \| null  | `limit` or `10`  | Maximum number of results to return. Overrides `limit` when set. Capped at `100`.                                                       |
+| `fusion_strategy` | `string` \| null | `"rrf"` (k=60)   | Fusion algorithm for candidate merging. Must be one of `"rrf"`, `"weighted"`, `"union"`. Returns an error for any other value.          |
+| `score_floor`     | `f32` \| null    | `0.0` (no floor) | Minimum composite score threshold applied after `compute_score`. Results below this floor are excluded. `0.0` or `null` = no filtering. |
+
+**`fusion_strategy` details:**
+
+- `"rrf"` — Reciprocal Rank Fusion with k=60 (default). Robust across query types.
+- `"weighted"` — Weighted linear combination. Text/vector weights come from the pack-level
+  config (`RecallConfig.fuse_strategy`), not the request. The request cannot override weights.
+- `"union"` — Max-score per candidate ID. Inclusive but may surface low-quality text-only hits.
+
+**Example request DSL:**
+
+```json
+{
+  "query": "attention mechanism in transformers",
+  "top_k": 5,
+  "fusion_strategy": "union",
+  "score_floor": 0.3
+}
+```
+
+This returns at most 5 results, fused via union strategy, with composite score ≥ 0.3.
+
+**Interaction with `RecallConfig`:** Per-request knobs have higher precedence than `config`
+and pack-level tuning. Resolution order: `top_k`/`fusion_strategy`/`score_floor` (request)
+
+> `config` object (per-call) > pack active config (tunable) > `RecallConfig::default()`.
+
 ### 7. Calibration protocol
 
 To calibrate recall parameters for a deployment:
