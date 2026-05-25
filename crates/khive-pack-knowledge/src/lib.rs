@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
+use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
 pub struct KnowledgePack {
     pub(crate) runtime: KhiveRuntime,
@@ -39,6 +39,32 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 3] = [
         description: "Register a concept entity with optional domain and tags",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "name",
+                param_type: "string",
+                required: true,
+                description: "Concept name",
+            },
+            ParamDef {
+                name: "description",
+                param_type: "string",
+                required: false,
+                description: "Optional concept description",
+            },
+            ParamDef {
+                name: "domain",
+                param_type: "string",
+                required: false,
+                description: "Optional domain tag (folded into properties.domain)",
+            },
+            ParamDef {
+                name: "tags",
+                param_type: "array<string>",
+                required: false,
+                description: "Optional tag list",
+            },
+        ],
     },
     // Commissive: commits an introduced_by edge between concept and source
     HandlerDef {
@@ -46,6 +72,26 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 3] = [
         description: "Link a concept to the paper or source that introduced it",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "concept_id",
+                param_type: "uuid",
+                required: true,
+                description: "Concept entity ID",
+            },
+            ParamDef {
+                name: "source_id",
+                param_type: "uuid",
+                required: true,
+                description: "Source document entity ID (must be kind=document)",
+            },
+            ParamDef {
+                name: "weight",
+                param_type: "float",
+                required: false,
+                description: "Edge weight; defaults to 1.0",
+            },
+        ],
     },
     // Assertive: retrieves concepts filtered by domain or free-text query
     HandlerDef {
@@ -53,6 +99,26 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 3] = [
         description: "List concepts filtered by domain or free-text query",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "domain",
+                param_type: "string",
+                required: false,
+                description: "Filter to concepts with this domain tag",
+            },
+            ParamDef {
+                name: "query",
+                param_type: "string",
+                required: false,
+                description: "Free-text search across concept name + description",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Max results; defaults to 50",
+            },
+        ],
     },
 ];
 
