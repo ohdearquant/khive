@@ -59,6 +59,89 @@ async fn send_and_inbox_roundtrip() {
 }
 
 #[tokio::test]
+async fn read_marks_message_as_read() {
+    let (registry, _rt) = build_registry();
+
+    // Send a message and capture the full_id.
+    let sent = registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": "agent:alice", "content": "mark me read" }),
+        )
+        .await
+        .expect("send succeeds");
+    let full_id = sent
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("send returns full_id");
+
+    // Call read with the full UUID — must succeed and return read: true.
+    let result = registry
+        .dispatch("read", serde_json::json!({ "id": full_id }))
+        .await
+        .expect("read succeeds");
+    assert_eq!(
+        result.get("read").and_then(|v| v.as_bool()),
+        Some(true),
+        "read returns read:true — got {result}"
+    );
+    assert_eq!(
+        result.get("full_id").and_then(|v| v.as_str()),
+        Some(full_id),
+        "read returns the same message id"
+    );
+}
+
+#[tokio::test]
+async fn reply_creates_threaded_message() {
+    let (registry, _rt) = build_registry();
+
+    // Send the original message.
+    let original = registry
+        .dispatch(
+            "send",
+            serde_json::json!({
+                "to": "agent:carol",
+                "content": "original message",
+                "subject": "Hello"
+            }),
+        )
+        .await
+        .expect("send original succeeds");
+    let original_full_id = original
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("send returns full_id");
+
+    // Reply to the original message.
+    let reply = registry
+        .dispatch(
+            "reply",
+            serde_json::json!({
+                "id": original_full_id,
+                "content": "this is a reply"
+            }),
+        )
+        .await
+        .expect("reply succeeds");
+
+    // reply must return an id (the new message).
+    assert!(reply.get("id").is_some(), "reply returns id: {reply}");
+    // thread_id must be set to the original message's UUID.
+    assert_eq!(
+        reply.get("thread_id").and_then(|v| v.as_str()),
+        Some(original_full_id),
+        "reply thread_id matches original full_id: {reply}"
+    );
+    // subject should be prefixed with "Re: ".
+    assert_eq!(
+        reply.get("subject").and_then(|v| v.as_str()),
+        Some("Re: Hello"),
+        "reply subject is prefixed with Re: — got {reply}"
+    );
+}
+
+#[tokio::test]
 async fn unknown_verb_returns_error() {
     let (registry, _rt) = build_registry();
     let err = registry
