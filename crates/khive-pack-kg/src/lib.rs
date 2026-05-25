@@ -126,18 +126,21 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         name: "propose",
         description: "Create an event-sourced change proposal",
         visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     // Declaration: approves/rejects/comments on a proposal (ADR-046)
     HandlerDef {
         name: "review",
         description: "Approve, reject, comment, or request changes on a proposal",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // Commissive: rescinds an open proposal (ADR-046)
     HandlerDef {
         name: "withdraw",
         description: "Withdraw an open proposal (proposer-only)",
         visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
 ];
 

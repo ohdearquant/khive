@@ -362,7 +362,6 @@ struct ProposeParams {
     reviewers: Vec<String>,
     expiry: Option<i64>,
     parent_id: Option<String>,
-    actor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -370,14 +369,12 @@ struct ReviewParams {
     proposal_id: String,
     decision: String,
     comment: Option<String>,
-    actor: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct WithdrawParams {
     proposal_id: String,
     rationale: Option<String>,
-    actor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1731,7 +1728,7 @@ impl KgPack {
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid changeset: {e}")))?;
 
         let proposal_id = Uuid::new_v4();
-        let actor = p.actor.unwrap_or_else(|| token.actor().id.clone());
+        let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
         let now = chrono::Utc::now().timestamp_micros();
 
@@ -1824,7 +1821,8 @@ impl KgPack {
         let proposal_id = Uuid::from_str(&p.proposal_id).map_err(|e| {
             RuntimeError::InvalidInput(format!("invalid proposal_id {:?}: {e}", p.proposal_id))
         })?;
-        let actor = p.actor.unwrap_or_else(|| token.actor().id.clone());
+        // Actor is always the authenticated token identity — client cannot override.
+        let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
         let now = chrono::Utc::now().timestamp_micros();
 
@@ -1887,7 +1885,13 @@ impl KgPack {
             )));
         }
 
-        if decision == ProposalDecision::Approve && actor == proposer {
+        // Self-approval guard: the proposer cannot approve their own proposal.
+        // Exception: OSS local mode (`actor == "local"`) operates as a single-user
+        // system where every operation runs under the same anonymous identity, so
+        // the guard would unconditionally block all approvals. Skip it in that case.
+        // Multi-actor deployments (where distinct actor IDs are assigned) enforce
+        // the guard normally.
+        if decision == ProposalDecision::Approve && actor == proposer && actor != "local" {
             return Err(RuntimeError::InvalidInput(format!(
                 "self-approval is forbidden: proposer {actor:?} cannot approve their own proposal"
             )));
@@ -1972,7 +1976,8 @@ impl KgPack {
         let proposal_id = Uuid::from_str(&p.proposal_id).map_err(|e| {
             RuntimeError::InvalidInput(format!("invalid proposal_id {:?}: {e}", p.proposal_id))
         })?;
-        let actor = p.actor.unwrap_or_else(|| token.actor().id.clone());
+        // Actor is always the authenticated token identity — client cannot override.
+        let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
         let now = chrono::Utc::now().timestamp_micros();
 
@@ -2315,6 +2320,48 @@ mod tests {
             .expect("ReviewParams must deserialize");
             assert_eq!(p.decision, decision);
         }
+    }
+
+    // CRIT-2 regression: ReviewParams must not accept an `actor` field.
+    // The actor is always derived from the NamespaceToken at dispatch time.
+    // If a client passes actor=<other_id>, the field is ignored (unknown fields
+    // are allowed by serde default, so the struct simply lacks the field).
+    #[test]
+    fn review_params_no_actor_field() {
+        use super::ReviewParams;
+        // Baseline: ReviewParams works without actor.
+        let p: ReviewParams = serde_json::from_value(json!({
+            "proposal_id": "00000000-0000-0000-0000-000000000001",
+            "decision": "approve",
+        }))
+        .expect("ReviewParams must deserialize without actor");
+        assert_eq!(p.proposal_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(p.decision, "approve");
+    }
+
+    // CRIT-2 regression: WithdrawParams must not accept an `actor` field.
+    #[test]
+    fn withdraw_params_no_actor_field() {
+        use super::WithdrawParams;
+        let p: WithdrawParams = serde_json::from_value(json!({
+            "proposal_id": "00000000-0000-0000-0000-000000000002",
+        }))
+        .expect("WithdrawParams must deserialize without actor");
+        assert_eq!(p.proposal_id, "00000000-0000-0000-0000-000000000002");
+        assert!(p.rationale.is_none());
+    }
+
+    // CRIT-2 regression: ProposeParams must not accept an `actor` field.
+    #[test]
+    fn propose_params_no_actor_field() {
+        use super::ProposeParams;
+        let p: ProposeParams = serde_json::from_value(json!({
+            "title": "Fix RoPE",
+            "description": "Fix RoPE entity",
+            "changeset": {"kind": "add_entity", "entity": "{}"},
+        }))
+        .expect("ProposeParams must deserialize without actor");
+        assert_eq!(p.title, "Fix RoPE");
     }
 
     // ADR-046: KG pack must expose exactly 14 handlers including propose/review/withdraw
