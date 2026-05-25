@@ -1,0 +1,6 @@
+Usage: khive auth <subcommand>
+
+Subcommands:
+  login         Sign in via GitHub OAuth
+  status        Show authentication state
+  logout        Remove stored credentials

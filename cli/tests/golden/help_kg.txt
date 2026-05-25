@@ -1,0 +1,22 @@
+Usage: khive kg <subcommand>
+
+Subcommands (Phase C1 — file-level operations):
+  init          Initialise .khive/kg/ in the current git repo
+  validate      Validate NDJSON files + rules.yaml (ADR-056; flags: --strict, --no-rules, --format, --quiet)
+  commit        Validate + stage + git commit .khive/kg/ files
+  sync          Validate NDJSON (DB rebuild: Phase C2)
+  status        Show entity/edge counts and uncommitted changes
+  config        Show or modify .khive/config.toml
+  embed         Plan embedding for entities awaiting vectors (run: Phase C2)
+  export        Re-write canonical .khive/kg/*.ndjson; --format archive emits a JSON bundle
+  import        Import a KgArchive JSON file (flags: --overwrite, --on-conflict <skip|replace|merge>)
+  resolve       Resolve NDJSON merge conflicts after 'git merge'
+  hook          Manage pre-commit validation hook (install|uninstall|status)
+  migrate       Apply schema migrations (ADR-054)
+  diff          Entity-aware diff between two NDJSON states (flags: --json, --name-only)
+  log           Show KG change history (flags: -n <limit>, --json, --stat)
+  stats         Show entity/edge counts, kind breakdown, schema coverage (flags: --json)
+  doctor        Validate KG integrity: syntax, refs, duplicates, orphans (flags: --json)
+
+Planned (Phase C2+):
+  update        Advance a remote pin

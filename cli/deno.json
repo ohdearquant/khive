@@ -6,6 +6,8 @@
   "tasks": {
     "dev": "deno run --allow-all main.ts",
     "test": "deno test --allow-all .",
+    "test:behavior": "deno test --allow-all tests/behavior/",
+    "test:contract": "deno test --allow-all tests/contract/",
     "check": "deno check main.ts",
     "fmt": "deno fmt .",
     "lint": "deno lint .",
