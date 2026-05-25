@@ -277,15 +277,20 @@ pub struct EngineConfig {
 }
 ```
 
-**Override semantics**: user-level `~/.khive/khive.toml` sets the default engine list.
-Project-level `.khive/khive.toml` replaces it entirely if it declares `[[engines]]`. There is
-no per-entry merge. Replacing, not merging, enforces project-consistency — collaborators
-sharing a project must run the same engines, so vectors are produced by the same models.
+**Default search path**: `.khive/config.toml` relative to the MCP server's working directory
+(project-local). This collocates config with the per-project `khive-test.db` that already
+lives under `.khive/`. `~/.khive/config.toml` is reserved for personal/global settings and
+is NOT searched automatically — use `--config` or `KHIVE_CONFIG` to point at it explicitly.
+
+**Override semantics**: project-local `.khive/config.toml` sets the engine list.
+There is no per-entry merge with any global config. Replacing, not merging, enforces
+project-consistency — collaborators sharing a project must run the same engines, so
+vectors are produced by the same models.
 
 Machine-local fields (`device`) are user-level only. The project commits to `name` / `dim` /
 `weight` / calibration; the execution environment is operator-local.
 
-**Single-engine fallback**: if neither user nor project declares `[[engines]]`, kkernel falls
+**Single-engine fallback**: if no project config declares `[[engines]]`, kkernel falls
 back to one built-in engine (`bge-small-en-v1.5`, 384-dim, weight 1.0, calibrated defaults).
 This preserves backward compatibility for deployments predating this ADR.
 
@@ -773,6 +778,89 @@ existing single-engine deployments see no behavior change.
 - khive-internal `apps/cli/src/server/unified.rs:414-664` — `resolve_embed_models`,
   historical multi-engine wiring; D2 pattern source
 - khive-internal summary `summary_20260326_165542_recall_overhaul_multi_index_architecture.md`
+
+---
+
+## Addendum — `[[engines]]` TOML config surface (v024/engines-toml-config, 2026-05-25)
+
+### Motivation
+
+The open-core port had no config-file path for engine registration. Operators had to set env
+vars:
+
+```
+KHIVE_EMBEDDING_MODEL=all-minilm-l6-v2
+KHIVE_ADDITIONAL_EMBEDDING_MODELS=paraphrase,bge-small-en-v1.5
+```
+
+This two-tier hack is a regression from D3's specified `[[engines]]` array. The Addendum
+implements D3's TOML schema for the MCP binary boot path.
+
+### Decision
+
+**New module**: `crates/khive-runtime/src/engine_config.rs`
+
+- `KhiveConfig` — top-level config struct; `[[engines]]` array; future sections addable.
+- `EngineConfig` — per-engine: `name`, `model`, `default`, `fusion_weight`, `dims`.
+- `KhiveConfig::load(path: Option<&Path>) -> Result<Option<Self>, ConfigError>` — loads and
+  validates the config file. Returns `Ok(None)` when no file is found.
+- `config_from_env() -> KhiveConfig` — builds an in-memory `KhiveConfig` from the legacy
+  env-var path; emits `tracing::info!` to direct operators to the config file.
+
+**New function**: `runtime_config_from_khive_config(cfg: &KhiveConfig, base: RuntimeConfig)`
+
+Converts `KhiveConfig` to `RuntimeConfig`: the `default = true` engine becomes
+`RuntimeConfig::embedding_model`; others go to `additional_embedding_models`. Unknown model
+names are skipped with a warning.
+
+**CLI flag** (`crates/khive-mcp/src/main.rs`):
+
+```
+--config <PATH>    (env: KHIVE_CONFIG)
+```
+
+Default search path: `.khive/config.toml` relative to the server's working directory
+(project-local). `~/.khive/config.toml` is reserved for personal/global defaults and is NOT
+searched automatically; the project-local default keeps config co-located with the KG database
+that already lives under `.khive/`.
+
+**Validation** (in `KhiveConfig::validate`):
+
+- Exactly one engine with `default = true` (error: `ConfigError::DefaultCount`).
+- Unique engine names (error: `ConfigError::DuplicateName`).
+- `fusion_weight` > 0 when present (error: `ConfigError::InvalidFusionWeight`).
+
+**Backward compatibility**: when no config file is present, the env-var path is used
+automatically. `RuntimeConfig::default()` continues to read `KHIVE_EMBEDDING_MODEL` and
+`KHIVE_ADDITIONAL_EMBEDDING_MODELS`. If both file and env vars are present, the file wins and
+a `tracing::warn!` is emitted.
+
+**The env-var path is now "fallback for testing/dev"**: in production, the `[[engines]]` TOML
+config is the authoritative surface. The env-var path has no roadmap for removal — it handles
+containerised/CI deployments where file-based config is inconvenient — but it is no longer
+the primary interface.
+
+**`fusion_weight` integration note**: when engines declare `fusion_weight`, the values are
+available on each `EngineConfig` for pack handlers to inject into `FusionStrategy::Weighted`.
+For pure rank-based unweighted RRF the weights are ignored (as stated in D5). Pack handlers
+are responsible for reading `EngineConfig.fusion_weight` and building the appropriate fusion
+strategy; no automatic wiring exists yet.
+
+**Example config**: `docs/khive-config-example.toml` ships as a reference.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `crates/khive-runtime/src/engine_config.rs` | New — `EngineConfig`, `KhiveConfig`, `ConfigError`, `config_from_env`, 9 unit tests |
+| `crates/khive-runtime/src/runtime.rs` | Added `runtime_config_from_khive_config` |
+| `crates/khive-runtime/src/lib.rs` | `pub mod engine_config`; re-exports |
+| `crates/khive-runtime/Cargo.toml` | Added `toml = { workspace = true }` |
+| `crates/Cargo.toml` | Added `toml = "0.8"` to workspace deps |
+| `crates/khive-mcp/src/main.rs` | `--config` / `KHIVE_CONFIG` flag; `resolve_embedding_config` |
+| `crates/khive-mcp/Cargo.toml` | `tempfile` in dev-deps |
+| `crates/khive-mcp/tests/integration.rs` | `engine_config_three_engines_all_registered` test |
+| `docs/khive-config-example.toml` | New — annotated example config |
 
 ---
 

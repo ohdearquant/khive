@@ -21,6 +21,7 @@
 
 pub mod curation;
 pub mod embedder_registry;
+pub mod engine_config;
 pub mod error;
 pub mod fusion;
 pub mod graph_traversal;
@@ -39,6 +40,7 @@ pub use curation::{
     MergeSummary, NotePatch,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
+pub use engine_config::{config_from_env, ConfigError, EngineConfig, KhiveConfig};
 pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::{PathNode, TraversalOptions};
@@ -63,7 +65,10 @@ pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{present, PresentationMode};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
-pub use runtime::{parse_pack_list, BackendId, KhiveRuntime, NamespaceToken, RuntimeConfig};
+pub use runtime::{
+    parse_pack_list, runtime_config_from_khive_config, BackendId, KhiveRuntime, NamespaceToken,
+    RuntimeConfig,
+};
 pub use validation::{
     GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
     ValidationRule, Violation,

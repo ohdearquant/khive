@@ -619,6 +619,58 @@ fn register_configured_embedding_models(
     Ok(())
 }
 
+/// Build a `RuntimeConfig` from a parsed `KhiveConfig`.
+///
+/// For each `[[engines]]` entry:
+/// - The engine flagged `default = true` becomes `RuntimeConfig::embedding_model`.
+/// - All other engines become `RuntimeConfig::additional_embedding_models`.
+///
+/// Model name validity is checked here: any engine whose `model` field cannot
+/// be parsed via `parse_embedding_model_alias` is skipped with a warning.
+///
+/// If `khive_cfg.engines` is empty, the returned `RuntimeConfig` uses the
+/// env-var-derived defaults from `RuntimeConfig::default()`.
+///
+/// When both a config file and `KHIVE_EMBEDDING_MODEL` env var are present,
+/// the caller is responsible for emitting a warning that env vars are ignored.
+/// This function purely converts `KhiveConfig` to `RuntimeConfig` fields.
+pub fn runtime_config_from_khive_config(
+    khive_cfg: &crate::engine_config::KhiveConfig,
+    base: RuntimeConfig,
+) -> RuntimeConfig {
+    if khive_cfg.engines.is_empty() {
+        return base;
+    }
+
+    let mut embedding_model: Option<EmbeddingModel> = None;
+    let mut additional: Vec<EmbeddingModel> = Vec::new();
+
+    for engine in &khive_cfg.engines {
+        match parse_embedding_model_alias(&engine.model) {
+            Some(model) => {
+                if engine.default {
+                    embedding_model = Some(model);
+                } else {
+                    additional.push(model);
+                }
+            }
+            None => {
+                tracing::warn!(
+                    engine = %engine.name,
+                    model = %engine.model,
+                    "engine config: unknown model name; engine will be skipped"
+                );
+            }
+        }
+    }
+
+    RuntimeConfig {
+        embedding_model,
+        additional_embedding_models: additional,
+        ..base
+    }
+}
+
 /// Parse a comma- or whitespace-separated list of embedding model names.
 fn parse_embedding_model_list(s: &str) -> Vec<EmbeddingModel> {
     parse_pack_list(s)
