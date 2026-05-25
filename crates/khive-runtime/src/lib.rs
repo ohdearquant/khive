@@ -60,7 +60,7 @@ pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{present, PresentationMode};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
-pub use runtime::{parse_pack_list, KhiveRuntime, NamespaceToken, RuntimeConfig};
+pub use runtime::{parse_pack_list, BackendId, KhiveRuntime, NamespaceToken, RuntimeConfig};
 pub use validation::{
     GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
     ValidationRule, Violation,

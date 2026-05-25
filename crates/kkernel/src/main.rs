@@ -1,15 +1,16 @@
 //! `kkernel` binary — khive admin/management Rust CLI.
 //!
-//! See [ADR-076](../../docs/adr/ADR-076-kkernel-and-mcp-split.md) for the
+//! See [ADR-003](../../docs/adr/ADR-003-system-architecture.md) for the
 //! kernel/MCP split rationale.
 //!
 //! Subcommands:
 //!
-//! - `sync`   — build a queryable SQLite DB from NDJSON sources (issue #174)
-//! - `pack`   — introspect registered packs (`list`, `handler <name>`)
-//! - `kg`     — KG validation, init, hook management (ADR-034, ADR-035)
-//! - `engine` — embedding model lifecycle: list/status/migrate/drift-check (ADR-043)
-//! - `vector` — vector store capabilities and orphan sweep (ADR-044)
+//! - `sync`    — build a queryable SQLite DB from NDJSON sources (issue #174)
+//! - `pack`    — introspect registered packs (`list`, `handler <name>`)
+//! - `kg`      — KG validation, init, hook management (ADR-034, ADR-035)
+//! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check (ADR-043)
+//! - `vector`  — vector store capabilities and orphan sweep (ADR-044)
+//! - `backend` — inspect registered backends (`list`, `info <name>`)
 //!
 //! All subcommands emit JSON on stdout by default for easy piping/parsing.
 //! Pass `--human` to switch to a readable table where supported.
@@ -19,7 +20,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use kkernel::{engine, kg, pack_introspect, sync, vector};
+use khive_runtime::{BackendId, KhiveRuntime, RuntimeConfig};
+use kkernel::{coordinator::BackendRegistry, engine, kg, pack_introspect, sync, vector};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,6 +58,10 @@ enum Command {
     /// Vector store capabilities and orphan sweep (ADR-044).
     #[command(subcommand)]
     Vector(vector::VectorCommand),
+
+    /// Inspect registered backends (ADR-009, ADR-028).
+    #[command(subcommand)]
+    Backend(BackendCommand),
 }
 
 #[derive(Parser, Debug)]
@@ -93,6 +99,31 @@ enum PackCommand {
     },
 }
 
+/// Backend admin commands (ADR-003 §four-invariants, ADR-009, ADR-028).
+///
+/// In the full multi-backend deployment, `kkernel backend list` reads `khive.toml`
+/// and enumerates all configured `[[backends]]` entries. In the current v1 implementation,
+/// it lists the single default backend constructed from `RuntimeConfig::default()`.
+#[derive(Subcommand, Debug)]
+enum BackendCommand {
+    /// List all registered backends.
+    List {
+        /// Print a human-readable table instead of JSON.
+        #[arg(long)]
+        human: bool,
+    },
+
+    /// Print information about a specific backend.
+    Info {
+        /// Backend name (e.g. `main`, `lore`, `archive`).
+        name: String,
+
+        /// Print human-readable output instead of JSON.
+        #[arg(long)]
+        human: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -104,6 +135,7 @@ async fn main() -> Result<()> {
         Command::Kg(k) => kg::run_kg(k),
         Command::Engine(e) => engine::run_engine(e),
         Command::Vector(v) => vector::run_vector(v),
+        Command::Backend(b) => cmd_backend(b),
     }
 }
 
@@ -178,6 +210,76 @@ fn cmd_pack(cmd: PackCommand) -> Result<()> {
             } else {
                 let json = serde_json::to_string(&info).expect("serialize PackInfo");
                 println!("{json}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_backend(cmd: BackendCommand) -> Result<()> {
+    // v1: enumerate backends from RuntimeConfig defaults.
+    // Full multi-backend implementation reads khive.toml (ADR-028); this ships
+    // the CLI surface so tooling can already call `kkernel backend list`.
+    let default_config = RuntimeConfig::default();
+    let default_id = default_config.backend_id.clone();
+    let default_path = default_config
+        .db_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ":memory:".to_string());
+
+    // Build a synthetic registry from the single default backend.
+    let mut registry = BackendRegistry::new();
+    let rt = KhiveRuntime::new(default_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    registry.register(default_id.clone(), std::sync::Arc::new(rt));
+
+    match cmd {
+        BackendCommand::List { human } => {
+            let ids: Vec<_> = registry.ids();
+            if human {
+                println!("Registered backends ({}):", ids.len());
+                for id in &ids {
+                    let entry = registry.get(id).unwrap();
+                    let primary_marker = if registry.primary().map(|p| p.id == *id).unwrap_or(false)
+                    {
+                        " [primary]"
+                    } else {
+                        ""
+                    };
+                    println!("  {}{}", id.as_str(), primary_marker);
+                    let _ = entry; // future: print path, file_backed
+                }
+            } else {
+                let names: Vec<&str> = ids.iter().map(|id| id.as_str()).collect();
+                let json = serde_json::json!({
+                    "backends": names,
+                    "primary": registry.primary().map(|e| e.id.as_str()),
+                    "count": ids.len(),
+                });
+                println!("{}", serde_json::to_string(&json).expect("serialize"));
+            }
+            Ok(())
+        }
+        BackendCommand::Info { name, human } => {
+            let id = BackendId::new(&name);
+            let entry = registry
+                .get(&id)
+                .with_context(|| format!("backend {name:?} is not registered"))?;
+            if human {
+                let is_primary = registry
+                    .primary()
+                    .map(|p| p.id == entry.id)
+                    .unwrap_or(false);
+                println!("backend: {}", entry.id.as_str());
+                println!("  primary: {is_primary}");
+                println!("  path:    {default_path}");
+            } else {
+                let json = serde_json::json!({
+                    "name": entry.id.as_str(),
+                    "path": default_path,
+                    "primary": registry.primary().map(|p| p.id == entry.id).unwrap_or(false),
+                });
+                println!("{}", serde_json::to_string(&json).expect("serialize"));
             }
             Ok(())
         }

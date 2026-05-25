@@ -1,6 +1,6 @@
 //! kkernel — khive admin/management library.
 //!
-//! See [ADR-076](../../docs/adr/ADR-076-kkernel-and-mcp-split.md) for the
+//! See [ADR-003](../../docs/adr/ADR-003-system-architecture.md) for the
 //! kernel/MCP split rationale. This library exposes the building blocks that
 //! the `kkernel` binary composes into subcommands:
 //!
@@ -9,7 +9,9 @@
 //! - [`kg`] — KG validation, init, and hook management (ADR-034, ADR-035).
 //! - [`engine`] — embedding model lifecycle management (ADR-043).
 //! - [`vector`] — vector store introspection and orphan sweep (ADR-044).
+//! - [`coordinator`] — SubstrateCoordinator for cross-backend dispatch (ADR-029).
 
+pub mod coordinator;
 pub mod engine;
 pub mod kg;
 pub mod pack_introspect;

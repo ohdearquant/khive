@@ -567,6 +567,7 @@ async fn file_backed_runtime_persists() {
             embedding_model: None,
             gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
             packs: vec!["kg".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local());
@@ -583,6 +584,7 @@ async fn file_backed_runtime_persists() {
             embedding_model: None,
             gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
             packs: vec!["kg".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
         };
         let rt = KhiveRuntime::new(config).unwrap();
         let tok = rt.authorize(Namespace::local());

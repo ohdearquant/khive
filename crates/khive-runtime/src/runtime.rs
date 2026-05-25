@@ -13,6 +13,47 @@ use tokio::sync::OnceCell;
 
 use crate::error::RuntimeResult;
 
+// ---- BackendId ----
+
+/// Identifies a named backend in a multi-backend deployment (ADR-009, ADR-028).
+///
+/// The `main` backend is the default single-backend name. Multi-backend deployments
+/// assign each `[[backends]]` entry a distinct `BackendId`. The
+/// [`SubstrateCoordinator`](kkernel::coordinator::SubstrateCoordinator) in `kkernel`
+/// uses `BackendId` for node-to-backend resolution and cross-backend edge routing.
+///
+/// A single-backend `KhiveRuntime` always has `BackendId("main")` by default.
+/// The boot path in `kkernel` or `khive-mcp` sets the id via `RuntimeConfig::backend_id`
+/// when constructing per-pack runtimes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BackendId(pub String);
+
+impl BackendId {
+    /// The default single-backend name.
+    pub const MAIN: &'static str = "main";
+
+    /// Construct from a string name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// The default `main` backend id.
+    pub fn main() -> Self {
+        Self(Self::MAIN.to_string())
+    }
+
+    /// Return the backend name as a `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BackendId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 // ---- Sealed token ----
 
 mod private {
@@ -74,14 +115,26 @@ impl NamespaceToken {
 // ---- RuntimeConfig ----
 
 /// Runtime configuration.
+///
+/// Per ADR-028, the `db_path` and `embedding_model` fields are deprecated in favour of
+/// constructing the backend externally and calling [`KhiveRuntime::from_backend`].
+/// They remain for backward compatibility with tests and single-binary deployments.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Path to the SQLite database file. `None` = in-memory (tests).
+    ///
+    /// Deprecated: use [`KhiveRuntime::from_backend`] instead. The boot path
+    /// constructs backends from `khive.toml` (`AppConfig`) and passes them to
+    /// `from_backend`. Direct `db_path` usage persists only in tests.
     pub db_path: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
     /// Local embedding model. `None` disables embedding and hybrid vector search;
     /// `hybrid_search` then falls back to text-only.
+    ///
+    /// Deprecated: per ADR-028/ADR-031, embedding engines move to a per-pack
+    /// `EmbedderRegistry`. This field persists for backward compatibility until
+    /// the embedder registry is fully plumbed.
     pub embedding_model: Option<EmbeddingModel>,
     /// Authorization gate consulted before each verb dispatch (ADR-029).
     /// Default: `AllowAllGate` (permissive). For production policy enforcement,
@@ -93,6 +146,11 @@ pub struct RuntimeConfig {
     /// by the transport, not silently ignored.
     /// Default: `["kg"]`.
     pub packs: Vec<String>,
+    /// Identifies this runtime's backend in a multi-backend deployment (ADR-009, ADR-028).
+    ///
+    /// Set by the boot path when constructing per-pack runtimes from `khive.toml`.
+    /// Single-backend deployments use the default `BackendId::MAIN`.
+    pub backend_id: BackendId,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -126,6 +184,7 @@ impl Default for RuntimeConfig {
             embedding_model,
             gate: Arc::new(AllowAllGate),
             packs,
+            backend_id: BackendId::main(),
         }
     }
 }
@@ -150,6 +209,10 @@ pub struct KhiveRuntime {
 
 impl KhiveRuntime {
     /// Create a new runtime with the given config.
+    ///
+    /// The config's `db_path` is used to open or create the SQLite backend.
+    /// For the preferred boot path in multi-backend deployments, use
+    /// [`from_backend`](Self::from_backend) instead.
     pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
         let backend = match &config.db_path {
             Some(path) => {
@@ -168,6 +231,24 @@ impl KhiveRuntime {
         })
     }
 
+    /// Construct a runtime from an already-opened backend (ADR-028 boot path).
+    ///
+    /// This is the preferred constructor for multi-backend deployments. The caller
+    /// (boot path in `kkernel` or `khive-mcp`) opens each backend from `khive.toml`,
+    /// then constructs a `KhiveRuntime` per pack using this method.
+    ///
+    /// The returned runtime has `db_path = None` and `embedding_model = None`; all
+    /// storage access is through the provided `backend`. Set `backend_id` and
+    /// `default_namespace` via the config builder pattern if non-defaults are needed.
+    pub fn from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
+        Self {
+            backend,
+            config,
+            embedder: Arc::new(OnceCell::new()),
+            edge_rules: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
     /// Create an in-memory runtime (for tests and ephemeral use).
     pub fn memory() -> RuntimeResult<Self> {
         Self::new(RuntimeConfig {
@@ -176,7 +257,16 @@ impl KhiveRuntime {
             embedding_model: None,
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
         })
+    }
+
+    /// Return the [`BackendId`] for this runtime's backend.
+    ///
+    /// Used by the [`SubstrateCoordinator`](kkernel::coordinator::SubstrateCoordinator)
+    /// to identify which backend owns a given node, and to detect cross-backend merges.
+    pub fn backend_id(&self) -> &BackendId {
+        &self.config.backend_id
     }
 
     /// Return a reference to the runtime config.
@@ -347,10 +437,33 @@ mod tests {
             embedding_model: None,
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
         assert_eq!(rt.config().default_namespace.as_str(), "test");
+    }
+
+    #[test]
+    fn from_backend_uses_provided_backend() {
+        let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::new("lore"),
+        };
+        let rt = KhiveRuntime::from_backend(backend, config);
+        assert_eq!(rt.backend_id().as_str(), "lore");
+        assert!(rt.config().db_path.is_none());
+    }
+
+    #[test]
+    fn backend_id_defaults_to_main() {
+        let rt = KhiveRuntime::memory().unwrap();
+        assert_eq!(rt.backend_id().as_str(), BackendId::MAIN);
     }
 
     #[test]
