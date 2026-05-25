@@ -68,7 +68,7 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
 }
 
 // =============================================================================
-// Versioned migration system (ADR-022)
+// Versioned migration system (ADR-015)
 // =============================================================================
 
 /// A single forward-only schema migration.
@@ -350,9 +350,12 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "add_entity_type_to_entities",
         up: V5_ADD_ENTITY_TYPE_TO_ENTITIES,
     },
-    // V6–V8 slots are reserved in the ADR-015 migration ledger for other ADRs
-    // (ADR-043, ADR-046, ADR-041 respectively).  These no-op migrations hold the
-    // slot open so the contiguity check passes while those ADRs are implemented.
+    // V6–V8: no-op placeholder slots originally reserved in the ADR-015 ledger for
+    // ADR-043, ADR-046, and ADR-041 respectively.  During the v1 parallel cluster
+    // landings (c01/c03/c04/c06) the concrete migrations from those ADRs landed at
+    // V5, V9, and V13 instead (slot assignments shifted as clusters merged).  V6–V8
+    // were absorbed as no-ops to keep the contiguity check passing.  Their names are
+    // frozen — V1-V13 are production schema.
     VersionedMigration {
         version: 6,
         name: "reserved_adr043_embedding_pipeline_extensions",
