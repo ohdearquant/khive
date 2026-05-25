@@ -96,6 +96,12 @@ jobs:
       - name: Build binaries (zigbuild cross)
         if: ${{ matrix.cross }}
         working-directory: crates
+        # sqlite-vec 0.1.9 uses BSD-style `u_int*_t` typedefs that musl libc
+        # does not provide (glibc only exposes them via _BSD_SOURCE). Inject
+        # the typedefs via CFLAGS so the C build succeeds under zig+musl.
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
+          CFLAGS_aarch64_unknown_linux_gnu: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
         run: |
           cargo zigbuild --release --target ${{ matrix.target }} -p kkernel -p khive-mcp
 
