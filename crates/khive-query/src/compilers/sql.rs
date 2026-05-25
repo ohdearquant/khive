@@ -4,20 +4,46 @@
 //! - Fixed-length patterns (all edges *1..1) → JOIN chain
 //! - Variable-length patterns (any edge *N..M where M>1) → recursive CTE
 //!
+//! Synthetic edge paths (ADR-041):
+//! - Relations prefixed `observed_as_*` join against `event_observations`, not `graph_edges`.
+//!
 //! Security invariants (MAJ-1/MAJ-2/MAJ-3 from critic review):
 //! - Namespace injection: WHERE clause always comes from CompileOptions.scopes, never the query.
 //! - Edge property whitelist: only `relation` and `weight` are queryable edge columns.
-//! - Depth cap: recursive CTE depth is min(requested, 10).
+//! - Depth cap: recursive CTE depth capped at MAX_DEPTH; exceeding it errors at validation.
 
 use crate::ast::*;
 use crate::error::QueryError;
 use crate::validate::{validate_with_warnings, MAX_DEPTH};
-use khive_storage::types::SqlValue;
+
+/// Observation roles used by the synthetic edge compiler (ADR-041 §8).
+const SYNTHETIC_RELATIONS: &[&str] = &[
+    "observed_as_candidate",
+    "observed_as_selected",
+    "observed_as_target",
+    "observed_as_signal",
+];
+
+/// Returns `true` when the relation string is a synthetic ADR-041 observation edge.
+fn is_synthetic(rel: &str) -> bool {
+    SYNTHETIC_RELATIONS.contains(&rel)
+}
+
+/// Returns the `role` value that maps to the given synthetic relation.
+fn synthetic_role(rel: &str) -> Option<&'static str> {
+    match rel {
+        "observed_as_candidate" => Some("candidate"),
+        "observed_as_selected" => Some("selected"),
+        "observed_as_target" => Some("target"),
+        "observed_as_signal" => Some("signal"),
+        _ => None,
+    }
+}
 
 #[derive(Debug)]
 pub struct CompiledQuery {
     pub sql: String,
-    pub params: Vec<SqlValue>,
+    pub params: Vec<QueryValue>,
     pub return_vars: Vec<ReturnItem>,
     pub warnings: Vec<String>,
 }
@@ -56,23 +82,59 @@ pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery,
     Ok(compiled)
 }
 
-fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<SqlValue>) -> String {
+fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryValue>) -> String {
     if opts.scopes.is_empty() {
         String::new()
     } else if opts.scopes.len() == 1 {
-        params.push(SqlValue::Text(opts.scopes[0].clone()));
+        params.push(QueryValue::Text(opts.scopes[0].clone()));
         format!(" AND {alias}.namespace = ?{}", params.len())
     } else {
         let placeholders: Vec<String> = opts
             .scopes
             .iter()
             .map(|s| {
-                params.push(SqlValue::Text(s.clone()));
+                params.push(QueryValue::Text(s.clone()));
                 format!("?{}", params.len())
             })
             .collect();
         format!(" AND {alias}.namespace IN ({})", placeholders.join(", "))
     }
+}
+
+/// Identifies node indices that are endpoints of synthetic `observed_as_*` edges.
+///
+/// Returns `(source_indices, target_indices)`:
+/// - `source_indices`: node indices bound to the `events` table (the event source node)
+/// - `target_indices`: node indices bound to the `notes` table (the observed note target node)
+fn synthetic_endpoint_node_indices(
+    elements: &[PatternElement],
+) -> (
+    std::collections::HashSet<usize>,
+    std::collections::HashSet<usize>,
+) {
+    let mut source_set = std::collections::HashSet::new();
+    let mut target_set = std::collections::HashSet::new();
+    let mut node_idx = 0usize;
+    let mut prev_node_idx: Option<usize> = None;
+    for element in elements {
+        match element {
+            PatternElement::Node(_) => {
+                prev_node_idx = Some(node_idx);
+                node_idx += 1;
+            }
+            PatternElement::Edge(ep) => {
+                let has_synthetic = ep.relations.iter().any(|r| is_synthetic(r));
+                if has_synthetic {
+                    if let Some(src_idx) = prev_node_idx {
+                        source_set.insert(src_idx);
+                        // The target is the next node (current node_idx).
+                        target_set.insert(node_idx);
+                    }
+                }
+            }
+        }
+    }
+    (source_set, target_set)
 }
 
 /// Compile fixed-length patterns to a chain of JOINs.
@@ -86,11 +148,14 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<SqlValu
 /// WHERE a.kind = 'concept' AND e.relation = 'introduced_by' AND b.kind = 'paper'
 ///   AND a.deleted_at IS NULL AND b.deleted_at IS NULL
 /// LIMIT 10
+///
+/// Synthetic `observed_as_*` patterns (ADR-041 §8) route the event-source node
+/// to the `events` table instead of `entities`.
 fn compile_fixed_length(
     query: &GqlQuery,
     opts: &CompileOptions,
 ) -> Result<CompiledQuery, QueryError> {
-    let mut params: Vec<SqlValue> = Vec::new();
+    let mut params: Vec<QueryValue> = Vec::new();
     let mut from_parts: Vec<String> = Vec::new();
     let mut join_parts: Vec<String> = Vec::new();
     let mut where_parts: Vec<String> = Vec::new();
@@ -101,6 +166,11 @@ fn compile_fixed_length(
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
         std::collections::HashMap::new();
 
+    // Pre-compute which node indices are endpoints of synthetic edges.
+    // Source nodes bind to `events`; target nodes bind to `notes`.
+    let (event_source_indices, note_target_indices) =
+        synthetic_endpoint_node_indices(&query.pattern.elements);
+
     let mut node_idx = 0usize;
     let mut edge_idx = 0usize;
 
@@ -110,43 +180,121 @@ fn compile_fixed_length(
                 let alias = format!("n{node_idx}");
                 node_aliases.push(alias.clone());
 
+                let is_event_source = event_source_indices.contains(&node_idx);
+                let is_note_target = note_target_indices.contains(&node_idx);
+
                 if node_idx == 0 {
-                    from_parts.push(format!("entities {alias}"));
-                }
-
-                where_parts.push(format!("{alias}.deleted_at IS NULL"));
-
-                let ns_filter = namespace_filter(&alias, opts, &mut params);
-                if !ns_filter.is_empty() {
-                    where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
-                }
-
-                if let Some(ref kind) = np.kind {
-                    params.push(SqlValue::Text(kind.clone()));
-                    where_parts.push(format!("{alias}.kind = ?{}", params.len()));
-                }
-
-                if let Some(ref et) = np.entity_type {
-                    params.push(SqlValue::Text(et.clone()));
-                    where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
-                }
-
-                for (key, val) in &np.properties {
-                    params.push(SqlValue::Text(val.clone()));
-                    if key == "name" {
-                        where_parts
-                            .push(format!("{alias}.name = ?{} COLLATE NOCASE", params.len()));
+                    if is_event_source {
+                        from_parts.push(format!("events {alias}"));
                     } else {
-                        where_parts.push(format!(
-                            "json_extract({alias}.properties, '$.{}') = ?{} COLLATE NOCASE",
-                            key.replace('\'', "''"),
-                            params.len()
+                        // Note targets are joined by the synthetic edge handler, not FROM.
+                        if !is_note_target {
+                            from_parts.push(format!("entities {alias}"));
+                        }
+                    }
+                }
+
+                if is_event_source {
+                    // Events table does not have `deleted_at`; filter is omitted.
+                    // Namespace filter uses the `events.namespace` column directly.
+                    let ns_filter = namespace_filter(&alias, opts, &mut params);
+                    if !ns_filter.is_empty() {
+                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                    }
+                    // `kind` on an event node filters events.kind (e.g. "recall_executed").
+                    if let Some(ref kind) = np.kind {
+                        params.push(QueryValue::Text(kind.clone()));
+                        where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                    }
+                    // entity_type and properties are not columns on events — reject explicitly.
+                    if np.entity_type.is_some() {
+                        return Err(QueryError::Compile(
+                            "event nodes do not have an entity_type column".into(),
                         ));
+                    }
+                    if !np.properties.is_empty() {
+                        return Err(QueryError::Compile(
+                            "event nodes do not support inline property filters; \
+                             use a WHERE clause on verb, outcome, or payload fields"
+                                .into(),
+                        ));
+                    }
+                } else if is_note_target {
+                    // Note targets: `notes` table (joined by the synthetic edge handler).
+                    where_parts.push(format!("{alias}.deleted_at IS NULL"));
+
+                    let ns_filter = namespace_filter(&alias, opts, &mut params);
+                    if !ns_filter.is_empty() {
+                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                    }
+
+                    if let Some(ref kind) = np.kind {
+                        params.push(QueryValue::Text(kind.clone()));
+                        where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                    }
+
+                    // entity_type does not exist on notes — reject explicitly.
+                    if np.entity_type.is_some() {
+                        return Err(QueryError::Compile(
+                            "observed note targets do not have an entity_type column".into(),
+                        ));
+                    }
+
+                    for (key, val) in &np.properties {
+                        params.push(QueryValue::Text(val.clone()));
+                        if key == "name" || key == "content" {
+                            where_parts
+                                .push(format!("{alias}.{key} = ?{} COLLATE NOCASE", params.len()));
+                        } else {
+                            where_parts.push(format!(
+                                "json_extract({alias}.properties, '$.{}') = ?{} COLLATE NOCASE",
+                                key.replace('\'', "''"),
+                                params.len()
+                            ));
+                        }
+                    }
+                } else {
+                    where_parts.push(format!("{alias}.deleted_at IS NULL"));
+
+                    let ns_filter = namespace_filter(&alias, opts, &mut params);
+                    if !ns_filter.is_empty() {
+                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                    }
+
+                    if let Some(ref kind) = np.kind {
+                        params.push(QueryValue::Text(kind.clone()));
+                        where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                    }
+
+                    if let Some(ref et) = np.entity_type {
+                        params.push(QueryValue::Text(et.clone()));
+                        where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
+                    }
+
+                    for (key, val) in &np.properties {
+                        params.push(QueryValue::Text(val.clone()));
+                        if key == "name" {
+                            where_parts
+                                .push(format!("{alias}.name = ?{} COLLATE NOCASE", params.len()));
+                        } else {
+                            where_parts.push(format!(
+                                "json_extract({alias}.properties, '$.{}') = ?{} COLLATE NOCASE",
+                                key.replace('\'', "''"),
+                                params.len()
+                            ));
+                        }
                     }
                 }
 
                 if let Some(ref var) = np.variable {
-                    var_to_alias.insert(var.clone(), (alias.clone(), VarKind::Node));
+                    let kind = if is_event_source {
+                        VarKind::EventNode
+                    } else if is_note_target {
+                        VarKind::NoteNode
+                    } else {
+                        VarKind::Node
+                    };
+                    var_to_alias.insert(var.clone(), (alias.clone(), kind));
                 }
 
                 node_idx += 1;
@@ -154,66 +302,124 @@ fn compile_fixed_length(
             PatternElement::Edge(ep) => {
                 let e_alias = format!("e{edge_idx}");
                 let prev_node = &node_aliases[node_aliases.len() - 1];
+                let next_alias = format!("n{}", node_idx);
 
                 edge_aliases.push(e_alias.clone());
 
-                let (source_join, target_join) = match ep.direction {
-                    EdgeDirection::Out => (
-                        format!("{e_alias}.source_id = {prev_node}.id"),
-                        "target_id",
-                    ),
-                    EdgeDirection::In => (
-                        format!("{e_alias}.target_id = {prev_node}.id"),
-                        "source_id",
-                    ),
-                    EdgeDirection::Both => (
-                        format!(
-                            "({e_alias}.source_id = {prev_node}.id OR {e_alias}.target_id = {prev_node}.id)"
-                        ),
-                        "CASE_BOTH",
-                    ),
-                };
-
-                let next_alias = format!("n{}", node_idx);
-
-                let next_join_col = if target_join == "CASE_BOTH" {
-                    format!(
-                        "CASE WHEN {e_alias}.source_id = {prev_node}.id THEN {e_alias}.target_id ELSE {e_alias}.source_id END"
-                    )
-                } else {
-                    format!("{e_alias}.{target_join}")
-                };
-
-                join_parts.push(format!(
-                    "JOIN graph_edges {e_alias} ON {source_join} AND {e_alias}.deleted_at IS NULL"
-                ));
-
-                let ens_filter = namespace_filter(&e_alias, opts, &mut params);
-                if !ens_filter.is_empty() {
-                    where_parts.push(ens_filter.trim_start_matches(" AND ").to_string());
+                // Detect synthetic event_observations edges (ADR-041 §8).
+                // A synthetic edge is one whose only relation(s) are observed_as_* names.
+                // Mixed synthetic+canonical relations are rejected: the two tables don't share
+                // a common join key that would make an OR across them meaningful.
+                let has_synthetic = ep.relations.iter().any(|r| is_synthetic(r));
+                let has_canonical = ep.relations.iter().any(|r| !is_synthetic(r));
+                if has_synthetic && has_canonical {
+                    return Err(QueryError::Compile(
+                        "cannot mix synthetic observed_as_* relations with canonical edge relations \
+                         in a single edge pattern"
+                            .into(),
+                    ));
                 }
 
-                join_parts.push(format!(
-                    "JOIN entities {next_alias} ON {next_alias}.id = {next_join_col}"
-                ));
-
-                if !ep.relations.is_empty() {
-                    if ep.relations.len() == 1 {
-                        params.push(SqlValue::Text(ep.relations[0].clone()));
-                        where_parts.push(format!("{e_alias}.relation = ?{}", params.len()));
-                    } else {
-                        let placeholders: Vec<String> = ep
-                            .relations
+                if has_synthetic {
+                    // Synthetic edge: join event_observations.
+                    // Direction is always event → entity/note (OUT from the event node).
+                    // The event node is the source (prev_node); the entity/note is the target.
+                    if !matches!(ep.direction, EdgeDirection::Out) {
+                        return Err(QueryError::Compile(
+                            "synthetic observed_as_* edges are always event → entity (outbound only)".into(),
+                        ));
+                    }
+                    join_parts.push(format!(
+                        "JOIN event_observations {e_alias} ON {e_alias}.event_id = {prev_node}.id"
+                    ));
+                    // Roles: collect the unique role values from the synthetic relation names.
+                    let roles: Vec<&'static str> = ep
+                        .relations
+                        .iter()
+                        .filter_map(|r| synthetic_role(r))
+                        .collect();
+                    if roles.len() == 1 {
+                        params.push(QueryValue::Text(roles[0].to_string()));
+                        where_parts.push(format!("{e_alias}.role = ?{}", params.len()));
+                    } else if roles.len() > 1 {
+                        let placeholders: Vec<String> = roles
                             .iter()
                             .map(|r| {
-                                params.push(SqlValue::Text(r.clone()));
+                                params.push(QueryValue::Text(r.to_string()));
                                 format!("?{}", params.len())
                             })
                             .collect();
-                        where_parts.push(format!(
-                            "{e_alias}.relation IN ({})",
-                            placeholders.join(", ")
-                        ));
+                        where_parts
+                            .push(format!("{e_alias}.role IN ({})", placeholders.join(", ")));
+                    }
+                    // Join the target node via event_observations.entity_id.
+                    // The `referent_kind` column discriminates between note and entity
+                    // substrates.  Per ADR-041, recall/rerank observations always target
+                    // notes (`referent_kind='note'`); we filter to note substrate and join
+                    // the `notes` table.  An explicit `AND e0.referent_kind='note'`
+                    // prevents cross-substrate ID collisions.
+                    join_parts.push(format!(
+                        "JOIN notes {next_alias} ON {next_alias}.id = {e_alias}.entity_id \
+                         AND {e_alias}.referent_kind = 'note'"
+                    ));
+                } else {
+                    // Standard canonical edge: join graph_edges.
+                    let (source_join, target_join) = match ep.direction {
+                        EdgeDirection::Out => (
+                            format!("{e_alias}.source_id = {prev_node}.id"),
+                            "target_id",
+                        ),
+                        EdgeDirection::In => (
+                            format!("{e_alias}.target_id = {prev_node}.id"),
+                            "source_id",
+                        ),
+                        EdgeDirection::Both => (
+                            format!(
+                                "({e_alias}.source_id = {prev_node}.id OR {e_alias}.target_id = {prev_node}.id)"
+                            ),
+                            "CASE_BOTH",
+                        ),
+                    };
+
+                    let next_join_col = if target_join == "CASE_BOTH" {
+                        format!(
+                            "CASE WHEN {e_alias}.source_id = {prev_node}.id THEN {e_alias}.target_id ELSE {e_alias}.source_id END"
+                        )
+                    } else {
+                        format!("{e_alias}.{target_join}")
+                    };
+
+                    join_parts.push(format!(
+                        "JOIN graph_edges {e_alias} ON {source_join} AND {e_alias}.deleted_at IS NULL"
+                    ));
+
+                    let ens_filter = namespace_filter(&e_alias, opts, &mut params);
+                    if !ens_filter.is_empty() {
+                        where_parts.push(ens_filter.trim_start_matches(" AND ").to_string());
+                    }
+
+                    join_parts.push(format!(
+                        "JOIN entities {next_alias} ON {next_alias}.id = {next_join_col}"
+                    ));
+
+                    if !ep.relations.is_empty() {
+                        if ep.relations.len() == 1 {
+                            params.push(QueryValue::Text(ep.relations[0].clone()));
+                            where_parts.push(format!("{e_alias}.relation = ?{}", params.len()));
+                        } else {
+                            let placeholders: Vec<String> = ep
+                                .relations
+                                .iter()
+                                .map(|r| {
+                                    params.push(QueryValue::Text(r.clone()));
+                                    format!("?{}", params.len())
+                                })
+                                .collect();
+                            where_parts.push(format!(
+                                "{e_alias}.relation IN ({})",
+                                placeholders.join(", ")
+                            ));
+                        }
                     }
                 }
 
@@ -226,72 +432,9 @@ fn compile_fixed_length(
         }
     }
 
-    // WHERE clause conditions from GQL WHERE
-    for cond in &query.where_clause {
-        let (alias, kind) = var_to_alias.get(&cond.variable).ok_or_else(|| {
-            QueryError::Compile(format!(
-                "unknown variable '{}' in WHERE clause",
-                cond.variable
-            ))
-        })?;
-
-        let col_expr = match kind {
-            VarKind::Node => {
-                if cond.property == "name"
-                    || cond.property == "kind"
-                    || cond.property == "entity_type"
-                    || cond.property == "namespace"
-                {
-                    format!("{alias}.{}", cond.property)
-                } else {
-                    format!(
-                        "json_extract({alias}.properties, '$.{}')",
-                        cond.property.replace('\'', "''")
-                    )
-                }
-            }
-            VarKind::Edge => {
-                // MAJ-1: edge property whitelist — only relation and weight are queryable
-                match cond.property.as_str() {
-                    "relation" | "weight" => format!("{alias}.{}", cond.property),
-                    other => {
-                        return Err(QueryError::Validation(format!(
-                            "edge property '{other}' not queryable; use 'relation' or 'weight'"
-                        )))
-                    }
-                }
-            }
-        };
-
-        let op_str = match cond.op {
-            CompareOp::Eq => "=",
-            CompareOp::Neq => "!=",
-            CompareOp::Gt => ">",
-            CompareOp::Lt => "<",
-            CompareOp::Gte => ">=",
-            CompareOp::Lte => "<=",
-            CompareOp::Like => "LIKE",
-        };
-
-        match &cond.value {
-            ConditionValue::String(s) => {
-                params.push(SqlValue::Text(s.clone()));
-                let collate = if matches!(cond.op, CompareOp::Eq | CompareOp::Like) {
-                    " COLLATE NOCASE"
-                } else {
-                    ""
-                };
-                where_parts.push(format!("{col_expr} {op_str} ?{}{}", params.len(), collate));
-            }
-            ConditionValue::Number(n) => {
-                params.push(SqlValue::Float(*n));
-                where_parts.push(format!("{col_expr} {op_str} ?{}", params.len()));
-            }
-            ConditionValue::Bool(b) => {
-                params.push(SqlValue::Integer(if *b { 1 } else { 0 }));
-                where_parts.push(format!("{col_expr} {op_str} ?{}", params.len()));
-            }
-        }
+    // WHERE clause conditions from GQL WHERE (supports AND / OR tree — ADR-008)
+    if let Some(where_sql) = compile_where_expr(&query.where_clause, &var_to_alias, &mut params)? {
+        where_parts.push(where_sql);
     }
 
     // SELECT clause
@@ -314,6 +457,27 @@ fn compile_fixed_length(
                              {alias}.updated_at AS {var}_updated_at"
                         ));
                     }
+                    VarKind::NoteNode => {
+                        select_parts.push(format!(
+                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
+                             {alias}.kind AS {var}_kind, {alias}.status AS {var}_status, \
+                             {alias}.content AS {var}_content, \
+                             {alias}.salience AS {var}_salience, \
+                             {alias}.properties AS {var}_properties, \
+                             {alias}.created_at AS {var}_created_at, \
+                             {alias}.updated_at AS {var}_updated_at"
+                        ));
+                    }
+                    VarKind::EventNode => {
+                        select_parts.push(format!(
+                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
+                             {alias}.verb AS {var}_verb, {alias}.substrate AS {var}_substrate, \
+                             {alias}.actor AS {var}_actor, {alias}.kind AS {var}_kind, \
+                             {alias}.outcome AS {var}_outcome, \
+                             {alias}.payload AS {var}_payload, \
+                             {alias}.created_at AS {var}_created_at"
+                        ));
+                    }
                     VarKind::Edge => {
                         select_parts.push(format!(
                             "{alias}.id AS {var}_id, {alias}.source_id AS {var}_source, \
@@ -332,7 +496,7 @@ fn compile_fixed_length(
     }
 
     let limit = query.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
-    params.push(SqlValue::Integer(limit as i64));
+    params.push(QueryValue::Integer(limit as i64));
 
     let sql = format!(
         "SELECT {} FROM {} {} WHERE {} LIMIT ?{}",
@@ -351,6 +515,203 @@ fn compile_fixed_length(
     })
 }
 
+/// Compile a `WhereExpr` tree into a SQL fragment, pushing bound parameters into `params`.
+///
+/// Returns `Ok(None)` for `WhereExpr::True` (no fragment needed), or `Ok(Some(sql))` otherwise.
+/// The caller is responsible for wrapping the result in an AND with the structural predicates.
+fn compile_where_expr(
+    expr: &WhereExpr,
+    var_to_alias: &std::collections::HashMap<String, (String, VarKind)>,
+    params: &mut Vec<QueryValue>,
+) -> Result<Option<String>, QueryError> {
+    match expr {
+        WhereExpr::True => Ok(None),
+        WhereExpr::Condition(cond) => {
+            let sql = compile_single_condition(cond, var_to_alias, params)?;
+            Ok(Some(sql))
+        }
+        WhereExpr::And(l, r) => {
+            let ls = compile_where_expr(l, var_to_alias, params)?;
+            let rs = compile_where_expr(r, var_to_alias, params)?;
+            Ok(match (ls, rs) {
+                (None, None) => None,
+                (Some(s), None) | (None, Some(s)) => Some(s),
+                (Some(l), Some(r)) => Some(format!("{l} AND {r}")),
+            })
+        }
+        WhereExpr::Or(l, r) => {
+            let ls = compile_where_expr(l, var_to_alias, params)?;
+            let rs = compile_where_expr(r, var_to_alias, params)?;
+            Ok(match (ls, rs) {
+                (None, None) => None,
+                (Some(s), None) | (None, Some(s)) => Some(s),
+                (Some(l), Some(r)) => Some(format!("({l} OR {r})")),
+            })
+        }
+    }
+}
+
+/// Compile a single leaf condition to a SQL predicate string.
+fn compile_single_condition(
+    cond: &Condition,
+    var_to_alias: &std::collections::HashMap<String, (String, VarKind)>,
+    params: &mut Vec<QueryValue>,
+) -> Result<String, QueryError> {
+    let (alias, kind) = var_to_alias.get(&cond.variable).ok_or_else(|| {
+        QueryError::Compile(format!(
+            "unknown variable '{}' in WHERE clause",
+            cond.variable
+        ))
+    })?;
+
+    let col_expr = match kind {
+        VarKind::Node => {
+            if cond.property == "name"
+                || cond.property == "kind"
+                || cond.property == "entity_type"
+                || cond.property == "namespace"
+            {
+                format!("{alias}.{}", cond.property)
+            } else {
+                format!(
+                    "json_extract({alias}.properties, '$.{}')",
+                    cond.property.replace('\'', "''")
+                )
+            }
+        }
+        VarKind::NoteNode => {
+            if NOTE_COLUMNS.contains(&cond.property.as_str()) {
+                format!("{alias}.{}", cond.property)
+            } else {
+                format!(
+                    "json_extract({alias}.properties, '$.{}')",
+                    cond.property.replace('\'', "''")
+                )
+            }
+        }
+        VarKind::EventNode => {
+            // Events table has direct columns only; reject unknown fields.
+            if EVENT_COLUMNS.contains(&cond.property.as_str()) {
+                format!("{alias}.{}", cond.property)
+            } else {
+                return Err(QueryError::Validation(format!(
+                    "event property '{}' not queryable; valid columns: {}",
+                    cond.property,
+                    EVENT_COLUMNS.join(", ")
+                )));
+            }
+        }
+        VarKind::Edge => match cond.property.as_str() {
+            "relation" | "weight" => format!("{alias}.{}", cond.property),
+            other => {
+                return Err(QueryError::Validation(format!(
+                    "edge property '{other}' not queryable; use 'relation' or 'weight'"
+                )))
+            }
+        },
+    };
+
+    let op_str = match cond.op {
+        CompareOp::Eq => "=",
+        CompareOp::Neq => "!=",
+        CompareOp::Gt => ">",
+        CompareOp::Lt => "<",
+        CompareOp::Gte => ">=",
+        CompareOp::Lte => "<=",
+        CompareOp::Like => "LIKE",
+    };
+
+    let sql = match &cond.value {
+        ConditionValue::String(s) => {
+            params.push(QueryValue::Text(s.clone()));
+            let collate = if matches!(cond.op, CompareOp::Eq | CompareOp::Like) {
+                " COLLATE NOCASE"
+            } else {
+                ""
+            };
+            format!("{col_expr} {op_str} ?{}{}", params.len(), collate)
+        }
+        ConditionValue::Number(n) => {
+            params.push(QueryValue::Float(*n));
+            format!("{col_expr} {op_str} ?{}", params.len())
+        }
+        ConditionValue::Bool(b) => {
+            params.push(QueryValue::Integer(if *b { 1 } else { 0 }));
+            format!("{col_expr} {op_str} ?{}", params.len())
+        }
+    };
+    Ok(sql)
+}
+
+/// Returns `true` if the given `WhereExpr` subtree references only the start
+/// variable (`start_var`), only the end variable, or neither — but NOT both.
+///
+/// Used to detect OR nodes whose branches reference different endpoints, which
+/// cannot be correctly compiled by the variable-length leaf-routing approach.
+fn expr_endpoint_set(
+    expr: &WhereExpr,
+    start_var: Option<&str>,
+    end_var: Option<&str>,
+) -> (bool, bool) {
+    match expr {
+        WhereExpr::True => (false, false),
+        WhereExpr::Condition(c) => {
+            let is_start = start_var == Some(c.variable.as_str());
+            let is_end = end_var == Some(c.variable.as_str());
+            (is_start, is_end)
+        }
+        WhereExpr::And(l, r) | WhereExpr::Or(l, r) => {
+            let (ls, le) = expr_endpoint_set(l, start_var, end_var);
+            let (rs, re) = expr_endpoint_set(r, start_var, end_var);
+            (ls || rs, le || re)
+        }
+    }
+}
+
+/// Walk the expression tree and return `Err(Unsupported)` if any `Or` node has
+/// branches that span both start and end endpoint variables.  Single-endpoint
+/// ORs (e.g. `a.name='X' OR a.name='Y'`) are fine.
+fn reject_or_spanning_endpoints(
+    expr: &WhereExpr,
+    start: &NodePattern,
+    end: &NodePattern,
+) -> Result<(), QueryError> {
+    let start_var = start.variable.as_deref();
+    let end_var = end.variable.as_deref();
+    reject_or_spanning_impl(expr, start_var, end_var)
+}
+
+fn reject_or_spanning_impl(
+    expr: &WhereExpr,
+    start_var: Option<&str>,
+    end_var: Option<&str>,
+) -> Result<(), QueryError> {
+    match expr {
+        WhereExpr::True | WhereExpr::Condition(_) => Ok(()),
+        WhereExpr::And(l, r) => {
+            reject_or_spanning_impl(l, start_var, end_var)?;
+            reject_or_spanning_impl(r, start_var, end_var)
+        }
+        WhereExpr::Or(l, r) => {
+            let (l_start, l_end) = expr_endpoint_set(l, start_var, end_var);
+            let (r_start, r_end) = expr_endpoint_set(r, start_var, end_var);
+            let spans_start = l_start || r_start;
+            let spans_end = l_end || r_end;
+            if spans_start && spans_end {
+                return Err(QueryError::Unsupported(
+                    "WHERE clauses that span both endpoints in a variable-length pattern \
+                     are not yet supported; rewrite as separate queries or restrict each \
+                     OR branch to one endpoint"
+                        .into(),
+                ));
+            }
+            // Even if this OR is safe, recurse to catch nested ORs.
+            reject_or_spanning_impl(l, start_var, end_var)?;
+            reject_or_spanning_impl(r, start_var, end_var)
+        }
+    }
+}
+
 /// Compile variable-length patterns to a recursive CTE.
 ///
 /// Depth is capped at min(requested, 10) — MAJ-2 (parameterized min_depth, not literal).
@@ -358,7 +719,7 @@ fn compile_variable_length(
     query: &GqlQuery,
     opts: &CompileOptions,
 ) -> Result<CompiledQuery, QueryError> {
-    let mut params: Vec<SqlValue> = Vec::new();
+    let mut params: Vec<QueryValue> = Vec::new();
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
         std::collections::HashMap::new();
 
@@ -392,15 +753,15 @@ fn compile_variable_length(
     }
 
     if let Some(ref kind) = start.kind {
-        params.push(SqlValue::Text(kind.clone()));
+        params.push(QueryValue::Text(kind.clone()));
         start_conditions.push(format!("s.kind = ?{}", params.len()));
     }
     if let Some(ref et) = start.entity_type {
-        params.push(SqlValue::Text(et.clone()));
+        params.push(QueryValue::Text(et.clone()));
         start_conditions.push(format!("s.entity_type = ?{}", params.len()));
     }
     for (key, val) in &start.properties {
-        params.push(SqlValue::Text(val.clone()));
+        params.push(QueryValue::Text(val.clone()));
         if key == "name" {
             start_conditions.push(format!("s.name = ?{} COLLATE NOCASE", params.len()));
         } else {
@@ -416,14 +777,14 @@ fn compile_variable_length(
     let mut relation_condition = String::new();
     if !edge.relations.is_empty() {
         if edge.relations.len() == 1 {
-            params.push(SqlValue::Text(edge.relations[0].clone()));
+            params.push(QueryValue::Text(edge.relations[0].clone()));
             relation_condition = format!(" AND e.relation = ?{}", params.len());
         } else {
             let placeholders: Vec<String> = edge
                 .relations
                 .iter()
                 .map(|r| {
-                    params.push(SqlValue::Text(r.clone()));
+                    params.push(QueryValue::Text(r.clone()));
                     format!("?{}", params.len())
                 })
                 .collect();
@@ -456,7 +817,7 @@ fn compile_variable_length(
         ),
     };
 
-    params.push(SqlValue::Integer(max_depth as i64));
+    params.push(QueryValue::Integer(max_depth as i64));
     let depth_param = params.len();
 
     // End-node conditions (applied in outer WHERE). `r` is always joined
@@ -468,15 +829,15 @@ fn compile_variable_length(
         end_conditions.push(r_ns_filter.trim_start_matches(" AND ").to_string());
     }
     if let Some(ref kind) = end.kind {
-        params.push(SqlValue::Text(kind.clone()));
+        params.push(QueryValue::Text(kind.clone()));
         end_conditions.push(format!("r.kind = ?{}", params.len()));
     }
     if let Some(ref et) = end.entity_type {
-        params.push(SqlValue::Text(et.clone()));
+        params.push(QueryValue::Text(et.clone()));
         end_conditions.push(format!("r.entity_type = ?{}", params.len()));
     }
     for (key, val) in &end.properties {
-        params.push(SqlValue::Text(val.clone()));
+        params.push(QueryValue::Text(val.clone()));
         if key == "name" {
             end_conditions.push(format!("r.name = ?{} COLLATE NOCASE", params.len()));
         } else {
@@ -488,12 +849,17 @@ fn compile_variable_length(
         }
     }
 
-    // WHERE clause conditions
-    for cond in &query.where_clause {
-        // Map variables to appropriate aliases
-        let col_alias = if start.variable.as_deref() == Some(&cond.variable) {
+    // WHERE clause conditions for variable-length patterns.
+    // Each leaf condition is routed to start_conditions (alias s) or end_conditions
+    // (alias r) based on which variable it references.  OR expressions that span
+    // both start and end nodes are not supported — reject explicitly with an
+    // actionable error message rather than silently converting OR to AND.
+    reject_or_spanning_endpoints(&query.where_clause, start, end)?;
+
+    for cond in query.where_clause.conditions() {
+        let col_alias = if start.variable.as_deref() == Some(cond.variable.as_str()) {
             "s"
-        } else if end.variable.as_deref() == Some(&cond.variable) {
+        } else if end.variable.as_deref() == Some(cond.variable.as_str()) {
             "r"
         } else {
             return Err(QueryError::Compile(format!(
@@ -525,7 +891,7 @@ fn compile_variable_length(
 
         match &cond.value {
             ConditionValue::String(s) => {
-                params.push(SqlValue::Text(s.clone()));
+                params.push(QueryValue::Text(s.clone()));
                 let collate = if matches!(cond.op, CompareOp::Eq | CompareOp::Like) {
                     " COLLATE NOCASE"
                 } else {
@@ -539,7 +905,7 @@ fn compile_variable_length(
                 }
             }
             ConditionValue::Number(n) => {
-                params.push(SqlValue::Float(*n));
+                params.push(QueryValue::Float(*n));
                 if col_alias == "s" {
                     start_conditions.push(format!("{col_expr} {op_str} ?{}", params.len()));
                 } else {
@@ -547,7 +913,7 @@ fn compile_variable_length(
                 }
             }
             ConditionValue::Bool(b) => {
-                params.push(SqlValue::Integer(if *b { 1 } else { 0 }));
+                params.push(QueryValue::Integer(if *b { 1 } else { 0 }));
                 if col_alias == "s" {
                     start_conditions.push(format!("{col_expr} {op_str} ?{}", params.len()));
                 } else {
@@ -559,12 +925,12 @@ fn compile_variable_length(
 
     // MAJ-2: min_depth is always a bound parameter, never a literal
     if min_depth > 0 {
-        params.push(SqlValue::Integer(min_depth as i64));
+        params.push(QueryValue::Integer(min_depth as i64));
         end_conditions.push(format!("t.depth >= ?{}", params.len()));
     }
 
     let limit = query.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
-    params.push(SqlValue::Integer(limit as i64));
+    params.push(QueryValue::Integer(limit as i64));
     let limit_param = params.len();
 
     // Register variables
@@ -588,6 +954,13 @@ fn compile_variable_length(
             match item {
                 ReturnItem::Property(_, prop) => {
                     let is_start = start.variable.as_deref() == Some(var);
+                    if matches!(kind, VarKind::EventNode | VarKind::NoteNode) {
+                        return Err(QueryError::Unsupported(
+                            "synthetic observed_as_* edges cannot be used in variable-length \
+                             patterns; use a fixed-length edge pattern instead"
+                                .into(),
+                        ));
+                    }
                     if *kind == VarKind::Node {
                         let tbl = if is_start { "s" } else { "r" };
                         if is_start {
@@ -632,6 +1005,15 @@ fn compile_variable_length(
                                  r.updated_at AS {var}_updated_at"
                             ));
                         }
+                    }
+                    VarKind::EventNode | VarKind::NoteNode => {
+                        // Synthetic observed_as_* edges require a fixed-length pattern;
+                        // variable-length recursion over the events/notes tables is not supported.
+                        return Err(QueryError::Unsupported(
+                            "synthetic observed_as_* edges cannot be used in variable-length \
+                             patterns; use a fixed-length edge pattern instead"
+                                .into(),
+                        ));
                     }
                     VarKind::Edge => {
                         select_parts.push(format!(
@@ -712,6 +1094,10 @@ fn compile_variable_length(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VarKind {
     Node,
+    /// Node that maps to the `events` table (synthetic edge source, ADR-041 §8).
+    EventNode,
+    /// Node that maps to the `notes` table (synthetic edge target, ADR-041 §8).
+    NoteNode,
     Edge,
 }
 
@@ -726,20 +1112,47 @@ const NODE_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
+/// Columns available for projection on `notes` table nodes (ADR-041 §8 targets).
+const NOTE_COLUMNS: &[&str] = &[
+    "id",
+    "namespace",
+    "kind",
+    "status",
+    "name",
+    "content",
+    "salience",
+    "decay_factor",
+    "properties",
+    "created_at",
+    "updated_at",
+];
+/// Columns available for projection on `events` table nodes (ADR-041 §8).
+const EVENT_COLUMNS: &[&str] = &[
+    "id",
+    "namespace",
+    "verb",
+    "substrate",
+    "actor",
+    "kind",
+    "outcome",
+    "payload",
+    "duration_us",
+    "target_id",
+    "session_id",
+    "created_at",
+];
 const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
 
 fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
-    let valid = match kind {
-        VarKind::Node => NODE_COLUMNS,
-        VarKind::Edge => EDGE_COLUMNS,
+    let (valid, kind_name) = match kind {
+        VarKind::Node => (NODE_COLUMNS, "node"),
+        VarKind::NoteNode => (NOTE_COLUMNS, "note"),
+        VarKind::EventNode => (EVENT_COLUMNS, "event"),
+        VarKind::Edge => (EDGE_COLUMNS, "edge"),
     };
     if valid.contains(&prop) {
         Ok(prop)
     } else {
-        let kind_name = match kind {
-            VarKind::Node => "node",
-            VarKind::Edge => "edge",
-        };
         Err(QueryError::Compile(format!(
             "unknown {kind_name} property '{prop}' in RETURN projection. \
              Valid: {}",
@@ -795,7 +1208,7 @@ mod tests {
         let has_ns_param = compiled
             .params
             .iter()
-            .any(|p| matches!(p, SqlValue::Text(s) if s == "research"));
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "research"));
         assert!(has_ns_param, "namespace must be a bound parameter");
     }
 
@@ -845,19 +1258,32 @@ mod tests {
     }
 
     #[test]
-    fn depth_cap_at_ten() {
-        // MAJ-2: depth capped at 10 regardless of query request
+    fn depth_cap_at_ten_rejects_above_max() {
+        // ADR-008 §"Depth limits": exceeding MAX_DEPTH is an InvalidInput error at
+        // validation time — the compiler never sees a query with depth > 10.
         let q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::InvalidInput(_)),
+            "expected InvalidInput for depth > 10, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn depth_within_cap_compiles() {
+        // depth *1..10 is at the cap — must compile successfully.
+        let q = gql::parse("MATCH (a)-[:extends*1..10]->(b) RETURN b").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
-        // The depth parameter must be <= 10
+        assert!(compiled.sql.contains("WITH RECURSIVE"));
+        // The depth parameter must equal 10
         let depth_val = compiled.params.iter().find_map(|p| {
-            if let SqlValue::Integer(n) = p {
+            if let QueryValue::Integer(n) = p {
                 Some(*n)
             } else {
                 None
             }
         });
-        assert!(depth_val.unwrap() <= 10, "depth must be capped at 10");
+        assert_eq!(depth_val, Some(10), "depth param should be 10");
     }
 
     #[test]
@@ -867,7 +1293,7 @@ mod tests {
         let compiled = compile(&q, &opts()).unwrap();
         let limit_param = compiled.params.last().unwrap();
         assert!(
-            matches!(limit_param, SqlValue::Integer(500)),
+            matches!(limit_param, QueryValue::Integer(500)),
             "expected Integer(500), got {limit_param:?}"
         );
     }
@@ -889,7 +1315,7 @@ mod tests {
         let has_gizmo = compiled
             .params
             .iter()
-            .any(|p| matches!(p, SqlValue::Text(s) if s == "gizmo"));
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "gizmo"));
         assert!(
             has_gizmo,
             "pack-agnostic: unknown kind must pass through into SQL params"
@@ -906,7 +1332,7 @@ mod tests {
         let has_paper = compiled
             .params
             .iter()
-            .any(|p| matches!(p, SqlValue::Text(s) if s == "paper"));
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "paper"));
         assert!(
             has_paper,
             "kind 'paper' must pass through unchanged into SQL params"
@@ -938,7 +1364,7 @@ mod tests {
         let has_paper = compiled
             .params
             .iter()
-            .any(|p| matches!(p, SqlValue::Text(s) if s == "paper"));
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "paper"));
         assert!(
             has_paper,
             "kind 'paper' must pass through unchanged into SQL params"
@@ -1101,10 +1527,263 @@ mod tests {
         let has_paper_param = compiled
             .params
             .iter()
-            .any(|p| matches!(p, SqlValue::Text(s) if s == "paper"));
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "paper"));
         assert!(
             has_paper_param,
             "entity_type value 'paper' must appear as a bound parameter"
+        );
+    }
+
+    // --- F047: OR support in WHERE clause (ADR-008 §"GQL WHERE expression") ---
+
+    #[test]
+    fn where_or_compiles_to_sql_or() {
+        let q = gql::parse(
+            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'LoRA' OR a.name = 'QLoRA' RETURN a",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains(" OR "),
+            "WHERE OR must produce SQL OR; sql: {}",
+            compiled.sql
+        );
+        let has_lora = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "LoRA"));
+        let has_qlora = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "QLoRA"));
+        assert!(has_lora && has_qlora, "both OR values must be bound params");
+    }
+
+    #[test]
+    fn where_and_or_precedence() {
+        // `a AND b OR c` should compile as `(a AND b) OR c`
+        let q = gql::parse(
+            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'X' AND a.kind = 'concept' OR b.kind = 'project' RETURN a"
+        ).unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // The SQL should contain an OR at the outer level wrapping the AND group
+        assert!(
+            compiled.sql.contains(" OR "),
+            "expected OR in sql; sql: {}",
+            compiled.sql
+        );
+    }
+
+    // --- F218: event_observations synthetic edge support (ADR-041 §8) ---
+
+    #[test]
+    fn synthetic_edge_joins_event_observations() {
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN ev, m").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("event_observations"),
+            "synthetic edge must join event_observations; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("graph_edges"),
+            "synthetic edge must NOT join graph_edges; sql: {}",
+            compiled.sql
+        );
+        let has_role_param = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "selected"));
+        assert!(has_role_param, "role 'selected' must be a bound parameter");
+    }
+
+    // CRIT-1 regression: event source node must bind to `events` table, not `entities`.
+    // Previously `FROM entities n0 JOIN event_observations e0 ON e0.event_id = n0.id`
+    // was emitted — IDs are disjoint so every query returned zero rows.
+    #[test]
+    fn synthetic_edge_event_source_binds_events_table() {
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN ev, m").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("FROM events "),
+            "CRIT-1: event source must come FROM events table, not entities; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled
+                .sql
+                .starts_with("SELECT * FROM entities n0 JOIN event_observations"),
+            "CRIT-1: must not join events via entities table; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn synthetic_edge_event_observation_join_uses_events_id() {
+        // The JOIN must be `event_observations.event_id = events_alias.id`,
+        // not `event_observations.event_id = entities_alias.id`.
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN m").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // The event alias is n0; the join must reference n0 against `events` table.
+        assert!(
+            compiled
+                .sql
+                .contains("JOIN event_observations e0 ON e0.event_id = n0.id"),
+            "CRIT-1: event_observations must join on events.id (n0 is now events); sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn synthetic_edge_event_node_projects_event_columns() {
+        // The event variable in RETURN must select event-table columns (verb, outcome, …),
+        // not entity columns (name, entity_type, properties, …).
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN ev").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("ev_verb"),
+            "CRIT-1: event variable must project verb column; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("ev_outcome"),
+            "CRIT-1: event variable must project outcome column; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("ev_name,") && !compiled.sql.contains("ev_name "),
+            "CRIT-1: event variable must NOT project entity name column; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("ev_properties"),
+            "CRIT-1: event variable must NOT project entity properties column; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn synthetic_edge_namespace_filter_on_events_table() {
+        // MIN-2: when scoped, the namespace filter must target the events table
+        // (which has a namespace column) — not rely on entities indirection.
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN m").unwrap();
+        let compiled = compile(&q, &scoped("test-ns")).unwrap();
+        // Both the event alias (n0, now from `events`) and the target alias (n1, from `entities`)
+        // must have namespace filters.
+        let ns_count = compiled
+            .params
+            .iter()
+            .filter(|p| matches!(p, QueryValue::Text(s) if s == "test-ns"))
+            .count();
+        assert!(
+            ns_count >= 2,
+            "MIN-2: namespace must be filtered on both events and target; params: {:?}",
+            compiled.params
+        );
+    }
+
+    #[test]
+    fn synthetic_edge_candidate_role() {
+        let q = gql::parse("MATCH (ev)-[:observed_as_candidate]->(m) RETURN ev, m").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("event_observations"),
+            "sql: {}",
+            compiled.sql
+        );
+        let has_candidate = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "candidate"));
+        assert!(has_candidate, "role 'candidate' must be bound");
+    }
+
+    #[test]
+    fn synthetic_edge_multi_role() {
+        // Multiple observed_as_* relations compile to a role IN (...) predicate.
+        let q =
+            gql::parse("MATCH (ev)-[:observed_as_candidate|observed_as_selected]->(m) RETURN m")
+                .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("event_observations"),
+            "sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("IN"),
+            "multi-role must use IN; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn mixed_synthetic_and_canonical_rejected() {
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected|extends]->(m) RETURN m").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(_)),
+            "mixed synthetic+canonical must be rejected; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn synthetic_edge_inbound_rejected() {
+        let q = gql::parse("MATCH (m)<-[:observed_as_selected]-(ev) RETURN m").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Compile(_)),
+            "inbound synthetic edge must be rejected; got {err:?}"
+        );
+    }
+
+    // --- MAJ-1: OR spanning both endpoints in variable-length patterns must be rejected ---
+
+    #[test]
+    fn variable_length_or_across_endpoints_rejected() {
+        // MAJ-1: `WHERE a.name='X' OR b.name='Y'` in a variable-length pattern must be
+        // rejected with Unsupported — not silently compiled to AND.
+        let q = gql::parse(
+            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' OR b.name = 'Y' RETURN a",
+        )
+        .unwrap();
+        let result = compile(&q, &opts());
+        assert!(
+            matches!(result, Err(QueryError::Unsupported(_))),
+            "MAJ-1: OR spanning both endpoints must return Unsupported; got {result:?}"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("separate queries") || err_msg.contains("one endpoint"),
+            "error must be actionable; got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn variable_length_or_single_endpoint_still_works() {
+        // OR within a single endpoint (same alias) must still compile successfully.
+        let q = gql::parse(
+            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' OR a.name = 'Y' RETURN a",
+        )
+        .unwrap();
+        let result = compile(&q, &opts());
+        assert!(
+            result.is_ok(),
+            "single-endpoint OR must compile; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn variable_length_and_across_endpoints_still_works() {
+        // AND across endpoints must still compile (the existing behavior is correct for AND).
+        let q = gql::parse(
+            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' AND b.name = 'Y' RETURN a",
+        )
+        .unwrap();
+        let result = compile(&q, &opts());
+        assert!(
+            result.is_ok(),
+            "AND across endpoints must compile; got {result:?}"
         );
     }
 }

@@ -348,7 +348,7 @@ fn triples_to_ast(
     let mut node_kinds: HashMap<String, String> = HashMap::new();
     let mut node_props: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut edges: Vec<(String, String, String, usize, usize)> = Vec::new(); // (src, tgt, rel, min, max)
-    let mut where_conditions: Vec<Condition> = Vec::new();
+    let mut where_cond_list: Vec<Condition> = Vec::new();
 
     for triple in triples {
         match triple.predicate {
@@ -378,7 +378,7 @@ fn triples_to_ast(
                         .insert(name, val);
                 }
                 Object::NumberLiteral(val) => {
-                    where_conditions.push(Condition {
+                    where_cond_list.push(Condition {
                         variable: triple.subject,
                         property: name,
                         op: CompareOp::Eq,
@@ -394,6 +394,17 @@ fn triples_to_ast(
             },
         }
     }
+
+    // Fold the flat condition list into a left-associative AND tree.
+    let where_conditions = where_cond_list
+        .into_iter()
+        .fold(WhereExpr::True, |acc, cond| {
+            let leaf = WhereExpr::Condition(cond);
+            match acc {
+                WhereExpr::True => leaf,
+                other => WhereExpr::And(Box::new(other), Box::new(leaf)),
+            }
+        });
 
     if edges.is_empty() {
         return Err(QueryError::Parse {
