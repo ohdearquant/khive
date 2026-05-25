@@ -3,7 +3,7 @@
  *
  * Strategy (in order):
  *   1. `KKERNEL_BINARY` env var — explicit override, used in dev and tests.
- *   2. `@khive/kernel-<platform>/bin/kkernel` under node_modules — production
+ *   2. `khive-kernel-<platform>/bin/kkernel` under node_modules — production
  *      install via npm optional dependencies (ADR-026).
  *   3. `<repo>/crates/target/release/kkernel` — monorepo dev convenience.
  *   4. `<repo>/crates/target/debug/kkernel` — last-resort dev fallback.
@@ -54,7 +54,7 @@ function detectLibc(): "gnu" | "musl" {
 }
 
 /**
- * Resolve the platform suffix for the @khive/kernel-{platform} subpackage on
+ * Resolve the platform suffix for the khive-kernel-{platform} subpackage on
  * Linux. Returns the suffix string, or throws with a clear "unsupported"
  * message for musl arm64 (not in the v1 matrix).
  */
@@ -132,8 +132,7 @@ export function kkernelPath(repoRoot?: string): string {
     const candidate = join(
       nodeModulesRoot,
       "node_modules",
-      "@khive",
-      `kernel-${platformKey()}`,
+      `khive-kernel-${platformKey()}`,
       "bin",
       exe,
     );
@@ -160,7 +159,7 @@ export function kkernelPath(repoRoot?: string): string {
     `kkernel binary not found.\n` +
       `Tried:\n` +
       `  KKERNEL_BINARY env var\n` +
-      `  @khive/kernel-${platformKey()}/bin/${exe} (npm install)\n` +
+      `  khive-kernel-${platformKey()}/bin/${exe} (npm install)\n` +
       `  ${candidates.join("\n  ")}\n` +
       `If you're developing locally, run: (cd crates && cargo build --release -p kkernel)\n` +
       `Supported platforms: darwin-arm64, darwin-x64, linux-x64-gnu, linux-x64-musl, linux-arm64, win32-x64.`,

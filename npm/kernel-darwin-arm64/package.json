@@ -1,5 +1,5 @@
 {
-  "name": "@khive/kernel-darwin-arm64",
+  "name": "khive-kernel-darwin-arm64",
   "version": "0.2.2",
   "description": "khive Rust binaries for macOS Apple Silicon (arm64)",
   "license": "Apache-2.0",

@@ -1,5 +1,5 @@
 {
-  "name": "@khive/kernel-linux-x64-musl",
+  "name": "khive-kernel-linux-x64-musl",
   "version": "0.2.2",
   "description": "khive Rust binaries for Linux x86_64 musl (Alpine etc.)",
   "license": "Apache-2.0",

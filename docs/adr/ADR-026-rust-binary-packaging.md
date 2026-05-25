@@ -50,12 +50,12 @@ khive (npm main package)
 Platform subpackages, one per target:
 
 ```
-@khive/kernel-darwin-arm64    (Apple Silicon macOS)
-@khive/kernel-darwin-x64      (Intel macOS)
-@khive/kernel-linux-x64-gnu   (Linux x86_64 glibc)
-@khive/kernel-linux-x64-musl  (Linux x86_64 musl / Alpine)
-@khive/kernel-linux-arm64     (Linux ARM64 glibc)
-@khive/kernel-win32-x64       (Windows x86_64)
+khive-kernel-darwin-arm64    (Apple Silicon macOS)
+khive-kernel-darwin-x64      (Intel macOS)
+khive-kernel-linux-x64-gnu   (Linux x86_64 glibc)
+khive-kernel-linux-x64-musl  (Linux x86_64 musl / Alpine)
+khive-kernel-linux-arm64     (Linux ARM64 glibc)
+khive-kernel-win32-x64       (Windows x86_64)
 ```
 
 Each subpackage ships exactly two binaries: `kkernel` and `khive-mcp` for the matching
@@ -76,7 +76,7 @@ function platformKey(): string {
 export function kkernelPath(): string {
   const key = platformKey();
   const candidates = [
-    `${nodeModulesRoot}/@khive/kernel-${key}/bin/kkernel`,
+    `${nodeModulesRoot}/khive-kernel-${key}/bin/kkernel`,
     // fallback paths for development / monorepo
     `${projectRoot}/target/release/kkernel`,
   ];
@@ -114,7 +114,7 @@ Each job runs:
 
 1. `cargo build --release --target <triple> -p kkernel -p khive-mcp`
 2. Strip (macOS, Linux) + sign + notarize (macOS) + sign (Windows)
-3. Publish `@khive/kernel-{platform}@<version>` to npm
+3. Publish `khive-kernel-{platform}@<version>` to npm
 4. Wait for all jobs to succeed
 5. Publish the umbrella `khive@<version>` package
 
@@ -156,7 +156,7 @@ Clear failure beats silent fallback to broken behavior.
 
 ### Future WASM subpackage (optional, not v1)
 
-A `@khive/kernel-wasm` subpackage could be added later as a fallback for unsupported
+A `khive-kernel-wasm` subpackage could be added later as a fallback for unsupported
 platforms, with reduced functionality (no sqlite-vec acceleration, no parallel embed
 inference). Not in scope for v1; tracked as a future enhancement.
 
@@ -272,13 +272,13 @@ users install once and run constantly, install size is a real friction point.
 
 1. **WASM fallback subpackage**. Open until someone files an issue requesting a target
    not in the matrix (e.g., riscv64, FreeBSD). When that happens, build a reduced-
-   functionality WASM subpackage as `@khive/kernel-wasm` and document the trade-offs.
-2. **Umbrella → subpackage version pinning**. Pin exact match (`@khive/kernel-* === khive
+   functionality WASM subpackage as `khive-kernel-wasm` and document the trade-offs.
+2. **Umbrella → subpackage version pinning**. Pin exact match (`khive-kernel-* === khive
    version`) to prevent skew during partial releases. Accepting a range (`^0.1.0`) would
    allow security patches without umbrella republish but breaks the atomic-release model.
    v1: exact pin.
 3. **Where does the Deno CLI source ship**. Same npm package, or separate? Default: same,
-   to keep one install. A `@khive/cli` separate package would only matter if we wanted to
+   to keep one install. A `khive-cli` separate package would only matter if we wanted to
    version the CLI independently of the kernel, which we do not yet.
 
 ## References
