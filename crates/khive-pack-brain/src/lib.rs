@@ -6,6 +6,7 @@ pub mod tunable;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -14,43 +15,67 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
     DispatchHook, EventView, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
 };
-use khive_storage::event::EventFilter;
+use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
 use khive_types::{HandlerDef, Pack, Visibility};
 
-use crate::fold::EventFold;
-use crate::state::BrainState;
+use crate::fold::BalancedRecallFold;
+use crate::state::{BrainState, ProfileBinding, ProfileLifecycle, ProfileRecord};
 
 const ENTITY_CACHE_CAPACITY: usize = 10_000;
 
-pub struct BrainPack {
-    runtime: KhiveRuntime,
-    state: Mutex<BrainState>,
-    fold: EventFold,
-}
+// ── Handler table ─────────────────────────────────────────────────────────────
 
-impl Pack for BrainPack {
-    const NAME: &'static str = "brain";
-    const NOTE_KINDS: &'static [&'static str] = &[];
-    const ENTITY_KINDS: &'static [&'static str] = &[];
-    const HANDLERS: &'static [HandlerDef] = &BRAIN_HANDLERS;
-    const REQUIRES: &'static [&'static str] = &["kg"];
-}
-
-static BRAIN_HANDLERS: [HandlerDef; 5] = [
+/// Brain pack verb surface per ADR-032 §11.
+///
+/// Visibility::Verb  = exposed on the MCP `request` tool.
+/// Visibility::Subhandler = internal / operator-only.
+static BRAIN_HANDLERS: &[HandlerDef] = &[
+    // ── Assertive (read) verbs ────────────────────────────────────────────
     HandlerDef {
         name: "brain.state",
         description: "Return current BrainState snapshot for inspection",
-        visibility: Visibility::Verb,
+        visibility: Visibility::Subhandler,
     },
     HandlerDef {
         name: "brain.config",
         description: "Return projected config for a named pack parameter",
-        visibility: Visibility::Verb,
+        visibility: Visibility::Subhandler,
     },
     HandlerDef {
         name: "brain.events",
         description: "List recent brain-relevant events for debugging",
+        visibility: Visibility::Subhandler,
+    },
+    HandlerDef {
+        name: "brain.profiles",
+        description: "List profiles, optionally filtered by lifecycle",
+        visibility: Visibility::Verb,
+    },
+    HandlerDef {
+        name: "brain.profile",
+        description: "Profile metadata, latest snapshot, current state summary",
+        visibility: Visibility::Verb,
+    },
+    HandlerDef {
+        name: "brain.resolve",
+        description: "Show which profile would serve a caller context",
+        visibility: Visibility::Verb,
+    },
+    // ── Commissive (write state) verbs ────────────────────────────────────
+    HandlerDef {
+        name: "brain.activate",
+        description: "Move a profile to Active (start live update loop)",
+        visibility: Visibility::Verb,
+    },
+    HandlerDef {
+        name: "brain.deactivate",
+        description: "Move a profile to Inactive (stop live updates, retain state)",
+        visibility: Visibility::Verb,
+    },
+    HandlerDef {
+        name: "brain.archive",
+        description: "Move a profile to Archived (read-only, audit-retained)",
         visibility: Visibility::Verb,
     },
     HandlerDef {
@@ -59,17 +84,56 @@ static BRAIN_HANDLERS: [HandlerDef; 5] = [
         visibility: Visibility::Verb,
     },
     HandlerDef {
-        name: "brain.emit",
-        description: "Manually emit a feedback event for a specific entity",
+        name: "brain.feedback",
+        description: "Emit a FeedbackExplicit event into the shared log",
         visibility: Visibility::Verb,
+    },
+    // ── Declaration verbs ─────────────────────────────────────────────────
+    HandlerDef {
+        name: "brain.bind",
+        description: "Write a row in the profile resolution table",
+        visibility: Visibility::Verb,
+    },
+    HandlerDef {
+        name: "brain.unbind",
+        description: "Remove rows from the profile resolution table",
+        visibility: Visibility::Verb,
+    },
+    // ── Legacy / internal ─────────────────────────────────────────────────
+    HandlerDef {
+        name: "brain.emit",
+        description: "Manually emit a feedback event (deprecated; use brain.feedback)",
+        visibility: Visibility::Subhandler,
     },
 ];
 
+// ── BrainPack ─────────────────────────────────────────────────────────────────
+
+/// Brain pack — profile-oriented auto-tuning (ADR-032).
+///
+/// `BrainState` holds the profile registry. `BalancedRecallFold` drives the
+/// v1 default profile. The old scalar `BrainState` design is superseded; see
+/// ADR-032 §1 and the migration notes in `state.rs`.
+pub struct BrainPack {
+    runtime: KhiveRuntime,
+    /// Profile registry + active balanced-recall state.
+    state: Mutex<BrainState>,
+    /// Fold for the built-in `balanced-recall-v1` profile.
+    fold: BalancedRecallFold,
+}
+
+impl Pack for BrainPack {
+    const NAME: &'static str = "brain";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = BRAIN_HANDLERS;
+    const REQUIRES: &'static [&'static str] = &["kg"];
+}
+
 impl BrainPack {
     pub fn new(runtime: KhiveRuntime) -> Self {
-        let fold = EventFold::new(ENTITY_CACHE_CAPACITY);
-        let ctx = FoldContext::new();
-        let state = fold.init(&ctx);
+        let fold = BalancedRecallFold::new(ENTITY_CACHE_CAPACITY);
+        let state = BrainState::new(ENTITY_CACHE_CAPACITY);
         Self {
             runtime,
             state: Mutex::new(state),
@@ -77,20 +141,20 @@ impl BrainPack {
         }
     }
 
+    /// Public snapshot of the current `BrainState`.
+    pub fn snapshot(&self) -> crate::state::BrainStateSnapshot {
+        self.state.lock().unwrap().to_snapshot()
+    }
+
+    // ── brain.state ───────────────────────────────────────────────────────
+
     async fn handle_state(&self, _params: Value) -> Result<Value, RuntimeError> {
         let state = self.state.lock().unwrap();
         let snapshot = state.to_snapshot();
         serde_json::to_value(&snapshot).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
     }
 
-    /// Public snapshot of the current `BrainState`.
-    ///
-    /// Equivalent to dispatching the `brain.state` verb but callable directly
-    /// when you hold an `Arc<BrainPack>` (e.g. a test that registered the pack
-    /// as a `DispatchHook` and wants to verify posteriors updated).
-    pub fn snapshot(&self) -> crate::state::BrainStateSnapshot {
-        self.state.lock().unwrap().to_snapshot()
-    }
+    // ── brain.config ──────────────────────────────────────────────────────
 
     async fn handle_config(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
@@ -101,12 +165,30 @@ impl BrainPack {
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         let state = self.state.lock().unwrap();
+        let br = &state.balanced_recall;
+
+        let param_map = [
+            ("recall::relevance_weight", &br.relevance),
+            ("recall::importance_weight", &br.importance),
+            ("recall::temporal_weight", &br.temporal),
+        ];
+
         match p.parameter {
             Some(key) => {
-                let posterior = state
-                    .parameters
-                    .get(&key)
-                    .ok_or_else(|| RuntimeError::NotFound(format!("parameter {key:?}")))?;
+                let posterior = param_map
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, p)| *p)
+                    .ok_or_else(|| {
+                        RuntimeError::NotFound(format!(
+                            "parameter {key:?}; valid: {}",
+                            param_map
+                                .iter()
+                                .map(|(k, _)| *k)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    })?;
                 Ok(json!({
                     "parameter": key,
                     "mean": posterior.mean(),
@@ -117,12 +199,11 @@ impl BrainPack {
                 }))
             }
             None => {
-                let configs: serde_json::Map<String, Value> = state
-                    .parameters
+                let configs: serde_json::Map<String, Value> = param_map
                     .iter()
                     .map(|(k, p)| {
                         (
-                            k.clone(),
+                            (*k).to_owned(),
                             json!({
                                 "mean": p.mean(),
                                 "variance": p.variance(),
@@ -135,6 +216,8 @@ impl BrainPack {
             }
         }
     }
+
+    // ── brain.events ──────────────────────────────────────────────────────
 
     async fn handle_events(
         &self,
@@ -156,7 +239,8 @@ impl BrainPack {
             verbs: vec![
                 "recall".into(),
                 "search".into(),
-                "brain.emit".into(),
+                "brain.feedback".into(),
+                "brain.emit".into(), // retained for backward-compat queries
                 "get".into(),
                 "remember".into(),
             ],
@@ -190,26 +274,168 @@ impl BrainPack {
         }))
     }
 
+    // ── brain.profiles ────────────────────────────────────────────────────
+
+    async fn handle_profiles(&self, params: Value) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        struct ProfilesParams {
+            lifecycle: Option<String>,
+        }
+        let p: ProfilesParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let state = self.state.lock().unwrap();
+        let filter_lc: Option<ProfileLifecycle> = p
+            .lifecycle
+            .as_deref()
+            .map(|s| serde_json::from_value(Value::String(s.to_owned())))
+            .transpose()
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid lifecycle: {e}")))?;
+
+        let profiles: Vec<&ProfileRecord> = state
+            .profiles
+            .values()
+            .filter(|r| filter_lc.as_ref().is_none_or(|lc| &r.lifecycle == lc))
+            .collect();
+
+        let items: Vec<Value> = profiles
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "description": r.description,
+                    "consumer_kind": r.consumer_kind,
+                    "state_class": r.state_class,
+                    "lifecycle": r.lifecycle,
+                    "total_events": r.total_events,
+                    "exploration_epoch": r.exploration_epoch,
+                    "created_at": r.created_at,
+                })
+            })
+            .collect();
+
+        Ok(json!({ "count": items.len(), "profiles": items }))
+    }
+
+    // ── brain.profile ─────────────────────────────────────────────────────
+
+    async fn handle_profile(&self, params: Value) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        struct ProfileParams {
+            id: String,
+        }
+        let p: ProfileParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let state = self.state.lock().unwrap();
+        let record = state
+            .profiles
+            .get(&p.id)
+            .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", p.id)))?;
+
+        Ok(json!({
+            "id": record.id,
+            "description": record.description,
+            "consumer_kind": record.consumer_kind,
+            "state_class": record.state_class,
+            "lifecycle": record.lifecycle,
+            "total_events": record.total_events,
+            "exploration_epoch": record.exploration_epoch,
+            "created_at": record.created_at,
+            "state_snapshot": record.state_snapshot,
+        }))
+    }
+
+    // ── brain.resolve ─────────────────────────────────────────────────────
+
+    async fn handle_resolve(&self, params: Value) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        struct ResolveParams {
+            actor: Option<String>,
+            namespace: Option<String>,
+            consumer_kind: String,
+        }
+        let p: ResolveParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let state = self.state.lock().unwrap();
+        match state.resolve(p.actor.as_deref(), p.namespace.as_deref(), &p.consumer_kind) {
+            Some(record) => Ok(json!({
+                "resolved_profile_id": record.id,
+                "lifecycle": record.lifecycle,
+                "consumer_kind": record.consumer_kind,
+            })),
+            None => Err(RuntimeError::NotFound(format!(
+                "no profile resolved for consumer_kind={:?}",
+                p.consumer_kind
+            ))),
+        }
+    }
+
+    // ── brain.activate / deactivate / archive ─────────────────────────────
+
+    async fn handle_activate(&self, params: Value) -> Result<Value, RuntimeError> {
+        self.set_lifecycle(params, ProfileLifecycle::Active).await
+    }
+
+    async fn handle_deactivate(&self, params: Value) -> Result<Value, RuntimeError> {
+        self.set_lifecycle(params, ProfileLifecycle::Inactive).await
+    }
+
+    async fn handle_archive(&self, params: Value) -> Result<Value, RuntimeError> {
+        self.set_lifecycle(params, ProfileLifecycle::Archived).await
+    }
+
+    async fn set_lifecycle(
+        &self,
+        params: Value,
+        lifecycle: ProfileLifecycle,
+    ) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        struct LifecycleParams {
+            profile_id: String,
+        }
+        let p: LifecycleParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let mut state = self.state.lock().unwrap();
+        let record = state
+            .profiles
+            .get_mut(&p.profile_id)
+            .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", p.profile_id)))?;
+
+        record.lifecycle = lifecycle.clone();
+        Ok(json!({
+            "profile_id": p.profile_id,
+            "lifecycle": lifecycle,
+        }))
+    }
+
+    // ── brain.reset ───────────────────────────────────────────────────────
+
     async fn handle_reset(&self, _params: Value) -> Result<Value, RuntimeError> {
         let mut state = self.state.lock().unwrap();
         state.reset_posteriors();
         Ok(json!({
             "reset": true,
-            "exploration_epoch": state.exploration_epoch,
+            "exploration_epoch": state.balanced_recall.exploration_epoch,
         }))
     }
 
-    async fn handle_emit(
+    // ── brain.feedback ────────────────────────────────────────────────────
+
+    async fn handle_feedback(
         &self,
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
-        struct EmitParams {
+        struct FeedbackParams {
             target_id: String,
             signal: String,
+            served_by_profile_id: Option<String>,
         }
-        let p: EmitParams = serde_json::from_value(params)
+        let p: FeedbackParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         let target: uuid::Uuid = p
@@ -228,15 +454,20 @@ impl BrainPack {
             }
         };
 
-        let event = khive_storage::event::Event::new(
+        let mut data = json!({"signal": signal});
+        if let Some(ref profile_id) = p.served_by_profile_id {
+            data["served_by_profile_id"] = json!(profile_id);
+        }
+
+        let event = Event::new(
             token.namespace().as_str().to_string(),
-            "brain.emit",
+            "brain.feedback",
             khive_types::EventKind::FeedbackExplicit,
-            khive_types::SubstrateKind::Entity,
+            khive_types::SubstrateKind::Event,
             "brain",
         )
         .with_target(target)
-        .with_payload(json!({"signal": signal, "about_id": target.to_string()}));
+        .with_payload(data);
 
         let store = self.runtime.events(token)?;
         store
@@ -244,25 +475,145 @@ impl BrainPack {
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        // Update brain state from this event
+        // Update balanced-recall profile state from this event
         let ctx = FoldContext::new();
         let mut state = self.state.lock().unwrap();
-        let current = std::mem::replace(
-            &mut *state,
-            BrainState::new(std::collections::HashMap::new(), 0),
+        let current_recall = std::mem::replace(
+            &mut state.balanced_recall,
+            crate::state::BalancedRecallState::new(0),
         );
-        *state = self.fold.reduce(current, &event, &ctx);
+        let updated = self.fold.reduce(current_recall, &event, &ctx);
+        state.balanced_recall = updated;
+
+        // Sync profile record metadata — collect values first to avoid borrow conflict.
+        let total_ev = state.balanced_recall.total_events;
+        let snap_val = serde_json::to_value(state.balanced_recall.to_snapshot()).ok();
+        if let Some(record) = state.profiles.get_mut("balanced-recall-v1") {
+            record.total_events = total_ev;
+            record.state_snapshot = snap_val;
+        }
 
         Ok(json!({
             "emitted": true,
             "event_id": event.id.to_string(),
+            "verb": "brain.feedback",
             "signal": signal,
             "target_id": target.to_string(),
         }))
     }
+
+    // ── brain.emit (deprecated) ───────────────────────────────────────────
+
+    /// Deprecated: use `brain.feedback`. Kept for backward-compat; routes to
+    /// `handle_feedback` with the same parameters.
+    async fn handle_emit(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.handle_feedback(token, params).await
+    }
+
+    // ── brain.bind ────────────────────────────────────────────────────────
+
+    async fn handle_bind(&self, params: Value) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        struct BindParams {
+            profile_id: String,
+            actor: Option<String>,
+            namespace: Option<String>,
+            consumer_kind: Option<String>,
+            priority: Option<i32>,
+        }
+        let p: BindParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let mut state = self.state.lock().unwrap();
+
+        // Verify the profile exists
+        if !state.profiles.contains_key(&p.profile_id) {
+            return Err(RuntimeError::NotFound(format!(
+                "profile {:?}",
+                p.profile_id
+            )));
+        }
+
+        let actor = p.actor.unwrap_or_else(|| "*".into());
+        let namespace = p.namespace.unwrap_or_else(|| "*".into());
+        let consumer_kind = p.consumer_kind.unwrap_or_else(|| "*".into());
+
+        // Validate that '*' is not used as a real value (ADR-032 §10 wildcard sentinel)
+        for (field, val) in [
+            ("actor", &actor),
+            ("namespace", &namespace),
+            ("consumer_kind", &consumer_kind),
+        ] {
+            if val.as_str() != "*" && val.contains('*') {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "{field}: '*' is reserved as the wildcard sentinel and cannot appear inside a real value"
+                )));
+            }
+        }
+
+        // Remove any existing binding for the same (actor, namespace, consumer_kind)
+        state.bindings.retain(|b| {
+            !(b.actor == actor && b.namespace == namespace && b.consumer_kind == consumer_kind)
+        });
+
+        state.bindings.push(ProfileBinding {
+            actor: actor.clone(),
+            namespace: namespace.clone(),
+            consumer_kind: consumer_kind.clone(),
+            profile_id: p.profile_id.clone(),
+            priority: p.priority.unwrap_or(0),
+            created_at: Utc::now(),
+        });
+
+        Ok(json!({
+            "bound": true,
+            "profile_id": p.profile_id,
+            "actor": actor,
+            "namespace": namespace,
+            "consumer_kind": consumer_kind,
+        }))
+    }
+
+    // ── brain.unbind ──────────────────────────────────────────────────────
+
+    async fn handle_unbind(&self, params: Value) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        struct UnbindParams {
+            profile_id: Option<String>,
+            actor: Option<String>,
+            namespace: Option<String>,
+            consumer_kind: Option<String>,
+        }
+        let p: UnbindParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let mut state = self.state.lock().unwrap();
+        let before = state.bindings.len();
+
+        state.bindings.retain(|b| {
+            let pid_match = p.profile_id.as_ref().is_none_or(|id| &b.profile_id == id);
+            let actor_match = p.actor.as_ref().is_none_or(|a| &b.actor == a);
+            let ns_match = p.namespace.as_ref().is_none_or(|n| &b.namespace == n);
+            let kind_match = p
+                .consumer_kind
+                .as_ref()
+                .is_none_or(|k| &b.consumer_kind == k);
+            // Retain if this binding does NOT match ALL of the provided filters.
+            // A filter that is absent (None) matches everything — only bindings
+            // satisfying every supplied criterion are removed.
+            !(pid_match && actor_match && ns_match && kind_match)
+        });
+
+        let removed = before - state.bindings.len();
+        Ok(json!({ "unbound": removed }))
+    }
 }
 
-// ── ADR-063: inventory self-registration ─────────────────────────────────────
+// ── Inventory self-registration ───────────────────────────────────────────────
 
 struct BrainPackFactory;
 
@@ -282,6 +633,8 @@ impl khive_runtime::PackFactory for BrainPackFactory {
 
 inventory::submit! { khive_runtime::PackRegistration(&BrainPackFactory) }
 
+// ── PackRuntime impl ──────────────────────────────────────────────────────────
+
 #[async_trait]
 impl PackRuntime for BrainPack {
     fn name(&self) -> &str {
@@ -297,7 +650,7 @@ impl PackRuntime for BrainPack {
     }
 
     fn handlers(&self) -> &'static [HandlerDef] {
-        &BRAIN_HANDLERS
+        BRAIN_HANDLERS
     }
 
     fn requires(&self) -> &'static [&'static str] {
@@ -312,10 +665,23 @@ impl PackRuntime for BrainPack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
+            // Assertive
             "brain.state" => self.handle_state(params).await,
             "brain.config" => self.handle_config(params).await,
             "brain.events" => self.handle_events(token, params).await,
+            "brain.profiles" => self.handle_profiles(params).await,
+            "brain.profile" => self.handle_profile(params).await,
+            "brain.resolve" => self.handle_resolve(params).await,
+            // Commissive
+            "brain.activate" => self.handle_activate(params).await,
+            "brain.deactivate" => self.handle_deactivate(params).await,
+            "brain.archive" => self.handle_archive(params).await,
             "brain.reset" => self.handle_reset(params).await,
+            "brain.feedback" => self.handle_feedback(token, params).await,
+            // Declaration
+            "brain.bind" => self.handle_bind(params).await,
+            "brain.unbind" => self.handle_unbind(params).await,
+            // Legacy
             "brain.emit" => self.handle_emit(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "brain pack does not handle verb {verb:?}"
@@ -324,29 +690,29 @@ impl PackRuntime for BrainPack {
     }
 }
 
-/// `BrainPack` as a post-dispatch hook (Issue #158).
+// ── DispatchHook impl ─────────────────────────────────────────────────────────
+
+/// `BrainPack` as a post-dispatch hook.
 ///
 /// When registered via `VerbRegistryBuilder::with_dispatch_hook`, every
 /// successful verb dispatch calls `on_dispatch` with a synthesized `Event`.
-/// The event is fed into `EventFold::step`, updating the brain's posteriors
-/// in real time — no polling required.
-///
-/// This is opt-in: the hook must be explicitly registered. Registries that do
-/// not load the brain pack are unaffected.
+/// The event is fed into `BalancedRecallFold::reduce`, updating the brain's
+/// posteriors in real time — no polling required.
 #[async_trait]
 impl DispatchHook for BrainPack {
     async fn on_dispatch(&self, view: &EventView) {
         let ctx = FoldContext::new();
         let mut state = self.state.lock().unwrap();
-        // Replace state with fold result. BrainState is not Clone, so we
-        // use mem::replace with a sentinel and immediately overwrite.
         let current = std::mem::replace(
-            &mut *state,
-            BrainState::new(std::collections::HashMap::new(), 0),
+            &mut state.balanced_recall,
+            crate::state::BalancedRecallState::new(0),
         );
-        *state = self.fold.reduce(current, &view.event, &ctx);
+        let updated = self.fold.reduce(current, &view.event, &ctx);
+        state.balanced_recall = updated;
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -407,13 +773,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_emit_invalid_signal_returns_invalid_input() {
+    async fn dispatch_feedback_invalid_signal_returns_invalid_input() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
         let target = "00000000-0000-0000-0000-000000000001";
         let err = pack
             .dispatch(
-                "brain.emit",
+                "brain.feedback",
                 json!({"target_id": target, "signal": "bad_signal"}),
                 &registry,
                 &rt.authorize(Namespace::local()),
@@ -447,11 +813,346 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.get("total_events").is_some(), "missing total_events");
+        assert!(result.get("profiles").is_some(), "missing profiles");
         assert!(
-            result.get("exploration_epoch").is_some(),
-            "missing exploration_epoch"
+            result.get("balanced_recall").is_some(),
+            "missing balanced_recall"
         );
-        assert!(result.get("parameters").is_some(), "missing parameters");
+        assert!(result.get("bindings").is_some(), "missing bindings");
+    }
+
+    #[tokio::test]
+    async fn dispatch_profiles_returns_default_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let result = pack
+            .dispatch(
+                "brain.profiles",
+                json!({}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap();
+        let profiles = result["profiles"].as_array().unwrap();
+        assert!(!profiles.is_empty(), "expected at least one profile");
+        assert_eq!(profiles[0]["id"], json!("balanced-recall-v1"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_profiles_filtered_by_lifecycle() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let result = pack
+            .dispatch(
+                "brain.profiles",
+                json!({"lifecycle": "active"}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap();
+        let profiles = result["profiles"].as_array().unwrap();
+        for p in profiles {
+            assert_eq!(p["lifecycle"], json!("active"));
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_profile_returns_profile_details() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let result = pack
+            .dispatch(
+                "brain.profile",
+                json!({"id": "balanced-recall-v1"}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["id"], json!("balanced-recall-v1"));
+        assert_eq!(result["state_class"], json!("Bayesian"));
+        assert_eq!(result["consumer_kind"], json!("recall"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_profile_not_found_returns_not_found() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let err = pack
+            .dispatch(
+                "brain.profile",
+                json!({"id": "nonexistent"}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_resolve_returns_default_profile_for_recall() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let result = pack
+            .dispatch(
+                "brain.resolve",
+                json!({"consumer_kind": "recall"}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["resolved_profile_id"], json!("balanced-recall-v1"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_activate_and_deactivate_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Deactivate the default profile
+        let result = pack
+            .dispatch(
+                "brain.deactivate",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["lifecycle"], json!("inactive"));
+
+        // Verify via brain.profile
+        let state = pack
+            .dispatch(
+                "brain.profile",
+                json!({"id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state["lifecycle"], json!("inactive"));
+
+        // Reactivate
+        let result = pack
+            .dispatch(
+                "brain.activate",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["lifecycle"], json!("active"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_archive_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let result = pack
+            .dispatch(
+                "brain.archive",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["lifecycle"], json!("archived"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_activate_nonexistent_profile_returns_not_found() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let err = pack
+            .dispatch(
+                "brain.activate",
+                json!({"profile_id": "ghost-profile"}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_bind_and_resolve_explicit_binding() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Bind balanced-recall-v1 for actor "agent-x"
+        let result = pack
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "agent-x",
+                    "consumer_kind": "recall"
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["bound"], json!(true));
+        assert_eq!(result["actor"], json!("agent-x"));
+
+        // Resolve — should return the explicitly bound profile
+        let resolved = pack
+            .dispatch(
+                "brain.resolve",
+                json!({"actor": "agent-x", "consumer_kind": "recall"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved["resolved_profile_id"], json!("balanced-recall-v1"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_bind_nonexistent_profile_returns_not_found() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let err = pack
+            .dispatch(
+                "brain.bind",
+                json!({"profile_id": "ghost", "consumer_kind": "recall"}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_unbind_removes_binding() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Add a binding
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "balanced-recall-v1", "actor": "agent-y", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Remove it
+        let result = pack
+            .dispatch(
+                "brain.unbind",
+                json!({"actor": "agent-y"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["unbound"], json!(1u64));
+    }
+
+    // Regression test for MAJ-002: unbind with multiple filters must use AND semantics,
+    // removing only the binding that satisfies ALL supplied criteria.
+    #[tokio::test]
+    async fn dispatch_unbind_uses_and_not_or() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // binding 1: ns=A, profile=P1 (the one we want to remove)
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "balanced-recall-v1", "namespace": "ns-a", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // binding 2: ns=B, profile=P1 (must survive)
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "balanced-recall-v1", "namespace": "ns-b", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Unbind using both filters: only binding-1 should be removed
+        let result = pack
+            .dispatch(
+                "brain.unbind",
+                json!({"namespace": "ns-a", "profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result["unbound"],
+            json!(1u64),
+            "should remove exactly one binding"
+        );
+
+        // binding-2 (ns-b) must still exist
+        let state = pack.state.lock().unwrap();
+        let remaining: Vec<_> = state
+            .bindings
+            .iter()
+            .filter(|b| b.namespace == "ns-b")
+            .collect();
+        assert_eq!(remaining.len(), 1, "ns-b binding must survive the unbind");
+    }
+
+    #[tokio::test]
+    async fn dispatch_config_all_parameters() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let result = pack
+            .dispatch(
+                "brain.config",
+                json!({}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        assert!(obj.contains_key("recall::relevance_weight"));
+        assert!(obj.contains_key("recall::importance_weight"));
+        assert!(obj.contains_key("recall::temporal_weight"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_config_single_parameter() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let result = pack
+            .dispatch(
+                "brain.config",
+                json!({"parameter": "recall::relevance_weight"}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["parameter"], json!("recall::relevance_weight"));
+        // Prior is Beta(7,3): mean = 0.7
+        let mean = result["mean"].as_f64().unwrap();
+        assert!((mean - 0.7).abs() < 1e-6);
     }
 }

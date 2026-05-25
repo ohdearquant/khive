@@ -1,10 +1,8 @@
 //! End-to-end tests for `BrainPack` as a `DispatchHook` (issue #158).
 //!
-//! The audit (parallel opus pass) found that the unit tests covered the
-//! DispatchHook trait via mock hooks (`CountingHook` / `NsCapturingHook`) but
-//! never wired the real `BrainPack` into a registry. These tests close that
-//! gap: register a `BrainPack` as the dispatch hook, fire a verb through the
-//! KG pack, and verify the brain's posteriors actually updated.
+//! Per ADR-032, `BrainState` now holds a profile registry; the BalancedRecall
+//! profile's `total_events` counter lives in `snapshot.balanced_recall.total_events`.
+//! These tests verify the dispatch hook still drives the BalancedRecallFold.
 
 use std::sync::Arc;
 
@@ -42,20 +40,17 @@ async fn brain_pack_dispatch_hook_records_real_dispatch_events() {
         .await
         .expect("create entity must succeed");
 
-    // Every successful dispatch increments BrainState.total_events via
-    // EventFold::step. That counter is the brain's lowest-common-denominator
-    // observation — it's incremented regardless of whether the event matches
-    // a recall-specific or entity-specific signal (those drive parameter
-    // posteriors). If the hook never fired, the counter would stay at baseline.
+    // Every successful dispatch increments BalancedRecallState.total_events via
+    // BalancedRecallFold::reduce. If the hook never fired, the counter stays at
+    // baseline.
     let after = brain.snapshot();
     assert_eq!(
-        after.total_events,
-        baseline.total_events + 1,
+        after.balanced_recall.total_events,
+        baseline.balanced_recall.total_events + 1,
         "#158 regression: total_events did not advance after a successful KG \
-         verb dispatch. Hook is wired (audit) but evidently no event reached \
-         the fold. baseline={}, after={}",
-        baseline.total_events,
-        after.total_events,
+         verb dispatch. baseline={}, after={}",
+        baseline.balanced_recall.total_events,
+        after.balanced_recall.total_events,
     );
 
     // Fire two more successful dispatches and verify the counter advances by
@@ -75,11 +70,11 @@ async fn brain_pack_dispatch_hook_records_real_dispatch_events() {
     }
     let final_state = brain.snapshot();
     assert_eq!(
-        final_state.total_events,
-        baseline.total_events + 3,
+        final_state.balanced_recall.total_events,
+        baseline.balanced_recall.total_events + 3,
         "hook must fire once per successful dispatch: expected {}+3 events, got {}",
-        baseline.total_events,
-        final_state.total_events,
+        baseline.balanced_recall.total_events,
+        final_state.balanced_recall.total_events,
     );
 }
 
@@ -101,12 +96,16 @@ async fn brain_pack_hook_does_not_fire_on_unknown_verb() {
     let _ = registry.dispatch("frobnicate_nonexistent", json!({})).await;
 
     let after = brain.snapshot();
-    // The verb errored, so parameters should be identical to baseline.
+    // The verb errored, so BalancedRecallState.total_events must be unchanged.
     assert_eq!(
-        after.parameters.len(),
-        baseline.parameters.len(),
-        "unknown verb must NOT change brain state — got {} params, baseline had {}",
-        after.parameters.len(),
-        baseline.parameters.len()
+        after.balanced_recall.total_events, baseline.balanced_recall.total_events,
+        "unknown verb must NOT change brain state — got {}, baseline had {}",
+        after.balanced_recall.total_events, baseline.balanced_recall.total_events,
+    );
+    // The profile registry is also unchanged
+    assert_eq!(
+        after.profiles.len(),
+        baseline.profiles.len(),
+        "profile registry must not change on failed dispatch"
     );
 }

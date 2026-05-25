@@ -1,4 +1,4 @@
-use khive_pack_brain::state::BrainState;
+use khive_pack_brain::state::BalancedRecallState;
 use khive_pack_brain::tunable::{PackTunable, ParameterDef, ParameterSpace};
 use khive_runtime::RuntimeError;
 use serde_json::Value;
@@ -10,8 +10,9 @@ use crate::MemoryPack;
 /// recall scoring pipeline based on observed usage patterns (Issue #159).
 ///
 /// Parameter names (`memory::relevance_weight`, `memory::importance_weight`,
-/// `memory::temporal_weight`) match the keys that brain's `EventFold` tracks,
-/// so posteriors from real-time dispatch events flow directly into these params.
+/// `memory::temporal_weight`) correspond to the three Beta posteriors in
+/// `BalancedRecallState` (ADR-032 §5a). Posterior means flow directly into
+/// `RecallConfig`.
 ///
 /// `project_config` reads posterior means → `RecallConfig`.
 /// `apply_config` validates and stores the new config; future recall calls
@@ -23,7 +24,7 @@ impl PackTunable for MemoryPack {
                 ParameterDef {
                     name: "memory::relevance_weight".into(),
                     // Prior: relevance is the dominant signal (7:3), matching
-                    // EventFold's initial "recall::relevance_weight" posterior.
+                    // BalancedRecallState's `relevance` posterior prior.
                     prior_alpha: 7.0,
                     prior_beta: 3.0,
                     bounds: (0.0, 1.0),
@@ -46,30 +47,16 @@ impl PackTunable for MemoryPack {
         }
     }
 
-    /// Project the current `BrainState` posteriors into a `RecallConfig` value.
+    /// Project the current `BalancedRecallState` posteriors into a `RecallConfig` value.
     ///
-    /// Reads `memory::*_weight` posterior means from `state`. Falls back to the
+    /// Reads the three posterior means from the profile state. Falls back to the
     /// current active config if a parameter is absent (brain not yet warmed up).
-    fn project_config(&self, state: &BrainState) -> Value {
+    fn project_config(&self, state: &BalancedRecallState) -> Value {
         let current = self.active_config();
 
-        let relevance = state
-            .parameters
-            .get("memory::relevance_weight")
-            .map(|p| p.mean())
-            .unwrap_or(current.relevance_weight);
-
-        let importance = state
-            .parameters
-            .get("memory::importance_weight")
-            .map(|p| p.mean())
-            .unwrap_or(current.importance_weight);
-
-        let temporal = state
-            .parameters
-            .get("memory::temporal_weight")
-            .map(|p| p.mean())
-            .unwrap_or(current.temporal_weight);
+        let relevance = state.relevance.mean();
+        let importance = state.importance.mean();
+        let temporal = state.temporal.mean();
 
         let projected = RecallConfig {
             relevance_weight: relevance,
@@ -98,17 +85,28 @@ impl PackTunable for MemoryPack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_pack_brain::state::BetaPosterior;
+    use khive_pack_brain::state::{BalancedRecallState, BetaPosterior};
     use khive_runtime::KhiveRuntime;
-    use std::collections::HashMap;
 
     fn make_pack() -> MemoryPack {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         MemoryPack::new(rt)
     }
 
-    fn brain_state_with_params(params: HashMap<String, BetaPosterior>) -> BrainState {
-        BrainState::new(params, 100)
+    fn balanced_state_with_means(
+        relevance_mean: f64,
+        importance_mean: f64,
+        temporal_mean: f64,
+    ) -> BalancedRecallState {
+        // Construct Beta posteriors whose means match the supplied values.
+        // Using ESS=10 for each: alpha = mean * 10, beta = (1-mean) * 10.
+        let to_posterior =
+            |mean: f64| -> BetaPosterior { BetaPosterior::new(mean * 10.0, (1.0 - mean) * 10.0) };
+        let mut state = BalancedRecallState::new(100);
+        state.relevance = to_posterior(relevance_mean);
+        state.importance = to_posterior(importance_mean);
+        state.temporal = to_posterior(temporal_mean);
+        state
     }
 
     #[test]
@@ -125,20 +123,7 @@ mod tests {
     #[test]
     fn project_config_reads_posterior_means() {
         let pack = make_pack();
-        let mut params = HashMap::new();
-        params.insert(
-            "memory::relevance_weight".into(),
-            BetaPosterior::new(6.0, 4.0), // mean = 0.6
-        );
-        params.insert(
-            "memory::importance_weight".into(),
-            BetaPosterior::new(3.0, 7.0), // mean = 0.3
-        );
-        params.insert(
-            "memory::temporal_weight".into(),
-            BetaPosterior::new(1.0, 9.0), // mean = 0.1
-        );
-        let state = brain_state_with_params(params);
+        let state = balanced_state_with_means(0.6, 0.3, 0.1);
         let projected = pack.project_config(&state);
 
         let cfg: RecallConfig = serde_json::from_value(projected).unwrap();
@@ -148,9 +133,10 @@ mod tests {
     }
 
     #[test]
-    fn project_config_falls_back_to_active_when_param_absent() {
+    fn project_config_with_default_priors_matches_expected_defaults() {
+        // Default BalancedRecallState priors: Beta(7,3)=0.7, Beta(2,8)=0.2, Beta(1,9)=0.1
         let pack = make_pack();
-        let state = brain_state_with_params(HashMap::new());
+        let state = BalancedRecallState::new(100);
         let projected = pack.project_config(&state);
 
         let cfg: RecallConfig = serde_json::from_value(projected).unwrap();
@@ -199,7 +185,8 @@ mod tests {
     }
 
     #[test]
-    fn prior_for_relevance_weight_matches_fold_priors() {
+    fn prior_for_relevance_weight_matches_balanced_recall_state_prior() {
+        // BalancedRecallState uses Beta(7,3) for relevance; ParameterDef must match.
         let pack = make_pack();
         let space = pack.parameter_space();
         let def = space
