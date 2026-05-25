@@ -1,14 +1,16 @@
 //! kkernel — khive admin/management library.
 //!
-//! See [ADR-076](../../docs/adr/ADR-076-kkernel-and-mcp-split.md) for the
+//! See [ADR-003](../../docs/adr/ADR-003-system-architecture.md) for the
 //! kernel/MCP split rationale. This library exposes the building blocks that
 //! the `kkernel` binary composes into subcommands:
 //!
 //! - [`sync`] — build a queryable SQLite DB from NDJSON sources (issue #174).
 //! - [`pack_introspect`] — enumerate registered packs and their handler surface.
+//! - [`coordinator`] — SubstrateCoordinator for cross-backend dispatch (ADR-029).
 //!
 //! Migration and other admin operations will land here as separate modules.
 
+pub mod coordinator;
 pub mod pack_introspect;
 pub mod sync;
 

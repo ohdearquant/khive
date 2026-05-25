@@ -56,4 +56,4 @@ pub use pack::{
 pub use portability::{ImportSummary, KgArchive};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
-pub use runtime::{parse_pack_list, KhiveRuntime, NamespaceToken, RuntimeConfig};
+pub use runtime::{parse_pack_list, BackendId, KhiveRuntime, NamespaceToken, RuntimeConfig};

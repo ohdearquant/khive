@@ -123,6 +123,23 @@ pub enum RuntimeError {
     /// cross-namespace existence information (ADR-007 timing-oracle mitigation).
     #[error("not found in this namespace")]
     NamespaceMismatch { id: uuid::Uuid },
+
+    /// Cross-backend `merge_entity` is unsupported in v1 (ADR-009 §cross-backend-merge).
+    ///
+    /// Both entities must reside on the same backend. To merge entities on different
+    /// backends, manually export `from_id`, delete it, and re-import on `into_id`'s backend.
+    #[error(
+        "cross-backend merge is not supported: \
+         into_id {into_id} is on backend '{into_backend}', \
+         from_id {from_id} is on backend '{from_backend}'. \
+         Both entities must be on the same backend to merge."
+    )]
+    CrossBackendMergeUnsupported {
+        into_id: uuid::Uuid,
+        from_id: uuid::Uuid,
+        into_backend: String,
+        from_backend: String,
+    },
 }
 
 impl From<khive_types::KhiveError> for RuntimeError {
