@@ -13,6 +13,16 @@
 //! Builds into `<target>.tmp` then renames over `<target>`. A crash mid-build
 //! leaves the previous DB intact.
 //!
+//! ## F201: Remote archive fetch + hash-pin verification (ADR-037)
+//!
+//! [`run_sync_remote`] fetches NDJSON files from a git remote URL into a local
+//! cache directory, computes the canonical SHA-256 content hash, and compares
+//! it against an optional `sha256:` pin in the caller-supplied [`RemoteConfig`].
+//! A pin mismatch aborts before any cache file is modified (fail-closed). If
+//! no pin is present the hash is still computed and written to `meta.json`.
+//! Pass `repin: true` to skip the pin comparison and have the computed hash
+//! returned for the caller to write back to `schema.yaml`.
+//!
 //! ## Consumers
 //!
 //! `kkernel sync` is the primary consumer. It calls [`run_sync`] and prints the
@@ -20,17 +30,24 @@
 //! can use this library directly.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
+use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use khive_storage::types::{Edge, TextDocument};
 use khive_storage::{LinkId, SubstrateKind};
 use khive_types::EdgeRelation;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::error::VcsError;
+use crate::hash::snapshot_id_for_archive;
+use crate::types::SnapshotId;
+
 /// Per-record entity shape in NDJSON sources (ADR-020 §2).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct NdjsonEntity {
     id: Uuid,
     kind: String,
@@ -48,7 +65,7 @@ struct NdjsonEntity {
 }
 
 /// Per-record edge shape in NDJSON sources (ADR-020 §2).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct NdjsonEdge {
     edge_id: Uuid,
     source: Uuid,
@@ -81,11 +98,338 @@ fn parse_ts_micros(s: Option<&str>) -> i64 {
 }
 
 /// Summary of a completed sync run.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Serialize)]
 pub struct SyncReport {
     pub entities: usize,
     pub edges: usize,
     pub db_path: String,
+}
+
+// ── F201: Remote archive fetch (ADR-037) ──────────────────────────────────────
+
+/// Configuration for a remote KG archive (maps to one entry in `schema.yaml`
+/// `remotes:` list per ADR-037 §schema-yaml-remotes-section).
+#[derive(Debug, Clone)]
+pub struct RemoteConfig {
+    /// Human-readable name for this remote (used in error messages and cache
+    /// directory paths).
+    pub name: String,
+    /// Git remote URL (e.g. `https://github.com/org/kg-data.git`).
+    pub url: String,
+    /// Git ref to check out (branch or tag, e.g. `main`).
+    pub git_ref: String,
+    /// Namespace to assign to imported records.
+    pub namespace: String,
+    /// Optional SHA-256 content-hash pin. When present, a mismatch between the
+    /// fetched archive hash and this value aborts the sync (fail-closed).
+    pub pin: Option<SnapshotId>,
+}
+
+/// Summary of a completed remote sync run (F201).
+#[derive(Debug, Serialize)]
+pub struct RemoteSyncReport {
+    pub entities: usize,
+    pub edges: usize,
+    /// Path to the populated cache directory (`.khive/kg/remotes/<name>/`).
+    pub cache_dir: String,
+    /// Path to the written `meta.json` file.
+    pub meta_path: String,
+    /// Canonical SHA-256 content hash of the fetched archive (`sha256:<hex>`).
+    pub content_hash: String,
+    /// `true` when `repin` was requested — the caller should write
+    /// `content_hash` back to `schema.yaml` as the new `pin` value.
+    pub repinned: bool,
+}
+
+/// Metadata written to `.khive/kg/remotes/<name>/meta.json` (ADR-037
+/// §remote-cache-layout).
+#[derive(Debug, Serialize)]
+struct MetaJson {
+    /// ISO-8601 timestamp of when the fetch completed.
+    fetched_at: String,
+    /// Git ref that was resolved.
+    git_ref: String,
+    /// Git commit SHA resolved from `git_ref` at fetch time.
+    commit_sha: String,
+    /// Canonical content hash of the fetched archive.
+    content_hash: String,
+}
+
+/// Fetch a remote KG archive, verify its SHA-256 content hash, populate the
+/// local cache, and write `meta.json`.
+///
+/// # Arguments
+///
+/// * `repo_root` — Repository root that owns the `.khive/` tree. The cache
+///   directory `<repo_root>/.khive/kg/remotes/<remote.name>/` is populated on
+///   success.
+/// * `remote` — Remote configuration (URL, git ref, namespace, optional pin).
+/// * `repin` — When `true`, skip pin comparison and return the computed hash
+///   for the caller to write back to `schema.yaml`. When `false` and a pin is
+///   present, a hash mismatch returns [`VcsError::HashMismatch`] via `anyhow`.
+///
+/// # Failure behaviour (ADR-037 §failure-behaviour-fail-closed)
+///
+/// On hash mismatch the function returns an error *before* any cache file is
+/// modified. The staging directory is cleaned up. The error message includes the
+/// remote name, expected hash, and actual hash so the operator can copy the
+/// actual hash into `schema.yaml` to accept the new content, or use `--repin`.
+///
+/// If no pin is present the hash is still computed and written to `meta.json`,
+/// but the sync proceeds regardless.
+pub async fn run_sync_remote(
+    repo_root: &Path,
+    remote: &RemoteConfig,
+    repin: bool,
+) -> Result<RemoteSyncReport> {
+    // ── 1. Create staging directory ──────────────────────────────────────────
+    let state_dir = repo_root.join(".khive/state/remote-staging");
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("creating staging dir {}", state_dir.display()))?;
+    let staging = tempfile::TempDir::new_in(&state_dir).context("creating staging temp dir")?;
+    let staging_path = staging.path().to_path_buf();
+
+    // ── 2. Git clone (sparse, depth=1) ───────────────────────────────────────
+    let entities_ndjson: Vec<NdjsonEntity>;
+    let edges_ndjson: Vec<NdjsonEdge>;
+    let commit_sha: String;
+
+    {
+        // Clone only the objects needed — no blobs, just tree metadata, then
+        // sparse-checkout the two NDJSON files we need.
+        let clone_out = Command::new("git")
+            .args([
+                "clone",
+                "--depth=1",
+                "--filter=blob:none",
+                "--no-checkout",
+                "--branch",
+                &remote.git_ref,
+                &remote.url,
+                staging_path.to_str().unwrap(),
+            ])
+            .output()
+            .context("running git clone")?;
+
+        if !clone_out.status.success() {
+            let stderr = String::from_utf8_lossy(&clone_out.stderr);
+            return Err(anyhow!(
+                "git clone failed for remote {:?} (url: {}): {}",
+                remote.name,
+                remote.url,
+                stderr.trim()
+            ));
+        }
+
+        // Resolve commit SHA from HEAD.
+        let rev_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&staging_path)
+            .output()
+            .context("running git rev-parse HEAD")?;
+        commit_sha = String::from_utf8_lossy(&rev_out.stdout).trim().to_string();
+
+        // Sparse checkout: enable and limit to the two NDJSON files.
+        run_git_in(&staging_path, &["sparse-checkout", "init", "--cone"])
+            .context("git sparse-checkout init")?;
+        run_git_in(
+            &staging_path,
+            &[
+                "sparse-checkout",
+                "set",
+                ".khive/kg/entities.ndjson",
+                ".khive/kg/edges.ndjson",
+            ],
+        )
+        .context("git sparse-checkout set")?;
+        run_git_in(&staging_path, &["checkout"]).context("git checkout")?;
+
+        // Parse the staged NDJSON files.
+        let entities_path = staging_path.join(".khive/kg/entities.ndjson");
+        let edges_path = staging_path.join(".khive/kg/edges.ndjson");
+
+        entities_ndjson = read_entities(&entities_path)
+            .with_context(|| format!("reading staged {}", entities_path.display()))?;
+        edges_ndjson = read_edges(&edges_path)
+            .with_context(|| format!("reading staged {}", edges_path.display()))?;
+    }
+    // `staging` tempdir is still alive here — we drop it after moving files.
+
+    // ── 3. Build KgArchive and compute canonical hash ─────────────────────────
+    let archive = build_kg_archive(&remote.namespace, &entities_ndjson, &edges_ndjson);
+    let actual_hash = snapshot_id_for_archive(&archive)
+        .map_err(|e| anyhow!("hashing archive for remote {:?}: {}", remote.name, e))?;
+
+    // ── 4. Pin verification (fail-closed) ────────────────────────────────────
+    if let Some(expected) = &remote.pin {
+        if !repin && actual_hash != *expected {
+            return Err(anyhow!(VcsError::HashMismatch {
+                expected: expected.clone(),
+                actual: actual_hash.clone(),
+            })
+            .context(format!(
+                "remote {:?}: hash mismatch — use `--repin` to accept the new content \
+                 after independently verifying it (actual hash: {})",
+                remote.name,
+                actual_hash.as_str()
+            )));
+        }
+    }
+
+    // ── 5. Atomically publish to cache ────────────────────────────────────────
+    let cache_dir = repo_root.join(".khive/kg/remotes").join(&remote.name);
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
+
+    // Write files into staging first, then rename into place atomically.
+    let tmp_entities = cache_dir.with_extension("entities.tmp");
+    let tmp_edges = cache_dir.with_extension("edges.tmp");
+
+    write_sorted_entities(&tmp_entities, &entities_ndjson)
+        .context("writing staged entities.ndjson")?;
+    write_sorted_edges(&tmp_edges, &edges_ndjson).context("writing staged edges.ndjson")?;
+
+    std::fs::rename(&tmp_entities, cache_dir.join("entities.ndjson"))
+        .context("renaming entities.ndjson into cache")?;
+    std::fs::rename(&tmp_edges, cache_dir.join("edges.ndjson"))
+        .context("renaming edges.ndjson into cache")?;
+
+    // ── 6. Write meta.json ────────────────────────────────────────────────────
+    let meta = MetaJson {
+        fetched_at: Utc::now().to_rfc3339(),
+        git_ref: remote.git_ref.clone(),
+        commit_sha,
+        content_hash: actual_hash.as_str().to_string(),
+    };
+    let meta_path = cache_dir.join("meta.json");
+    let meta_json = serde_json::to_string_pretty(&meta).context("serializing meta.json")?;
+    std::fs::write(&meta_path, meta_json.as_bytes()).context("writing meta.json")?;
+
+    // staging tempdir is dropped here, cleaning up the clone.
+    drop(staging);
+
+    Ok(RemoteSyncReport {
+        entities: entities_ndjson.len(),
+        edges: edges_ndjson.len(),
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        meta_path: meta_path.to_string_lossy().into_owned(),
+        content_hash: actual_hash.as_str().to_string(),
+        repinned: repin,
+    })
+}
+
+/// Run a git command inside `dir`, returning an error if it fails.
+fn run_git_in(dir: &Path, args: &[&str]) -> Result<()> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!("git {} failed: {}", args.join(" "), stderr.trim()));
+    }
+    Ok(())
+}
+
+/// Convert the NDJSON record slices into a [`KgArchive`] for hashing.
+fn build_kg_archive(namespace: &str, entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> KgArchive {
+    let now = Utc::now();
+    let exported_entities: Vec<ExportedEntity> = entities
+        .iter()
+        .map(|e| ExportedEntity {
+            id: e.id,
+            kind: e.kind.clone(),
+            entity_type: None,
+            name: e.name.clone(),
+            description: e.description.clone(),
+            properties: e.properties.clone(),
+            tags: e.tags.clone(),
+            created_at: e
+                .created_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now),
+            updated_at: e
+                .updated_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now),
+        })
+        .collect();
+
+    let exported_edges: Vec<ExportedEdge> = edges
+        .iter()
+        .filter_map(|e| {
+            let relation: EdgeRelation = e.relation.parse().ok()?;
+            Some(ExportedEdge {
+                edge_id: e.edge_id,
+                source: e.source,
+                target: e.target,
+                relation,
+                weight: e.weight,
+            })
+        })
+        .collect();
+
+    KgArchive {
+        format: "khive-kg".into(),
+        version: "0.1".into(),
+        namespace: namespace.to_string(),
+        exported_at: now,
+        entities: exported_entities,
+        edges: exported_edges,
+    }
+}
+
+/// Write entities to a file as sorted NDJSON (one JSON object per line).
+///
+/// Entities are sorted by UUID string (case-insensitive ascending) to match
+/// the canonical sort order used by `snapshot_id_for_archive`.
+fn write_sorted_entities(path: &Path, records: &[NdjsonEntity]) -> Result<()> {
+    let mut sorted: Vec<&NdjsonEntity> = records.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.id.to_string()
+            .to_ascii_lowercase()
+            .cmp(&b.id.to_string().to_ascii_lowercase())
+    });
+    let mut lines = Vec::with_capacity(sorted.len());
+    for r in sorted {
+        let line = serde_json::to_string(r).context("serializing entity")?;
+        lines.push(line);
+    }
+    std::fs::write(path, lines.join("\n")).context("writing entities file")?;
+    Ok(())
+}
+
+/// Write edges to a file as sorted NDJSON (one JSON object per line).
+///
+/// Edges are sorted by (source, target, relation) to match the canonical sort
+/// order used by `snapshot_id_for_archive`.
+fn write_sorted_edges(path: &Path, records: &[NdjsonEdge]) -> Result<()> {
+    let mut sorted: Vec<&NdjsonEdge> = records.iter().collect();
+    sorted.sort_by(|a, b| {
+        let ak = (
+            a.source.to_string(),
+            a.target.to_string(),
+            a.relation.clone(),
+        );
+        let bk = (
+            b.source.to_string(),
+            b.target.to_string(),
+            b.relation.clone(),
+        );
+        ak.cmp(&bk)
+    });
+    let mut lines = Vec::with_capacity(sorted.len());
+    for r in sorted {
+        let line = serde_json::to_string(r).context("serializing edge")?;
+        lines.push(line);
+    }
+    std::fs::write(path, lines.join("\n")).context("writing edges file")?;
+    Ok(())
 }
 
 /// Rebuild `db_path` from `.khive/kg/{entities,edges}.ndjson` under `repo_root`.
@@ -309,6 +653,57 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // ── F201 test helpers ─────────────────────────────────────────────────────
+
+    /// Create a minimal git repository under `dir` with the given NDJSON content
+    /// inside `.khive/kg/`. Returns the URL-style path suitable for `git clone`.
+    fn make_git_remote(dir: &Path, entities_ndjson: &str, edges_ndjson: &str) -> String {
+        let kg_dir = dir.join(".khive/kg");
+        std::fs::create_dir_all(&kg_dir).unwrap();
+        std::fs::write(kg_dir.join("entities.ndjson"), entities_ndjson).unwrap();
+        std::fs::write(kg_dir.join("edges.ndjson"), edges_ndjson).unwrap();
+
+        // Initialise git repo with a single commit on `main`.
+        run_git(dir, &["init", "-b", "main"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+        run_git(dir, &["config", "user.name", "Test"]);
+        run_git(dir, &["add", "-A"]);
+        run_git(dir, &["commit", "-m", "init"]);
+
+        dir.to_string_lossy().into_owned()
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap_or_else(|e| panic!("git {} failed to spawn: {e}", args.join(" ")));
+        assert!(
+            status.success(),
+            "git {} exited with {}",
+            args.join(" "),
+            status
+        );
+    }
+
+    /// Compute the canonical `SnapshotId` for entity/edge NDJSON strings without
+    /// touching the filesystem, so we can build expected pins from in-memory data.
+    fn compute_pin(entities_ndjson: &str, edges_ndjson: &str, namespace: &str) -> SnapshotId {
+        let tmp = TempDir::new().unwrap();
+        let kg = tmp.path().join(".khive/kg");
+        std::fs::create_dir_all(&kg).unwrap();
+        std::fs::write(kg.join("entities.ndjson"), entities_ndjson).unwrap();
+        std::fs::write(kg.join("edges.ndjson"), edges_ndjson).unwrap();
+
+        let entities = read_entities(&kg.join("entities.ndjson")).unwrap();
+        let edges = read_edges(&kg.join("edges.ndjson")).unwrap();
+        let archive = build_kg_archive(namespace, &entities, &edges);
+        snapshot_id_for_archive(&archive).unwrap()
+    }
+
+    // ── test_run_sync_local_path_unchanged_behavior ───────────────────────────
+
     fn write_repo(dir: &Path, entities_ndjson: &str, edges_ndjson: &str) {
         let kg_dir = dir.join(".khive/kg");
         std::fs::create_dir_all(&kg_dir).unwrap();
@@ -470,5 +865,207 @@ mod tests {
             id_a,
             "FTS hit must reference the synced entity UUID"
         );
+    }
+
+    // ── F201 tests ────────────────────────────────────────────────────────────
+
+    /// F201-1: `run_sync_remote` with a correct pin succeeds and writes the
+    /// expected cache files and `meta.json`.
+    #[tokio::test]
+    async fn run_sync_remote_fetches_and_verifies_hash_match() {
+        let remote_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+
+        let id_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let entities = format!(
+            r#"{{"id":"{id_a}","kind":"concept","name":"RemoteEntity","properties":{{}},"tags":[]}}"#
+        );
+        let edges = "";
+
+        let remote_url = make_git_remote(remote_dir.path(), &entities, edges);
+        let expected_pin = compute_pin(&entities, edges, "remote-ns");
+
+        let remote = RemoteConfig {
+            name: "upstream".to_string(),
+            url: remote_url,
+            git_ref: "main".to_string(),
+            namespace: "remote-ns".to_string(),
+            pin: Some(expected_pin.clone()),
+        };
+
+        let report = run_sync_remote(repo_dir.path(), &remote, false)
+            .await
+            .expect("run_sync_remote must succeed with correct pin");
+
+        assert_eq!(report.entities, 1, "must report 1 entity");
+        assert_eq!(report.edges, 0, "must report 0 edges");
+        assert_eq!(
+            report.content_hash,
+            expected_pin.as_str(),
+            "content_hash must match the pin"
+        );
+        assert!(!report.repinned, "repin was not requested");
+
+        // Cache files must exist.
+        let cache = repo_dir.path().join(".khive/kg/remotes/upstream");
+        assert!(
+            cache.join("entities.ndjson").exists(),
+            "entities.ndjson must exist in cache"
+        );
+        assert!(
+            cache.join("edges.ndjson").exists(),
+            "edges.ndjson must exist in cache"
+        );
+        assert!(
+            cache.join("meta.json").exists(),
+            "meta.json must exist in cache"
+        );
+
+        // meta.json must be valid JSON with the expected fields.
+        let meta_bytes = std::fs::read(cache.join("meta.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        assert_eq!(
+            meta["content_hash"].as_str().unwrap(),
+            expected_pin.as_str(),
+            "meta.json content_hash must match"
+        );
+        assert!(
+            meta["fetched_at"].as_str().is_some(),
+            "meta.json must have fetched_at"
+        );
+        assert!(
+            meta["commit_sha"].as_str().is_some(),
+            "meta.json must have commit_sha"
+        );
+    }
+
+    /// F201-2: `run_sync_remote` with a wrong pin fails before touching the
+    /// cache (fail-closed guarantee from ADR-037 §failure-behaviour).
+    #[tokio::test]
+    async fn run_sync_remote_rejects_hash_mismatch() {
+        let remote_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+
+        let id_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let entities = format!(
+            r#"{{"id":"{id_b}","kind":"concept","name":"AnotherEntity","properties":{{}},"tags":[]}}"#
+        );
+        let edges = "";
+
+        let remote_url = make_git_remote(remote_dir.path(), &entities, edges);
+
+        // Deliberate wrong pin: 64 zero hex chars.
+        let wrong_pin = SnapshotId::from_hash(&"0".repeat(64)).unwrap();
+
+        let remote = RemoteConfig {
+            name: "upstream".to_string(),
+            url: remote_url,
+            git_ref: "main".to_string(),
+            namespace: "remote-ns".to_string(),
+            pin: Some(wrong_pin.clone()),
+        };
+
+        let err = run_sync_remote(repo_dir.path(), &remote, false)
+            .await
+            .expect_err("run_sync_remote must fail on hash mismatch");
+
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("hash mismatch") || err_msg.contains("sha256:"),
+            "error must mention hash mismatch, got: {err_msg}"
+        );
+
+        // Cache must NOT have been written (fail-closed).
+        let cache = repo_dir.path().join(".khive/kg/remotes/upstream");
+        assert!(
+            !cache.join("entities.ndjson").exists(),
+            "entities.ndjson must NOT exist after mismatch"
+        );
+        assert!(
+            !cache.join("meta.json").exists(),
+            "meta.json must NOT exist after mismatch"
+        );
+    }
+
+    /// F201-3: `run_sync_remote` with no pin still proceeds and writes `meta.json`
+    /// (auditability even without a pin — ADR-037 §hash-requirement).
+    #[tokio::test]
+    async fn run_sync_remote_no_pin_proceeds_and_writes_meta() {
+        let remote_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+
+        let id_c = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let entities = format!(
+            r#"{{"id":"{id_c}","kind":"concept","name":"Pinless","properties":{{}},"tags":[]}}"#
+        );
+
+        let remote_url = make_git_remote(remote_dir.path(), &entities, "");
+
+        let remote = RemoteConfig {
+            name: "no-pin-remote".to_string(),
+            url: remote_url,
+            git_ref: "main".to_string(),
+            namespace: "remote-ns".to_string(),
+            pin: None,
+        };
+
+        let report = run_sync_remote(repo_dir.path(), &remote, false)
+            .await
+            .expect("run_sync_remote must succeed with no pin");
+
+        assert_eq!(report.entities, 1);
+        assert!(
+            report.content_hash.starts_with("sha256:"),
+            "content_hash must have sha256: prefix even without pin"
+        );
+
+        let cache = repo_dir.path().join(".khive/kg/remotes/no-pin-remote");
+        assert!(
+            cache.join("meta.json").exists(),
+            "meta.json must be written even when pin is absent"
+        );
+    }
+
+    /// F201-4: `--repin` skips pin comparison and returns the actual hash,
+    /// allowing the caller to update `schema.yaml`.
+    #[tokio::test]
+    async fn run_sync_remote_repin_updates_hash_ignoring_old_pin() {
+        let remote_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+
+        let id_d = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+        let entities = format!(
+            r#"{{"id":"{id_d}","kind":"concept","name":"RepinTarget","properties":{{}},"tags":[]}}"#
+        );
+
+        let remote_url = make_git_remote(remote_dir.path(), &entities, "");
+        let actual_hash = compute_pin(&entities, "", "repin-ns");
+
+        // Deliberately stale/wrong pin — repin must ignore it.
+        let stale_pin = SnapshotId::from_hash(&"f".repeat(64)).unwrap();
+
+        let remote = RemoteConfig {
+            name: "repinned".to_string(),
+            url: remote_url,
+            git_ref: "main".to_string(),
+            namespace: "repin-ns".to_string(),
+            pin: Some(stale_pin),
+        };
+
+        let report = run_sync_remote(repo_dir.path(), &remote, true)
+            .await
+            .expect("repin must succeed even with wrong existing pin");
+
+        assert!(report.repinned, "repinned flag must be true");
+        assert_eq!(
+            report.content_hash,
+            actual_hash.as_str(),
+            "repinned hash must be the actual fetched archive hash"
+        );
+
+        // Cache must be populated.
+        let cache = repo_dir.path().join(".khive/kg/remotes/repinned");
+        assert!(cache.join("entities.ndjson").exists());
+        assert!(cache.join("meta.json").exists());
     }
 }

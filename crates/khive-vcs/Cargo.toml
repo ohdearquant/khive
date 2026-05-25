@@ -21,8 +21,8 @@ sha2 = "0.10"
 hex = "0.4"
 tokio = { workspace = true }
 anyhow = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
-tempfile = "3"
 khive-vcs-adapters = { version = "0.2.2", path = "../khive-vcs-adapters" }
