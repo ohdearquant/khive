@@ -23,6 +23,7 @@ members = [
     "khive-pack-template",
     "khive-mcp",
     "khive-vcs",
+    "khive-vcs-adapters",
     "kkernel",
     "khive-retrieval",
 ]

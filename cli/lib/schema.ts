@@ -85,12 +85,29 @@ export interface EdgeRelationDef {
   description?: string;
 }
 
-/** A remote KG reference as defined in ADR-048 §3. */
+/**
+ * A remote KG reference (ADR-037 §Reference syntax).
+ *
+ * Fields `url`, `ref`, and `namespace` are required (ADR-037 §schema.yaml remotes section).
+ * `pin` is optional: a SHA-256 content hash (`sha256:<64hexchars>`); when present,
+ * sync verifies the fetched archive against this hash before accepting it.
+ *
+ * Note: the legacy `repo`/`path`/`commit` field shape from ADR-020 v0 is superseded
+ * by this `url`/`ref`/`namespace`/`pin` shape. Schema validation rejects the old shape.
+ */
 export interface RemoteDef {
   name: string;
-  repo: string;
-  path: string;
-  commit: string;
+  /** Git remote URL (required). */
+  url: string;
+  /** Branch or tag to resolve against (required). */
+  ref: string;
+  /** Namespace scoping entity resolution for this remote (required). */
+  namespace: string;
+  /**
+   * Optional SHA-256 content hash pin (`sha256:<64hexchars>`).
+   * When present, sync is mandatory-verify (ADR-037 §pin format).
+   */
+  pin?: string;
 }
 
 export interface PackRef {
@@ -103,7 +120,7 @@ export interface Schema {
   entity_kinds: string[];
   edge_relations: EdgeRelationDef[];
   note_kinds?: string[];
-  /** Remotes are a list of {name, repo, path, commit} entries (ADR-048 §3). */
+  /** Remotes are a list of {name, url, ref, namespace, pin?} entries (ADR-037 §remotes). */
   remotes?: RemoteDef[];
   packs?: PackRef[];
 }
