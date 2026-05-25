@@ -79,6 +79,10 @@ struct RecallParams {
     score_floor: Option<f32>,
     #[serde(default)]
     embedding_model: Option<String>,
+    /// When "verbose", include per-component score breakdown in each result.
+    /// Does not affect non-verbose (agent-mode) shape.
+    #[serde(default)]
+    presentation: Option<String>,
 }
 
 impl RecallParams {
@@ -108,13 +112,29 @@ impl RecallParams {
     }
 }
 
+/// Normalize a raw fusion score to a [0, 1]-comparable range.
+///
+/// RRF scores are `1/(k+rank)` — for k=60, rank 1 gives ≈0.0164, rank 2 gives
+/// ≈0.0161, etc. This is orders of magnitude smaller than weighted/union scores
+/// (which sit in [0.0, 1.0+]). Multiplying by `(k+1)` maps the RRF maximum
+/// (rank-1) to exactly 1.0, making `score_floor` portable across fusion strategies.
+///
+/// Weighted and union scores are already in [0,1] and pass through unchanged.
+fn normalize_relevance(raw: f64, strategy: &khive_runtime::FusionStrategy) -> f64 {
+    match strategy {
+        khive_runtime::FusionStrategy::Rrf { k } => raw * (*k as f64 + 1.0),
+        _ => raw,
+    }
+}
+
 fn compute_score(
     cfg: &RecallConfig,
-    rrf: f64,
+    raw_relevance: f64,
     salience: f64,
     decay_factor: f64,
     age_days: f64,
 ) -> (f64, ScoreBreakdown) {
+    let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
     let effective_importance = cfg.decay_model.apply(
         salience,
         age_days,
@@ -127,12 +147,12 @@ fn compute_score(
     };
     let weight_sum = cfg.relevance_weight + cfg.importance_weight + cfg.temporal_weight;
     let norm = if weight_sum > 0.0 { weight_sum } else { 1.0 };
-    let r_contrib = cfg.relevance_weight * rrf / norm;
+    let r_contrib = cfg.relevance_weight * relevance / norm;
     let i_contrib = cfg.importance_weight * effective_importance / norm;
     let t_contrib = cfg.temporal_weight * temporal / norm;
     let total = r_contrib + i_contrib + t_contrib;
     let breakdown = ScoreBreakdown {
-        relevance: rrf,
+        relevance,
         importance_raw: salience,
         importance_decayed: effective_importance,
         temporal,
@@ -414,16 +434,28 @@ impl MemoryPack {
             }
         }
 
-        // F109: reject invalid source_id UUID strings
+        // F109: resolve source_id — accepts full UUIDs and 8-char short IDs (same
+        // contract as `get` / `link`). Short IDs are expanded via prefix lookup
+        // before validation so the chain `create → remember(source_id=$prev.id)`
+        // works in agent mode where $prev.id is the 8-char short form.
         let mut annotates: Vec<Uuid> = vec![];
         if let Some(sid) = &p.source_id {
-            match sid.parse::<Uuid>() {
-                Ok(source_uuid) => annotates.push(source_uuid),
-                Err(_) => {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "source_id {sid:?} is not a valid UUID"
-                    )));
+            if let Ok(full_uuid) = sid.parse::<Uuid>() {
+                annotates.push(full_uuid);
+            } else if sid.len() >= 8 && sid.chars().all(|c| c.is_ascii_hexdigit()) {
+                match self.runtime.resolve_prefix(token, sid).await {
+                    Ok(Some(uuid)) => annotates.push(uuid),
+                    Ok(None) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "source_id {sid:?}: no record matches this prefix"
+                        )));
+                    }
+                    Err(e) => return Err(e),
                 }
+            } else {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "source_id {sid:?} is not a valid UUID or 8-char short ID"
+                )));
             }
         }
 
@@ -596,7 +628,8 @@ impl MemoryPack {
         });
         ranked.truncate(limit as usize);
 
-        let include_breakdown = cfg.include_breakdown;
+        let include_breakdown =
+            cfg.include_breakdown || p.presentation.as_deref() == Some("verbose");
         let results: Vec<Value> = ranked
             .into_iter()
             .map(|(id, score, breakdown, note)| {
@@ -952,6 +985,7 @@ mod tests {
             fusion_strategy: None,
             score_floor: None,
             embedding_model: None,
+            presentation: None,
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.relevance_weight - 0.70).abs() < 1e-12);
@@ -972,6 +1006,7 @@ mod tests {
             fusion_strategy: None,
             score_floor: None,
             embedding_model: None,
+            presentation: None,
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.min_score - 0.5).abs() < 1e-12);
@@ -994,6 +1029,7 @@ mod tests {
             fusion_strategy: None,
             score_floor: None,
             embedding_model: None,
+            presentation: None,
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.relevance_weight - 0.50).abs() < 1e-12);
@@ -1025,6 +1061,7 @@ mod tests {
             fusion_strategy: Some("weighted".to_string()),
             score_floor: None,
             embedding_model: None,
+            presentation: None,
         };
 
         let mut cfg = p.effective_config(base);
@@ -1136,18 +1173,40 @@ mod tests {
     }
 
     #[test]
-    fn compute_score_default_config_reproduces_legacy() {
-        let cfg = RecallConfig::default();
-        let rrf = 0.5;
+    fn compute_score_weighted_strategy_formula() {
+        // Use Weighted strategy (normalization factor = 1.0) to directly verify
+        // the weighted-combination formula: total = w_r*r + w_i*i + w_t*t.
+        let cfg = RecallConfig {
+            fuse_strategy: khive_runtime::FusionStrategy::Weighted {
+                weights: vec![0.3, 0.7],
+            },
+            ..RecallConfig::default()
+        };
+        let relevance = 0.5;
         let salience = 0.8;
         let decay_factor = 0.01;
         let age_days = 0.0;
-        let (total, bd) = compute_score(&cfg, rrf, salience, decay_factor, age_days);
-        // At age=0: importance_decayed = salience, temporal = 1.0
+        let (total, bd) = compute_score(&cfg, relevance, salience, decay_factor, age_days);
+        // At age=0: importance_decayed = salience, temporal = 1.0, normalization = 1.0
         // total = 0.70*0.5 + 0.20*0.8 + 0.10*1.0 = 0.35 + 0.16 + 0.10 = 0.61
         assert!((total - 0.61).abs() < 1e-10, "got {total}");
         assert!((bd.relevance - 0.5).abs() < 1e-12);
         assert!((bd.importance_raw - 0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compute_score_rrf_strategy_normalizes_to_comparable_range() {
+        // With RRF k=60 the raw score for rank 1 is 1/(60+1) ≈ 0.01639.
+        // After normalization (* 61) it becomes exactly 1.0, placing relevance
+        // in the same [0, 1] range as weighted/union fusion outputs.
+        let cfg = RecallConfig::default(); // Rrf { k: 60 }
+        let raw_rrf_rank1 = 1.0 / 61.0;
+        let (_, bd) = compute_score(&cfg, raw_rrf_rank1, 1.0, 0.0, 0.0);
+        assert!(
+            (bd.relevance - 1.0).abs() < 1e-10,
+            "RRF rank-1 relevance should normalize to 1.0, got {}",
+            bd.relevance
+        );
     }
 
     #[test]
@@ -1190,10 +1249,14 @@ mod tests {
 
     #[test]
     fn compute_score_custom_weights() {
+        // Use Weighted strategy so relevance passes through unnormalized.
         let cfg = RecallConfig {
             relevance_weight: 1.0,
             importance_weight: 0.0,
             temporal_weight: 0.0,
+            fuse_strategy: khive_runtime::FusionStrategy::Weighted {
+                weights: vec![0.5, 0.5],
+            },
             ..RecallConfig::default()
         };
         let (total, _) = compute_score(&cfg, 0.8, 0.9, 0.01, 10.0);

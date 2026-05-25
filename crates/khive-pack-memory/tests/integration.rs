@@ -1,7 +1,7 @@
 use khive_pack_brain::tunable::PackTunable;
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder};
+use khive_runtime::{FusionStrategy, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder};
 use khive_types::Pack;
 use serde_json::json;
 use uuid::Uuid;
@@ -968,10 +968,15 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     // by exercising the same wire on a fresh pack.
     let rt2 = make_runtime();
     let pack2 = MemoryPack::new(rt2.clone());
+    // Use Weighted strategy so the input relevance score (1.0) passes through
+    // unnormalized — RRF strategy would scale it by (k+1) = 61, producing 61.0.
     let relevance_only = RecallConfig {
         relevance_weight: 1.0,
         importance_weight: 0.0,
         temporal_weight: 0.0,
+        fuse_strategy: FusionStrategy::Weighted {
+            weights: vec![0.5, 0.5],
+        },
         ..RecallConfig::default()
     };
     pack2
@@ -998,7 +1003,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     let total2 = result2["total"].as_f64().expect("total is a number");
     assert!(
         (total2 - 1.0).abs() < 1e-9,
-        "under relevance_weight=1.0 with rrf=1.0 → score=1.0; got {total2}"
+        "under relevance_weight=1.0 with rrf=1.0 (Weighted strategy) → score=1.0; got {total2}"
     );
 }
 
@@ -1490,5 +1495,276 @@ async fn test_rerank_subhandler_uses_request_weights() {
     assert!(
         active.iter().any(|v| v.as_str() == Some("relevance")),
         "active_rerankers must include 'relevance'"
+    );
+}
+
+// ── Wave-1 hygiene fixes (v024) ────────────────────────────────────────────────
+
+/// Fix 1 (Critical): remember(source_id=) accepts 8-char short IDs.
+///
+/// The chain `create → remember(source_id=$prev.id)` broke because agent-mode
+/// responses carry an 8-char short ID (first 8 hex chars of the full UUID) and
+/// `remember` was parsing it as a full UUID, which always fails.
+#[tokio::test]
+async fn test_remember_source_id_accepts_short_id() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Create an entity; the internal test registry returns the full UUID in "id".
+    let entity = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "attention mechanism",
+                "description": "QKV self-attention"
+            }),
+        )
+        .await
+        .expect("create entity");
+
+    let full_id = entity["id"].as_str().expect("entity has id");
+    // Simulate agent-mode short ID: first 8 hex chars of the UUID (strip dashes).
+    let short_id: String = full_id.chars().filter(|c| c != &'-').take(8).collect();
+    assert_eq!(short_id.len(), 8, "derived short_id must be 8 chars");
+
+    // remember with short id — must NOT return an error (previously did)
+    let result = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "attention uses Q K V matrices",
+                "source_id": short_id,
+            }),
+        )
+        .await
+        .expect("remember with 8-char short source_id must succeed");
+
+    let note_id_str = result["note_id"].as_str().expect("has note_id");
+
+    // Verify the annotates edge was created: neighbors(note, direction=out) returns
+    // an array of NeighborHit; each hit carries "id" (the neighbor's UUID) and "relation".
+    let neighbors = registry
+        .dispatch(
+            "neighbors",
+            json!({
+                "id": note_id_str,
+                "direction": "out",
+            }),
+        )
+        .await
+        .expect("neighbors call succeeds");
+
+    // response is a direct JSON array (not wrapped in an object)
+    let hits = neighbors.as_array().expect("neighbors returns array");
+    let found = hits.iter().any(|h| h["id"].as_str() == Some(full_id));
+    assert!(
+        found,
+        "annotates edge to entity {full_id} must appear in note neighbors; got: {hits:?}\n\
+         (short_id used: {short_id}, note_id: {note_id_str})"
+    );
+}
+
+/// Fix 2: recall(help=true) must expose all params added in PRs #406/#421.
+/// Fix 3: remember(help=true) must show decay_factor default as 0.01.
+#[test]
+fn test_handler_def_recall_params_complete() {
+    use khive_types::Pack;
+
+    let recall_def = khive_pack_memory::MemoryPack::HANDLERS
+        .iter()
+        .find(|h| h.name == "recall")
+        .expect("recall handler must be registered");
+
+    let param_names: Vec<&str> = recall_def.params.iter().map(|p| p.name).collect();
+
+    assert!(
+        param_names.contains(&"top_k"),
+        "recall HandlerDef must expose top_k param; got: {param_names:?}"
+    );
+    assert!(
+        param_names.contains(&"score_floor"),
+        "recall HandlerDef must expose score_floor param; got: {param_names:?}"
+    );
+    assert!(
+        param_names.contains(&"fusion_strategy"),
+        "recall HandlerDef must expose fusion_strategy param; got: {param_names:?}"
+    );
+    assert!(
+        param_names.contains(&"embedding_model"),
+        "recall HandlerDef must expose embedding_model param; got: {param_names:?}"
+    );
+    assert!(
+        param_names.contains(&"presentation"),
+        "recall HandlerDef must expose presentation param; got: {param_names:?}"
+    );
+}
+
+#[test]
+fn test_handler_def_remember_params_complete() {
+    use khive_types::Pack;
+
+    let remember_def = khive_pack_memory::MemoryPack::HANDLERS
+        .iter()
+        .find(|h| h.name == "remember")
+        .expect("remember handler must be registered");
+
+    let param_names: Vec<&str> = remember_def.params.iter().map(|p| p.name).collect();
+    assert!(
+        param_names.contains(&"embedding_model"),
+        "remember HandlerDef must expose embedding_model param; got: {param_names:?}"
+    );
+
+    // Fix 3: decay_factor default must be documented as 0.01 (not 0.1)
+    let decay_def = remember_def
+        .params
+        .iter()
+        .find(|p| p.name == "decay_factor")
+        .expect("decay_factor param must exist");
+    assert!(
+        decay_def.description.contains("0.01"),
+        "decay_factor description must document default 0.01, got: {:?}",
+        decay_def.description
+    );
+    assert!(
+        !decay_def.description.contains("0.1 ")
+            && !decay_def
+                .description
+                .starts_with("Decay rate 0.0–1.0 (default 0.1)"),
+        "decay_factor description must NOT say 'default 0.1', got: {:?}",
+        decay_def.description
+    );
+}
+
+/// Fix 4: score_floor is portable across fusion strategies.
+///
+/// Creates 10 memories with varying salience; recall with score_floor=0.3 must
+/// return a non-zero comparable number of hits under both RRF and Weighted fusion
+/// — not 0 for one and many for the other.
+#[tokio::test]
+async fn test_score_floor_portable_across_fusion_strategies() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Create 10 memories with varying importance so some will score above 0.3
+    // and some below (with recency decay = 0 since all are brand-new).
+    for (i, content) in [
+        "transformer architecture uses attention",
+        "attention mechanism in neural networks",
+        "feedforward layers in transformer blocks",
+        "layer normalization in deep learning",
+        "residual connections in transformers",
+        "positional encoding in sequence models",
+        "multi-head attention splits queries keys",
+        "softmax function in attention scores",
+        "token embeddings in transformer input",
+        "output projection in transformer layers",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let importance = 0.4 + 0.06 * (i as f64); // 0.40 to 0.94
+        registry
+            .dispatch(
+                "remember",
+                json!({
+                    "content": content,
+                    "importance": importance,
+                    "decay_factor": 0.0,
+                }),
+            )
+            .await
+            .expect("remember");
+    }
+
+    // Query relevant to several memories
+    let rrf_result = registry
+        .dispatch(
+            "recall",
+            json!({
+                "query": "attention transformer",
+                "score_floor": 0.3_f64,
+                "fusion_strategy": "rrf",
+                "limit": 20,
+            }),
+        )
+        .await
+        .expect("recall rrf");
+
+    let weighted_result = registry
+        .dispatch(
+            "recall",
+            json!({
+                "query": "attention transformer",
+                "score_floor": 0.3_f64,
+                "fusion_strategy": "weighted",
+                "limit": 20,
+            }),
+        )
+        .await
+        .expect("recall weighted");
+
+    let rrf_hits = rrf_result.as_array().expect("rrf array").len();
+    let weighted_hits = weighted_result.as_array().expect("weighted array").len();
+
+    assert!(
+        rrf_hits > 0,
+        "score_floor=0.3 with RRF strategy must return > 0 hits (got 0); \
+         RRF scores are not being normalized to [0,1]"
+    );
+    assert!(
+        weighted_hits > 0,
+        "score_floor=0.3 with Weighted strategy must return > 0 hits (got 0)"
+    );
+}
+
+/// Fix 5: presentation="verbose" includes score breakdown without changing agent-mode shape.
+#[tokio::test]
+async fn test_recall_verbose_presentation_includes_breakdown() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    registry
+        .dispatch(
+            "remember",
+            json!({ "content": "transformer positional encoding", "importance": 0.8 }),
+        )
+        .await
+        .expect("remember");
+
+    // Default (agent-mode): no breakdown
+    let default_result = registry
+        .dispatch("recall", json!({ "query": "transformer" }))
+        .await
+        .expect("recall default");
+
+    let default_hits = default_result.as_array().expect("array");
+    assert!(!default_hits.is_empty(), "must have hits");
+    assert!(
+        default_hits[0].get("breakdown").is_none(),
+        "default presentation must NOT include breakdown"
+    );
+
+    // Verbose: breakdown present
+    let verbose_result = registry
+        .dispatch(
+            "recall",
+            json!({ "query": "transformer", "presentation": "verbose" }),
+        )
+        .await
+        .expect("recall verbose");
+
+    let verbose_hits = verbose_result.as_array().expect("array");
+    assert!(!verbose_hits.is_empty(), "verbose must have hits");
+    let bd = verbose_hits[0]
+        .get("breakdown")
+        .expect("verbose result must include breakdown");
+    assert!(
+        bd.get("relevance").is_some(),
+        "breakdown must have relevance field; got: {bd}"
+    );
+    assert!(
+        bd.get("temporal").is_some(),
+        "breakdown must have temporal field; got: {bd}"
     );
 }
