@@ -657,6 +657,123 @@ async fn test_recall_fuse_source_field_is_plain_string() {
     );
 }
 
+/// Verifies that recall.fuse routes through khive_retrieval::fuse_search_results
+/// by injecting a non-default fusion config (Rrf k=1) and asserting the fused
+/// score matches the RRF k=1 formula: 1/(k + rank) = 1/(1 + 1) = 0.5.
+///
+/// Under default k=60 the score would be 1/61 ≈ 0.0164. The large gap (0.5 vs
+/// 0.0164) is the discriminator: if the adapter did not pass k=1 through to
+/// khive_retrieval::HybridConfig, the score would not be 0.5.
+#[tokio::test]
+async fn test_recall_fuse_rrf_k1_uses_retrieval_adapter() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    registry
+        .dispatch(
+            "remember",
+            json!({ "content": "retrieval adapter rrf k1 probe memory" }),
+        )
+        .await
+        .expect("remember");
+
+    let result = registry
+        .dispatch(
+            "recall.fuse",
+            json!({
+                "query": "retrieval adapter rrf k1 probe",
+                "config": {
+                    "fuse_strategy": { "rrf": { "k": 1 } }
+                }
+            }),
+        )
+        .await
+        .expect("recall.fuse with Rrf k=1");
+
+    let fused = result["fused_candidates"].as_array().expect("fused array");
+    assert!(
+        !fused.is_empty(),
+        "recall.fuse must return at least one candidate"
+    );
+
+    let score = fused[0]["fused_score"]
+        .as_f64()
+        .expect("fused_score is f64");
+    // Rank 1 in a single text source with k=1: RRF = 1/(1+1) = 0.5.
+    // If k=60 were used instead, score ≈ 0.0164 — the gap proves the adapter works.
+    let expected = 0.5_f64;
+    assert!(
+        (score - expected).abs() < 1e-6,
+        "RRF k=1, rank 1 → fused_score must be 0.5; got {score:.6} \
+         (≈0.0164 means the adapter passed k=60 instead of k=1)"
+    );
+}
+
+/// Regression: after wiring khive-retrieval into fuse_candidates, the recall.fuse
+/// response shape must be unchanged — top-level strategy + candidate_limit, and
+/// per-candidate note_id + fused_score + source must all be present. Full recall
+/// fields (content, salience) must remain absent.
+#[tokio::test]
+async fn test_recall_fuse_shape_preserved_after_retrieval_wiring() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    registry
+        .dispatch(
+            "remember",
+            json!({ "content": "shape regression check after retrieval wiring" }),
+        )
+        .await
+        .expect("remember");
+
+    let result = registry
+        .dispatch(
+            "recall.fuse",
+            json!({ "query": "shape regression retrieval wiring" }),
+        )
+        .await
+        .expect("recall.fuse");
+
+    // Top-level shape
+    assert!(
+        result.get("strategy").is_some(),
+        "strategy field must be present in recall.fuse response"
+    );
+    assert!(
+        result["candidate_limit"].as_u64().is_some(),
+        "candidate_limit must be a non-negative integer"
+    );
+
+    let fused = result["fused_candidates"]
+        .as_array()
+        .expect("fused_candidates array");
+    assert!(!fused.is_empty(), "fused_candidates must be non-empty");
+
+    let c = &fused[0];
+    assert!(
+        c["note_id"].as_str().is_some(),
+        "note_id must be a string UUID"
+    );
+    assert!(
+        c["fused_score"].as_f64().is_some(),
+        "fused_score must be a float"
+    );
+    let source = c["source"].as_str().expect("source must be a plain string");
+    assert!(
+        matches!(source, "text" | "vector" | "both"),
+        "source must be a plain label, got {source:?}"
+    );
+    // Full recall fields must not leak into fuse output
+    assert!(
+        c.get("content").is_none(),
+        "content must be absent from recall.fuse output"
+    );
+    assert!(
+        c.get("salience").is_none(),
+        "salience must be absent from recall.fuse output"
+    );
+}
+
 /// When include_breakdown is true, breakdown.total() must equal the hit's composite score.
 #[tokio::test]
 async fn test_recall_breakdown_total_matches_composite_score() {

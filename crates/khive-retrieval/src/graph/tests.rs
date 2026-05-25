@@ -1,6 +1,6 @@
 //! Unit tests for graph traversal module.
 
-use super::compat::{test_context, EntityRef, MockLinkStore};
+use super::compat::{test_context, EntityRef, LinkStore, MockLinkStore};
 
 use crate::graph::types::{
     Direction, PathNode, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_RESULTS,

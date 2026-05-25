@@ -844,11 +844,26 @@ pub mod metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_db::SqliteStore;
 
     fn make_conn() -> Arc<Mutex<Connection>> {
-        let store = SqliteStore::memory().expect("in-memory store");
-        store.conn()
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE weight_events (
+                namespace TEXT NOT NULL,
+                atom_id TEXT NOT NULL,
+                delta REAL NOT NULL,
+                weight_after REAL NOT NULL,
+                channel TEXT NOT NULL,
+                eta REAL NOT NULL,
+                event_id TEXT,
+                context_id TEXT,
+                ts INTEGER NOT NULL
+            );
+            "#,
+        )
+        .expect("init replay test schema");
+        Arc::new(Mutex::new(conn))
     }
 
     fn insert_weight_event(

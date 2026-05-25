@@ -298,14 +298,35 @@ pub async fn batch_load_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_db::SqliteStore;
     use std::sync::Arc;
 
     fn make_conn() -> Arc<Mutex<Connection>> {
-        // Open an in-memory SQLite DB and run migrations so atom_weights and
-        // weight_events tables exist.
-        let store = SqliteStore::memory().expect("in-memory store");
-        store.conn()
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE atom_weights (
+                namespace TEXT NOT NULL,
+                atom_id TEXT NOT NULL,
+                weight REAL NOT NULL,
+                updated_at INTEGER NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(namespace, atom_id)
+            );
+            CREATE TABLE weight_events (
+                namespace TEXT NOT NULL,
+                atom_id TEXT NOT NULL,
+                delta REAL NOT NULL,
+                weight_after REAL NOT NULL,
+                channel TEXT NOT NULL,
+                eta REAL NOT NULL,
+                event_id TEXT,
+                context_id TEXT,
+                ts INTEGER NOT NULL
+            );
+            "#,
+        )
+        .expect("init weight test schema");
+        Arc::new(Mutex::new(conn))
     }
 
     // -------------------------------------------------------------------------

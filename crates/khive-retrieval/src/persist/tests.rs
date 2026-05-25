@@ -1,4 +1,5 @@
 use super::*;
+use crate::NodeId;
 use khive_bm25::Bm25Index;
 use khive_hnsw::HnswIndex;
 use rusqlite::Connection;

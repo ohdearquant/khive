@@ -26,7 +26,7 @@
 //!
 //! ```rust,no_run
 //! use khive_retrieval::persist::RetrievalPersistence;
-//! use khive_retrieval::hnsw::HnswIndex;
+//! use khive_retrieval::HnswIndex;
 //! use rusqlite::Connection;
 //! use std::sync::Arc;
 //! use tokio::sync::Mutex;

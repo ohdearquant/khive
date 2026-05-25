@@ -4,8 +4,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::fusion::fuse_with_strategy;
-use khive_runtime::{NamespaceToken, RuntimeError, SearchHit, SearchSource, VerbRegistry};
+use khive_retrieval::{
+    fuse_search_results, FusionStrategy as RetrievalFusionStrategy, HybridConfig,
+};
+use khive_runtime::{
+    FusionStrategy as RuntimeFusionStrategy, NamespaceToken, RuntimeError, SearchHit, SearchSource,
+    VerbRegistry,
+};
 use khive_storage::types::{
     TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
     VectorSearchRequest,
@@ -138,6 +143,49 @@ fn search_source_label(source: SearchSource) -> &'static str {
     }
 }
 
+#[derive(Default)]
+struct CandidateMeta {
+    in_text: bool,
+    in_vector: bool,
+    title: Option<String>,
+    snippet: Option<String>,
+}
+
+fn to_retrieval_fusion_strategy(strategy: &RuntimeFusionStrategy) -> RetrievalFusionStrategy {
+    match strategy {
+        RuntimeFusionStrategy::Rrf { k } => RetrievalFusionStrategy::Rrf { k: *k },
+        RuntimeFusionStrategy::Weighted { .. } => RetrievalFusionStrategy::Weighted {
+            weights: Vec::new(),
+        },
+        RuntimeFusionStrategy::Union => RetrievalFusionStrategy::Union,
+        RuntimeFusionStrategy::VectorOnly => RetrievalFusionStrategy::VectorOnly,
+    }
+}
+
+fn retrieval_hybrid_config(strategy: &RuntimeFusionStrategy, limit: usize) -> HybridConfig {
+    let mut config = HybridConfig::new(limit)
+        .with_pool_size(limit)
+        .with_fusion_strategy(to_retrieval_fusion_strategy(strategy));
+
+    if let RuntimeFusionStrategy::Weighted { weights } = strategy {
+        // Runtime weighted fusion uses [text, vector]. HybridConfig uses keyword/vector.
+        // Preserve arbitrary positive scales — do not clamp via with_weights().
+        config.keyword_weight = weights.first().copied().unwrap_or(0.0).max(0.0);
+        config.vector_weight = weights.get(1).copied().unwrap_or(0.0).max(0.0);
+    }
+
+    config
+}
+
+fn source_from_meta(meta: &CandidateMeta) -> SearchSource {
+    match (meta.in_vector, meta.in_text) {
+        (true, true) => SearchSource::Both,
+        (true, false) => SearchSource::Vector,
+        (false, true) => SearchSource::Text,
+        (false, false) => SearchSource::Text,
+    }
+}
+
 fn fuse_candidates(
     text_hits: Vec<TextSearchHit>,
     vector_hits: Vec<VectorSearchHit>,
@@ -145,15 +193,68 @@ fn fuse_candidates(
     cfg: &RecallConfig,
     limit: usize,
 ) -> Vec<SearchHit> {
-    let text: Vec<TextSearchHit> = text_hits
+    let mut meta = HashMap::<Uuid, CandidateMeta>::new();
+
+    let text_source: Vec<_> = text_hits
         .into_iter()
         .filter(|h| memory_ids.contains(&h.subject_id))
+        .map(|h| {
+            let TextSearchHit {
+                subject_id,
+                score,
+                title,
+                snippet,
+                ..
+            } = h;
+            let entry = meta.entry(subject_id).or_default();
+            entry.in_text = true;
+            if entry.title.is_none() {
+                entry.title = title;
+            }
+            if entry.snippet.is_none() {
+                entry.snippet = snippet;
+            }
+            (subject_id, score)
+        })
         .collect();
-    let vec: Vec<VectorSearchHit> = vector_hits
+
+    let vector_source: Vec<_> = vector_hits
         .into_iter()
         .filter(|h| memory_ids.contains(&h.subject_id))
+        .map(|h| {
+            let entry = meta.entry(h.subject_id).or_default();
+            entry.in_vector = true;
+            (h.subject_id, h.score)
+        })
         .collect();
-    fuse_with_strategy(text, vec, &cfg.fuse_strategy, limit)
+
+    let vector_only = matches!(&cfg.fuse_strategy, RuntimeFusionStrategy::VectorOnly);
+    let sources = if vector_only {
+        vec![vector_source]
+    } else {
+        // HybridConfig weighted convention: vector first, keyword second.
+        vec![vector_source, text_source]
+    };
+
+    let retrieval_cfg = retrieval_hybrid_config(&cfg.fuse_strategy, limit);
+    fuse_search_results(sources, &retrieval_cfg)
+        .into_iter()
+        .map(|(id, score)| {
+            let m = meta.remove(&id).unwrap_or_default();
+            let (source, title, snippet) = if vector_only {
+                (SearchSource::Vector, None, None)
+            } else {
+                (source_from_meta(&m), m.title, m.snippet)
+            };
+            SearchHit {
+                entity_id: id,
+                score,
+                source,
+                title,
+                snippet,
+            }
+        })
+        .collect()
 }
 
 impl MemoryPack {
