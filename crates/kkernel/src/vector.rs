@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use serde::Serialize;
 
@@ -75,15 +75,6 @@ pub struct CapabilitiesReport {
     pub index_kinds: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct SweepReport {
-    pub engine_name: String,
-    pub namespaces_scanned: Vec<String>,
-    pub orphans_found: u64,
-    pub orphans_deleted: u64,
-    pub dry_run: bool,
-}
-
 // ── Entry point ────────────────────────────────────────────────────────────────
 
 pub fn run_vector(cmd: VectorCommand) -> Result<()> {
@@ -141,42 +132,11 @@ fn cmd_vector_capabilities(args: VectorCapabilitiesArgs) -> Result<()> {
 
 // ── sweep ─────────────────────────────────────────────────────────────────────
 
-fn cmd_vector_sweep(args: VectorSweepArgs) -> Result<()> {
-    let engine_name = args.engine.unwrap_or_else(|| "default".to_string());
-    let namespaces_scanned = if args.namespace.is_empty() {
-        vec!["*".to_string()]
-    } else {
-        args.namespace.clone()
-    };
-
-    // A full implementation:
-    // 1. Opens the SQLite backend at args.db (or default path).
-    // 2. Calls VectorStore::orphan_sweep(OrphanSweepConfig {
-    //        namespaces: args.namespace,
-    //        subject_id_allowlist: None,
-    //        max_delete: args.max_delete,
-    //        dry_run: args.dry_run,
-    //    }).await
-    // 3. Returns the OrphanSweepResult from ADR-044 §5.
-    //
-    // The VectorStore::orphan_sweep default impl returns Unsupported when
-    // supports_orphan_sweep = false (sqlite-vec baseline). The real
-    // production sweep implementation is in khive-db and checks the live table.
-    //
-    // This scaffold emits the correct shape so the CLI surface is testable
-    // and the command routing is exercised by `cargo test -p kkernel`.
-
-    let report = SweepReport {
-        engine_name,
-        namespaces_scanned,
-        orphans_found: 0,
-        orphans_deleted: 0,
-        dry_run: args.dry_run,
-    };
-
-    let json = serde_json::to_string(&report).expect("serialize SweepReport");
-    println!("{json}");
-    Ok(())
+fn cmd_vector_sweep(_args: VectorSweepArgs) -> Result<()> {
+    Err(anyhow!(
+        "vector sweep is not yet implemented (ADR-044 backend orphan-sweep deferred to \
+         follow-up #381). SqliteVecStore returns Unsupported per the ADR."
+    ))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -227,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_dry_run_returns_zero_deletions() {
+    fn sweep_returns_not_implemented() {
         let args = VectorSweepArgs {
             namespace: vec![],
             max_delete: 100,
@@ -235,11 +195,20 @@ mod tests {
             engine: None,
             db: None,
         };
-        cmd_vector_sweep(args).expect("sweep command succeeds");
+        let err = cmd_vector_sweep(args).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not yet implemented"),
+            "expected 'not yet implemented' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("#381"),
+            "expected follow-up issue reference in error, got: {msg}"
+        );
     }
 
     #[test]
-    fn sweep_with_namespaces() {
+    fn sweep_with_namespaces_returns_not_implemented() {
         let args = VectorSweepArgs {
             namespace: vec!["local".into(), "research".into()],
             max_delete: 500,
@@ -247,6 +216,7 @@ mod tests {
             engine: Some("mE5-small".into()),
             db: None,
         };
-        cmd_vector_sweep(args).expect("sweep with namespaces succeeds");
+        let err = cmd_vector_sweep(args).unwrap_err();
+        assert!(err.to_string().contains("not yet implemented"));
     }
 }

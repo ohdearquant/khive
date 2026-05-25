@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use serde::Serialize;
 
@@ -117,23 +117,6 @@ pub struct EngineStatus {
     pub pending_model: Option<EngineModelRecord>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct MigrateResult {
-    pub engine_name: String,
-    pub action: String,
-    pub status: String,
-    pub message: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DriftCheckResult {
-    pub engine_name: String,
-    pub sample_size: usize,
-    pub distance: f64,
-    pub threshold: Option<f64>,
-    pub recommendation: String,
-}
-
 // ── Entry point ────────────────────────────────────────────────────────────────
 
 pub fn run_engine(cmd: EngineCommand) -> Result<()> {
@@ -201,83 +184,20 @@ fn cmd_engine_status(args: EngineStatusArgs) -> Result<()> {
 
 // ── migrate ───────────────────────────────────────────────────────────────────
 
-fn cmd_engine_migrate(args: EngineMigrateArgs) -> Result<()> {
-    let (action, message) = if let Some(ref to) = args.to {
-        (
-            "start",
-            format!(
-                "Migration to model '{}' for engine '{}' queued. \
-                 The EmbedMigrationWorker will process the EmbeddingModelChanged event.",
-                to, args.engine
-            ),
-        )
-    } else if args.resume {
-        (
-            "resume",
-            format!(
-                "Resume requested for engine '{}'. \
-                 The EmbedMigrationWorker will retry the Failed migration.",
-                args.engine
-            ),
-        )
-    } else if args.abort {
-        (
-            "abort",
-            format!(
-                "Abort requested for engine '{}'. \
-                 Pending vectors will be swept via orphan_sweep before clearing migration state.",
-                args.engine
-            ),
-        )
-    } else {
-        (
-            "noop",
-            "No action specified. Use --to <model>, --resume, or --abort.".to_string(),
-        )
-    };
-
-    let result = MigrateResult {
-        engine_name: args.engine.clone(),
-        action: action.to_string(),
-        status: "accepted".to_string(),
-        message,
-    };
-    let json = serde_json::to_string(&result).expect("serialize MigrateResult");
-    println!("{json}");
-    Ok(())
+fn cmd_engine_migrate(_args: EngineMigrateArgs) -> Result<()> {
+    Err(anyhow!(
+        "engine migrate is not yet implemented (ADR-043 D2-D6 — EmbedMigrationWorker deferred \
+         to follow-up #380). Use 'kkernel engine list' / 'status' to inspect registered models."
+    ))
 }
 
 // ── drift-check ───────────────────────────────────────────────────────────────
 
-fn cmd_engine_drift_check(args: EngineDriftCheckArgs) -> Result<()> {
-    // Drift detection is compute-bound and delegates to lattice_transport.
-    // This implementation emits the CLI surface; the actual Wasserstein/Sinkhorn
-    // computation is performed by lattice_transport::drift::detect_drift_records
-    // when the runtime is configured with a live embedding model (ADR-043 §5).
-    let result = DriftCheckResult {
-        engine_name: args.engine.clone(),
-        sample_size: args.sample,
-        // Placeholder: real distance requires a live runtime + lattice OT call.
-        distance: 0.0,
-        threshold: None,
-        recommendation: format!(
-            "Drift check for engine '{}' requires a running khive instance with \
-             an active embedding model. Run via the khive-mcp server or integrate \
-             lattice_transport::drift::detect_drift_records in your pipeline.",
-            args.engine
-        ),
-    };
-
-    if args.human {
-        println!("engine:          {}", result.engine_name);
-        println!("sample_size:     {}", result.sample_size);
-        println!("distance:        {:.4}", result.distance);
-        println!("recommendation:  {}", result.recommendation);
-    } else {
-        let json = serde_json::to_string(&result).expect("serialize DriftCheckResult");
-        println!("{json}");
-    }
-    Ok(())
+fn cmd_engine_drift_check(_args: EngineDriftCheckArgs) -> Result<()> {
+    Err(anyhow!(
+        "engine drift-check is not yet implemented (ADR-043 §5 lattice_transport integration \
+         deferred). Track follow-up #380."
+    ))
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -342,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_migrate_start_produces_accepted() {
+    fn engine_migrate_returns_not_implemented() {
         let args = EngineMigrateArgs {
             engine: "mE5-small".into(),
             to: Some("bge-small-en-v1.5".into()),
@@ -350,43 +270,61 @@ mod tests {
             abort: false,
             db: None,
         };
-        let (action, msg) = (
-            "start",
-            format!(
-                "Migration to model '{}' for engine '{}' queued. \
-             The EmbedMigrationWorker will process the EmbeddingModelChanged event.",
-                "bge-small-en-v1.5", "mE5-small"
-            ),
+        let err = cmd_engine_migrate(args).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not yet implemented"),
+            "expected 'not yet implemented' in error, got: {msg}"
         );
-        let result = MigrateResult {
-            engine_name: args.engine.clone(),
-            action: action.to_string(),
-            status: "accepted".to_string(),
-            message: msg,
-        };
-        assert_eq!(result.action, "start");
-        assert_eq!(result.status, "accepted");
+        assert!(
+            msg.contains("#380"),
+            "expected follow-up issue reference in error, got: {msg}"
+        );
     }
 
     #[test]
-    fn engine_migrate_abort_produces_accepted() {
-        let result = MigrateResult {
-            engine_name: "mE5-small".into(),
-            action: "abort".into(),
-            status: "accepted".into(),
-            message: "abort requested".into(),
+    fn engine_migrate_resume_returns_not_implemented() {
+        let args = EngineMigrateArgs {
+            engine: "mE5-small".into(),
+            to: None,
+            resume: true,
+            abort: false,
+            db: None,
         };
-        assert_eq!(result.action, "abort");
+        let err = cmd_engine_migrate(args).unwrap_err();
+        assert!(err.to_string().contains("not yet implemented"));
     }
 
     #[test]
-    fn drift_check_returns_engine_name() {
+    fn engine_migrate_abort_returns_not_implemented() {
+        let args = EngineMigrateArgs {
+            engine: "mE5-small".into(),
+            to: None,
+            resume: false,
+            abort: true,
+            db: None,
+        };
+        let err = cmd_engine_migrate(args).unwrap_err();
+        assert!(err.to_string().contains("not yet implemented"));
+    }
+
+    #[test]
+    fn drift_check_returns_not_implemented() {
         let args = EngineDriftCheckArgs {
             engine: "mE5-small".into(),
             sample: 500,
             human: false,
             db: None,
         };
-        cmd_engine_drift_check(args).expect("drift-check command completes");
+        let err = cmd_engine_drift_check(args).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not yet implemented"),
+            "expected 'not yet implemented' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("#380"),
+            "expected follow-up issue reference in error, got: {msg}"
+        );
     }
 }
