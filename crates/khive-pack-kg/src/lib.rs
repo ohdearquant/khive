@@ -377,22 +377,40 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         category: VerbCategory::Commissive,
         params: &[
             ParamDef {
-                name: "target_id",
-                param_type: "uuid",
+                name: "title",
+                param_type: "string",
                 required: true,
-                description: "Entity targeted by the proposal.",
+                description: "Short title for the proposal (must be non-empty).",
+            },
+            ParamDef {
+                name: "description",
+                param_type: "string",
+                required: true,
+                description: "Full description explaining the proposed change (must be non-empty).",
             },
             ParamDef {
                 name: "changeset",
                 param_type: "object",
                 required: true,
-                description: "Proposed changes (field patches).",
+                description: "Proposed changes as a structured patch object.",
             },
             ParamDef {
-                name: "rationale",
-                param_type: "string",
+                name: "reviewers",
+                param_type: "array<string>",
                 required: false,
-                description: "Explanation for the proposed change.",
+                description: "Actor IDs requested as reviewers. Default: empty list.",
+            },
+            ParamDef {
+                name: "expiry",
+                param_type: "integer",
+                required: false,
+                description: "Expiry timestamp in microseconds since epoch. Omit for no expiry.",
+            },
+            ParamDef {
+                name: "parent_id",
+                param_type: "uuid",
+                required: false,
+                description: "UUID of a parent proposal this supersedes or extends.",
             },
         ],
     },
@@ -419,7 +437,7 @@ static KG_HANDLERS: [HandlerDef; 14] = [
                 name: "comment",
                 param_type: "string",
                 required: false,
-                description: "Optional reviewer comment.",
+                description: "Optional reviewer comment attached to the review event.",
             },
         ],
     },
@@ -429,12 +447,20 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Withdraw an open proposal (proposer-only)",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
-        params: &[ParamDef {
-            name: "proposal_id",
-            param_type: "uuid",
-            required: true,
-            description: "UUID of the proposal to withdraw.",
-        }],
+        params: &[
+            ParamDef {
+                name: "proposal_id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the open proposal to withdraw.",
+            },
+            ParamDef {
+                name: "rationale",
+                param_type: "string",
+                required: false,
+                description: "Optional reason for withdrawing the proposal.",
+            },
+        ],
     },
 ];
 
@@ -504,5 +530,96 @@ impl PackRuntime for KgPack {
                 "kg pack does not handle verb {verb:?}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+
+    fn find_handler(name: &str) -> &'static HandlerDef {
+        KG_HANDLERS
+            .iter()
+            .find(|h| h.name == name)
+            .unwrap_or_else(|| panic!("handler {name:?} not found in KG_HANDLERS"))
+    }
+
+    #[test]
+    fn propose_params_has_required_title_description_changeset() {
+        let h = find_handler("propose");
+        assert!(!h.params.is_empty(), "propose must have params");
+        assert!(
+            h.params.iter().any(|p| p.name == "title" && p.required),
+            "propose must have required title param"
+        );
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "description" && p.required),
+            "propose must have required description param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "changeset" && p.required),
+            "propose must have required changeset param"
+        );
+    }
+
+    #[test]
+    fn propose_params_has_optional_reviewers_expiry_parent_id() {
+        let h = find_handler("propose");
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "reviewers" && !p.required),
+            "propose must document optional reviewers"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "expiry" && !p.required),
+            "propose must document optional expiry"
+        );
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "parent_id" && !p.required),
+            "propose must document optional parent_id"
+        );
+    }
+
+    #[test]
+    fn review_params_has_required_proposal_id_and_decision() {
+        let h = find_handler("review");
+        assert!(!h.params.is_empty(), "review must have params");
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "proposal_id" && p.required),
+            "review must have required proposal_id param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "decision" && p.required),
+            "review must have required decision param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "comment" && !p.required),
+            "review must document optional comment param"
+        );
+    }
+
+    #[test]
+    fn withdraw_params_has_required_proposal_id_and_optional_rationale() {
+        let h = find_handler("withdraw");
+        assert!(!h.params.is_empty(), "withdraw must have params");
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "proposal_id" && p.required),
+            "withdraw must have required proposal_id param"
+        );
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "rationale" && !p.required),
+            "withdraw must document optional rationale param"
+        );
     }
 }

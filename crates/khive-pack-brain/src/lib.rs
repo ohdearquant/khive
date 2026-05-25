@@ -17,7 +17,7 @@ use khive_runtime::{
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
-use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
+use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
 use crate::fold::BalancedRecallFold;
 use crate::state::{BrainState, ProfileBinding, ProfileLifecycle, ProfileRecord};
@@ -64,35 +64,74 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Return projected config for a named pack parameter",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
-        params: &[],
+        params: &[ParamDef {
+            name: "parameter",
+            param_type: "string",
+            required: false,
+            description: "Specific parameter to query: \"recall::relevance_weight\" | \"recall::importance_weight\" | \"recall::temporal_weight\". Omit to return all.",
+        }],
     },
     HandlerDef {
         name: "brain.events",
         description: "List recent brain-relevant events for debugging",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
-        params: &[],
+        params: &[ParamDef {
+            name: "limit",
+            param_type: "integer",
+            required: false,
+            description: "Maximum events to return (default 20, max 100).",
+        }],
     },
     HandlerDef {
         name: "brain.profiles",
         description: "List profiles, optionally filtered by lifecycle",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[],
+        params: &[ParamDef {
+            name: "lifecycle",
+            param_type: "string",
+            required: false,
+            description: "Filter profiles by lifecycle state: \"active\" | \"inactive\" | \"archived\". Omit to return all.",
+        }],
     },
     HandlerDef {
         name: "brain.profile",
         description: "Profile metadata, latest snapshot, current state summary",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[],
+        params: &[ParamDef {
+            name: "id",
+            param_type: "string",
+            required: true,
+            description: "Profile ID string (e.g. \"balanced-recall-v1\"). NOT a UUID — use the string identifier.",
+        }],
     },
     HandlerDef {
         name: "brain.resolve",
         description: "Show which profile would serve a caller context",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[],
+        params: &[
+            ParamDef {
+                name: "consumer_kind",
+                param_type: "string",
+                required: true,
+                description: "Verb or operation type the caller is about to perform (e.g. \"recall\").",
+            },
+            ParamDef {
+                name: "actor",
+                param_type: "string",
+                required: false,
+                description: "Caller actor identifier. Defaults to \"*\" wildcard match.",
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Namespace for binding resolution. Defaults to \"*\" wildcard match.",
+            },
+        ],
     },
     // ── Commissive (write state) verbs ────────────────────────────────────
     HandlerDef {
@@ -100,21 +139,36 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Move a profile to Active (start live update loop)",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
-        params: &[],
+        params: &[ParamDef {
+            name: "profile_id",
+            param_type: "string",
+            required: true,
+            description: "Profile ID to activate (e.g. \"balanced-recall-v1\").",
+        }],
     },
     HandlerDef {
         name: "brain.deactivate",
         description: "Move a profile to Inactive (stop live updates, retain state)",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
-        params: &[],
+        params: &[ParamDef {
+            name: "profile_id",
+            param_type: "string",
+            required: true,
+            description: "Profile ID to deactivate.",
+        }],
     },
     HandlerDef {
         name: "brain.archive",
         description: "Move a profile to Archived (read-only, audit-retained)",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
-        params: &[],
+        params: &[ParamDef {
+            name: "profile_id",
+            param_type: "string",
+            required: true,
+            description: "Profile ID to archive.",
+        }],
     },
     HandlerDef {
         name: "brain.reset",
@@ -128,7 +182,26 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Emit a FeedbackExplicit event into the shared log",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
-        params: &[],
+        params: &[
+            ParamDef {
+                name: "target_id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the memory note or entity the feedback applies to.",
+            },
+            ParamDef {
+                name: "signal",
+                param_type: "string",
+                required: true,
+                description: "Feedback signal: \"useful\" | \"not_useful\" | \"wrong\".",
+            },
+            ParamDef {
+                name: "served_by_profile_id",
+                param_type: "string",
+                required: false,
+                description: "Profile ID that served the result being rated. Recorded in the event payload.",
+            },
+        ],
     },
     // ── Declaration verbs ─────────────────────────────────────────────────
     HandlerDef {
@@ -136,14 +209,70 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Write a row in the profile resolution table",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
-        params: &[],
+        params: &[
+            ParamDef {
+                name: "profile_id",
+                param_type: "string",
+                required: true,
+                description: "Profile ID to bind (must exist).",
+            },
+            ParamDef {
+                name: "actor",
+                param_type: "string",
+                required: false,
+                description: "Actor identifier to match. Default \"*\" (all actors). Cannot contain \"*\" inside a real value.",
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Namespace to match. Default \"*\" (all namespaces).",
+            },
+            ParamDef {
+                name: "consumer_kind",
+                param_type: "string",
+                required: false,
+                description: "Verb / operation kind to match. Default \"*\" (all kinds).",
+            },
+            ParamDef {
+                name: "priority",
+                param_type: "integer",
+                required: false,
+                description: "Binding priority; higher wins when multiple bindings match (default 0).",
+            },
+        ],
     },
     HandlerDef {
         name: "brain.unbind",
         description: "Remove rows from the profile resolution table",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
-        params: &[],
+        params: &[
+            ParamDef {
+                name: "profile_id",
+                param_type: "string",
+                required: false,
+                description: "Remove bindings for this profile ID. All filters use AND semantics.",
+            },
+            ParamDef {
+                name: "actor",
+                param_type: "string",
+                required: false,
+                description: "Remove bindings for this actor.",
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Remove bindings for this namespace.",
+            },
+            ParamDef {
+                name: "consumer_kind",
+                param_type: "string",
+                required: false,
+                description: "Remove bindings for this consumer_kind.",
+            },
+        ],
     },
     // ── Legacy / internal ─────────────────────────────────────────────────
     HandlerDef {
@@ -151,7 +280,26 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Manually emit a feedback event (deprecated; use brain.feedback)",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Commissive,
-        params: &[],
+        params: &[
+            ParamDef {
+                name: "target_id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the record the feedback applies to.",
+            },
+            ParamDef {
+                name: "signal",
+                param_type: "string",
+                required: true,
+                description: "Feedback signal: \"useful\" | \"not_useful\" | \"wrong\". Deprecated: use brain.feedback instead.",
+            },
+            ParamDef {
+                name: "served_by_profile_id",
+                param_type: "string",
+                required: false,
+                description: "Profile ID that served the result.",
+            },
+        ],
     },
 ];
 
@@ -1627,6 +1775,190 @@ mod tests {
             "#355: recall miss must further increment temporal.beta: expected {}, got {}",
             tmp_beta_before + 2.0,
             after_miss.balanced_recall.temporal.beta
+        );
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+
+    fn find_handler(name: &str) -> &'static HandlerDef {
+        BRAIN_HANDLERS
+            .iter()
+            .find(|h| h.name == name)
+            .unwrap_or_else(|| panic!("handler {name:?} not found in BRAIN_HANDLERS"))
+    }
+
+    #[test]
+    fn brain_feedback_params_non_empty_and_has_target_and_signal() {
+        let h = find_handler("brain.feedback");
+        assert!(!h.params.is_empty(), "brain.feedback must have params");
+        assert!(
+            h.params.iter().any(|p| p.name == "target_id" && p.required),
+            "brain.feedback must have required target_id param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "signal" && p.required),
+            "brain.feedback must have required signal param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "served_by_profile_id"),
+            "brain.feedback must document served_by_profile_id"
+        );
+    }
+
+    #[test]
+    fn brain_profile_params_has_required_id() {
+        let h = find_handler("brain.profile");
+        assert!(!h.params.is_empty(), "brain.profile must have params");
+        assert!(
+            h.params.iter().any(|p| p.name == "id" && p.required),
+            "brain.profile must have required id param (not name)"
+        );
+    }
+
+    #[test]
+    fn brain_profiles_params_has_lifecycle_filter() {
+        let h = find_handler("brain.profiles");
+        assert!(!h.params.is_empty(), "brain.profiles must have params");
+        assert!(
+            h.params.iter().any(|p| p.name == "lifecycle"),
+            "brain.profiles must document lifecycle filter param"
+        );
+    }
+
+    #[test]
+    fn brain_resolve_params_has_consumer_kind_required() {
+        let h = find_handler("brain.resolve");
+        assert!(!h.params.is_empty(), "brain.resolve must have params");
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "consumer_kind" && p.required),
+            "brain.resolve must have required consumer_kind"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "actor"),
+            "brain.resolve must document optional actor"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "namespace"),
+            "brain.resolve must document optional namespace"
+        );
+    }
+
+    #[test]
+    fn brain_bind_params_has_required_profile_id_and_optionals() {
+        let h = find_handler("brain.bind");
+        assert!(!h.params.is_empty(), "brain.bind must have params");
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "profile_id" && p.required),
+            "brain.bind must have required profile_id"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "actor"),
+            "brain.bind must document actor"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "namespace"),
+            "brain.bind must document namespace"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "consumer_kind"),
+            "brain.bind must document consumer_kind"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "priority"),
+            "brain.bind must document priority"
+        );
+    }
+
+    #[test]
+    fn brain_unbind_params_non_empty_all_optional() {
+        let h = find_handler("brain.unbind");
+        assert!(!h.params.is_empty(), "brain.unbind must have params");
+        assert!(
+            h.params.iter().all(|p| !p.required),
+            "brain.unbind params must all be optional (filter semantics)"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "profile_id"),
+            "brain.unbind must document profile_id filter"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "actor"),
+            "brain.unbind must document actor filter"
+        );
+    }
+
+    #[test]
+    fn brain_activate_deactivate_archive_each_have_profile_id() {
+        for verb in ["brain.activate", "brain.deactivate", "brain.archive"] {
+            let h = find_handler(verb);
+            assert!(!h.params.is_empty(), "{verb} must have params");
+            assert!(
+                h.params
+                    .iter()
+                    .any(|p| p.name == "profile_id" && p.required),
+                "{verb} must have required profile_id param"
+            );
+        }
+    }
+
+    #[test]
+    fn brain_reset_params_empty() {
+        let h = find_handler("brain.reset");
+        assert!(
+            h.params.is_empty(),
+            "brain.reset takes no params — params slice must be empty"
+        );
+    }
+
+    #[test]
+    fn brain_config_params_has_parameter() {
+        let h = find_handler("brain.config");
+        assert!(
+            !h.params.is_empty(),
+            "brain.config must document the parameter arg"
+        );
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "parameter" && !p.required),
+            "brain.config parameter must be optional"
+        );
+    }
+
+    #[test]
+    fn brain_events_params_has_limit() {
+        let h = find_handler("brain.events");
+        assert!(
+            !h.params.is_empty(),
+            "brain.events must document the limit arg"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "limit" && !p.required),
+            "brain.events limit must be optional"
+        );
+    }
+
+    #[test]
+    fn brain_emit_params_non_empty_with_target_and_signal() {
+        let h = find_handler("brain.emit");
+        assert!(
+            !h.params.is_empty(),
+            "brain.emit must have params (mirrors brain.feedback)"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "target_id" && p.required),
+            "brain.emit must have required target_id"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "signal" && p.required),
+            "brain.emit must have required signal"
         );
     }
 }

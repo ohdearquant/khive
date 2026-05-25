@@ -1323,3 +1323,129 @@ async fn test_prev_bare_resolves_full_result() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ── help=true schema envelope integration tests ─────────────────────────────
+//
+// These tests confirm that help=true calls through the MCP surface return
+// non-empty params slices with specific known parameters — verifying that
+// the HandlerDef.params slices are populated (not left as &[]).
+
+fn make_full_server() -> KhiveMcpServer {
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("test").unwrap(),
+        embedding_model: None,
+        packs: vec![
+            "kg".to_string(),
+            "gtd".to_string(),
+            "memory".to_string(),
+            "brain".to_string(),
+        ],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("in-memory runtime with all packs");
+    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd+memory+brain")
+}
+
+async fn connect_full(
+) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = make_full_server();
+    tokio::spawn(async move {
+        if let Ok(server_service) = server.serve(server_transport).await {
+            let _ = server_service.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    Ok(client)
+}
+
+/// Helper: call `verb(help=true)` through the MCP surface and return the
+/// parsed result. Asserts the op succeeded and returns the schema envelope.
+async fn help_schema(
+    client: &impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>,
+    verb: &str,
+) -> anyhow::Result<Value> {
+    let ops = format!("{verb}(help=true)");
+    let result = call(client, "request", json!({"ops": &ops})).await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = body["results"].get(0).cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        first["ok"],
+        json!(true),
+        "{verb}(help=true) must succeed, got: {first}"
+    );
+    Ok(first["result"].clone())
+}
+
+#[tokio::test]
+async fn help_recall_params_non_empty_with_query_param() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let schema = help_schema(&client, "recall").await?;
+    let params = schema["params"]
+        .as_array()
+        .expect("params must be an array");
+    assert!(
+        !params.is_empty(),
+        "recall help=true must return non-empty params; got empty slice"
+    );
+    let has_query = params.iter().any(|p| p["name"] == json!("query"));
+    assert!(
+        has_query,
+        "recall params must include 'query'; got: {params:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn help_brain_feedback_params_non_empty_with_target_and_signal() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let schema = help_schema(&client, "brain.feedback").await?;
+    let params = schema["params"]
+        .as_array()
+        .expect("params must be an array");
+    assert!(
+        !params.is_empty(),
+        "brain.feedback help=true must return non-empty params"
+    );
+    let has_target_id = params.iter().any(|p| p["name"] == json!("target_id"));
+    assert!(
+        has_target_id,
+        "brain.feedback params must include 'target_id'; got: {params:?}"
+    );
+    let has_signal = params.iter().any(|p| p["name"] == json!("signal"));
+    assert!(
+        has_signal,
+        "brain.feedback params must include 'signal'; got: {params:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn help_propose_params_non_empty_with_title_description_changeset() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let schema = help_schema(&client, "propose").await?;
+    let params = schema["params"]
+        .as_array()
+        .expect("params must be an array");
+    assert!(
+        !params.is_empty(),
+        "propose help=true must return non-empty params"
+    );
+    let has_title = params.iter().any(|p| p["name"] == json!("title"));
+    assert!(
+        has_title,
+        "propose params must include 'title'; got: {params:?}"
+    );
+    let has_description = params.iter().any(|p| p["name"] == json!("description"));
+    assert!(
+        has_description,
+        "propose params must include 'description'; got: {params:?}"
+    );
+    let has_changeset = params.iter().any(|p| p["name"] == json!("changeset"));
+    assert!(
+        has_changeset,
+        "propose params must include 'changeset'; got: {params:?}"
+    );
+    Ok(())
+}
