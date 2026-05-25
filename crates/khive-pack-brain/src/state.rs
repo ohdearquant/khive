@@ -366,9 +366,10 @@ impl BrainState {
         // usable, otherwise fall through to any active profile for the consumer_kind.
         // ADR-032 §10: "balanced-recall-v1" is the v1 system-default for recall.
         if let Some(default) = self.profiles.get("balanced-recall-v1") {
-            if default.consumer_kind == consumer_kind
-                || consumer_kind == "*"
-                || default.consumer_kind == "*"
+            if default.lifecycle == ProfileLifecycle::Active
+                && (default.consumer_kind == consumer_kind
+                    || consumer_kind == "*"
+                    || default.consumer_kind == "*")
             {
                 return Some(default);
             }
@@ -543,6 +544,27 @@ mod tests {
         // Different actor falls back to default
         let resolved_other = state.resolve(Some("agent-2"), None, "recall");
         assert_eq!(resolved_other.unwrap().id, "balanced-recall-v1");
+    }
+
+    // Regression test for MAJ-005: an archived default profile must NOT be returned
+    // by resolve (ADR-032 §10: "Archived … NOT resolvable for live recall").
+    #[test]
+    fn brain_state_resolve_skips_archived_default() {
+        let mut state = BrainState::new(100);
+
+        // Archive the built-in default
+        state
+            .profiles
+            .get_mut("balanced-recall-v1")
+            .expect("default profile always exists")
+            .lifecycle = ProfileLifecycle::Archived;
+
+        // No explicit binding → must not return the archived default
+        let resolved = state.resolve(None, None, "recall");
+        assert!(
+            resolved.is_none(),
+            "archived default profile must not be returned by resolve"
+        );
     }
 
     #[test]

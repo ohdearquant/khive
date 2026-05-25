@@ -581,15 +581,17 @@ impl BrainPack {
         let before = state.bindings.len();
 
         state.bindings.retain(|b| {
-            let pid_match = p.profile_id.as_ref().is_some_and(|id| &b.profile_id == id);
-            let actor_match = p.actor.as_ref().is_some_and(|a| &b.actor == a);
-            let ns_match = p.namespace.as_ref().is_some_and(|n| &b.namespace == n);
+            let pid_match = p.profile_id.as_ref().is_none_or(|id| &b.profile_id == id);
+            let actor_match = p.actor.as_ref().is_none_or(|a| &b.actor == a);
+            let ns_match = p.namespace.as_ref().is_none_or(|n| &b.namespace == n);
             let kind_match = p
                 .consumer_kind
                 .as_ref()
-                .is_some_and(|k| &b.consumer_kind == k);
-            // Retain if NONE of the provided filters match this binding
-            !(pid_match || actor_match || ns_match || kind_match)
+                .is_none_or(|k| &b.consumer_kind == k);
+            // Retain if this binding does NOT match ALL of the provided filters.
+            // A filter that is absent (None) matches everything — only bindings
+            // satisfying every supplied criterion are removed.
+            !(pid_match && actor_match && ns_match && kind_match)
         });
 
         let removed = before - state.bindings.len();
@@ -994,6 +996,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["unbound"], json!(1u64));
+    }
+
+    // Regression test for MAJ-002: unbind with multiple filters must use AND semantics,
+    // removing only the binding that satisfies ALL supplied criteria.
+    #[tokio::test]
+    async fn dispatch_unbind_uses_and_not_or() {
+        let pack = make_pack();
+        let registry = empty_registry();
+
+        // binding 1: ns=A, profile=P1 (the one we want to remove)
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "balanced-recall-v1", "namespace": "ns-a", "consumer_kind": "recall"}),
+            &registry,
+        )
+        .await
+        .unwrap();
+
+        // binding 2: ns=B, profile=P1 (must survive)
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "balanced-recall-v1", "namespace": "ns-b", "consumer_kind": "recall"}),
+            &registry,
+        )
+        .await
+        .unwrap();
+
+        // Unbind using both filters: only binding-1 should be removed
+        let result = pack
+            .dispatch(
+                "brain.unbind",
+                json!({"namespace": "ns-a", "profile_id": "balanced-recall-v1"}),
+                &registry,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result["unbound"],
+            json!(1u64),
+            "should remove exactly one binding"
+        );
+
+        // binding-2 (ns-b) must still exist
+        let state = pack.state.lock().unwrap();
+        let remaining: Vec<_> = state
+            .bindings
+            .iter()
+            .filter(|b| b.namespace == "ns-b")
+            .collect();
+        assert_eq!(remaining.len(), 1, "ns-b binding must survive the unbind");
     }
 
     #[tokio::test]
