@@ -14,7 +14,7 @@ concepts, links ideas, records decisions — khive gives that work a typed, quer
 persists across sessions.
 
 It is NOT a general-purpose database, a vector DB, or a chat memory system. It has opinions:
-6 entity kinds, 13 edge relations, 5 note kinds — all closed sets. If your data doesn't fit the
+8 entity kinds, 15 edge relations, 5 note kinds — all closed sets. If your data doesn't fit the
 schema, change how you model it, not the schema. Schema changes require an ADR.
 
 ---
@@ -48,16 +48,16 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-mcp      — stdio MCP server (the only binary)         │
-│  1 tool: `request` (ADR-020 + ADR-027) — parses DSL,         │
+│  1 tool: `request` (ADR-016) — parses DSL,                   │
 │  dispatches verb ops through the VerbRegistry                │
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg     — KG vocabulary + 11 verb handlers (ADR-025)     │
-│  khive-pack-gtd    — GTD lifecycle, 5 verbs (ADR-026, optional)     │
-│  khive-pack-memory — memory/recall verbs + decay (ADR-036, optional)│
-│  khive-vcs         — KG versioning: snapshots/branches (ADR-042)    │
-│  khive-merge       — three-way KG merge algorithm (ADR-043)         │
+│  khive-pack-kg     — KG vocabulary + 11 verb handlers (ADR-017)     │
+│  khive-pack-gtd    — GTD lifecycle, 5 verbs (ADR-019, optional)     │
+│  khive-pack-memory — memory/recall verbs + decay (ADR-021, optional)│
+│  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
+│  khive-merge       — KG merge algorithm (ADR-039)                   │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -82,61 +82,64 @@ not shipped.
 
 ## Directory map
 
-| Path                       | Purpose                                                                                                                              |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `crates/khive-types`       | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                                              |
-| `crates/khive-score`       | Deterministic i64 fixed-point scoring + RRF                                                                                          |
-| `crates/khive-storage`     | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                                                           |
-| `crates/khive-db`          | SQLite backend + sqlite-vec + FTS5 trigram                                                                                           |
-| `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                                   |
-| `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                                       |
-| `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                                         |
-| `crates/khive-pack-kg`     | KG pack: vocabulary, 11 verb handlers, kind validation                                                                               |
-| `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                                         |
-| `crates/khive-pack-memory` | Memory pack: `remember`/`recall` verbs, decay-weighted recall ([ADR-036](docs/adr/ADR-036-memory-pack-semantics.md))                 |
-| `crates/khive-vcs`         | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-042](docs/adr/ADR-042-kg-versioning-implementation.md)) |
-| `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-043](docs/adr/ADR-043-kg-merge-algorithm.md))       |
-| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry                                                                           |
-| `docs/adr/`                | Architecture Decision Records (the design contract)                                                                                  |
-| `marketplace/`             | Claude Code plugins (`kg`, `gtd`) — install via `/plugin install`                                                                    |
-| `tests/smoke_test.py`      | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                               |
-| `scripts/publish.sh`       | Publish all crates to crates.io in dependency order                                                                                  |
+| Path                       | Purpose                                                                                                                |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `crates/khive-types`       | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                                |
+| `crates/khive-score`       | Deterministic i64 fixed-point scoring + RRF                                                                            |
+| `crates/khive-storage`     | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                                             |
+| `crates/khive-db`          | SQLite backend + sqlite-vec + FTS5 trigram                                                                             |
+| `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                     |
+| `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                         |
+| `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                           |
+| `crates/khive-pack-kg`     | KG pack: vocabulary, 11 verb handlers, kind validation                                                                 |
+| `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                           |
+| `crates/khive-pack-memory` | Memory pack: `remember`/`recall` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))             |
+| `crates/khive-vcs`         | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-010](docs/adr/ADR-010-kg-versioning.md))  |
+| `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-039](docs/adr/ADR-039-note-merge.md)) |
+| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry                                                             |
+| `docs/adr/`                | Architecture Decision Records (the design contract)                                                                    |
+| `marketplace/`             | Claude Code plugins (`kg`, `gtd`) — install via `/plugin install`                                                      |
+| `tests/smoke_test.py`      | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                 |
+| `scripts/publish.sh`       | Publish all crates to crates.io in dependency order                                                                    |
 
 ---
 
 ## Closed taxonomies (DO NOT extend without an ADR)
 
-### 6 entity kinds ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md))
+### 8 entity kinds ([ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md))
 
-`concept` | `document` | `dataset` | `project` | `person` | `org`
+`concept` | `document` | `dataset` | `project` | `person` | `org` | `artifact` | `service`
 
-### 13 edge relations ([ADR-002](docs/adr/ADR-002-edge-ontology.md))
+### 15 edge relations ([ADR-002](docs/adr/ADR-002-edge-ontology.md))
 
 Structure: `contains` | `part_of` | `instance_of`
 Derivation: `extends` | `variant_of` | `introduced_by` | `supersedes`
+Provenance: `derived_from`
+Temporal: `precedes`
 Dependency: `depends_on` | `enables`
 Implementation: `implements`
 Lateral: `competes_with` | `composed_with`
 Annotation: `annotates`
 
-### 5 note kinds ([ADR-019](docs/adr/ADR-019-note-kind-taxonomy.md))
+### 5 note kinds ([ADR-013](docs/adr/ADR-013-note-kind-taxonomy.md))
 
 `observation` | `insight` | `question` | `decision` | `reference`
 
-Entity and note kinds are **pack-owned** ([ADR-025](docs/adr/ADR-025-pack-standard.md)) — the
+Entity and note kinds are **pack-owned** ([ADR-017](docs/adr/ADR-017-pack-standard.md)) — the
 `kg` pack declares them as static vocabulary; the runtime validates against all loaded packs.
 Edge relations remain a **closed enum** (compile-time). Ad-hoc kinds/relations are rejected,
 not silently accepted.
 
 The per-relation **endpoint contract** (which `(source, relation, target)` triples are legal)
 is the ADR-002 base contract _plus_ any pack-declared additions
-([ADR-031](docs/adr/ADR-031-pack-extensible-edge-endpoints.md)). The GTD pack uses this to
-allow `depends_on` between two `task` notes — base contract alone would reject a note source
-for non-`annotates` relations. Rules are additive only; packs cannot tighten the base contract.
+([ADR-017](docs/adr/ADR-017-pack-standard.md) §"Pack-extensible edge endpoints"). The GTD pack
+uses this to allow `depends_on` between two `task` notes — base contract alone would reject a
+note source for non-`annotates` relations. Rules are additive only; packs cannot tighten the
+base contract.
 
 ---
 
-## MCP tool surface (one tool: `request`, v0.2 — ADR-020 + ADR-027)
+## MCP tool surface (one tool: `request` — ADR-016)
 
 The MCP server exposes a single tool named `request` that accepts a verb-dispatch DSL string
 and routes each parsed op through the loaded packs. Verb taxonomy and semantics are unchanged
@@ -156,7 +159,7 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default is
 `kg` only.
 
-### KG pack verbs (11 — ADR-023 + ADR-024)
+### KG pack verbs (11 — ADR-017)
 
 `create`, `list`, and `search` take a `kind` discriminant. It accepts either the substrate-level
 name (`entity`, `note`, `edge`) **or** a pack-registered granular kind (`concept`, `document`,
@@ -177,7 +180,7 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 | `traverse`  | `roots`, `max_depth?`, `relations?`          | Multi-hop BFS with filters                                    |
 | `query`     | GQL or SPARQL string                         | Pattern matching compiled to SQL                              |
 
-### GTD pack verbs (5 — ADR-026, optional)
+### GTD pack verbs (5 — ADR-019, optional)
 
 Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
 
@@ -189,7 +192,7 @@ Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
 | `tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                       |
 | `transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation  |
 
-### Memory pack verbs (2 — ADR-036, optional)
+### Memory pack verbs (2 — ADR-021, optional)
 
 Load with `KHIVE_PACKS=kg,memory` or `--pack memory`. Adds the `memory` note kind.
 
@@ -304,20 +307,19 @@ ADRs specify. Changing the schema or interface requires an ADR **before** code l
 
 Key ADRs for contributors:
 
-| ADR                                                       | What it governs                                      |
-| --------------------------------------------------------- | ---------------------------------------------------- |
-| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)           | 6 entity kinds — don't add without this              |
-| [002](docs/adr/ADR-002-edge-ontology.md)                  | 13 edge relations — closed set                       |
-| [005](docs/adr/ADR-005-storage-capability-traits.md)      | Storage traits — the abstraction boundary            |
-| [008](docs/adr/ADR-008-query-layer-separation.md)         | Query crate — parser/validator/compiler separation   |
-| [019](docs/adr/ADR-019-note-kind-taxonomy.md)             | 5 note kinds                                         |
-| [020](docs/adr/ADR-020-request-dsl.md)                    | Request DSL — verb-dispatch syntax for `request`     |
-| [022](docs/adr/ADR-022-schema-migrations.md)              | Migration system — how to change the DB schema       |
-| [023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md)  | Verb taxonomy (wire shape now via `request`)         |
-| [025](docs/adr/ADR-025-pack-standard.md)                  | Pack trait — composable vocabulary extension         |
-| [027](docs/adr/ADR-027-single-tool-mcp-surface.md)        | Single-tool MCP surface — `request` is the only tool |
-| [028](docs/adr/ADR-028-request-parser-crate.md)           | Parser crate split — `khive-request`                 |
-| [031](docs/adr/ADR-031-pack-extensible-edge-endpoints.md) | Pack-extensible edge endpoints — `EDGE_RULES`        |
+| ADR                                                  | What it governs                                      |
+| ---------------------------------------------------- | ---------------------------------------------------- |
+| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)      | 8 entity kinds — don't add without this              |
+| [002](docs/adr/ADR-002-edge-ontology.md)             | 15 edge relations — closed set                       |
+| [005](docs/adr/ADR-005-storage-capability-traits.md) | Storage traits — the abstraction boundary            |
+| [008](docs/adr/ADR-008-query-layer-separation.md)    | Query crate — parser/validator/compiler separation   |
+| [013](docs/adr/ADR-013-note-kind-taxonomy.md)        | 5 base note kinds                                    |
+| [015](docs/adr/ADR-015-schema-migrations.md)         | Migration system — how to change the DB schema       |
+| [016](docs/adr/ADR-016-request-dsl.md)               | Request DSL — verb-dispatch syntax for `request`     |
+| [017](docs/adr/ADR-017-pack-standard.md)             | Pack trait, `EDGE_RULES`, pack-extensible endpoints  |
+| [023](docs/adr/ADR-023-declarative-pack-format.md)   | Pack verb surface, visibility, and composition       |
+| [027](docs/adr/ADR-027-dynamic-pack-loading.md)      | Dynamic pack loading via self-registration           |
+| [028](docs/adr/ADR-028-pack-scoped-backends.md)      | Pack-scoped backends and per-pack schema declaration |
 
 Full index: [docs/adr/README.md](docs/adr/README.md).
 
@@ -328,15 +330,15 @@ Full index: [docs/adr/README.md](docs/adr/README.md).
 | Want to do...                                               | Edit this                                                                                                                             |
 | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | Add a new verb                                              | Pack handler in `crates/khive-pack-kg/src/handlers.rs` (or your pack); the MCP surface is `request` — no per-verb tool file to author |
-| Change DSL syntax                                           | `crates/khive-request/src/lib.rs` + unit tests (ADR-020, ADR-028)                                                                     |
-| Change MCP surface shape                                    | `crates/khive-mcp/src/server.rs` (ADR-027 — `request` is the only tool)                                                               |
+| Change DSL syntax                                           | `crates/khive-request/src/lib.rs` + unit tests (ADR-016)                                                                              |
+| Change MCP surface shape                                    | `crates/khive-mcp/src/server.rs` (ADR-016 — `request` is the only tool)                                                               |
 | Add a runtime operation                                     | `crates/khive-runtime/src/operations.rs`                                                                                              |
 | Change DB schema                                            | `crates/khive-db/src/migrations.rs` (new version) + store DDL                                                                         |
 | Add a new entity kind                                       | `crates/khive-pack-kg/src/vocab.rs` + ADR-001 amendment                                                                               |
 | Add a new edge relation                                     | **STOP** — ADR change ([ADR-002](docs/adr/ADR-002-edge-ontology.md))                                                                  |
-| Allow a new edge endpoint pair (e.g. note-kind→entity-kind) | Pack's `EDGE_RULES` const ([ADR-031](docs/adr/ADR-031-pack-extensible-edge-endpoints.md)); additive only                              |
-| Add a new note kind                                         | `crates/khive-pack-kg/src/vocab.rs` + ADR-019 amendment                                                                               |
-| Add a new pack                                              | New crate implementing `Pack` + `PackRuntime` ([ADR-025](docs/adr/ADR-025-pack-standard.md))                                          |
+| Allow a new edge endpoint pair (e.g. note-kind→entity-kind) | Pack's `EDGE_RULES` const ([ADR-017](docs/adr/ADR-017-pack-standard.md) §"Pack-extensible edge endpoints"); additive only             |
+| Add a new note kind                                         | `crates/khive-pack-kg/src/vocab.rs` + ADR-013 amendment                                                                               |
+| Add a new pack                                              | New crate implementing `Pack` + `PackRuntime` ([ADR-017](docs/adr/ADR-017-pack-standard.md))                                          |
 | Fix a query parser bug                                      | `crates/khive-query/src/parsers/` + add regression test                                                                               |
 | Fix a storage bug                                           | `crates/khive-db/src/stores/` + test                                                                                                  |
 
