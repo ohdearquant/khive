@@ -324,6 +324,23 @@ const V12_NULLABLE_NOTE_METRICS: &str = "\
 // (which includes the new columns) does not fail with "duplicate column name".
 const V13_EVENT_OBSERVABILITY_PROVENANCE: &str = "__v13_computed_at_runtime__";
 
+/// V14: Embedding model registry (`_embedding_models`) and per-engine model FK column.
+///
+/// Creates the `_embedding_models` registry table that tracks which embedding model
+/// is active for each vector engine (ADR-043 §1). Also adds the `embedding_model_id`
+/// FK column to any existing regular `vec_<engine>` tables found in sqlite_master
+/// so that stored vectors can be traced back to the model that produced them.
+///
+/// sqlite-vec virtual tables (`vec0`) do not support `ALTER TABLE ADD COLUMN`;
+/// for those tables the column is added during the startup backfill rebuild
+/// (ADR-043 §8) which runs after this migration. New tables created after V14
+/// include `embedding_model_id` from creation via the updated DDL in backend.rs.
+///
+/// The migration SQL is computed at runtime via `build_v14_embedding_model_registry_sql`
+/// to discover existing `vec_<engine>` tables dynamically and skip the `ALTER TABLE`
+/// step for any table that already has the column.
+const V14_EMBEDDING_MODEL_REGISTRY: &str = "__v14_computed_at_runtime__";
+
 pub const MIGRATIONS: &[VersionedMigration] = &[
     VersionedMigration {
         version: 1,
@@ -395,6 +412,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 13,
         name: "event_observability_provenance",
         up: V13_EVENT_OBSERVABILITY_PROVENANCE,
+    },
+    VersionedMigration {
+        version: 14,
+        name: "embedding_model_registry",
+        up: V14_EMBEDDING_MODEL_REGISTRY,
     },
 ];
 
@@ -607,6 +629,11 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
                 version: migration.version,
                 error: e.to_string(),
             })?
+        } else if migration.version == 14 {
+            build_v14_embedding_model_registry_sql(&tx).map_err(|e| SqliteError::Migration {
+                version: migration.version,
+                error: e.to_string(),
+            })?
         } else {
             migration.up.to_string()
         };
@@ -709,6 +736,85 @@ fn build_v13_event_observability_sql(conn: &Connection) -> Result<String, rusqli
     Ok(sql)
 }
 
+/// Build V14 migration SQL at runtime.
+///
+/// Creates the `_embedding_models` registry table and its indexes (ADR-043 §1).
+/// Then discovers any existing regular (non-virtual) `vec_<engine>` tables in
+/// sqlite_master and adds the `embedding_model_id` FK column where absent.
+///
+/// sqlite-vec virtual tables (`vec0`) do not support `ALTER TABLE ADD COLUMN`;
+/// those tables are handled by the startup backfill rebuild (ADR-043 §8) which
+/// runs after the SQL migration completes. New `vec_<engine>` tables created
+/// after V14 include `embedding_model_id` from the start via the updated DDL
+/// in `StorageBackend::vectors_for_namespace`.
+fn build_v14_embedding_model_registry_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
+    let mut sql = String::from(
+        "CREATE TABLE IF NOT EXISTS _embedding_models (\
+            id              BLOB PRIMARY KEY,\
+            engine_name     TEXT NOT NULL,\
+            model_id        TEXT NOT NULL,\
+            key_version     TEXT NOT NULL,\
+            dim             INTEGER NOT NULL,\
+            output_dim      INTEGER,\
+            status          TEXT NOT NULL CHECK (status IN ('pending', 'active', 'superseded', 'archived')),\
+            activated_at    INTEGER,\
+            superseded_at   INTEGER,\
+            superseded_by   BLOB,\
+            canonical_key   BLOB NOT NULL UNIQUE,\
+            created_at      INTEGER NOT NULL\
+        );\
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_embed_models_one_active \
+            ON _embedding_models(engine_name) WHERE status = 'active';\
+        CREATE INDEX IF NOT EXISTS idx_embed_models_engine_status \
+            ON _embedding_models(engine_name, status);",
+    );
+
+    // Discover existing regular (non-virtual) vec_<engine> tables. sqlite-vec virtual
+    // tables carry type='table' in sqlite_master with sql beginning 'CREATE VIRTUAL
+    // TABLE'; we exclude them here since ALTER TABLE ADD COLUMN is not supported for
+    // virtual tables. Those tables receive the column during startup backfill rebuild.
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'table' \
+           AND name LIKE 'vec_%' \
+           AND sql NOT LIKE '%VIRTUAL%' \
+           AND sql NOT LIKE '%vec0%'",
+    )?;
+    let vec_tables: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for table in &vec_tables {
+        // Validate table name: only alphanumeric and underscores after the 'vec_' prefix.
+        let valid = table.starts_with("vec_")
+            && table[4..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            continue;
+        }
+        // Check whether the column already exists.
+        let col_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = 'embedding_model_id'",
+                rusqlite::params![table],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if col_exists {
+            continue;
+        }
+        sql.push_str(&format!(
+            "ALTER TABLE {t} ADD COLUMN embedding_model_id BLOB REFERENCES _embedding_models(id);\
+             CREATE INDEX IF NOT EXISTS idx_{t}_model ON {t}(embedding_model_id);",
+            t = table,
+        ));
+    }
+
+    Ok(sql)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -725,17 +831,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
-        // Verify the tracking table has rows for V1 through V13.
+        // Verify the tracking table has rows for V1 through V14.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 13);
+        assert_eq!(count, 14);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -858,6 +964,31 @@ mod tests {
                 .unwrap();
             assert!(exists, "V13 must create index {idx}");
         }
+
+        // Verify V14 created the _embedding_models registry table.
+        let embed_tbl: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_embedding_models'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(embed_tbl, 1, "V14 must create _embedding_models table");
+
+        // Verify V14 indexes exist.
+        for idx in [
+            "idx_embed_models_one_active",
+            "idx_embed_models_engine_status",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "V14 must create index {idx}");
+        }
     }
 
     #[test]
@@ -865,16 +996,16 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 13);
-        assert_eq!(v2, 13);
+        assert_eq!(v1, 14);
+        assert_eq!(v2, 14);
 
-        // Should still have exactly thirteen rows in the tracking table (V1..V13).
+        // Should still have exactly fourteen rows in the tracking table (V1..V14).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 13);
+        assert_eq!(count, 14);
     }
 
     // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
@@ -884,8 +1015,8 @@ mod tests {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
         assert_eq!(
-            version, 13,
-            "F052: latest migration must be V13 (event observability provenance)"
+            version, 14,
+            "F052: latest migration must be V14 (embedding model registry)"
         );
         let col: i64 = conn
             .query_row(
@@ -913,40 +1044,40 @@ mod tests {
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v14 = VersionedMigration {
-            version: 14,
+        let bad_v15 = VersionedMigration {
+            version: 15,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1..V13) so the DB is at V13.
-        run_migrations(&mut conn).expect("V1..V13 should apply cleanly");
+        // Apply all real migrations (V1..V14) so the DB is at V14.
+        run_migrations(&mut conn).expect("V1..V14 should apply cleanly");
 
-        // Now manually drive the bad V14 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v14);
+        // Now manually drive the bad V15 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v15);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V13 — no V14 row in tracking.
-        let v14_count: i64 = conn
+        // DB should still be at V14 — no V15 row in tracking.
+        let v15_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 14",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 15",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v14_count, 0, "V14 must not be recorded after rollback");
+        assert_eq!(v15_count, 0, "V15 must not be recorded after rollback");
 
-        // V1..V13 should still be there.
+        // V1..V14 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(applied_count, 13, "V1..V13 must still be recorded");
+        assert_eq!(applied_count, 14, "V1..V14 must still be recorded");
     }
 
     #[test]
@@ -978,9 +1109,10 @@ mod tests {
         // V9 rebuilds graph_edges with lifecycle columns; V10 should detect the existing
         // status column and skip; V11 should detect the existing merged_into column and skip;
         // V12 should detect that salience is already nullable and skip;
-        // V13 adds event observability columns and event_observations table.
+        // V13 adds event observability columns and event_observations table;
+        // V14 creates the _embedding_models registry table.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -1073,6 +1205,19 @@ mod tests {
             v13_count, 1,
             "V13 must be recorded after store-DDL + migrations"
         );
+
+        // V14 (embedding model registry) must be recorded.
+        let v14_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 14",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v14_count, 1,
+            "V14 must be recorded after store-DDL + migrations"
+        );
     }
 
     /// Verify that V12 rebuilds a V1-era notes table so salience/decay_factor
@@ -1144,9 +1289,9 @@ mod tests {
         )
         .unwrap();
 
-        // Run V2-V13 migrations.
+        // Run V2-V14 migrations.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         // After V12, salience must be nullable (notnull=0).
         let notnull: i64 = conn
@@ -1190,7 +1335,7 @@ mod tests {
         ensure_events_schema(&conn).expect("store DDL should create events");
 
         let version = run_migrations(&mut conn).expect("migrations after events store DDL");
-        assert_eq!(version, 13, "must reach V13 even when events DDL ran first");
+        assert_eq!(version, 14, "must reach V14 even when events DDL ran first");
 
         let v13_count: i64 = conn
             .query_row(
@@ -1200,6 +1345,144 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v13_count, 1, "V13 must be recorded");
+
+        let v14_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 14",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v14_count, 1, "V14 must be recorded");
+    }
+
+    /// F227/F228: V14 must create the _embedding_models registry table and its indexes.
+    ///
+    /// F227: MIGRATIONS previously stopped at V4 (dedupe_graph_edge_triples); no
+    ///       embedding registry existed.
+    /// F228: vec_<engine> tables previously lacked the embedding_model_id FK column.
+    ///       New tables created after V14 include it from the start via the updated DDL.
+    #[test]
+    fn migration_v14_creates_embedding_model_registry() {
+        let mut conn = open_memory();
+        let version = run_migrations(&mut conn).expect("migrations should succeed");
+        assert_eq!(
+            version, 14,
+            "F227: latest migration must be V14 (embedding model registry)"
+        );
+
+        // Verify _embedding_models table exists.
+        let tbl: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_embedding_models'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tbl, 1, "F227: _embedding_models table must exist after V14");
+
+        // Verify the partial unique index for one-active-per-engine constraint.
+        let one_active_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_embed_models_one_active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            one_active_idx, 1,
+            "V14 must create idx_embed_models_one_active partial unique index"
+        );
+
+        // Verify the engine+status composite index.
+        let engine_status_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_embed_models_engine_status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            engine_status_idx, 1,
+            "V14 must create idx_embed_models_engine_status index"
+        );
+
+        // Verify the _embedding_models schema contains required columns.
+        for col in [
+            "id",
+            "engine_name",
+            "model_id",
+            "key_version",
+            "dim",
+            "output_dim",
+            "status",
+            "activated_at",
+            "superseded_at",
+            "superseded_by",
+            "canonical_key",
+            "created_at",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('_embedding_models') WHERE name = ?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                exists,
+                "F227: _embedding_models must have column '{col}' after V14"
+            );
+        }
+    }
+
+    /// F228: New vec_<engine> tables created after V14 (via StorageBackend::vectors_for_namespace)
+    /// include the embedding_model_id FK column from the start.
+    ///
+    /// This test verifies the migration adds embedding_model_id to a pre-existing
+    /// regular (non-virtual) vec_ table that was created before V14 ran.
+    #[test]
+    fn migration_v14_adds_embedding_model_id_to_existing_regular_vec_tables() {
+        let mut conn = open_memory();
+
+        // Simulate a pre-V14 database state: apply V1-V13 manually by running
+        // migrations up to V13, then create a regular (non-virtual) vec_ table
+        // without the embedding_model_id column, then run the full migration.
+        //
+        // We use a real SQLite table here (not a vec0 virtual table) because
+        // sqlite-vec is not available in the unit test environment. The migration
+        // correctly detects and skips virtual tables.
+        conn.execute_batch(
+            "CREATE TABLE vec_legacy_model (\
+                subject_id TEXT PRIMARY KEY,\
+                namespace TEXT NOT NULL,\
+                kind TEXT NOT NULL,\
+                field TEXT NOT NULL\
+            );",
+        )
+        .unwrap();
+
+        // Run the full migration suite — V14 should add embedding_model_id to the
+        // regular vec_legacy_model table.
+        let version = run_migrations(&mut conn).expect("migrations should succeed");
+        assert_eq!(version, 14);
+
+        // The embedding_model_id column must now exist.
+        let col_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('vec_legacy_model') WHERE name = 'embedding_model_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            col_exists,
+            "F228: V14 must add embedding_model_id to existing regular vec_ tables"
+        );
+
+        // Running migrations again must be idempotent (column already present).
+        let version2 = run_migrations(&mut conn).expect("second run must succeed");
+        assert_eq!(version2, 14);
     }
 
     /// Helper: apply a single migration in a transaction, recording it in the

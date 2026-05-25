@@ -318,6 +318,33 @@ impl StorageBackend {
             }
         }
 
+        // Ensure the _embedding_models registry table exists (ADR-043 §1).
+        // This is a no-op when the table already exists. Running it here ensures
+        // the registry is present for any caller that opens a vector store without
+        // first calling run_migrations() (e.g., tests that create stores directly).
+        // Production callers are expected to call run_migrations() at startup, which
+        // creates the registry via V14; this is a belt-and-suspenders fallback.
+        writer.conn().execute_batch(
+            "CREATE TABLE IF NOT EXISTS _embedding_models (\
+                id              BLOB PRIMARY KEY,\
+                engine_name     TEXT NOT NULL,\
+                model_id        TEXT NOT NULL,\
+                key_version     TEXT NOT NULL,\
+                dim             INTEGER NOT NULL,\
+                output_dim      INTEGER,\
+                status          TEXT NOT NULL CHECK (status IN ('pending', 'active', 'superseded', 'archived')),\
+                activated_at    INTEGER,\
+                superseded_at   INTEGER,\
+                superseded_by   BLOB,\
+                canonical_key   BLOB NOT NULL UNIQUE,\
+                created_at      INTEGER NOT NULL\
+            );\
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_embed_models_one_active \
+                ON _embedding_models(engine_name) WHERE status = 'active';\
+            CREATE INDEX IF NOT EXISTS idx_embed_models_engine_status \
+                ON _embedding_models(engine_name, status);",
+        )?;
+
         // Create the vec0 virtual table with the full ADR-044 schema. Idempotent
         // on fresh databases and after the old-schema rebuild above.
         let ddl = format!(
