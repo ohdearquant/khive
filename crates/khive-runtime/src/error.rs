@@ -136,6 +136,25 @@ pub enum RuntimeError {
     /// cross-namespace existence information (ADR-007 timing-oracle mitigation).
     #[error("not found in this namespace")]
     NamespaceMismatch { id: uuid::Uuid },
+
+    /// A short-prefix lookup matched more than one record (ADR-016 §UUID arguments).
+    ///
+    /// `prefix` is the 8+ hex-char prefix supplied by the caller.
+    /// `matches` holds the full UUIDs of all matching records (at most 2 are
+    /// reported to bound the scan — callers must supply the full UUID to disambiguate).
+    #[error("ambiguous prefix {prefix:?}: matches {}", format_uuid_list(matches))]
+    AmbiguousPrefix {
+        prefix: String,
+        matches: Vec<uuid::Uuid>,
+    },
+}
+
+fn format_uuid_list(uuids: &[uuid::Uuid]) -> String {
+    let shorts: Vec<String> = uuids
+        .iter()
+        .map(|u| u.to_string()[..8].to_string())
+        .collect();
+    shorts.join(", ")
 }
 
 impl From<khive_types::KhiveError> for RuntimeError {

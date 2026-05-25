@@ -27,6 +27,7 @@ pub mod objectives;
 pub mod operations;
 pub mod pack;
 pub mod portability;
+pub mod presentation;
 pub mod registry;
 pub mod retrieval;
 pub mod runtime;
@@ -56,6 +57,7 @@ pub use pack::{
     PackRegistry, PackRuntime, PackSchemaPlan, SchemaPlan, VerbRegistry, VerbRegistryBuilder,
 };
 pub use portability::{ImportSummary, KgArchive};
+pub use presentation::{present, PresentationMode};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{parse_pack_list, KhiveRuntime, NamespaceToken, RuntimeConfig};
