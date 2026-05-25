@@ -1081,3 +1081,245 @@ async fn runtime_khive_error_serializes_as_structured_object() -> anyhow::Result
 
     Ok(())
 }
+
+// ── Chain $prev dispatch tests (ADR-016) ─────────────────────────────────────
+//
+// These tests verify that $prev / $prev.dotted.path references in chain ops are
+// resolved against the prior op's canonical result BEFORE dispatch — not passed
+// through as literal strings.  The four cases mirror the UE4 DSL critical finding.
+
+/// Chain: assign a task then complete it using $prev.id.
+///
+/// The canonical result of `assign` contains an `id` field (short UUID).
+/// `$prev.id` must resolve to that value so `complete` receives a valid ID.
+#[tokio::test]
+async fn test_prev_dot_id_resolves() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"assign(title="chain-prev-id-test", status="next") | complete(id=$prev.id)"#,
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let results = body["results"].as_array().expect("results array");
+
+    assert_eq!(results.len(), 2, "expected 2 ops in chain result");
+    assert_eq!(
+        results[0]["ok"],
+        json!(true),
+        "assign (op 0) must succeed: {}",
+        results[0]
+    );
+    assert_eq!(
+        results[1]["ok"],
+        json!(true),
+        "complete (op 1) must succeed — $prev.id was not resolved: {}",
+        results[1]
+    );
+    assert_eq!(body["summary"]["succeeded"], json!(2));
+    assert_eq!(body["summary"]["failed"], json!(0));
+    assert_eq!(body["summary"]["aborted"], json!(0));
+
+    // The completed task must have status "done".
+    let complete_result = &results[1]["result"];
+    assert_eq!(
+        complete_result["to"].as_str().unwrap_or(""),
+        "done",
+        "completed task must have to=done: {complete_result}"
+    );
+    Ok(())
+}
+
+/// Chain: create a concept entity, then link it to a pre-created target using
+/// $prev.id (op 0 result), then fetch the link using $prev.id (op 1 result).
+///
+/// This verifies that $prev.field correctly walks single-level dotted paths in
+/// a 3-op chain, and that $prev always refers to the IMMEDIATELY preceding op.
+#[tokio::test]
+async fn test_prev_dotted_path_resolves() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create a target entity first (outside the chain — we need its id).
+    // Entity create results expose "id" (short 8-char form); full UUID is not
+    // separately aliased for entities (unlike task notes which use "full_id").
+    let target = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="PrevDottedTarget")"#,
+    )
+    .await?;
+    let target_id = target["id"]
+        .as_str()
+        .expect("id field on entity result")
+        .to_string();
+
+    // Chain: create source | link (uses $prev.id from create) | get (uses $prev.id from link)
+    let ops = format!(
+        r#"create(kind="entity", entity_kind="concept", name="PrevDottedSource") | link(source_id=$prev.id, target_id="{target_id}", relation="extends") | get(id=$prev.id)"#
+    );
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let results = body["results"].as_array().expect("results array");
+
+    assert_eq!(results.len(), 3, "expected 3 ops");
+    assert_eq!(
+        results[0]["ok"],
+        json!(true),
+        "create failed: {}",
+        results[0]
+    );
+    assert_eq!(
+        results[1]["ok"],
+        json!(true),
+        "link failed — $prev.id (create result) not resolved: {}",
+        results[1]
+    );
+    assert_eq!(
+        results[2]["ok"],
+        json!(true),
+        "get failed — $prev.id (link result) not resolved: {}",
+        results[2]
+    );
+    assert_eq!(body["summary"]["succeeded"], json!(3));
+    assert_eq!(body["summary"]["aborted"], json!(0));
+
+    // The link result should have source_id matching the created entity.
+    let source_id = results[0]["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| results[0]["result"]["full_id"].as_str().unwrap_or(""));
+    let link_source = results[1]["result"]["source_id"].as_str().unwrap_or("");
+    assert!(
+        link_source.starts_with(source_id) || source_id.starts_with(link_source),
+        "link.source_id {link_source:?} should match created entity {source_id:?}"
+    );
+    Ok(())
+}
+
+/// Chain abort: second op references a non-existent $prev field.
+///
+/// The failing op must have ok=false with an error message referencing the
+/// unavailable path.  All subsequent ops must be marked aborted (ok=false,
+/// aborted=true).  Summary: succeeded=1, failed=1, aborted=1.
+#[tokio::test]
+async fn test_prev_unresolvable_aborts_chain() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let ops = r#"create(kind="entity", entity_kind="concept", name="AbortSource") | get(id=$prev.bogus_field_xyz) | create(kind="entity", entity_kind="concept", name="AbortSink")"#;
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let results = body["results"].as_array().expect("results array");
+
+    assert_eq!(results.len(), 3, "expected 3 ops in chain result");
+
+    // Op 0: create must succeed.
+    assert_eq!(
+        results[0]["ok"],
+        json!(true),
+        "create (op 0) must succeed: {}",
+        results[0]
+    );
+
+    // Op 1: get with unresolvable $prev path must fail (not be silently ok).
+    assert_eq!(
+        results[1]["ok"],
+        json!(false),
+        "get with bogus $prev path (op 1) must fail: {}",
+        results[1]
+    );
+    // The error message must reference the path that could not be resolved.
+    let err_obj = &results[1]["error"];
+    let err_str = err_obj
+        .as_str()
+        .unwrap_or_else(|| err_obj["message"].as_str().unwrap_or(""));
+    assert!(
+        err_str.contains("bogus_field_xyz") || err_str.contains("not found"),
+        "error must mention the unresolvable path; got: {err_str}"
+    );
+    // The failing op itself must NOT be marked aborted.
+    assert_ne!(
+        results[1]["aborted"],
+        json!(true),
+        "the failing op (op 1) must not be marked aborted: {}",
+        results[1]
+    );
+
+    // Op 2: must be aborted because op 1 failed.
+    assert_eq!(
+        results[2]["ok"],
+        json!(false),
+        "aborted op (op 2) must have ok=false: {}",
+        results[2]
+    );
+    assert_eq!(
+        results[2]["aborted"],
+        json!(true),
+        "aborted op (op 2) must have aborted=true: {}",
+        results[2]
+    );
+
+    assert_eq!(body["summary"]["total"], json!(3));
+    assert_eq!(body["summary"]["succeeded"], json!(1));
+    assert_eq!(body["summary"]["failed"], json!(1));
+    assert_eq!(body["summary"]["aborted"], json!(1));
+    Ok(())
+}
+
+/// Chain: $prev bare (no dot path) substitutes the entire prior op's result object.
+///
+/// We use `assign | complete(id=$prev.id, result=$prev)` — the `result` arg
+/// receives the entire assign result JSON object.  The substitution itself must
+/// succeed (no "unresolved $prev" error).  Even if `complete` rejects the object
+/// value for `result`, the failure must not be a substitution error.
+#[tokio::test]
+async fn test_prev_bare_resolves_full_result() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"assign(title="bare-prev-test") | complete(id=$prev.id, result=$prev)"#,
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let results = body["results"].as_array().expect("results array");
+
+    assert_eq!(results.len(), 2, "expected 2 ops");
+    assert_eq!(
+        results[0]["ok"],
+        json!(true),
+        "assign must succeed: {}",
+        results[0]
+    );
+
+    // Op 1 uses $prev.id (resolves to ID string) and $prev (resolves to the
+    // whole assign result object).  Whether or not complete succeeds, the
+    // failure must NOT be a substitution error mentioning "$prev".
+    let op1_err = {
+        let e = &results[1]["error"];
+        e.as_str()
+            .unwrap_or_else(|| e["message"].as_str().unwrap_or(""))
+            .to_string()
+    };
+    assert!(
+        !op1_err.contains("$prev"),
+        "op 1 error must not mention '$prev' — bare substitution must have succeeded; got: {op1_err}"
+    );
+    Ok(())
+}
