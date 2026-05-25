@@ -21,6 +21,7 @@ members = [
     "khive-pack-comm",
     "khive-pack-schedule",
     "khive-pack-template",
+    "khive-pack-knowledge",
     "khive-mcp",
     "khive-vcs",
     "khive-vcs-adapters",
