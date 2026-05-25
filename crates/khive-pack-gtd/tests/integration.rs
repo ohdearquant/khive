@@ -1218,3 +1218,54 @@ async fn timestamps_are_rfc3339_across_verbs() {
     chrono::DateTime::parse_from_rfc3339(completed_at)
         .unwrap_or_else(|e| panic!("completed_at not RFC 3339: {completed_at} — {e}"));
 }
+// ---- Fix 3: complete/transition write GTD status to notes.status column ----
+
+/// After `complete`, a `get` on the task must show `data.status = "done"`,
+/// not always "active". Regression for Fix 3.
+#[tokio::test]
+async fn complete_writes_status_column_to_done() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "Write notes.status on complete"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    pack.dispatch("complete", json!({"id": id}))
+        .await
+        .expect("complete must succeed");
+
+    // `get` round-trips through the kg pack's note handler.
+    let fetched = pack
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get after complete must succeed");
+
+    let data_status = fetched["data"]["status"].as_str().unwrap_or("<missing>");
+    assert_eq!(
+        data_status, "done",
+        "notes.status column must be 'done' after complete (Fix 3); got: {data_status}"
+    );
+}
+
+/// After `transition` to `active`, a `get` on the task must show
+/// `data.status = "active"`. Regression for Fix 3.
+#[tokio::test]
+async fn transition_writes_status_column() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "Write notes.status on transition"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // inbox → next
+    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+        .await
+        .expect("transition inbox→next must succeed");
+
+    let fetched = pack
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get after transition must succeed");
+
+    let data_status = fetched["data"]["status"].as_str().unwrap_or("<missing>");
+    assert_eq!(
+        data_status, "next",
+        "notes.status column must be 'next' after transition (Fix 3); got: {data_status}"
+    );
+}

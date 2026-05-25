@@ -175,6 +175,12 @@ static KG_HANDLERS: [HandlerDef; 14] = [
                 description: "UUID of the entity or edge to patch.",
             },
             ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Substrate hint (entity | note | edge). Omit to resolve substrate from UUID (ADR-014).",
+            },
+            ParamDef {
                 name: "name",
                 param_type: "string",
                 required: false,
@@ -212,6 +218,12 @@ static KG_HANDLERS: [HandlerDef; 14] = [
                 param_type: "uuid",
                 required: true,
                 description: "UUID of the record to delete.",
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Substrate hint (entity | note | edge). Omit to resolve substrate from UUID (ADR-014).",
             },
             ParamDef {
                 name: "hard",

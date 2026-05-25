@@ -2497,4 +2497,229 @@ async fn list_observation_notes_status_is_row_visibility_unchanged() {
             "observation must NOT have lifecycle field; got item: {item}"
         );
     }
+// ---- Fix 1: update/delete accept absent `kind`, resolving substrate from UUID ----
+
+/// ADR-014: `update` without `kind` resolves the substrate from the UUID.
+#[tokio::test]
+async fn update_entity_without_kind_resolves_from_uuid() {
+    let pack = pack();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "TestEntity", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    // `update` without `kind` — substrate must be inferred from the UUID.
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "description": "updated via UUID inference"}),
+        )
+        .await
+        .expect("update without kind must succeed (ADR-014)");
+
+    let desc = updated
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        desc.contains("updated via UUID inference"),
+        "updated entity must carry new description; got: {updated}"
+    );
+}
+
+/// ADR-014: `delete` without `kind` resolves the substrate from the UUID.
+#[tokio::test]
+async fn delete_entity_without_kind_resolves_from_uuid() {
+    let pack = pack();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "ToDeleteNoKind", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let del = pack
+        .dispatch("delete", json!({"id": id}))
+        .await
+        .expect("delete without kind must succeed (ADR-014)");
+
+    assert_eq!(
+        del.get("deleted").and_then(Value::as_bool),
+        Some(true),
+        "delete without kind must return deleted=true"
+    );
+
+    // Verify the entity is gone.
+    let err = pack.dispatch("get", json!({"id": id})).await.unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "get after delete-without-kind must be NotFound, got: {err:?}"
+    );
+}
+
+/// ADR-014: `update` without `kind` on a nonexistent UUID returns NotFound.
+#[tokio::test]
+async fn update_nonexistent_uuid_without_kind_returns_not_found() {
+    let pack = pack();
+    let err = pack
+        .dispatch(
+            "update",
+            json!({"id": "00000000-0000-0000-0000-000000000099", "description": "ghost"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::NotFound(_)),
+        "update on nonexistent UUID without kind must be NotFound, got: {err:?}"
+    );
+}
+
+// ---- Fix 2: traverse/neighbors exclude soft-deleted entity nodes ----
+
+/// Soft-deleted entities must not appear in `neighbors` results.
+#[tokio::test]
+async fn neighbors_excludes_soft_deleted_entity() {
+    let pack = pack();
+
+    let alive = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Alive", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create alive must succeed");
+    let alive_id = alive.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let deleted = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "ToSoftDelete", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create deleted must succeed");
+    let deleted_id = deleted
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    // Link alive → deleted.
+    pack.dispatch(
+        "link",
+        json!({"source_id": alive_id, "target_id": deleted_id, "relation": "contains"}),
+    )
+    .await
+    .expect("link must succeed");
+
+    // Soft-delete the target.
+    pack.dispatch("delete", json!({"id": deleted_id, "kind": "entity"}))
+        .await
+        .expect("delete must succeed");
+
+    // neighbors from alive must NOT include the soft-deleted node.
+    let neighbors = pack
+        .dispatch(
+            "neighbors",
+            json!({"node_id": alive_id, "direction": "out"}),
+        )
+        .await
+        .expect("neighbors must succeed");
+
+    let items = neighbors.as_array().expect("neighbors must be array");
+    // NeighborHit serializes `node_id` as `id` using the full 36-char hyphenated UUID.
+    // `deleted_id` is the 8-char short ID from the create response, so we match by prefix.
+    let ids: Vec<&str> = items
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !ids.iter().any(|&id| id.starts_with(deleted_id.as_str())),
+        "neighbors must not include soft-deleted node (short_id={deleted_id}); ids: {ids:?}"
+    );
+}
+
+/// Soft-deleted entities must not appear in `traverse` results.
+#[tokio::test]
+async fn traverse_excludes_soft_deleted_entity() {
+    let pack = pack();
+
+    let root = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "TraverseRoot", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create root must succeed");
+    let root_id = root.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let ghost = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "GhostNode", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create ghost must succeed");
+    let ghost_id = ghost.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // Link root → ghost.
+    pack.dispatch(
+        "link",
+        json!({"source_id": root_id, "target_id": ghost_id, "relation": "contains"}),
+    )
+    .await
+    .expect("link must succeed");
+
+    // Soft-delete ghost.
+    pack.dispatch("delete", json!({"id": ghost_id, "kind": "entity"}))
+        .await
+        .expect("delete must succeed");
+
+    // traverse from root must not include the deleted node.
+    let paths = pack
+        .dispatch(
+            "traverse",
+            json!({"roots": [root_id], "max_depth": 2, "direction": "out", "include_roots": false}),
+        )
+        .await
+        .expect("traverse must succeed");
+
+    let arr = paths.as_array().expect("traverse must return array");
+    // Each element is a GraphPath: {root_id, nodes: [{id, ...}], total_weight}.
+    let all_ids: Vec<String> = arr
+        .iter()
+        .flat_map(|path| {
+            path.get("nodes")
+                .and_then(Value::as_array)
+                .map(|nodes| {
+                    nodes
+                        .iter()
+                        .filter_map(|n| n.get("id").and_then(Value::as_str))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    assert!(
+        !all_ids
+            .iter()
+            .any(|id| ghost_id.starts_with(id.as_str()) || id.starts_with(&ghost_id[..8])),
+        "traverse must not include soft-deleted node; ids: {all_ids:?}"
+    );
 }

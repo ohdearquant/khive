@@ -10,8 +10,8 @@ use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page,
-    PageRequest, SortOrder, SqlRow, SqlStatement, TextDocument, TextFilter, TextQueryMode,
-    TextSearchRequest, TraversalRequest,
+    PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextDocument, TextFilter,
+    TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
@@ -723,6 +723,10 @@ impl KhiveRuntime {
     /// Applies symmetric-relation direction normalization (ADR-002): if the
     /// relations filter contains only symmetric relations the direction is
     /// overridden to `Both` so edges stored in canonical order are always found.
+    ///
+    /// Soft-deleted entity nodes are excluded from results unless the caller
+    /// explicitly requested them (future: `include_deleted` flag; currently
+    /// always false per Fix 2).
     pub async fn neighbors_with_query(
         &self,
         token: &NamespaceToken,
@@ -733,10 +737,18 @@ impl KhiveRuntime {
             normalize_symmetric_direction(query.direction, query.relations.as_deref());
         let mut hits = self.graph(token)?.neighbors(node_id, query).await?;
         self.enrich_neighbor_hits(token, &mut hits).await;
+        // Filter out soft-deleted entity nodes (Fix 2).
+        let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.node_id).collect();
+        let deleted = self.deleted_entity_ids(candidate_ids).await;
+        if !deleted.is_empty() {
+            hits.retain(|h| !deleted.contains(&h.node_id));
+        }
         Ok(hits)
     }
 
     /// Traverse the graph from a set of root nodes.
+    ///
+    /// Soft-deleted entity nodes are excluded from results (Fix 2).
     pub async fn traverse(
         &self,
         token: &NamespaceToken,
@@ -744,7 +756,63 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<GraphPath>> {
         let mut paths = self.graph(token)?.traverse(request).await?;
         self.enrich_path_nodes(token, &mut paths).await;
+        // Filter out soft-deleted entity nodes from all path nodes (Fix 2).
+        let all_node_ids: Vec<Uuid> = paths
+            .iter()
+            .flat_map(|p| p.nodes.iter().map(|n| n.node_id))
+            .collect();
+        let deleted = self.deleted_entity_ids(all_node_ids).await;
+        if !deleted.is_empty() {
+            for path in paths.iter_mut() {
+                path.nodes.retain(|n| !deleted.contains(&n.node_id));
+            }
+            paths.retain(|p| !p.nodes.is_empty());
+        }
         Ok(paths)
+    }
+
+    /// Batch-query for soft-deleted entity UUIDs in `ids`.
+    ///
+    /// Returns the subset of `ids` that have `deleted_at IS NOT NULL` in the
+    /// entities table. Takes `Vec<Uuid>` (not an iterator) so the async
+    /// state machine holds only owned data — no iterator borrow across yields.
+    async fn deleted_entity_ids(&self, ids: Vec<Uuid>) -> std::collections::HashSet<Uuid> {
+        if ids.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        let placeholders = id_strs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql_str = format!(
+            "SELECT id FROM entities WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL"
+        );
+        let params: Vec<SqlValue> = id_strs.into_iter().map(SqlValue::Text).collect();
+        let stmt = SqlStatement {
+            sql: sql_str,
+            params,
+            label: Some("deleted_entity_ids".into()),
+        };
+        let mut out = std::collections::HashSet::new();
+        let sql = self.sql();
+        if let Ok(mut reader) = sql.reader().await {
+            if let Ok(rows) = reader.query_all(stmt).await {
+                for row in rows {
+                    if let Some(col) = row.columns.first() {
+                        if let SqlValue::Text(s) = &col.value {
+                            if let Ok(u) = s.parse::<Uuid>() {
+                                out.insert(u);
+                            }
+                        }
+                    }
+                }
+            }
+            // best-effort: on reader or query error, treat none as deleted
+        }
+        out
     }
 
     /// Populate `name` and `kind` on each `NeighborHit` from the corresponding

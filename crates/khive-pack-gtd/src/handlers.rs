@@ -556,6 +556,9 @@ impl GtdPack {
             }
         }
         note.properties = Some(props);
+        // notes.status is row-visibility (always "active" for live rows);
+        // GTD status lives in properties.status and W1-G's remap surfaces it
+        // at data.status in the response.
         note.updated_at = Utc::now().timestamp_micros();
 
         self.runtime()
@@ -706,6 +709,9 @@ impl GtdPack {
             }
         }
         note.properties = Some(props);
+        // notes.status is row-visibility (always "active" for live rows);
+        // GTD status lives in properties.status and W1-G's remap surfaces it
+        // at data.status in the response.
         note.updated_at = Utc::now().timestamp_micros();
 
         self.runtime()

@@ -242,7 +242,8 @@ struct ListParams {
 #[derive(Deserialize)]
 struct UpdateParams {
     id: String,
-    kind: String,
+    /// Optional — resolved from UUID when absent (ADR-014: UUID-only ops).
+    kind: Option<String>,
     name: Option<Value>,
     description: Option<Value>,
     content: Option<String>,
@@ -259,7 +260,8 @@ struct UpdateParams {
 #[derive(Deserialize)]
 struct DeleteParams {
     id: String,
-    kind: String,
+    /// Optional — resolved from UUID when absent (ADR-014: UUID-only ops).
+    kind: Option<String>,
     hard: Option<bool>,
 }
 
@@ -811,6 +813,32 @@ fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Er
 // ---- Handler implementations ----
 
 impl KgPack {
+    /// Infer the substrate kind of an existing record from its UUID.
+    ///
+    /// Called by `handle_update` and `handle_delete` when `kind` is absent
+    /// (ADR-014: UUID-only ops). Probes entity → note → edge in order.
+    /// Takes no `&VerbRegistry` so it can be `.await`ed freely without
+    /// violating the `async_trait` `Send + 'static` bound on `dispatch`.
+    async fn infer_kind_from_uuid(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        id_str: &str,
+    ) -> Result<KindSpec, RuntimeError> {
+        use khive_runtime::Resolved;
+        match self.runtime.resolve(token, id).await? {
+            Some(Resolved::Entity(_)) => Ok(KindSpec::Entity { specific: None }),
+            Some(Resolved::Note(_)) => Ok(KindSpec::Note { specific: None }),
+            _ => {
+                if self.runtime.get_edge(token, id).await?.is_some() {
+                    Ok(KindSpec::Edge)
+                } else {
+                    Err(RuntimeError::NotFound(format!("not found: {id_str}")))
+                }
+            }
+        }
+    }
+
     pub(crate) async fn handle_create(
         &self,
         token: &NamespaceToken,
@@ -1200,8 +1228,21 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: UpdateParams = deser(params)?;
+        // Resolve `kind` with registry BEFORE the first .await so that the
+        // registry borrow is provably dead at all yield points (mirrors the
+        // pattern used in handle_create / handle_list).  ADR-014: when `kind`
+        // is absent, the substrate is inferred from the UUID via
+        // `infer_kind_from_uuid` (which takes no `registry`).
+        let explicit_spec: Option<KindSpec> = if let Some(k) = p.kind.as_deref() {
+            Some(resolve_kind_spec(k, registry)?)
+        } else {
+            None
+        };
         let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
-        let spec = resolve_kind_spec(&p.kind, registry)?;
+        let spec: KindSpec = match explicit_spec {
+            Some(s) => s,
+            None => self.infer_kind_from_uuid(token, id, &p.id).await?,
+        };
 
         match spec {
             KindSpec::Entity { specific } => {
@@ -1262,8 +1303,19 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: DeleteParams = deser(params)?;
+        // Resolve `kind` with registry BEFORE the first .await — same pattern
+        // as handle_update. When `kind` is absent, substrate is inferred from
+        // the UUID after the await (ADR-014).
+        let explicit_spec: Option<KindSpec> = if let Some(k) = p.kind.as_deref() {
+            Some(resolve_kind_spec(k, registry)?)
+        } else {
+            None
+        };
         let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
-        let spec = resolve_kind_spec(&p.kind, registry)?;
+        let spec: KindSpec = match explicit_spec {
+            Some(s) => s,
+            None => self.infer_kind_from_uuid(token, id, &p.id).await?,
+        };
 
         match spec {
             KindSpec::Entity { specific } => {
