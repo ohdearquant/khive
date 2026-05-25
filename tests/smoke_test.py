@@ -165,11 +165,12 @@ def main():
         paper_id = paper["id"]
         print(f"  [ok] create entity — paper ({paper_id[:8]}...)")
 
-        # 4. Get entity via get (auto-detects kind; returns {"kind": "entity", "data": {...}})
+        # 4. Get entity via get (auto-detects substrate; flat shape per W2 #454,
+        #    granular kind at top level — same shape as create/list)
         fetched = call_verb(proc, "get", {"id": lora_id})
-        assert fetched["kind"] == "entity", f"expected kind=entity, got: {fetched}"
-        assert fetched["data"]["name"] == "LoRA", f"unexpected: {fetched}"
-        print(f"  [ok] get entity — wrapped response kind={fetched['kind']}")
+        assert fetched["kind"] == "concept", f"expected granular kind=concept, got: {fetched}"
+        assert fetched["name"] == "LoRA", f"unexpected: {fetched}"
+        print(f"  [ok] get entity — flat response kind={fetched['kind']}")
 
         # 5. List entities
         entities = call_verb(proc, "list", {"kind": "entity", "entity_kind": "concept"})

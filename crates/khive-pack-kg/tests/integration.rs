@@ -398,21 +398,21 @@ async fn create_entity_then_get_roundtrip() {
         .await
         .expect("get by id must succeed");
 
+    // P-H2: get returns a flat object — entity fields at top level, no data wrapper.
+    assert!(
+        fetched.get("data").is_none(),
+        "get must NOT wrap in {{data: ...}} (P-H2); got: {fetched}"
+    );
+    assert_eq!(
+        fetched.get("name").and_then(Value::as_str),
+        Some("LoRA"),
+        "entity name must roundtrip at top level"
+    );
+    // Entity struct carries granular `kind` ("concept") — matches create/list.
     assert_eq!(
         fetched.get("kind").and_then(Value::as_str),
-        Some("entity"),
-        "get must return kind=entity"
-    );
-    let data = fetched.get("data").expect("get response must have 'data'");
-    assert_eq!(
-        data.get("name").and_then(Value::as_str),
-        Some("LoRA"),
-        "entity name must roundtrip"
-    );
-    assert_eq!(
-        data.get("kind").and_then(Value::as_str),
         Some("concept"),
-        "entity kind must roundtrip (field is 'kind' in the entity struct)"
+        "entity kind must roundtrip at top level (same shape as create)"
     );
 }
 
@@ -1521,26 +1521,31 @@ async fn get_event_uuid_returns_event_wrapper() {
         .await
         .expect("get(id=event_uuid) must succeed");
 
+    // P-H2: get returns flat — events don't have a kind field in the struct,
+    // so flatten_get_result injects kind="event" at the top level.
     assert_eq!(
         get_result.get("kind").and_then(Value::as_str),
         Some("event"),
-        "get wrapper must have kind=event"
+        "get must have kind=event at top level"
     );
-    let data = get_result.get("data").expect("get must have data field");
+    assert!(
+        get_result.get("data").is_none(),
+        "get must NOT wrap in {{data: ...}} (P-H2); got: {get_result}"
+    );
     assert_eq!(
-        data.get("id").and_then(Value::as_str),
+        get_result.get("id").and_then(Value::as_str),
         Some(event_id.as_str()),
-        "data.id must match the requested event UUID"
+        "id must match the requested event UUID"
     );
     assert_eq!(
-        data.get("verb").and_then(Value::as_str),
+        get_result.get("verb").and_then(Value::as_str),
         Some("create"),
-        "data.verb must be create"
+        "verb must be create"
     );
     assert_eq!(
-        data.get("outcome").and_then(Value::as_str),
+        get_result.get("outcome").and_then(Value::as_str),
         Some("success"),
-        "data.outcome must be success"
+        "outcome must be success"
     );
 }
 
@@ -2457,15 +2462,20 @@ async fn get_observation_note_status_is_row_visibility_unchanged() {
         .await
         .expect("get must succeed");
 
+    // P-H2: get returns flat — note fields at top level.
     // Non-task notes must NOT be remapped: status stays as row-visibility.
     assert_eq!(
-        got["data"]["status"], "active",
-        "observation note data.status must be row-visibility 'active'; got: {got}"
+        got["status"], "active",
+        "observation note status must be row-visibility 'active'; got: {got}"
     );
     // No lifecycle field injected for non-lifecycle notes.
     assert!(
-        got["data"].get("lifecycle").is_none(),
+        got.get("lifecycle").is_none(),
         "observation note must NOT have a lifecycle field; got: {got}"
+    );
+    assert!(
+        got.get("data").is_none(),
+        "get must NOT wrap in {{data: ...}} (P-H2); got: {got}"
     );
 }
 

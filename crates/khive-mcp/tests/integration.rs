@@ -708,7 +708,7 @@ async fn search_with_granular_entity_kind() -> anyhow::Result<()> {
         let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
-            got["data"]["kind"], "concept",
+            got["kind"], "concept",
             "search(kind=\"concept\") returned non-concept: {got}"
         );
     }
@@ -736,7 +736,7 @@ async fn search_with_granular_task_kind() -> anyhow::Result<()> {
         let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
-            got["data"]["kind"], "task",
+            got["kind"], "task",
             "search(kind=\"task\") returned non-task: {got}"
         );
     }
@@ -824,7 +824,7 @@ async fn search_substrate_kind_entity_with_legacy_entity_kind_sub_filter() -> an
         let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
-            got["data"]["kind"], "concept",
+            got["kind"], "concept",
             "search(kind=\"entity\", entity_kind=\"concept\") returned non-concept: {got}"
         );
     }
@@ -858,7 +858,7 @@ async fn search_substrate_kind_note_with_legacy_note_kind_sub_filter() -> anyhow
         let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
-            got["data"]["kind"], "task",
+            got["kind"], "task",
             "search(kind=\"note\", note_kind=\"task\") returned non-task: {got}"
         );
     }
@@ -928,7 +928,7 @@ async fn search_kind_filter_surfaces_right_kind_when_wrong_kind_outranks() -> an
         let id = hit["id"].as_str().unwrap().to_string();
         let got = ok_one(&client, &format!(r#"get(id="{}")"#, id)).await?;
         assert_eq!(
-            got["data"]["kind"], "concept",
+            got["kind"], "concept",
             "search(kind=\"concept\") must only return concepts: {got}"
         );
     }
@@ -1831,30 +1831,26 @@ async fn subhandler_verb_help_introspection_still_works() -> anyhow::Result<()> 
     Ok(())
 }
 
-// ── Fix 3: AlwaysVerbose verbs return full UUIDs in default (Agent) mode ────
+// ── P-C1: full_id is never shortened in Agent mode ───────────────────────────
 
-/// `get` and `link` are declared AlwaysVerbose (ADR-045 §6).  Without the
-/// fix, they return 8-char short UUIDs in default (Agent) mode — callers
-/// cannot chain them into subsequent operations that require full UUIDs.
-///
-/// With the fix, both verbs return full 36-char UUIDs even when the request
-/// uses the default presentation (Agent mode).
+/// `get` is AlwaysVerbose (ADR-045 §6) — returns full 36-char UUIDs even
+/// in default (Agent) mode.  The response is now flat (P-H2): `{kind, id, ...}`
+/// rather than the old wrapped `{kind, data: {...}}` shape.
 #[tokio::test]
-async fn get_returns_full_uuid_in_default_agent_mode() -> anyhow::Result<()> {
+async fn get_returns_flat_shape_with_full_uuid_in_default_agent_mode() -> anyhow::Result<()> {
     let client = connect().await?;
 
-    // Create in verbose mode so we have the full UUID.
-    // Entity create returns `id` (full UUID) in verbose mode.
+    // ok_one uses presentation=verbose, so this gives us the full UUID.
     let created = ok_one(
         &client,
-        r#"create(kind="entity", entity_kind="concept", name="AlwaysVerboseEntity")"#,
+        r#"create(kind="entity", entity_kind="concept", name="FlatGetEntity")"#,
     )
     .await?;
     let full_id = created["id"].as_str().unwrap().to_string();
-    assert_eq!(full_id.len(), 36, "created entity must have full UUID");
+    assert_eq!(full_id.len(), 36, "verbose create must have full UUID");
 
     // Fetch via `get` WITHOUT specifying presentation — default is Agent mode.
-    // AlwaysVerbose must override and return the full UUID in the `id` field.
+    // `get` is AlwaysVerbose so it returns the full UUID regardless.
     let result = call(
         &client,
         "request",
@@ -1866,14 +1862,24 @@ async fn get_returns_full_uuid_in_default_agent_mode() -> anyhow::Result<()> {
     let first = &body["results"][0];
     assert_eq!(first["ok"], true, "get must succeed: {first}");
 
-    // `get` wraps the entity in {"kind": "entity", "data": <entity>}.
-    // The entity's UUID lives at result["data"]["id"].
+    // P-H2: `get` now returns a flat object — `kind` is at the top level
+    // (the entity_kind, e.g. "concept"), NOT nested as `result.data.kind`.
+    // There is no `data` wrapper.
     let entity = &first["result"];
-    let returned_id = entity["data"]["id"].as_str().unwrap_or("");
+    assert_eq!(
+        entity["kind"], "concept",
+        "get flat response must have top-level kind=concept (entity_kind); got {entity}"
+    );
+    assert!(
+        entity.get("data").is_none(),
+        "get must NOT wrap in {{data: ...}}; got {entity}"
+    );
+    // `get` is AlwaysVerbose: full 36-char UUID in `id` even in Agent mode.
+    let returned_id = entity["id"].as_str().unwrap_or("");
     assert_eq!(
         returned_id.len(),
         36,
-        "get in default (Agent) mode must return full 36-char UUID in data.id; got {returned_id:?}"
+        "get (AlwaysVerbose) must return full 36-char UUID in id; got {returned_id:?}"
     );
     assert_eq!(
         returned_id, full_id,
@@ -1882,27 +1888,31 @@ async fn get_returns_full_uuid_in_default_agent_mode() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// P-H1: `link` is Standard policy — source_id/target_id are truncated to
+/// 8 chars in Agent mode, matching every other UUID field in the system.
+/// Previously `link` was AlwaysVerbose which was inconsistent.
 #[tokio::test]
-async fn link_returns_full_uuids_in_default_agent_mode() -> anyhow::Result<()> {
+async fn link_source_and_target_ids_are_short_in_agent_mode() -> anyhow::Result<()> {
     let client = connect().await?;
 
-    // Create two entities in verbose mode.
+    // Create two entities via ok_one (verbose) to get full UUIDs for linking.
     let a = ok_one(
         &client,
-        r#"create(kind="entity", entity_kind="concept", name="NodeA")"#,
+        r#"create(kind="entity", entity_kind="concept", name="LinkNodeA")"#,
     )
     .await?;
     let b = ok_one(
         &client,
-        r#"create(kind="entity", entity_kind="concept", name="NodeB")"#,
+        r#"create(kind="entity", entity_kind="concept", name="LinkNodeB")"#,
     )
     .await?;
-    // Entity create returns `id` (full UUID) in verbose mode.
     let a_id = a["id"].as_str().unwrap().to_string();
     let b_id = b["id"].as_str().unwrap().to_string();
+    assert_eq!(a_id.len(), 36);
+    assert_eq!(b_id.len(), 36);
 
-    // Call `link` WITHOUT presentation=verbose — default is Agent mode.
-    // AlwaysVerbose must override and return full UUIDs in source_id / target_id.
+    // Call `link` in default Agent mode (no presentation key).
+    // Standard policy: source_id/target_id should be 8-char short form.
     let result = call(
         &client,
         "request",
@@ -1923,13 +1933,42 @@ async fn link_returns_full_uuids_in_default_agent_mode() -> anyhow::Result<()> {
     let tgt = edge["target_id"].as_str().unwrap_or("");
     assert_eq!(
         src.len(),
-        36,
-        "link source_id must be full 36-char UUID in default mode; got {src:?}"
+        8,
+        "link source_id must be 8-char short form in Agent mode (P-H1); got {src:?}"
     );
     assert_eq!(
         tgt.len(),
+        8,
+        "link target_id must be 8-char short form in Agent mode (P-H1); got {tgt:?}"
+    );
+    // The edge's own id should also be short in agent mode.
+    let edge_id = edge["id"].as_str().unwrap_or("");
+    assert_eq!(
+        edge_id.len(),
+        8,
+        "link edge id must be 8-char in Agent mode; got {edge_id:?}"
+    );
+
+    // Verify: with presentation=verbose, full 36-char UUIDs are returned.
+    let result_verbose = call(
+        &client,
+        "request",
+        json!({
+            "ops": format!(
+                r#"link(source_id="{a_id}", target_id="{b_id}", relation="variant_of")"#
+            ),
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body_v: Value = serde_json::from_str(&first_text(&result_verbose))?;
+    let first_v = &body_v["results"][0];
+    assert_eq!(first_v["ok"], true, "verbose link must succeed: {first_v}");
+    let edge_v = &first_v["result"];
+    assert_eq!(
+        edge_v["source_id"].as_str().unwrap_or("").len(),
         36,
-        "link target_id must be full 36-char UUID in default mode; got {tgt:?}"
+        "link source_id must be 36-char in verbose mode"
     );
     Ok(())
 }

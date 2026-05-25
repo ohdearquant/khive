@@ -112,7 +112,7 @@ pub enum VerbPresentationPolicy {
     Standard,
     /// Always use `Verbose` output regardless of the caller's mode.
     ///
-    /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`.
+    /// Declared verbs: `get`, `query`, `traverse`, `neighbors`.
     AlwaysVerbose,
 }
 
@@ -126,10 +126,13 @@ impl HandlerDef {
     /// The set is derived from ADR-045 §6.  New verbs that need this override
     /// must be added here; omission from the list means `Standard` applies.
     pub fn presentation_policy(&self) -> VerbPresentationPolicy {
+        // `link` was previously listed here but it is NOT AlwaysVerbose (P-H1):
+        // source_id/target_id in the edge response should be short-form in Agent
+        // mode just like every other UUID field. Callers that need the full UUID
+        // to chain operations should use `get` (which is AlwaysVerbose) or pass
+        // `presentation=verbose` explicitly.
         match self.name {
-            "get" | "link" | "query" | "traverse" | "neighbors" => {
-                VerbPresentationPolicy::AlwaysVerbose
-            }
+            "get" | "query" | "traverse" | "neighbors" => VerbPresentationPolicy::AlwaysVerbose,
             _ => VerbPresentationPolicy::Standard,
         }
     }

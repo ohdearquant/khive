@@ -288,9 +288,11 @@ def test_namespace_isolation(proc: subprocess.Popen) -> None:
     )
 
     # ---- get from ns-alpha must succeed ----
+    # Post-W2 (PR #454): get returns FLAT shape with granular kind (concept,
+    # observation, …) — same shape as create/list. No more {kind, data} wrapper.
     fetched = _tool(proc, "get", {"id": full_id, "namespace": "ns-alpha"})
-    assert fetched["kind"] == "entity", f"Expected kind=entity, got {fetched['kind']}"
-    assert fetched["data"]["name"] == "AlphaEntity"
+    assert fetched["kind"] == "concept", f"Expected granular kind=concept, got {fetched['kind']}"
+    assert fetched["name"] == "AlphaEntity"
 
     # ---- short prefix from ns-beta must not resolve to the entity (RPC-level error) ----
     err_prefix = _expect_rpc_error(proc, "get", {"id": short_prefix, "namespace": "ns-beta"})
@@ -345,9 +347,10 @@ def test_short_uuid_prefix_resolution(proc: subprocess.Popen) -> None:
     prefix_bad = "ZZZZZZZZ"  # non-hex (alphabetically valid length, but contains non-hex)
 
     # ---- 8-char prefix resolves correctly ----
+    # Post-W2 #454: flat shape, granular kind at top level.
     fetched = _tool(proc, "get", {"id": prefix8})
-    assert fetched["kind"] == "entity"
-    assert fetched["data"]["name"] == "PrefixTarget", (
+    assert fetched["kind"] == "concept"
+    assert fetched["name"] == "PrefixTarget", (
         f"8-char prefix did not resolve to PrefixTarget: {fetched}"
     )
 
@@ -564,17 +567,18 @@ def test_note_supersession(proc: subprocess.Popen) -> None:
     )
 
     # ---- get(old_id) must still succeed — superseded is not deleted ----
+    # Post-W2 #454: flat shape with granular kind ("observation").
     fetched_old = _tool(proc, "get", {"id": old_id})
-    assert fetched_old["kind"] == "note", (
+    assert fetched_old["kind"] == "observation", (
         f"Superseded note must still be gettable via get(), got: {fetched_old}"
     )
-    assert fetched_old["data"]["content"] == "SupersededContent unique_token_abc", (
+    assert fetched_old["content"] == "SupersededContent unique_token_abc", (
         f"Superseded note content incorrect: {fetched_old}"
     )
 
     # ---- get(new_id) must also succeed (recoverability check) ----
     fetched_new = _tool(proc, "get", {"id": new_id})
-    assert fetched_new["kind"] == "note", (
+    assert fetched_new["kind"] == "insight", (
         f"New note must be gettable via get(): {fetched_new}"
     )
 
@@ -721,22 +725,23 @@ def test_merge_semantics(proc: subprocess.Popen) -> None:
     )
 
     # ---- Inbound edge now points to kept_id (rewired) ----
+    # Post-W2 #454: flat shape — edge fields at top level, kind="edge".
     rewired_edge = _tool(proc, "get", {"id": e_inbound_id})
     assert rewired_edge["kind"] == "edge", f"rewired edge not found: {rewired_edge}"
-    edge_data = rewired_edge["data"]
-    assert edge_data["target_id"] == kept["id"], (
+    assert rewired_edge["target_id"] == kept["id"], (
         f"Inbound edge target should be rewired to kept_id={kept['id']}, "
-        f"got target_id={edge_data['target_id']}"
+        f"got target_id={rewired_edge['target_id']}"
     )
-    assert edge_data["source_id"] == third["id"], (
+    assert rewired_edge["source_id"] == third["id"], (
         f"Inbound edge source should still be third={third['id']}, "
-        f"got {edge_data['source_id']}"
+        f"got {rewired_edge['source_id']}"
     )
 
     # ---- Tags are unioned on the kept entity ----
+    # Post-W2 #454: granular kind ("concept") at top level.
     kept_after = _tool(proc, "get", {"id": kept["id"]})
-    assert kept_after["kind"] == "entity"
-    tags_after = set(kept_after["data"].get("tags", []))
+    assert kept_after["kind"] == "concept"
+    tags_after = set(kept_after.get("tags", []))
     assert "alpha" in tags_after, f"Tag 'alpha' missing after merge: {tags_after}"
     assert "beta" in tags_after, f"Tag 'beta' missing after merge: {tags_after}"
     assert "gamma" in tags_after, f"Tag 'gamma' missing after merge: {tags_after}"

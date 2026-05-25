@@ -488,6 +488,48 @@ fn format_edge_output(v: Value, _verbose: bool) -> Value {
     v
 }
 
+/// Flatten a `get` result to a top-level object (P-H2).
+///
+/// Previously `get` returned `{"kind": "entity", "data": {...}}`. That shape
+/// forces callers to access fields via `result.data.X` — inconsistent with
+/// `create` / `list` which return flat objects. The flat shape matches the
+/// other verbs and is easier to work with.
+///
+/// For entities and notes the inner struct already carries a `kind` field
+/// (the entity_kind / note_kind — e.g. "concept", "task"), so we simply
+/// return the struct directly. For edges and events there is no `kind` field
+/// in the struct, so we inject one to preserve discriminability.
+///
+/// If the inner value is not an object (shouldn't happen in practice) we fall
+/// back to the wrapped form to avoid data loss.
+fn flatten_get_result(substrate: &str, mut inner: Value) -> Result<Value, RuntimeError> {
+    if let Some(obj) = inner.as_object_mut() {
+        // Entities/notes: granular `kind` (e.g. "concept", "observation") stays
+        // at top level, mirroring `create` and `list` responses. Edges: inject
+        // "edge". Events: rename `kind` (EventKind) to `event_kind`, inject
+        // substrate label.
+        match substrate {
+            "edge" => {
+                obj.entry("kind".to_string())
+                    .or_insert_with(|| serde_json::Value::String("edge".to_string()));
+            }
+            "event" => {
+                if let Some(event_kind) = obj.remove("kind") {
+                    obj.insert("event_kind".to_string(), event_kind);
+                }
+                obj.insert(
+                    "kind".to_string(),
+                    serde_json::Value::String("event".to_string()),
+                );
+            }
+            _ => {}
+        }
+        Ok(inner)
+    } else {
+        Ok(serde_json::json!({"kind": substrate, "data": inner}))
+    }
+}
+
 /// Remap note response fields so pack-owned lifecycle status is visible at the
 /// top level (Option A — ADR-004).
 ///
@@ -1021,7 +1063,7 @@ impl KgPack {
         let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
 
         if let Ok(entity) = self.runtime.get_entity(token, id).await {
-            return to_json(&serde_json::json!({"kind": "entity", "data": entity}));
+            return flatten_get_result("entity", to_json(&entity)?);
         }
 
         if let Some(note) = self
@@ -1034,12 +1076,12 @@ impl KgPack {
             if note.namespace == token.namespace().as_str() {
                 let note_val = to_json(&note)?;
                 let remapped = remap_note_status(note_val);
-                return to_json(&serde_json::json!({"kind": "note", "data": remapped}));
+                return flatten_get_result("note", remapped);
             }
         }
 
         if let Some(edge) = self.runtime.get_edge(token, id).await? {
-            return to_json(&serde_json::json!({"kind": "edge", "data": edge}));
+            return flatten_get_result("edge", to_json(&edge)?);
         }
 
         if let Some(event) = self
@@ -1050,7 +1092,7 @@ impl KgPack {
             .map_err(RuntimeError::Storage)?
         {
             if event.namespace == token.namespace().as_str() {
-                return to_json(&serde_json::json!({"kind": "event", "data": event}));
+                return flatten_get_result("event", to_json(&event)?);
             }
         }
 

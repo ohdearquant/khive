@@ -86,6 +86,14 @@ const SCORE_FIELDS: &[&str] = &[
 /// UUID v4 canonical string length (8-4-4-4-12 = 32 hex + 4 dashes = 36).
 const UUID_CANONICAL_LEN: usize = 36;
 
+/// Field names whose UUID values MUST NOT be shortened in Agent mode.
+///
+/// `full_id` is the canonical 36-char UUID companion to the short `id` field.
+/// The entire point of exposing `full_id` is to give callers an unambiguous
+/// chaining handle regardless of presentation mode — shortening it makes it
+/// identical to `id` and defeats its purpose (P-C1).
+const NEVER_SHORTEN_UUID_FIELDS: &[&str] = &["full_id"];
+
 /// Transform a successful verb result value according to the given
 /// [`PresentationMode`].
 ///
@@ -170,8 +178,13 @@ fn transform_field_agent(
                 Some(value)
             }
         }
-        // Shorten UUIDs in string fields.
-        Value::String(s) if is_canonical_uuid(s) => Some(Value::String(s[..8].to_string())),
+        // Shorten UUIDs in string fields — UNLESS the field is exempted.
+        // `full_id` must always pass through as the full 36-char UUID (P-C1):
+        // its purpose is to give callers a stable chaining handle, so shortening
+        // it makes it identical to `id` and defeats the field entirely.
+        Value::String(s) if is_canonical_uuid(s) && !NEVER_SHORTEN_UUID_FIELDS.contains(&key) => {
+            Some(Value::String(s[..8].to_string()))
+        }
         // Compact ISO-8601 timestamps in string fields.
         Value::String(s) if looks_like_iso8601(s) => Some(Value::String(compact_timestamp(s, now))),
         // Recurse into objects and arrays.
@@ -412,6 +425,39 @@ mod tests {
         assert!(item.get("tags").is_none());
         let s = item["score"].as_f64().unwrap();
         assert!((s - 1.0).abs() < 1e-9);
+    }
+
+    // P-C1 regression: full_id must never be shortened in Agent mode.
+    #[test]
+    fn agent_preserves_full_id_as_36_chars() {
+        let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let v = json!({"id": uuid, "full_id": uuid, "title": "X"});
+        let out = agent(v);
+        // `id` is shortened to 8 chars
+        assert_eq!(
+            out["id"],
+            json!("a1b2c3d4"),
+            "id should be 8-char short form"
+        );
+        // `full_id` must remain the full 36-char UUID
+        assert_eq!(
+            out["full_id"].as_str().unwrap().len(),
+            36,
+            "full_id must be 36 chars in agent mode"
+        );
+        assert_eq!(
+            out["full_id"],
+            json!(uuid),
+            "full_id must equal the original UUID"
+        );
+        // Verify the invariant: full_id starts with the short id prefix
+        assert!(
+            out["full_id"]
+                .as_str()
+                .unwrap()
+                .starts_with(out["id"].as_str().unwrap()),
+            "full_id must start with the short id prefix"
+        );
     }
 
     #[test]

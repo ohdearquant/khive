@@ -774,15 +774,20 @@ async fn get_task_exposes_gtd_status_not_row_visibility() {
         .await
         .expect("get must succeed");
 
-    // data.status must be the GTD lifecycle value.
-    assert_eq!(
-        got["data"]["status"], "inbox",
-        "get(task) must expose GTD status 'inbox' at data.status; got: {got}"
+    // P-H2: get returns flat — note fields at top level, no data wrapper.
+    assert!(
+        got.get("data").is_none(),
+        "get must NOT wrap in {{data: ...}} (P-H2); got: {got}"
     );
-    // data.lifecycle must hold the row-visibility value.
+    // status must be the GTD lifecycle value.
     assert_eq!(
-        got["data"]["lifecycle"], "active",
-        "get(task) must move row-visibility to data.lifecycle; got: {got}"
+        got["status"], "inbox",
+        "get(task) must expose GTD status 'inbox' at top-level status; got: {got}"
+    );
+    // lifecycle must hold the row-visibility value.
+    assert_eq!(
+        got["lifecycle"], "active",
+        "get(task) must move row-visibility to top-level lifecycle; got: {got}"
     );
 }
 
@@ -807,12 +812,13 @@ async fn get_task_after_transition_exposes_updated_gtd_status() {
         .await
         .expect("get after transition must succeed");
 
+    // P-H2: flat response.
     assert_eq!(
-        got["data"]["status"], "active",
-        "after transition to active, data.status must be 'active' (GTD); got: {got}"
+        got["status"], "active",
+        "after transition to active, status must be 'active' (GTD); got: {got}"
     );
     assert_eq!(
-        got["data"]["lifecycle"], "active",
+        got["lifecycle"], "active",
         "row-visibility must remain 'active' for a live task; got: {got}"
     );
 }
@@ -835,12 +841,13 @@ async fn get_task_after_complete_exposes_done_status() {
         .await
         .expect("get after complete must succeed");
 
+    // P-H2: flat response.
     assert_eq!(
-        got["data"]["status"], "done",
-        "after complete, data.status must be 'done'; got: {got}"
+        got["status"], "done",
+        "after complete, status must be 'done'; got: {got}"
     );
     assert_eq!(
-        got["data"]["lifecycle"], "active",
+        got["lifecycle"], "active",
         "soft-completed task row-visibility is still 'active'; got: {got}"
     );
 }
@@ -1238,15 +1245,16 @@ async fn complete_writes_status_column_to_done() {
         .await
         .expect("get after complete must succeed");
 
-    let data_status = fetched["data"]["status"].as_str().unwrap_or("<missing>");
+    // P-H2: get returns flat — status at top level.
+    let status = fetched["status"].as_str().unwrap_or("<missing>");
     assert_eq!(
-        data_status, "done",
-        "notes.status column must be 'done' after complete (Fix 3); got: {data_status}"
+        status, "done",
+        "notes.status column must be 'done' after complete (Fix 3); got: {status}"
     );
 }
 
 /// After `transition` to `active`, a `get` on the task must show
-/// `data.status = "active"`. Regression for Fix 3.
+/// `status = "next"`. Regression for Fix 3 (P-H2: flat response).
 #[tokio::test]
 async fn transition_writes_status_column() {
     let pack = pack(rt());
@@ -1263,10 +1271,11 @@ async fn transition_writes_status_column() {
         .await
         .expect("get after transition must succeed");
 
-    let data_status = fetched["data"]["status"].as_str().unwrap_or("<missing>");
+    // P-H2: get returns flat — status at top level.
+    let status = fetched["status"].as_str().unwrap_or("<missing>");
     assert_eq!(
-        data_status, "next",
-        "notes.status column must be 'next' after transition (Fix 3); got: {data_status}"
+        status, "next",
+        "notes.status column must be 'next' after transition (Fix 3); got: {status}"
     );
 }
 
