@@ -150,7 +150,7 @@ impl HnswIndex {
     /// Emits `hnsw.search.duration_ms`, `hnsw.search.count`, and
     /// `hnsw.search.results` metrics when a sink is attached.
     ///
-    /// **PROOF CORRESPONDENCE**: Lion.Retrieval.HNSW.search_complexity_log
+    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.HNSW.search_complexity_log`
     /// Search complexity is O(ef * log_M(N)) where:
     /// - ef is the search expansion factor
     /// - M is the number of neighbors per node

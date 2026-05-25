@@ -2,8 +2,8 @@
 //!
 //! # Formal proof reference
 //!
-//! `proofs/Retrieval/Distance.lean` — hash identity used in checkpoint
-//! compatibility checks.
+//! `proofs/Retrieval/HNSW.lean` — hash identity used in checkpoint
+//! compatibility checks (khive.Retrieval.HNSW.checkpoint_correctness).
 
 use core::fmt;
 
@@ -34,6 +34,40 @@ impl Hash32 {
     #[inline]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Compute a BLAKE3 hash over the given byte slice.
+    ///
+    /// Requires the `blake3` feature.
+    #[cfg(feature = "blake3")]
+    #[inline]
+    pub fn from_blake3(data: &[u8]) -> Self {
+        let hash = blake3::hash(data);
+        Self(*hash.as_bytes())
+    }
+
+    /// Constant-time equality check.
+    ///
+    /// Accumulates XOR over all 32 bytes without early exit so the comparison
+    /// takes the same number of iterations regardless of where bytes differ.
+    /// Suitable for integrity comparisons where timing side-channels are a
+    /// concern.  The `#[inline(never)]` attribute discourages the compiler from
+    /// inlining and optimising away the full-loop traversal.
+    #[inline(never)]
+    pub fn eq_ct(&self, other: &Self) -> bool {
+        let diff = self
+            .0
+            .iter()
+            .zip(other.0.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        diff == 0
+    }
+}
+
+impl From<[u8; 32]> for Hash32 {
+    #[inline]
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 

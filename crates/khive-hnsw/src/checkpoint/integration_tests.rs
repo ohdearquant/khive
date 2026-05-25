@@ -1,11 +1,6 @@
 use super::*;
 use khive_fold::{Checkpoint, CheckpointStore, FoldContext, InMemoryCheckpointStore};
-use khive_types::Hash32;
 use uuid::Uuid;
-
-fn test_hash() -> Hash32 {
-    Hash32::from_bytes(*blake3::hash(b"hnsw checkpoint test").as_bytes())
-}
 
 fn make_id(seed: u8) -> NodeId {
     NodeId::new([seed; 16])
@@ -60,11 +55,11 @@ fn create_hnsw_checkpoint() {
         "hnsw_test:ckpt-1",
         snap,
         Uuid::new_v4(),
-        test_hash(),
         100,
         FoldContext::new(),
         1,
-    );
+    )
+    .expect("Checkpoint::new");
 
     assert_eq!(checkpoint.state.total_nodes, 1);
     assert_eq!(checkpoint.state.live_nodes, 1);
@@ -79,11 +74,11 @@ fn create_hnsw_checkpoint_with_tombstones() {
         "hnsw_test:ckpt-1",
         snap,
         Uuid::new_v4(),
-        test_hash(),
         100,
         FoldContext::new(),
         1,
-    );
+    )
+    .expect("Checkpoint::new");
 
     assert_eq!(checkpoint.state.total_nodes, 2);
     assert_eq!(checkpoint.state.live_nodes, 1);
@@ -100,13 +95,13 @@ fn store_and_load_hnsw_checkpoint() {
         "hnsw_idx:ckpt-1",
         snap,
         Uuid::new_v4(),
-        test_hash(),
         50,
         FoldContext::new(),
         1,
-    );
+    )
+    .expect("Checkpoint::new");
 
-    store.save(&checkpoint).expect("save");
+    store.save(checkpoint).expect("save");
 
     let loaded = store
         .load("hnsw_idx:ckpt-1")
@@ -129,13 +124,13 @@ fn store_and_load_checkpoint_with_tombstones() {
         "hnsw_idx:ckpt-tomb",
         snap,
         Uuid::new_v4(),
-        test_hash(),
         50,
         FoldContext::new(),
         1,
-    );
+    )
+    .expect("Checkpoint::new");
 
-    store.save(&checkpoint).expect("save");
+    store.save(checkpoint).expect("save");
 
     let loaded = store
         .load("hnsw_idx:ckpt-tomb")
@@ -161,12 +156,12 @@ fn load_latest_hnsw_checkpoint() {
             format!("hnsw_idx:ckpt-{i}"),
             snap,
             Uuid::new_v4(),
-            test_hash(),
             (i + 1) * 10,
             FoldContext::new(),
             1,
-        );
-        store.save(&checkpoint).expect("save");
+        )
+        .expect("Checkpoint::new");
+        store.save(checkpoint).expect("save");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 

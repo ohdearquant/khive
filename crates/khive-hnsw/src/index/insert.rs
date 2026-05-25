@@ -202,10 +202,10 @@ impl HnswIndex {
     ///
     /// Uses seeded RNG if `config.seed` was set for reproducible builds.
     ///
-    /// **PROOF CORRESPONDENCE**: Lion.Retrieval.HNSW.level_prob_sums_to_one
+    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.HNSW.level_prob_sums_to_one`
     /// Level probabilities form a valid distribution: sum_{l=0}^{inf} P(level=l) = 1
     ///
-    /// **PROOF CORRESPONDENCE**: Lion.Retrieval.HNSW.level_survival_decreasing
+    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.HNSW.level_survival_decreasing`
     /// Survival probability decreases exponentially: P(level >= l) = (1/M)^l
     pub(super) fn random_level(&mut self) -> usize {
         let r: f64 = self.rng.gen::<f64>().max(f64::MIN_POSITIVE);
