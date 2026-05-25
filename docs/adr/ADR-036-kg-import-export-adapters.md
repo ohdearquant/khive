@@ -367,7 +367,11 @@ entry keys for BibTeX, and subject IRIs for RDF.
 All adapters use streaming parsers. The full source file is never loaded into memory:
 
 - CSV: row-by-row via a streaming CSV reader.
-- JSON: streaming token parser (jq-style token stream).
+- JSON: **P0 exception — eager parse.** The P0 `JsonFormatAdapter` uses
+  `serde_json::from_str` and buffers all records into `Vec`s before iteration
+  starts. This is intentional for the "ship one impl" goal of issue #366. P1
+  work item: replace with `serde_json::Deserializer::from_reader` streaming
+  deserialization once the CLI pipeline supplies an `impl Read` source.
 - BibTeX: entry-by-entry streaming.
 - RDF: triple-by-triple; blank node expansion buffers only the blank node subgraph, not the
   full file.

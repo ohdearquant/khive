@@ -25,3 +25,4 @@ anyhow = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
+khive-vcs-adapters = { version = "0.2.2", path = "../khive-vcs-adapters" }

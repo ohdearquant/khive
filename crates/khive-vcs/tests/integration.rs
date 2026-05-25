@@ -9,12 +9,17 @@
 //! flag were removed in the ADR-010/ADR-020 alignment pass. Tests that relied on
 //! those types have been replaced with tests for `SnapshotCoverage` and the
 //! git-native `VcsState`.
+//!
+//! The final section tests that `khive-vcs-adapters::JsonFormatAdapter` can parse
+//! a JSON substrate snapshot and hand the records to the hash pipeline (making
+//! `khive-vcs-adapters` a non-orphan crate).
 
 use chrono::Utc;
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_storage::EdgeRelation;
 use khive_vcs::hash::{canonical_json, snapshot_id_for_archive};
 use khive_vcs::types::{SnapshotCoverage, SnapshotId, VcsState, KG_V1_COVERAGE};
+use khive_vcs_adapters::{FormatAdapter, JsonFormatAdapter};
 use uuid::Uuid;
 
 fn make_archive(namespace: &str) -> KgArchive {
@@ -168,4 +173,78 @@ fn snapshot_coverage_serde_roundtrip() {
     let json = serde_json::to_string(&cov).unwrap();
     let back: SnapshotCoverage = serde_json::from_str(&json).unwrap();
     assert_eq!(back, cov);
+}
+
+// ---------------------------------------------------------------------------
+// Consumer test: JsonFormatAdapter → khive-vcs hash pipeline
+//
+// This test is the designated consumer that makes `khive-vcs-adapters` a
+// non-orphan crate. It proves that records produced by the adapter can be
+// fed into the vcs hash pipeline end-to-end, which is the actual use-case
+// described in ADR-036 §1 (adapter → intermediate NDJSON → standard import).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_adapter_records_survive_entity_hash_pipeline() {
+    // A minimal JSON substrate snapshot with one entity
+    let json_input = r#"[
+        {
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "kind": "concept",
+            "name": "RoPE",
+            "description": "Rotary Position Embedding"
+        }
+    ]"#;
+
+    let mut adapter = JsonFormatAdapter::new(json_input).expect("valid fixture must construct");
+
+    let entities: Vec<_> = adapter
+        .entities()
+        .map(|r| r.expect("no errors in fixture"))
+        .collect();
+
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].name, "RoPE");
+    assert_eq!(entities[0].kind, "concept");
+    assert_eq!(
+        entities[0].id.to_string(),
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    );
+
+    // Feed the parsed entity into a KgArchive and hash it — the full vcs pipeline.
+    let now = Utc::now();
+    let archive = KgArchive {
+        format: "kg-archive".into(),
+        version: "0.2".into(),
+        namespace: "test".into(),
+        exported_at: now,
+        entities: vec![ExportedEntity {
+            id: entities[0].id,
+            kind: entities[0].kind.clone(),
+            entity_type: None,
+            name: entities[0].name.clone(),
+            description: entities[0].description.clone(),
+            properties: None,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }],
+        edges: Vec::new(),
+    };
+
+    let snapshot_id =
+        snapshot_id_for_archive(&archive).expect("hashing a single-entity archive must succeed");
+
+    assert!(
+        snapshot_id.as_str().starts_with("sha256:"),
+        "snapshot id from adapter-sourced entity must carry sha256: prefix"
+    );
+    assert_eq!(snapshot_id.hex().len(), 64);
+
+    // Determinism check: re-hash the same archive — must match.
+    let snapshot_id2 = snapshot_id_for_archive(&archive).unwrap();
+    assert_eq!(
+        snapshot_id, snapshot_id2,
+        "repeated hashing of the same archive must be deterministic"
+    );
 }

@@ -1,0 +1,369 @@
+// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+//
+//! JSON array format adapter (ADR-036 §2 "JSON array").
+//!
+//! Accepts a JSON array of objects at the top level. Objects with both `source`
+//! and `target` keys are treated as edge records; all other objects are treated
+//! as entity records. Unknown keys on entity objects are collected into
+//! `properties`.
+//!
+//! ## Parse strategy
+//!
+//! The P0 JSON adapter uses eager `serde_json::from_str` — the full source is
+//! loaded into memory before iteration begins.  ADR-036 §7 calls for streaming
+//! parsers; that requirement is deferred to P1 for this adapter.
+//! TODO(P1): replace with `serde_json::Deserializer::from_reader` streaming
+//! parse once the CLI pipeline wires in an `impl Read` source.
+
+use crate::adapter::FormatAdapter;
+use crate::error::AdapterError;
+use crate::record::{EdgeRecord, EntityRecord};
+use serde_json::Value;
+use uuid::Uuid;
+
+/// A [`FormatAdapter`] that parses a JSON array of objects.
+///
+/// Entities and edges may be mixed in the same array — the adapter dispatches
+/// by checking for `source` + `target` keys (edge) vs. their absence (entity).
+///
+/// Construct with [`JsonFormatAdapter::new`], passing the raw JSON bytes.
+/// The constructor parses eagerly; iteration is cheap once constructed.
+pub struct JsonFormatAdapter {
+    entities: Vec<Result<EntityRecord, AdapterError>>,
+    edges: Vec<Result<EdgeRecord, AdapterError>>,
+    warnings: Vec<String>,
+}
+
+impl JsonFormatAdapter {
+    /// Parse `json_input` and return a ready adapter.
+    ///
+    /// Returns `Err(AdapterError::Parse)` if `json_input` is not valid JSON or
+    /// is not a JSON array at the top level.
+    pub fn new(json_input: &str) -> Result<Self, AdapterError> {
+        let value: Value =
+            serde_json::from_str(json_input).map_err(|e| AdapterError::Parse(e.to_string()))?;
+
+        let array = match value {
+            Value::Array(a) => a,
+            _ => {
+                return Err(AdapterError::Parse(
+                    "expected a JSON array at the top level".into(),
+                ))
+            }
+        };
+
+        let mut entities = Vec::new();
+        let mut edges = Vec::new();
+        let mut warnings = Vec::new();
+
+        for (index, item) in array.into_iter().enumerate() {
+            let obj = match item {
+                Value::Object(m) => m,
+                other => {
+                    warnings.push(format!(
+                        "record {index}: expected an object, got {}; skipped",
+                        other.type_str()
+                    ));
+                    continue;
+                }
+            };
+
+            // Normalise keys to lowercase once for dispatch detection.
+            // Case-insensitive per ADR-036 §2: "maps keys … case-insensitively".
+            let has_source = obj.keys().any(|k| {
+                let l = k.to_ascii_lowercase();
+                l == "source" || l == "from"
+            });
+            let has_target = obj.keys().any(|k| {
+                let l = k.to_ascii_lowercase();
+                l == "target" || l == "to"
+            });
+
+            if has_source && has_target {
+                edges.push(parse_edge(index, obj));
+            } else {
+                entities.push(parse_entity(index, obj, &mut warnings));
+            }
+        }
+
+        Ok(Self {
+            entities,
+            edges,
+            warnings,
+        })
+    }
+}
+
+impl FormatAdapter for JsonFormatAdapter {
+    fn name(&self) -> &str {
+        "json"
+    }
+
+    fn entities(&mut self) -> impl Iterator<Item = Result<EntityRecord, AdapterError>> {
+        self.entities.drain(..)
+    }
+
+    fn edges(&mut self) -> impl Iterator<Item = Result<EdgeRecord, AdapterError>> {
+        self.edges.drain(..)
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Remove a key from the map case-insensitively.
+///
+/// Looks for the first key whose ASCII-lowercase form equals `field_lower`.
+/// Returns `(original_key, value)` if found, `None` otherwise.
+fn remove_ci(
+    obj: &mut serde_json::Map<String, Value>,
+    field_lower: &str,
+) -> Option<(String, Value)> {
+    let key = obj
+        .keys()
+        .find(|k| k.to_ascii_lowercase() == field_lower)
+        .cloned()?;
+    let val = obj.remove(&key)?;
+    Some((key, val))
+}
+
+fn parse_entity(
+    index: usize,
+    mut obj: serde_json::Map<String, Value>,
+    warnings: &mut Vec<String>,
+) -> Result<EntityRecord, AdapterError> {
+    // Required: name (case-insensitive per ADR-036 §2)
+    let name = match remove_ci(&mut obj, "name") {
+        Some((_, Value::String(s))) if !s.is_empty() => s,
+        Some(_) => {
+            return Err(AdapterError::InvalidField {
+                index,
+                field: "name".into(),
+                reason: "must be a non-empty string".into(),
+            })
+        }
+        None => {
+            return Err(AdapterError::MissingField {
+                index,
+                field: "name".into(),
+            })
+        }
+    };
+
+    // Required: kind (falls back to warning + "concept" when absent; case-insensitive)
+    let kind = match remove_ci(&mut obj, "kind") {
+        Some((_, Value::String(s))) if !s.is_empty() => s,
+        Some(_) => {
+            return Err(AdapterError::InvalidField {
+                index,
+                field: "kind".into(),
+                reason: "must be a non-empty string".into(),
+            })
+        }
+        None => {
+            warnings.push(format!(
+                "record {index}: missing 'kind'; defaulting to 'concept'"
+            ));
+            "concept".into()
+        }
+    };
+
+    // Optional: id (generate if absent; case-insensitive)
+    let id = match remove_ci(&mut obj, "id") {
+        Some((_, Value::String(s))) => {
+            s.parse::<Uuid>().map_err(|e| AdapterError::InvalidField {
+                index,
+                field: "id".into(),
+                reason: e.to_string(),
+            })?
+        }
+        Some(_) => {
+            return Err(AdapterError::InvalidField {
+                index,
+                field: "id".into(),
+                reason: "must be a UUID string".into(),
+            })
+        }
+        None => Uuid::new_v4(),
+    };
+
+    // Optional: description (case-insensitive)
+    let description = match remove_ci(&mut obj, "description") {
+        Some((_, Value::String(s))) => Some(s),
+        Some(_) => {
+            warnings.push(format!(
+                "record {index}: 'description' is not a string; ignored"
+            ));
+            None
+        }
+        None => None,
+    };
+
+    // Optional: tags (array of strings; case-insensitive)
+    let tags: Vec<String> = match remove_ci(&mut obj, "tags") {
+        Some((_, Value::Array(arr))) => arr
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s),
+                _ => {
+                    warnings.push(format!("record {index}: non-string tag value ignored"));
+                    None
+                }
+            })
+            .collect(),
+        Some(_) => {
+            warnings.push(format!("record {index}: 'tags' is not an array; ignored"));
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+
+    // Optional: explicit properties block merges into remaining keys (case-insensitive)
+    let mut properties = match remove_ci(&mut obj, "properties") {
+        Some((_, Value::Object(m))) => m,
+        Some((_, other)) => {
+            warnings.push(format!(
+                "record {index}: 'properties' is not an object (got {}); ignored",
+                other.type_str()
+            ));
+            serde_json::Map::new()
+        }
+        None => serde_json::Map::new(),
+    };
+
+    // All remaining keys fold into properties (ADR-036 §2: "All other keys collect into properties")
+    for (k, v) in obj {
+        properties.insert(k, v);
+    }
+
+    Ok(EntityRecord {
+        id,
+        kind,
+        name,
+        description,
+        properties: Value::Object(properties),
+        tags,
+    })
+}
+
+fn parse_edge(
+    index: usize,
+    mut obj: serde_json::Map<String, Value>,
+) -> Result<EdgeRecord, AdapterError> {
+    // Support both "source"/"target" and "from"/"to" aliases, case-insensitive
+    let source = remove_ci(&mut obj, "source")
+        .or_else(|| remove_ci(&mut obj, "from"))
+        .and_then(|(_, v)| v.as_str().map(|s| s.to_owned()))
+        .ok_or_else(|| AdapterError::MissingField {
+            index,
+            field: "source".into(),
+        })?;
+
+    let target = remove_ci(&mut obj, "target")
+        .or_else(|| remove_ci(&mut obj, "to"))
+        .and_then(|(_, v)| v.as_str().map(|s| s.to_owned()))
+        .ok_or_else(|| AdapterError::MissingField {
+            index,
+            field: "target".into(),
+        })?;
+
+    let relation = match remove_ci(&mut obj, "relation") {
+        Some((_, Value::String(s))) if !s.is_empty() => s,
+        Some(_) => {
+            return Err(AdapterError::InvalidField {
+                index,
+                field: "relation".into(),
+                reason: "must be a non-empty string".into(),
+            })
+        }
+        None => {
+            return Err(AdapterError::MissingField {
+                index,
+                field: "relation".into(),
+            })
+        }
+    };
+
+    let edge_id = match remove_ci(&mut obj, "edge_id").or_else(|| remove_ci(&mut obj, "id")) {
+        Some((_, Value::String(s))) => {
+            s.parse::<Uuid>().map_err(|e| AdapterError::InvalidField {
+                index,
+                field: "edge_id".into(),
+                reason: e.to_string(),
+            })?
+        }
+        Some(_) => {
+            return Err(AdapterError::InvalidField {
+                index,
+                field: "edge_id".into(),
+                reason: "must be a UUID string".into(),
+            })
+        }
+        None => Uuid::new_v4(),
+    };
+
+    let weight = match remove_ci(&mut obj, "weight") {
+        Some((_, Value::Number(n))) => n.as_f64().ok_or_else(|| AdapterError::InvalidField {
+            index,
+            field: "weight".into(),
+            reason: "weight is not a finite f64".into(),
+        })?,
+        Some(_) => {
+            return Err(AdapterError::InvalidField {
+                index,
+                field: "weight".into(),
+                reason: "must be a number".into(),
+            })
+        }
+        None => 0.7,
+    };
+
+    // Extract top-level "properties" object as the base (case-insensitive).
+    // Remaining unknown edge keys are then merged in — this mirrors parse_entity's
+    // approach and prevents the double-nesting bug where a round-tripped edge with
+    // an explicit "properties" field would produce properties.properties.
+    let mut properties = match remove_ci(&mut obj, "properties") {
+        Some((_, Value::Object(m))) => m,
+        Some(_) | None => serde_json::Map::new(),
+    };
+
+    // Remaining unknown keys fold into edge properties
+    for (k, v) in obj {
+        properties.insert(k, v);
+    }
+
+    Ok(EdgeRecord {
+        edge_id,
+        source,
+        target,
+        relation,
+        weight,
+        properties: Value::Object(properties),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Helper trait: readable type name for error messages
+// ---------------------------------------------------------------------------
+
+trait TypeStr {
+    fn type_str(&self) -> &'static str;
+}
+
+impl TypeStr for Value {
+    fn type_str(&self) -> &'static str {
+        match self {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
+    }
+}
