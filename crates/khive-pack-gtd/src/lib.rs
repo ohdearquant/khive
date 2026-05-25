@@ -181,7 +181,7 @@ impl GtdPack {
     }
 }
 
-// ── ADR-063: inventory self-registration ─────────────────────────────────────
+// ── ADR-027: inventory self-registration ─────────────────────────────────────
 
 struct GtdPackFactory;
 

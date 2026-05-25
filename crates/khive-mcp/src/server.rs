@@ -123,7 +123,7 @@ impl std::error::Error for PackRegError {}
 /// Built-in pack names known to this binary.
 ///
 /// Sourced from `PackRegistry::discovered_names()` so the list always reflects
-/// whatever pack crates are linked into the binary (ADR-063).
+/// whatever pack crates are linked into the binary (ADR-027).
 pub fn builtin_pack_names() -> Vec<&'static str> {
     PackRegistry::discovered_names()
 }
@@ -135,38 +135,20 @@ impl KhiveMcpServer {
     /// registry. Gate decisions are **hard-enforcing** in v0.3 — a `Deny`
     /// result blocks pack dispatch and returns `PermissionDenied` (ADR-035).
     ///
-    /// Always returns a server. Unknown pack names are logged via `tracing::warn!`
-    /// rather than rejected — startup must remain robust if a future binary drops
-    /// a pack that an older config still names. Use [`Self::with_packs`] for
-    /// strict validation in tests / programmatic callers.
-    pub fn new(runtime: KhiveRuntime) -> Self {
+    /// Fails fast if any requested pack is unknown or has an unsatisfied
+    /// dependency (ADR-027). A misconfigured `KHIVE_PACKS` is a boot error —
+    /// callers must list all required packs explicitly. Use [`Self::with_packs`]
+    /// for the same strict path with an explicit pack list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackRegError`] if any pack in `runtime.config().packs` is
+    /// unknown or if a declared dependency is absent from the list.
+    // The error variant intentionally carries the runtime so callers can recover.
+    #[allow(clippy::result_large_err)]
+    pub fn new(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
         let packs: Vec<String> = runtime.config().packs.clone();
-        Self::with_packs(runtime, &packs).unwrap_or_else(|err| {
-            tracing::warn!("pack registration: {err}; falling back to kg only");
-            let recovered_runtime = err.runtime;
-            let gate = recovered_runtime.config().gate.clone();
-            let default_namespace = recovered_runtime.config().default_namespace.clone();
-            let mut builder = VerbRegistryBuilder::new();
-            builder.with_gate(gate);
-            builder.with_default_namespace(default_namespace.as_str());
-            // ADR-035: wire the EventStore for the fallback path too.
-            if let Ok(event_store) = recovered_runtime
-                .events(&recovered_runtime.authorize(khive_runtime::Namespace::local()))
-            {
-                builder.with_event_store(event_store);
-            }
-            // Fallback: register the kg pack through the inventory registry so
-            // this code path stays free of direct pack-type imports.
-            PackRegistry::register_packs(
-                &["kg".to_string()],
-                recovered_runtime.clone(),
-                &mut builder,
-            )
-            .expect("kg is a known pack name");
-            let registry = builder.build().expect("fallback kg registry builds");
-            recovered_runtime.install_edge_rules(registry.all_edge_rules());
-            Self { registry }
-        })
+        Self::with_packs(runtime, &packs)
     }
 
     /// Build a server with an explicit pack list (strict — fails on unknown names).
