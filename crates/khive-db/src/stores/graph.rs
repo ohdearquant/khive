@@ -799,8 +799,15 @@ impl GraphStore for SqlGraphStore {
 
                 let mut nodes = Vec::new();
                 let mut max_weight = 0.0f64;
+                // Track visited node IDs to deduplicate multi-path reachability
+                // (#285). Rows are ordered by depth (shallowest first), so the
+                // first occurrence is the BFS-order first-visit — that is the
+                // one we keep.
+                let mut seen: std::collections::HashSet<Uuid> =
+                    std::collections::HashSet::new();
 
                 if include_roots {
+                    seen.insert(*root_id);
                     nodes.push(PathNode {
                         node_id: *root_id,
                         via_edge: None,
@@ -813,6 +820,10 @@ impl GraphStore for SqlGraphStore {
                 for row in rows {
                     let (node_str, edge_str, depth, total_weight) = row?;
                     let node_id = parse_uuid(&node_str)?;
+                    // Skip nodes already seen via an earlier (shallower) path.
+                    if !seen.insert(node_id) {
+                        continue;
+                    }
                     let via_edge = edge_str.map(|s| parse_uuid(&s)).transpose()?;
                     nodes.push(PathNode {
                         node_id,
@@ -1061,6 +1072,118 @@ mod tests {
         assert!(node_ids.contains(&b));
         assert!(node_ids.contains(&c));
         assert!(!node_ids.contains(&d));
+    }
+
+    /// Diamond graph: A→B, A→C, B→D, C→D.
+    /// D is reachable via two paths at depth 2.  After the fix it must appear
+    /// exactly once in the result (#285).
+    #[tokio::test]
+    async fn test_traverse_dedups_multipath_node() {
+        let store = setup_memory_store();
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+
+        store
+            .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        store
+            .upsert_edge(make_edge(a, c, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        store
+            .upsert_edge(make_edge(b, d, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        store
+            .upsert_edge(make_edge(c, d, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+
+        let request = TraversalRequest {
+            roots: vec![a],
+            options: TraversalOptions::new(3).with_direction(Direction::Out),
+            include_roots: false,
+        };
+
+        let paths = store.traverse(request).await.unwrap();
+        assert_eq!(paths.len(), 1);
+        let nodes = &paths[0].nodes;
+
+        // D must appear exactly once despite being reachable via both B and C.
+        let d_count = nodes.iter().filter(|n| n.node_id == d).count();
+        assert_eq!(d_count, 1, "D must appear exactly once (dedup multi-path)");
+
+        // B and C must each appear once as well.
+        assert_eq!(nodes.iter().filter(|n| n.node_id == b).count(), 1);
+        assert_eq!(nodes.iter().filter(|n| n.node_id == c).count(), 1);
+    }
+
+    /// First-visit (BFS) ordering is deterministic: the node seen at the
+    /// shallowest depth wins, and the `via_edge` recorded for it is the one
+    /// from that first-visited path.
+    ///
+    /// Graph: A→B (depth 1), A→C (depth 1), B→D (depth 2), C→D (depth 2).
+    /// D appears at depth 2 via B or C.  Rows are ordered by depth; whichever
+    /// path SQLite enumerates first for depth-2 is the keeper.  The test
+    /// asserts that D has exactly one entry with a non-None `via_edge` — we
+    /// do NOT assert *which* edge wins because SQLite row order within the
+    /// same depth level is non-deterministic, but we DO assert stability:
+    /// running twice gives the same count.
+    #[tokio::test]
+    async fn test_traverse_preserves_first_path_metadata() {
+        let store = setup_memory_store();
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+
+        store
+            .upsert_edge(make_edge(a, b, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        store
+            .upsert_edge(make_edge(a, c, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        store
+            .upsert_edge(make_edge(b, d, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+        store
+            .upsert_edge(make_edge(c, d, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+
+        let make_request = || TraversalRequest {
+            roots: vec![a],
+            options: TraversalOptions::new(3).with_direction(Direction::Out),
+            include_roots: false,
+        };
+
+        let paths1 = store.traverse(make_request()).await.unwrap();
+        let paths2 = store.traverse(make_request()).await.unwrap();
+
+        // Both runs must return the same total node count (dedup is stable).
+        let count1 = paths1[0].nodes.len();
+        let count2 = paths2[0].nodes.len();
+        assert_eq!(
+            count1, count2,
+            "traverse result count must be stable across calls"
+        );
+
+        // D must appear exactly once and carry a via_edge (it was not a root).
+        let d_nodes: Vec<_> = paths1[0].nodes.iter().filter(|n| n.node_id == d).collect();
+        assert_eq!(d_nodes.len(), 1, "D deduped to one entry");
+        assert!(
+            d_nodes[0].via_edge.is_some(),
+            "kept entry must have a via_edge"
+        );
+        assert_eq!(d_nodes[0].depth, 2, "D lives at depth 2");
     }
 
     #[tokio::test]
