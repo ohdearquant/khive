@@ -30,11 +30,20 @@ MEMORY_VERBS = frozenset({
     "remember", "recall",
 })
 
-ALL_VERBS = KG_VERBS | GTD_VERBS | MEMORY_VERBS
+BRAIN_VERBS = frozenset({
+    "brain.profiles", "brain.profile", "brain.resolve",
+    "brain.activate", "brain.deactivate", "brain.archive",
+    "brain.feedback", "brain.reset",
+    "brain.bind", "brain.unbind",
+    # internal/subhandler — callable by operators
+    "brain.state", "brain.config", "brain.events", "brain.emit",
+})
 
-# Regex that matches the start of a verb call line
+ALL_VERBS = KG_VERBS | GTD_VERBS | MEMORY_VERBS | BRAIN_VERBS
+
+# Regex that matches the start of a verb call line (supports dotted names like brain.profiles)
 _VERB_RE = re.compile(
-    r"^(?:request|\[)?(" + "|".join(sorted(ALL_VERBS)) + r")\s*\("
+    r"^(?:request|\[)?(" + "|".join(sorted(ALL_VERBS, key=len, reverse=True)) + r")\s*\("
 )
 _REQUEST_RE = re.compile(r"^request\s*\(")
 
@@ -157,15 +166,17 @@ def _validate_batch(inner: str, original: str) -> tuple[bool, str | None]:
     # Extract individual verb calls from within the brackets
     stripped = inner.strip().lstrip("[").rstrip("]").strip()
     # Split on top-level commas (simple approach: find verb( patterns)
+    # Sort by length descending so dotted names (brain.profiles) match before prefixes (brain)
     verb_starts = [m.start() for m in re.finditer(
-        r"\b(" + "|".join(sorted(ALL_VERBS)) + r")\s*\(", stripped
+        r"(?<![a-z_.])(" + "|".join(sorted(ALL_VERBS, key=len, reverse=True)) + r")\s*\(", stripped
     )]
     if not verb_starts:
         return True, None  # No recognisable verbs in batch; skip
     for i, start in enumerate(verb_starts):
         end = verb_starts[i + 1] if i + 1 < len(verb_starts) else len(stripped)
         segment = stripped[start:end].strip().rstrip(", ")
-        m = re.match(r"([a-z_]+)\s*\(", segment)
+        # Support dotted names (brain.profiles, brain.feedback, etc.)
+        m = re.match(r"([a-z][a-z_.]*)\s*\(", segment)
         if not m:
             continue
         verb = m.group(1)
@@ -182,7 +193,8 @@ def _validate_batch(inner: str, original: str) -> tuple[bool, str | None]:
 def _validate_single_inner(inner: str, original: str) -> tuple[bool, str | None]:
     """Validate a single inner verb call string (unescaped)."""
     inner = inner.strip()
-    m = re.match(r"([a-z_]+)\s*\(", inner)
+    # Support dotted names (brain.profiles, brain.feedback, etc.)
+    m = re.match(r"([a-z][a-z_.]*)\s*\(", inner)
     if not m:
         return True, None  # Can't parse — skip
     verb = m.group(1)

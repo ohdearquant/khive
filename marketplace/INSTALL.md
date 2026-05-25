@@ -1,6 +1,6 @@
 # khive Marketplace Plugin Installation
 
-This document covers how to install the `kg`, `gtd`, and `memory` plugins for Claude Code
+This document covers how to install the `kg`, `gtd`, `memory`, and `brain` plugins for Claude Code
 and verify they are wired correctly to a running `khive-mcp` server.
 
 ## Version compatibility
@@ -10,6 +10,7 @@ and verify they are wired correctly to a running `khive-mcp` server.
 | kg     | 0.2.2   | ≥ 0.2.2   |
 | gtd    | 0.2.2   | ≥ 0.2.2   |
 | memory | 0.2.2   | ≥ 0.2.2   |
+| brain  | 0.2.2   | ≥ 0.2.2   |
 
 ## Step 1 — Install khive-mcp
 
@@ -34,7 +35,7 @@ Create or update `.mcp.json` in your project root:
   "mcpServers": {
     "khive": {
       "command": "khive-mcp",
-      "args": ["--pack", "kg", "--pack", "gtd", "--pack", "memory"]
+      "args": ["--pack", "kg", "--pack", "gtd", "--pack", "memory", "--pack", "brain"]
     }
   }
 }
@@ -52,8 +53,11 @@ claude mcp add --transport stdio khive -- khive-mcp --pack gtd
 # Memory only
 claude mcp add --transport stdio khive -- khive-mcp --pack memory
 
-# All three packs (recommended for kg-agent swarms)
-claude mcp add --transport stdio khive -- khive-mcp --pack kg --pack gtd --pack memory
+# Brain only (kg dependency resolved automatically)
+claude mcp add --transport stdio khive -- khive-mcp --pack brain
+
+# All four packs (recommended for kg-agent swarms with adaptive recall)
+claude mcp add --transport stdio khive -- khive-mcp --pack kg --pack gtd --pack memory --pack brain
 ```
 
 ## Step 3 — Install the plugins
@@ -63,6 +67,7 @@ claude mcp add --transport stdio khive -- khive-mcp --pack kg --pack gtd --pack 
 claude plugin install marketplace/kg
 claude plugin install marketplace/gtd
 claude plugin install marketplace/memory
+claude plugin install marketplace/brain
 ```
 
 Or manually copy each plugin directory into `~/.claude/plugins/`:
@@ -71,6 +76,7 @@ Or manually copy each plugin directory into `~/.claude/plugins/`:
 cp -r marketplace/kg     ~/.claude/plugins/kg
 cp -r marketplace/gtd    ~/.claude/plugins/gtd
 cp -r marketplace/memory ~/.claude/plugins/memory
+cp -r marketplace/brain  ~/.claude/plugins/brain
 ```
 
 ## Step 4 — Verify installation
@@ -98,6 +104,14 @@ request(ops="complete(id=\"<id-from-assign>\")")
 ```text
 request(ops="remember(content=\"install verification note\", memory_type=\"episodic\", importance=0.1)")
 request(ops="recall(query=\"install verification\", limit=1)")
+```
+
+### Brain pack smoke tests
+
+```text
+request(ops="brain.profiles()")
+request(ops="brain.profile(id=\"balanced-recall-v1\")")
+request(ops="brain.resolve(consumer_kind=\"recall\")")
 ```
 
 ## Step 5 — Run the example validator
