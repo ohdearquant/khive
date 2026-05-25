@@ -5,6 +5,10 @@
 //! and feeds it in via the candidate struct.
 //!
 //! See ADR-061 — Retrieval Infrastructure.
+//! See ADR-033 — Recall Pipeline (NoteCandidate, DecayAwareImportanceObjective,
+//!                                TemporalRecencyObjective, RerankerObjective).
+
+use std::collections::HashMap;
 
 use uuid::Uuid;
 
@@ -114,6 +118,9 @@ impl Objective<RetrievalCandidate> for GraphProximityObjective {
 /// Scores a candidate by its pre-computed RRF fusion score.
 ///
 /// Returns `rrf_score` unchanged, or 0.0 when the field is absent.
+/// Implements `Objective` for both `RetrievalCandidate` and `NoteCandidate`
+/// so the same objective can be used in the general retrieval pipeline
+/// and the memory recall pipeline (ADR-033 §4).
 pub struct RrfFusionObjective;
 
 impl Objective<RetrievalCandidate> for RrfFusionObjective {
@@ -124,6 +131,171 @@ impl Objective<RetrievalCandidate> for RrfFusionObjective {
 
     fn name(&self) -> &str {
         "RrfFusionObjective"
+    }
+}
+
+impl Objective<NoteCandidate> for RrfFusionObjective {
+    #[inline]
+    fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
+        candidate.rrf_score.unwrap_or(0.0)
+    }
+
+    fn name(&self) -> &str {
+        "RrfFusionObjective"
+    }
+}
+
+// ── Memory-Recall Objectives (ADR-033 §4) ────────────────────────────────────
+
+/// Pre-computed signals for a single memory note candidate.
+///
+/// Used by the recall pipeline's `ComposePipeline` to score and rank candidates
+/// via `DecayAwareImportanceObjective`, `TemporalRecencyObjective`, and
+/// `RerankerObjective` without any IO. The runtime layer populates this struct
+/// from stored notes before handing the slice to the pipeline.
+///
+/// See ADR-033 §4.
+#[derive(Debug, Clone)]
+pub struct NoteCandidate {
+    /// Stable note UUID.
+    pub id: Uuid,
+    /// Pre-fused RRF score from the retrieval stage (0.0–1.0).
+    pub rrf_score: Option<f64>,
+    /// Raw salience stored on the note (0.0–1.0).
+    pub salience: f64,
+    /// Per-note exponential decay rate (>= 0.0).
+    pub decay_factor: f64,
+    /// Age of the note in days at query time.
+    pub age_days: f64,
+    /// Per-reranker scores populated by the rerank stage.
+    /// Keyed by reranker name (e.g. "cross_encoder", "salience", "graph_proximity").
+    pub rerank_scores: HashMap<String, f64>,
+}
+
+impl HasId for NoteCandidate {
+    #[inline]
+    fn id(&self) -> Uuid {
+        self.id
+    }
+}
+
+// ── DecayAwareImportanceObjective ────────────────────────────────────────────
+
+/// Scores a `NoteCandidate` by salience with configurable temporal decay.
+///
+/// ADR-021 §5 / ADR-033 §4. The decay formula is determined by the configured
+/// `DecayModel` (injected at construction time). The default `DecayModel::Exponential`
+/// uses the note's own `decay_factor`: `salience * exp(-decay_factor * age_days)`.
+///
+/// This objective participates in `WeightedObjective` composition alongside
+/// `RrfFusionObjective` and `TemporalRecencyObjective` to form the full recall
+/// scoring pipeline.
+pub struct DecayAwareImportanceObjective {
+    /// Exponential decay rate k (>= 0.0). Score = `salience * exp(-k * age_days)`.
+    /// Corresponds to ADR-021's per-note `decay_factor` parameter.
+    pub decay_rate: f64,
+}
+
+impl DecayAwareImportanceObjective {
+    /// Create a new objective with the given exponential decay rate.
+    ///
+    /// `decay_rate = 0.01` gives a ~69-day half-life (the ADR-021 default for memory notes).
+    pub fn new(decay_rate: f64) -> Self {
+        Self { decay_rate }
+    }
+
+    /// Default memory decay rate from ADR-021: 0.01 (~69-day half-life).
+    pub fn default_memory() -> Self {
+        Self::new(0.01)
+    }
+}
+
+impl Objective<NoteCandidate> for DecayAwareImportanceObjective {
+    #[inline]
+    fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
+        // ADR-021 §5 / ADR-033 §4:
+        // effective_importance = salience * exp(-decay_factor * age_days)
+        candidate.salience * (-candidate.decay_factor * candidate.age_days).exp()
+    }
+
+    fn name(&self) -> &str {
+        "DecayAwareImportanceObjective"
+    }
+}
+
+// ── TemporalRecencyObjective ─────────────────────────────────────────────────
+
+/// Scores a `NoteCandidate` by pure temporal recency with a configurable half-life.
+///
+/// Formula: `exp(-ln(2) / half_life_days * age_days)`
+///
+/// At `age_days = 0` → score 1.0 (brand new note).
+/// At `age_days = half_life_days` → score 0.5.
+///
+/// Complements `DecayAwareImportanceObjective`: this signal rewards freshness
+/// independently of the note's own decay rate.
+pub struct TemporalRecencyObjective {
+    /// Number of days for the recency score to halve. Must be > 0.
+    pub half_life_days: f64,
+}
+
+impl TemporalRecencyObjective {
+    /// Create with the ADR-021 default temporal half-life of 30 days.
+    pub fn default_memory() -> Self {
+        Self {
+            half_life_days: 30.0,
+        }
+    }
+}
+
+impl Objective<NoteCandidate> for TemporalRecencyObjective {
+    #[inline]
+    fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
+        let k = std::f64::consts::LN_2 / self.half_life_days.max(f64::EPSILON);
+        (-k * candidate.age_days).exp()
+    }
+
+    fn name(&self) -> &str {
+        "TemporalRecencyObjective"
+    }
+}
+
+// ── RerankerObjective ────────────────────────────────────────────────────────
+
+/// Scores a `NoteCandidate` using a named reranker's pre-computed score.
+///
+/// Looks up `candidate.rerank_scores[reranker_name]`. Returns 0.0 when the
+/// reranker was not run (key absent) — callers should gate on
+/// `RecallConfig.reranker_weights[name] > 0.0` before including this objective
+/// in a `WeightedObjective` composition.
+///
+/// See ADR-033 §4 and ADR-042 §7 for the reranker integration protocol.
+pub struct RerankerObjective {
+    /// Name of the reranker to look up in `candidate.rerank_scores`.
+    pub reranker_name: String,
+}
+
+impl RerankerObjective {
+    /// Create a new objective for the named reranker.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            reranker_name: name.into(),
+        }
+    }
+}
+
+impl Objective<NoteCandidate> for RerankerObjective {
+    #[inline]
+    fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
+        candidate
+            .rerank_scores
+            .get(&self.reranker_name)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    fn name(&self) -> &str {
+        "RerankerObjective"
     }
 }
 
@@ -152,6 +324,22 @@ mod tests {
             text_score: text,
             graph_distance: dist,
             rrf_score: rrf,
+        }
+    }
+
+    fn note_candidate(
+        rrf: Option<f64>,
+        salience: f64,
+        decay_factor: f64,
+        age_days: f64,
+    ) -> NoteCandidate {
+        NoteCandidate {
+            id: Uuid::new_v4(),
+            rrf_score: rrf,
+            salience,
+            decay_factor,
+            age_days,
+            rerank_scores: HashMap::new(),
         }
     }
 
@@ -331,5 +519,158 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert!((top[0].score - 0.9).abs() < 1e-12);
         assert!((top[1].score - 0.6).abs() < 1e-12);
+    }
+
+    // ── NoteCandidate: HasId ─────────────────────────────────────────────
+
+    #[test]
+    fn note_candidate_has_id_returns_uuid() {
+        let id = Uuid::new_v4();
+        let c = NoteCandidate {
+            id,
+            rrf_score: None,
+            salience: 0.5,
+            decay_factor: 0.01,
+            age_days: 0.0,
+            rerank_scores: HashMap::new(),
+        };
+        assert_eq!(c.id(), id);
+    }
+
+    // ── DecayAwareImportanceObjective ────────────────────────────────────
+
+    #[test]
+    fn decay_aware_zero_age_returns_full_salience() {
+        let obj = DecayAwareImportanceObjective::new(0.01);
+        let c = note_candidate(None, 0.8, 0.01, 0.0);
+        let score = obj.score(&c, &ctx());
+        assert!((score - 0.8).abs() < 1e-12, "got {score}");
+    }
+
+    #[test]
+    fn decay_aware_uses_note_decay_factor_not_field() {
+        // ADR-021 §5: uses the note's own decay_factor, not the objective's
+        let obj = DecayAwareImportanceObjective::new(0.99); // obj.decay_rate ignored
+                                                            // Note's decay_factor = 0.01, age=100 days → exp(-0.01*100) ≈ 0.368
+        let c = note_candidate(None, 1.0, 0.01, 100.0);
+        let score = obj.score(&c, &ctx());
+        let expected = (-0.01_f64 * 100.0).exp();
+        assert!(
+            (score - expected).abs() < 1e-12,
+            "got {score}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn decay_aware_high_decay_reduces_score_faster() {
+        // High decay note should score lower at same age
+        let obj = DecayAwareImportanceObjective::new(0.0);
+        let slow = note_candidate(None, 1.0, 0.001, 100.0);
+        let fast = note_candidate(None, 1.0, 0.1, 100.0);
+        let score_slow = obj.score(&slow, &ctx());
+        let score_fast = obj.score(&fast, &ctx());
+        assert!(
+            score_slow > score_fast,
+            "slow decay should score higher: {score_slow} vs {score_fast}"
+        );
+    }
+
+    // ── TemporalRecencyObjective ─────────────────────────────────────────
+
+    #[test]
+    fn temporal_score_one_at_zero_age() {
+        let obj = TemporalRecencyObjective {
+            half_life_days: 30.0,
+        };
+        let c = note_candidate(None, 0.5, 0.01, 0.0);
+        let score = obj.score(&c, &ctx());
+        assert!((score - 1.0).abs() < 1e-12, "got {score}");
+    }
+
+    #[test]
+    fn temporal_score_half_at_half_life() {
+        let half_life = 30.0;
+        let obj = TemporalRecencyObjective {
+            half_life_days: half_life,
+        };
+        let c = note_candidate(None, 0.5, 0.01, half_life);
+        let score = obj.score(&c, &ctx());
+        assert!(
+            (score - 0.5).abs() < 1e-10,
+            "expected 0.5 at half_life, got {score}"
+        );
+    }
+
+    #[test]
+    fn temporal_score_decreases_with_age() {
+        let obj = TemporalRecencyObjective {
+            half_life_days: 30.0,
+        };
+        let young = note_candidate(None, 1.0, 0.01, 10.0);
+        let old = note_candidate(None, 1.0, 0.01, 100.0);
+        let score_young = obj.score(&young, &ctx());
+        let score_old = obj.score(&old, &ctx());
+        assert!(
+            score_young > score_old,
+            "younger note should score higher: {score_young} vs {score_old}"
+        );
+    }
+
+    // ── RerankerObjective ────────────────────────────────────────────────
+
+    #[test]
+    fn reranker_returns_named_score() {
+        let mut c = note_candidate(None, 0.5, 0.01, 0.0);
+        c.rerank_scores.insert("cross_encoder".to_string(), 0.9);
+        let obj = RerankerObjective::new("cross_encoder");
+        let score = obj.score(&c, &ctx());
+        assert!((score - 0.9).abs() < 1e-12, "got {score}");
+    }
+
+    #[test]
+    fn reranker_absent_key_returns_zero() {
+        let c = note_candidate(None, 0.5, 0.01, 0.0);
+        let obj = RerankerObjective::new("cross_encoder");
+        let score = obj.score(&c, &ctx());
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn reranker_different_keys_independent() {
+        let mut c = note_candidate(None, 0.5, 0.01, 0.0);
+        c.rerank_scores.insert("salience".to_string(), 0.7);
+        let obj_ce = RerankerObjective::new("cross_encoder");
+        let obj_sal = RerankerObjective::new("salience");
+        assert_eq!(obj_ce.score(&c, &ctx()), 0.0);
+        assert!((obj_sal.score(&c, &ctx()) - 0.7).abs() < 1e-12);
+    }
+
+    // ── Weighted composition of memory objectives ────────────────────────
+
+    #[test]
+    fn memory_pipeline_weighted_composition() {
+        // Reproduce ADR-021 §5 formula via WeightedObjective:
+        // score = rrf * 0.70 + importance_decayed * 0.20 + temporal * 0.10
+        // At age=0: importance_decayed = salience, temporal = 1.0
+        let c = NoteCandidate {
+            id: Uuid::new_v4(),
+            rrf_score: Some(0.5),
+            salience: 0.8,
+            decay_factor: 0.01,
+            age_days: 0.0,
+            rerank_scores: HashMap::new(),
+        };
+        let pipeline = WeightedObjective::<NoteCandidate>::new()
+            .add(Box::new(RrfFusionObjective), 0.70)
+            .add(Box::new(DecayAwareImportanceObjective::new(0.0)), 0.20)
+            .add(
+                Box::new(TemporalRecencyObjective {
+                    half_life_days: 30.0,
+                }),
+                0.10,
+            );
+        let score = pipeline.score(&c, &ctx());
+        // (0.7*0.5 + 0.2*0.8 + 0.1*1.0) / 1.0 = 0.35 + 0.16 + 0.10 = 0.61
+        assert!((score - 0.61).abs() < 1e-10, "got {score}");
     }
 }
