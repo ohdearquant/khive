@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
-use khive_runtime::pack::{PackRuntime, VerbDef};
+use khive_runtime::pack::{HandlerDef, PackRuntime};
 use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use khive_types::Pack;
 use serde_json::{json, Value};
@@ -27,7 +27,7 @@ impl Fixture {
         self.registry.dispatch(verb, args).await
     }
 
-    fn verbs(&self) -> Vec<&'static VerbDef> {
+    fn verbs(&self) -> Vec<&'static HandlerDef> {
         self.registry.all_verbs()
     }
 }
@@ -43,7 +43,8 @@ fn pack() -> Fixture {
 
 fn pack_with_events() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let event_store = rt.events(None).expect("event store must be available");
+    let tok = rt.authorize(khive_runtime::Namespace::local());
+    let event_store = rt.events(&tok).expect("event store must be available");
     let mut builder = VerbRegistryBuilder::new();
     builder.with_event_store(event_store);
     builder.register(KgPack::new(rt));
@@ -65,13 +66,15 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 
 // ---- PackRuntime trait: verbs() and unknown-verb dispatch ----
 
+// ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
+// handler count from 11 to 14.
 #[test]
-fn pack_verbs_returns_eleven() {
+fn pack_verbs_returns_fourteen() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        11,
-        "KgPack must expose exactly 11 verbs"
+        14,
+        "KgPack must expose exactly 14 verbs (11 original + propose/review/withdraw)"
     );
 }
 
@@ -91,6 +94,9 @@ fn pack_verbs_names_are_correct() {
         "neighbors",
         "traverse",
         "query",
+        "propose",
+        "review",
+        "withdraw",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -259,7 +265,8 @@ async fn create_note_no_kind_defaults_to_observation() {
 }
 
 #[tokio::test]
-async fn create_note_alias_obs_works() {
+async fn create_note_alias_obs_rejected() {
+    // Aliases removed per ADR-013 (F071) — only canonical note kind names accepted.
     let pack = pack();
     let result = pack
         .dispatch(
@@ -271,11 +278,16 @@ async fn create_note_alias_obs_works() {
             }),
         )
         .await;
-    assert!(result.is_ok(), "alias 'obs' must succeed: {:?}", result);
+    assert!(
+        result.is_err(),
+        "alias 'obs' must be rejected: {:?}",
+        result
+    );
 }
 
 #[tokio::test]
-async fn create_note_alias_finding_normalizes_to_insight() {
+async fn create_note_alias_finding_rejected() {
+    // Aliases removed per ADR-013 (F071) — only canonical note kind names accepted.
     let pack = pack();
     let result = pack
         .dispatch(
@@ -286,13 +298,11 @@ async fn create_note_alias_finding_normalizes_to_insight() {
                 "note_kind": "finding"
             }),
         )
-        .await
-        .expect("alias 'finding' must succeed");
-    let stored_kind = result.get("kind").and_then(Value::as_str);
-    assert_eq!(
-        stored_kind,
-        Some("insight"),
-        "alias 'finding' must normalize to 'insight'; got: {result}"
+        .await;
+    assert!(
+        result.is_err(),
+        "alias 'finding' must be rejected: {:?}",
+        result
     );
 }
 
@@ -874,7 +884,7 @@ async fn neighbors_enriches_with_name_and_kind() {
     let tgt = pack
         .dispatch(
             "create",
-            json!({"kind": "entity", "name": "GQA", "entity_kind": "project"}),
+            json!({"kind": "entity", "name": "GQA", "entity_kind": "concept"}),
         )
         .await
         .unwrap();
@@ -905,7 +915,7 @@ async fn neighbors_enriches_with_name_and_kind() {
     );
     assert_eq!(
         hit.get("kind").and_then(Value::as_str),
-        Some("project"),
+        Some("concept"),
         "neighbor hit must carry entity kind (#162); hit={hit}"
     );
 }
@@ -1117,7 +1127,7 @@ async fn soft_delete_entity_not_found_on_get() {
         .to_string();
 
     let del = pack
-        .dispatch("delete", json!({"id": id}))
+        .dispatch("delete", json!({"id": id, "kind": "entity"}))
         .await
         .expect("delete must succeed");
     assert_eq!(
@@ -1139,7 +1149,7 @@ async fn delete_nonexistent_id_returns_not_found() {
     let err = pack
         .dispatch(
             "delete",
-            json!({"id": "00000000-0000-0000-0000-000000000002"}),
+            json!({"id": "00000000-0000-0000-0000-000000000002", "kind": "entity"}),
         )
         .await
         .unwrap_err();
@@ -1203,7 +1213,7 @@ impl Pack for FakeMemoryPack {
     const NAME: &'static str = "memory";
     const NOTE_KINDS: &'static [&'static str] = &["memory"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const VERBS: &'static [VerbDef] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[];
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
@@ -1221,8 +1231,8 @@ impl PackRuntime for FakeMemoryPack {
         FakeMemoryPack::ENTITY_KINDS
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        FakeMemoryPack::VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        FakeMemoryPack::HANDLERS
     }
 
     fn requires(&self) -> &'static [&'static str] {
@@ -1234,6 +1244,7 @@ impl PackRuntime for FakeMemoryPack {
         verb: &str,
         _params: Value,
         _registry: &VerbRegistry,
+        _token: &khive_runtime::NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         Err(RuntimeError::InvalidInput(format!(
             "FakeMemoryPack does not handle verb {verb:?}"
@@ -1560,7 +1571,7 @@ async fn update_event_uuid_returns_immutable_error() {
     let err = pack
         .dispatch(
             "update",
-            json!({"id": event_id, "name": "should-not-apply"}),
+            json!({"id": event_id, "kind": "event", "name": "should-not-apply"}),
         )
         .await
         .unwrap_err();
@@ -1599,7 +1610,7 @@ async fn delete_event_uuid_returns_immutable_error_and_event_persists() {
         .to_string();
 
     let err = pack
-        .dispatch("delete", json!({"id": event_id}))
+        .dispatch("delete", json!({"id": event_id, "kind": "event"}))
         .await
         .unwrap_err();
     assert!(
@@ -1952,5 +1963,471 @@ async fn link_output_returns_full_uuids_and_iso_dates() {
     assert!(
         created_at.contains('T'),
         "created_at must be ISO 8601; got: {created_at:?}"
+    );
+}
+
+// ── Bulk link: entry limit, dedup, and response shape ────────────────────────
+
+// Fix 2: >1000 entries must return InvalidInput immediately.
+#[tokio::test]
+async fn bulk_link_over_1000_entries_returns_error() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "BulkA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "BulkB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let entries: Vec<Value> = (0..1001)
+        .map(|_| {
+            json!({
+                "source_id": a_id,
+                "target_id": b_id,
+                "relation": "extends",
+            })
+        })
+        .collect();
+
+    let err = pack
+        .dispatch("link", json!({"links": entries}))
+        .await
+        .expect_err("1001 entries must return an error");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput for >1000 bulk entries, got {err:?}"
+    );
+}
+
+// Fix 3: duplicate entries in a bulk request must be deduplicated (skipped count > 0).
+// Fix 4: response shape must have attempted/created/skipped/failed keys.
+#[tokio::test]
+async fn bulk_link_dedup_and_response_shape() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DedupA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DedupB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+    let c = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DedupC", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let c_id = c.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // 3 entries: A->B extends, A->B extends (dup), A->C extends.
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [
+                    {"source_id": a_id, "target_id": b_id, "relation": "extends"},
+                    {"source_id": a_id, "target_id": b_id, "relation": "extends"},
+                    {"source_id": a_id, "target_id": c_id, "relation": "extends"},
+                ],
+                "atomic": true,
+            }),
+        )
+        .await
+        .expect("bulk link must succeed");
+
+    assert_eq!(
+        result.get("attempted").and_then(Value::as_u64),
+        Some(3),
+        "attempted must be 3; got {result:?}"
+    );
+    assert_eq!(
+        result.get("created").and_then(Value::as_u64),
+        Some(2),
+        "created must be 2 (one dup skipped); got {result:?}"
+    );
+    assert_eq!(
+        result.get("skipped").and_then(Value::as_u64),
+        Some(1),
+        "skipped must be 1; got {result:?}"
+    );
+    assert_eq!(
+        result.get("failed").and_then(Value::as_u64),
+        Some(0),
+        "failed must be 0; got {result:?}"
+    );
+    // ADR-038: edges key must be absent when verbose is not set (F205).
+    assert!(
+        result.get("edges").is_none(),
+        "edges must be absent without verbose=true (ADR-038 F205); got {result:?}"
+    );
+}
+
+// F205: bulk link with verbose=true must include edges array; without verbose it must be absent.
+#[tokio::test]
+async fn bulk_link_verbose_controls_edges_key() {
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "VerbA", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "VerbB", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // Without verbose: no edges key.
+    let result_no_verbose = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [{"source_id": a_id, "target_id": b_id, "relation": "extends"}],
+            }),
+        )
+        .await
+        .expect("bulk link must succeed");
+    assert!(
+        result_no_verbose.get("edges").is_none(),
+        "edges must be absent without verbose=true (ADR-038 F205); got {result_no_verbose:?}"
+    );
+
+    // With verbose=true: edges key present.
+    let c = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "VerbC", "entity_kind": "concept"}),
+        )
+        .await
+        .unwrap();
+    let c_id = c.get("id").and_then(Value::as_str).unwrap().to_string();
+    let result_verbose = pack
+        .dispatch(
+            "link",
+            json!({
+                "links": [{"source_id": a_id, "target_id": c_id, "relation": "extends"}],
+                "verbose": true,
+            }),
+        )
+        .await
+        .expect("bulk link with verbose must succeed");
+    assert!(
+        result_verbose
+            .get("edges")
+            .and_then(Value::as_array)
+            .is_some(),
+        "edges must be present with verbose=true (ADR-038 F205); got {result_verbose:?}"
+    );
+}
+
+// ---- ADR-014 curation event payload regression tests (codex round-2) ----
+
+/// Update an entity → list entity_updated events → assert payload has id, namespace,
+/// changed_fields per ADR-014.
+#[tokio::test]
+async fn curation_update_entity_event_payload_has_adr014_fields() {
+    let pack = pack_with_events();
+
+    // Create then update with a name change.
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PayloadTestEntity"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    pack.dispatch(
+        "update",
+        json!({"id": entity_id, "kind": "entity", "name": "PayloadTestEntityRenamed"}),
+    )
+    .await
+    .expect("update must succeed");
+
+    // Retrieve the entity_updated event.
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "entity_updated", "limit": 10}),
+        )
+        .await
+        .expect("list entity_updated events must succeed");
+    let arr = events.as_array().expect("list must return array");
+    assert!(
+        !arr.is_empty(),
+        "at least one entity_updated event must be present after update"
+    );
+
+    // Find the event for our specific entity (by target_id).
+    let our_event = arr
+        .iter()
+        .find(|e| {
+            e.get("target_id")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == entity_id || t.starts_with(&entity_id[..8]))
+        })
+        .unwrap_or(&arr[0]);
+
+    let payload = our_event
+        .get("payload")
+        .expect("event must have payload field");
+    assert!(
+        payload.get("id").is_some(),
+        "entity_updated payload must contain 'id'; got {payload}"
+    );
+    assert!(
+        payload.get("namespace").is_some(),
+        "entity_updated payload must contain 'namespace'; got {payload}"
+    );
+    let changed = payload
+        .get("changed_fields")
+        .and_then(Value::as_array)
+        .expect("entity_updated payload must contain 'changed_fields' array");
+    assert!(
+        changed.iter().any(|v| v.as_str() == Some("name")),
+        "changed_fields must include 'name' when name was updated; got {changed:?}"
+    );
+}
+
+/// Merge two entities → list entity_merged events → assert payload has into_id, from_id,
+/// policy, edges_rewired per ADR-014.
+#[tokio::test]
+async fn curation_merge_entity_event_payload_has_adr014_fields() {
+    let pack = pack_with_events();
+
+    let into_e = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "MergeIntoEntity"}),
+        )
+        .await
+        .expect("create into must succeed");
+    let into_id = into_e
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    let from_e = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "MergeFromEntity"}),
+        )
+        .await
+        .expect("create from must succeed");
+    let from_id = from_e
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    pack.dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect("merge must succeed");
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "entity_merged", "limit": 10}),
+        )
+        .await
+        .expect("list entity_merged events must succeed");
+    let arr = events.as_array().expect("list must return array");
+    assert!(
+        !arr.is_empty(),
+        "at least one entity_merged event must be present"
+    );
+
+    let event = &arr[0];
+    let payload = event.get("payload").expect("event must have payload field");
+    assert!(
+        payload.get("into_id").is_some(),
+        "entity_merged payload must contain 'into_id'; got {payload}"
+    );
+    assert!(
+        payload.get("from_id").is_some(),
+        "entity_merged payload must contain 'from_id'; got {payload}"
+    );
+    assert!(
+        payload.get("policy").is_some(),
+        "entity_merged payload must contain 'policy'; got {payload}"
+    );
+    assert!(
+        payload.get("edges_rewired").is_some(),
+        "entity_merged payload must contain 'edges_rewired'; got {payload}"
+    );
+}
+
+/// Delete an entity with hard=true → list entity_deleted events → assert payload has
+/// id, namespace, hard=true per ADR-014.
+#[tokio::test]
+async fn curation_delete_entity_hard_event_payload_has_adr014_fields() {
+    let pack = pack_with_events();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "HardDeletePayloadEntity"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    pack.dispatch(
+        "delete",
+        json!({"id": entity_id, "kind": "entity", "hard": true}),
+    )
+    .await
+    .expect("hard delete must succeed");
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "entity_deleted", "limit": 10}),
+        )
+        .await
+        .expect("list entity_deleted events must succeed");
+    let arr = events.as_array().expect("list must return array");
+    assert!(
+        !arr.is_empty(),
+        "at least one entity_deleted event must be present"
+    );
+
+    let event = &arr[0];
+    let payload = event.get("payload").expect("event must have payload field");
+    assert!(
+        payload.get("id").is_some(),
+        "entity_deleted payload must contain 'id'; got {payload}"
+    );
+    assert!(
+        payload.get("namespace").is_some(),
+        "entity_deleted payload must contain 'namespace'; got {payload}"
+    );
+    assert_eq!(
+        payload.get("hard").and_then(Value::as_bool),
+        Some(true),
+        "entity_deleted payload must have hard=true for hard delete; got {payload}"
+    );
+}
+
+// ---- ADR-022 provenance filter regression tests (codex round-2) ----
+
+/// list(kind="event", observed=[uuid]) must pass the filter down to storage and
+/// return only events whose observed list contains that UUID.
+#[tokio::test]
+async fn list_event_observed_filter_is_wired_through_to_storage() {
+    let pack = pack_with_events();
+
+    // Create an entity so we have at least one known-good UUID to search with.
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "ObservedFilterEntity"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    // Query with observed=[entity_id] — may return 0 results if the store has no
+    // observed projections for this entity, but must NOT return an error.
+    // What we validate: the filter parses and reaches storage without a parse error.
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "observed": [entity_id], "limit": 10}),
+        )
+        .await
+        .expect("list(kind=event, observed=[...]) must not return an error");
+    assert!(
+        result.as_array().is_some(),
+        "list with observed filter must return an array; got {result}"
+    );
+}
+
+/// list(kind="event", selected=[uuid]) must pass the filter down to storage without
+/// returning a parse error.
+#[tokio::test]
+async fn list_event_selected_filter_is_wired_through_to_storage() {
+    let pack = pack_with_events();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "SelectedFilterEntity"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "selected": [entity_id], "limit": 10}),
+        )
+        .await
+        .expect("list(kind=event, selected=[...]) must not return an error");
+    assert!(
+        result.as_array().is_some(),
+        "list with selected filter must return an array; got {result}"
+    );
+}
+
+/// list(kind="event", observed=["not-a-uuid"]) must return InvalidInput.
+#[tokio::test]
+async fn list_event_observed_filter_invalid_uuid_returns_invalid_input() {
+    let pack = pack_with_events();
+    let err = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "observed": ["not-a-valid-uuid"], "limit": 10}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "invalid UUID in observed must return InvalidInput; got {err:?}"
     );
 }

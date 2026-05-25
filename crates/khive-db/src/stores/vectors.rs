@@ -183,11 +183,22 @@ impl VectorStore for SqliteVecStore {
         subject_id: Uuid,
         kind: SubstrateKind,
         namespace: &str,
-        embedding: Vec<f32>,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
     ) -> Result<(), StorageError> {
+        if vectors.len() != 1 {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_insert".into(),
+                message: "sqlite-vec supports exactly one vector per record".into(),
+            });
+        }
+        let embedding = vectors.into_iter().next().expect("len checked");
+
         let table = self.table_name.clone();
         let dims = self.dimensions;
         let namespace = namespace.to_string();
+        let field = field.to_string();
         let kind_str = kind.to_string();
 
         if embedding.len() == dims {
@@ -215,13 +226,13 @@ impl VectorStore for SqliteVecStore {
             )?;
 
             let ins_sql = format!(
-                "INSERT INTO {} (subject_id, namespace, kind, embedding) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO {} (subject_id, namespace, kind, field, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
                 table
             );
             let blob = f32_slice_as_bytes(&embedding);
             conn.execute(
                 &ins_sql,
-                rusqlite::params![subject_id.to_string(), &namespace, &kind_str, blob],
+                rusqlite::params![subject_id.to_string(), &namespace, &kind_str, &field, blob],
             )?;
             Ok(())
         })
@@ -242,7 +253,7 @@ impl VectorStore for SqliteVecStore {
                 table
             );
             let ins_sql = format!(
-                "INSERT INTO {} (subject_id, namespace, kind, embedding) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO {} (subject_id, namespace, kind, field, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
                 table
             );
 
@@ -251,22 +262,27 @@ impl VectorStore for SqliteVecStore {
             let mut failed = 0u64;
 
             for record in &records {
-                if record.embedding.len() != dims {
+                if record.vectors.len() != 1 {
                     failed += 1;
                     continue;
                 }
-                if non_finite_index(&record.embedding).is_some() {
+                let embedding = &record.vectors[0];
+                if embedding.len() != dims {
                     failed += 1;
                     continue;
                 }
-                let blob = f32_slice_as_bytes(&record.embedding);
+                if non_finite_index(embedding).is_some() {
+                    failed += 1;
+                    continue;
+                }
+                let blob = f32_slice_as_bytes(embedding);
                 let id_str = record.subject_id.to_string();
                 let kind_str = record.kind.to_string();
                 // Use the record's own namespace — the caller is responsible for namespace.
                 let _ = conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace]);
                 match conn.execute(
                     &ins_sql,
-                    rusqlite::params![&id_str, &record.namespace, &kind_str, blob],
+                    rusqlite::params![&id_str, &record.namespace, &kind_str, &record.field, blob],
                 ) {
                     Ok(_) => affected += 1,
                     Err(_) => failed += 1,
@@ -318,6 +334,22 @@ impl VectorStore for SqliteVecStore {
         &self,
         request: VectorSearchRequest,
     ) -> Result<Vec<VectorSearchHit>, StorageError> {
+        if request.filter.as_ref().is_some_and(|f| !f.is_empty()) {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_search".into(),
+                message: "use search_with_filter for filtered queries".into(),
+            });
+        }
+        if request.query_vectors.len() != 1 {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_search".into(),
+                message: "sqlite-vec supports exactly one query vector per search".into(),
+            });
+        }
+        let query_embedding = request.query_vectors[0].clone();
+
         let table = self.table_name.clone();
         let dims = self.dimensions;
         // Use request.namespace if present; fall back to self.namespace.
@@ -327,20 +359,20 @@ impl VectorStore for SqliteVecStore {
             .unwrap_or_else(|| self.namespace.clone());
         let kind_filter = request.kind.map(|k| k.to_string());
 
-        if request.query_embedding.len() == dims {
-            if let Some(idx) = non_finite_index(&request.query_embedding) {
+        if query_embedding.len() == dims {
+            if let Some(idx) = non_finite_index(&query_embedding) {
                 return Err(non_finite_vector_error(
                     "vec_search",
                     idx,
-                    request.query_embedding[idx],
+                    query_embedding[idx],
                 ));
             }
         }
 
         self.with_reader("vec_search", move |conn| {
-            if request.query_embedding.len() != dims {
+            if query_embedding.len() != dims {
                 return Err(rusqlite::Error::InvalidParameterCount(
-                    request.query_embedding.len(),
+                    query_embedding.len(),
                     dims,
                 ));
             }
@@ -365,7 +397,7 @@ impl VectorStore for SqliteVecStore {
                 kind_clause = subquery_kind_clause
             );
 
-            let query_blob = f32_slice_as_bytes(&request.query_embedding);
+            let query_blob = f32_slice_as_bytes(&query_embedding);
             let mut stmt = conn.prepare(&sql)?;
 
             // Collect rows into a Vec to avoid holding MappedRows (which is
@@ -445,6 +477,12 @@ impl VectorStore for SqliteVecStore {
             supports_batch_search: false,
             supports_quantization: false,
             supports_update: false,
+            supports_orphan_sweep: false,
+            // sqlite-vec uses subject_id as PRIMARY KEY — only one vector per
+            // subject per namespace is stored. Callers must use a single canonical
+            // field (e.g. "content") and are not permitted to store both
+            // "entity.title" and "entity.body" as separate vectors in one table.
+            supports_multi_field: false,
             // sqlite-vec 0.1.9 rejects dimensions > SQLITE_VEC_VEC0_MAX_DIMENSIONS (8192).
             // Reporting 8192 lets callers know that 4097–8192 dimensional models are
             // supported. The previous value of 4096 was the K_MAX (neighbors per query)
@@ -596,6 +634,10 @@ mod capabilities_tests {
         assert!(
             !caps.supports_update,
             "sqlite-vec does not support in-place update"
+        );
+        assert!(
+            !caps.supports_orphan_sweep,
+            "sqlite-vec does not support orphan sweep"
         );
         // sqlite-vec 0.1.9: SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192.
         assert_eq!(caps.max_dimensions, Some(8192));

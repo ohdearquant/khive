@@ -1,6 +1,6 @@
-//! KG-pack vocabulary — closed enums for the 6 entity kinds and 5 note kinds.
+//! KG-pack vocabulary — pack-owned entity and note vocabulary.
 //!
-//! These enums validate and canonicalize kind strings at the pack boundary.
+//! Entity kind validation now uses `khive_types::EntityKind` directly.
 //! The runtime accepts any String — validation is the pack's responsibility.
 
 use core::fmt;
@@ -73,7 +73,7 @@ impl std::str::FromStr for EntityKind {
     }
 }
 
-/// Closed taxonomy for note classification (ADR-019).
+/// KG pack note kinds. Public note kind validation is canonical-only per ADR-013.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NoteKind {
     #[default]
@@ -129,11 +129,11 @@ impl std::str::FromStr for NoteKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "observation" | "obs" => Ok(Self::Observation),
-            "insight" | "finding" => Ok(Self::Insight),
-            "question" | "q" => Ok(Self::Question),
-            "decision" | "choice" => Ok(Self::Decision),
-            "reference" | "ref" | "citation" => Ok(Self::Reference),
+            "observation" => Ok(Self::Observation),
+            "insight" => Ok(Self::Insight),
+            "question" => Ok(Self::Question),
+            "decision" => Ok(Self::Decision),
+            "reference" => Ok(Self::Reference),
             other => Err(UnknownVariant::new("note_kind", other, Self::NAMES)),
         }
     }
@@ -145,28 +145,6 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn entity_kind_roundtrip() {
-        for kind in EntityKind::ALL {
-            let parsed = EntityKind::from_str(kind.name()).unwrap();
-            assert_eq!(parsed, kind);
-        }
-    }
-
-    #[test]
-    fn entity_kind_aliases() {
-        assert_eq!(EntityKind::from_str("paper").unwrap(), EntityKind::Document);
-        assert_eq!(EntityKind::from_str("repo").unwrap(), EntityKind::Project);
-        assert_eq!(EntityKind::from_str("lab").unwrap(), EntityKind::Org);
-    }
-
-    #[test]
-    fn entity_kind_unknown_errors_with_valid_list() {
-        let err = EntityKind::from_str("gadget").unwrap_err();
-        assert_eq!(err.domain, "entity_kind");
-        assert!(err.valid.contains(&"concept"));
-    }
-
-    #[test]
     fn note_kind_roundtrip() {
         for kind in NoteKind::ALL {
             let parsed = NoteKind::from_str(kind.name()).unwrap();
@@ -175,8 +153,13 @@ mod tests {
     }
 
     #[test]
-    fn note_kind_aliases() {
-        assert_eq!(NoteKind::from_str("obs").unwrap(), NoteKind::Observation);
-        assert_eq!(NoteKind::from_str("ref").unwrap(), NoteKind::Reference);
+    fn note_kind_aliases_rejected() {
+        // Aliases were removed per ADR-013 — only canonical names are accepted.
+        assert!(NoteKind::from_str("obs").is_err());
+        assert!(NoteKind::from_str("finding").is_err());
+        assert!(NoteKind::from_str("q").is_err());
+        assert!(NoteKind::from_str("choice").is_err());
+        assert!(NoteKind::from_str("ref").is_err());
+        assert!(NoteKind::from_str("citation").is_err());
     }
 }

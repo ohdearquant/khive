@@ -5,19 +5,26 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    EdgeListFilter, EntityPatch, KhiveRuntime, MergeStrategy, RuntimeError, VerbRegistry,
+    ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
+    KhiveRuntime, LinkSpec, MergeSummary, NamespaceToken, NotePatch, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{
     Direction, NeighborQuery, PageRequest, TraversalOptions, TraversalRequest,
 };
+use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
 
-use crate::vocab::{EntityKind, NoteKind};
+use khive_types::{
+    EntityKind, EventKind, ProposalChangeset, ProposalCreatedPayload, ProposalDecision,
+    ProposalReviewedPayload, ProposalWithdrawnPayload,
+};
+
+use crate::vocab::NoteKind;
 use crate::KgPack;
 
 // ---- Kind canonicalization (ADR-030) ----
@@ -83,6 +90,8 @@ pub(crate) enum KindSpec {
     Edge,
     /// `kind="event"` — only valid for `list`; `get` resolves events by UUID.
     Event,
+    /// `kind="proposal"` — queries the `proposals_open` projection table (ADR-046).
+    Proposal,
 }
 
 impl KindSpec {
@@ -92,6 +101,7 @@ impl KindSpec {
             KindSpec::Note { .. } => "note",
             KindSpec::Edge => "edge",
             KindSpec::Event => "event",
+            KindSpec::Proposal => "proposal",
         }
     }
 }
@@ -115,6 +125,7 @@ pub(crate) fn resolve_kind_spec(
         "note" => return Ok(KindSpec::Note { specific: None }),
         "edge" => return Ok(KindSpec::Edge),
         "event" => return Ok(KindSpec::Event),
+        "proposal" => return Ok(KindSpec::Proposal),
         _ => {}
     }
 
@@ -147,6 +158,7 @@ pub(crate) fn resolve_kind_spec(
         "note".into(),
         "edge".into(),
         "event".into(),
+        "proposal".into(),
     ];
     all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
     all.extend(registry.all_note_kinds().iter().map(|s| (*s).to_string()));
@@ -184,7 +196,7 @@ fn reconcile_specific(
 #[derive(Deserialize)]
 struct CreateParams {
     kind: String,
-    namespace: Option<String>,
+    entity_type: Option<String>,
     name: Option<String>,
     description: Option<String>,
     content: Option<String>,
@@ -196,17 +208,16 @@ struct CreateParams {
 
 #[derive(Deserialize)]
 struct GetParams {
-    namespace: Option<String>,
     id: String,
 }
 
 #[derive(Deserialize)]
 struct ListParams {
     kind: String,
-    namespace: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
     entity_kind: Option<String>,
+    entity_type: Option<String>,
     source_id: Option<String>,
     target_id: Option<String>,
     relations: Option<Vec<String>>,
@@ -221,14 +232,24 @@ struct ListParams {
     substrate: Option<String>,
     since: Option<i64>,
     until: Option<i64>,
+    event_kind: Option<String>,
+    event_kinds: Option<Vec<String>>,
+    session_id: Option<String>,
+    observed: Option<Vec<String>>,
+    selected: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 struct UpdateParams {
-    namespace: Option<String>,
     id: String,
-    name: Option<String>,
+    kind: String,
+    name: Option<Value>,
     description: Option<Value>,
+    content: Option<String>,
+    #[serde(default, deserialize_with = "tri_f64")]
+    salience: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "tri_f64")]
+    decay_factor: Option<Option<f64>>,
     properties: Option<Value>,
     tags: Option<Vec<String>>,
     relation: Option<String>,
@@ -237,45 +258,71 @@ struct UpdateParams {
 
 #[derive(Deserialize)]
 struct DeleteParams {
-    namespace: Option<String>,
     id: String,
+    kind: String,
     hard: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct MergeParams {
-    namespace: Option<String>,
     into_id: String,
     from_id: String,
+    kind: Option<String>,
     strategy: Option<String>,
+    content_strategy: Option<String>,
+    dry_run: Option<bool>,
+    #[allow(dead_code)]
+    verbose: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct SearchParams {
     kind: String,
-    namespace: Option<String>,
     query: String,
     limit: Option<u32>,
     entity_kind: Option<String>,
+    entity_type: Option<String>,
     note_kind: Option<String>,
+    include_superseded: Option<bool>,
     properties: Option<Value>,
 }
 
+/// One entry in a bulk-link request (F205 / ADR-038).
 #[derive(Deserialize)]
-struct LinkParams {
-    namespace: Option<String>,
+struct BulkLinkEntry {
     source_id: String,
     target_id: String,
     relation: String,
     weight: Option<f64>,
+    metadata: Option<Value>,
+    dependency_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LinkParams {
+    // Singleton fields (required unless `links` is provided).
+    source_id: Option<String>,
+    target_id: Option<String>,
+    relation: Option<String>,
+    weight: Option<f64>,
+    /// Edge metadata (open JSON; governed keys validated by runtime).
+    metadata: Option<Value>,
+    /// Shortcut for `metadata.dependency_kind` on `depends_on` edges.
+    dependency_kind: Option<String>,
     /// When `true`, output uses full UUIDs and ISO 8601 timestamps instead of
     /// the default 8-char short IDs and YYYY/MM/DD date format.
     verbose: Option<bool>,
+    // Bulk link fields (ADR-038).
+    /// Multiple edges to create in one call.
+    links: Option<Vec<BulkLinkEntry>>,
+    /// When `true` (default), the entire batch is atomic — any failure rolls
+    /// back all writes. When `false`, errors are collected and returned as
+    /// warnings while successful entries are committed individually.
+    atomic: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct NeighborsParams {
-    namespace: Option<String>,
     /// Accepts either `id` (canonical, ADR-148 normalized) or `node_id` (legacy).
     #[serde(alias = "node_id")]
     id: String,
@@ -287,7 +334,6 @@ struct NeighborsParams {
 
 #[derive(Deserialize)]
 struct TraverseParams {
-    namespace: Option<String>,
     /// Accepts either `roots` (legacy) or `ids` (normalized). Each entry may
     /// be a full UUID or an 8-char prefix; resolved via `resolve_uuid_async`.
     #[serde(alias = "ids")]
@@ -302,8 +348,41 @@ struct TraverseParams {
 
 #[derive(Deserialize)]
 struct QueryParams {
-    namespace: Option<String>,
     query: String,
+}
+
+// ---- Proposal param structs (ADR-046) ----
+
+#[derive(Deserialize)]
+struct ProposeParams {
+    title: String,
+    description: String,
+    changeset: Value,
+    #[serde(default)]
+    reviewers: Vec<String>,
+    expiry: Option<i64>,
+    parent_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReviewParams {
+    proposal_id: String,
+    decision: String,
+    comment: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WithdrawParams {
+    proposal_id: String,
+    rationale: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListProposalsParams {
+    status: Option<String>,
+    proposer: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
 }
 
 // ---- Helpers ----
@@ -320,7 +399,7 @@ struct QueryParams {
 async fn resolve_name_async(
     name: &str,
     runtime: &KhiveRuntime,
-    namespace: Option<&str>,
+    token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
     // Use EntityFilter.name_prefix with the full name to do an exact match.
     // The DB implements `name LIKE '?%'` so we get back all names that start
@@ -330,9 +409,9 @@ async fn resolve_name_async(
         ..Default::default()
     };
     let page = runtime
-        .entities(namespace)?
+        .entities(token)?
         .query_entities(
-            runtime.ns(namespace),
+            token.namespace().as_str(),
             filter,
             khive_storage::types::PageRequest {
                 offset: 0,
@@ -376,13 +455,13 @@ async fn resolve_name_async(
 async fn resolve_uuid_async(
     s: &str,
     runtime: &KhiveRuntime,
-    namespace: Option<&str>,
+    token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
     if let Ok(uuid) = Uuid::from_str(s) {
         return Ok(uuid);
     }
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        match runtime.resolve_prefix(namespace, s).await {
+        match runtime.resolve_prefix(token, s).await {
             Ok(Some(uuid)) => return Ok(uuid),
             Ok(None) => {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -393,7 +472,7 @@ async fn resolve_uuid_async(
         }
     }
     // Fall back to name-based resolution (issue #65).
-    resolve_name_async(s, runtime, namespace).await
+    resolve_name_async(s, runtime, token).await
 }
 
 // ---- Output formatting helpers (issue #66) ----
@@ -415,13 +494,36 @@ fn parse_direction(s: Option<&str>) -> Direction {
     }
 }
 
+/// Merge `dependency_kind` shortcut into `metadata` for `depends_on` edges.
+///
+/// When `dependency_kind` is provided separately and `metadata` does not already
+/// carry the key, the value is injected into the metadata object. This allows
+/// callers to write `dependency_kind: "build"` instead of the full
+/// `metadata: { "dependency_kind": "build" }` form.
+fn merge_entry_metadata(
+    metadata: Option<Value>,
+    dependency_kind: Option<String>,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(dk) = dependency_kind else {
+        return Ok(metadata);
+    };
+    let mut obj = metadata.unwrap_or_else(|| serde_json::json!({}));
+    let map = obj
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError::InvalidInput("metadata must be a JSON object".into()))?;
+    map.entry("dependency_kind".to_string())
+        .or_insert_with(|| serde_json::json!(dk));
+    Ok(Some(obj))
+}
+
 fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
     s.parse::<EdgeRelation>().map_err(|_| {
-        RuntimeError::InvalidInput(format!(
-            "unknown relation {s:?}; valid: contains | part_of | instance_of | extends | \
-             variant_of | introduced_by | supersedes | depends_on | enables | implements | \
-             competes_with | composed_with | annotates"
-        ))
+        let valid = EdgeRelation::ALL
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        RuntimeError::InvalidInput(format!("unknown relation {s:?}; valid: {valid}"))
     })
 }
 
@@ -453,6 +555,11 @@ fn parse_event_substrate(raw: &str) -> Result<SubstrateKind, RuntimeError> {
         })
 }
 
+fn parse_event_kind(raw: &str) -> Result<EventKind, RuntimeError> {
+    raw.parse::<EventKind>()
+        .map_err(|e| RuntimeError::InvalidInput(format!("unknown event_kind {raw:?}: {e}")))
+}
+
 fn event_filter_from_params(
     p: &ListParams,
 ) -> Result<(EventFilter, Option<EventOutcome>), RuntimeError> {
@@ -471,6 +578,47 @@ fn event_filter_from_params(
 
     let outcome = p.outcome.as_deref().map(parse_event_outcome).transpose()?;
 
+    let mut kinds: Vec<EventKind> = Vec::new();
+    if let Some(k) = &p.event_kind {
+        kinds.push(parse_event_kind(k)?);
+    }
+    if let Some(ks) = &p.event_kinds {
+        for k in ks {
+            kinds.push(parse_event_kind(k)?);
+        }
+    }
+
+    let session_id = p
+        .session_id
+        .as_deref()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid session_id {s:?}: {e}")))
+        })
+        .transpose()?;
+
+    let observed = p
+        .observed
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid observed id {s:?}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let selected = p
+        .selected
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid selected id {s:?}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok((
         EventFilter {
             verbs,
@@ -478,6 +626,10 @@ fn event_filter_from_params(
             actors: p.actor.clone().into_iter().collect(),
             after: p.since,
             before: p.until,
+            kinds,
+            session_id,
+            observed,
+            selected,
             ..EventFilter::default()
         },
         outcome,
@@ -512,11 +664,112 @@ fn props_match(entity_props: Option<&Value>, filter: &Value) -> bool {
         .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
 }
 
+// ---- Handler helpers ----
+
+fn parse_entity_policy(s: &str) -> Result<EntityDedupMergePolicy, RuntimeError> {
+    match s {
+        "prefer_into" => Ok(EntityDedupMergePolicy::PreferInto),
+        "prefer_from" => Ok(EntityDedupMergePolicy::PreferFrom),
+        "union" => Ok(EntityDedupMergePolicy::Union),
+        other => Err(RuntimeError::InvalidInput(format!(
+            "unknown strategy {other:?}; use prefer_into | prefer_from | union"
+        ))),
+    }
+}
+
+fn parse_content_strategy(s: &str) -> Result<ContentMergeStrategy, RuntimeError> {
+    match s {
+        "append" => Ok(ContentMergeStrategy::Append),
+        "prefer_into" => Ok(ContentMergeStrategy::PreferInto),
+        "prefer_from" => Ok(ContentMergeStrategy::PreferFrom),
+        other => Err(RuntimeError::InvalidInput(format!(
+            "unknown content_strategy {other:?}; use append | prefer_into | prefer_from"
+        ))),
+    }
+}
+
+async fn ensure_entity_kind(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    expected_kind: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let entity = runtime.get_entity(token, id).await?;
+    if let Some(k) = expected_kind {
+        if entity.kind != k {
+            return Err(RuntimeError::NotFound(format!("{k} {id}")));
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_note_kind(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    expected_kind: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let note = runtime
+        .notes(token)?
+        .get_note(id)
+        .await
+        .map_err(RuntimeError::Storage)?
+        .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+    if let Some(k) = expected_kind {
+        if note.kind != k {
+            return Err(RuntimeError::NotFound(format!("{k} {id}")));
+        }
+    }
+    Ok(())
+}
+
+fn description_patch(v: Option<Value>) -> Result<Option<Option<String>>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "description must be null or a string, got: {other}"
+        ))),
+    }
+}
+
+fn string_value(v: Option<Value>, field: &str) -> Result<Option<String>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{field} must be a string, got: {other}"
+        ))),
+    }
+}
+
+fn optional_string_patch(
+    v: Option<Value>,
+    field: &str,
+) -> Result<Option<Option<String>>, RuntimeError> {
+    match v {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s))),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{field} must be null or a string, got: {other}"
+        ))),
+    }
+}
+
+/// Serde deserializer for tri-state nullable f64:
+/// field absent → outer None, field = null → Some(None), field = number → Some(Some(v)).
+fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
+    Ok(Some(Option::deserialize(d)?))
+}
+
 // ---- Handler implementations ----
 
 impl KgPack {
     pub(crate) async fn handle_create(
         &self,
+        token: &NamespaceToken,
         mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
@@ -548,7 +801,7 @@ impl KgPack {
                 )?
                 .ok_or_else(|| {
                     RuntimeError::InvalidInput(
-                        "kind=entity requires a specific kind: either kind=<concept|document|dataset|project|person|org> directly, or kind=entity + entity_kind=<…>".into(),
+                        "kind=entity requires a specific kind: either kind=<concept|document|dataset|project|person|org|artifact|service> directly, or kind=entity + entity_kind=<…>".into(),
                     )
                 })?;
                 let hook = registry.find_kind_hook(&canonical);
@@ -578,6 +831,11 @@ impl KgPack {
                     "kind=edge is not creatable via `create` — use `link` for edges".into(),
                 ));
             }
+            KindSpec::Proposal => {
+                return Err(RuntimeError::InvalidInput(
+                    "kind=proposal is not creatable via `create` — use `propose` to create a proposal".into(),
+                ));
+            }
         };
 
         // Rewrite `kind` to the substrate label so downstream `CreateParams`
@@ -594,9 +852,16 @@ impl KgPack {
                     KindSpec::Note { .. } => {
                         obj.insert("note_kind".into(), json!(canonical));
                     }
-                    KindSpec::Edge | KindSpec::Event => {}
+                    KindSpec::Edge | KindSpec::Event | KindSpec::Proposal => {}
                 }
             }
+        }
+
+        // Propagate the authorized namespace into params so KindHooks can build
+        // their own NamespaceToken (hooks don't receive a token directly).
+        if let Some(obj) = params.as_object_mut() {
+            obj.entry("namespace")
+                .or_insert_with(|| json!(token.namespace().as_str()));
         }
 
         if let Some(ref h) = hook {
@@ -615,8 +880,9 @@ impl KgPack {
                 let entity = self
                     .runtime
                     .create_entity(
-                        p.namespace.as_deref(),
+                        token,
                         &canonical,
+                        p.entity_type.as_deref(),
                         &name,
                         p.description.as_deref(),
                         p.properties,
@@ -633,20 +899,18 @@ impl KgPack {
                 let content = p.content.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=note requires 'content'".into())
                 })?;
-                let salience = p.salience.unwrap_or(0.5);
                 let mut annotates = Vec::new();
                 for s in p.annotates.unwrap_or_default() {
-                    annotates
-                        .push(resolve_uuid_async(&s, &self.runtime, p.namespace.as_deref()).await?);
+                    annotates.push(resolve_uuid_async(&s, &self.runtime, token).await?);
                 }
                 let note = self
                     .runtime
                     .create_note(
-                        p.namespace.as_deref(),
+                        token,
                         &canonical,
                         p.name.as_deref(),
                         &content,
-                        salience,
+                        p.salience,
                         p.properties,
                         annotates,
                     )
@@ -675,39 +939,42 @@ impl KgPack {
         Ok(response)
     }
 
-    pub(crate) async fn handle_get(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_get(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params)?;
-        let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
-        let ns = p.namespace.as_deref();
+        let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
 
-        if let Some(entity) = self.runtime.get_entity(ns, id).await? {
+        if let Ok(entity) = self.runtime.get_entity(token, id).await {
             return to_json(&serde_json::json!({"kind": "entity", "data": entity}));
         }
 
         if let Some(note) = self
             .runtime
-            .notes(ns)?
+            .notes(token)?
             .get_note(id)
             .await
             .map_err(RuntimeError::Storage)?
         {
-            if note.namespace == self.runtime.ns(ns) {
+            if note.namespace == token.namespace().as_str() {
                 return to_json(&serde_json::json!({"kind": "note", "data": note}));
             }
         }
 
-        if let Some(edge) = self.runtime.get_edge(ns, id).await? {
+        if let Some(edge) = self.runtime.get_edge(token, id).await? {
             return to_json(&serde_json::json!({"kind": "edge", "data": edge}));
         }
 
         if let Some(event) = self
             .runtime
-            .events(ns)?
+            .events(token)?
             .get_event(id)
             .await
             .map_err(RuntimeError::Storage)?
         {
-            if event.namespace == self.runtime.ns(ns) {
+            if event.namespace == token.namespace().as_str() {
                 return to_json(&serde_json::json!({"kind": "event", "data": event}));
             }
         }
@@ -717,9 +984,23 @@ impl KgPack {
 
     pub(crate) async fn handle_list(
         &self,
+        token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        // Fast-path: kind=proposal dispatches to the proposals_open projection
+        // before deserializing into ListParams, so proposal-specific fields
+        // (status, proposer) are handled without polluting ListParams.
+        let raw_kind = params
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if raw_kind == "proposal" {
+            return self.handle_list_proposals(token, params).await;
+        }
+
         let p: ListParams = deser(params)?;
         let spec = resolve_kind_spec(&p.kind, registry)?;
         match spec {
@@ -735,8 +1016,9 @@ impl KgPack {
                 let entities = self
                     .runtime
                     .list_entities(
-                        p.namespace.as_deref(),
+                        token,
                         kind_filter.as_deref(),
+                        p.entity_type.as_deref(),
                         limit,
                         offset,
                     )
@@ -745,15 +1027,11 @@ impl KgPack {
             }
             KindSpec::Edge => {
                 let source_id = match p.source_id.as_deref() {
-                    Some(s) => {
-                        Some(resolve_uuid_async(s, &self.runtime, p.namespace.as_deref()).await?)
-                    }
+                    Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
                     None => None,
                 };
                 let target_id = match p.target_id.as_deref() {
-                    Some(s) => {
-                        Some(resolve_uuid_async(s, &self.runtime, p.namespace.as_deref()).await?)
-                    }
+                    Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
                     None => None,
                 };
                 let relations: Vec<EdgeRelation> = p
@@ -770,10 +1048,7 @@ impl KgPack {
                     max_weight: p.max_weight,
                 };
                 let limit = p.limit.unwrap_or(100);
-                let edges = self
-                    .runtime
-                    .list_edges(p.namespace.as_deref(), filter, limit)
-                    .await?;
+                let edges = self.runtime.list_edges(token, filter, limit).await?;
                 to_json(&edges)
             }
             KindSpec::Note { specific } => {
@@ -787,15 +1062,11 @@ impl KgPack {
                 let offset = p.offset.unwrap_or(0);
                 let notes = self
                     .runtime
-                    .list_notes(
-                        p.namespace.as_deref(),
-                        kind_filter.as_deref(),
-                        limit,
-                        offset,
-                    )
+                    .list_notes(token, kind_filter.as_deref(), limit, offset)
                     .await?;
                 to_json(&notes)
             }
+            KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
                 let limit = p.limit.unwrap_or(100).clamp(1, 1000);
                 let offset = p.offset.unwrap_or(0);
@@ -816,10 +1087,12 @@ impl KgPack {
                         let page = self
                             .runtime
                             .list_events(
-                                p.namespace.as_deref(),
+                                token,
                                 filter.clone(),
-                                batch_size,
-                                raw_offset,
+                                PageRequest {
+                                    limit: batch_size,
+                                    offset: raw_offset.into(),
+                                },
                             )
                             .await?;
                         let batch_len = page.items.len() as u32;
@@ -851,7 +1124,14 @@ impl KgPack {
                 } else {
                     let page = self
                         .runtime
-                        .list_events(p.namespace.as_deref(), filter, limit, offset)
+                        .list_events(
+                            token,
+                            filter,
+                            PageRequest {
+                                limit,
+                                offset: offset.into(),
+                            },
+                        )
                         .await?;
                     to_json(&page.items)
                 }
@@ -859,115 +1139,179 @@ impl KgPack {
         }
     }
 
-    pub(crate) async fn handle_update(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_update(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
         let p: UpdateParams = deser(params)?;
-        let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
-        let ns = p.namespace.as_deref();
+        let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
+        let spec = resolve_kind_spec(&p.kind, registry)?;
 
-        if self
-            .runtime
-            .events(ns)?
-            .get_event(id)
-            .await
-            .map_err(RuntimeError::Storage)?
-            .is_some()
-        {
-            return Err(immutable_event_error());
-        }
-
-        if self.runtime.get_entity(ns, id).await?.is_some() {
-            let description = match p.description {
-                None => None,
-                Some(Value::Null) => Some(None),
-                Some(Value::String(s)) => Some(Some(s)),
-                Some(other) => {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "description must be null or a string, got: {other}"
-                    )))
+        match spec {
+            KindSpec::Entity { specific } => {
+                let entity = self.runtime.get_entity(token, id).await?;
+                if specific.as_ref().is_some_and(|k| entity.kind != *k) {
+                    return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
                 }
-            };
-            let patch = EntityPatch {
-                name: p.name,
-                description,
-                properties: p.properties,
-                tags: p.tags,
-            };
-            let entity = self.runtime.update_entity(ns, id, patch).await?;
-            return to_json(&entity);
+                let patch = EntityPatch {
+                    name: string_value(p.name, "name")?,
+                    description: description_patch(p.description)?,
+                    properties: p.properties,
+                    tags: p.tags,
+                };
+                to_json(&self.runtime.update_entity(token, id, patch).await?)
+            }
+            KindSpec::Edge => {
+                let relation = p.relation.as_deref().map(parse_relation).transpose()?;
+                let patch = EdgePatch {
+                    relation,
+                    weight: p.weight,
+                    properties: p.properties,
+                };
+                to_json(&self.runtime.update_edge(token, id, patch).await?)
+            }
+            KindSpec::Note { specific } => {
+                let note = self
+                    .runtime
+                    .notes(token)?
+                    .get_note(id)
+                    .await
+                    .map_err(RuntimeError::Storage)?;
+                if note
+                    .as_ref()
+                    .is_none_or(|n| specific.as_ref().is_some_and(|k| n.kind != *k))
+                {
+                    return Err(RuntimeError::NotFound(format!("note {}", p.id)));
+                }
+                let patch = NotePatch::new(
+                    optional_string_patch(p.name, "name")?,
+                    p.content,
+                    p.salience,
+                    p.decay_factor,
+                    p.properties,
+                );
+                to_json(&self.runtime.update_note(token, id, patch).await?)
+            }
+            KindSpec::Event => Err(immutable_event_error()),
+            KindSpec::Proposal => Err(RuntimeError::InvalidInput(
+                "proposal events are immutable — use `withdraw` to rescind a proposal".into(),
+            )),
         }
-
-        if self.runtime.get_edge(ns, id).await?.is_some() {
-            let relation = p.relation.as_deref().map(parse_relation).transpose()?;
-            let edge = self.runtime.update_edge(ns, id, relation, p.weight).await?;
-            return to_json(&edge);
-        }
-
-        Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
     }
 
-    pub(crate) async fn handle_delete(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_delete(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
         let p: DeleteParams = deser(params)?;
-        let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
-        let ns = p.namespace.as_deref();
+        let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
+        let spec = resolve_kind_spec(&p.kind, registry)?;
 
-        if self
-            .runtime
-            .events(ns)?
-            .get_event(id)
-            .await
-            .map_err(RuntimeError::Storage)?
-            .is_some()
-        {
-            return Err(immutable_event_error());
+        match spec {
+            KindSpec::Entity { specific } => {
+                if let Some(ref expected) = specific {
+                    let entity = self.runtime.get_entity(token, id).await?;
+                    if entity.kind != *expected {
+                        return Err(RuntimeError::NotFound(format!("{} {}", expected, p.id)));
+                    }
+                }
+                let deleted = self
+                    .runtime
+                    .delete_entity(token, id, p.hard.unwrap_or(false))
+                    .await?;
+                if !deleted {
+                    return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
+                }
+                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
+            }
+            KindSpec::Note { specific } => {
+                if let Some(ref expected) = specific {
+                    let note = self
+                        .runtime
+                        .notes(token)?
+                        .get_note(id)
+                        .await
+                        .map_err(RuntimeError::Storage)?;
+                    if note.as_ref().is_none_or(|n| n.kind != *expected) {
+                        return Err(RuntimeError::NotFound(format!("{} {}", expected, p.id)));
+                    }
+                }
+                let deleted = self
+                    .runtime
+                    .delete_note(token, id, p.hard.unwrap_or(false))
+                    .await?;
+                if !deleted {
+                    return Err(RuntimeError::NotFound(format!("note {}", p.id)));
+                }
+                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": p.kind }))
+            }
+            KindSpec::Edge => {
+                let deleted = self
+                    .runtime
+                    .delete_edge(token, id, p.hard.unwrap_or(false))
+                    .await?;
+                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": "edge" }))
+            }
+            KindSpec::Event => Err(immutable_event_error()),
+            KindSpec::Proposal => Err(RuntimeError::InvalidInput(
+                "proposal events are immutable — use `withdraw` to rescind a proposal".into(),
+            )),
         }
-
-        if self.runtime.get_entity(ns, id).await?.is_some() {
-            let deleted = self
-                .runtime
-                .delete_entity(ns, id, p.hard.unwrap_or(false))
-                .await?;
-            return to_json(&serde_json::json!({ "deleted": deleted, "id": p.id }));
-        }
-
-        if self.runtime.get_edge(ns, id).await?.is_some() {
-            let deleted = self.runtime.delete_edge(ns, id).await?;
-            return to_json(&serde_json::json!({ "deleted": deleted, "id": p.id }));
-        }
-
-        let deleted_note = self
-            .runtime
-            .delete_note(ns, id, p.hard.unwrap_or(false))
-            .await?;
-        if deleted_note {
-            return to_json(&serde_json::json!({ "deleted": true, "id": p.id }));
-        }
-
-        Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
     }
 
-    pub(crate) async fn handle_merge(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_merge(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
         let p: MergeParams = deser(params)?;
-        let into_id = resolve_uuid_async(&p.into_id, &self.runtime, p.namespace.as_deref()).await?;
-        let from_id = resolve_uuid_async(&p.from_id, &self.runtime, p.namespace.as_deref()).await?;
-        let strategy = match p.strategy.as_deref().unwrap_or("prefer_into") {
-            "prefer_into" => MergeStrategy::PreferInto,
-            "prefer_from" => MergeStrategy::PreferFrom,
-            "union" => MergeStrategy::Union,
-            other => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "unknown strategy {other:?}; use prefer_into | prefer_from | union"
-                )))
+        let into_id = resolve_uuid_async(&p.into_id, &self.runtime, token).await?;
+        let from_id = resolve_uuid_async(&p.from_id, &self.runtime, token).await?;
+        let raw_kind = p.kind.as_deref().unwrap_or("entity");
+        let spec = resolve_kind_spec(raw_kind, registry)?;
+        let policy = parse_entity_policy(p.strategy.as_deref().unwrap_or("prefer_into"))?;
+        let content_strategy =
+            parse_content_strategy(p.content_strategy.as_deref().unwrap_or("append"))?;
+        let dry_run = p.dry_run.unwrap_or(false);
+
+        let summary: MergeSummary = match spec {
+            KindSpec::Entity { specific } => {
+                ensure_entity_kind(&self.runtime, token, into_id, specific.as_deref()).await?;
+                ensure_entity_kind(&self.runtime, token, from_id, specific.as_deref()).await?;
+                self.runtime
+                    .merge_entity(token, into_id, from_id, policy, dry_run)
+                    .await?
+            }
+            KindSpec::Note { specific } => {
+                ensure_note_kind(&self.runtime, token, into_id, specific.as_deref()).await?;
+                ensure_note_kind(&self.runtime, token, from_id, specific.as_deref()).await?;
+                self.runtime
+                    .merge_note(token, into_id, from_id, policy, content_strategy, dry_run)
+                    .await?
+            }
+            KindSpec::Edge => {
+                return Err(RuntimeError::InvalidInput(
+                    "merge(kind=\"edge\") is unsupported".into(),
+                ))
+            }
+            KindSpec::Event => return Err(immutable_event_error()),
+            KindSpec::Proposal => {
+                return Err(RuntimeError::InvalidInput(
+                    "proposal events are immutable and cannot be merged".into(),
+                ))
             }
         };
-        let summary = self
-            .runtime
-            .merge_entity(p.namespace.as_deref(), into_id, from_id, strategy)
-            .await?;
         to_json(&summary)
     }
 
     pub(crate) async fn handle_search(
         &self,
+        token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
@@ -999,11 +1343,12 @@ impl KgPack {
                 let hits = self
                     .runtime
                     .hybrid_search(
-                        p.namespace.as_deref(),
+                        token,
                         &p.query,
                         None,
                         search_limit,
                         kind_filter.as_deref(),
+                        p.entity_type.as_deref(),
                     )
                     .await?;
 
@@ -1018,9 +1363,9 @@ impl KgPack {
                 } else {
                     let entities_page = self
                         .runtime
-                        .entities(p.namespace.as_deref())?
+                        .entities(token)?
                         .query_entities(
-                            self.runtime.ns(p.namespace.as_deref()),
+                            token.namespace().as_str(),
                             EntityFilter {
                                 ids: candidate_ids,
                                 ..EntityFilter::default()
@@ -1080,11 +1425,12 @@ impl KgPack {
                 let hits = self
                     .runtime
                     .search_notes(
-                        p.namespace.as_deref(),
+                        token,
                         &p.query,
                         None,
                         limit,
                         kind_filter.as_deref(),
+                        p.include_superseded.unwrap_or(false),
                     )
                     .await?;
 
@@ -1093,7 +1439,7 @@ impl KgPack {
                 let note_kinds: HashMap<Uuid, String> = if hits.is_empty() {
                     HashMap::new()
                 } else {
-                    let note_store = self.runtime.notes(p.namespace.as_deref())?;
+                    let note_store = self.runtime.notes(token)?;
                     let mut map = HashMap::new();
                     for h in &hits {
                         if let Ok(Some(n)) = note_store.get_note(h.note_id).await {
@@ -1123,29 +1469,170 @@ impl KgPack {
             KindSpec::Event => Err(RuntimeError::InvalidInput(
                 "search does not support kind=event — use `list(kind=\"event\", ...)` for event browsing".into(),
             )),
+            KindSpec::Proposal => Err(RuntimeError::InvalidInput(
+                "search does not support kind=proposal — use `list(kind=\"proposal\", ...)` for proposal browsing".into(),
+            )),
         }
     }
 
-    pub(crate) async fn handle_link(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_link(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: LinkParams = deser(params)?;
         let verbose = p.verbose.unwrap_or(false);
-        let source =
-            resolve_uuid_async(&p.source_id, &self.runtime, p.namespace.as_deref()).await?;
-        let target =
-            resolve_uuid_async(&p.target_id, &self.runtime, p.namespace.as_deref()).await?;
+
+        if let Some(entries) = p.links {
+            let attempted = entries.len();
+            if attempted > 1000 {
+                return Err(RuntimeError::InvalidInput(
+                    "bulk link limited to 1000 entries per request".into(),
+                ));
+            }
+            let atomic = p.atomic.unwrap_or(true);
+            if atomic {
+                let mut specs = Vec::with_capacity(attempted);
+                let mut seen = std::collections::HashSet::new();
+                let mut skipped = 0usize;
+                for entry in entries {
+                    let source = resolve_uuid_async(&entry.source_id, &self.runtime, token).await?;
+                    let target = resolve_uuid_async(&entry.target_id, &self.runtime, token).await?;
+                    let relation = parse_relation(&entry.relation)?;
+                    let (source, target) = if relation.is_symmetric() && target < source {
+                        (target, source)
+                    } else {
+                        (source, target)
+                    };
+                    let key = format!("{source}::{target}::{}", relation.as_str());
+                    if !seen.insert(key) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let weight = entry.weight.unwrap_or(1.0).clamp(0.0, 1.0);
+                    let metadata = merge_entry_metadata(entry.metadata, entry.dependency_kind)?;
+                    specs.push(LinkSpec {
+                        namespace: Some(token.namespace().as_str().to_owned()),
+                        source_id: source,
+                        target_id: target,
+                        relation,
+                        weight,
+                        metadata,
+                    });
+                }
+                let edges = self.runtime.link_many(token, specs).await?;
+                let mut resp = serde_json::json!({
+                    "attempted": attempted,
+                    "created": edges.len(),
+                    "skipped": skipped,
+                    "failed": 0,
+                });
+                if verbose {
+                    resp["edges"] = serde_json::to_value(&edges)
+                        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+                }
+                return to_json(&resp);
+            } else {
+                let mut results: Vec<Value> = Vec::new();
+                let mut error_list: Vec<Value> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                let mut skipped = 0usize;
+                for (idx, entry) in entries.into_iter().enumerate() {
+                    let source =
+                        match resolve_uuid_async(&entry.source_id, &self.runtime, token).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                                continue;
+                            }
+                        };
+                    let target =
+                        match resolve_uuid_async(&entry.target_id, &self.runtime, token).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                                continue;
+                            }
+                        };
+                    let relation = match parse_relation(&entry.relation) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                            continue;
+                        }
+                    };
+                    let (source, target) = if relation.is_symmetric() && target < source {
+                        (target, source)
+                    } else {
+                        (source, target)
+                    };
+                    let key = format!("{source}::{target}::{}", relation.as_str());
+                    if !seen.insert(key) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let weight = entry.weight.unwrap_or(1.0).clamp(0.0, 1.0);
+                    let metadata = match merge_entry_metadata(entry.metadata, entry.dependency_kind)
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                            continue;
+                        }
+                    };
+                    match self
+                        .runtime
+                        .link(token, source, target, relation, weight, metadata)
+                        .await
+                    {
+                        Ok(edge) => results.push(to_json(&edge)?),
+                        Err(e) => error_list.push(json!({"index": idx, "error": format!("{e}")})),
+                    }
+                }
+                let mut resp = serde_json::json!({
+                    "attempted": attempted,
+                    "created": results.len(),
+                    "skipped": skipped,
+                    "failed": error_list.len(),
+                    "errors": error_list,
+                });
+                if verbose {
+                    resp["edges"] = serde_json::Value::Array(results);
+                }
+                return to_json(&resp);
+            }
+        }
+
+        // Singleton path.
+        let source_id_str = p.source_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("link requires source_id (or links for bulk)".into())
+        })?;
+        let target_id_str = p.target_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("link requires target_id (or links for bulk)".into())
+        })?;
+        let relation_str = p.relation.ok_or_else(|| {
+            RuntimeError::InvalidInput("link requires relation (or links for bulk)".into())
+        })?;
+        let source = resolve_uuid_async(&source_id_str, &self.runtime, token).await?;
+        let target = resolve_uuid_async(&target_id_str, &self.runtime, token).await?;
         let weight = p.weight.unwrap_or(1.0).clamp(0.0, 1.0);
-        let relation = parse_relation(&p.relation)?;
+        let relation = parse_relation(&relation_str)?;
+        let metadata = merge_entry_metadata(p.metadata, p.dependency_kind)?;
         let edge = self
             .runtime
-            .link(p.namespace.as_deref(), source, target, relation, weight)
+            .link(token, source, target, relation, weight, metadata)
             .await?;
         let raw = to_json(&edge)?;
         Ok(format_edge_output(raw, verbose))
     }
 
-    pub(crate) async fn handle_neighbors(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_neighbors(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: NeighborsParams = deser(params)?;
-        let node_id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
+        let node_id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
         let direction = parse_direction(p.direction.as_deref());
         let relations: Option<Vec<EdgeRelation>> = p
             .relations
@@ -1158,7 +1645,7 @@ impl KgPack {
         let hits = self
             .runtime
             .neighbors_with_query(
-                p.namespace.as_deref(),
+                token,
                 node_id,
                 NeighborQuery {
                     direction,
@@ -1171,11 +1658,15 @@ impl KgPack {
         to_json(&hits)
     }
 
-    pub(crate) async fn handle_traverse(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_traverse(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: TraverseParams = deser(params)?;
         let mut roots = Vec::with_capacity(p.roots.len());
         for s in &p.roots {
-            roots.push(resolve_uuid_async(s, &self.runtime, p.namespace.as_deref()).await?);
+            roots.push(resolve_uuid_async(s, &self.runtime, token).await?);
         }
         let direction = parse_direction(p.direction.as_deref());
         let relations: Option<Vec<EdgeRelation>> = p
@@ -1198,19 +1689,698 @@ impl KgPack {
             options,
             include_roots: p.include_roots.unwrap_or(true),
         };
-        let paths = self
-            .runtime
-            .traverse(p.namespace.as_deref(), request)
-            .await?;
+        let paths = self.runtime.traverse(token, request).await?;
         to_json(&paths)
     }
 
-    pub(crate) async fn handle_query(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_query(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: QueryParams = deser(params)?;
-        let result = self
-            .runtime
-            .query_with_metadata(p.namespace.as_deref(), &p.query)
-            .await?;
+        let result = self.runtime.query_with_metadata(token, &p.query).await?;
         to_json(&result)
+    }
+
+    // ---- Proposal verbs (ADR-046) ----
+
+    /// `propose` — commissive verb. Emits a `ProposalCreated` event and inserts
+    /// a row into the `proposals_open` projection table.
+    pub(crate) async fn handle_propose(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: ProposeParams = deser(params)?;
+        if p.title.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "propose requires a non-empty 'title'".into(),
+            ));
+        }
+        if p.description.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "propose requires a non-empty 'description'".into(),
+            ));
+        }
+
+        let _changeset: ProposalChangeset = serde_json::from_value(p.changeset.clone())
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid changeset: {e}")))?;
+
+        let proposal_id = Uuid::new_v4();
+        let actor = token.actor().id.clone();
+        let ns = token.namespace().as_str().to_owned();
+        let now = chrono::Utc::now().timestamp_micros();
+
+        let payload = ProposalCreatedPayload {
+            proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
+            proposer: actor.clone(),
+            title: p.title.clone(),
+            description: p.description.clone(),
+            changeset: _changeset,
+            reviewers: p.reviewers.clone(),
+            expiry: p
+                .expiry
+                .map(|v| khive_types::Timestamp::from_micros(v as u64)),
+            parent_id: p
+                .parent_id
+                .as_deref()
+                .map(|s| {
+                    Uuid::from_str(s)
+                        .map(|u| khive_types::Id128::from_u128(u.as_u128()))
+                        .map_err(|e| {
+                            RuntimeError::InvalidInput(format!("invalid parent_id {s:?}: {e}"))
+                        })
+                })
+                .transpose()?,
+        };
+
+        let event_payload_json = serde_json::to_value(&payload)
+            .map_err(|e| RuntimeError::Internal(format!("serialize proposal payload: {e}")))?;
+
+        let mut event = khive_storage::event::Event::new(
+            &ns,
+            "propose",
+            EventKind::ProposalCreated,
+            SubstrateKind::Entity,
+            &actor,
+        );
+        event.payload = event_payload_json;
+        event.aggregate_kind = Some("proposal".to_string());
+        event.aggregate_id = Some(proposal_id);
+
+        let event_store = self.runtime.events(token)?;
+        event_store
+            .append_event(event)
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let expiry_val = p.expiry;
+        let sql = self.runtime.sql();
+        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+        writer
+            .execute(SqlStatement {
+                sql: "\
+                    INSERT INTO proposals_open \
+                        (proposal_id, namespace, proposer, title, status, \
+                         created_at, updated_at, expiry) \
+                    VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, ?6)"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns),
+                    SqlValue::Text(actor.clone()),
+                    SqlValue::Text(p.title.clone()),
+                    SqlValue::Integer(now),
+                    match expiry_val {
+                        Some(v) => SqlValue::Integer(v),
+                        None => SqlValue::Null,
+                    },
+                ],
+                label: Some("proposals_open.insert".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        to_json(&serde_json::json!({
+            "proposal_id": proposal_id.to_string(),
+            "status": "open",
+            "proposer": actor,
+            "title": p.title,
+        }))
+    }
+
+    /// `review` — declaration verb. Emits a `ProposalReviewed` event and updates
+    /// the `proposals_open` projection table (counts, status, last_decision).
+    pub(crate) async fn handle_review(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: ReviewParams = deser(params)?;
+        let proposal_id = Uuid::from_str(&p.proposal_id).map_err(|e| {
+            RuntimeError::InvalidInput(format!("invalid proposal_id {:?}: {e}", p.proposal_id))
+        })?;
+        // Actor is always the authenticated token identity — client cannot override.
+        let actor = token.actor().id.clone();
+        let ns = token.namespace().as_str().to_owned();
+        let now = chrono::Utc::now().timestamp_micros();
+
+        let decision: ProposalDecision = match p.decision.trim().to_ascii_lowercase().as_str() {
+            "approve" => ProposalDecision::Approve,
+            "reject" => ProposalDecision::Reject,
+            "comment" => ProposalDecision::Comment,
+            "request_changes" | "requestchanges" => ProposalDecision::RequestChanges,
+            other => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "unknown decision {other:?}; valid: approve | reject | comment | request_changes"
+                )));
+            }
+        };
+
+        let sql = self.runtime.sql();
+        let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT proposer, status FROM proposals_open \
+                      WHERE proposal_id = ?1 AND namespace = ?2"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns.clone()),
+                ],
+                label: Some("proposals_open.get".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?
+            .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.proposal_id)))?;
+
+        let proposer = row
+            .get("proposer")
+            .and_then(|v| {
+                if let SqlValue::Text(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let current_status = row
+            .get("status")
+            .and_then(|v| {
+                if let SqlValue::Text(s) = v {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("open");
+
+        if matches!(current_status, "applied" | "withdrawn" | "rejected") {
+            return Err(RuntimeError::InvalidInput(format!(
+                "proposal {} is already {current_status} and cannot be reviewed",
+                p.proposal_id
+            )));
+        }
+
+        // Self-approval guard: the proposer cannot approve their own proposal.
+        // Exception: OSS local mode (`actor == "local"`) operates as a single-user
+        // system where every operation runs under the same anonymous identity, so
+        // the guard would unconditionally block all approvals. Skip it in that case.
+        // Multi-actor deployments (where distinct actor IDs are assigned) enforce
+        // the guard normally.
+        if decision == ProposalDecision::Approve && actor == proposer && actor != "local" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "self-approval is forbidden: proposer {actor:?} cannot approve their own proposal"
+            )));
+        }
+
+        let payload = ProposalReviewedPayload {
+            proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
+            reviewer: actor.clone(),
+            decision,
+            comment: p.comment.clone(),
+        };
+        let event_payload_json = serde_json::to_value(&payload)
+            .map_err(|e| RuntimeError::Internal(format!("serialize review payload: {e}")))?;
+
+        let mut event = khive_storage::event::Event::new(
+            &ns,
+            "review",
+            EventKind::ProposalReviewed,
+            SubstrateKind::Entity,
+            &actor,
+        );
+        event.payload = event_payload_json;
+        event.aggregate_kind = Some("proposal".to_string());
+        event.aggregate_id = Some(proposal_id);
+
+        let event_store = self.runtime.events(token)?;
+        event_store
+            .append_event(event)
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let (new_status, approve_delta, reject_delta) = match decision {
+            ProposalDecision::Approve => ("approved", 1i64, 0i64),
+            ProposalDecision::Reject => ("rejected", 0, 1),
+            ProposalDecision::Comment => (current_status, 0, 0),
+            ProposalDecision::RequestChanges => ("changes_requested", 0, 0),
+        };
+
+        let last_decision_json = serde_json::to_string(&decision)
+            .map_err(|e| RuntimeError::Internal(format!("serialize decision: {e}")))?;
+
+        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE proposals_open \
+                      SET status = ?1, updated_at = ?2, last_decision = ?3, \
+                          review_count = review_count + 1, \
+                          approve_count = approve_count + ?4, \
+                          reject_count = reject_count + ?5 \
+                      WHERE proposal_id = ?6 AND namespace = ?7"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(new_status.to_string()),
+                    SqlValue::Integer(now),
+                    SqlValue::Text(last_decision_json),
+                    SqlValue::Integer(approve_delta),
+                    SqlValue::Integer(reject_delta),
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns),
+                ],
+                label: Some("proposals_open.update_review".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        to_json(&serde_json::json!({
+            "proposal_id": proposal_id.to_string(),
+            "reviewer": actor,
+            "decision": p.decision,
+            "status": new_status,
+        }))
+    }
+
+    /// `withdraw` — commissive verb. Emits a `ProposalWithdrawn` event and updates
+    /// the `proposals_open` projection table to status='withdrawn'.
+    pub(crate) async fn handle_withdraw(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: WithdrawParams = deser(params)?;
+        let proposal_id = Uuid::from_str(&p.proposal_id).map_err(|e| {
+            RuntimeError::InvalidInput(format!("invalid proposal_id {:?}: {e}", p.proposal_id))
+        })?;
+        // Actor is always the authenticated token identity — client cannot override.
+        let actor = token.actor().id.clone();
+        let ns = token.namespace().as_str().to_owned();
+        let now = chrono::Utc::now().timestamp_micros();
+
+        let sql = self.runtime.sql();
+        let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT proposer, status FROM proposals_open \
+                      WHERE proposal_id = ?1 AND namespace = ?2"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns.clone()),
+                ],
+                label: Some("proposals_open.get_for_withdraw".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?
+            .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.proposal_id)))?;
+
+        let proposer = row
+            .get("proposer")
+            .and_then(|v| {
+                if let SqlValue::Text(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        if actor != proposer {
+            return Err(RuntimeError::InvalidInput(format!(
+                "only the original proposer {proposer:?} may withdraw this proposal"
+            )));
+        }
+
+        let current_status = row
+            .get("status")
+            .and_then(|v| {
+                if let SqlValue::Text(s) = v {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("open");
+
+        if matches!(current_status, "applied" | "withdrawn") {
+            return Err(RuntimeError::InvalidInput(format!(
+                "proposal {} is already {current_status}",
+                p.proposal_id
+            )));
+        }
+
+        let payload = ProposalWithdrawnPayload {
+            proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
+            by: actor.clone(),
+            reason: p.rationale.clone(),
+        };
+        let event_payload_json = serde_json::to_value(&payload)
+            .map_err(|e| RuntimeError::Internal(format!("serialize withdraw payload: {e}")))?;
+
+        let mut event = khive_storage::event::Event::new(
+            &ns,
+            "withdraw",
+            EventKind::ProposalWithdrawn,
+            SubstrateKind::Entity,
+            &actor,
+        );
+        event.payload = event_payload_json;
+        event.aggregate_kind = Some("proposal".to_string());
+        event.aggregate_id = Some(proposal_id);
+
+        let event_store = self.runtime.events(token)?;
+        event_store
+            .append_event(event)
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE proposals_open \
+                      SET status = 'withdrawn', updated_at = ?1 \
+                      WHERE proposal_id = ?2 AND namespace = ?3"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Integer(now),
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns),
+                ],
+                label: Some("proposals_open.withdraw".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        to_json(&serde_json::json!({
+            "proposal_id": proposal_id.to_string(),
+            "status": "withdrawn",
+            "by": actor,
+        }))
+    }
+
+    /// `list(kind=proposal)` — assertive verb. Queries the `proposals_open`
+    /// projection table with optional status / proposer filters.
+    pub(crate) async fn handle_list_proposals(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: ListProposalsParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))?;
+        let ns = token.namespace().as_str().to_owned();
+        let limit = p.limit.unwrap_or(50).min(500) as i64;
+        let offset = p.offset.unwrap_or(0) as i64;
+
+        let mut sql_str = "\
+            SELECT proposal_id, proposer, title, status, created_at, updated_at, \
+                   expiry, last_decision, review_count, approve_count, reject_count \
+            FROM proposals_open \
+            WHERE namespace = ?1"
+            .to_string();
+        let mut sql_params: Vec<SqlValue> = vec![SqlValue::Text(ns)];
+        let mut param_idx = 2usize;
+
+        if let Some(status) = &p.status {
+            sql_str.push_str(&format!(" AND status = ?{param_idx}"));
+            sql_params.push(SqlValue::Text(status.clone()));
+            param_idx += 1;
+        }
+        if let Some(proposer) = &p.proposer {
+            sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
+            sql_params.push(SqlValue::Text(proposer.clone()));
+            param_idx += 1;
+        }
+
+        sql_str.push_str(&format!(
+            " ORDER BY updated_at DESC LIMIT ?{param_idx} OFFSET ?{}",
+            param_idx + 1
+        ));
+        sql_params.push(SqlValue::Integer(limit));
+        sql_params.push(SqlValue::Integer(offset));
+
+        let sql = self.runtime.sql();
+        let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: sql_str,
+                params: sql_params,
+                label: Some("proposals_open.list".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let items: Vec<Value> = rows
+            .into_iter()
+            .map(|row| {
+                let get_text = |name: &str| -> String {
+                    row.get(name)
+                        .and_then(|v| {
+                            if let SqlValue::Text(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default()
+                };
+                let get_int = |name: &str| -> Option<i64> {
+                    row.get(name).and_then(|v| {
+                        if let SqlValue::Integer(i) = v {
+                            Some(*i)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                serde_json::json!({
+                    "proposal_id": get_text("proposal_id"),
+                    "proposer": get_text("proposer"),
+                    "title": get_text("title"),
+                    "status": get_text("status"),
+                    "created_at": get_int("created_at"),
+                    "updated_at": get_int("updated_at"),
+                    "expiry": get_int("expiry"),
+                    "last_decision": get_text("last_decision"),
+                    "review_count": get_int("review_count").unwrap_or(0),
+                    "approve_count": get_int("approve_count").unwrap_or(0),
+                    "reject_count": get_int("reject_count").unwrap_or(0),
+                })
+            })
+            .collect();
+
+        to_json(&items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_relation, UpdateParams};
+    use serde_json::json;
+
+    // F009 (CRIT): error text must be derived from EdgeRelation::ALL, not a hardcoded list.
+    // ADR-002 mandates 15 relations; error text must include derived_from and precedes.
+    #[test]
+    fn parse_relation_error_lists_all_relations() {
+        let err = parse_relation("not_a_relation").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("derived_from"),
+            "F009: parse_relation error must list derived_from (ADR-002); got: {msg}"
+        );
+        assert!(
+            msg.contains("precedes"),
+            "F009: parse_relation error must list precedes (ADR-002); got: {msg}"
+        );
+    }
+
+    // ADR-014: wire-level tri-state nullable f64 for `update`.
+    //   absent  → outer None (preserve existing value)
+    //   null    → Some(None) (clear the value)
+    //   number  → Some(Some(v)) (set to v)
+    //
+    // Regression for round-3 finding: the previous `Option<Value>` representation
+    // collapsed absent and null into the same `None`, so JSON null could not
+    // distinguish "clear" from "preserve" through the MCP wire surface.
+    #[test]
+    fn update_params_tri_state_salience() {
+        let absent: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note"})).unwrap();
+        assert_eq!(
+            absent.salience, None,
+            "absent salience key must deserialize to outer None (preserve)"
+        );
+
+        let cleared: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note", "salience": null})).unwrap();
+        assert_eq!(
+            cleared.salience,
+            Some(None),
+            "salience=null must deserialize to Some(None) (clear)"
+        );
+
+        let set: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note", "salience": 0.5})).unwrap();
+        assert_eq!(
+            set.salience,
+            Some(Some(0.5)),
+            "salience=0.5 must deserialize to Some(Some(0.5)) (set)"
+        );
+    }
+
+    #[test]
+    fn update_params_tri_state_decay_factor() {
+        let absent: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note"})).unwrap();
+        assert_eq!(
+            absent.decay_factor, None,
+            "absent decay_factor key must deserialize to outer None (preserve)"
+        );
+
+        let cleared: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note", "decay_factor": null}))
+                .unwrap();
+        assert_eq!(
+            cleared.decay_factor,
+            Some(None),
+            "decay_factor=null must deserialize to Some(None) (clear)"
+        );
+
+        let set: UpdateParams =
+            serde_json::from_value(json!({"id": "x", "kind": "note", "decay_factor": 0.6}))
+                .unwrap();
+        assert_eq!(
+            set.decay_factor,
+            Some(Some(0.6)),
+            "decay_factor=0.6 must deserialize to Some(Some(0.6)) (set)"
+        );
+    }
+
+    // ADR-046: resolve_kind_spec must recognise "proposal" as KindSpec::Proposal
+    #[test]
+    fn resolve_kind_spec_proposal() {
+        use super::{resolve_kind_spec, KindSpec};
+        use crate::KgPack;
+        use khive_runtime::VerbRegistryBuilder;
+
+        let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let spec = resolve_kind_spec("proposal", &registry).expect("should resolve proposal");
+        assert_eq!(
+            spec,
+            KindSpec::Proposal,
+            "kind=proposal must resolve to KindSpec::Proposal"
+        );
+
+        let spec_upper =
+            resolve_kind_spec("Proposal", &registry).expect("should be case-insensitive");
+        assert_eq!(
+            spec_upper,
+            KindSpec::Proposal,
+            "kind=Proposal (mixed case) must resolve"
+        );
+    }
+
+    // ADR-046: propose param deserialization
+    #[test]
+    fn propose_params_deserialization() {
+        use super::ProposeParams;
+        let p: ProposeParams = serde_json::from_value(json!({
+            "title": "Add RoPE",
+            "description": "Add RoPE entity to the graph",
+            "changeset": {
+                "kind": "add_entity",
+                "entity": "{\"kind\":\"concept\",\"name\":\"RoPE\"}"
+            },
+            "reviewers": ["alice"],
+        }))
+        .expect("ProposeParams must deserialize");
+        assert_eq!(p.title, "Add RoPE");
+        assert_eq!(p.reviewers, vec!["alice"]);
+        assert!(p.parent_id.is_none());
+        assert!(p.expiry.is_none());
+    }
+
+    // ADR-046: review param deserialization with all valid decisions
+    #[test]
+    fn review_params_decisions() {
+        use super::ReviewParams;
+        for decision in ["approve", "reject", "comment", "request_changes"] {
+            let p: ReviewParams = serde_json::from_value(json!({
+                "proposal_id": "00000000-0000-0000-0000-000000000001",
+                "decision": decision,
+            }))
+            .expect("ReviewParams must deserialize");
+            assert_eq!(p.decision, decision);
+        }
+    }
+
+    // CRIT-2 regression: ReviewParams must not accept an `actor` field.
+    // The actor is always derived from the NamespaceToken at dispatch time.
+    // If a client passes actor=<other_id>, the field is ignored (unknown fields
+    // are allowed by serde default, so the struct simply lacks the field).
+    #[test]
+    fn review_params_no_actor_field() {
+        use super::ReviewParams;
+        // Baseline: ReviewParams works without actor.
+        let p: ReviewParams = serde_json::from_value(json!({
+            "proposal_id": "00000000-0000-0000-0000-000000000001",
+            "decision": "approve",
+        }))
+        .expect("ReviewParams must deserialize without actor");
+        assert_eq!(p.proposal_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(p.decision, "approve");
+    }
+
+    // CRIT-2 regression: WithdrawParams must not accept an `actor` field.
+    #[test]
+    fn withdraw_params_no_actor_field() {
+        use super::WithdrawParams;
+        let p: WithdrawParams = serde_json::from_value(json!({
+            "proposal_id": "00000000-0000-0000-0000-000000000002",
+        }))
+        .expect("WithdrawParams must deserialize without actor");
+        assert_eq!(p.proposal_id, "00000000-0000-0000-0000-000000000002");
+        assert!(p.rationale.is_none());
+    }
+
+    // CRIT-2 regression: ProposeParams must not accept an `actor` field.
+    #[test]
+    fn propose_params_no_actor_field() {
+        use super::ProposeParams;
+        let p: ProposeParams = serde_json::from_value(json!({
+            "title": "Fix RoPE",
+            "description": "Fix RoPE entity",
+            "changeset": {"kind": "add_entity", "entity": "{}"},
+        }))
+        .expect("ProposeParams must deserialize without actor");
+        assert_eq!(p.title, "Fix RoPE");
+    }
+
+    // ADR-046: KG pack must expose exactly 14 handlers including propose/review/withdraw
+    #[test]
+    fn kg_pack_exposes_14_handlers() {
+        use crate::KgPack;
+        use khive_types::Pack;
+        let handlers = KgPack::HANDLERS;
+        assert_eq!(
+            handlers.len(),
+            14,
+            "ADR-046: kg pack must expose 14 handlers (was 11, +3 for propose/review/withdraw)"
+        );
+        let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
+        assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
+        assert!(names.contains(&"review"), "review must be in KG_HANDLERS");
+        assert!(
+            names.contains(&"withdraw"),
+            "withdraw must be in KG_HANDLERS"
+        );
     }
 }

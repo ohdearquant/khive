@@ -10,8 +10,9 @@ use khive_types::SubstrateKind;
 use crate::capability::StorageCapability;
 use crate::error::StorageError;
 use crate::types::{
-    BatchWriteSummary, IndexRebuildScope, StorageResult, VectorIndexKind, VectorMetadataFilter,
-    VectorRecord, VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
+    BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, OrphanSweepResult, StorageResult,
+    VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
+    VectorStoreCapabilities, VectorStoreInfo,
 };
 
 #[async_trait]
@@ -23,7 +24,8 @@ pub trait VectorStore: Send + Sync + 'static {
         subject_id: Uuid,
         kind: SubstrateKind,
         namespace: &str,
-        embedding: Vec<f32>,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
     ) -> StorageResult<()>;
     async fn insert_batch(&self, records: Vec<VectorRecord>) -> StorageResult<BatchWriteSummary>;
     async fn delete(&self, subject_id: Uuid) -> StorageResult<bool>;
@@ -47,6 +49,8 @@ pub trait VectorStore: Send + Sync + 'static {
             supports_batch_search: false,
             supports_quantization: false,
             supports_update: false,
+            supports_orphan_sweep: false,
+            supports_multi_field: false,
             // sqlite-vec 0.1.9 enforces SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192.
             // The baseline uses the same value so generic callers that have not
             // overridden capabilities() report the correct ceiling.
@@ -64,33 +68,40 @@ pub trait VectorStore: Send + Sync + 'static {
     ///
     /// Callers must check `capabilities().supports_filter` before calling; the
     /// runtime layer is responsible for post-filtering when native pushdown is absent.
+    ///
+    /// A backend that claims `supports_filter = true` but does not override this
+    /// method will trigger a `debug_assert` at runtime (ADR-044 §4).
     async fn search_with_filter(
         &self,
-        request: VectorSearchRequest,
-        filter: VectorMetadataFilter,
+        request: &VectorSearchRequest,
+        filter: &VectorMetadataFilter,
     ) -> StorageResult<Vec<VectorSearchHit>> {
         if filter.is_empty() {
-            return self.search(request).await;
+            return self.search(request.clone()).await;
         }
+        debug_assert!(
+            !self.capabilities().supports_filter,
+            "backend claims supports_filter=true but did not override search_with_filter"
+        );
         Err(StorageError::Unsupported {
             capability: StorageCapability::Vectors,
             operation: "search_with_filter".into(),
-            message: "filter pushdown not supported by this backend".into(),
+            message: "filter pushdown not supported; set supports_filter=true only when overriding this method".into(),
         })
     }
 
     /// Search with N query vectors in one round-trip (HyDE fan-out, multi-query).
     ///
-    /// Default: sequential calls to [`search`]. Backends that support native batch
-    /// search (amortising index-walk overhead) should override this and set
-    /// `supports_batch_search = true` in their [`VectorStoreCapabilities`].
+    /// Default: sequential calls to [`search`], isolating per-query errors so one
+    /// bad request does not abort the batch. Backends that support native batch
+    /// search should override this and set `supports_batch_search = true`.
     async fn search_batch(
         &self,
-        requests: Vec<VectorSearchRequest>,
-    ) -> StorageResult<Vec<Vec<VectorSearchHit>>> {
+        requests: &[VectorSearchRequest],
+    ) -> StorageResult<Vec<StorageResult<Vec<VectorSearchHit>>>> {
         let mut out = Vec::with_capacity(requests.len());
         for req in requests {
-            out.push(self.search(req).await?);
+            out.push(self.search(req.clone()).await);
         }
         Ok(out)
     }
@@ -105,10 +116,25 @@ pub trait VectorStore: Send + Sync + 'static {
         subject_id: Uuid,
         kind: SubstrateKind,
         namespace: &str,
-        embedding: Vec<f32>,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
     ) -> StorageResult<()> {
         self.delete(subject_id).await?;
-        self.insert(subject_id, kind, namespace, embedding).await
+        self.insert(subject_id, kind, namespace, field, vectors)
+            .await
+    }
+
+    /// Remove vectors with no live subject (orphan sweep, ADR-044).
+    ///
+    /// Default returns [`StorageError::Unsupported`]. Backends that implement
+    /// deletion must set `supports_orphan_sweep = true` and override this method.
+    async fn orphan_sweep(&self, config: &OrphanSweepConfig) -> StorageResult<OrphanSweepResult> {
+        let _ = config;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Vectors,
+            operation: "orphan_sweep".into(),
+            message: "this backend does not support orphan sweep".into(),
+        })
     }
 }
 
@@ -123,8 +149,8 @@ mod tests {
     use super::*;
     use crate::error::StorageError;
     use crate::types::{
-        BatchWriteSummary, IndexRebuildScope, VectorIndexKind, VectorMetadataFilter,
-        VectorSearchHit, VectorSearchRequest, VectorStoreInfo,
+        BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, VectorIndexKind,
+        VectorMetadataFilter, VectorSearchHit, VectorSearchRequest, VectorStoreInfo,
     };
 
     // -- Minimal test fake --
@@ -170,7 +196,8 @@ mod tests {
             _subject_id: Uuid,
             _kind: SubstrateKind,
             _namespace: &str,
-            _embedding: Vec<f32>,
+            _field: &str,
+            _vectors: Vec<Vec<f32>>,
         ) -> StorageResult<()> {
             self.insert_called.store(true, Ordering::SeqCst);
             if self.fail_insert.load(Ordering::SeqCst) {
@@ -248,6 +275,7 @@ mod tests {
         assert!(!caps.supports_batch_search);
         assert!(!caps.supports_quantization);
         assert!(!caps.supports_update);
+        assert!(!caps.supports_orphan_sweep);
         // Baseline reports the sqlite-vec hard limit (SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192).
         assert_eq!(caps.max_dimensions, Some(8192));
         assert_eq!(caps.index_kinds, vec![VectorIndexKind::SqliteVec]);
@@ -269,17 +297,21 @@ mod tests {
         );
     }
 
+    // -- Test cases --
+
     #[tokio::test]
     async fn search_with_filter_empty_filter_delegates_to_search() {
         let store = TestVectorStore::new();
         let req = VectorSearchRequest {
-            query_embedding: vec![0.1, 0.2, 0.3, 0.4],
+            query_vectors: vec![vec![0.1, 0.2, 0.3, 0.4]],
             top_k: 5,
             namespace: None,
             kind: None,
+            filter: None,
+            backend_hints: None,
         };
         let filter = VectorMetadataFilter::default(); // all fields empty
-        let result = store.search_with_filter(req, filter).await;
+        let result = store.search_with_filter(&req, &filter).await;
         assert!(result.is_ok());
         let hits = result.unwrap();
         // search() on TestVectorStore returns exactly one hit
@@ -290,17 +322,19 @@ mod tests {
     async fn search_with_filter_non_empty_filter_returns_unsupported() {
         let store = TestVectorStore::new();
         let req = VectorSearchRequest {
-            query_embedding: vec![0.1, 0.2, 0.3, 0.4],
+            query_vectors: vec![vec![0.1, 0.2, 0.3, 0.4]],
             top_k: 5,
             namespace: None,
             kind: None,
+            filter: None,
+            backend_hints: None,
         };
         let filter = VectorMetadataFilter {
             namespaces: vec!["ns:agent".into()],
             kinds: vec![],
-            properties: vec![],
+            property_filters: vec![],
         };
-        let result = store.search_with_filter(req, filter).await;
+        let result = store.search_with_filter(&req, &filter).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -314,31 +348,40 @@ mod tests {
         let store = TestVectorStore::new();
         let requests = vec![
             VectorSearchRequest {
-                query_embedding: vec![0.1, 0.2, 0.3, 0.4],
+                query_vectors: vec![vec![0.1, 0.2, 0.3, 0.4]],
                 top_k: 3,
                 namespace: None,
                 kind: None,
+                filter: None,
+                backend_hints: None,
             },
             VectorSearchRequest {
-                query_embedding: vec![0.5, 0.6, 0.7, 0.8],
+                query_vectors: vec![vec![0.5, 0.6, 0.7, 0.8]],
                 top_k: 3,
                 namespace: None,
                 kind: None,
+                filter: None,
+                backend_hints: None,
             },
         ];
-        let result = store.search_batch(requests).await;
+        let result = store.search_batch(&requests).await;
         assert!(result.is_ok());
         let batched = result.unwrap();
         assert_eq!(batched.len(), 2, "should return one result set per request");
-        for hits in &batched {
-            assert_eq!(hits.len(), 1, "each result set should have one hit");
+        for inner in &batched {
+            assert!(inner.is_ok(), "each inner result should be Ok");
+            assert_eq!(
+                inner.as_ref().unwrap().len(),
+                1,
+                "each Ok should have one hit"
+            );
         }
     }
 
     #[tokio::test]
-    async fn search_batch_propagates_search_error() {
-        // TestVectorStore.search always succeeds; inject failure via fail_insert
-        // trick — instead use a custom store that fails on search.
+    async fn search_batch_isolates_per_query_errors() {
+        // A store that always fails search — the outer Ok must still be returned,
+        // and the failed inner result must carry the error.
         struct FailingSearch;
 
         #[async_trait]
@@ -348,7 +391,8 @@ mod tests {
                 _: Uuid,
                 _: SubstrateKind,
                 _: &str,
-                _: Vec<f32>,
+                _: &str,
+                _: Vec<Vec<f32>>,
             ) -> StorageResult<()> {
                 Ok(())
             }
@@ -385,13 +429,37 @@ mod tests {
 
         let store = FailingSearch;
         let requests = vec![VectorSearchRequest {
-            query_embedding: vec![0.1],
+            query_vectors: vec![vec![0.1]],
             top_k: 1,
             namespace: None,
             kind: None,
+            filter: None,
+            backend_hints: None,
         }];
-        let result = store.search_batch(requests).await;
-        assert!(result.is_err());
+        // Outer result is Ok; the error is in the inner vec.
+        let result = store.search_batch(&requests).await;
+        assert!(result.is_ok(), "outer result must be Ok for batch");
+        let batched = result.unwrap();
+        assert_eq!(batched.len(), 1);
+        assert!(batched[0].is_err(), "inner result must carry the error");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_default_returns_unsupported() {
+        let store = TestVectorStore::new();
+        let config = OrphanSweepConfig {
+            subject_id_allowlist: None,
+            namespaces: vec![],
+            substrate_kinds: vec![],
+            max_delete: 100,
+            dry_run: true,
+        };
+        let result = store.orphan_sweep(&config).await;
+        assert!(
+            matches!(result, Err(StorageError::Unsupported { .. })),
+            "expected Unsupported, got {result:?}"
+        );
+        assert!(!store.capabilities().supports_orphan_sweep);
     }
 
     #[tokio::test]
@@ -399,7 +467,13 @@ mod tests {
         let store = TestVectorStore::new();
         let id = Uuid::new_v4();
         let result = store
-            .update(id, SubstrateKind::Entity, "ns:test", vec![0.1, 0.2])
+            .update(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.1, 0.2]],
+            )
             .await;
         assert!(result.is_ok());
         assert!(
@@ -417,7 +491,13 @@ mod tests {
         let store = TestVectorStore::with_fail_delete();
         let id = Uuid::new_v4();
         let result = store
-            .update(id, SubstrateKind::Entity, "ns:test", vec![0.1, 0.2])
+            .update(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.1, 0.2]],
+            )
             .await;
         assert!(result.is_err());
         assert!(
@@ -435,12 +515,41 @@ mod tests {
         let store = TestVectorStore::with_fail_insert();
         let id = Uuid::new_v4();
         let result = store
-            .update(id, SubstrateKind::Entity, "ns:test", vec![0.1, 0.2])
+            .update(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.1, 0.2]],
+            )
             .await;
         assert!(result.is_err());
         assert!(
             store.insert_called.load(Ordering::SeqCst),
             "insert must be attempted"
         );
+    }
+
+    #[tokio::test]
+    async fn vector_metadata_filter_is_empty_with_property_filters() {
+        let empty = VectorMetadataFilter::default();
+        assert!(empty.is_empty());
+
+        let with_ns = VectorMetadataFilter {
+            namespaces: vec!["ns".into()],
+            ..Default::default()
+        };
+        assert!(!with_ns.is_empty());
+
+        use crate::types::{PropertyFilter, PropertyOp};
+        let with_prop = VectorMetadataFilter {
+            property_filters: vec![PropertyFilter {
+                key: "k".into(),
+                op: PropertyOp::Eq,
+                value: serde_json::Value::Bool(true),
+            }],
+            ..Default::default()
+        };
+        assert!(!with_prop.is_empty());
     }
 }

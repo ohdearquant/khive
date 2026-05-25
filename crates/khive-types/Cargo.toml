@@ -10,12 +10,17 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["serde", "std"]
+# std is included in default so the crate is usable without explicit feature selection.
+# serde is optional — removed from default so `khive-types` is truly no_std-optional.
+# All internal dependents that need serde must declare `features = ["serde"]` explicitly.
+default = ["std"]
 serde = ["dep:serde"]
 std = []
+blake3 = ["dep:blake3"]
 
 [dependencies]
 serde = { workspace = true, optional = true, features = ["derive"] }
+blake3 = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
 serde_json = { workspace = true }

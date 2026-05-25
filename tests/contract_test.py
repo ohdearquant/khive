@@ -87,10 +87,17 @@ def _recv(proc: subprocess.Popen) -> dict:
 def _request_raw(proc: subprocess.Popen, ops_string: str) -> dict:
     """Call the single `request` MCP tool and return the parsed response body.
 
+    Uses ``presentation: "verbose"`` so test assertions receive full canonical
+    UUIDs and timestamps (ADR-045 — scripted/CI callers default to Verbose).
+
     Returns {"_rpc_error": {...}} if the server replied with a JSON-RPC error
     (i.e. the DSL itself was rejected — malformed input).
     """
-    _send(proc, "tools/call", {"name": "request", "arguments": {"ops": ops_string}})
+    _send(
+        proc,
+        "tools/call",
+        {"name": "request", "arguments": {"ops": ops_string, "presentation": "verbose"}},
+    )
     resp = _recv(proc)
     if "error" in resp:
         return {"_rpc_error": resp["error"]}
@@ -411,7 +418,7 @@ def test_gql_property_projection(proc: subprocess.Popen) -> None:
     )
     # Error must contain the compiler's fixed-format valid-column list.  If the
     # columns change, this assertion will catch the drift.
-    assert "Valid: id, name, kind, namespace, description, properties, created_at, updated_at" in err_text, (
+    assert "Valid: id, name, kind, entity_type, namespace, description, properties, created_at, updated_at" in err_text, (
         f"Error text must contain the full valid-column list emitted by the compiler: {err_text!r}"
     )
 
@@ -435,8 +442,10 @@ def test_edge_cascade_hard_delete(proc: subprocess.Popen) -> None:
     e1 = _tool(proc, "link", {
         "source_id": hub["id"], "target_id": spoke1["id"], "relation": "extends",
     })
+    # ADR-002: depends_on is restricted to Project/Service/Artifact endpoints, not Concept.
+    # Use `enables` (valid concept-to-concept) for this contract.
     e2 = _tool(proc, "link", {
-        "source_id": spoke2["id"], "target_id": hub["id"], "relation": "depends_on",
+        "source_id": spoke2["id"], "target_id": hub["id"], "relation": "enables",
     })
     e1_id = e1["id"]
     e2_id = e2["id"]
@@ -448,7 +457,7 @@ def test_edge_cascade_hard_delete(proc: subprocess.Popen) -> None:
     )
 
     # Hard-delete the hub
-    del_result = _tool(proc, "delete", {"id": hub["id"], "hard": True})
+    del_result = _tool(proc, "delete", {"id": hub["id"], "kind": "entity", "hard": True})
     assert del_result["deleted"] is True, f"Hard delete should return deleted=true: {del_result}"
 
     # Both incident edges must be gone — assert via get() AND via list() so the
@@ -491,7 +500,7 @@ def test_edge_cascade_hard_delete(proc: subprocess.Popen) -> None:
     })
     e_soft_id = e_soft["id"]
 
-    del_soft = _tool(proc, "delete", {"id": hub_soft["id"]})  # hard=False by default
+    del_soft = _tool(proc, "delete", {"id": hub_soft["id"], "kind": "entity"})  # hard=False by default
     assert del_soft["deleted"] is True
 
     # Edge should still be retrievable after soft delete
@@ -673,10 +682,12 @@ def test_merge_semantics(proc: subprocess.Popen) -> None:
     # Create edges incident on "gone":
     #   third → gone (inbound edge to gone)
     #   gone → kept  (outbound edge from gone, which would become a self-loop after merge — should be dropped)
+    # ADR-002: depends_on is restricted to Project/Service/Artifact endpoints, not Concept.
+    # Use `enables` (valid concept-to-concept) for this contract.
     e_inbound = _tool(proc, "link", {
         "source_id": third["id"],
         "target_id": gone["id"],
-        "relation": "depends_on",
+        "relation": "enables",
         "weight": 0.7,
     })
     e_self_loop = _tool(proc, "link", {
@@ -822,7 +833,7 @@ def test_annotates_source_must_be_note(proc: subprocess.Popen) -> None:
     )
 
     # ---- Hard-delete the target entity cascades the annotates edge ----
-    del_result = _tool(proc, "delete", {"id": concept["id"], "hard": True})
+    del_result = _tool(proc, "delete", {"id": concept["id"], "kind": "entity", "hard": True})
     assert del_result["deleted"] is True
 
     err_edge = _expect_rpc_error(proc, "get", {"id": edge_id})

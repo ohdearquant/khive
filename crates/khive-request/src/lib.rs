@@ -16,40 +16,114 @@
 //! chains, `$prev` substitution, LNDL-style natural-language declarations,
 //! bash-flavoured redirections — without touching the runtime layering.
 //!
-//! ## Today's syntax (v0.2 — ADR-020)
+//! ## Today's syntax (ADR-016)
 //!
-//! - **Function-call form**: `tool_name(arg=value, arg=value)`
-//! - **Function-call batch**: `[tool_name(...), tool_name(...)]`
+//! - **Single op**: `tool_name(arg=value, arg=value)` — `ExecutionMode::Single`
+//! - **Parallel batch**: `[tool_name(...), tool_name(...)]` — `ExecutionMode::Parallel`
+//! - **Sequential chain**: `op1(...) | op2(id=$prev.id)` — `ExecutionMode::Chain`
 //! - **JSON form**: `[{"tool":"...", "args": {...}}, ...]` (or a single object)
 //!
 //! Argument values are JSON literals — strings, numbers, booleans, `null`,
-//! arrays, objects. Top-level operations inside `[...]` run in parallel by
-//! convention (the parser preserves order; the transport drives concurrency).
-//!
-//! ## Planned (deferred to dedicated ADRs)
-//!
-//! - Pipe chains for sequential dependent ops (`v1(...) | v2(id=$prev.id)`).
-//! - LNDL frontend — parses lact-block source and emits the same `ParsedRequest`.
-//! - Bash-style redirection / substitution for ops that produce stream output.
+//! arrays, objects. Chain-only: `$prev` and `$prev.field.path` references resolve
+//! at dispatch time against the preceding op's result.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde_json::{Map, Value};
 
-/// Hard cap on operations per request. ADR-020 §Why-100.
+/// Hard cap on operations per request. ADR-016 §Why-100.
 pub const MAX_OPS: usize = 100;
 
+/// Execution mode for a [`ParsedRequest`] (ADR-016).
+///
+/// - `Single`: one operation, no batching.
+/// - `Parallel`: operations separated by `,` inside `[...]`; run concurrently,
+///   results in input order.
+/// - `Chain`: operations separated by `|`; run sequentially, each op may
+///   reference the prior op's result via `$prev` / `$prev.field.path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// One operation, no batching or chaining.
+    Single,
+    /// `[op1(...), op2(...)]` — parallel, best-effort, independent results.
+    Parallel,
+    /// `op1(...) | op2(id=$prev.id)` — sequential, abort-on-failure.
+    Chain,
+}
+
+/// An argument value in a [`ParsedOp`].
+///
+/// Most arguments are concrete JSON values. In chain ops (ADR-016 §Chain
+/// semantics), arguments may reference the preceding op's result via `$prev`
+/// or `$prev.dotted.path`. Substitution happens at dispatch time, not at parse
+/// time, because the prior result isn't known until runtime.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArgValue {
+    /// A concrete JSON value.
+    Value(Value),
+    /// A `$prev` or `$prev.field.path` reference — chain mode only.
+    ///
+    /// `path` is the dot-separated field path after `$prev`. Empty string means
+    /// the whole prior result (`$prev` with no field selector).
+    PrevRef { path: String },
+}
+
+impl ArgValue {
+    /// Returns the contained [`Value`] if this is `ArgValue::Value`.
+    pub fn as_value(&self) -> Option<&Value> {
+        match self {
+            ArgValue::Value(v) => Some(v),
+            ArgValue::PrevRef { .. } => None,
+        }
+    }
+
+    /// Returns `true` if this is a `$prev` reference.
+    pub fn is_prev_ref(&self) -> bool {
+        matches!(self, ArgValue::PrevRef { .. })
+    }
+
+    /// Resolve a `$prev` reference against a preceding op's result.
+    ///
+    /// Returns the extracted field value, or `None` if the path doesn't
+    /// exist in `prev_result`. Non-`PrevRef` variants return `None`.
+    pub fn resolve_prev<'a>(&self, prev_result: &'a Value) -> Option<&'a Value> {
+        let ArgValue::PrevRef { path } = self else {
+            return None;
+        };
+        if path.is_empty() {
+            return Some(prev_result);
+        }
+        let mut cur = prev_result;
+        for segment in path.split('.') {
+            cur = cur.get(segment)?;
+        }
+        Some(cur)
+    }
+}
+
 /// A single parsed operation: tool name + named argument bag.
+///
+/// Arguments may be concrete [`ArgValue::Value`]s or `$prev` references
+/// ([`ArgValue::PrevRef`]) that the dispatcher resolves against the prior op's
+/// result (chain mode only).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedOp {
     pub tool: String,
-    pub args: Map<String, Value>,
+    pub args: BTreeMap<String, ArgValue>,
 }
 
-/// Result of parsing a `request` input string.
+/// Result of parsing a `request` input string (ADR-016).
+///
+/// The `mode` field tells the dispatcher how to execute the operations:
+/// - `Single`: dispatch the one op, wrap in a single-element envelope.
+/// - `Parallel`: dispatch all ops concurrently via `join_all`, collect in order.
+/// - `Chain`: dispatch ops sequentially; substitute `$prev` references between
+///   ops; abort remaining ops when any op or substitution fails.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedRequest {
     pub ops: Vec<ParsedOp>,
+    pub mode: ExecutionMode,
 }
 
 /// Parser error — surfaced as `invalid_params` at the MCP boundary.
@@ -85,6 +159,12 @@ pub enum DslError {
     UnclosedBracket {
         kind: char,
     },
+    /// `$prev` reference used outside a chain context.
+    PrevRefOutsideChain {
+        pos: usize,
+    },
+    /// Mixing `,` and `|` at the top level.
+    MixedSeparators,
 }
 
 impl fmt::Display for DslError {
@@ -119,6 +199,18 @@ impl fmt::Display for DslError {
             DslError::UnclosedBracket { kind } => {
                 write!(f, "unclosed bracket: {kind:?} has no matching close")
             }
+            DslError::PrevRefOutsideChain { pos } => {
+                write!(
+                    f,
+                    "at position {pos}: $prev reference is only valid in chain (|) mode"
+                )
+            }
+            DslError::MixedSeparators => {
+                write!(
+                    f,
+                    "cannot mix ',' (parallel) and '|' (chain) separators at the top level"
+                )
+            }
         }
     }
 }
@@ -147,32 +239,77 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
         return parse_json_form(trimmed);
     }
 
-    // Function-call batch.
+    // Function-call batch `[...]` — parallel.
     if first == b'[' {
         return parse_fn_batch(trimmed);
     }
 
-    // Single op.
+    // Chain or single: starts with an identifier.
+    // Parse the first op, then check for `|` to detect chain mode.
     let mut p = Parser::new(trimmed);
-    let op = p.parse_op()?;
+    let first_op = p.parse_op()?;
     p.skip_ws();
+
+    if p.eof() {
+        // Single op — no separator follows.
+        return Ok(ParsedRequest {
+            ops: vec![first_op],
+            mode: ExecutionMode::Single,
+        });
+    }
+
+    if p.peek() == Some('|') {
+        // Chain mode: `op1 | op2 | ...`
+        return parse_chain_tail(p, first_op);
+    }
+
+    // Unexpected trailing content after a single op.
+    Err(DslError::UnexpectedChar {
+        pos: p.pos,
+        found: p.peek().unwrap(),
+        expected: "'|' or end of input",
+    })
+}
+
+/// Parse the rest of a chain after the first op has been consumed.
+///
+/// Called when we've seen `first_op` followed by `|`. Parses one or more
+/// `| op` segments and returns a `Chain` request.
+fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedRequest, DslError> {
+    let mut ops = vec![first_op];
+    while p.peek() == Some('|') {
+        if ops.len() >= MAX_OPS {
+            return Err(DslError::TooManyOps {
+                count: ops.len() + 1,
+                max: MAX_OPS,
+            });
+        }
+        p.advance(1); // consume '|'
+        p.skip_ws();
+        let op = p.parse_op()?;
+        ops.push(op);
+        p.skip_ws();
+    }
     if !p.eof() {
         return Err(DslError::UnexpectedChar {
             pos: p.pos,
             found: p.peek().unwrap(),
-            expected: "end of input",
+            expected: "'|' or end of input",
         });
     }
-    Ok(ParsedRequest { ops: vec![op] })
+    Ok(ParsedRequest {
+        ops,
+        mode: ExecutionMode::Chain,
+    })
 }
 
 fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
     let v: Value = serde_json::from_str(input).map_err(|e| DslError::InvalidJson {
         error: e.to_string(),
     })?;
-    let arr: Vec<Value> = match v {
-        Value::Array(arr) => arr,
-        Value::Object(_) => vec![v],
+    let (arr, is_single) = match v {
+        Value::Array(arr) => (arr, false),
+        Value::Object(_) => (vec![v], true),
         other => {
             return Err(DslError::InvalidJson {
                 error: format!("expected object or array of objects, got {other}"),
@@ -201,7 +338,7 @@ fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
             .get("args")
             .cloned()
             .unwrap_or_else(|| Value::Object(Map::new()));
-        let args = match args {
+        let args_map = match args {
             Value::Object(m) => m,
             other => {
                 return Err(DslError::InvalidJson {
@@ -209,9 +346,19 @@ fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
                 })
             }
         };
+        // JSON form does not support $prev references — all args are Values.
+        let args: BTreeMap<String, ArgValue> = args_map
+            .into_iter()
+            .map(|(k, v)| (k, ArgValue::Value(v)))
+            .collect();
         ops.push(ParsedOp { tool, args });
     }
-    Ok(ParsedRequest { ops })
+    let mode = if is_single {
+        ExecutionMode::Single
+    } else {
+        ExecutionMode::Parallel
+    };
+    Ok(ParsedRequest { ops, mode })
 }
 
 fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
@@ -221,7 +368,10 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
     let mut ops = Vec::new();
     if p.peek() == Some(']') {
         p.advance(1);
-        return Ok(ParsedRequest { ops });
+        return Ok(ParsedRequest {
+            ops,
+            mode: ExecutionMode::Parallel,
+        });
     }
     loop {
         if ops.len() >= MAX_OPS {
@@ -260,7 +410,10 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
             expected: "end of input",
         });
     }
-    Ok(ParsedRequest { ops })
+    Ok(ParsedRequest {
+        ops,
+        mode: ExecutionMode::Parallel,
+    })
 }
 
 // ── recursive-descent parser ────────────────────────────────────────────────
@@ -347,7 +500,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_char('(')?;
         self.skip_ws();
-        let mut args: Map<String, Value> = Map::new();
+        let mut args: BTreeMap<String, ArgValue> = BTreeMap::new();
         if self.peek() == Some(')') {
             self.advance(1);
             return Ok(ParsedOp { tool, args });
@@ -356,11 +509,11 @@ impl<'a> Parser<'a> {
             let name = self.parse_identifier()?;
             self.expect_char('=')?;
             self.skip_ws();
-            let value = self.parse_value()?;
+            let arg_val = self.parse_arg_value()?;
             if args.contains_key(&name) {
                 return Err(DslError::DuplicateArg { name });
             }
-            args.insert(name, value);
+            args.insert(name, arg_val);
             self.skip_ws();
             match self.peek() {
                 Some(',') => {
@@ -381,6 +534,49 @@ impl<'a> Parser<'a> {
                 None => return Err(DslError::UnexpectedEof { expected: "')'" }),
             }
         }
+    }
+
+    /// Parse an argument value — either a `$prev` reference or a JSON literal.
+    fn parse_arg_value(&mut self) -> Result<ArgValue, DslError> {
+        self.skip_ws();
+        if self.peek() == Some('$') {
+            return self.parse_prev_ref();
+        }
+        let v = self.parse_value()?;
+        Ok(ArgValue::Value(v))
+    }
+
+    /// Parse a `$prev` or `$prev.field.path` reference.
+    ///
+    /// Grammar: `$prev` optionally followed by `.identifier(.identifier)*`
+    fn parse_prev_ref(&mut self) -> Result<ArgValue, DslError> {
+        let start = self.pos;
+        // Consume `$`
+        self.advance(1);
+        // Must be followed by `prev`
+        let ident = self
+            .parse_identifier()
+            .map_err(|_| DslError::InvalidValue {
+                pos: start,
+                error: "expected '$prev' — '$' must be followed by 'prev'".into(),
+            })?;
+        if ident != "prev" {
+            return Err(DslError::InvalidValue {
+                pos: start,
+                error: format!("expected '$prev', found '${}'", ident),
+            });
+        }
+        // Optional dot-path
+        let mut path = String::new();
+        while self.peek() == Some('.') {
+            self.advance(1); // consume '.'
+            let segment = self.parse_identifier()?;
+            if !path.is_empty() {
+                path.push('.');
+            }
+            path.push_str(&segment);
+        }
+        Ok(ArgValue::PrevRef { path })
     }
 
     fn parse_value(&mut self) -> Result<Value, DslError> {
@@ -492,25 +688,38 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn req(s: &str) -> ParsedRequest {
+        parse_request(s).unwrap_or_else(|e| panic!("parse({s:?}) failed: {e}"))
+    }
+
     fn ops(s: &str) -> Vec<ParsedOp> {
-        parse_request(s)
-            .unwrap_or_else(|e| panic!("parse({s:?}) failed: {e}"))
-            .ops
+        req(s).ops
+    }
+
+    /// Extract the concrete `Value` from an `ArgValue::Value`, panicking on `PrevRef`.
+    fn val(arg: &ArgValue) -> &Value {
+        match arg {
+            ArgValue::Value(v) => v,
+            ArgValue::PrevRef { path } => {
+                panic!("expected Value, got PrevRef {{ path: {path:?} }}")
+            }
+        }
     }
 
     #[test]
     fn single_op_no_args() {
-        let v = ops("next()");
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].tool, "next");
-        assert!(v[0].args.is_empty());
+        let r = req("next()");
+        assert_eq!(r.mode, ExecutionMode::Single);
+        assert_eq!(r.ops.len(), 1);
+        assert_eq!(r.ops[0].tool, "next");
+        assert!(r.ops[0].args.is_empty());
     }
 
     #[test]
     fn single_op_with_string_arg() {
         let v = ops(r#"assign(title="ship release")"#);
         assert_eq!(v[0].tool, "assign");
-        assert_eq!(v[0].args["title"], json!("ship release"));
+        assert_eq!(val(&v[0].args["title"]), &json!("ship release"));
     }
 
     #[test]
@@ -519,60 +728,63 @@ mod tests {
             r#"create(kind="entity", entity_kind="concept", name="LoRA", weight=0.9, active=true)"#,
         );
         assert_eq!(v[0].tool, "create");
-        assert_eq!(v[0].args["kind"], json!("entity"));
-        assert_eq!(v[0].args["weight"], json!(0.9));
-        assert_eq!(v[0].args["active"], json!(true));
+        assert_eq!(val(&v[0].args["kind"]), &json!("entity"));
+        assert_eq!(val(&v[0].args["weight"]), &json!(0.9));
+        assert_eq!(val(&v[0].args["active"]), &json!(true));
     }
 
     #[test]
     fn batch_three_ops() {
-        let v = ops(
+        let r = req(
             r#"[create(kind="entity", name="A"), create(kind="entity", name="B"), link(source_id="x", target_id="y", relation="extends")]"#,
         );
-        assert_eq!(v.len(), 3);
-        assert_eq!(v[0].tool, "create");
-        assert_eq!(v[2].tool, "link");
-        assert_eq!(v[2].args["relation"], json!("extends"));
+        assert_eq!(r.mode, ExecutionMode::Parallel);
+        assert_eq!(r.ops.len(), 3);
+        assert_eq!(r.ops[0].tool, "create");
+        assert_eq!(r.ops[2].tool, "link");
+        assert_eq!(val(&r.ops[2].args["relation"]), &json!("extends"));
     }
 
     #[test]
     fn empty_batch_is_legal() {
-        let v = ops("[]");
-        assert!(v.is_empty());
+        let r = req("[]");
+        assert_eq!(r.mode, ExecutionMode::Parallel);
+        assert!(r.ops.is_empty());
     }
 
     #[test]
     fn nested_array_and_object_values() {
         let v = ops(r#"assign(title="x", tags=["a","b"], properties={"k":"v","n":1})"#);
-        assert_eq!(v[0].args["tags"], json!(["a", "b"]));
-        assert_eq!(v[0].args["properties"], json!({"k": "v", "n": 1}));
+        assert_eq!(val(&v[0].args["tags"]), &json!(["a", "b"]));
+        assert_eq!(val(&v[0].args["properties"]), &json!({"k": "v", "n": 1}));
     }
 
     #[test]
     fn string_with_comma_and_paren_inside() {
         let v = ops(r#"assign(title="hello, world (now)")"#);
-        assert_eq!(v[0].args["title"], json!("hello, world (now)"));
+        assert_eq!(val(&v[0].args["title"]), &json!("hello, world (now)"));
     }
 
     #[test]
     fn string_with_escaped_quote() {
         let v = ops(r#"assign(title="he said \"hi\"")"#);
-        assert_eq!(v[0].args["title"], json!("he said \"hi\""));
+        assert_eq!(val(&v[0].args["title"]), &json!("he said \"hi\""));
     }
 
     #[test]
     fn null_and_negative_number() {
         let v = ops(r#"update(id="x", description=null, weight=-0.5)"#);
-        assert_eq!(v[0].args["description"], json!(null));
-        assert_eq!(v[0].args["weight"], json!(-0.5));
+        assert_eq!(val(&v[0].args["description"]), &json!(null));
+        assert_eq!(val(&v[0].args["weight"]), &json!(-0.5));
     }
 
     #[test]
     fn json_form_batch_parses() {
-        let v = ops(r#"[{"tool":"next","args":{}}, {"tool":"complete","args":{"id":"abc"}}]"#);
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[1].tool, "complete");
-        assert_eq!(v[1].args["id"], json!("abc"));
+        let r = req(r#"[{"tool":"next","args":{}}, {"tool":"complete","args":{"id":"abc"}}]"#);
+        assert_eq!(r.mode, ExecutionMode::Parallel);
+        assert_eq!(r.ops.len(), 2);
+        assert_eq!(r.ops[1].tool, "complete");
+        assert_eq!(val(&r.ops[1].args["id"]), &json!("abc"));
     }
 
     #[test]
@@ -591,9 +803,10 @@ mod tests {
 
     #[test]
     fn json_form_single_object_is_treated_as_one_op() {
-        let v = ops(r#"{"tool":"next","args":{}}"#);
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].tool, "next");
+        let r = req(r#"{"tool":"next","args":{}}"#);
+        assert_eq!(r.mode, ExecutionMode::Single);
+        assert_eq!(r.ops.len(), 1);
+        assert_eq!(r.ops[0].tool, "next");
     }
 
     #[test]
@@ -646,7 +859,7 @@ mod tests {
         let v = ops(r#"recall(query="test")"#);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].tool, "recall");
-        assert_eq!(v[0].args["query"], json!("test"));
+        assert_eq!(val(&v[0].args["query"]), &json!("test"));
     }
 
     #[test]
@@ -654,18 +867,19 @@ mod tests {
         let v = ops(r#"search(query="test", limit=5)"#);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].tool, "search");
-        assert_eq!(v[0].args["query"], json!("test"));
-        assert_eq!(v[0].args["limit"], json!(5));
+        assert_eq!(val(&v[0].args["query"]), &json!("test"));
+        assert_eq!(val(&v[0].args["limit"]), &json!(5));
     }
 
     #[test]
     fn parallel_recall_and_inbox() {
-        let v = ops(r#"[recall(query="x"), inbox()]"#);
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0].tool, "recall");
-        assert_eq!(v[0].args["query"], json!("x"));
-        assert_eq!(v[1].tool, "inbox");
-        assert!(v[1].args.is_empty());
+        let r = req(r#"[recall(query="x"), inbox()]"#);
+        assert_eq!(r.mode, ExecutionMode::Parallel);
+        assert_eq!(r.ops.len(), 2);
+        assert_eq!(r.ops[0].tool, "recall");
+        assert_eq!(val(&r.ops[0].args["query"]), &json!("x"));
+        assert_eq!(r.ops[1].tool, "inbox");
+        assert!(r.ops[1].args.is_empty());
     }
 
     // ── JSON form edge cases ───────────────────────────────────────────────────
@@ -697,8 +911,8 @@ mod tests {
     fn dotted_tool_with_args() {
         let v = ops(r#"recall.candidates(query="test", limit=5)"#);
         assert_eq!(v[0].tool, "recall.candidates");
-        assert_eq!(v[0].args["query"], json!("test"));
-        assert_eq!(v[0].args["limit"], json!(5));
+        assert_eq!(val(&v[0].args["query"]), &json!("test"));
+        assert_eq!(val(&v[0].args["limit"]), &json!(5));
     }
 
     #[test]
@@ -727,12 +941,120 @@ mod tests {
     #[test]
     fn boolean_false_as_arg_value() {
         let v = ops("flag(active=false)");
-        assert_eq!(v[0].args["active"], json!(false));
+        assert_eq!(val(&v[0].args["active"]), &json!(false));
     }
 
     #[test]
     fn unicode_string_arg_preserved() {
         let v = ops(r#"assign(title="café")"#);
-        assert_eq!(v[0].args["title"], json!("café"));
+        assert_eq!(val(&v[0].args["title"]), &json!("café"));
+    }
+
+    // ── Chain mode (ADR-016) ──────────────────────────────────────────────────
+
+    #[test]
+    fn chain_two_ops_with_prev_ref() {
+        let r = req(
+            r#"create(kind="entity", entity_kind="concept", name="A") | link(source_id=$prev.id, target_id="abc", relation="extends")"#,
+        );
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(r.ops.len(), 2);
+        assert_eq!(r.ops[0].tool, "create");
+        assert_eq!(r.ops[1].tool, "link");
+        // The second op's source_id should be a PrevRef
+        assert_eq!(
+            r.ops[1].args["source_id"],
+            ArgValue::PrevRef { path: "id".into() }
+        );
+        // target_id is a concrete value
+        assert_eq!(val(&r.ops[1].args["target_id"]), &json!("abc"));
+    }
+
+    #[test]
+    fn chain_three_ops_mode() {
+        let r = req(
+            r#"create(kind="entity", name="A") | link(source_id=$prev.id, target_id="b", relation="extends") | update(id=$prev.id, description="desc")"#,
+        );
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(r.ops.len(), 3);
+        assert_eq!(r.ops[2].args["id"], ArgValue::PrevRef { path: "id".into() });
+    }
+
+    #[test]
+    fn chain_prev_no_field_selector() {
+        // $prev alone (no dot path) refers to the whole prior result.
+        let r = req(r#"next() | update(id=$prev)"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(r.ops[1].args["id"], ArgValue::PrevRef { path: "".into() });
+    }
+
+    #[test]
+    fn chain_prev_deep_path() {
+        let r = req(
+            r#"create(kind="entity", name="A") | link(source_id=$prev.result.id, target_id="b", relation="extends")"#,
+        );
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(
+            r.ops[1].args["source_id"],
+            ArgValue::PrevRef {
+                path: "result.id".into()
+            }
+        );
+    }
+
+    #[test]
+    fn single_op_mode() {
+        let r = req("next()");
+        assert_eq!(r.mode, ExecutionMode::Single);
+    }
+
+    #[test]
+    fn chain_too_many_ops_rejected() {
+        let mut s = String::from("next()");
+        for _ in 0..MAX_OPS {
+            s.push_str(" | next()");
+        }
+        let err = parse_request(&s).unwrap_err();
+        assert!(matches!(err, DslError::TooManyOps { .. }));
+    }
+
+    // ── ArgValue helpers ──────────────────────────────────────────────────────
+
+    #[test]
+    fn arg_value_resolve_prev_simple() {
+        let prev = json!({"id": "abc-123", "name": "A"});
+        let r = ArgValue::PrevRef { path: "id".into() };
+        assert_eq!(r.resolve_prev(&prev), Some(&json!("abc-123")));
+    }
+
+    #[test]
+    fn arg_value_resolve_prev_empty_path() {
+        let prev = json!({"id": "x"});
+        let r = ArgValue::PrevRef { path: "".into() };
+        assert_eq!(r.resolve_prev(&prev), Some(&prev));
+    }
+
+    #[test]
+    fn arg_value_resolve_prev_nested_path() {
+        let prev = json!({"result": {"id": "nested-id"}});
+        let r = ArgValue::PrevRef {
+            path: "result.id".into(),
+        };
+        assert_eq!(r.resolve_prev(&prev), Some(&json!("nested-id")));
+    }
+
+    #[test]
+    fn arg_value_resolve_prev_missing_field_returns_none() {
+        let prev = json!({"id": "x"});
+        let r = ArgValue::PrevRef {
+            path: "nonexistent".into(),
+        };
+        assert_eq!(r.resolve_prev(&prev), None);
+    }
+
+    #[test]
+    fn arg_value_value_returns_none_for_resolve_prev() {
+        let r = ArgValue::Value(json!("hello"));
+        assert_eq!(r.resolve_prev(&json!({})), None);
     }
 }

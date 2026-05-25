@@ -14,10 +14,10 @@ use khive_storage::types::{
     TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
-use khive_types::{EdgeEndpointRule, EndpointKind, SubstrateKind};
+use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::runtime::KhiveRuntime;
+use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 // Test-only failure injection for `create_note_inner`.
 //
@@ -46,6 +46,31 @@ fn text_preview(text: &str, max_chars: usize) -> Option<String> {
         None
     } else {
         Some(trimmed.chars().take(max_chars).collect())
+    }
+}
+
+/// ADR-002: symmetric relations (`competes_with`, `composed_with`) are stored
+/// with a canonical source (lower UUID wins), so a directed `Out` or `In` query
+/// may miss results. When the relations filter is non-empty and contains **only**
+/// symmetric relations, override direction to `Both` so callers always see all
+/// edges for these relations regardless of storage canonicalization.
+fn normalize_symmetric_direction(
+    direction: Direction,
+    relations: Option<&[EdgeRelation]>,
+) -> Direction {
+    let Some(rels) = relations else {
+        return direction;
+    };
+    if rels.is_empty() {
+        return direction;
+    }
+    let all_symmetric = rels
+        .iter()
+        .all(|r| matches!(r, EdgeRelation::CompetesWith | EdgeRelation::ComposedWith));
+    if all_symmetric {
+        Direction::Both
+    } else {
+        direction
     }
 }
 
@@ -107,21 +132,181 @@ fn pack_rule_allows(
     })
 }
 
+/// ADR-002 base endpoint allowlist for entity→entity relations.
+///
+/// Returns `true` if `(src_kind, relation, tgt_kind)` is an explicitly listed
+/// triple in the ADR-002 base contract. `"*"` as `src_kind` means "any entity
+/// kind" (used for `instance_of` whose source is unrestricted).
+///
+/// Pack rules (via `EDGE_RULES`) are additive — they cannot remove rows here.
+fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &str) -> bool {
+    const RULES: &[(&str, EdgeRelation, &str)] = &[
+        // Structure
+        ("concept", EdgeRelation::Contains, "concept"),
+        ("project", EdgeRelation::Contains, "project"),
+        ("project", EdgeRelation::Contains, "artifact"),
+        ("org", EdgeRelation::Contains, "project"),
+        ("org", EdgeRelation::Contains, "service"),
+        ("concept", EdgeRelation::PartOf, "concept"),
+        ("project", EdgeRelation::PartOf, "project"),
+        ("project", EdgeRelation::PartOf, "org"),
+        ("*", EdgeRelation::InstanceOf, "concept"),
+        ("service", EdgeRelation::InstanceOf, "project"),
+        // Derivation
+        ("concept", EdgeRelation::Extends, "concept"),
+        ("concept", EdgeRelation::VariantOf, "concept"),
+        ("artifact", EdgeRelation::VariantOf, "artifact"),
+        ("concept", EdgeRelation::IntroducedBy, "document"),
+        ("concept", EdgeRelation::IntroducedBy, "person"),
+        ("artifact", EdgeRelation::IntroducedBy, "document"),
+        // Provenance
+        ("artifact", EdgeRelation::DerivedFrom, "dataset"),
+        ("artifact", EdgeRelation::DerivedFrom, "document"),
+        ("artifact", EdgeRelation::DerivedFrom, "project"),
+        ("artifact", EdgeRelation::DerivedFrom, "artifact"),
+        // Temporal
+        ("document", EdgeRelation::Precedes, "document"),
+        ("dataset", EdgeRelation::Precedes, "dataset"),
+        ("artifact", EdgeRelation::Precedes, "artifact"),
+        ("service", EdgeRelation::Precedes, "service"),
+        ("project", EdgeRelation::Precedes, "project"),
+        // Dependency
+        ("project", EdgeRelation::DependsOn, "project"),
+        ("service", EdgeRelation::DependsOn, "project"),
+        ("service", EdgeRelation::DependsOn, "service"),
+        ("service", EdgeRelation::DependsOn, "artifact"),
+        ("service", EdgeRelation::DependsOn, "dataset"),
+        ("artifact", EdgeRelation::DependsOn, "project"),
+        ("artifact", EdgeRelation::DependsOn, "service"),
+        ("concept", EdgeRelation::Enables, "concept"),
+        ("service", EdgeRelation::Enables, "concept"),
+        ("dataset", EdgeRelation::Enables, "concept"),
+        // Implementation
+        ("project", EdgeRelation::Implements, "concept"),
+        ("service", EdgeRelation::Implements, "concept"),
+        // Lateral
+        ("concept", EdgeRelation::CompetesWith, "concept"),
+        ("project", EdgeRelation::CompetesWith, "project"),
+        ("service", EdgeRelation::CompetesWith, "service"),
+        ("concept", EdgeRelation::ComposedWith, "concept"),
+        ("project", EdgeRelation::ComposedWith, "project"),
+        // Versioning (Supersedes — ADR-002:190-194: Concept/Document/Artifact/Service/Dataset only)
+        ("concept", EdgeRelation::Supersedes, "concept"),
+        ("document", EdgeRelation::Supersedes, "document"),
+        ("artifact", EdgeRelation::Supersedes, "artifact"),
+        ("service", EdgeRelation::Supersedes, "service"),
+        ("dataset", EdgeRelation::Supersedes, "dataset"),
+    ];
+    RULES.iter().any(|(src, rel, tgt)| {
+        *rel == relation && (*src == "*" || *src == src_kind) && *tgt == tgt_kind
+    })
+}
+
+/// Canonical endpoint order for symmetric relations (F012).
+///
+/// For `competes_with` and `composed_with`, normalises direction so that
+/// `source_uuid < target_uuid` (lexicographic on the UUID bytes). This
+/// collapses A→B and B→A into a single canonical row, preventing duplicates.
+fn canonical_edge_endpoints(
+    relation: EdgeRelation,
+    source_id: Uuid,
+    target_id: Uuid,
+) -> (Uuid, Uuid) {
+    if relation.is_symmetric() && target_id < source_id {
+        (target_id, source_id)
+    } else {
+        (source_id, target_id)
+    }
+}
+
+/// Infer the default `dependency_kind` from endpoint entity kinds (ADR-002).
+fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'static str> {
+    match (src_kind, tgt_kind) {
+        ("project", "project") => Some("build"),
+        ("service", "service") => Some("runtime"),
+        ("service", "dataset") => Some("data"),
+        ("service", "artifact") => Some("artifact"),
+        ("artifact", "project") | ("artifact", "service") => Some("tooling"),
+        _ => None,
+    }
+}
+
+/// Merge an inferred `dependency_kind` into `depends_on` edge metadata.
+///
+/// If `metadata` already carries a `dependency_kind` key the existing value is
+/// preserved. If the key is absent and the endpoint pair has a known default,
+/// the inferred value is added. Returns `metadata` unchanged for all other
+/// cases (no matching default, or metadata already has the key).
+fn merge_dependency_kind(
+    src_kind: &str,
+    tgt_kind: &str,
+    metadata: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if let Some(ref m) = metadata {
+        if m.get("dependency_kind").is_some() {
+            return metadata;
+        }
+    }
+    let inferred = infer_dependency_kind(src_kind, tgt_kind)?;
+    let mut obj = metadata.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(o) = obj.as_object_mut() {
+        o.insert("dependency_kind".to_string(), serde_json::json!(inferred));
+    }
+    Some(obj)
+}
+
+/// Valid `dependency_kind` values for `depends_on` edges (ADR-002).
+const VALID_DEPENDENCY_KINDS: &[&str] = &["build", "runtime", "data", "artifact", "tooling"];
+
+/// Validate governed edge metadata keys (ADR-002 §Edge Metadata).
+///
+/// Currently enforces:
+/// - `dependency_kind` is only valid on `depends_on` edges.
+/// - `dependency_kind`, when present, must be one of the five governed values.
+fn validate_edge_metadata(
+    relation: EdgeRelation,
+    metadata: Option<&serde_json::Value>,
+) -> RuntimeResult<()> {
+    let Some(meta) = metadata else {
+        return Ok(());
+    };
+    if let Some(dk) = meta.get("dependency_kind") {
+        if relation != EdgeRelation::DependsOn {
+            return Err(RuntimeError::InvalidInput(format!(
+                "dependency_kind is only valid on depends_on edges (got {})",
+                relation.as_str()
+            )));
+        }
+        let dk_str = dk
+            .as_str()
+            .ok_or_else(|| RuntimeError::InvalidInput("dependency_kind must be a string".into()))?;
+        if !VALID_DEPENDENCY_KINDS.contains(&dk_str) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "unknown dependency_kind {dk_str:?}; valid: {}",
+                VALID_DEPENDENCY_KINDS.join(" | ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl KhiveRuntime {
     // ---- Entity operations ----
 
     /// Create and persist a new entity.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_entity(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         kind: &str,
+        entity_type: Option<&str>,
         name: &str,
         description: Option<&str>,
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
-        let ns = self.ns(namespace);
-        let mut entity = Entity::new(ns, kind, name);
+        let ns = token.namespace().as_str();
+        let mut entity = Entity::new(ns, kind, name).with_entity_type(entity_type);
         if let Some(d) = description {
             entity = entity.with_description(d);
         }
@@ -131,15 +316,13 @@ impl KhiveRuntime {
         if !tags.is_empty() {
             entity = entity.with_tags(tags);
         }
-        self.entities(Some(ns))?
-            .upsert_entity(entity.clone())
-            .await?;
+        self.entities(token)?.upsert_entity(entity.clone()).await?;
 
         let body = match &entity.description {
             Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
             _ => entity.name.clone(),
         };
-        self.text(namespace)?
+        self.text(token)?
             .upsert_document(TextDocument {
                 subject_id: entity.id,
                 kind: SubstrateKind::Entity,
@@ -154,38 +337,56 @@ impl KhiveRuntime {
 
         if self.config().embedding_model.is_some() {
             let vector = self.embed(&body).await?;
-            self.vectors(namespace)?
-                .insert(entity.id, SubstrateKind::Entity, ns, vector)
+            self.vectors(token)?
+                .insert(
+                    entity.id,
+                    SubstrateKind::Entity,
+                    ns,
+                    "entity.body",
+                    vec![vector],
+                )
                 .await?;
         }
 
         Ok(entity)
     }
 
-    /// Retrieve an entity by ID.
+    /// Retrieve an entity by ID, enforcing namespace isolation (ADR-007).
     ///
-    /// Returns `None` if the entity does not exist or belongs to a different namespace.
-    /// This enforces ADR-007 namespace isolation at the runtime layer.
-    pub async fn get_entity(
-        &self,
-        namespace: Option<&str>,
-        id: Uuid,
-    ) -> RuntimeResult<Option<Entity>> {
-        let entity = match self.entities(namespace)?.get_entity(id).await? {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-        if entity.namespace != self.ns(namespace) {
-            return Ok(None);
-        }
-        Ok(Some(entity))
+    /// Returns `Err(NotFound)` if the entity does not exist in storage,
+    /// or `Err(NamespaceMismatch)` if it exists in a different namespace.
+    pub async fn get_entity(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<Entity> {
+        let entity = self
+            .entities(token)?
+            .get_entity(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
+        self.ensure_namespace(&entity.namespace, token, id)?;
+        Ok(entity)
     }
 
-    /// List entities in a namespace, optionally filtered by kind.
+    /// Enforce that `actual` matches the token's namespace.
+    ///
+    /// Returns `Err(NamespaceMismatch { id })` when they differ, preserving ADR-007
+    /// timing-oracle mitigation (the external message is "not found in this namespace").
+    pub(crate) fn ensure_namespace(
+        &self,
+        actual: &str,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<()> {
+        if actual == token.namespace().as_str() {
+            return Ok(());
+        }
+        Err(RuntimeError::NamespaceMismatch { id })
+    }
+
+    /// List entities in a namespace, optionally filtered by kind and entity_type.
     pub async fn list_entities(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         kind: Option<&str>,
+        entity_type: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Entity>> {
@@ -194,12 +395,16 @@ impl KhiveRuntime {
                 Some(k) => vec![k.to_string()],
                 None => vec![],
             },
+            entity_types: match entity_type {
+                Some(t) => vec![t.to_string()],
+                None => vec![],
+            },
             ..Default::default()
         };
         let page = self
-            .entities(namespace)?
+            .entities(token)?
             .query_entities(
-                self.ns(namespace),
+                token.namespace().as_str(),
                 filter,
                 PageRequest {
                     offset: offset.into(),
@@ -210,26 +415,17 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// List events in a namespace, optionally filtered.
+    /// List events in the namespace proven by the caller token.
     pub async fn list_events(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         filter: EventFilter,
-        limit: u32,
-        offset: u32,
+        page: PageRequest,
     ) -> RuntimeResult<Page<Event>> {
-        let limit = limit.clamp(1, 1000);
-        let page = self
-            .events(namespace)?
-            .query_events(
-                filter,
-                PageRequest {
-                    offset: offset.into(),
-                    limit,
-                },
-            )
-            .await?;
-        Ok(page)
+        self.events(token)?
+            .query_events(filter, page)
+            .await
+            .map_err(Into::into)
     }
 
     // ---- Edge operations ----
@@ -247,14 +443,14 @@ impl KhiveRuntime {
     /// the same messages as the previous inline block (byte-identical behaviour).
     async fn validate_edge_relation_endpoints(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,
     ) -> RuntimeResult<()> {
         if relation == EdgeRelation::Annotates {
             // Source must be a note in namespace.
-            match self.resolve(namespace, source_id).await? {
+            match self.resolve(token, source_id).await? {
                 Some(Resolved::Note(_)) => {}
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -263,7 +459,7 @@ impl KhiveRuntime {
                 }
                 None => {
                     // Existing edge used as annotates source: wrong kind, not absent.
-                    if self.get_edge(namespace, source_id).await?.is_some() {
+                    if self.get_edge(token, source_id).await?.is_some() {
                         return Err(RuntimeError::InvalidInput(format!(
                             "annotates source {source_id} must be a note"
                         )));
@@ -274,7 +470,7 @@ impl KhiveRuntime {
                 }
             }
             // Target may be any substrate (entity, note, event, or edge).
-            if !self.substrate_exists_in_ns(namespace, target_id).await? {
+            if !self.substrate_exists_in_ns(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(
                     "link target {target_id} not found in namespace"
                 )));
@@ -282,10 +478,10 @@ impl KhiveRuntime {
         } else if relation == EdgeRelation::Supersedes {
             // supersedes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
-            let src = match self.resolve(namespace, source_id).await? {
+            let src = match self.resolve(token, source_id).await? {
                 Some(r) => r,
                 None => {
-                    if self.get_edge(namespace, source_id).await?.is_some() {
+                    if self.get_edge(token, source_id).await?.is_some() {
                         return Err(RuntimeError::InvalidInput(format!(
                             "supersedes source {source_id} must be a note or entity (got edge)"
                         )));
@@ -295,10 +491,10 @@ impl KhiveRuntime {
                     )));
                 }
             };
-            let tgt = match self.resolve(namespace, target_id).await? {
+            let tgt = match self.resolve(token, target_id).await? {
                 Some(r) => r,
                 None => {
-                    if self.get_edge(namespace, target_id).await?.is_some() {
+                    if self.get_edge(token, target_id).await?.is_some() {
                         return Err(RuntimeError::InvalidInput(format!(
                             "supersedes target {target_id} must be a note or entity (got edge)"
                         )));
@@ -309,7 +505,16 @@ impl KhiveRuntime {
                 }
             };
             match (&src, &tgt) {
-                (Resolved::Entity(_), Resolved::Entity(_)) => {}
+                (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
+                    if !base_entity_rule_allows(&src_e.kind, EdgeRelation::Supersedes, &tgt_e.kind)
+                    {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "({}) -[supersedes]-> ({}) is not in the ADR-002 base endpoint \
+                             allowlist; supersedes requires same-kind entity endpoints",
+                            src_e.kind, tgt_e.kind
+                        )));
+                    }
+                }
                 (Resolved::Note(_), Resolved::Note(_)) => {}
                 (Resolved::Event(_), _) => {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -335,14 +540,14 @@ impl KhiveRuntime {
                 }
             }
         } else {
-            // All 11 entity-default relations: ADR-002 base contract is
-            // entity→entity. ADR-031 allows packs to extend allowed endpoint
-            // pairs additively (e.g. GTD lets `depends_on` span task→task).
+            // All 13 base relations: ADR-002 contract is entity→entity with
+            // kind-level restrictions (see base allowlist). ADR-031 allows packs
+            // to extend the allowlist additively via EDGE_RULES.
             //
             // Strategy: resolve both endpoints once, consult pack rules; on
             // miss, fall through to the original base-rule error messages.
-            let src_res = self.resolve(namespace, source_id).await?;
-            let tgt_res = self.resolve(namespace, target_id).await?;
+            let src_res = self.resolve(token, source_id).await?;
+            let tgt_res = self.resolve(token, target_id).await?;
 
             if pack_rule_allows(
                 &self.pack_edge_rules(),
@@ -353,9 +558,9 @@ impl KhiveRuntime {
                 return Ok(());
             }
 
-            // Base-rule check. Same error messages as the pre-ADR-031 surface.
-            match src_res {
-                Some(Resolved::Entity(_)) => {}
+            // Substrate check: both endpoints must be entities.
+            let src_kind = match src_res {
+                Some(Resolved::Entity(e)) => e.kind,
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "link source {source_id} must be an entity for relation {relation:?} \
@@ -363,7 +568,7 @@ impl KhiveRuntime {
                     )));
                 }
                 None => {
-                    if self.get_edge(namespace, source_id).await?.is_some() {
+                    if self.get_edge(token, source_id).await?.is_some() {
                         return Err(RuntimeError::InvalidInput(format!(
                             "link source {source_id} must be an entity for relation {relation:?} \
                              (ADR-002: only `annotates` crosses substrates)"
@@ -373,9 +578,9 @@ impl KhiveRuntime {
                         "link source {source_id} not found in namespace"
                     )));
                 }
-            }
-            match tgt_res {
-                Some(Resolved::Entity(_)) => {}
+            };
+            let tgt_kind = match tgt_res {
+                Some(Resolved::Entity(e)) => e.kind,
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "link target {target_id} must be an entity for relation {relation:?} \
@@ -383,7 +588,7 @@ impl KhiveRuntime {
                     )));
                 }
                 None => {
-                    if self.get_edge(namespace, target_id).await?.is_some() {
+                    if self.get_edge(token, target_id).await?.is_some() {
                         return Err(RuntimeError::InvalidInput(format!(
                             "link target {target_id} must be an entity for relation {relation:?} \
                              (ADR-002: only `annotates` crosses substrates)"
@@ -393,6 +598,13 @@ impl KhiveRuntime {
                         "link target {target_id} not found in namespace"
                     )));
                 }
+            };
+            if !base_entity_rule_allows(&src_kind, relation, &tgt_kind) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "({src_kind}) -[{}]-> ({tgt_kind}) is not in the ADR-002 base endpoint \
+                     allowlist; use pack EDGE_RULES to extend the allowlist",
+                    relation.as_str()
+                )));
             }
         }
         Ok(())
@@ -403,28 +615,62 @@ impl KhiveRuntime {
     /// Enforces the ADR-002/ADR-019/ADR-024 three-case relation contract via
     /// `validate_edge_relation_endpoints`. See that method for the full contract.
     ///
+    /// For symmetric relations (`competes_with`, `composed_with`) the endpoint
+    /// pair is canonicalised to `source_uuid < target_uuid` so that A→B and B→A
+    /// deduplicate to one row (F012).
+    ///
+    /// `metadata` is validated against governed keys (ADR-002 §Edge Metadata);
+    /// `dependency_kind` is inferred for `depends_on` edges when absent (F013).
+    ///
+    /// ADR-009 invariant: `target_backend` is always `None` for locally-routed
+    /// edges written through this path. The `validate_edge_relation_endpoints`
+    /// call above already ensures both endpoints exist in the local namespace,
+    /// so setting `target_backend = None` is the only valid choice (F161).
+    ///
     /// A record that exists but belongs to a different namespace is treated as not found
     /// (fail-closed; no cross-namespace existence leak).
     pub async fn link(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,
         weight: f64,
+        metadata: Option<serde_json::Value>,
     ) -> RuntimeResult<Edge> {
-        self.validate_edge_relation_endpoints(namespace, source_id, target_id, relation)
+        self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
+        let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
+        let metadata = if relation == EdgeRelation::DependsOn {
+            match (
+                self.resolve(token, source_id).await?,
+                self.resolve(token, target_id).await?,
+            ) {
+                (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
+                    merge_dependency_kind(&src_e.kind, &tgt_e.kind, metadata)
+                }
+                _ => metadata,
+            }
+        } else {
+            metadata
+        };
+        validate_edge_metadata(relation, metadata.as_ref())?;
+        let now = chrono::Utc::now();
+        let ns = token.namespace().as_str();
         let edge = Edge {
             id: LinkId::from(Uuid::new_v4()),
+            namespace: ns.to_string(),
             source_id,
             target_id,
             relation,
             weight,
-            created_at: chrono::Utc::now(),
-            metadata: None,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata,
+            target_backend: None,
         };
-        self.graph(namespace)?.upsert_edge(edge.clone()).await?;
+        self.graph(token)?.upsert_edge(edge.clone()).await?;
         Ok(edge)
     }
 
@@ -434,29 +680,33 @@ impl KhiveRuntime {
     /// A record that exists in a different namespace returns `false` (fail-closed).
     async fn substrate_exists_in_ns(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<bool> {
-        if self.resolve(namespace, id).await?.is_some() {
+        if self.resolve(token, id).await?.is_some() {
             return Ok(true);
         }
-        Ok(self.get_edge(namespace, id).await?.is_some())
+        Ok(self.get_edge(token, id).await?.is_some())
     }
 
     /// Get immediate neighbors of a node, optionally filtered by relation type.
     ///
     /// Pass `relations: Some(vec![EdgeRelation::Annotates])` to retrieve only
     /// annotation edges, enabling cross-substrate navigation as described in ADR-024.
+    ///
+    /// ADR-002: symmetric relations (`competes_with`, `composed_with`) are stored
+    /// with the canonical source as the lower UUID. Direction normalization is
+    /// applied in `neighbors_with_query` so both callers see correct results.
     pub async fn neighbors(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         node_id: Uuid,
         direction: Direction,
         limit: Option<u32>,
         relations: Option<Vec<EdgeRelation>>,
     ) -> RuntimeResult<Vec<NeighborHit>> {
         self.neighbors_with_query(
-            namespace,
+            token,
             node_id,
             NeighborQuery {
                 direction,
@@ -469,25 +719,31 @@ impl KhiveRuntime {
     }
 
     /// Get neighbors with full query control (includes `min_weight`).
+    ///
+    /// Applies symmetric-relation direction normalization (ADR-002): if the
+    /// relations filter contains only symmetric relations the direction is
+    /// overridden to `Both` so edges stored in canonical order are always found.
     pub async fn neighbors_with_query(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         node_id: Uuid,
-        query: NeighborQuery,
+        mut query: NeighborQuery,
     ) -> RuntimeResult<Vec<NeighborHit>> {
-        let mut hits = self.graph(namespace)?.neighbors(node_id, query).await?;
-        self.enrich_neighbor_hits(namespace, &mut hits).await;
+        query.direction =
+            normalize_symmetric_direction(query.direction, query.relations.as_deref());
+        let mut hits = self.graph(token)?.neighbors(node_id, query).await?;
+        self.enrich_neighbor_hits(token, &mut hits).await;
         Ok(hits)
     }
 
     /// Traverse the graph from a set of root nodes.
     pub async fn traverse(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         request: TraversalRequest,
     ) -> RuntimeResult<Vec<GraphPath>> {
-        let mut paths = self.graph(namespace)?.traverse(request).await?;
-        self.enrich_path_nodes(namespace, &mut paths).await;
+        let mut paths = self.graph(token)?.traverse(request).await?;
+        self.enrich_path_nodes(token, &mut paths).await;
         Ok(paths)
     }
 
@@ -498,11 +754,11 @@ impl KhiveRuntime {
     /// Done as a single batched entity fetch instead of an SQL JOIN at the
     /// graph store, so test databases that wire up a graph store without an
     /// entities table still work. Cost: one query per neighbors() call.
-    async fn enrich_neighbor_hits(&self, namespace: Option<&str>, hits: &mut [NeighborHit]) {
+    async fn enrich_neighbor_hits(&self, token: &NamespaceToken, hits: &mut [NeighborHit]) {
         if hits.is_empty() {
             return;
         }
-        let store = match self.entities(namespace) {
+        let store = match self.entities(token) {
             Ok(s) => s,
             Err(_) => return, // no entity store configured; leave name/kind as None
         };
@@ -516,11 +772,11 @@ impl KhiveRuntime {
 
     /// Populate `name` and `kind` on each `PathNode` from the corresponding
     /// entity record (#162). Same best-effort policy as `enrich_neighbor_hits`.
-    async fn enrich_path_nodes(&self, namespace: Option<&str>, paths: &mut [GraphPath]) {
+    async fn enrich_path_nodes(&self, token: &NamespaceToken, paths: &mut [GraphPath]) {
         if paths.is_empty() {
             return;
         }
-        let store = match self.entities(namespace) {
+        let store = match self.entities(token) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -547,16 +803,16 @@ impl KhiveRuntime {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_note(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         kind: &str,
         name: Option<&str>,
         content: &str,
-        salience: f64,
+        salience: Option<f64>,
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
         self.create_note_inner(
-            namespace, kind, name, content, salience, None, properties, annotates,
+            token, kind, name, content, salience, None, properties, annotates,
         )
         .await
     }
@@ -565,17 +821,17 @@ impl KhiveRuntime {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_note_with_decay(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         kind: &str,
         name: Option<&str>,
         content: &str,
-        salience: f64,
+        salience: Option<f64>,
         decay_factor: f64,
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
         self.create_note_inner(
-            namespace,
+            token,
             kind,
             name,
             content,
@@ -590,27 +846,30 @@ impl KhiveRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn create_note_inner(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         kind: &str,
         name: Option<&str>,
         content: &str,
-        salience: f64,
+        salience: Option<f64>,
         decay_factor: Option<f64>,
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        let ns = self.ns(namespace);
+        let ns = token.namespace().as_str();
 
         // Validate all annotates targets before any write (ADR-024:295 atomicity).
         for &target_id in &annotates {
-            if !self.substrate_exists_in_ns(namespace, target_id).await? {
+            if !self.substrate_exists_in_ns(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(
                     "create_note annotates target {target_id} not found in namespace"
                 )));
             }
         }
 
-        let mut note = Note::new(ns, kind, content).with_salience(salience);
+        let mut note = Note::new(ns, kind, content);
+        if let Some(s) = salience {
+            note = note.with_salience(s);
+        }
         if let Some(df) = decay_factor {
             note = note.with_decay(df);
         }
@@ -620,14 +879,14 @@ impl KhiveRuntime {
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
-        self.notes(Some(ns))?.upsert_note(note.clone()).await?;
+        self.notes(token)?.upsert_note(note.clone()).await?;
 
         let body = match &note.name {
             Some(n) => format!("{n} {}", note.content),
             None => note.content.clone(),
         };
 
-        self.text_for_notes(Some(ns))?
+        self.text_for_notes(token)?
             .upsert_document(TextDocument {
                 subject_id: note.id,
                 kind: SubstrateKind::Note,
@@ -642,8 +901,14 @@ impl KhiveRuntime {
 
         if self.config().embedding_model.is_some() {
             let vector = self.embed(&note.content).await?;
-            self.vectors(Some(ns))?
-                .insert(note.id, SubstrateKind::Note, ns, vector)
+            self.vectors(token)?
+                .insert(
+                    note.id,
+                    SubstrateKind::Note,
+                    ns,
+                    "note.content",
+                    vec![vector],
+                )
                 .await?;
         }
 
@@ -700,8 +965,15 @@ impl KhiveRuntime {
             let link_result = if let Some(e) = injected_err {
                 Err(e)
             } else {
-                self.link(Some(ns), note.id, target_id, EdgeRelation::Annotates, 1.0)
-                    .await
+                self.link(
+                    token,
+                    note.id,
+                    target_id,
+                    EdgeRelation::Annotates,
+                    1.0,
+                    None,
+                )
+                .await
             };
 
             match link_result {
@@ -709,16 +981,16 @@ impl KhiveRuntime {
                 Err(e) => {
                     // Best-effort compensation — ignore cleanup errors.
                     for edge_id in created_edges {
-                        let _ = self.delete_edge(Some(ns), edge_id).await;
+                        let _ = self.delete_edge(token, edge_id, true).await;
                     }
-                    if let Ok(store) = self.notes(Some(ns)) {
+                    if let Ok(store) = self.notes(token) {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
-                    if let Ok(fts) = self.text_for_notes(Some(ns)) {
+                    if let Ok(fts) = self.text_for_notes(token) {
                         let _ = fts.delete_document(ns, note.id).await;
                     }
                     if self.config().embedding_model.is_some() {
-                        if let Ok(vs) = self.vectors(Some(ns)) {
+                        if let Ok(vs) = self.vectors(token) {
                             let _ = vs.delete(note.id).await;
                         }
                     }
@@ -733,15 +1005,15 @@ impl KhiveRuntime {
     /// List notes, optionally filtered by kind.
     pub async fn list_notes(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         kind: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Note>> {
         let page = self
-            .notes(namespace)?
+            .notes(token)?
             .query_notes(
-                self.ns(namespace),
+                token.namespace().as_str(),
                 kind,
                 PageRequest {
                     offset: offset.into(),
@@ -763,19 +1035,20 @@ impl KhiveRuntime {
     /// 6. Truncate to `limit`.
     pub async fn search_notes(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         query_text: &str,
         query_vector: Option<Vec<f32>>,
         limit: u32,
         note_kind: Option<&str>,
+        include_superseded: bool,
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
         const RRF_K: usize = 60;
         let candidates = limit.saturating_mul(4).max(limit);
-        let ns = self.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_owned();
 
         // FTS5 over the notes index.
         let text_hits = self
-            .text_for_notes(namespace)?
+            .text_for_notes(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
                 mode: TextQueryMode::Plain,
@@ -791,7 +1064,7 @@ impl KhiveRuntime {
         // Vector search filtered to notes.
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
             self.vector_search(
-                namespace,
+                token,
                 query_vector,
                 Some(query_text),
                 candidates,
@@ -837,7 +1110,7 @@ impl KhiveRuntime {
         // soft-delete + (optional) kind filtering. Notes whose `kind` doesn't
         // match `note_kind` are dropped post-fetch — they're a small set
         // bounded by `candidates`, so the extra read is cheap.
-        let note_store = self.notes(namespace)?;
+        let note_store = self.notes(token)?;
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
             if let Some(note) = note_store.get_note(*id).await? {
@@ -853,10 +1126,11 @@ impl KhiveRuntime {
             }
         }
 
-        // Drop superseded notes: any note targeted by a `supersedes` edge is
-        // obsolete and excluded from default search (ADR-019, ADR-024).
-        if !alive_notes.is_empty() {
-            let graph = self.graph(namespace)?;
+        // Drop superseded notes unless include_superseded is true: any note targeted
+        // by a `supersedes` edge is obsolete and excluded from default search
+        // (ADR-013, ADR-024).
+        if !include_superseded && !alive_notes.is_empty() {
+            let graph = self.graph(token)?;
             let mut superseded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
             for &note_id in alive_notes.keys() {
                 let inbound = graph
@@ -882,7 +1156,8 @@ impl KhiveRuntime {
             .into_iter()
             .filter_map(|(id, bucket)| {
                 let note = alive_notes.get(&id)?;
-                let weight = 0.5 + 0.5 * note.salience;
+                let salience = note.salience.unwrap_or(0.5);
+                let weight = 0.5 + 0.5 * salience;
                 let weighted = DeterministicScore::from_f64(bucket.score.to_f64() * weight);
                 Some(NoteSearchHit {
                     note_id: id,
@@ -906,12 +1181,12 @@ impl KhiveRuntime {
     /// ambiguous (multiple matches).
     pub async fn resolve_prefix(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         prefix: &str,
     ) -> RuntimeResult<Option<Uuid>> {
         use khive_storage::types::{SqlStatement, SqlValue};
 
-        let ns = self.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_owned();
         let pattern = format!("{}%", prefix);
 
         let tables = [
@@ -970,9 +1245,16 @@ impl KhiveRuntime {
                     .map_err(|e| RuntimeError::Internal(format!("stored UUID is invalid: {e}")))?;
                 Ok(Some(uuid))
             }
-            _ => Err(RuntimeError::Ambiguous(format!(
-                "prefix '{prefix}' matches multiple UUIDs"
-            ))),
+            _ => {
+                let uuids: Vec<uuid::Uuid> = matches
+                    .iter()
+                    .filter_map(|s| Uuid::from_str(s).ok())
+                    .collect();
+                Err(RuntimeError::AmbiguousPrefix {
+                    prefix: prefix.to_string(),
+                    matches: uuids,
+                })
+            }
         }
     }
 
@@ -982,25 +1264,27 @@ impl KhiveRuntime {
     /// Cost: at most 3 store lookups per call (cheap for v0.1).
     pub async fn resolve(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<Option<Resolved>> {
-        let ns = self.ns(namespace);
+        let ns = token.namespace().as_str();
 
-        // Entity: use the namespace-checked getter (returns None on mismatch).
-        if let Some(entity) = self.get_entity(namespace, id).await? {
-            return Ok(Some(Resolved::Entity(entity)));
+        // Entity: use the namespace-checked getter (errors on mismatch/absent).
+        match self.get_entity(token, id).await {
+            Ok(entity) => return Ok(Some(Resolved::Entity(entity))),
+            Err(RuntimeError::NotFound(_) | RuntimeError::NamespaceMismatch { .. }) => {}
+            Err(e) => return Err(e),
         }
 
         // Note: storage get_note is ID-only — verify namespace after fetch.
-        if let Some(note) = self.notes(namespace)?.get_note(id).await? {
+        if let Some(note) = self.notes(token)?.get_note(id).await? {
             if note.namespace == ns {
                 return Ok(Some(Resolved::Note(note)));
             }
         }
 
         // Event: storage get_event is ID-only — verify namespace after fetch.
-        if let Some(event) = self.events(namespace)?.get_event(id).await? {
+        if let Some(event) = self.events(token)?.get_event(id).await? {
             if event.namespace == ns {
                 return Ok(Some(Resolved::Event(event)));
             }
@@ -1016,22 +1300,22 @@ impl KhiveRuntime {
     /// references for `annotates` edges that target this note (ADR-002, ADR-024).
     /// Soft delete also cleans FTS and vector indexes; edges are left in place.
     ///
-    /// Returns `false` without deleting if the note does not exist or belongs to
-    /// a different namespace (ADR-007 namespace isolation).
+    /// Returns `Ok(false)` if the note does not exist, or `Err(NamespaceMismatch)`
+    /// if it belongs to a different namespace (ADR-007 namespace isolation).
     pub async fn delete_note(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
-        let ns = self.ns(namespace);
-        let note_store = self.notes(namespace)?;
+        let ns = token.namespace().as_str();
+        let note_store = self.notes(token)?;
         let note = match note_store.get_note(id).await? {
             Some(n) => n,
             None => return Ok(false),
         };
         if note.namespace != ns {
-            return Ok(false);
+            return Err(RuntimeError::NamespaceMismatch { id });
         }
         let mode = if hard {
             DeleteMode::Hard
@@ -1041,7 +1325,7 @@ impl KhiveRuntime {
 
         // On hard delete, cascade-remove incident edges and clean up indexes.
         if hard {
-            let graph = self.graph(namespace)?;
+            let graph = self.graph(token)?;
             for direction in [Direction::Out, Direction::In] {
                 let hits = graph
                     .neighbors(
@@ -1055,27 +1339,45 @@ impl KhiveRuntime {
                     )
                     .await?;
                 for hit in hits {
-                    graph.delete_edge(LinkId::from(hit.edge_id)).await?;
+                    graph
+                        .delete_edge(LinkId::from(hit.edge_id), DeleteMode::Hard)
+                        .await?;
                 }
             }
             let ns_str = ns.to_string();
-            self.text_for_notes(namespace)?
+            self.text_for_notes(token)?
                 .delete_document(&ns_str, id)
                 .await?;
             if self.config().embedding_model.is_some() {
-                self.vectors(namespace)?.delete(id).await?;
+                self.vectors(token)?.delete(id).await?;
             }
         }
 
         let deleted = note_store.delete_note(id, mode).await?;
         if !hard && deleted {
             let ns_str = ns.to_string();
-            self.text_for_notes(namespace)?
+            self.text_for_notes(token)?
                 .delete_document(&ns_str, id)
                 .await?;
             if self.config().embedding_model.is_some() {
-                self.vectors(namespace)?.delete(id).await?;
+                self.vectors(token)?.delete(id).await?;
             }
+        }
+        if deleted {
+            let event_store = self.events(token)?;
+            let ns_str = ns.to_string();
+            let event = khive_storage::event::Event::new(
+                ns_str.clone(),
+                "delete",
+                EventKind::NoteDeleted,
+                SubstrateKind::Note,
+                "",
+            )
+            .with_target(id)
+            .with_payload(serde_json::json!({"id": id, "namespace": ns_str, "hard": hard}));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("delete_note: event store write failed: {e}"))
+            })?;
         }
         Ok(deleted)
     }
@@ -1097,17 +1399,20 @@ impl KhiveRuntime {
     /// The query is compiled to SQL with the namespace scope applied.
     /// GQL syntax: `MATCH (a:concept)-[e:extends]->(b) RETURN a, b LIMIT 10`
     /// SPARQL syntax: `SELECT ?a WHERE { ?a :kind "concept" . }`
-    pub async fn query(&self, namespace: Option<&str>, query: &str) -> RuntimeResult<Vec<SqlRow>> {
-        Ok(self.query_with_metadata(namespace, query).await?.rows)
+    pub async fn query(&self, token: &NamespaceToken, query: &str) -> RuntimeResult<Vec<SqlRow>> {
+        Ok(self.query_with_metadata(token, query).await?.rows)
     }
 
     /// Execute a GQL/SPARQL query, returning rows and any validation warnings.
     pub async fn query_with_metadata(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         query: &str,
     ) -> RuntimeResult<QueryResult> {
-        let ns = self.ns(namespace);
+        use khive_query::QueryValue;
+        use khive_storage::types::SqlValue;
+
+        let ns = token.namespace().as_str();
         let ast = khive_query::parse_auto(query)?;
         let opts = khive_query::CompileOptions {
             scopes: vec![ns.to_string()],
@@ -1115,10 +1420,25 @@ impl KhiveRuntime {
         };
         let compiled = khive_query::compile(&ast, &opts)?;
         let warnings = compiled.warnings;
+
+        // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
+        // at the query–storage boundary (ADR-008 §"Query crate compiles against khive-types only").
+        let params: Vec<SqlValue> = compiled
+            .params
+            .into_iter()
+            .map(|qv| match qv {
+                QueryValue::Null => SqlValue::Null,
+                QueryValue::Integer(n) => SqlValue::Integer(n),
+                QueryValue::Float(f) => SqlValue::Float(f),
+                QueryValue::Text(s) => SqlValue::Text(s),
+                QueryValue::Blob(b) => SqlValue::Blob(b),
+            })
+            .collect();
+
         let mut reader = self.sql().reader().await?;
         let stmt = SqlStatement {
             sql: compiled.sql,
-            params: compiled.params,
+            params,
             label: None,
         };
         let rows = reader.query_all(stmt).await?;
@@ -1131,21 +1451,19 @@ impl KhiveRuntime {
     /// outbound) to prevent dangling references. Soft delete also cleans FTS
     /// and vector indexes; edges are left in place.
     ///
-    /// Returns `false` without deleting if the entity exists but belongs to a
+    /// Returns `Err(NamespaceMismatch)` if the entity exists but belongs to a
     /// different namespace (ADR-007 namespace isolation).
     pub async fn delete_entity(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         id: Uuid,
         hard: bool,
     ) -> RuntimeResult<bool> {
-        let entity = match self.entities(namespace)?.get_entity(id).await? {
+        let entity = match self.entities(token)?.get_entity(id).await? {
             Some(e) => e,
             None => return Ok(false),
         };
-        if entity.namespace != self.ns(namespace) {
-            return Ok(false);
-        }
+        self.ensure_namespace(&entity.namespace, token, id)?;
         let mode = if hard {
             DeleteMode::Hard
         } else {
@@ -1154,7 +1472,7 @@ impl KhiveRuntime {
 
         // On hard delete, cascade-remove incident edges to prevent dangling refs.
         if hard {
-            let graph = self.graph(namespace)?;
+            let graph = self.graph(token)?;
             for direction in [Direction::Out, Direction::In] {
                 let hits = graph
                     .neighbors(
@@ -1168,15 +1486,33 @@ impl KhiveRuntime {
                     )
                     .await?;
                 for hit in hits {
-                    graph.delete_edge(LinkId::from(hit.edge_id)).await?;
+                    graph
+                        .delete_edge(LinkId::from(hit.edge_id), DeleteMode::Hard)
+                        .await?;
                 }
             }
-            self.remove_from_indexes(namespace, id).await?;
+            self.remove_from_indexes(token, id).await?;
         }
 
-        let deleted = self.entities(namespace)?.delete_entity(id, mode).await?;
+        let deleted = self.entities(token)?.delete_entity(id, mode).await?;
         if !hard && deleted {
-            self.remove_from_indexes(namespace, id).await?;
+            self.remove_from_indexes(token, id).await?;
+        }
+        if deleted {
+            let event_store = self.events(token)?;
+            let ns = entity.namespace.clone();
+            let event = khive_storage::event::Event::new(
+                ns.clone(),
+                "delete",
+                EventKind::EntityDeleted,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(id)
+            .with_payload(serde_json::json!({"id": id, "namespace": ns, "hard": hard}));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("delete_entity: event store write failed: {e}"))
+            })?;
         }
         Ok(deleted)
     }
@@ -1184,7 +1520,7 @@ impl KhiveRuntime {
     /// Count entities in a namespace, optionally filtered.
     pub async fn count_entities(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         kind: Option<&str>,
     ) -> RuntimeResult<u64> {
         let filter = EntityFilter {
@@ -1195,8 +1531,8 @@ impl KhiveRuntime {
             ..Default::default()
         };
         Ok(self
-            .entities(namespace)?
-            .count_entities(self.ns(namespace), filter)
+            .entities(token)?
+            .count_entities(token.namespace().as_str(), filter)
             .await?)
     }
 
@@ -1205,25 +1541,22 @@ impl KhiveRuntime {
     /// Fetch a single edge by id. Returns `None` if the edge does not exist.
     pub async fn get_edge(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         edge_id: Uuid,
     ) -> RuntimeResult<Option<Edge>> {
-        Ok(self
-            .graph(namespace)?
-            .get_edge(LinkId::from(edge_id))
-            .await?)
+        Ok(self.graph(token)?.get_edge(LinkId::from(edge_id)).await?)
     }
 
     /// List edges matching `filter`. `limit` is capped at 1000; defaults to 100.
     pub async fn list_edges(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         filter: crate::curation::EdgeListFilter,
         limit: u32,
     ) -> RuntimeResult<Vec<Edge>> {
         let limit = limit.clamp(1, 1000);
         let page = self
-            .graph(namespace)?
+            .graph(token)?
             .query_edges(
                 filter.into(),
                 vec![SortOrder {
@@ -1244,28 +1577,51 @@ impl KhiveRuntime {
     /// ADR-002/ADR-019/ADR-024 three-case contract; the edge is NOT mutated on error.
     pub async fn update_edge(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         edge_id: Uuid,
-        relation: Option<EdgeRelation>,
-        weight: Option<f64>,
+        patch: crate::curation::EdgePatch,
     ) -> RuntimeResult<Edge> {
-        let graph = self.graph(namespace)?;
+        let graph = self.graph(token)?;
         let mut edge = graph
             .get_edge(LinkId::from(edge_id))
             .await?
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
 
-        if let Some(r) = relation {
+        let mut changed_fields: Vec<&'static str> = Vec::new();
+        if let Some(r) = patch.relation {
             // Validate before mutating — use the existing endpoints with the new relation.
-            self.validate_edge_relation_endpoints(namespace, edge.source_id, edge.target_id, r)
+            self.validate_edge_relation_endpoints(token, edge.source_id, edge.target_id, r)
                 .await?;
             edge.relation = r;
+            changed_fields.push("relation");
         }
-        if let Some(w) = weight {
+        if let Some(w) = patch.weight {
             edge.weight = w.clamp(0.0, 1.0);
+            changed_fields.push("weight");
+        }
+        if let Some(props) = patch.properties {
+            edge.metadata = Some(props);
         }
 
         graph.upsert_edge(edge.clone()).await?;
+
+        let event_store = self.events(token)?;
+        let ns = token.namespace().as_str().to_string();
+        let event = khive_storage::event::Event::new(
+            ns.clone(),
+            "update",
+            EventKind::EdgeUpdated,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(edge_id)
+        .with_payload(
+            serde_json::json!({"id": edge_id, "namespace": ns, "changed_fields": changed_fields}),
+        );
+        event_store.append_event(event).await.map_err(|e| {
+            RuntimeError::Internal(format!("update_edge: event store write failed: {e}"))
+        })?;
+
         Ok(edge)
     }
 
@@ -1279,8 +1635,18 @@ impl KhiveRuntime {
     /// If `edge_id` does not refer to an edge (e.g. the caller passes an entity or
     /// note UUID by mistake), this method returns `Ok(false)` immediately with no
     /// side effects — it does **not** cascade inbound edges of the non-edge record.
-    pub async fn delete_edge(&self, namespace: Option<&str>, edge_id: Uuid) -> RuntimeResult<bool> {
-        let graph = self.graph(namespace)?;
+    pub async fn delete_edge(
+        &self,
+        token: &NamespaceToken,
+        edge_id: Uuid,
+        hard: bool,
+    ) -> RuntimeResult<bool> {
+        let graph = self.graph(token)?;
+        let mode = if hard {
+            DeleteMode::Hard
+        } else {
+            DeleteMode::Soft
+        };
 
         // Guard: verify `edge_id` is actually an edge before touching anything.
         // Without this check, passing an entity/note UUID would delete all inbound
@@ -1303,27 +1669,142 @@ impl KhiveRuntime {
             )
             .await?;
         for hit in inbound {
-            graph.delete_edge(LinkId::from(hit.edge_id)).await?;
+            graph
+                .delete_edge(LinkId::from(hit.edge_id), DeleteMode::Hard)
+                .await?;
         }
 
-        Ok(graph.delete_edge(LinkId::from(edge_id)).await?)
+        let deleted = graph.delete_edge(LinkId::from(edge_id), mode).await?;
+        if deleted {
+            let event_store = self.events(token)?;
+            let ns = token.namespace().as_str().to_string();
+            let event = khive_storage::event::Event::new(
+                ns.clone(),
+                "delete",
+                EventKind::EdgeDeleted,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(edge_id)
+            .with_payload(serde_json::json!({"id": edge_id, "namespace": ns, "hard": hard}));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("delete_edge: event store write failed: {e}"))
+            })?;
+        }
+        Ok(deleted)
     }
 
     /// Count edges matching `filter`.
     pub async fn count_edges(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         filter: crate::curation::EdgeListFilter,
     ) -> RuntimeResult<u64> {
-        Ok(self.graph(namespace)?.count_edges(filter.into()).await?)
+        Ok(self.graph(token)?.count_edges(filter.into()).await?)
     }
+
+    /// Validate and construct an edge from a [`LinkSpec`] without writing to storage.
+    ///
+    /// Applies the full ADR-002 contract (endpoint validation, symmetric
+    /// canonicalization, `dependency_kind` inference and metadata validation).
+    /// Returns the constructed `Edge` on success; the caller is responsible for
+    /// persisting it (e.g. via `upsert_edge` or `link_many`).
+    ///
+    /// The `token` must be a pre-authorized namespace token from the dispatch
+    /// layer. If `spec.namespace` is set it must match `token.namespace()`;
+    /// a mismatch returns `RuntimeError::InvalidInput` (ADR-007).
+    pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        let ns_str = match &spec.namespace {
+            Some(s) => {
+                let spec_ns = crate::Namespace::parse(s)
+                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
+                if &spec_ns != token.namespace() {
+                    return Err(RuntimeError::InvalidInput(
+                        "LinkSpec namespace does not match token namespace".into(),
+                    ));
+                }
+                s.as_str()
+            }
+            None => token.namespace().as_str(),
+        };
+        self.validate_edge_relation_endpoints(token, spec.source_id, spec.target_id, spec.relation)
+            .await?;
+        let (source_id, target_id) =
+            canonical_edge_endpoints(spec.relation, spec.source_id, spec.target_id);
+        let metadata = if spec.relation == EdgeRelation::DependsOn {
+            match (
+                self.resolve(token, source_id).await?,
+                self.resolve(token, target_id).await?,
+            ) {
+                (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
+                    merge_dependency_kind(&src_e.kind, &tgt_e.kind, spec.metadata.clone())
+                }
+                _ => spec.metadata.clone(),
+            }
+        } else {
+            spec.metadata.clone()
+        };
+        validate_edge_metadata(spec.relation, metadata.as_ref())?;
+        let now = chrono::Utc::now();
+        Ok(Edge {
+            id: LinkId::from(Uuid::new_v4()),
+            namespace: ns_str.to_string(),
+            source_id,
+            target_id,
+            relation: spec.relation,
+            weight: spec.weight,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata,
+            target_backend: None,
+        })
+    }
+
+    /// Validate and atomically upsert a batch of edges.
+    ///
+    /// All edges are validated and constructed with `build_edge` before any
+    /// write. If validation fails for any entry the entire batch is rejected
+    /// (no writes occur). On success, all edges are persisted in a single
+    /// atomic transaction via `upsert_edges`.
+    ///
+    /// All specs must share the same namespace; the namespace is taken from
+    /// `token` (or validated against it if `spec.namespace` is set).
+    pub async fn link_many(
+        &self,
+        token: &NamespaceToken,
+        specs: Vec<LinkSpec>,
+    ) -> RuntimeResult<Vec<Edge>> {
+        if specs.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut edges = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            edges.push(self.build_edge(token, spec).await?);
+        }
+        self.graph(token)?.upsert_edges(edges.clone()).await?;
+        Ok(edges)
+    }
+}
+
+/// Fully specified edge creation request — input to [`KhiveRuntime::build_edge`]
+/// and [`KhiveRuntime::link_many`].
+#[derive(Clone, Debug)]
+pub struct LinkSpec {
+    pub namespace: Option<String>,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relation: EdgeRelation,
+    pub weight: f64,
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::curation::EdgeListFilter;
-    use crate::runtime::KhiveRuntime;
+    use crate::runtime::{KhiveRuntime, NamespaceToken};
+    use crate::Namespace;
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
@@ -1332,22 +1813,30 @@ mod tests {
     #[tokio::test]
     async fn update_edge_changes_weight() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, None, Some(0.5))
+            .update_edge(
+                &tok,
+                edge_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.5),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!((updated.weight - 0.5).abs() < 0.001);
@@ -1356,22 +1845,30 @@ mod tests {
     #[tokio::test]
     async fn update_edge_changes_relation() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::VariantOf), None)
+            .update_edge(
+                &tok,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::VariantOf),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
@@ -1384,24 +1881,32 @@ mod tests {
     #[tokio::test]
     async fn update_edge_annotates_note_to_entity_set_supersedes_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
-            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
+            .create_note(&tok, "observation", None, "a note", Some(0.5), None, vec![])
             .await
             .unwrap();
         let entity = rt
-            .create_entity(None, "concept", "E", None, None, vec![])
+            .create_entity(&tok, "concept", None, "E", None, None, vec![])
             .await
             .unwrap();
         // Create a valid note→entity annotates edge.
         let edge = rt
-            .link(None, note.id, entity.id, EdgeRelation::Annotates, 1.0)
+            .link(&tok, note.id, entity.id, EdgeRelation::Annotates, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
         // Attempt to change relation to Supersedes (crossing substrates → invalid).
         let result = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::Supersedes), None)
+            .update_edge(
+                &tok,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::Supersedes),
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
@@ -1409,7 +1914,7 @@ mod tests {
         );
 
         // Edge must NOT be mutated — re-fetch and verify relation unchanged.
-        let fetched = rt.get_edge(None, edge_id).await.unwrap().unwrap();
+        let fetched = rt.get_edge(&tok, edge_id).await.unwrap().unwrap();
         assert_eq!(
             fetched.relation,
             EdgeRelation::Annotates,
@@ -1422,22 +1927,30 @@ mod tests {
     #[tokio::test]
     async fn update_edge_entity_to_entity_set_annotates_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
         let result = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::Annotates), None)
+            .update_edge(
+                &tok,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::Annotates),
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
@@ -1450,28 +1963,36 @@ mod tests {
     #[tokio::test]
     async fn update_edge_entity_to_entity_set_supersedes_succeeds() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::Supersedes), None)
+            .update_edge(
+                &tok,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::Supersedes),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::Supersedes);
 
         // Verify persisted.
-        let fetched = rt.get_edge(None, edge_id).await.unwrap().unwrap();
+        let fetched = rt.get_edge(&tok, edge_id).await.unwrap().unwrap();
         assert_eq!(fetched.relation, EdgeRelation::Supersedes);
     }
 
@@ -1479,22 +2000,30 @@ mod tests {
     #[tokio::test]
     async fn update_edge_weight_only_skips_validation() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, None, Some(0.3))
+            .update_edge(
+                &tok,
+                edge_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.3),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::Extends);
@@ -1505,22 +2034,30 @@ mod tests {
     #[tokio::test]
     async fn update_edge_same_class_relation_change_succeeds() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
-            .update_edge(None, edge_id, Some(EdgeRelation::VariantOf), None)
+            .update_edge(
+                &tok,
+                edge_id,
+                crate::curation::EdgePatch {
+                    relation: Some(EdgeRelation::VariantOf),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
@@ -1529,23 +2066,24 @@ mod tests {
     #[tokio::test]
     async fn list_edges_filters_by_relation() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(&tok, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
@@ -1553,7 +2091,7 @@ mod tests {
             relations: vec![EdgeRelation::Extends],
             ..Default::default()
         };
-        let edges = rt.list_edges(None, filter, 100).await.unwrap();
+        let edges = rt.list_edges(&tok, filter, 100).await.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].relation, EdgeRelation::Extends);
     }
@@ -1561,27 +2099,28 @@ mod tests {
     #[tokio::test]
     async fn list_edges_filters_by_source() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
         let d = rt
-            .create_entity(None, "concept", "D", None, None, vec![])
+            .create_entity(&tok, "concept", None, "D", None, None, vec![])
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, c.id, d.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, c.id, d.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
@@ -1589,7 +2128,7 @@ mod tests {
             source_id: Some(a.id),
             ..Default::default()
         };
-        let edges = rt.list_edges(None, filter, 100).await.unwrap();
+        let edges = rt.list_edges(&tok, filter, 100).await.unwrap();
         assert_eq!(edges.len(), 1);
         let src: Uuid = edges[0].source_id;
         assert_eq!(src, a.id);
@@ -1598,59 +2137,61 @@ mod tests {
     #[tokio::test]
     async fn delete_edge_removes_from_storage() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
-        let deleted = rt.delete_edge(None, edge_id).await.unwrap();
+        let deleted = rt.delete_edge(&tok, edge_id, true).await.unwrap();
         assert!(deleted);
 
-        let fetched = rt.get_edge(None, edge_id).await.unwrap();
+        let fetched = rt.get_edge(&tok, edge_id).await.unwrap();
         assert!(fetched.is_none(), "edge should be gone after delete");
     }
 
     #[tokio::test]
     async fn count_edges_matches_filter() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(&tok, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
         let all = rt
-            .count_edges(None, EdgeListFilter::default())
+            .count_edges(&tok, EdgeListFilter::default())
             .await
             .unwrap();
         assert_eq!(all, 2);
 
         let just_extends = rt
             .count_edges(
-                None,
+                &tok,
                 EdgeListFilter {
                     relations: vec![EdgeRelation::Extends],
                     ..Default::default()
@@ -1664,50 +2205,84 @@ mod tests {
     #[tokio::test]
     async fn get_entity_namespace_isolation() {
         let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
         let entity = rt
-            .create_entity(Some("ns-a"), "concept", "Alpha", None, None, vec![])
+            .create_entity(&ns_a, "concept", None, "Alpha", None, None, vec![])
             .await
             .unwrap();
 
         // Same namespace: visible.
-        let found = rt.get_entity(Some("ns-a"), entity.id).await.unwrap();
-        assert!(found.is_some(), "should be visible in its own namespace");
+        let found = rt.get_entity(&ns_a, entity.id).await;
+        assert!(found.is_ok(), "should be visible in its own namespace");
 
-        // Different namespace: invisible.
-        let not_found = rt.get_entity(Some("ns-b"), entity.id).await.unwrap();
+        // Different namespace: NamespaceMismatch error (ADR-007).
+        let not_found = rt.get_entity(&ns_b, entity.id).await;
         assert!(
-            not_found.is_none(),
+            not_found.is_err(),
             "should not be visible across namespaces"
+        );
+        // Must be the specific NamespaceMismatch variant, not generic NotFound.
+        assert!(
+            matches!(not_found.unwrap_err(), crate::RuntimeError::NamespaceMismatch { id } if id == entity.id),
+            "cross-namespace get must return NamespaceMismatch with the entity id"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_mismatch_error_message_is_opaque() {
+        // ADR-007 timing-oracle mitigation: the external error message must not
+        // reveal which namespace the record actually lives in.
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("secret-ns").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("other-ns").unwrap());
+        let entity = rt
+            .create_entity(&ns_a, "concept", None, "Hidden", None, None, vec![])
+            .await
+            .unwrap();
+
+        let err = rt.get_entity(&ns_b, entity.id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("secret-ns"),
+            "error message must not leak the actual namespace; got: {msg}"
+        );
+        assert!(
+            !msg.contains("other-ns"),
+            "error message must not leak the requested namespace; got: {msg}"
         );
     }
 
     #[tokio::test]
     async fn delete_entity_namespace_isolation() {
         let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
         let entity = rt
-            .create_entity(Some("ns-a"), "concept", "Beta", None, None, vec![])
+            .create_entity(&ns_a, "concept", None, "Beta", None, None, vec![])
             .await
             .unwrap();
 
-        // Delete from wrong namespace: no-op, returns false.
-        let deleted = rt
-            .delete_entity(Some("ns-b"), entity.id, true)
-            .await
-            .unwrap();
-        assert!(!deleted, "cross-namespace delete must return false");
+        // Delete from wrong namespace: NamespaceMismatch error (ADR-007 — no information leak).
+        let cross_ns_result = rt.delete_entity(&ns_b, entity.id, true).await;
+        assert!(
+            cross_ns_result.is_err(),
+            "cross-namespace delete must error"
+        );
+        assert!(
+            matches!(cross_ns_result.unwrap_err(), crate::RuntimeError::NamespaceMismatch { id } if id == entity.id),
+            "cross-namespace delete must return NamespaceMismatch, not a generic error"
+        );
 
         // Entity still present in its own namespace.
-        let still_there = rt.get_entity(Some("ns-a"), entity.id).await.unwrap();
+        let still_there = rt.get_entity(&ns_a, entity.id).await;
         assert!(
-            still_there.is_some(),
+            still_there.is_ok(),
             "entity must survive cross-ns delete attempt"
         );
 
         // Delete from correct namespace: succeeds.
-        let deleted_ok = rt
-            .delete_entity(Some("ns-a"), entity.id, true)
-            .await
-            .unwrap();
+        let deleted_ok = rt.delete_entity(&ns_a, entity.id, true).await.unwrap();
         assert!(deleted_ok, "same-namespace delete must succeed");
     }
 
@@ -1716,13 +2291,14 @@ mod tests {
     #[tokio::test]
     async fn create_note_indexes_into_fts5() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "FlashAttention reduces memory by using tiling",
-                0.8,
+                Some(0.8),
                 None,
                 vec![],
             )
@@ -1730,9 +2306,9 @@ mod tests {
             .unwrap();
 
         // FTS5 should have indexed the note content.
-        let ns = rt.ns(None).to_string();
+        let ns = tok.namespace().as_str().to_string();
         let hits = rt
-            .text_for_notes(None)
+            .text_for_notes(&tok)
             .unwrap()
             .search(khive_storage::types::TextSearchRequest {
                 query: "FlashAttention".to_string(),
@@ -1756,14 +2332,15 @@ mod tests {
     #[tokio::test]
     async fn create_note_with_properties() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let props = serde_json::json!({"source": "arxiv:2205.14135"});
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "insight",
                 None,
                 "FlashAttention is IO-aware",
-                0.9,
+                Some(0.9),
                 Some(props.clone()),
                 vec![],
             )
@@ -1776,18 +2353,19 @@ mod tests {
     #[tokio::test]
     async fn create_note_creates_annotates_edges() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
-            .create_entity(None, "concept", "FlashAttention", None, None, vec![])
+            .create_entity(&tok, "concept", None, "FlashAttention", None, None, vec![])
             .await
             .unwrap();
 
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "FlashAttention uses SRAM tiling for memory efficiency",
-                0.9,
+                Some(0.9),
                 None,
                 vec![entity.id],
             )
@@ -1797,7 +2375,7 @@ mod tests {
         // The note should have an outbound `annotates` edge to the entity.
         let out_neighbors = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -1812,7 +2390,7 @@ mod tests {
         // The entity should have an inbound `annotates` edge from the note.
         let in_neighbors = rt
             .neighbors(
-                None,
+                &tok,
                 entity.id,
                 Direction::In,
                 None,
@@ -1827,28 +2405,29 @@ mod tests {
     #[tokio::test]
     async fn neighbors_without_relation_filter_returns_all() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(&tok, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
         let all = rt
-            .neighbors(None, a.id, Direction::Out, None, None)
+            .neighbors(&tok, a.id, Direction::Out, None, None)
             .await
             .unwrap();
         assert_eq!(all.len(), 2);
@@ -1857,29 +2436,30 @@ mod tests {
     #[tokio::test]
     async fn neighbors_with_relation_filter_returns_subset() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", "C", None, None, vec![])
+            .create_entity(&tok, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
 
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, a.id, c.id, EdgeRelation::DependsOn, 1.0)
+        rt.link(&tok, a.id, c.id, EdgeRelation::Enables, 1.0, None)
             .await
             .unwrap();
 
         let filtered = rt
             .neighbors(
-                None,
+                &tok,
                 a.id,
                 Direction::Out,
                 None,
@@ -1895,12 +2475,13 @@ mod tests {
     #[tokio::test]
     async fn search_notes_returns_relevant_note() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         rt.create_note(
-            None,
+            &tok,
             "observation",
             None,
             "GQA reduces KV cache memory for large models",
-            0.8,
+            Some(0.8),
             None,
             vec![],
         )
@@ -1908,7 +2489,7 @@ mod tests {
         .unwrap();
 
         let results = rt
-            .search_notes(None, "GQA KV cache", None, 10, None)
+            .search_notes(&tok, "GQA KV cache", None, 10, None, false)
             .await
             .unwrap();
 
@@ -1927,13 +2508,14 @@ mod tests {
     #[tokio::test]
     async fn search_notes_excludes_soft_deleted() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "RoPE positional encoding rotary embeddings",
-                0.7,
+                Some(0.7),
                 None,
                 vec![],
             )
@@ -1941,14 +2523,14 @@ mod tests {
             .unwrap();
 
         // Soft-delete the note.
-        rt.notes(None)
+        rt.notes(&tok)
             .unwrap()
             .delete_note(note.id, DeleteMode::Soft)
             .await
             .unwrap();
 
         let results = rt
-            .search_notes(None, "RoPE rotary positional", None, 10, None)
+            .search_notes(&tok, "RoPE rotary positional", None, 10, None, false)
             .await
             .unwrap();
 
@@ -1961,12 +2543,13 @@ mod tests {
     #[tokio::test]
     async fn resolve_returns_entity() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
-            .create_entity(None, "concept", "LoRA", None, None, vec![])
+            .create_entity(&tok, "concept", None, "LoRA", None, None, vec![])
             .await
             .unwrap();
 
-        let resolved = rt.resolve(None, entity.id).await.unwrap();
+        let resolved = rt.resolve(&tok, entity.id).await.unwrap();
         match resolved {
             Some(Resolved::Entity(e)) => assert_eq!(e.id, entity.id),
             other => panic!("expected Resolved::Entity, got {:?}", other),
@@ -1976,20 +2559,21 @@ mod tests {
     #[tokio::test]
     async fn resolve_returns_note() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "LoRA fine-tunes LLMs with low-rank adapters",
-                0.85,
+                Some(0.85),
                 None,
                 vec![],
             )
             .await
             .unwrap();
 
-        let resolved = rt.resolve(None, note.id).await.unwrap();
+        let resolved = rt.resolve(&tok, note.id).await.unwrap();
         match resolved {
             Some(Resolved::Note(n)) => assert_eq!(n.id, note.id),
             other => panic!("expected Resolved::Note, got {:?}", other),
@@ -1999,35 +2583,39 @@ mod tests {
     #[tokio::test]
     async fn resolve_returns_none_for_unknown_uuid() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let unknown = Uuid::new_v4();
-        let resolved = rt.resolve(None, unknown).await.unwrap();
+        let resolved = rt.resolve(&tok, unknown).await.unwrap();
         assert!(resolved.is_none(), "unknown UUID should resolve to None");
     }
 
     #[tokio::test]
     async fn resolve_prefix_finds_entity_in_own_namespace() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
-            .create_entity(None, "concept", "PrefixTest", None, None, vec![])
+            .create_entity(&tok, "concept", None, "PrefixTest", None, None, vec![])
             .await
             .unwrap();
         let prefix = &entity.id.to_string()[..8];
 
-        let resolved = rt.resolve_prefix(None, prefix).await.unwrap();
+        let resolved = rt.resolve_prefix(&tok, prefix).await.unwrap();
         assert_eq!(resolved, Some(entity.id));
     }
 
     #[tokio::test]
     async fn resolve_prefix_invisible_across_namespaces() {
         let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
         let entity = rt
-            .create_entity(Some("ns_a"), "concept", "Invisible", None, None, vec![])
+            .create_entity(&ns_a, "concept", None, "Invisible", None, None, vec![])
             .await
             .unwrap();
         let prefix = &entity.id.to_string()[..8];
 
         // From ns_b, the entity in ns_a should not be visible.
-        let resolved = rt.resolve_prefix(Some("ns_b"), prefix).await.unwrap();
+        let resolved = rt.resolve_prefix(&ns_b, prefix).await.unwrap();
         assert_eq!(resolved, None);
     }
 
@@ -2036,6 +2624,7 @@ mod tests {
         use khive_storage::entity::Entity;
 
         let rt = rt();
+        let tok = NamespaceToken::local();
         // Two entities with UUIDs sharing the same 8-char prefix "aabbccdd".
         let id_a = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000001").unwrap();
         let id_b = Uuid::parse_str("aabbccdd-2222-4000-8000-000000000002").unwrap();
@@ -2045,11 +2634,11 @@ mod tests {
         let mut entity_b = Entity::new("local", "concept", "AmbigB");
         entity_b.id = id_b;
 
-        let store = rt.entities(None).unwrap();
+        let store = rt.entities(&tok).unwrap();
         store.upsert_entity(entity_a).await.unwrap();
         store.upsert_entity(entity_b).await.unwrap();
 
-        let result = rt.resolve_prefix(None, "aabbccdd").await;
+        let result = rt.resolve_prefix(&tok, "aabbccdd").await;
         assert!(
             result.is_err(),
             "shared 8-char prefix must return Ambiguous error"
@@ -2065,15 +2654,22 @@ mod tests {
     #[tokio::test]
     async fn resolve_finds_event_by_full_uuid() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
-        let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "actor");
+        let tok = NamespaceToken::local();
+        let ns = tok.namespace().as_str();
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "actor",
+        );
         let event_id = event.id;
-        rt.events(None).unwrap().append_event(event).await.unwrap();
+        rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
-        let resolved = rt.resolve(None, event_id).await.unwrap();
+        let resolved = rt.resolve(&tok, event_id).await.unwrap();
         assert!(
             matches!(resolved, Some(Resolved::Event(_))),
             "event UUID must resolve to Resolved::Event, got {resolved:?}"
@@ -2083,16 +2679,23 @@ mod tests {
     #[tokio::test]
     async fn resolve_prefix_finds_event() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
-        let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "actor");
+        let tok = NamespaceToken::local();
+        let ns = tok.namespace().as_str();
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "actor",
+        );
         let event_id = event.id;
-        rt.events(None).unwrap().append_event(event).await.unwrap();
+        rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
         let prefix = &event_id.to_string()[..8];
-        let resolved = rt.resolve_prefix(None, prefix).await.unwrap();
+        let resolved = rt.resolve_prefix(&tok, prefix).await.unwrap();
         assert_eq!(
             resolved,
             Some(event_id),
@@ -2105,14 +2708,15 @@ mod tests {
     #[tokio::test]
     async fn link_phantom_source_returns_not_found() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, phantom, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, phantom, b.id, EdgeRelation::Extends, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2128,14 +2732,15 @@ mod tests {
     #[tokio::test]
     async fn link_phantom_target_returns_not_found() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, a.id, phantom, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, phantom, EdgeRelation::Extends, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2151,17 +2756,18 @@ mod tests {
     #[tokio::test]
     async fn link_real_entities_succeeds() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
 
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 0.8)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.8, None)
             .await
             .unwrap();
         assert_eq!(edge.source_id, a.id);
@@ -2172,15 +2778,16 @@ mod tests {
     #[tokio::test]
     async fn create_note_annotates_phantom_returns_not_found() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let phantom = Uuid::new_v4();
 
         let result = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "some content",
-                0.5,
+                Some(0.5),
                 None,
                 vec![phantom],
             )
@@ -2194,18 +2801,19 @@ mod tests {
     #[tokio::test]
     async fn create_note_annotates_real_entity_succeeds() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
-            .create_entity(None, "concept", "RealTarget", None, None, vec![])
+            .create_entity(&tok, "concept", None, "RealTarget", None, None, vec![])
             .await
             .unwrap();
 
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "content",
-                0.5,
+                Some(0.5),
                 None,
                 vec![entity.id],
             )
@@ -2214,7 +2822,7 @@ mod tests {
 
         let neighbors = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -2230,22 +2838,23 @@ mod tests {
     #[tokio::test]
     async fn create_note_multi_annotates_creates_all_edges() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let t1 = rt
-            .create_entity(None, "concept", "Target1", None, None, vec![])
+            .create_entity(&tok, "concept", None, "Target1", None, None, vec![])
             .await
             .unwrap();
         let t2 = rt
-            .create_entity(None, "concept", "Target2", None, None, vec![])
+            .create_entity(&tok, "concept", None, "Target2", None, None, vec![])
             .await
             .unwrap();
 
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "content",
-                0.5,
+                Some(0.5),
                 None,
                 vec![t1.id, t2.id],
             )
@@ -2254,7 +2863,7 @@ mod tests {
 
         let neighbors = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -2275,18 +2884,20 @@ mod tests {
     #[tokio::test]
     async fn link_target_in_different_namespace_returns_not_found() {
         let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
         let a = rt
-            .create_entity(Some("ns-a"), "concept", "A", None, None, vec![])
+            .create_entity(&ns_a, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(Some("ns-b"), "concept", "B", None, None, vec![])
+            .create_entity(&ns_b, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
 
         // Linking from ns-a: target b lives in ns-b — must be treated as not found.
         let result = rt
-            .link(Some("ns-a"), a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&ns_a, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await;
         assert!(
             matches!(result, Err(RuntimeError::NotFound(_))),
@@ -2297,10 +2908,11 @@ mod tests {
     #[tokio::test]
     async fn link_phantom_self_loop_returns_not_found() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, phantom, phantom, EdgeRelation::Extends, 1.0)
+            .link(&tok, phantom, phantom, EdgeRelation::Extends, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2318,29 +2930,38 @@ mod tests {
     #[tokio::test]
     async fn link_note_to_edge_annotates_succeeds() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         // Create a real edge between a and b, capture its UUID.
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         // Create a note and annotate the edge itself (edge is a valid substrate target per ADR-024).
         let note = rt
-            .create_note(None, "observation", None, "edge note", 0.5, None, vec![])
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "edge note",
+                Some(0.5),
+                None,
+                vec![],
+            )
             .await
             .unwrap();
 
         let result = rt
-            .link(None, note.id, edge_uuid, EdgeRelation::Annotates, 1.0)
+            .link(&tok, note.id, edge_uuid, EdgeRelation::Annotates, 1.0, None)
             .await;
         assert!(
             result.is_ok(),
@@ -2351,27 +2972,28 @@ mod tests {
     #[tokio::test]
     async fn create_note_annotates_real_edge_succeeds() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "annotating an edge",
-                0.5,
+                Some(0.5),
                 None,
                 vec![edge_uuid],
             )
@@ -2380,7 +3002,7 @@ mod tests {
 
         let neighbors = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -2395,17 +3017,18 @@ mod tests {
     #[tokio::test]
     async fn create_note_annotates_phantom_is_atomic_no_note_persisted() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let phantom = Uuid::new_v4();
 
-        let before_count = rt.list_notes(None, None, 1000, 0).await.unwrap().len();
+        let before_count = rt.list_notes(&tok, None, 1000, 0).await.unwrap().len();
 
         let result = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "should not persist",
-                0.5,
+                Some(0.5),
                 None,
                 vec![phantom],
             )
@@ -2416,7 +3039,7 @@ mod tests {
         );
 
         // Atomicity: the note row must NOT have been written.
-        let after_count = rt.list_notes(None, None, 1000, 0).await.unwrap().len();
+        let after_count = rt.list_notes(&tok, None, 1000, 0).await.unwrap().len();
         assert_eq!(
             before_count, after_count,
             "failed create_note must not persist any note row (atomicity)"
@@ -2424,7 +3047,7 @@ mod tests {
 
         // FTS must not contain the content either.
         let search_hits = rt
-            .search_notes(None, "should not persist", None, 10, None)
+            .search_notes(&tok, "should not persist", None, 10, None, false)
             .await
             .unwrap();
         assert!(
@@ -2441,23 +3064,24 @@ mod tests {
     #[tokio::test]
     async fn link_entity_to_edge_uuid_non_annotates_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         // Create a real edge; capture its UUID as the bad target.
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         let result = rt
-            .link(None, a.id, edge_uuid, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, edge_uuid, EdgeRelation::Extends, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2476,17 +3100,18 @@ mod tests {
     #[tokio::test]
     async fn link_note_as_source_non_annotates_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
-            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
+            .create_note(&tok, "observation", None, "a note", Some(0.5), None, vec![])
             .await
             .unwrap();
         let entity = rt
-            .create_entity(None, "concept", "E", None, None, vec![])
+            .create_entity(&tok, "concept", None, "E", None, None, vec![])
             .await
             .unwrap();
 
         let result = rt
-            .link(None, note.id, entity.id, EdgeRelation::DependsOn, 1.0)
+            .link(&tok, note.id, entity.id, EdgeRelation::DependsOn, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2503,17 +3128,18 @@ mod tests {
     #[tokio::test]
     async fn link_entity_as_annotates_source_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
 
         let result = rt
-            .link(None, a.id, b.id, EdgeRelation::Annotates, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Annotates, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2531,23 +3157,24 @@ mod tests {
     #[tokio::test]
     async fn link_edge_as_annotates_source_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         // An existing edge used as an annotates source: wrong kind, not absent.
         let result = rt
-            .link(None, edge_uuid, a.id, EdgeRelation::Annotates, 1.0)
+            .link(&tok, edge_uuid, a.id, EdgeRelation::Annotates, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2564,16 +3191,17 @@ mod tests {
     #[tokio::test]
     async fn link_note_to_event_annotates_succeeds() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "observing an event",
-                0.6,
+                Some(0.6),
                 None,
                 vec![],
             )
@@ -2581,13 +3209,19 @@ mod tests {
             .unwrap();
 
         // Build an event directly via the store (no runtime create_event exists).
-        let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let ns = tok.namespace().as_str();
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
-        rt.events(None).unwrap().append_event(event).await.unwrap();
+        rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
         let result = rt
-            .link(None, note.id, event_id, EdgeRelation::Annotates, 1.0)
+            .link(&tok, note.id, event_id, EdgeRelation::Annotates, 1.0, None)
             .await;
         assert!(
             result.is_ok(),
@@ -2599,21 +3233,28 @@ mod tests {
     #[tokio::test]
     async fn create_note_annotates_event_succeeds() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
-        let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let tok = NamespaceToken::local();
+        let ns = tok.namespace().as_str();
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
-        rt.events(None).unwrap().append_event(event).await.unwrap();
+        rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
         let result = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "note annotating an event",
-                0.5,
+                Some(0.5),
                 None,
                 vec![event_id],
             )
@@ -2626,7 +3267,7 @@ mod tests {
         let note = result.unwrap();
         let neighbors = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -2644,13 +3285,14 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_note_to_note_succeeds() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let old_note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "old observation",
-                0.7,
+                Some(0.7),
                 None,
                 vec![],
             )
@@ -2658,11 +3300,11 @@ mod tests {
             .unwrap();
         let new_note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "revised observation superseding the old one",
-                0.9,
+                Some(0.9),
                 None,
                 vec![],
             )
@@ -2671,11 +3313,12 @@ mod tests {
 
         let result = rt
             .link(
-                None,
+                &tok,
                 new_note.id,
                 old_note.id,
                 EdgeRelation::Supersedes,
                 1.0,
+                None,
             )
             .await;
         assert!(
@@ -2687,22 +3330,24 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_entity_to_entity_succeeds() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let old_entity = rt
-            .create_entity(None, "concept", "OldConcept", None, None, vec![])
+            .create_entity(&tok, "concept", None, "OldConcept", None, None, vec![])
             .await
             .unwrap();
         let new_entity = rt
-            .create_entity(None, "concept", "NewConcept", None, None, vec![])
+            .create_entity(&tok, "concept", None, "NewConcept", None, None, vec![])
             .await
             .unwrap();
 
         let result = rt
             .link(
-                None,
+                &tok,
                 new_entity.id,
                 old_entity.id,
                 EdgeRelation::Supersedes,
                 1.0,
+                None,
             )
             .await;
         assert!(
@@ -2714,17 +3359,25 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_note_to_entity_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
-            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
+            .create_note(&tok, "observation", None, "a note", Some(0.5), None, vec![])
             .await
             .unwrap();
         let entity = rt
-            .create_entity(None, "concept", "SomeEntity", None, None, vec![])
+            .create_entity(&tok, "concept", None, "SomeEntity", None, None, vec![])
             .await
             .unwrap();
 
         let result = rt
-            .link(None, note.id, entity.id, EdgeRelation::Supersedes, 1.0)
+            .link(
+                &tok,
+                note.id,
+                entity.id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2742,17 +3395,25 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_entity_to_note_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
-            .create_entity(None, "concept", "SomeEntity", None, None, vec![])
+            .create_entity(&tok, "concept", None, "SomeEntity", None, None, vec![])
             .await
             .unwrap();
         let note = rt
-            .create_note(None, "observation", None, "a note", 0.5, None, vec![])
+            .create_note(&tok, "observation", None, "a note", Some(0.5), None, vec![])
             .await
             .unwrap();
 
         let result = rt
-            .link(None, entity.id, note.id, EdgeRelation::Supersedes, 1.0)
+            .link(
+                &tok,
+                entity.id,
+                note.id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2770,21 +3431,35 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_event_source_returns_invalid_input() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
-        let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let tok = NamespaceToken::local();
+        let ns = tok.namespace().as_str();
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
-        rt.events(None).unwrap().append_event(event).await.unwrap();
+        rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
         let entity = rt
-            .create_entity(None, "concept", "SomeEntity", None, None, vec![])
+            .create_entity(&tok, "concept", None, "SomeEntity", None, None, vec![])
             .await
             .unwrap();
 
         let result = rt
-            .link(None, event_id, entity.id, EdgeRelation::Supersedes, 1.0)
+            .link(
+                &tok,
+                event_id,
+                entity.id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2799,21 +3474,35 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_event_target_returns_invalid_input() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
-        let ns = rt.ns(None);
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let tok = NamespaceToken::local();
+        let ns = tok.namespace().as_str();
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
-        rt.events(None).unwrap().append_event(event).await.unwrap();
+        rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
         let entity = rt
-            .create_entity(None, "concept", "SomeEntity", None, None, vec![])
+            .create_entity(&tok, "concept", None, "SomeEntity", None, None, vec![])
             .await
             .unwrap();
 
         let result = rt
-            .link(None, entity.id, event_id, EdgeRelation::Supersedes, 1.0)
+            .link(
+                &tok,
+                entity.id,
+                event_id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2828,22 +3517,23 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_edge_source_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         let result = rt
-            .link(None, edge_uuid, a.id, EdgeRelation::Supersedes, 1.0)
+            .link(&tok, edge_uuid, a.id, EdgeRelation::Supersedes, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2858,22 +3548,23 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_edge_target_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         let result = rt
-            .link(None, a.id, edge_uuid, EdgeRelation::Supersedes, 1.0)
+            .link(&tok, a.id, edge_uuid, EdgeRelation::Supersedes, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::InvalidInput(msg)) => {
@@ -2888,13 +3579,14 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_phantom_source_returns_not_found() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "existing note",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -2903,7 +3595,7 @@ mod tests {
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, phantom, note.id, EdgeRelation::Supersedes, 1.0)
+            .link(&tok, phantom, note.id, EdgeRelation::Supersedes, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2916,13 +3608,14 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_phantom_target_returns_not_found() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "existing note",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -2931,7 +3624,7 @@ mod tests {
         let phantom = Uuid::new_v4();
 
         let result = rt
-            .link(None, note.id, phantom, EdgeRelation::Supersedes, 1.0)
+            .link(&tok, note.id, phantom, EdgeRelation::Supersedes, 1.0, None)
             .await;
         match result {
             Err(RuntimeError::NotFound(msg)) => {
@@ -2944,13 +3637,15 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_cross_namespace_source_returns_not_found() {
         let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
         let note_a = rt
             .create_note(
-                Some("ns-a"),
+                &ns_a,
                 "observation",
                 None,
                 "note in ns-a",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -2958,11 +3653,11 @@ mod tests {
             .unwrap();
         let note_b = rt
             .create_note(
-                Some("ns-b"),
+                &ns_b,
                 "observation",
                 None,
                 "note in ns-b",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -2972,11 +3667,12 @@ mod tests {
         // From ns-a perspective, note_b is in a different namespace — treated as not found.
         let result = rt
             .link(
-                Some("ns-a"),
+                &ns_a,
                 note_b.id,
                 note_a.id,
                 EdgeRelation::Supersedes,
                 1.0,
+                None,
             )
             .await;
         assert!(
@@ -2989,25 +3685,26 @@ mod tests {
     #[tokio::test]
     async fn link_extends_note_source_still_returns_invalid_input() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "a note that cannot be an extends source",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
             .await
             .unwrap();
         let entity = rt
-            .create_entity(None, "concept", "E", None, None, vec![])
+            .create_entity(&tok, "concept", None, "E", None, None, vec![])
             .await
             .unwrap();
 
         let result = rt
-            .link(None, note.id, entity.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, note.id, entity.id, EdgeRelation::Extends, 1.0, None)
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
@@ -3019,27 +3716,28 @@ mod tests {
     #[tokio::test]
     async fn link_annotates_note_to_edge_still_succeeds_after_fix() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "annotating an edge",
-                0.5,
+                Some(0.5),
                 None,
                 vec![],
             )
@@ -3047,7 +3745,7 @@ mod tests {
             .unwrap();
 
         let result = rt
-            .link(None, note.id, edge_uuid, EdgeRelation::Annotates, 1.0)
+            .link(&tok, note.id, edge_uuid, EdgeRelation::Annotates, 1.0, None)
             .await;
         assert!(
             result.is_ok(),
@@ -3071,8 +3769,9 @@ mod tests {
     #[tokio::test]
     async fn create_note_multi_annotates_compensation_cleanup_restores_pristine_state() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let t1 = rt
-            .create_entity(None, "concept", "T1", None, None, vec![])
+            .create_entity(&tok, "concept", None, "T1", None, None, vec![])
             .await
             .unwrap();
 
@@ -3080,11 +3779,11 @@ mod tests {
         // note persisted + first annotates edge created.
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "partial note",
-                0.5,
+                Some(0.5),
                 None,
                 vec![t1.id],
             )
@@ -3092,11 +3791,11 @@ mod tests {
             .unwrap();
 
         // Confirm the partial state exists before compensation.
-        let before_notes = rt.list_notes(None, None, 1000, 0).await.unwrap();
+        let before_notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
         assert_eq!(before_notes.len(), 1, "note must be present before cleanup");
         let before_edges = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -3112,19 +3811,19 @@ mod tests {
         let edge_id: Uuid = before_edges[0].edge_id;
 
         // Execute the same cleanup sequence that `create_note_inner`'s Err branch runs.
-        rt.delete_edge(None, edge_id).await.unwrap();
-        rt.delete_note(None, note.id, true /* hard */)
+        rt.delete_edge(&tok, edge_id, true).await.unwrap();
+        rt.delete_note(&tok, note.id, true /* hard */)
             .await
             .unwrap();
 
         // Post-compensation invariants:
-        let after_notes = rt.list_notes(None, None, 1000, 0).await.unwrap();
+        let after_notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
         assert!(
             after_notes.is_empty(),
             "compensation must remove the note row; got {after_notes:?}"
         );
         let search_hits = rt
-            .search_notes(None, "partial note", None, 10, None)
+            .search_notes(&tok, "partial note", None, 10, None, false)
             .await
             .unwrap();
         assert!(
@@ -3132,7 +3831,7 @@ mod tests {
             "compensation must clean the FTS index; got {search_hits:?}"
         );
         let after_edges = rt
-            .neighbors(None, note.id, Direction::Out, None, None)
+            .neighbors(&tok, note.id, Direction::Out, None, None)
             .await
             .unwrap();
         assert!(
@@ -3151,17 +3850,18 @@ mod tests {
     #[tokio::test]
     async fn annotated_entity_hard_delete_cascades_annotate_edge() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
-            .create_entity(None, "concept", "E", None, None, vec![])
+            .create_entity(&tok, "concept", None, "E", None, None, vec![])
             .await
             .unwrap();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "note about entity",
-                0.5,
+                Some(0.5),
                 None,
                 vec![entity.id],
             )
@@ -3171,7 +3871,7 @@ mod tests {
         // Confirm edge exists before delete.
         let before = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -3186,13 +3886,13 @@ mod tests {
         );
 
         // Hard delete the entity.
-        let deleted = rt.delete_entity(None, entity.id, true).await.unwrap();
+        let deleted = rt.delete_entity(&tok, entity.id, true).await.unwrap();
         assert!(deleted, "entity hard delete must return true");
 
         // Annotates edge must be gone.
         let after = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -3209,19 +3909,28 @@ mod tests {
     #[tokio::test]
     async fn annotated_note_hard_delete_cascades_annotate_edge() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         // note_target is the thing being annotated (a note itself).
         let note_target = rt
-            .create_note(None, "observation", None, "target note", 0.5, None, vec![])
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "target note",
+                Some(0.5),
+                None,
+                vec![],
+            )
             .await
             .unwrap();
         // note_source annotates note_target.
         let note_source = rt
             .create_note(
-                None,
+                &tok,
                 "insight",
                 None,
                 "annotation",
-                0.5,
+                Some(0.5),
                 None,
                 vec![note_target.id],
             )
@@ -3230,7 +3939,7 @@ mod tests {
 
         let before = rt
             .neighbors(
-                None,
+                &tok,
                 note_source.id,
                 Direction::Out,
                 None,
@@ -3245,13 +3954,13 @@ mod tests {
         );
 
         // Hard delete the annotation TARGET note.
-        let deleted = rt.delete_note(None, note_target.id, true).await.unwrap();
+        let deleted = rt.delete_note(&tok, note_target.id, true).await.unwrap();
         assert!(deleted, "note hard delete must return true");
 
         // The annotates edge targeting note_target must be gone.
         let after = rt
             .neighbors(
-                None,
+                &tok,
                 note_source.id,
                 Direction::Out,
                 None,
@@ -3268,17 +3977,18 @@ mod tests {
     #[tokio::test]
     async fn annotated_edge_delete_cascades_annotate_edge() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         // Create an edge to annotate.
         let base_edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 1.0)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         let base_edge_uuid: Uuid = base_edge.id.into();
@@ -3286,11 +3996,11 @@ mod tests {
         // Create a note that annotates the edge.
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "note about edge",
-                0.5,
+                Some(0.5),
                 None,
                 vec![base_edge_uuid],
             )
@@ -3299,7 +4009,7 @@ mod tests {
 
         let before = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -3314,13 +4024,13 @@ mod tests {
         );
 
         // Delete the base edge.
-        let deleted = rt.delete_edge(None, base_edge_uuid).await.unwrap();
+        let deleted = rt.delete_edge(&tok, base_edge_uuid, true).await.unwrap();
         assert!(deleted, "edge delete must return true");
 
         // The annotates edge targeting base_edge must be gone.
         let after = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -3337,23 +4047,24 @@ mod tests {
     #[tokio::test]
     async fn mixed_multi_annotates_partial_target_hard_delete_leaves_remaining_edges() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let t1 = rt
-            .create_entity(None, "concept", "T1", None, None, vec![])
+            .create_entity(&tok, "concept", None, "T1", None, None, vec![])
             .await
             .unwrap();
         let t2 = rt
-            .create_entity(None, "concept", "T2", None, None, vec![])
+            .create_entity(&tok, "concept", None, "T2", None, None, vec![])
             .await
             .unwrap();
 
         // Note annotates both t1 and t2.
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "multi-target note",
-                0.5,
+                Some(0.5),
                 None,
                 vec![t1.id, t2.id],
             )
@@ -3362,7 +4073,7 @@ mod tests {
 
         let before = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -3377,12 +4088,12 @@ mod tests {
         );
 
         // Hard delete only t1.
-        rt.delete_entity(None, t1.id, true).await.unwrap();
+        rt.delete_entity(&tok, t1.id, true).await.unwrap();
 
         // Edge to t1 must be gone, edge to t2 must remain.
         let after = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -3404,17 +4115,18 @@ mod tests {
     #[tokio::test]
     async fn annotated_note_soft_delete_preserves_annotate_edge() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note_target = rt
-            .create_note(None, "observation", None, "target", 0.5, None, vec![])
+            .create_note(&tok, "observation", None, "target", Some(0.5), None, vec![])
             .await
             .unwrap();
         let note_source = rt
             .create_note(
-                None,
+                &tok,
                 "insight",
                 None,
                 "annotation",
-                0.5,
+                Some(0.5),
                 None,
                 vec![note_target.id],
             )
@@ -3423,7 +4135,7 @@ mod tests {
 
         let before = rt
             .neighbors(
-                None,
+                &tok,
                 note_source.id,
                 Direction::Out,
                 None,
@@ -3434,12 +4146,12 @@ mod tests {
         assert_eq!(before.len(), 1);
 
         // Soft delete must NOT cascade edges (data-vs-view principle).
-        let deleted = rt.delete_note(None, note_target.id, false).await.unwrap();
+        let deleted = rt.delete_note(&tok, note_target.id, false).await.unwrap();
         assert!(deleted, "soft delete must return true");
 
         let after = rt
             .neighbors(
-                None,
+                &tok,
                 note_source.id,
                 Direction::Out,
                 None,
@@ -3463,19 +4175,20 @@ mod tests {
     #[tokio::test]
     async fn delete_edge_non_edge_uuid_has_no_side_effects() {
         let rt = rt();
+        let tok = NamespaceToken::local();
 
         // Create an entity that has an inbound annotates edge.
         let entity = rt
-            .create_entity(None, "concept", "Target", None, None, vec![])
+            .create_entity(&tok, "concept", None, "Target", None, None, vec![])
             .await
             .unwrap();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "annotates the entity",
-                0.5,
+                Some(0.5),
                 None,
                 vec![entity.id],
             )
@@ -3485,7 +4198,7 @@ mod tests {
         // Confirm the annotates edge exists.
         let before = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -3497,7 +4210,7 @@ mod tests {
         let annotates_edge_id: Uuid = before[0].edge_id;
 
         // Call delete_edge with the entity UUID (NOT an edge UUID).
-        let result = rt.delete_edge(None, entity.id).await;
+        let result = rt.delete_edge(&tok, entity.id, true).await;
         assert!(
             result.is_ok(),
             "delete_edge must not error on a non-edge UUID"
@@ -3510,7 +4223,7 @@ mod tests {
         // The inbound annotates edge to the entity must still exist — no side effects.
         let after = rt
             .neighbors(
-                None,
+                &tok,
                 note.id,
                 Direction::Out,
                 None,
@@ -3542,12 +4255,13 @@ mod tests {
     #[tokio::test]
     async fn create_note_multi_annotates_second_link_failure_rolls_back_partial_write() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let t1 = rt
-            .create_entity(None, "concept", "T1", None, None, vec![])
+            .create_entity(&tok, "concept", None, "T1", None, None, vec![])
             .await
             .unwrap();
         let t2 = rt
-            .create_entity(None, "concept", "T2", None, None, vec![])
+            .create_entity(&tok, "concept", None, "T2", None, None, vec![])
             .await
             .unwrap();
 
@@ -3556,11 +4270,11 @@ mod tests {
 
         let result = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "rollback target",
-                0.5,
+                Some(0.5),
                 None,
                 vec![t1.id, t2.id],
             )
@@ -3578,7 +4292,7 @@ mod tests {
         );
 
         // Compensation must have removed the note row.
-        let notes = rt.list_notes(None, None, 1000, 0).await.unwrap();
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
         assert!(
             notes.is_empty(),
             "compensation must remove the note row; got {notes:?}"
@@ -3586,7 +4300,7 @@ mod tests {
 
         // FTS must have no hit for the content.
         let hits = rt
-            .search_notes(None, "rollback target", None, 10, None)
+            .search_notes(&tok, "rollback target", None, 10, None, false)
             .await
             .unwrap();
         assert!(
@@ -3597,7 +4311,7 @@ mod tests {
         // No partial annotates edges must remain (first edge must have been deleted).
         let edges_from_t1 = rt
             .neighbors(
-                None,
+                &tok,
                 t1.id,
                 Direction::In,
                 None,
@@ -3607,7 +4321,7 @@ mod tests {
             .unwrap();
         let edges_from_t2 = rt
             .neighbors(
-                None,
+                &tok,
                 t2.id,
                 Direction::In,
                 None,
@@ -3630,10 +4344,12 @@ mod tests {
     #[tokio::test]
     async fn soft_delete_entity_removes_indexes() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
+                None,
                 "QuantumEntanglement",
                 Some("unique FTS term xzqjwv for soft delete test"),
                 None,
@@ -3642,10 +4358,10 @@ mod tests {
             .await
             .unwrap();
 
-        let ns = rt.ns(None).to_string();
+        let ns = tok.namespace().as_str().to_string();
 
         let before = rt
-            .text(None)
+            .text(&tok)
             .unwrap()
             .search(TextSearchRequest {
                 query: "xzqjwv".to_string(),
@@ -3664,11 +4380,11 @@ mod tests {
             "entity must be in FTS before soft-delete"
         );
 
-        let deleted = rt.delete_entity(None, entity.id, false).await.unwrap();
+        let deleted = rt.delete_entity(&tok, entity.id, false).await.unwrap();
         assert!(deleted, "soft delete must return true");
 
         let after = rt
-            .text(None)
+            .text(&tok)
             .unwrap()
             .search(TextSearchRequest {
                 query: "xzqjwv".to_string(),
@@ -3691,13 +4407,14 @@ mod tests {
     #[tokio::test]
     async fn soft_delete_note_removes_indexes() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let note = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "SpectralDecomposition unique term yvwkqz for soft delete test",
-                0.7,
+                Some(0.7),
                 None,
                 vec![],
             )
@@ -3705,7 +4422,7 @@ mod tests {
             .unwrap();
 
         let before = rt
-            .search_notes(None, "yvwkqz", None, 10, None)
+            .search_notes(&tok, "yvwkqz", None, 10, None, false)
             .await
             .unwrap();
         assert!(
@@ -3713,16 +4430,454 @@ mod tests {
             "note must be in FTS before soft-delete"
         );
 
-        let deleted = rt.delete_note(None, note.id, false).await.unwrap();
+        let deleted = rt.delete_note(&tok, note.id, false).await.unwrap();
         assert!(deleted, "soft delete must return true");
 
         let after = rt
-            .search_notes(None, "yvwkqz", None, 10, None)
+            .search_notes(&tok, "yvwkqz", None, 10, None, false)
             .await
             .unwrap();
         assert!(
             after.iter().all(|h| h.note_id != note.id),
             "soft-deleted note must be removed from FTS index"
+        );
+    }
+
+    // F010 (CRIT): ADR-002 base endpoint allowlist — unlisted triples must fail closed.
+    // Document->Document Extends is not in the ADR-002 table; current generic fallthrough accepts it.
+    #[tokio::test]
+    async fn link_extends_document_to_document_returns_invalid_input() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let d1 = rt
+            .create_entity(&tok, "document", None, "DocA", None, None, vec![])
+            .await
+            .unwrap();
+        let d2 = rt
+            .create_entity(&tok, "document", None, "DocB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, d1.id, d2.id, EdgeRelation::Extends, 1.0, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "F010: document->document Extends must be rejected by ADR-002 allowlist; \
+             current generic entity fallthrough incorrectly accepts it"
+        );
+    }
+
+    // F010 happy path: Concept->Concept Extends is in the ADR-002 allowlist and must succeed.
+    #[tokio::test]
+    async fn link_extends_concept_to_concept_succeeds() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "CA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "CB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "F010: concept->concept Extends must be allowed (ADR-002 allowlist)"
+        );
+    }
+
+    // F012 (CRIT): CompetesWith is symmetric; reversed pair must deduplicate to one canonical row.
+    // Current code stores both directions as distinct rows (no canonicalization).
+    #[tokio::test]
+    async fn link_symmetric_relation_canonicalizes_endpoint_order() {
+        use khive_storage::EdgeFilter;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "ConceptP", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "ConceptQ", None, None, vec![])
+            .await
+            .unwrap();
+        // Link A->B then B->A with the same symmetric relation.
+        rt.link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        rt.link(&tok, b.id, a.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        let count = rt
+            .graph(&tok)
+            .unwrap()
+            .count_edges(EdgeFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            count,
+            1,
+            "F012: CompetesWith is symmetric; A->B and B->A must deduplicate to one canonical row; \
+             found {count} rows (canonicalization not yet implemented)"
+        );
+    }
+
+    // F010 (ADR-002): Supersedes — positive tests for all 5 allowed entity kinds.
+    #[tokio::test]
+    async fn f010_supersedes_document_to_document_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "document", None, "DocA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "document", None, "DocB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "document->document Supersedes must be allowed (ADR-002:191), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_artifact_to_artifact_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "artifact", None, "ArtA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "artifact", None, "ArtB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "artifact->artifact Supersedes must be allowed (ADR-002:192), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_service_to_service_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "service", None, "SvcA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "service", None, "SvcB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "service->service Supersedes must be allowed (ADR-002:193), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_dataset_to_dataset_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "dataset", None, "DataA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "dataset", None, "DataB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "dataset->dataset Supersedes must be allowed (ADR-002:194), got {result:?}"
+        );
+    }
+
+    // F010 (ADR-002): Supersedes — negative tests for rejected entity kinds.
+    #[tokio::test]
+    async fn f010_supersedes_project_to_project_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "project", None, "ProjA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "project", None, "ProjB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "project->project Supersedes must be rejected (not in ADR-002 allowlist), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_person_to_person_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "person", None, "Alice", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "person", None, "Bob", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "person->person Supersedes must be rejected (not in ADR-002 allowlist), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f010_supersedes_org_to_org_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "org", None, "OrgA", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "org", None, "OrgB", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "org->org Supersedes must be rejected (not in ADR-002 allowlist), got {result:?}"
+        );
+    }
+
+    // Fix 1: Supersedes entity→entity — same kind (concept→concept) must be allowed.
+    #[tokio::test]
+    async fn f010_supersedes_same_kind_entity_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "OldV", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "NewV", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(&tok, b.id, a.id, EdgeRelation::Supersedes, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "concept->concept Supersedes must be allowed by ADR-002 allowlist, got {result:?}"
+        );
+    }
+
+    // F161: ADR-009 target_backend invariant — all edges written through link() must have
+    // target_backend = None because validate_edge_relation_endpoints already ensured the
+    // target exists locally.
+    #[tokio::test]
+    async fn f161_link_always_writes_null_target_backend() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        assert!(
+            edge.target_backend.is_none(),
+            "ADR-009: target_backend must be None for locally-routed edges (F161); got {:?}",
+            edge.target_backend
+        );
+    }
+
+    // F161: link_many must also write null target_backend for all local edges.
+    #[tokio::test]
+    async fn f161_link_many_always_writes_null_target_backend() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let c = rt
+            .create_entity(&tok, "concept", None, "C", None, None, vec![])
+            .await
+            .unwrap();
+        let specs = vec![
+            LinkSpec {
+                namespace: None,
+                source_id: a.id,
+                target_id: b.id,
+                relation: EdgeRelation::Extends,
+                weight: 1.0,
+                metadata: None,
+            },
+            LinkSpec {
+                namespace: None,
+                source_id: a.id,
+                target_id: c.id,
+                relation: EdgeRelation::Enables,
+                weight: 1.0,
+                metadata: None,
+            },
+        ];
+        let edges = rt.link_many(&tok, specs).await.unwrap();
+        for edge in &edges {
+            assert!(
+                edge.target_backend.is_none(),
+                "ADR-009: target_backend must be None for locally-routed edges in link_many (F161); got {:?}",
+                edge.target_backend
+            );
+        }
+    }
+
+    // F012: symmetric relation neighbors — competes_with queried from the non-canonical
+    // endpoint must still return results when direction=Out is requested.
+    #[tokio::test]
+    async fn f012_symmetric_neighbors_visible_from_both_endpoints() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        // Link A→B competes_with; if A.id > B.id the edge is stored as B→A (canonical).
+        rt.link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        // Both endpoints should see the edge regardless of direction=Out.
+        let from_a = rt
+            .neighbors(
+                &tok,
+                a.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::CompetesWith]),
+            )
+            .await
+            .unwrap();
+        let from_b = rt
+            .neighbors(
+                &tok,
+                b.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::CompetesWith]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            from_a.len(),
+            1,
+            "node A must see competes_with neighbor from Direction::Out (F012); got {from_a:?}"
+        );
+        assert_eq!(
+            from_b.len(),
+            1,
+            "node B must see competes_with neighbor from Direction::Out (F012); got {from_b:?}"
+        );
+    }
+
+    // Fix 1: Supersedes entity→entity — cross-kind (concept→document) must be rejected.
+    #[tokio::test]
+    async fn f010_supersedes_cross_kind_entity_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let concept = rt
+            .create_entity(&tok, "concept", None, "MyConcept", None, None, vec![])
+            .await
+            .unwrap();
+        let doc = rt
+            .create_entity(&tok, "document", None, "MyDoc", None, None, vec![])
+            .await
+            .unwrap();
+        let result = rt
+            .link(
+                &tok,
+                concept.id,
+                doc.id,
+                EdgeRelation::Supersedes,
+                1.0,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(_))),
+            "concept->document Supersedes must be rejected by ADR-002 allowlist, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_note_cross_namespace_returns_mismatch_error() {
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+        let note = rt
+            .create_note(
+                &ns_a,
+                "observation",
+                None,
+                "note in ns-a",
+                Some(0.8),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Attempt to delete from a different namespace must return NamespaceMismatch.
+        let result = rt.delete_note(&ns_b, note.id, true).await;
+        assert!(
+            matches!(result.unwrap_err(), crate::RuntimeError::NamespaceMismatch { id } if id == note.id),
+            "cross-namespace delete_note must return NamespaceMismatch with the note id"
+        );
+
+        // Note must still exist in ns-a after the failed cross-ns delete.
+        let note_store = rt.notes(&ns_a).unwrap();
+        let still_there = note_store.get_note(note.id).await.unwrap();
+        assert!(
+            still_there.is_some(),
+            "note must survive cross-ns delete attempt"
         );
     }
 }

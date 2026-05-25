@@ -24,8 +24,11 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 
-use khive_request::{parse_request, DslError, ParsedOp};
-use khive_runtime::{KhiveRuntime, PackRegistry, RuntimeError, VerbRegistry, VerbRegistryBuilder};
+use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
+use khive_runtime::{
+    present, KhiveRuntime, PackRegistry, PresentationMode, RuntimeError, VerbRegistry,
+    VerbRegistryBuilder,
+};
 
 use crate::tools::request::RequestParams;
 
@@ -123,7 +126,7 @@ impl std::error::Error for PackRegError {}
 /// Built-in pack names known to this binary.
 ///
 /// Sourced from `PackRegistry::discovered_names()` so the list always reflects
-/// whatever pack crates are linked into the binary (ADR-063).
+/// whatever pack crates are linked into the binary (ADR-027).
 pub fn builtin_pack_names() -> Vec<&'static str> {
     PackRegistry::discovered_names()
 }
@@ -135,36 +138,22 @@ impl KhiveMcpServer {
     /// registry. Gate decisions are **hard-enforcing** in v0.3 — a `Deny`
     /// result blocks pack dispatch and returns `PermissionDenied` (ADR-035).
     ///
-    /// Always returns a server. Unknown pack names are logged via `tracing::warn!`
-    /// rather than rejected — startup must remain robust if a future binary drops
-    /// a pack that an older config still names. Use [`Self::with_packs`] for
-    /// strict validation in tests / programmatic callers.
-    pub fn new(runtime: KhiveRuntime) -> Self {
+    /// Fails fast if any requested pack is unknown or has an unsatisfied
+    /// dependency (ADR-027). A misconfigured `KHIVE_PACKS` is a boot error —
+    /// callers must list all required packs explicitly. Use [`Self::with_packs`]
+    /// for the same strict path with an explicit pack list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackRegError`] if any pack in `runtime.config().packs` is
+    /// unknown or if a declared dependency is absent from the list.
+    // The error variant intentionally carries the runtime so callers can recover.
+    #[allow(clippy::result_large_err)]
+    pub fn new(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
         let packs: Vec<String> = runtime.config().packs.clone();
-        Self::with_packs(runtime, &packs).unwrap_or_else(|err| {
-            tracing::warn!("pack registration: {err}; falling back to kg only");
-            let recovered_runtime = err.runtime;
-            let gate = recovered_runtime.config().gate.clone();
-            let default_namespace = recovered_runtime.config().default_namespace.clone();
-            let mut builder = VerbRegistryBuilder::new();
-            builder.with_gate(gate);
-            builder.with_default_namespace(default_namespace);
-            // ADR-035: wire the EventStore for the fallback path too.
-            if let Ok(event_store) = recovered_runtime.events(None) {
-                builder.with_event_store(event_store);
-            }
-            // Fallback: register the kg pack through the inventory registry so
-            // this code path stays free of direct pack-type imports.
-            PackRegistry::register_packs(
-                &["kg".to_string()],
-                recovered_runtime.clone(),
-                &mut builder,
-            )
-            .expect("kg is a known pack name");
-            let registry = builder.build().expect("fallback kg registry builds");
-            recovered_runtime.install_edge_rules(registry.all_edge_rules());
-            Self { registry }
-        })
+        // ADR-014 (c14 hardening): fail-fast on bad packs so callers can decide
+        // recovery. The c12 schema_plan application happens inside with_packs.
+        Self::with_packs(runtime, &packs)
     }
 
     /// Build a server with an explicit pack list (strict — fails on unknown names).
@@ -177,9 +166,11 @@ impl KhiveMcpServer {
         let default_namespace = runtime.config().default_namespace.clone();
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(gate);
-        builder.with_default_namespace(default_namespace);
+        builder.with_default_namespace(default_namespace.as_str());
         // ADR-035: wire the EventStore into the registry for audit persistence.
-        if let Ok(event_store) = runtime.events(None) {
+        if let Ok(event_store) =
+            runtime.events(&runtime.authorize(khive_runtime::Namespace::local()))
+        {
             builder.with_event_store(event_store);
         }
         if let Err(unknown) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
@@ -195,6 +186,10 @@ impl KhiveMcpServer {
         // ADR-031: aggregate pack-declared edge endpoint rules into the runtime
         // so `validate_edge_relation_endpoints` can consult them.
         runtime.install_edge_rules(registry.all_edge_rules());
+        // ADR-017 §c12: apply pack-auxiliary schema plans at startup so pack
+        // tables are present before any handler runs. Errors are logged but
+        // not propagated so a single pack's schema failure cannot abort startup.
+        registry.apply_schema_plans(runtime.backend());
         Ok(Self { registry })
     }
 
@@ -229,40 +224,236 @@ impl KhiveMcpServer {
         build_verb_catalog(verbs)
     }
 
-    /// Run a parsed batch in parallel, gathering per-op results in input order.
-    async fn run_parsed(&self, ops: Vec<ParsedOp>) -> Value {
-        let futures = ops.into_iter().map(|op| {
-            let registry = self.registry.clone();
-            async move {
-                let ParsedOp { tool, args } = op;
-                let args_value = Value::Object(args);
-                match registry.dispatch(&tool, args_value).await {
-                    Ok(result) => json!({ "ok": true, "tool": tool, "result": result }),
-                    Err(RuntimeError::Khive(k)) => {
-                        // Preserve the full structured KhiveError on the wire.
-                        // Non-Khive variants fall through to the flat-string form
-                        // below to keep backward compatibility.
-                        let error_payload = serde_json::to_value(&k).unwrap_or_else(
-                            |_| json!({ "kind": "internal", "message": k.to_string() }),
-                        );
-                        json!({ "ok": false, "tool": tool, "error": error_payload })
-                    }
-                    Err(e) => json!({ "ok": false, "tool": tool, "error": e.to_string() }),
+    /// Dispatch a single [`ParsedOp`] by resolving its args (potentially
+    /// substituting `$prev` references) and calling the [`VerbRegistry`].
+    ///
+    /// Returns a per-op result object: `{ok, tool, result}` on success or
+    /// `{ok: false, tool, error}` on failure.
+    async fn dispatch_op(
+        &self,
+        op: ParsedOp,
+        prev_result: Option<&Value>,
+    ) -> Result<Value, (String, Value)> {
+        let ParsedOp { tool, args } = op;
+
+        // Resolve args — substitute $prev references when prev_result is Some.
+        let mut resolved: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (name, arg_val) in args {
+            let value = match &arg_val {
+                ArgValue::Value(v) => v.clone(),
+                ArgValue::PrevRef { path } => {
+                    let prev = prev_result.ok_or_else(|| {
+                        (
+                            tool.clone(),
+                            json!({
+                                "kind": "substitution_error",
+                                "message": format!(
+                                    "argument {name:?}: $prev reference in non-chain context"
+                                )
+                            }),
+                        )
+                    })?;
+                    let extracted = arg_val.resolve_prev(prev).ok_or_else(|| {
+                        let display_path = if path.is_empty() {
+                            "$prev".to_string()
+                        } else {
+                            format!("$prev.{path}")
+                        };
+                        (
+                            tool.clone(),
+                            json!({
+                                "kind": "substitution_error",
+                                "message": format!(
+                                    "argument {name:?}: path {display_path:?} not found in prior result"
+                                ),
+                                "path": display_path
+                            }),
+                        )
+                    })?;
+                    extracted.clone()
                 }
+            };
+            resolved.insert(name, value);
+        }
+
+        let args_value = Value::Object(resolved);
+        match self.registry.dispatch(&tool, args_value).await {
+            Ok(result) => Ok(json!({ "ok": true, "tool": tool, "result": result })),
+            Err(RuntimeError::Khive(k)) => {
+                let error_payload = serde_json::to_value(&k)
+                    .unwrap_or_else(|_| json!({ "kind": "internal", "message": k.to_string() }));
+                Err((tool, error_payload))
             }
-        });
-        let results: Vec<Value> = futures::future::join_all(futures).await;
-        let total = results.len();
-        let succeeded = results
-            .iter()
-            .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
-            .count();
-        let failed = total - succeeded;
-        json!({
-            "results": results,
-            "summary": { "total": total, "succeeded": succeeded, "failed": failed },
-        })
+            Err(e) => Err((tool, json!(e.to_string()))),
+        }
     }
+
+    /// Execute a parsed request, dispatching according to its [`ExecutionMode`].
+    ///
+    /// - `Single` / `Parallel`: all ops run concurrently; per-op failure does
+    ///   not abort siblings. `aborted` count is always 0.
+    /// - `Chain`: ops run sequentially; `$prev` from each op's result is
+    ///   substituted into the next op's args. If any op fails (or a `$prev`
+    ///   substitution fails), remaining ops appear as `aborted: true`.
+    ///
+    /// Presentation transforms (ADR-045) are applied per-op AFTER dispatch,
+    /// using `mode_for_op` to determine the mode per position. Chain `$prev`
+    /// substitution uses canonical (verbose) handler output; the transform runs
+    /// only at the final response-envelope boundary.
+    ///
+    /// Response envelope (ADR-016):
+    /// ```json
+    /// {
+    ///   "results": [...],
+    ///   "summary": { "total": N, "succeeded": K, "failed": M, "aborted": A }
+    /// }
+    /// ```
+    async fn run_parsed(
+        &self,
+        ops: Vec<ParsedOp>,
+        mode: ExecutionMode,
+        presentation: PresentationMode,
+        presentation_per_op: Option<Vec<Option<PresentationMode>>>,
+    ) -> Value {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Resolve per-op presentation mode: per-op entry overrides batch default.
+        let mode_for_op = |i: usize| -> PresentationMode {
+            presentation_per_op
+                .as_ref()
+                .and_then(|v| v.get(i))
+                .and_then(|o| *o)
+                .unwrap_or(presentation)
+        };
+
+        match mode {
+            ExecutionMode::Single | ExecutionMode::Parallel => {
+                // Independent dispatch — run all concurrently, results in input order.
+                let futures = ops.into_iter().enumerate().map(|(i, op)| {
+                    let registry = self.registry.clone();
+                    let op_mode = mode_for_op(i);
+                    async move {
+                        let tool = op.tool.clone();
+                        // No $prev in parallel/single mode.
+                        let mut resolved: serde_json::Map<String, Value> =
+                            serde_json::Map::new();
+                        for (name, arg_val) in &op.args {
+                            let value = match arg_val {
+                                ArgValue::Value(v) => v.clone(),
+                                ArgValue::PrevRef { .. } => {
+                                    // $prev in non-chain context: treat as error for this op.
+                                    return json!({
+                                        "ok": false,
+                                        "tool": tool,
+                                        "error": format!(
+                                            "argument {name:?}: $prev reference is only valid in chain (|) mode"
+                                        )
+                                    });
+                                }
+                            };
+                            resolved.insert(name.clone(), value);
+                        }
+                        let args_value = Value::Object(resolved);
+                        match registry.dispatch(&tool, args_value).await {
+                            Ok(result) => {
+                                let presented = present(result, op_mode, now_unix);
+                                json!({ "ok": true, "tool": tool, "result": presented })
+                            }
+                            Err(RuntimeError::Khive(k)) => {
+                                let error_payload = serde_json::to_value(&k).unwrap_or_else(
+                                    |_| json!({ "kind": "internal", "message": k.to_string() }),
+                                );
+                                json!({ "ok": false, "tool": tool, "error": error_payload })
+                            }
+                            Err(e) => json!({ "ok": false, "tool": tool, "error": e.to_string() }),
+                        }
+                    }
+                });
+                let results: Vec<Value> = futures::future::join_all(futures).await;
+                let total = results.len();
+                let succeeded = results
+                    .iter()
+                    .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
+                    .count();
+                let failed = total - succeeded;
+                json!({
+                    "results": results,
+                    "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": 0 },
+                })
+            }
+            ExecutionMode::Chain => {
+                // Sequential execution with $prev substitution and abort-on-failure.
+                // $prev uses canonical (verbose) handler output — presentation runs
+                // only at the final response-envelope boundary (ADR-045 §4).
+                let total = ops.len();
+                let mut results: Vec<Value> = Vec::with_capacity(total);
+                // prev_result holds the CANONICAL result (pre-presentation) for $prev.
+                let mut prev_result: Option<Value> = None;
+                let mut aborted_from: Option<usize> = None;
+
+                for (i, op) in ops.into_iter().enumerate() {
+                    if aborted_from.is_some() {
+                        // A prior op failed — mark remaining as aborted.
+                        results.push(json!({ "ok": false, "tool": op.tool, "aborted": true }));
+                        continue;
+                    }
+                    let op_mode = mode_for_op(i);
+                    match self.dispatch_op(op, prev_result.as_ref()).await {
+                        Ok(result_obj) => {
+                            // Extract canonical result for $prev (pre-presentation).
+                            prev_result = result_obj.get("result").cloned();
+                            // Apply presentation to the result field only.
+                            let presented_obj =
+                                apply_presentation_to_result(result_obj, op_mode, now_unix);
+                            results.push(presented_obj);
+                        }
+                        Err((tool, error_payload)) => {
+                            results
+                                .push(json!({ "ok": false, "tool": tool, "error": error_payload }));
+                            aborted_from = Some(i + 1);
+                        }
+                    }
+                }
+
+                let succeeded = results
+                    .iter()
+                    .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
+                    .count();
+                let aborted = results
+                    .iter()
+                    .filter(|r| r.get("aborted").and_then(Value::as_bool) == Some(true))
+                    .count();
+                let failed = total - succeeded - aborted;
+                json!({
+                    "results": results,
+                    "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": aborted },
+                })
+            }
+        }
+    }
+}
+
+/// Apply the presentation transform to the `result` field of a successful
+/// per-op envelope, leaving error envelopes unchanged.
+///
+/// Per ADR-045 §3.5: "Error envelopes are NEVER transformed."
+fn apply_presentation_to_result(
+    mut result_obj: Value,
+    mode: PresentationMode,
+    now_unix: i64,
+) -> Value {
+    if result_obj.get("ok").and_then(Value::as_bool) == Some(true) {
+        if let Some(result_field) = result_obj.get("result").cloned() {
+            let presented = present(result_field, mode, now_unix);
+            if let Some(obj) = result_obj.as_object_mut() {
+                obj.insert("result".to_string(), presented);
+            }
+        }
+    }
+    result_obj
 }
 
 // ── single MCP tool ─────────────────────────────────────────────────────────
@@ -271,33 +462,62 @@ impl KhiveMcpServer {
 impl KhiveMcpServer {
     #[tool(description = r#"Run one or more khive verbs in a single MCP call.
 
-ops syntax (ADR-020):
+ops syntax (ADR-016):
 
   Single op   : verb(name=value, name=value)
   Batch       : [verb(...), verb(...)]                 — parallel, max 100
+  Chain       : verb1(...) | verb2(id=$prev.id)        — sequential, $prev
   JSON form   : [{"tool":"verb","args":{...}}, ...]    — equivalent
 
 Argument values are JSON literals: strings (double-quoted), numbers, booleans,
 null, arrays, objects. Strings may contain commas / parens; escape with \".
+Chain-only: $prev resolves to the prior op's result; $prev.field.path extracts
+a nested field.
 
 Response shape:
 
   {
     "results": [ {"ok": true, "tool": "verb", "result": {...}}, ... ],
-    "summary": { "total": N, "succeeded": N, "failed": N }
+    "summary": { "total": N, "succeeded": N, "failed": N, "aborted": N }
   }
 
-A failed op does NOT abort the batch. Each entry has its own ok / error.
+Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
+ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
 schemas live in each pack's docs and SKILL.md files.
 
 Tip: for one-shot calls, the single-op form is the densest. Use batch when
-several independent ops can run together (e.g. bulk create + link)."#)]
+several independent ops can run together; use chain when each op needs the prior
+result (e.g. create then link with the new entity's id)."#)]
     async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
-        let result = self.run_parsed(parsed.ops).await;
+
+        // Parse presentation strings → PresentationMode (ADR-045).
+        let presentation = parse_presentation_mode(p.presentation.as_deref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let presentation_per_op: Option<Vec<Option<PresentationMode>>> =
+            if let Some(per_op_strs) = p.presentation_per_op {
+                let mut modes = Vec::with_capacity(per_op_strs.len());
+                for s in per_op_strs {
+                    let mode = match s.as_deref() {
+                        None => None,
+                        Some(v) => Some(
+                            parse_presentation_mode(Some(v))
+                                .map_err(|e| McpError::invalid_params(e, None))?,
+                        ),
+                    };
+                    modes.push(mode);
+                }
+                Some(modes)
+            } else {
+                None
+            };
+
+        let result = self
+            .run_parsed(parsed.ops, parsed.mode, presentation, presentation_per_op)
+            .await;
         serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))
     }
@@ -305,6 +525,20 @@ several independent ops can run together (e.g. bulk create + link)."#)]
 
 fn dsl_err_to_mcp(e: DslError) -> McpError {
     McpError::invalid_params(e.to_string(), None)
+}
+
+/// Parse an optional presentation mode string from the request envelope.
+///
+/// `None` → default (`Agent`). Known values: `"agent"`, `"verbose"`, `"human"`.
+fn parse_presentation_mode(s: Option<&str>) -> Result<PresentationMode, String> {
+    match s {
+        None | Some("agent") => Ok(PresentationMode::Agent),
+        Some("verbose") => Ok(PresentationMode::Verbose),
+        Some("human") => Ok(PresentationMode::Human),
+        Some(other) => Err(format!(
+            "unknown presentation mode {other:?}; valid values: \"agent\", \"verbose\", \"human\""
+        )),
+    }
 }
 
 #[tool_handler]

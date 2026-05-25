@@ -33,7 +33,7 @@ function printUsage(): void {
 Usage:
   khive kg <subcommand>     Manage the git-native knowledge graph
   khive pack <subcommand>   Author and validate declarative packs (ADR-050)
-  khive auth <subcommand>   Authenticate with khive.ai (optional)
+  khive auth <subcommand>   Authenticate with khive (optional)
 
 KG subcommands:
   init          Initialise .khive/kg/ in the current git repo
@@ -59,11 +59,11 @@ Pack subcommands (ADR-050):
   check         Validate a pack.yaml manifest
 
 Auth subcommands:
-  login         Sign in to khive.ai via GitHub OAuth
+  login         Sign in via GitHub OAuth
   status        Show current authentication state
   logout        Remove stored credentials
 
-All 'khive kg' commands work without a khive.ai account.
+All 'khive kg' commands work without a khive auth account.
 
 Run 'khive <group> <subcommand> --help' for detailed usage.`);
 }
@@ -97,7 +97,7 @@ function printAuthUsage(): void {
   console.log(`Usage: khive auth <subcommand>
 
 Subcommands:
-  login         Sign in to khive.ai
+  login         Sign in via GitHub OAuth
   status        Show authentication state
   logout        Remove stored credentials`);
 }

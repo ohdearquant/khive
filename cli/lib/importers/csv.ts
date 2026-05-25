@@ -1,5 +1,5 @@
 /**
- * CSV / TSV adapter (ADR-055 §2 — P0 format).
+ * CSV / TSV adapter (ADR-036 §2 — P0 format).
  *
  * Parses a CSV file into entity + edge records. Auto-detects whether the file
  * is an entity list or an edge list from the presence of `source` and `target`
@@ -7,7 +7,7 @@
  *   - file with source + target columns → edges
  *   - otherwise                          → entities (name required)
  *
- * Mapping files (ADR-055 §2 P0) are a future extension; this Phase E1 adapter
+ * Mapping files (ADR-036 §2 P0) are a future extension; this Phase E1 adapter
  * accepts only auto-detected schemas.
  *
  * Fatal errors (throw): empty/no-header CSV, missing required column, missing

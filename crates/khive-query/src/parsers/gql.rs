@@ -1,14 +1,15 @@
 //! Hand-written recursive descent parser for GQL subset.
 //!
 //! Grammar:
-//!   query     = 'MATCH' pattern ['WHERE' conditions] 'RETURN' items ['LIMIT' number]
+//!   query     = 'MATCH' pattern ['WHERE' where_expr] 'RETURN' items ['LIMIT' number]
 //!   pattern   = node_pat (edge_pat node_pat)*
 //!   node_pat  = '(' [var] [':' ident] [props] ')'
 //!   edge_pat  = '-[' [var] [':' rels] [range] ']->' | '<-[' ... ']-' | '-[' ... ']-'
 //!   rels      = ident ('|' ident)*
 //!   range     = '*' number ['..' number]
 //!   props     = '{' key ':' value (',' key ':' value)* '}'
-//!   conditions = condition ('AND' condition)*
+//!   where_expr = and_expr ('OR' and_expr)*
+//!   and_expr   = condition ('AND' condition)*
 //!   condition  = var '.' prop op value
 //!   items     = item (',' item)*
 //!   item      = var | var '.' prop
@@ -213,6 +214,7 @@ impl Parser {
             return Ok(NodePattern {
                 variable,
                 kind,
+                entity_type: None,
                 properties,
             });
         }
@@ -245,10 +247,15 @@ impl Parser {
             properties = self.parse_props()?;
         }
 
+        // Lift entity_type out of properties so the SQL compiler targets the
+        // dedicated column instead of json_extract(properties, '$.entity_type').
+        let entity_type = properties.remove("entity_type");
+
         self.expect_char(')')?;
         Ok(NodePattern {
             variable,
             kind,
+            entity_type,
             properties,
         })
     }
@@ -403,28 +410,49 @@ impl Parser {
         }
     }
 
-    fn parse_conditions(&mut self) -> Result<Vec<Condition>, QueryError> {
-        let mut conditions = Vec::new();
-        loop {
-            self.skip_whitespace();
-            let variable = self.parse_ident()?;
-            self.expect_char('.')?;
-            let property = self.parse_ident()?;
-            let op = self.parse_compare_op()?;
-            let value = self.parse_value()?;
-            conditions.push(Condition {
-                variable,
-                property,
-                op,
-                value,
-            });
+    fn parse_condition(&mut self) -> Result<Condition, QueryError> {
+        self.skip_whitespace();
+        let variable = self.parse_ident()?;
+        self.expect_char('.')?;
+        let property = self.parse_ident()?;
+        let op = self.parse_compare_op()?;
+        let value = self.parse_value()?;
+        Ok(Condition {
+            variable,
+            property,
+            op,
+            value,
+        })
+    }
 
+    /// Parse a single AND-chain of conditions.
+    fn parse_and_expr(&mut self) -> Result<WhereExpr, QueryError> {
+        let first = WhereExpr::Condition(self.parse_condition()?);
+        let mut acc = first;
+        loop {
             self.skip_whitespace();
             if !self.try_keyword("AND") {
                 break;
             }
+            let rhs = WhereExpr::Condition(self.parse_condition()?);
+            acc = WhereExpr::And(Box::new(acc), Box::new(rhs));
         }
-        Ok(conditions)
+        Ok(acc)
+    }
+
+    /// Parse a WHERE expression: and_expr ('OR' and_expr)* (ADR-008 §"GQL WHERE expression").
+    fn parse_where_expr(&mut self) -> Result<WhereExpr, QueryError> {
+        let first = self.parse_and_expr()?;
+        let mut acc = first;
+        loop {
+            self.skip_whitespace();
+            if !self.try_keyword("OR") {
+                break;
+            }
+            let rhs = self.parse_and_expr()?;
+            acc = WhereExpr::Or(Box::new(acc), Box::new(rhs));
+        }
+        Ok(acc)
     }
 
     fn parse_return_items(&mut self) -> Result<Vec<ReturnItem>, QueryError> {
@@ -458,9 +486,9 @@ impl Parser {
         let pattern = self.parse_pattern()?;
 
         let where_clause = if self.try_keyword("WHERE") {
-            self.parse_conditions()?
+            self.parse_where_expr()?
         } else {
-            Vec::new()
+            WhereExpr::True
         };
 
         self.expect_keyword("RETURN")?;
@@ -539,9 +567,51 @@ mod tests {
         let q = parse(
             "MATCH (a)-[e:implements]->(b:project) WHERE b.name = 'lattice-inference' RETURN a LIMIT 10"
         ).unwrap();
-        assert_eq!(q.where_clause.len(), 1);
-        assert_eq!(q.where_clause[0].variable, "b");
-        assert_eq!(q.where_clause[0].property, "name");
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0].variable, "b");
+        assert_eq!(conds[0].property, "name");
+    }
+
+    #[test]
+    fn where_clause_and() {
+        let q = parse(
+            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'LoRA' AND b.kind = 'concept' RETURN a, b"
+        ).unwrap();
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(conds.len(), 2, "AND should produce two leaf conditions");
+        assert!(
+            matches!(&q.where_clause, WhereExpr::And(_, _)),
+            "should be And node"
+        );
+    }
+
+    #[test]
+    fn where_clause_or() {
+        let q = parse(
+            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'LoRA' OR a.name = 'QLoRA' RETURN a",
+        )
+        .unwrap();
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(conds.len(), 2, "OR should produce two leaf conditions");
+        assert!(
+            matches!(&q.where_clause, WhereExpr::Or(_, _)),
+            "should be Or node"
+        );
+    }
+
+    #[test]
+    fn where_clause_and_or() {
+        // AND binds tighter than OR: `a AND b OR c` = `(a AND b) OR c`
+        let q = parse(
+            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'X' AND a.kind = 'concept' OR b.kind = 'project' RETURN a"
+        ).unwrap();
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(conds.len(), 3);
+        assert!(
+            matches!(&q.where_clause, WhereExpr::Or(_, _)),
+            "top-level should be Or"
+        );
     }
 
     #[test]
@@ -566,5 +636,20 @@ mod tests {
         assert_eq!(q.pattern.elements.len(), 5);
         let nodes: Vec<_> = q.pattern.nodes().collect();
         assert_eq!(nodes.len(), 3);
+    }
+
+    #[test]
+    fn node_pattern_entity_type_lifted_from_properties() {
+        let q = parse("MATCH (n:document {entity_type: 'paper'}) RETURN n").unwrap();
+        let nodes: Vec<_> = q.pattern.nodes().collect();
+        assert_eq!(
+            nodes[0].entity_type.as_deref(),
+            Some("paper"),
+            "entity_type must be lifted into NodePattern.entity_type"
+        );
+        assert!(
+            !nodes[0].properties.contains_key("entity_type"),
+            "entity_type must be removed from the properties map after lifting"
+        );
     }
 }

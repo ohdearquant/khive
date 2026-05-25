@@ -22,10 +22,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
+
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
-use crate::stores::{entity, event, graph, note, text, vectors};
+use crate::stores::{entity, event, graph, note, sparse, text, vectors};
 
 /// Concrete storage backend providing capability traits.
 pub struct StorageBackend {
@@ -88,6 +90,34 @@ impl StorageBackend {
     ) -> Result<(), SqliteError> {
         let writer = self.pool.try_writer()?;
         crate::migrations::apply_schema_plan(writer.conn(), plan)
+    }
+
+    /// Apply pack-auxiliary DDL statements (ADR-017 §Storage profile and
+    /// pack-auxiliary schema).
+    ///
+    /// Executes each DDL statement idempotently via `execute_batch`. Each
+    /// statement MUST be self-contained and use `CREATE TABLE IF NOT EXISTS`
+    /// (or equivalent idempotent DDL) so that calling this method more than
+    /// once does not fail.
+    ///
+    /// Pack auxiliary tables are NOT tracked in `_schema_versions` — they are
+    /// non-versioned in v1 (ADR-017). Use `apply_schema` with a
+    /// `ServiceSchemaPlan` when version tracking is needed.
+    ///
+    /// This method is lower-level than `PackRuntime::schema_plan()` — the
+    /// runtime bootstrap calls `pack.schema_plan().statements` and passes the
+    /// slice here. The `SchemaPlan` type lives in `khive-runtime` (above this
+    /// crate in the dep chain); this method accepts a plain `&[&'static str]`
+    /// to avoid a circular dependency.
+    pub fn apply_pack_ddl_statements(
+        &self,
+        statements: &[&'static str],
+    ) -> Result<(), SqliteError> {
+        let writer = self.pool.try_writer()?;
+        for &stmt in statements {
+            writer.conn().execute_batch(stmt)?;
+        }
+        Ok(())
     }
 
     /// Get an EntityStore. Applies the entities DDL if not already present.
@@ -247,17 +277,78 @@ impl StorageBackend {
         // Ensure sqlite-vec is registered before creating vec0 tables.
         crate::extension::ensure_extensions_loaded();
 
-        // Create the vec0 virtual table. Idempotent.
+        let table = format!("vec_{}", model_key);
+        let writer = self.pool.try_writer()?;
+
+        // Detect old-schema vec0 tables that predate the `field` column (ADR-044).
+        // vec0 virtual tables do not support ALTER TABLE, so we must drop and recreate
+        // the table if it exists without the `field` column. Vector data is a cache —
+        // callers can re-embed from the source record after the table is rebuilt.
+        // Use pragma_table_info to check columns directly; substring matching on the
+        // CREATE DDL is fragile (a model_key containing "field" would false-match).
+        let table_exists: bool = writer
+            .conn()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                rusqlite::params![&table],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(SqliteError::Rusqlite)?
+            .is_some();
+
+        if table_exists {
+            let has_field: bool = {
+                let pragma = format!("PRAGMA table_xinfo({})", table);
+                let mut stmt = writer.conn().prepare(&pragma)?;
+                let mut rows = stmt.query([])?;
+                let mut found = false;
+                while let Some(row) = rows.next()? {
+                    let name: String = row.get(1)?;
+                    if name == "field" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if !has_field {
+                let drop_ddl = format!("DROP TABLE IF EXISTS {}", table);
+                writer.conn().execute_batch(&drop_ddl)?;
+            }
+        }
+
+        // Ensure the _embedding_models registry table exists (ADR-043 §1).
+        // This is a no-op when the table already exists. Running it here ensures
+        // the registry is present for any caller that opens a vector store without
+        // first calling run_migrations() (e.g., tests that create stores directly).
+        // Production callers are expected to call run_migrations() at startup, which
+        // creates the registry via V14; this is a belt-and-suspenders fallback.
+        // Schema is defined in `migrations::EMBEDDING_MODELS_DDL` (single source of
+        // truth) to prevent the two copies from silently drifting.
+        writer
+            .conn()
+            .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
+
+        // Create the vec0 virtual table. Idempotent on fresh databases and after the
+        // old-schema rebuild above.
+        //
+        // NOTE: `embedding_model_id` is NOT included in this DDL because sqlite-vec
+        // enforces NOT NULL on TEXT metadata columns at insert time, so the column
+        // cannot be added at virtual-table creation as a nullable FK.  The column will
+        // be present after the ADR-043 §8 startup backfill rebuild (steps 2-4), which
+        // is deferred to a follow-up PR — see the tracking issue filed against MAJ-2
+        // of codex round-1 review of PR #374.
         let ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
              subject_id TEXT PRIMARY KEY, \
              namespace TEXT NOT NULL, \
              kind TEXT NOT NULL, \
+             field TEXT NOT NULL, \
              embedding float[{}] distance_metric=cosine\
              )",
             model_key, dimensions
         );
-        let writer = self.pool.try_writer()?;
         writer.conn().execute_batch(&ddl)?;
 
         Ok(Arc::new(vectors::SqliteVecStore::new(
@@ -265,6 +356,51 @@ impl StorageBackend {
             self.is_file_backed,
             model_key.to_string(),
             dimensions,
+            namespace.trim().to_string(),
+        )?))
+    }
+
+    /// Get a SparseStore for a specific model key, scoped to the default namespace.
+    ///
+    /// Creates the sparse table if it does not already exist.
+    pub fn sparse(
+        &self,
+        model_key: &str,
+    ) -> Result<Arc<dyn khive_storage::SparseStore>, SqliteError> {
+        self.sparse_for_namespace(model_key, "local")
+    }
+
+    /// Get a SparseStore for a specific model key with an explicit default namespace.
+    ///
+    /// The `model_key` must contain only ASCII alphanumeric/underscore characters.
+    pub fn sparse_for_namespace(
+        &self,
+        model_key: &str,
+        namespace: &str,
+    ) -> Result<Arc<dyn khive_storage::SparseStore>, SqliteError> {
+        if model_key.is_empty()
+            || !model_key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(SqliteError::InvalidData(format!(
+                "invalid model_key '{}': must be non-empty and contain only alphanumeric/underscore characters",
+                model_key
+            )));
+        }
+        if namespace.trim().is_empty() {
+            return Err(SqliteError::InvalidData(
+                "sparse store namespace must be non-empty".to_string(),
+            ));
+        }
+
+        let writer = self.pool.try_writer()?;
+        sparse::ensure_sparse_schema(writer.conn(), model_key).map_err(SqliteError::Rusqlite)?;
+
+        Ok(Arc::new(sparse::SqliteSparseStore::new(
+            Arc::clone(&self.pool),
+            self.is_file_backed,
+            model_key.to_string(),
             namespace.trim().to_string(),
         )?))
     }
@@ -471,17 +607,20 @@ mod tests {
                 id,
                 khive_types::SubstrateKind::Entity,
                 "local",
-                vec![1.0, 0.0, 0.0],
+                "content",
+                vec![vec![1.0, 0.0, 0.0]],
             )
             .await
             .unwrap();
 
         let hits = store
             .search(khive_storage::types::VectorSearchRequest {
-                query_embedding: vec![1.0, 0.0, 0.0],
+                query_vectors: vec![vec![1.0, 0.0, 0.0]],
                 top_k: 1,
                 namespace: None,
                 kind: None,
+                filter: None,
+                backend_hints: None,
             })
             .await
             .unwrap();
@@ -505,7 +644,8 @@ mod tests {
                 id,
                 khive_types::SubstrateKind::Entity,
                 "local",
-                vec![1.0, 0.0, 0.0],
+                "content",
+                vec![vec![1.0, 0.0, 0.0]],
             )
             .await
             .unwrap();

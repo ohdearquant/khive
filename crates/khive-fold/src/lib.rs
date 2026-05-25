@@ -33,6 +33,10 @@ mod error;
 mod fold;
 mod result;
 
+// ── Checkpoint protocol ─────────────────────────────────────────────────
+
+pub mod checkpoint;
+
 pub use compose::{filter, map, DualFold, FilterFold, MapFold, SequentialFold};
 pub use context::{FoldContext, SharedJson};
 pub use error::{FoldError, FoldResult, FoldResult as FoldResultType};
@@ -41,6 +45,10 @@ pub use fold::{
     Fold, FoldFailure, SumI64Fold, TryFold,
 };
 pub use result::FoldOutcome;
+
+// ── Checkpoint re-exports ────────────────────────────────────────────────
+
+pub use checkpoint::{Checkpoint, CheckpointStore, InMemoryCheckpointStore};
 
 // ── Anchor primitive ────────────────────────────────────────────────────
 
@@ -71,6 +79,36 @@ pub use objective::compose::{
 pub use objective::error::{ObjectiveError, ObjectiveResult};
 pub use objective::{objective_fn, DeterministicObjective, Objective, ObjectiveContext, Selection};
 pub use ordering::{
-    canonical_f32, canonical_f64, cmp_asc_score_then_id, cmp_desc_score_then_id, HasId, QuantKey,
-    Ranked, ScoredEntry,
+    canonical_f32, canonical_f64, cmp_asc_score_then_id, cmp_desc_score_then_id, HasId, Ranked,
+    ScoredEntry,
 };
+
+// ── ComposePipeline ─────────────────────────────────────────────────────
+
+/// Pipeline that scores candidates with an objective then packs to budget via a selector.
+pub struct ComposePipeline<T> {
+    pub anchor: Box<dyn Anchor>,
+    pub objective: Box<dyn Objective<T>>,
+    pub selector: Box<dyn Selector<T>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> ComposePipeline<T> {
+    /// Score candidates with the objective, then pack under budget with the selector.
+    pub fn execute(
+        &self,
+        _graph: &AnchorGraph,
+        candidates: Vec<SelectorInput<T>>,
+        budget: usize,
+        weights: &SelectorWeights,
+        context: &ObjectiveContext,
+    ) -> Result<SelectorOutput<T>, FoldError> {
+        let scored = candidates
+            .into_iter()
+            .map(|mut candidate| {
+                candidate.score = self.objective.score(&candidate.content, context) as f32;
+                candidate
+            })
+            .collect();
+        self.selector.select(scored, budget, weights)
+    }
+}

@@ -103,6 +103,19 @@ pub enum RuntimeError {
         second_idx: usize,
     },
 
+    /// Two packs declared the same `Visibility::Verb` handler name (ADR-017
+    /// §Boot-time collision checks). `Visibility::Subhandler` entries are
+    /// pack-prefixed and do not participate in cross-pack collision checks.
+    #[error(
+        "verb collision: verb {verb:?} declared by both pack {first_pack:?} and pack \
+         {second_pack:?}; rename one handler or use Visibility::Subhandler for internal verbs"
+    )]
+    VerbCollision {
+        verb: String,
+        first_pack: String,
+        second_pack: String,
+    },
+
     /// Gate denied this verb invocation (ADR-035).
     ///
     /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns
@@ -116,6 +129,70 @@ pub enum RuntimeError {
     /// `kind`, `code`, `details`, and `retry_hint` without information loss.
     #[error("{0}")]
     Khive(khive_types::KhiveError),
+
+    /// Record exists but belongs to a different namespace than the provided token.
+    ///
+    /// Externally reported as "not found in this namespace" to avoid leaking
+    /// cross-namespace existence information (ADR-007 timing-oracle mitigation).
+    #[error("not found in this namespace")]
+    NamespaceMismatch { id: uuid::Uuid },
+
+    /// A short-prefix lookup matched more than one record (ADR-016 §UUID arguments).
+    ///
+    /// `prefix` is the 8+ hex-char prefix supplied by the caller.
+    /// `matches` holds the full UUIDs of all matching records (at most 2 are
+    /// reported to bound the scan — callers must supply the full UUID to disambiguate).
+    #[error("ambiguous prefix {prefix:?}: matches {}", format_uuid_list(matches))]
+    AmbiguousPrefix {
+        prefix: String,
+        matches: Vec<uuid::Uuid>,
+    },
+
+    /// Cross-backend `merge_entity` is unsupported in v1 (ADR-009 §cross-backend-merge).
+    ///
+    /// Both entities must reside on the same backend. To merge entities on different
+    /// backends, manually export `from_id`, delete it, and re-import on `into_id`'s backend.
+    #[error(
+        "cross-backend merge is not supported: \
+         into_id {into_id} is on backend '{into_backend}', \
+         from_id {from_id} is on backend '{from_backend}'. \
+         Both entities must be on the same backend to merge."
+    )]
+    CrossBackendMergeUnsupported {
+        into_id: uuid::Uuid,
+        from_id: uuid::Uuid,
+        into_backend: String,
+        from_backend: String,
+    },
+
+    // ── ADR-037: Remote Resolution and Content-Hash Verification ─────────────
+    /// A `kg://` ref names a remote not declared in `schema.yaml`.
+    #[error("unknown remote: {name:?}")]
+    UnknownRemote { name: String },
+
+    /// A remote cache entry is absent and `--fetch` was not requested.
+    #[error("remote cache missing for remote={remote:?} namespace={namespace:?}")]
+    RemoteCacheMissing { remote: String, namespace: String },
+
+    /// A short ID matches multiple entities in the same namespace or remote cache.
+    #[error("ambiguous id {id:?}: matched {count} records")]
+    AmbiguousId { id: String, count: usize },
+
+    /// A write operation targeted a remote namespace, which is read-only.
+    #[error("cross-namespace write denied: cannot write to remote namespace {namespace:?}")]
+    CrossNamespaceWrite { namespace: String },
+
+    /// A remote fetch failed (network error, authentication failure, etc.).
+    #[error("remote fetch error for remote={remote:?}: {message}")]
+    RemoteFetchError { remote: String, message: String },
+}
+
+fn format_uuid_list(uuids: &[uuid::Uuid]) -> String {
+    let shorts: Vec<String> = uuids
+        .iter()
+        .map(|u| u.to_string()[..8].to_string())
+        .collect();
+    shorts.join(", ")
 }
 
 impl From<khive_types::KhiveError> for RuntimeError {

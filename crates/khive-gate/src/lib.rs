@@ -16,7 +16,7 @@
 //! let gate: GateRef = Arc::new(AllowAllGate);
 //! let req = GateRequest::new(
 //!     ActorRef::anonymous(),
-//!     Namespace::default_ns(),
+//!     Namespace::local(),
 //!     "search",
 //!     json!({"query": "LoRA"}),
 //! );
@@ -307,7 +307,7 @@ mod tests {
     fn sample_request() -> GateRequest {
         GateRequest::new(
             ActorRef::anonymous(),
-            Namespace::default_ns(),
+            Namespace::local(),
             "search",
             json!({"query": "LoRA"}),
         )
@@ -444,7 +444,7 @@ mod tests {
     fn sample_req_with_session() -> GateRequest {
         GateRequest::new(
             ActorRef::new("user", "ocean"),
-            Namespace::default_ns(),
+            Namespace::local(),
             "create",
             json!({"kind": "concept"}),
         )

@@ -599,7 +599,7 @@ impl Bm25Index {
     /// Emits `bm25.search.duration_ms`, `bm25.search.count`, and
     /// `bm25.search.results` metrics when a sink is attached.
     ///
-    /// **PROOF CORRESPONDENCE**: `Lion.Retrieval.BM25.bm25_nonneg`
+    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.BM25.bm25_nonneg`
     /// Total BM25 score >= 0 for any query and document, since it is a sum of
     /// non-negative IDF values multiplied by non-negative TF components.
     /// Returns up to `k` (id, score) pairs sorted by BM25 score descending.
@@ -792,7 +792,7 @@ impl Bm25Index {
     /// on other targets). Pre-converted f32 document lengths avoid per-scoring
     /// integer-to-float conversion.
     ///
-    /// **PROOF CORRESPONDENCE**: `Lion.Retrieval.BM25.tf_bounded`
+    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.BM25.tf_bounded`
     /// TF saturation: tf * (k1 + 1) / (tf + k1 * ...) < k1 + 1 for all tf >= 0.
     pub(crate) fn search_brute_force(
         &self,
@@ -1068,10 +1068,10 @@ impl Bm25Index {
     /// This variant always returns non-negative IDF (Robertson-Walker variant).
     /// Uses interior mutability for cache updates to enable concurrent reads.
     ///
-    /// **PROOF CORRESPONDENCE**: `Lion.Retrieval.BM25.idf_nonneg`
+    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.BM25.idf_nonneg`
     /// With +1 inside ln(), IDF(t) >= 0 for all terms regardless of document frequency.
     ///
-    /// **PROOF CORRESPONDENCE**: `Lion.Retrieval.BM25.idf_mono`
+    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.BM25.idf_mono`
     /// Rarer terms have higher IDF: n1 < n2 implies IDF(n1) > IDF(n2).
     pub(super) fn compute_idf(&self, term: &str, doc_count: usize) -> f64 {
         use std::sync::atomic::Ordering as AtomicOrdering;

@@ -10,15 +10,40 @@
 //! consumes whatever is registered and prints it.
 
 use anyhow::{anyhow, Context, Result};
-use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder, Visibility};
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use serde::Serialize;
 
-/// Description of a single registered verb.
+/// Visibility tier of a registered handler (ADR-017 §Visibility).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VerbVisibility {
+    /// Externally invokable — surfaced on the MCP `request` tool wire.
+    Verb,
+    /// Internal pipeline step — addressable via the DSL but NOT on the MCP wire.
+    Subhandler,
+}
+
+impl From<&Visibility> for VerbVisibility {
+    fn from(v: &Visibility) -> Self {
+        match v {
+            Visibility::Verb => VerbVisibility::Verb,
+            Visibility::Subhandler => VerbVisibility::Subhandler,
+        }
+    }
+}
+
+/// Description of a single registered handler (ADR-017 §Introspection, F126).
+///
+/// Includes `visibility` and `category` alongside `name` and `description`
+/// so introspection clients can distinguish MCP-exposed verbs from internal
+/// subhandlers and surface speech-act classification.
 #[derive(Debug, Serialize)]
 pub struct VerbInfo {
     pub name: String,
     pub description: String,
+    pub visibility: VerbVisibility,
+    pub category: String,
 }
 
 /// Description of a single registered pack.
@@ -37,7 +62,8 @@ pub struct PackInfo {
 fn build_registry() -> Result<(VerbRegistry, KhiveRuntime)> {
     let config = RuntimeConfig {
         db_path: None,
-        default_namespace: "kkernel-introspect".to_string(),
+        default_namespace: khive_runtime::Namespace::parse("kkernel-introspect")
+            .unwrap_or_else(|_| khive_runtime::Namespace::local()),
         embedding_model: None,
         ..RuntimeConfig::default()
     };
@@ -81,6 +107,8 @@ fn pack_info_from_registry(registry: &VerbRegistry, name: &str) -> Option<PackIn
             .map(|v| VerbInfo {
                 name: v.name.to_string(),
                 description: v.description.to_string(),
+                visibility: VerbVisibility::from(&v.visibility),
+                category: format!("{:?}", v.category),
             })
             .collect(),
     })
@@ -135,13 +163,53 @@ mod tests {
             "kg pack must expose verbs; got {:?}",
             info.verbs
         );
-        // ADR-024 requires 11 KG verbs
+        // ADR-024 requires 11 KG verbs; ADR-046 adds propose/review/withdraw → 14 total
         assert_eq!(
             info.verbs.len(),
-            11,
-            "kg pack must expose 11 verbs (ADR-024); got {}: {:?}",
+            14,
+            "kg pack must expose 14 verbs (ADR-024 + ADR-046); got {}: {:?}",
             info.verbs.len(),
             info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
+        // F126: VerbInfo must include visibility and category fields.
+        let create = info.verbs.iter().find(|v| v.name == "create").unwrap();
+        assert_eq!(
+            create.visibility,
+            VerbVisibility::Verb,
+            "kg create must have Verb visibility"
+        );
+        assert!(
+            !create.category.is_empty(),
+            "kg create must have a non-empty category"
+        );
+    }
+
+    #[test]
+    fn memory_pack_subhandlers_carry_subhandler_visibility() {
+        let info = pack_handler("memory")
+            .expect("pack_handler succeeds")
+            .expect("memory pack must exist");
+        // recall.embed, recall.candidates, recall.fuse, recall.score are Subhandler.
+        let subhandlers: Vec<&VerbInfo> = info
+            .verbs
+            .iter()
+            .filter(|v| v.visibility == VerbVisibility::Subhandler)
+            .collect();
+        assert!(
+            !subhandlers.is_empty(),
+            "memory pack must have subhandler entries; got none in {:?}",
+            info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
+        // recall.embed must be a subhandler.
+        let embed = info
+            .verbs
+            .iter()
+            .find(|v| v.name == "recall.embed")
+            .expect("recall.embed must be in the handler list");
+        assert_eq!(
+            embed.visibility,
+            VerbVisibility::Subhandler,
+            "recall.embed must have Subhandler visibility (F119)"
         );
     }
 

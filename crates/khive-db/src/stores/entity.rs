@@ -109,13 +109,16 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
     let id_str: String = row.get(0)?;
     let namespace: String = row.get(1)?;
     let kind: String = row.get(2)?;
-    let name: String = row.get(3)?;
-    let description: Option<String> = row.get(4)?;
-    let properties_str: Option<String> = row.get(5)?;
-    let tags_str: String = row.get(6)?;
-    let created_at: i64 = row.get(7)?;
-    let updated_at: i64 = row.get(8)?;
-    let deleted_at: Option<i64> = row.get(9)?;
+    let entity_type: Option<String> = row.get(3)?;
+    let name: String = row.get(4)?;
+    let description: Option<String> = row.get(5)?;
+    let properties_str: Option<String> = row.get(6)?;
+    let tags_str: String = row.get(7)?;
+    let created_at: i64 = row.get(8)?;
+    let updated_at: i64 = row.get(9)?;
+    let deleted_at: Option<i64> = row.get(10)?;
+    let merged_into_str: Option<String> = row.get(11)?;
+    let merge_event_id_str: Option<String> = row.get(12)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -123,7 +126,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         .map(|s| {
             serde_json::from_str(&s).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    5,
+                    6,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -132,13 +135,30 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         .transpose()?;
 
     let tags: Vec<String> = serde_json::from_str(&tags_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
     })?;
+
+    let merged_into = merged_into_str
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+    let merge_event_id = merge_event_id_str
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
     Ok(Entity {
         id,
         namespace,
         kind,
+        entity_type,
         name,
         description,
         properties,
@@ -146,6 +166,8 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         created_at,
         updated_at,
         deleted_at,
+        merged_into,
+        merge_event_id,
     })
 }
 
@@ -189,6 +211,18 @@ fn build_entity_where(
         conditions.push(format!("kind IN ({})", placeholders.join(", ")));
     }
 
+    if !filter.entity_types.is_empty() {
+        let placeholders: Vec<String> = filter
+            .entity_types
+            .iter()
+            .map(|t| {
+                params.push(Box::new(t.clone()));
+                format!("?{}", params.len())
+            })
+            .collect();
+        conditions.push(format!("entity_type IN ({})", placeholders.join(", ")));
+    }
+
     if let Some(ref prefix) = filter.name_prefix {
         params.push(Box::new(format!("{}%", prefix)));
         conditions.push(format!("name LIKE ?{}", params.len()));
@@ -228,16 +262,20 @@ impl EntityStore for SqlEntityStore {
             .map(|v| serde_json::to_string(v).unwrap_or_default());
         let tags_str = serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
 
+        let merged_into_str = entity.merged_into.map(|u| u.to_string());
+        let merge_event_id_str = entity.merge_event_id.map(|u| u.to_string());
+
         self.with_writer("upsert_entity", move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO entities \
-                 (id, namespace, kind, name, description, properties, tags, \
-                  created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, namespace, kind, entity_type, name, description, properties, tags, \
+                  created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     id_str,
                     namespace,
                     entity.kind,
+                    entity.entity_type,
                     entity.name,
                     entity.description,
                     properties_str,
@@ -245,6 +283,8 @@ impl EntityStore for SqlEntityStore {
                     entity.created_at,
                     entity.updated_at,
                     entity.deleted_at,
+                    merged_into_str,
+                    merge_event_id_str,
                 ],
             )?;
             Ok(())
@@ -273,15 +313,18 @@ impl EntityStore for SqlEntityStore {
                 let tags_str =
                     serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
 
+                let merged_into_str = entity.merged_into.map(|u| u.to_string());
+                let merge_event_id_str = entity.merge_event_id.map(|u| u.to_string());
                 match conn.execute(
                     "INSERT OR REPLACE INTO entities \
-                     (id, namespace, kind, name, description, properties, tags, \
-                      created_at, updated_at, deleted_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     (id, namespace, kind, entity_type, name, description, properties, tags, \
+                      created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     rusqlite::params![
                         id_str,
                         &entity.namespace,
                         entity.kind,
+                        entity.entity_type,
                         entity.name,
                         entity.description,
                         properties_str,
@@ -289,6 +332,8 @@ impl EntityStore for SqlEntityStore {
                         entity.created_at,
                         entity.updated_at,
                         entity.deleted_at,
+                        merged_into_str,
+                        merge_event_id_str,
                     ],
                 ) {
                     Ok(_) => affected += 1,
@@ -320,8 +365,8 @@ impl EntityStore for SqlEntityStore {
 
         self.with_reader("get_entity", move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, namespace, kind, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at \
+                "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
+                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
                  FROM entities WHERE id = ?1 AND deleted_at IS NULL",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -388,8 +433,8 @@ impl EntityStore for SqlEntityStore {
             let offset_idx = data_params.len();
 
             let data_sql = format!(
-                "SELECT id, namespace, kind, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at \
+                "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
+                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
                  FROM entities{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
@@ -441,18 +486,23 @@ const ENTITIES_DDL: &str = "\
         id TEXT PRIMARY KEY,\
         namespace TEXT NOT NULL,\
         kind TEXT NOT NULL,\
+        entity_type TEXT,\
         name TEXT NOT NULL,\
         description TEXT,\
         properties TEXT,\
         tags TEXT NOT NULL DEFAULT '[]',\
         created_at INTEGER NOT NULL,\
         updated_at INTEGER NOT NULL,\
-        deleted_at INTEGER\
+        deleted_at INTEGER,\
+        merged_into TEXT,\
+        merge_event_id TEXT\
     );\
     CREATE INDEX IF NOT EXISTS idx_entities_namespace ON entities(namespace);\
     CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(namespace, kind);\
+    CREATE INDEX IF NOT EXISTS idx_entities_kind_entity_type ON entities(namespace, kind, entity_type);\
     CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(namespace, name);\
     CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC);\
+    CREATE INDEX IF NOT EXISTS idx_entities_merged_into ON entities(namespace, merged_into);\
 ";
 
 pub(crate) fn ensure_entities_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
@@ -491,6 +541,7 @@ mod tests {
             id: Uuid::new_v4(),
             namespace: namespace.to_string(),
             kind: kind.to_string(),
+            entity_type: None,
             name: name.to_string(),
             description: None,
             properties: None,
@@ -498,6 +549,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            merged_into: None,
+            merge_event_id: None,
         }
     }
 
@@ -821,6 +874,50 @@ mod tests {
         assert!(!names.contains(&"E2"));
     }
 
+    #[tokio::test]
+    async fn test_entity_type_roundtrip() {
+        let store = setup_memory_store();
+
+        let entity =
+            Entity::new("default", "document", "ResearchPaper").with_entity_type(Some("paper"));
+        let id = entity.id;
+
+        store.upsert_entity(entity).await.unwrap();
+
+        let fetched = store.get_entity(id).await.unwrap().unwrap();
+        assert_eq!(fetched.entity_type, Some("paper".to_string()));
+        assert_eq!(fetched.kind, "document");
+        assert_eq!(fetched.name, "ResearchPaper");
+    }
+
+    #[tokio::test]
+    async fn test_query_by_kind_and_entity_type() {
+        let store = setup_memory_store_ns("et_ns");
+
+        let typed =
+            Entity::new("et_ns", "person", "Researcher").with_entity_type(Some("researcher"));
+        let untyped = make_entity("et_ns", "person", "Generic");
+
+        store.upsert_entity(typed).await.unwrap();
+        store.upsert_entity(untyped).await.unwrap();
+
+        let result = store
+            .query_entities(
+                "et_ns",
+                EntityFilter {
+                    entity_types: vec!["researcher".to_string()],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].name, "Researcher");
+        assert_eq!(result.items[0].entity_type, Some("researcher".to_string()));
+    }
+
     /// UUID is globally unique (id TEXT PRIMARY KEY). Upserting the same UUID in a
     /// different namespace overwrites the row (INSERT OR REPLACE). get_entity by ID
     /// returns whichever namespace currently owns that UUID.
@@ -836,6 +933,7 @@ mod tests {
             id: shared_id,
             namespace: "ns_a".to_string(),
             kind: "concept".to_string(),
+            entity_type: None,
             name: "SharedInA".to_string(),
             description: None,
             properties: None,
@@ -843,6 +941,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            merged_into: None,
+            merge_event_id: None,
         };
         store.upsert_entity(entity_a).await.unwrap();
 
@@ -856,6 +956,7 @@ mod tests {
             id: shared_id,
             namespace: "ns_b".to_string(),
             kind: "concept".to_string(),
+            entity_type: None,
             name: "SharedInB".to_string(),
             description: None,
             properties: None,
@@ -863,6 +964,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted_at: None,
+            merged_into: None,
+            merge_event_id: None,
         };
         store.upsert_entity(entity_b).await.unwrap();
 

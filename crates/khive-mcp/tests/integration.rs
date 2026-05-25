@@ -5,9 +5,13 @@
 use async_trait::async_trait;
 use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{
-    KhiveRuntime, PackRuntime, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+    KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig, RuntimeError,
+    VerbRegistry, VerbRegistryBuilder,
 };
-use khive_types::{Details, ErrorCode as KhiveErrorCode, ErrorDomain, KhiveError, Pack, VerbDef};
+use khive_types::{
+    Details, ErrorCode as KhiveErrorCode, ErrorDomain, HandlerDef, KhiveError, Pack, VerbCategory,
+    Visibility,
+};
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult, ClientInfo, ErrorCode},
     ClientHandler, ServerHandler, ServiceError, ServiceExt,
@@ -17,13 +21,13 @@ use serde_json::{json, Value};
 fn make_server() -> KhiveMcpServer {
     let config = RuntimeConfig {
         db_path: None,
-        default_namespace: "test".to_string(),
+        default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         packs: vec!["kg".to_string(), "gtd".to_string()],
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-    KhiveMcpServer::new(runtime)
+    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd")
 }
 
 #[derive(Clone, Default)]
@@ -67,12 +71,19 @@ async fn call(
 }
 
 /// Helper: run a single op via `request` and return the parsed `result` field
-/// of the first entry. Panics if the op failed.
+/// of the first entry. Uses `presentation: "verbose"` so tests receive full
+/// canonical UUIDs and timestamps (not Agent-mode short forms). Panics if the
+/// op failed.
 async fn ok_one(
     client: &impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>,
     ops: &str,
 ) -> anyhow::Result<Value> {
-    let result = call(client, "request", json!({"ops": ops})).await?;
+    let result = call(
+        client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = body["results"].get(0).cloned().unwrap_or(Value::Null);
     assert_eq!(
@@ -330,13 +341,13 @@ async fn unknown_verb_returns_per_op_failure_not_invalid_params() -> anyhow::Res
 async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
     let config = RuntimeConfig {
         db_path: None,
-        default_namespace: "test".to_string(),
+        default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         packs: vec!["kg".to_string()],
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).unwrap();
-    let server = KhiveMcpServer::new(runtime);
+    let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
     let info = server.get_info();
     let instructions = info.instructions.unwrap_or_default();
     assert!(instructions.contains("create"), "kg verb missing");
@@ -347,25 +358,45 @@ async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
 }
 
 #[tokio::test]
-async fn pack_gtd_auto_loads_kg_via_transitive_requires() {
-    // GTD declares requires(&["kg"]) — requesting only "gtd" must auto-load "kg"
-    // so that kg verbs (e.g. "create") are present alongside gtd verbs (e.g. "assign").
+async fn pack_gtd_without_kg_fails_at_boot() {
+    // ADR-027: gtd declares requires=["kg"]; omitting "kg" from the pack list
+    // must fail at boot with a clear error — not silently auto-add kg.
     let config = RuntimeConfig {
         db_path: None,
-        default_namespace: "test".to_string(),
+        default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
         packs: vec!["gtd".to_string()],
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).unwrap();
-    let server = KhiveMcpServer::new(runtime);
+    match KhiveMcpServer::new(runtime) {
+        Ok(_) => panic!("gtd without kg must fail: missing dependency is a boot error (ADR-027)"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("kg") || msg.contains("unknown pack"),
+                "error must name the missing dependency: {msg}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pack_gtd_with_kg_explicit_works() {
+    // When both kg and gtd are listed, gtd's requires=["kg"] is satisfied.
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("test").unwrap(),
+        embedding_model: None,
+        packs: vec!["kg".to_string(), "gtd".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).unwrap();
+    let server = KhiveMcpServer::new(runtime).expect("kg+gtd builds");
     let info = server.get_info();
     let instructions = info.instructions.unwrap_or_default();
     assert!(instructions.contains("assign"), "gtd verb must be present");
-    assert!(
-        instructions.contains("create"),
-        "kg verb must be auto-loaded via gtd's transitive requires"
-    );
+    assert!(instructions.contains("create"), "kg verb must be present");
 }
 
 #[tokio::test]
@@ -912,9 +943,11 @@ impl khive_types::Pack for ErrorInjectPack {
     const NAME: &'static str = "error-inject";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const VERBS: &'static [VerbDef] = &[VerbDef {
+    const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
         name: "always_fail",
         description: "always returns a KhiveError::unavailable with code + details",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     }];
 }
 
@@ -932,8 +965,8 @@ impl PackRuntime for ErrorInjectPack {
         &[]
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        ErrorInjectPack::VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        ErrorInjectPack::HANDLERS
     }
 
     async fn dispatch(
@@ -941,6 +974,7 @@ impl PackRuntime for ErrorInjectPack {
         _verb: &str,
         _params: serde_json::Value,
         _registry: &VerbRegistry,
+        _token: &NamespaceToken,
     ) -> Result<serde_json::Value, RuntimeError> {
         let err = KhiveError::unavailable("downstream service offline")
             .with_code(KhiveErrorCode::new(ErrorDomain::Runtime, 10))

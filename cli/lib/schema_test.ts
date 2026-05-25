@@ -1,6 +1,6 @@
 /**
- * Tests for schema.yaml parser — specifically the ADR-048 remotes format
- * (list of {name, repo, path, commit} entries).
+ * Tests for schema.yaml parser — specifically the ADR-037 remotes format
+ * (list of {name, url, ref, namespace, pin?} entries).
  */
 
 import { assertEquals } from "@std/assert";
@@ -22,9 +22,9 @@ async function writeSchema(dir: string, content: string): Promise<string> {
   return dir;
 }
 
-// ─── remotes (ADR-048 §3 format) ─────────────────────────────────────────────
+// ─── remotes (ADR-037 shape: {name, url, ref, namespace, pin?}) ──────────────
 
-Deno.test("loadSchema: parses ADR-048 remotes as list of {name, repo, path, commit}", async () => {
+Deno.test("loadSchema: parses ADR-037 remotes as list of {name, url, ref, namespace}", async () => {
   const dir = await makeTempDir();
   try {
     await writeSchema(
@@ -37,13 +37,14 @@ Deno.test("loadSchema: parses ADR-048 remotes as list of {name, repo, path, comm
         "  - relation: implements",
         "remotes:",
         "  - name: lattice",
-        "    repo: ohdearquant/lattice",
-        "    path: .khive/kg",
-        "    commit: a1b2c3d4e5f6789012345678901234567890abcd",
+        "    url: https://github.com/ohdearquant/lattice.git",
+        "    ref: main",
+        "    namespace: lattice",
         "  - name: atlas",
-        "    repo: ohdearquant/atlas",
-        "    path: .khive/kg",
-        "    commit: f9e8d7c6b5a4321098765432109876543210fedc",
+        "    url: https://github.com/ohdearquant/atlas.git",
+        "    ref: main",
+        "    namespace: atlas",
+        "    pin: sha256:a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef12345678",
       ].join("\n") + "\n",
     );
 
@@ -53,15 +54,20 @@ Deno.test("loadSchema: parses ADR-048 remotes as list of {name, repo, path, comm
 
     const lattice = schema.remotes![0];
     assertEquals(lattice.name, "lattice");
-    assertEquals(lattice.repo, "ohdearquant/lattice");
-    assertEquals(lattice.path, ".khive/kg");
-    assertEquals(lattice.commit, "a1b2c3d4e5f6789012345678901234567890abcd");
+    assertEquals(lattice.url, "https://github.com/ohdearquant/lattice.git");
+    assertEquals(lattice.ref, "main");
+    assertEquals(lattice.namespace, "lattice");
+    assertEquals(lattice.pin, undefined);
 
     const atlas = schema.remotes![1];
     assertEquals(atlas.name, "atlas");
-    assertEquals(atlas.repo, "ohdearquant/atlas");
-    assertEquals(atlas.path, ".khive/kg");
-    assertEquals(atlas.commit, "f9e8d7c6b5a4321098765432109876543210fedc");
+    assertEquals(atlas.url, "https://github.com/ohdearquant/atlas.git");
+    assertEquals(atlas.ref, "main");
+    assertEquals(atlas.namespace, "atlas");
+    assertEquals(
+      atlas.pin,
+      "sha256:a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef12345678",
+    );
   } finally {
     await removeDir(dir);
   }

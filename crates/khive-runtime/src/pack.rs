@@ -14,31 +14,71 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::runtime::NamespaceToken;
 use async_trait::async_trait;
 use khive_gate::{ActorRef, AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
-use khive_storage::{Event, EventStore, SubstrateKind};
-use khive_types::{EventOutcome, Namespace};
+use khive_storage::{Event, EventStore, EventView, SubstrateKind};
+use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
-pub use khive_types::{EdgeEndpointRule, EndpointKind, VerbDef};
+pub use khive_types::{
+    EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, PackSchemaPlan,
+    VerbCategory, Visibility,
+};
+// Backward-compat re-export.
+#[allow(deprecated)]
+pub use khive_types::VerbDef;
+
+use crate::validation::ValidationRule;
+
+/// Pack-auxiliary schema plan (ADR-017 §Storage profile and pack-auxiliary schema).
+///
+/// Declares `CREATE TABLE IF NOT EXISTS` statements for pack-owned tables that
+/// are NOT part of the core substrate schema (entities, notes, edges, events).
+/// Applied at boot via `StorageBackend::apply_schema` / `apply_pack_schema_plan`.
+///
+/// Core substrate tables evolve through versioned migrations (ADR-015). Pack
+/// schema is strictly for pack-auxiliary tables (e.g. GTD lifecycle audit,
+/// memory index). v1 pack schemas are non-versioned.
+#[derive(Debug, Default, Clone)]
+pub struct SchemaPlan {
+    /// Owning pack name.
+    pub pack: &'static str,
+    /// DDL statements applied idempotently at boot.
+    /// Each entry must be a self-contained `CREATE TABLE IF NOT EXISTS` or
+    /// similar idempotent statement.
+    pub statements: &'static [&'static str],
+}
+
+impl SchemaPlan {
+    /// Construct a `SchemaPlan` with no statements.
+    ///
+    /// Packs whose state lives entirely in the core substrate tables (entities,
+    /// notes, edges) use this as their `schema_plan()` return value.
+    pub const fn empty() -> Self {
+        Self {
+            pack: "",
+            statements: &[],
+        }
+    }
+
+    /// Returns `true` when the plan contains no DDL statements.
+    pub fn is_empty(&self) -> bool {
+        self.statements.is_empty()
+    }
+}
 
 /// Hook called after every successful verb dispatch (Issue #158).
 ///
-/// Packs that want to observe real-time dispatch outcomes (e.g. brain pack
-/// updating its posteriors) implement this trait and register it via
-/// [`VerbRegistryBuilder::with_dispatch_hook`]. The hook is opt-in: when no
-/// hook is registered, dispatch incurs zero overhead.
-///
-/// The hook receives the synthesized `Event` that was built from the dispatch
-/// outcome — same representation used by the EventStore audit path — so brain
-/// pack's `EventFold` can process it without extra conversion.
+/// Packs observe enriched event views so provenance-aware consumers can use
+/// `view.observations` while legacy folds can still consume `view.event`.
 #[async_trait]
 pub trait DispatchHook: Send + Sync {
-    /// Called with the dispatch-outcome event after a successful pack dispatch.
+    /// Called with the dispatch-outcome event view after a successful pack dispatch.
     ///
     /// Errors are logged via `tracing::warn!` and never propagated to the
-    /// caller — the dispatch has already succeeded.
-    async fn on_dispatch(&self, event: &Event);
+    /// caller; the dispatch has already succeeded.
+    async fn on_dispatch(&self, view: &EventView);
 }
 
 use crate::error::{
@@ -65,8 +105,8 @@ pub trait PackRuntime: Send + Sync {
     /// Entity kinds this pack owns — must equal `<Self as Pack>::ENTITY_KINDS`.
     fn entity_kinds(&self) -> &'static [&'static str];
 
-    /// Verbs this pack handles — must equal `<Self as Pack>::VERBS`.
-    fn verbs(&self) -> &'static [VerbDef];
+    /// Handlers this pack registers — must equal `<Self as Pack>::HANDLERS`.
+    fn handlers(&self) -> &'static [HandlerDef];
 
     /// Pack-extensible edge endpoint rules — must equal `<Self as Pack>::EDGE_RULES`.
     /// Defaults to empty so existing packs that don't extend the edge contract
@@ -81,6 +121,16 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
+    /// NoteKindSpec declarations for note kinds this pack owns (ADR-004).
+    ///
+    /// Packs that introduce note kinds with explicit lifecycle semantics
+    /// declare the spec here.  The runtime collects these for introspection
+    /// and future enforcement.  Defaults to empty so existing packs compile
+    /// without changes.
+    fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
+        &[]
+    }
+
     /// Optional per-kind hook for shared CRUD specialization (ADR-030).
     ///
     /// When a kind is owned by this pack (declared in `note_kinds()` or
@@ -92,15 +142,48 @@ pub trait PackRuntime: Send + Sync {
         None
     }
 
+    /// Pack-auxiliary schema (ADR-017 §Storage profile and pack-auxiliary schema).
+    ///
+    /// Returns DDL statements for pack-owned tables that are NOT part of the
+    /// core substrate schema. Statements are idempotent (`CREATE TABLE IF NOT
+    /// EXISTS`) so callers can apply them safely on every registration. Core
+    /// substrate tables evolve through versioned migrations (ADR-015); pack
+    /// schema is strictly pack-auxiliary.
+    ///
+    /// Defaults to an empty plan — packs that store everything in the core
+    /// substrate tables (entities, notes, edges, events) return this default.
+    ///
+    /// Plans are aggregated via [`VerbRegistry::all_schema_plans`] and applied
+    /// at startup via `KhiveMcpServer::with_packs` (c12). Packs that need their
+    /// schema present (e.g. GTD) also self-bootstrap lazily on first call for
+    /// robustness in test contexts that create fresh in-memory databases.
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan::empty()
+    }
+
+    /// Domain-specific validation rules contributed by this pack (ADR-034 §9).
+    ///
+    /// Rule IDs MUST follow the `<pack>/<rule-id>` namespace convention.
+    /// Built-in rules (no pack prefix) are reserved for the `khive-runtime`
+    /// validation infrastructure.
+    ///
+    /// Defaults to empty — packs with no domain-specific rules return `&[]`.
+    fn validation_rules(&self) -> &'static [ValidationRule] {
+        &[]
+    }
+
     /// Dispatch a verb call. Returns serialized JSON response.
     ///
     /// The `registry` parameter gives the handler access to the merged
     /// vocabulary and kind hooks across all loaded packs (ADR-030).
+    /// The `token` is an authorized namespace token minted by the dispatch
+    /// boundary after gate authorization — handlers must use it directly.
     async fn dispatch(
         &self,
         verb: &str,
         params: Value,
         registry: &VerbRegistry,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError>;
 }
 
@@ -174,7 +257,7 @@ impl VerbRegistryBuilder {
         Self {
             packs: Vec::new(),
             gate: std::sync::Arc::new(AllowAllGate),
-            default_namespace: Namespace::default_ns().as_str().to_string(),
+            default_namespace: Namespace::local().as_str().to_string(),
             event_store: None,
             dispatch_hook: None,
         }
@@ -187,7 +270,7 @@ impl VerbRegistryBuilder {
         self
     }
 
-    /// Register a boxed pack directly (ADR-063).
+    /// Register a boxed pack directly (ADR-027).
     ///
     /// Crate-private: only [`PackRegistry::register_packs`] should call this.
     /// External callers must use the typed [`Self::register`] which enforces the
@@ -326,6 +409,9 @@ impl VerbRegistryBuilder {
             .map(|idx| slots[idx].take().expect("topological index must exist"))
             .collect();
 
+        validate_unique_note_kinds(&ordered_packs)?;
+        validate_unique_verb_names(&ordered_packs)?;
+
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
             gate: self.gate,
@@ -334,6 +420,52 @@ impl VerbRegistryBuilder {
             dispatch_hook: self.dispatch_hook,
         })
     }
+}
+
+/// Validate that no two packs declare the same note kind (F073).
+///
+/// Boot-time duplicate detection prevents pack configuration errors from
+/// silently corrupting note kind routing. Returns an error naming the
+/// duplicate kind and the two packs that claim it.
+fn validate_unique_note_kinds(packs: &[Box<dyn PackRuntime>]) -> Result<(), RuntimeError> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for pack in packs {
+        for &kind in pack.note_kinds() {
+            if let Some(first_pack) = seen.insert(kind, pack.name()) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "duplicate note kind {kind:?}: claimed by both {first_pack:?} and {:?}",
+                    pack.name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that no two packs declare the same `Visibility::Verb` handler name
+/// (ADR-017 §Boot-time collision checks, F093).
+///
+/// `Visibility::Subhandler` entries are pack-prefixed by convention and excluded
+/// from cross-pack collision detection. Two packs declaring the same subhandler
+/// name prefix (e.g. `recall.embed`) would be a pack-authoring error but does not
+/// produce a cross-pack routing conflict since only the owning pack dispatches them.
+fn validate_unique_verb_names(packs: &[Box<dyn PackRuntime>]) -> Result<(), RuntimeError> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for pack in packs {
+        for handler in pack.handlers() {
+            if !matches!(handler.visibility, Visibility::Verb) {
+                continue;
+            }
+            if let Some(first_pack) = seen.insert(handler.name, pack.name()) {
+                return Err(RuntimeError::VerbCollision {
+                    verb: handler.name.to_string(),
+                    first_pack: first_pack.to_string(),
+                    second_pack: pack.name().to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn find_pack_dependency_cycle(
@@ -456,12 +588,9 @@ impl VerbRegistry {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| self.default_namespace.clone());
-        let gate_req = GateRequest::new(
-            ActorRef::anonymous(),
-            Namespace::new(&ns_str),
-            verb,
-            params.clone(),
-        );
+        let ns = Namespace::parse(&ns_str)
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
+        let gate_req = GateRequest::new(ActorRef::anonymous(), ns, verb, params.clone());
 
         // Consult the gate (ADR-029, ADR-035).
         //
@@ -494,11 +623,12 @@ impl VerbRegistry {
                     let storage_event = Event::new(
                         gate_req.namespace.as_str(),
                         verb,
+                        EventKind::Audit,
                         SubstrateKind::Event,
                         format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
                     )
                     .with_outcome(outcome)
-                    .with_data(audit_data);
+                    .with_payload(audit_data);
                     if let Err(store_err) = store.append_event(storage_event).await {
                         tracing::warn!(
                             verb,
@@ -534,17 +664,34 @@ impl VerbRegistry {
             });
         }
 
+        // Mint the authorized namespace token at the dispatch boundary (ADR-007).
+        // ns_str was already validated above when building the gate request.
+        let token = NamespaceToken::mint_authorized(
+            Namespace::parse(&ns_str)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?,
+            ActorRef::anonymous(),
+        );
+
         for pack in self.packs.iter() {
-            if pack.verbs().iter().any(|v| v.name == verb) {
-                let result = pack.dispatch(verb, params, self).await;
+            if pack.handlers().iter().any(|v| v.name == verb) {
+                let result = pack.dispatch(verb, params, self, &token).await;
 
                 // Post-dispatch hook: fires on success, opt-in (Issue #158).
                 if let (Ok(_), Some(hook)) = (&result, &self.dispatch_hook) {
-                    let dispatch_event =
-                        Event::new(ns_str.as_str(), verb, SubstrateKind::Event, pack.name())
-                            .with_outcome(EventOutcome::Success);
+                    let dispatch_event = Event::new(
+                        ns_str.as_str(),
+                        verb,
+                        EventKind::Audit,
+                        SubstrateKind::Event,
+                        pack.name(),
+                    )
+                    .with_outcome(EventOutcome::Success);
+                    let dispatch_view = EventView {
+                        event: dispatch_event,
+                        observations: Vec::new(),
+                    };
                     let hook = Arc::clone(hook);
-                    hook.on_dispatch(&dispatch_event).await;
+                    hook.on_dispatch(&dispatch_view).await;
                 }
 
                 return result;
@@ -553,7 +700,7 @@ impl VerbRegistry {
         let available: Vec<&str> = self
             .packs
             .iter()
-            .flat_map(|p| p.verbs().iter().map(|v| v.name))
+            .flat_map(|p| p.handlers().iter().map(|v| v.name))
             .collect();
         Err(RuntimeError::InvalidInput(format!(
             "unknown verb {verb:?}; available: {}",
@@ -579,24 +726,43 @@ impl VerbRegistry {
         None
     }
 
-    /// All verb definitions across all registered packs.
+    /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
     ///
-    /// Returned with `'static` lifetime since pack verbs are `&'static [VerbDef]`
-    /// constants — callers can keep the slice references beyond the registry's
-    /// borrow.
-    pub fn all_verbs(&self) -> Vec<&'static VerbDef> {
-        self.packs.iter().flat_map(|p| p.verbs().iter()).collect()
-    }
-
-    /// All verb definitions paired with the name of the pack that owns them.
-    ///
-    /// Useful for building catalogs that attribute each verb to its source pack.
-    /// The pack name has the same lifetime as `&self`; the `VerbDef` reference
-    /// is `'static`.
-    pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static VerbDef)> {
+    /// Subhandlers (`Visibility::Subhandler`) are excluded — they are internal
+    /// pipeline steps not surfaced on the MCP wire (ADR-017 §Visibility filtering,
+    /// F118). Returned with `'static` lifetime since pack handlers are `&'static
+    /// [HandlerDef]` constants.
+    pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
         self.packs
             .iter()
-            .flat_map(|p| p.verbs().iter().map(move |v| (p.name(), v)))
+            .flat_map(|p| p.handlers().iter())
+            .filter(|h| matches!(h.visibility, Visibility::Verb))
+            .collect()
+    }
+
+    /// All MCP-exposed handlers paired with the name of the pack that owns them
+    /// (`Visibility::Verb` only).
+    ///
+    /// Subhandlers (`Visibility::Subhandler`) are excluded from the MCP catalog
+    /// (ADR-017 §Visibility filtering, F118-F123). Use `all_handlers_with_names`
+    /// when internal handlers must also be enumerated (e.g. runtime introspection).
+    pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
+            .filter(|(_, h)| matches!(h.visibility, Visibility::Verb))
+            .collect()
+    }
+
+    /// All handler definitions across all registered packs, including subhandlers.
+    ///
+    /// Unlike `all_verbs`, this includes `Visibility::Subhandler` entries. Useful
+    /// for runtime introspection (e.g. `list_handlers`) and tooling that needs
+    /// the complete handler surface (ADR-017 §Introspection).
+    pub fn all_handlers_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
             .collect()
     }
 
@@ -657,16 +823,16 @@ impl VerbRegistry {
             .map(|p| p.entity_kinds())
     }
 
-    /// Verbs declared by a specific registered pack.
+    /// Handlers declared by a specific registered pack.
     ///
-    /// Returns `None` if no pack with `name` is registered. Each `VerbDef`
-    /// carries name + description — sufficient for introspection clients
-    /// like `kkernel pack handler` (ADR-076).
-    pub fn pack_verbs(&self, name: &str) -> Option<&'static [VerbDef]> {
+    /// Returns `None` if no pack with `name` is registered. Each `HandlerDef`
+    /// carries name + description + visibility — sufficient for introspection
+    /// clients like `kkernel pack handler` (ADR-076).
+    pub fn pack_verbs(&self, name: &str) -> Option<&'static [HandlerDef]> {
         self.packs
             .iter()
             .find(|p| p.name() == name)
-            .map(|p| p.verbs())
+            .map(|p| p.handlers())
     }
 
     /// All pack-declared edge endpoint rules across registered packs (ADR-031).
@@ -680,12 +846,71 @@ impl VerbRegistry {
             .flat_map(|p| p.edge_rules().iter().copied())
             .collect()
     }
+
+    /// Collect all `NoteKindSpec` declarations from every loaded pack (ADR-004).
+    ///
+    /// Used by the runtime for lifecycle introspection and future enforcement.
+    pub fn all_note_kind_specs(&self) -> Vec<&'static NoteKindSpec> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.note_kind_specs().iter())
+            .collect()
+    }
+
+    /// All pack-contributed validation rules across registered packs (ADR-034 §9).
+    ///
+    /// Returns references into the pack-owned `'static` slices — no allocation
+    /// beyond the outer `Vec`. Rule IDs are namespaced by pack; callers can
+    /// group by `rule.id.split_once('/')` to attribute rules to their packs.
+    pub fn all_validation_rules(&self) -> Vec<&'static ValidationRule> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.validation_rules().iter())
+            .collect()
+    }
+
+    /// Pack-auxiliary schema plans for all registered packs (ADR-017).
+    ///
+    /// Returns one `SchemaPlan` per pack. Callers (typically the runtime
+    /// bootstrap) apply each plan to the pack's assigned backend. Empty plans
+    /// are included so the caller can iterate uniformly; callers that want to
+    /// skip empty plans should check `plan.is_empty()`.
+    pub fn all_schema_plans(&self) -> Vec<SchemaPlan> {
+        self.packs.iter().map(|p| p.schema_plan()).collect()
+    }
+
+    /// Apply all non-empty pack-auxiliary schema plans to the given backend
+    /// (ADR-017 §c12 startup application).
+    ///
+    /// This is the centralized startup hook that replaced the previous lazy
+    /// per-pack self-bootstrap pattern. Each pack's `SchemaPlan` carries
+    /// idempotent `CREATE TABLE IF NOT EXISTS` DDL; calling this more than once
+    /// is safe. Empty plans are skipped.
+    ///
+    /// Errors from individual plans are logged via `tracing::warn!` and not
+    /// propagated so that a single pack's schema failure does not prevent the
+    /// rest from loading. Callers that need hard-failure semantics should call
+    /// `all_schema_plans()` and apply each plan individually.
+    pub fn apply_schema_plans(&self, backend: &khive_db::StorageBackend) {
+        for plan in self.all_schema_plans() {
+            if plan.is_empty() {
+                continue;
+            }
+            if let Err(e) = backend.apply_pack_ddl_statements(plan.statements) {
+                tracing::warn!(
+                    pack = plan.pack,
+                    error = %e,
+                    "failed to apply pack schema plan at startup (non-fatal)"
+                );
+            }
+        }
+    }
 }
 
-// ── ADR-063: inventory-based dynamic pack loading ─────────────────────────────
+// ── ADR-027: inventory-based dynamic pack loading ─────────────────────────────
 
 /// Factory for creating pack instances registered via `inventory` at link time
-/// (ADR-063). Each pack crate submits a `&'static dyn PackFactory` wrapped in a
+/// (ADR-027). Each pack crate submits a `&'static dyn PackFactory` wrapped in a
 /// [`PackRegistration`]; the binary's linker collects them all into a single
 /// slice iterable at runtime.
 ///
@@ -698,8 +923,9 @@ pub trait PackFactory: Send + Sync + 'static {
     /// Names of packs that must be loaded before this one (ADR-037).
     ///
     /// Defaults to empty so pack crates that have no dependencies compile
-    /// without changes. [`PackRegistry::register_packs`] uses this to compute
-    /// the transitive closure of required packs before registering anything.
+    /// without changes. [`PackRegistry::register_packs`] validates that every
+    /// name listed here is present in the caller's explicit pack list — absent
+    /// dependencies are a boot error, not silently auto-added (ADR-027).
     fn requires(&self) -> &'static [&'static str] {
         &[]
     }
@@ -711,12 +937,12 @@ pub trait PackFactory: Send + Sync + 'static {
 /// Newtype wrapper collected by `inventory` so pack crates can submit
 /// `&'static dyn PackFactory` references without the type-ascription syntax
 /// that `inventory::submit!` does not support for bare trait-object references
-/// (ADR-063).
+/// (ADR-027).
 pub struct PackRegistration(pub &'static dyn PackFactory);
 
 inventory::collect!(PackRegistration);
 
-/// Registry of pack factories discovered via `inventory` at link time (ADR-063).
+/// Registry of pack factories discovered via `inventory` at link time (ADR-027).
 ///
 /// No instance is needed — all methods are associated functions that walk the
 /// globally-collected [`PackRegistration`] slice.
@@ -733,15 +959,17 @@ impl PackRegistry {
 
     /// Register the named packs into `builder` using the supplied `runtime`.
     ///
-    /// Resolves transitive `requires()` dependencies declared on each
-    /// [`PackFactory`] before registering anything. A pack that declares
-    /// `requires = &["kg"]` will cause `"kg"` to be included even if the caller
-    /// only asked for `"gtd"`.  The [`VerbRegistryBuilder::build`] topo-sort
-    /// then ensures correct load order.
+    /// Validates the explicit pack list against `PackFactory::requires()` —
+    /// if any requested pack declares a dependency that is absent from `names`,
+    /// registration fails with `Err(missing_name)` (ADR-027: missing dependency
+    /// is a boot error, not silently auto-added). Callers must include all
+    /// required packs explicitly.
     ///
-    /// Returns `Ok(())` when all names (including their transitive deps) are
-    /// recognised; returns `Err(name)` for the first unrecognised name so
-    /// callers can surface a clear error.
+    /// The [`VerbRegistryBuilder::build`] topo-sort enforces correct load order.
+    ///
+    /// Returns `Ok(())` when all names are recognised and all declared
+    /// dependencies are satisfied; returns `Err(name)` for the first
+    /// unrecognised or unsatisfied pack name.
     pub fn register_packs(
         names: &[String],
         runtime: KhiveRuntime,
@@ -756,33 +984,27 @@ impl PackRegistry {
             all.iter().copied().find(|f| f.name() == name)
         };
 
-        // BFS transitive closure: start with the explicitly requested names,
-        // then walk each factory's requires() to pull in dependencies.
-        let mut full_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
-
+        // Validate that every requested name is a known factory.
+        let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
         for name in names {
-            queue.push_back(name.as_str());
+            factory_for(name.as_str()).ok_or_else(|| name.clone())?;
         }
 
-        while let Some(name) = queue.pop_front() {
-            if !full_set.insert(name) {
-                continue; // already visited
-            }
-            let factory = factory_for(name).ok_or_else(|| name.to_string())?;
+        // Validate that all requires() dependencies are explicitly present in
+        // the requested set. ADR-027: missing dep → boot error, not auto-add.
+        for name in names {
+            let factory = factory_for(name.as_str()).unwrap(); // validated above
             for &dep in factory.requires() {
-                if !full_set.contains(dep) {
-                    queue.push_back(dep);
+                if !requested.contains(dep) {
+                    return Err(dep.to_string());
                 }
             }
         }
 
-        // Register every pack in the resolved set; VerbRegistryBuilder::build()
+        // Register every requested pack; VerbRegistryBuilder::build()
         // performs the topo-sort, so insertion order here does not matter.
-        for name in &full_set {
-            // factory_for cannot fail here: every name in full_set passed the
-            // lookup above without returning Err.
-            let factory = factory_for(name).unwrap();
+        for name in names {
+            let factory = factory_for(name.as_str()).unwrap(); // validated above
             builder.register_boxed(factory.create(runtime.clone()));
         }
 
@@ -801,14 +1023,18 @@ mod tests {
         const NAME: &'static str = "alpha";
         const NOTE_KINDS: &'static [&'static str] = &["memo", "log"];
         const ENTITY_KINDS: &'static [&'static str] = &["widget"];
-        const VERBS: &'static [VerbDef] = &[
-            VerbDef {
+        const HANDLERS: &'static [HandlerDef] = &[
+            HandlerDef {
                 name: "create",
                 description: "create a widget",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
             },
-            VerbDef {
+            HandlerDef {
                 name: "list",
                 description: "list widgets",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
             },
         ];
     }
@@ -824,14 +1050,15 @@ mod tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             AlphaPack::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            AlphaPack::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            AlphaPack::HANDLERS
         }
         async fn dispatch(
             &self,
             verb: &str,
             _params: Value,
             _registry: &VerbRegistry,
+            _token: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
         }
@@ -841,18 +1068,78 @@ mod tests {
 
     impl Pack for BetaPack {
         const NAME: &'static str = "beta";
-        const NOTE_KINDS: &'static [&'static str] = &["log", "alert"];
+        const NOTE_KINDS: &'static [&'static str] = &["alert"];
         const ENTITY_KINDS: &'static [&'static str] = &["widget", "gadget"];
-        const VERBS: &'static [VerbDef] = &[
-            VerbDef {
+        const HANDLERS: &'static [HandlerDef] = &[
+            HandlerDef {
                 name: "notify",
                 description: "send alert",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
             },
-            VerbDef {
+            // "create" is Subhandler so it does NOT collide with AlphaPack's
+            // Verb-visibility "create" — subhandlers are pack-internal and
+            // excluded from cross-pack collision detection (ADR-017).
+            HandlerDef {
                 name: "create",
-                description: "create a gadget",
+                description: "beta internal create (subhandler)",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Commissive,
             },
         ];
+    }
+
+    /// Build a registry with AlphaPack + BetaPack.
+    ///
+    /// BetaPack's `create` is Subhandler so there is no Verb-visibility
+    /// collision with AlphaPack's `create` Verb. Tests that need a collision
+    /// use `build_colliding_registry()` instead.
+    fn build_registry() -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.register(BetaPack);
+        builder.build().expect("registry builds without collision")
+    }
+
+    /// Build a registry with two packs that declare the same Verb-visibility
+    /// handler — used to test that `VerbCollision` is raised at build time.
+    struct CollidingPack;
+
+    impl Pack for CollidingPack {
+        const NAME: &'static str = "colliding";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "create",
+            description: "duplicate Verb-visibility create",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for CollidingPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({ "pack": "colliding", "verb": verb }))
+        }
     }
 
     #[async_trait]
@@ -866,24 +1153,18 @@ mod tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             BetaPack::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            BetaPack::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            BetaPack::HANDLERS
         }
         async fn dispatch(
             &self,
             verb: &str,
             _params: Value,
             _registry: &VerbRegistry,
+            _token: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "pack": "beta", "verb": verb }))
         }
-    }
-
-    fn build_registry() -> VerbRegistry {
-        let mut builder = VerbRegistryBuilder::new();
-        builder.register(AlphaPack);
-        builder.register(BetaPack);
-        builder.build().expect("registry builds")
     }
 
     #[tokio::test]
@@ -897,12 +1178,80 @@ mod tests {
         assert_eq!(res["pack"], "beta");
     }
 
-    #[tokio::test]
-    async fn dispatch_first_registered_wins_on_collision() {
-        let reg = build_registry();
+    /// ADR-017 §Boot-time collision checks (F093/F094): two packs declaring the
+    /// same `Visibility::Verb` handler must be rejected at build time — the old
+    /// "first registered wins" behaviour is replaced by a boot error.
+    #[test]
+    fn verb_collision_is_boot_time_error() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.register(CollidingPack);
+        let err = builder
+            .build()
+            .err()
+            .expect("duplicate Verb-visibility handler must be rejected at build time");
+        assert!(
+            matches!(err, RuntimeError::VerbCollision { ref verb, .. } if verb == "create"),
+            "expected VerbCollision for 'create', got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("create"),
+            "error must name the colliding verb: {msg}"
+        );
+        assert!(
+            msg.contains("alpha") || msg.contains("colliding"),
+            "error must name one of the conflicting packs: {msg}"
+        );
+    }
 
-        let res = reg.dispatch("create", Value::Null).await.unwrap();
-        assert_eq!(res["pack"], "alpha", "first registered pack wins");
+    /// Subhandler-visibility handlers with the same name across packs are NOT
+    /// a collision — they are pack-internal and excluded from cross-pack
+    /// collision detection (ADR-017 §Boot-time collision checks).
+    #[test]
+    fn subhandler_same_name_across_packs_is_not_a_collision() {
+        struct SubhandlerPack;
+        impl Pack for SubhandlerPack {
+            const NAME: &'static str = "subhandler_pack";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+                name: "create",
+                description: "internal create",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Commissive,
+            }];
+        }
+        #[async_trait]
+        impl PackRuntime for SubhandlerPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                verb: &str,
+                _: Value,
+                _: &VerbRegistry,
+                _: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                Ok(serde_json::json!({"pack": "subhandler_pack", "verb": verb}))
+            }
+        }
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack); // AlphaPack has Verb "create"
+        builder.register(SubhandlerPack); // SubhandlerPack has Subhandler "create" — no collision
+        builder
+            .build()
+            .expect("subhandler same name must NOT be a collision");
     }
 
     #[tokio::test]
@@ -915,21 +1264,42 @@ mod tests {
         assert!(msg.contains("create"));
     }
 
+    /// `all_verbs` returns only `Visibility::Verb` entries (ADR-017 F118).
+    ///
+    /// BetaPack's `create` is `Visibility::Subhandler` — it must NOT appear
+    /// in `all_verbs()` even though it has the same name as a Verb in AlphaPack.
     #[test]
-    fn all_verbs_aggregates_across_packs() {
+    fn all_verbs_aggregates_across_packs_excludes_subhandlers() {
         let reg = build_registry();
         let verbs: Vec<&str> = reg.all_verbs().iter().map(|v| v.name).collect();
-        assert_eq!(verbs, vec!["create", "list", "notify", "create"]);
+        // BetaPack's "create" (Subhandler) is absent; only Verb-visibility entries appear.
+        assert_eq!(verbs, vec!["create", "list", "notify"]);
     }
 
     #[test]
-    fn all_verbs_with_names_pairs_pack_name() {
+    fn all_verbs_with_names_pairs_pack_name_excludes_subhandlers() {
         let reg = build_registry();
         let pairs: Vec<(&str, &str)> = reg
             .all_verbs_with_names()
             .iter()
             .map(|(pack, v)| (*pack, v.name))
             .collect();
+        // BetaPack's "create" is Subhandler and must NOT appear here.
+        assert_eq!(
+            pairs,
+            vec![("alpha", "create"), ("alpha", "list"), ("beta", "notify"),]
+        );
+    }
+
+    #[test]
+    fn all_handlers_with_names_includes_subhandlers() {
+        let reg = build_registry();
+        let pairs: Vec<(&str, &str)> = reg
+            .all_handlers_with_names()
+            .iter()
+            .map(|(pack, v)| (*pack, v.name))
+            .collect();
+        // BetaPack's Subhandler "create" IS present in the full handler list.
         assert_eq!(
             pairs,
             vec![
@@ -942,10 +1312,65 @@ mod tests {
     }
 
     #[test]
-    fn note_kinds_are_deduplicated() {
+    fn note_kinds_are_ordered() {
         let reg = build_registry();
         let kinds = reg.all_note_kinds();
         assert_eq!(kinds, vec!["memo", "log", "alert"]);
+    }
+
+    #[test]
+    fn note_kind_duplicate_rejected_at_build_time() {
+        struct DupPack;
+
+        impl khive_types::Pack for DupPack {
+            const NAME: &'static str = "dup";
+            // "memo" is already declared by AlphaPack — must be rejected at build.
+            const NOTE_KINDS: &'static [&'static str] = &["memo"];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
+        }
+
+        #[async_trait]
+        impl PackRuntime for DupPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                Ok(Value::Null)
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.register(DupPack);
+        let err = builder
+            .build()
+            .err()
+            .expect("duplicate note kind must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memo"),
+            "error must name the duplicate kind: {msg}"
+        );
+        assert!(
+            msg.contains("alpha") || msg.contains("dup"),
+            "error must name one of the conflicting packs: {msg}"
+        );
     }
 
     #[test]
@@ -1080,16 +1505,18 @@ mod tests {
             .unwrap();
         // Missing namespace → registry default.
         reg.dispatch("list", Value::Null).await.unwrap();
-        // Explicit empty namespace string is preserved (it is what
-        // `KhiveRuntime::ns` would also see). Gate and runtime MUST agree on
-        // the namespace they observe; coercing here while the runtime
-        // continues to honor `""` would create an audit blind spot.
-        reg.dispatch("list", serde_json::json!({"namespace": ""}))
+        // Empty string is rejected: Namespace::parse("") fails → InvalidInput error.
+        let err = reg
+            .dispatch("list", serde_json::json!({"namespace": ""}))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "empty namespace must return InvalidInput, got {err:?}"
+        );
 
         let seen = gate.seen.lock().unwrap().clone();
-        assert_eq!(seen, vec!["tenant-y", "tenant-x", ""]);
+        assert_eq!(seen, vec!["tenant-y", "tenant-x"]);
     }
 
     #[tokio::test]
@@ -1431,6 +1858,7 @@ mod tests {
 
     // ---- Hard enforcement + EventStore persistence (ADR-035) ----
 
+    use crate::runtime::NamespaceToken;
     use async_trait::async_trait;
     use khive_storage::{
         BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, SubstrateKind,
@@ -1525,9 +1953,11 @@ mod tests {
             const NAME: &'static str = "tracked";
             const NOTE_KINDS: &'static [&'static str] = &[];
             const ENTITY_KINDS: &'static [&'static str] = &[];
-            const VERBS: &'static [VerbDef] = &[VerbDef {
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
                 name: "guarded",
                 description: "a guarded verb",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
             }];
         }
 
@@ -1542,14 +1972,15 @@ mod tests {
             fn entity_kinds(&self) -> &'static [&'static str] {
                 Self::ENTITY_KINDS
             }
-            fn verbs(&self) -> &'static [VerbDef] {
-                Self::VERBS
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
             }
             async fn dispatch(
                 &self,
                 _verb: &str,
                 _params: Value,
                 _registry: &VerbRegistry,
+                _token: &NamespaceToken,
             ) -> Result<Value, RuntimeError> {
                 self.invoked.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::json!({"invoked": true}))
@@ -1802,14 +2233,11 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Denied);
 
-        // The data field must hold the full AuditEvent envelope (ADR-033 contract).
-        let data = ev
-            .data
-            .as_ref()
-            .expect("Event.data must be Some — full AuditEvent envelope must be persisted");
+        // The payload field must hold the full AuditEvent envelope (ADR-033 contract).
+        let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
-            .expect("Event.data must deserialize to AuditEvent");
+            .expect("Event.payload must deserialize to AuditEvent");
 
         assert_eq!(
             audit.deny_reason.as_deref(),
@@ -1870,13 +2298,10 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Success);
 
-        let data = ev
-            .data
-            .as_ref()
-            .expect("Event.data must be Some — AuditEvent envelope must be persisted on allow");
+        let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
-            .expect("Event.data must deserialize to AuditEvent");
+            .expect("Event.payload must deserialize to AuditEvent");
 
         assert_eq!(audit.gate_impl, "ObligationGate");
         assert_eq!(
@@ -1914,8 +2339,9 @@ mod tests {
         // events_for_namespace ensures the events schema and returns a SqlEventStore
         // scoped to "test-ns". The pool is shared so reads and writes see the same data.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let test_tok = NamespaceToken::for_namespace(Namespace::parse("test-ns").unwrap());
         let sql_store = rt
-            .events(Some("test-ns"))
+            .events(&test_tok)
             .expect("events_for_namespace must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -1954,16 +2380,13 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Denied);
 
-        // Event.data must hold the full AuditEvent serialized as JSON text and
+        // Event.payload must hold the full AuditEvent serialized as JSON text and
         // parsed back. If the SQL path was lossy, this deserialization would fail
         // or the field assertions below would fail.
-        let data = ev
-            .data
-            .as_ref()
-            .expect("Event.data must be Some — SqlEventStore must persist AuditEvent envelope");
+        let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
-            .expect("Event.data must deserialize to AuditEvent after SQL round-trip");
+            .expect("Event.payload must deserialize to AuditEvent after SQL round-trip");
 
         assert_eq!(
             audit.deny_reason.as_deref(),
@@ -2016,8 +2439,9 @@ mod tests {
         }
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let test_tok = NamespaceToken::for_namespace(Namespace::parse("test-ns").unwrap());
         let sql_store = rt
-            .events(Some("test-ns"))
+            .events(&test_tok)
             .expect("events_for_namespace must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -2051,10 +2475,7 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Success);
 
-        let data = ev
-            .data
-            .as_ref()
-            .expect("Event.data must be Some — SqlEventStore must persist AuditEvent envelope");
+        let data = &ev.payload;
 
         // Layer 1: raw JSON check — obligations must be a non-empty array in
         // the persisted TEXT. If the SQL path dropped the field, the default
@@ -2148,14 +2569,11 @@ mod tests {
             "ev.namespace must match the dispatch namespace"
         );
 
-        // ev.data must hold the full AuditEvent envelope (ADR-033 / ADR-035 contract).
-        let data = ev
-            .data
-            .as_ref()
-            .expect("ev.data must be Some — full AuditEvent envelope required by ADR-035");
+        // ev.payload must hold the full AuditEvent envelope (ADR-033 / ADR-035 contract).
+        let data = &ev.payload;
 
-        let audit: khive_gate::AuditEvent =
-            serde_json::from_value(data.clone()).expect("ev.data must deserialize to AuditEvent");
+        let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
+            .expect("ev.payload must deserialize to AuditEvent");
 
         assert_eq!(
             audit.decision,
@@ -2204,14 +2622,14 @@ mod dep_tests {
         const NAME: &'static str = "kg_dep";
         const NOTE_KINDS: &'static [&'static str] = &["observation"];
         const ENTITY_KINDS: &'static [&'static str] = &["concept"];
-        const VERBS: &'static [VerbDef] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
     }
 
     impl Pack for MemoryDepPack {
         const NAME: &'static str = "memory_dep";
         const NOTE_KINDS: &'static [&'static str] = &["memory"];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const VERBS: &'static [VerbDef] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
         const REQUIRES: &'static [&'static str] = &["kg_dep"];
     }
 
@@ -2219,7 +2637,7 @@ mod dep_tests {
         const NAME: &'static str = "pack_a";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const VERBS: &'static [VerbDef] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
         const REQUIRES: &'static [&'static str] = &["pack_b"];
     }
 
@@ -2227,7 +2645,7 @@ mod dep_tests {
         const NAME: &'static str = "pack_b";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const VERBS: &'static [VerbDef] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
         const REQUIRES: &'static [&'static str] = &["pack_a"];
     }
 
@@ -2242,14 +2660,15 @@ mod dep_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             Self::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            Self::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
         }
         async fn dispatch(
             &self,
             verb: &str,
             _: Value,
             _: &VerbRegistry,
+            _: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Err(RuntimeError::InvalidInput(format!(
                 "KgDepPack has no verbs: {verb}"
@@ -2268,8 +2687,8 @@ mod dep_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             Self::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            Self::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
         }
         fn requires(&self) -> &'static [&'static str] {
             Self::REQUIRES
@@ -2279,6 +2698,7 @@ mod dep_tests {
             verb: &str,
             _: Value,
             _: &VerbRegistry,
+            _: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Err(RuntimeError::InvalidInput(format!(
                 "MemoryDepPack has no verbs: {verb}"
@@ -2297,8 +2717,8 @@ mod dep_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             Self::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            Self::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
         }
         fn requires(&self) -> &'static [&'static str] {
             Self::REQUIRES
@@ -2308,6 +2728,7 @@ mod dep_tests {
             verb: &str,
             _: Value,
             _: &VerbRegistry,
+            _: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Err(RuntimeError::InvalidInput(format!(
                 "ADepPack has no verbs: {verb}"
@@ -2326,8 +2747,8 @@ mod dep_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             Self::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            Self::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
         }
         fn requires(&self) -> &'static [&'static str] {
             Self::REQUIRES
@@ -2337,6 +2758,7 @@ mod dep_tests {
             verb: &str,
             _: Value,
             _: &VerbRegistry,
+            _: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Err(RuntimeError::InvalidInput(format!(
                 "BDepPack has no verbs: {verb}"
@@ -2412,14 +2834,14 @@ mod dep_tests {
             const NAME: &'static str = "no_deps_a";
             const NOTE_KINDS: &'static [&'static str] = &[];
             const ENTITY_KINDS: &'static [&'static str] = &[];
-            const VERBS: &'static [VerbDef] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
         }
 
         impl Pack for NoDepsB {
             const NAME: &'static str = "no_deps_b";
             const NOTE_KINDS: &'static [&'static str] = &[];
             const ENTITY_KINDS: &'static [&'static str] = &[];
-            const VERBS: &'static [VerbDef] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
         }
 
         #[async_trait]
@@ -2433,14 +2855,15 @@ mod dep_tests {
             fn entity_kinds(&self) -> &'static [&'static str] {
                 Self::ENTITY_KINDS
             }
-            fn verbs(&self) -> &'static [VerbDef] {
-                Self::VERBS
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
             }
             async fn dispatch(
                 &self,
                 verb: &str,
                 _: Value,
                 _: &VerbRegistry,
+                _: &NamespaceToken,
             ) -> Result<Value, RuntimeError> {
                 Err(RuntimeError::InvalidInput(format!("NoDepsA: {verb}")))
             }
@@ -2457,14 +2880,15 @@ mod dep_tests {
             fn entity_kinds(&self) -> &'static [&'static str] {
                 Self::ENTITY_KINDS
             }
-            fn verbs(&self) -> &'static [VerbDef] {
-                Self::VERBS
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
             }
             async fn dispatch(
                 &self,
                 verb: &str,
                 _: Value,
                 _: &VerbRegistry,
+                _: &NamespaceToken,
             ) -> Result<Value, RuntimeError> {
                 Err(RuntimeError::InvalidInput(format!("NoDepsB: {verb}")))
             }
@@ -2495,9 +2919,11 @@ mod hook_tests {
         const NAME: &'static str = "simple";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
-        const VERBS: &'static [VerbDef] = &[VerbDef {
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
             name: "ping",
             description: "ping",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
         }];
     }
 
@@ -2512,14 +2938,15 @@ mod hook_tests {
         fn entity_kinds(&self) -> &'static [&'static str] {
             SimplePack::ENTITY_KINDS
         }
-        fn verbs(&self) -> &'static [VerbDef] {
-            SimplePack::VERBS
+        fn handlers(&self) -> &'static [HandlerDef] {
+            SimplePack::HANDLERS
         }
         async fn dispatch(
             &self,
             verb: &str,
             _params: Value,
             _registry: &VerbRegistry,
+            _token: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "verb": verb }))
         }
@@ -2534,9 +2961,9 @@ mod hook_tests {
 
     #[async_trait]
     impl DispatchHook for CountingHook {
-        async fn on_dispatch(&self, event: &Event) {
+        async fn on_dispatch(&self, view: &EventView) {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_verb.lock().unwrap() = event.verb.clone();
+            *self.last_verb.lock().unwrap() = view.event.verb.clone();
         }
     }
 
@@ -2638,8 +3065,8 @@ mod hook_tests {
 
         #[async_trait]
         impl DispatchHook for NsCapturingHook {
-            async fn on_dispatch(&self, event: &Event) {
-                *self.ns.lock().unwrap() = event.namespace.clone();
+            async fn on_dispatch(&self, view: &EventView) {
+                *self.ns.lock().unwrap() = view.event.namespace.clone();
             }
         }
 

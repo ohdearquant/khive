@@ -56,7 +56,7 @@
 //! let gate: GateRef = Arc::new(RegoGate::from_policy_str(policy).unwrap());
 //! let req = GateRequest::new(
 //!     ActorRef::anonymous(),
-//!     Namespace::default_ns(),
+//!     Namespace::local(),
 //!     "search",
 //!     json!({"query": "LoRA"}),
 //! );

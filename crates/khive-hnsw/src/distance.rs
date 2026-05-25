@@ -3,7 +3,7 @@
 //! # Formal Verification
 //!
 //! This implementation corresponds to the formal proofs in
-//! `proofs/Lion/Retrieval/Distance.lean`. Key theorems:
+//! `proofs/Retrieval/Distance.lean` (ADR-030 §Phase 2). Key theorems:
 //!
 //! ## Metric Axioms (Euclidean)
 //! - `euclidean_nonneg`: d(x,y) ≥ 0
@@ -24,6 +24,7 @@
 //! - `similarity_bounded`: 0 ≤ sim ≤ 1 for d ≥ 0
 
 use super::config::DistanceMetric;
+use khive_score::DeterministicScore;
 
 /// Compute cosine distance from pre-computed dot product and norms.
 ///
@@ -67,10 +68,10 @@ pub fn compute_distance(
         DistanceMetric::Cosine => {
             // ADR-002: khive-embed is the SIMD foundation layer
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Cosine.cosine_sim_bounded
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Cosine.cosine_sim_bounded
             // Cosine similarity is bounded: -1 <= cos(x,y) <= 1 for unit vectors
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Cosine.cauchy_schwarz
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Cosine.cauchy_schwarz
             // Cauchy-Schwarz inequality: |<x,y>| <= ||x|| * ||y||
             let dot = lattice_embed::simd::dot_product(a, b);
             cosine_distance_from_parts(dot, a_norm, b_norm)
@@ -83,13 +84,13 @@ pub fn compute_distance(
         DistanceMetric::L2 => {
             // ADR-002: lattice-embed is the SIMD foundation layer
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Distance.euclidean_nonneg
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.euclidean_nonneg
             // Euclidean distance is non-negative: d(x,y) >= 0
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Distance.euclidean_symm
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.euclidean_symm
             // Euclidean distance is symmetric: d(x,y) = d(y,x)
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Distance.euclidean_triangle
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.euclidean_triangle
             // Triangle inequality: d(x,z) <= d(x,y) + d(y,z)
             lattice_embed::simd::euclidean_distance(a, b)
         }
@@ -124,20 +125,24 @@ pub(crate) fn compute_ordering_distance(
     }
 }
 
-/// Convert distance back to similarity score (higher = more similar).
+/// Convert distance to a `DeterministicScore` (higher score = more similar).
 ///
-/// **PROOF CORRESPONDENCE**: Lion.Retrieval.Distance.similarity_mono
+/// Replaces the former `distance_to_similarity -> f32` at the HNSW output boundary
+/// so that score arithmetic stays in fixed-point throughout the result pipeline.
+///
+/// **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.similarity_mono
 /// Similarity conversion is monotonically decreasing in distance:
 /// d1 < d2 implies sim(d1) > sim(d2)
 #[inline]
-pub fn distance_to_similarity(dist: f32, metric: DistanceMetric) -> f32 {
-    match metric {
-        DistanceMetric::Cosine => 1.0 - dist,
-        DistanceMetric::Dot => -dist,
-        DistanceMetric::L2 => 1.0 / (1.0 + dist),
-        // Fall back to cosine similarity for future variants.
-        _ => 1.0 - dist,
-    }
+pub(crate) fn score_from_distance(dist: f32, metric: DistanceMetric) -> DeterministicScore {
+    let d = if dist.is_nan() { 0.0 } else { dist } as f64;
+    let similarity = match metric {
+        DistanceMetric::Cosine => 1.0 - d,
+        DistanceMetric::Dot => -d,
+        DistanceMetric::L2 => 1.0 / (1.0 + d.max(0.0)),
+        _ => 1.0 - d,
+    };
+    DeterministicScore::from_f64(similarity)
 }
 
 /// Ordered wrapper for f32 to enable use in BinaryHeap.
@@ -269,15 +274,21 @@ mod tests {
     }
 
     #[test]
-    fn test_distance_to_similarity() {
+    fn test_score_from_distance() {
+        // f32 input loses precision on widening to f64; use 1e-6 tolerance.
         // Cosine: similarity = 1 - distance
-        assert!((distance_to_similarity(0.2, DistanceMetric::Cosine) - 0.8).abs() < 0.001);
+        assert!((score_from_distance(0.2, DistanceMetric::Cosine).to_f64() - 0.8).abs() < 1e-6);
 
         // Dot: similarity = -distance
-        assert!((distance_to_similarity(-5.0, DistanceMetric::Dot) - 5.0).abs() < 0.001);
+        assert!((score_from_distance(-5.0, DistanceMetric::Dot).to_f64() - 5.0).abs() < 1e-6);
 
         // Euclidean: similarity = 1/(1+distance)
-        assert!((distance_to_similarity(1.0, DistanceMetric::L2) - 0.5).abs() < 0.001);
+        assert!((score_from_distance(1.0, DistanceMetric::L2).to_f64() - 0.5).abs() < 1e-6);
+
+        // NaN input maps to 0 distance, then cosine gives 1.0
+        assert!(
+            (score_from_distance(f32::NAN, DistanceMetric::Cosine).to_f64() - 1.0).abs() < 1e-6
+        );
     }
 
     #[test]

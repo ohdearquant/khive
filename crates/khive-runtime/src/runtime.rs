@@ -3,9 +3,9 @@
 use std::sync::{Arc, RwLock};
 
 use khive_db::StorageBackend;
-use khive_gate::{AllowAllGate, GateRef};
+use khive_gate::{ActorRef, AllowAllGate, GateRef};
 use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
-use khive_types::EdgeEndpointRule;
+use khive_types::{EdgeEndpointRule, Namespace};
 use lattice_embed::{
     CachedEmbeddingService, EmbeddingModel, EmbeddingService, NativeEmbeddingService,
 };
@@ -13,15 +13,128 @@ use tokio::sync::OnceCell;
 
 use crate::error::RuntimeResult;
 
+// ---- BackendId ----
+
+/// Identifies a named backend in a multi-backend deployment (ADR-009, ADR-028).
+///
+/// The `main` backend is the default single-backend name. Multi-backend deployments
+/// assign each `[[backends]]` entry a distinct `BackendId`. The
+/// [`SubstrateCoordinator`](kkernel::coordinator::SubstrateCoordinator) in `kkernel`
+/// uses `BackendId` for node-to-backend resolution and cross-backend edge routing.
+///
+/// A single-backend `KhiveRuntime` always has `BackendId("main")` by default.
+/// The boot path in `kkernel` or `khive-mcp` sets the id via `RuntimeConfig::backend_id`
+/// when constructing per-pack runtimes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BackendId(pub String);
+
+impl BackendId {
+    /// The default single-backend name.
+    pub const MAIN: &'static str = "main";
+
+    /// Construct from a string name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// The default `main` backend id.
+    pub fn main() -> Self {
+        Self(Self::MAIN.to_string())
+    }
+
+    /// Return the backend name as a `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BackendId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ---- Sealed token ----
+
+mod private {
+    #[derive(Clone, Debug)]
+    pub(crate) struct Sealed;
+}
+
+/// Authorization proof that a caller is permitted to access a specific namespace.
+///
+/// Created by [`VerbRegistry::dispatch`] after the gate approves the request.
+/// The sealed inner field prevents external code from constructing a token
+/// without going through the authorization path.
+#[derive(Clone, Debug)]
+pub struct NamespaceToken {
+    namespace: Namespace,
+    actor: ActorRef,
+    _sealed: private::Sealed,
+}
+
+impl NamespaceToken {
+    /// Mint an authorized token. Only callable from within `khive-runtime`.
+    pub(crate) fn mint_authorized(namespace: Namespace, actor: ActorRef) -> Self {
+        Self {
+            namespace,
+            actor,
+            _sealed: private::Sealed,
+        }
+    }
+
+    /// Convenience constructor for the local namespace with an anonymous actor.
+    ///
+    /// Only callable from within `khive-runtime`. External callers must use
+    /// [`KhiveRuntime::authorize`] to mint tokens.
+    // Used only in #[cfg(test)] blocks within this crate's src/ files.
+    #[allow(dead_code)]
+    pub(crate) fn local() -> Self {
+        Self::mint_authorized(Namespace::local(), ActorRef::anonymous())
+    }
+
+    /// Convenience constructor for a specific namespace with an anonymous actor.
+    ///
+    /// Only callable from within `khive-runtime`. External callers must use
+    /// [`KhiveRuntime::authorize`] to mint tokens.
+    // Used only in #[cfg(test)] blocks within this crate's src/ files.
+    #[allow(dead_code)]
+    pub(crate) fn for_namespace(ns: Namespace) -> Self {
+        Self::mint_authorized(ns, ActorRef::anonymous())
+    }
+
+    pub fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+
+    pub fn actor(&self) -> &ActorRef {
+        &self.actor
+    }
+}
+
+// ---- RuntimeConfig ----
+
 /// Runtime configuration.
+///
+/// Per ADR-028, the `db_path` and `embedding_model` fields are deprecated in favour of
+/// constructing the backend externally and calling [`KhiveRuntime::from_backend`].
+/// They remain for backward compatibility with tests and single-binary deployments.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Path to the SQLite database file. `None` = in-memory (tests).
+    ///
+    /// Deprecated: use [`KhiveRuntime::from_backend`] instead. The boot path
+    /// constructs backends from `khive.toml` (`AppConfig`) and passes them to
+    /// `from_backend`. Direct `db_path` usage persists only in tests.
     pub db_path: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
-    pub default_namespace: String,
+    pub default_namespace: Namespace,
     /// Local embedding model. `None` disables embedding and hybrid vector search;
     /// `hybrid_search` then falls back to text-only.
+    ///
+    /// Deprecated: per ADR-028/ADR-031, embedding engines move to a per-pack
+    /// `EmbedderRegistry`. This field persists for backward compatibility until
+    /// the embedder registry is fully plumbed.
     pub embedding_model: Option<EmbeddingModel>,
     /// Authorization gate consulted before each verb dispatch (ADR-029).
     /// Default: `AllowAllGate` (permissive). For production policy enforcement,
@@ -33,6 +146,11 @@ pub struct RuntimeConfig {
     /// by the transport, not silently ignored.
     /// Default: `["kg"]`.
     pub packs: Vec<String>,
+    /// Identifies this runtime's backend in a multi-backend deployment (ADR-009, ADR-028).
+    ///
+    /// Set by the boot path when constructing per-pack runtimes from `khive.toml`.
+    /// Single-backend deployments use the default `BackendId::MAIN`.
+    pub backend_id: BackendId,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -62,13 +180,16 @@ impl Default for RuntimeConfig {
             .unwrap_or_else(|| vec!["kg".to_string()]);
         Self {
             db_path,
-            default_namespace: "local".to_string(),
+            default_namespace: Namespace::local(),
             embedding_model,
             gate: Arc::new(AllowAllGate),
             packs,
+            backend_id: BackendId::main(),
         }
     }
 }
+
+// ---- KhiveRuntime ----
 
 /// Composable runtime handle used by the MCP server.
 ///
@@ -88,6 +209,10 @@ pub struct KhiveRuntime {
 
 impl KhiveRuntime {
     /// Create a new runtime with the given config.
+    ///
+    /// The config's `db_path` is used to open or create the SQLite backend.
+    /// For the preferred boot path in multi-backend deployments, use
+    /// [`from_backend`](Self::from_backend) instead.
     pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
         let backend = match &config.db_path {
             Some(path) => {
@@ -106,15 +231,42 @@ impl KhiveRuntime {
         })
     }
 
+    /// Construct a runtime from an already-opened backend (ADR-028 boot path).
+    ///
+    /// This is the preferred constructor for multi-backend deployments. The caller
+    /// (boot path in `kkernel` or `khive-mcp`) opens each backend from `khive.toml`,
+    /// then constructs a `KhiveRuntime` per pack using this method.
+    ///
+    /// The returned runtime has `db_path = None` and `embedding_model = None`; all
+    /// storage access is through the provided `backend`. Set `backend_id` and
+    /// `default_namespace` via the config builder pattern if non-defaults are needed.
+    pub fn from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
+        Self {
+            backend,
+            config,
+            embedder: Arc::new(OnceCell::new()),
+            edge_rules: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
     /// Create an in-memory runtime (for tests and ephemeral use).
     pub fn memory() -> RuntimeResult<Self> {
         Self::new(RuntimeConfig {
             db_path: None,
-            default_namespace: "local".to_string(),
+            default_namespace: Namespace::local(),
             embedding_model: None,
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
         })
+    }
+
+    /// Return the [`BackendId`] for this runtime's backend.
+    ///
+    /// Used by the [`SubstrateCoordinator`](kkernel::coordinator::SubstrateCoordinator)
+    /// to identify which backend owns a given node, and to detect cross-backend merges.
+    pub fn backend_id(&self) -> &BackendId {
+        &self.config.backend_id
     }
 
     /// Return a reference to the runtime config.
@@ -127,31 +279,34 @@ impl KhiveRuntime {
         &self.backend
     }
 
-    /// Resolve namespace: use provided value or fall back to `default_namespace`.
-    pub fn ns<'a>(&'a self, namespace: Option<&'a str>) -> &'a str {
-        namespace.unwrap_or(&self.config.default_namespace)
+    // ---- Store accessors (token-scoped) ----
+
+    /// Get an EntityStore scoped to the token's namespace.
+    pub fn entities(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn EntityStore>> {
+        Ok(self
+            .backend
+            .entities_for_namespace(token.namespace().as_str())?)
     }
 
-    // ---- Store accessors ----
-
-    /// Get an EntityStore scoped to the given namespace (or default).
-    pub fn entities(&self, namespace: Option<&str>) -> RuntimeResult<Arc<dyn EntityStore>> {
-        Ok(self.backend.entities_for_namespace(self.ns(namespace))?)
+    /// Get a GraphStore scoped to the token's namespace.
+    pub fn graph(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn GraphStore>> {
+        Ok(self
+            .backend
+            .graph_for_namespace(token.namespace().as_str())?)
     }
 
-    /// Get a GraphStore scoped to the given namespace (or default).
-    pub fn graph(&self, namespace: Option<&str>) -> RuntimeResult<Arc<dyn GraphStore>> {
-        Ok(self.backend.graph_for_namespace(self.ns(namespace))?)
+    /// Get a NoteStore scoped to the token's namespace.
+    pub fn notes(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn NoteStore>> {
+        Ok(self
+            .backend
+            .notes_for_namespace(token.namespace().as_str())?)
     }
 
-    /// Get a NoteStore scoped to the given namespace (or default).
-    pub fn notes(&self, namespace: Option<&str>) -> RuntimeResult<Arc<dyn NoteStore>> {
-        Ok(self.backend.notes_for_namespace(self.ns(namespace))?)
-    }
-
-    /// Get an EventStore scoped to the given namespace (or default).
-    pub fn events(&self, namespace: Option<&str>) -> RuntimeResult<Arc<dyn EventStore>> {
-        Ok(self.backend.events_for_namespace(self.ns(namespace))?)
+    /// Get an EventStore scoped to the token's namespace.
+    pub fn events(&self, token: &NamespaceToken) -> RuntimeResult<Arc<dyn EventStore>> {
+        Ok(self
+            .backend
+            .events_for_namespace(token.namespace().as_str())?)
     }
 
     /// Get the raw SQL access capability (for ad-hoc queries).
@@ -159,12 +314,12 @@ impl KhiveRuntime {
         self.backend.sql()
     }
 
-    /// Get a VectorStore for the configured embedding model, scoped to the namespace.
+    /// Get a VectorStore for the configured embedding model, scoped to the token's namespace.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is set.
     pub fn vectors(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
     ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
         let model = self
             .config
@@ -173,26 +328,36 @@ impl KhiveRuntime {
         Ok(self.backend.vectors_for_namespace(
             &vec_model_key(model),
             model.dimensions(),
-            self.ns(namespace),
+            token.namespace().as_str(),
         )?)
     }
 
-    /// Get a TextSearch index for the namespace's entity corpus.
+    /// Get a TextSearch index for the token's namespace entity corpus.
     pub fn text(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
     ) -> RuntimeResult<Arc<dyn khive_storage::TextSearch>> {
-        let key = format!("entities_{}", sanitize_key(self.ns(namespace)));
+        let key = format!("entities_{}", sanitize_key(token.namespace().as_str()));
         Ok(self.backend.text(&key)?)
     }
 
-    /// Get a TextSearch index for the namespace's notes corpus.
+    /// Get a TextSearch index for the token's namespace notes corpus.
     pub fn text_for_notes(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
     ) -> RuntimeResult<Arc<dyn khive_storage::TextSearch>> {
-        let key = format!("notes_{}", sanitize_key(self.ns(namespace)));
+        let key = format!("notes_{}", sanitize_key(token.namespace().as_str()));
         Ok(self.backend.text(&key)?)
+    }
+
+    /// Mint an authorization token for the given namespace.
+    ///
+    /// This is the official OSS API for obtaining a [`NamespaceToken`]. In
+    /// local / single-user mode (the default) this always succeeds — there is
+    /// no multi-tenant gate to consult. Multi-tenant deployments replace the
+    /// gate with a policy-backed impl; this method would then enforce it.
+    pub fn authorize(&self, ns: Namespace) -> NamespaceToken {
+        NamespaceToken::mint_authorized(ns, ActorRef::anonymous())
     }
 
     /// Install the pack-aggregated edge endpoint rules (ADR-031).
@@ -268,36 +433,54 @@ mod tests {
         let path = dir.path().join("test.db");
         let config = RuntimeConfig {
             db_path: Some(path.clone()),
-            default_namespace: "test".to_string(),
+            default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
         };
         let rt = KhiveRuntime::new(config).expect("file runtime should create");
         assert!(path.exists());
-        assert_eq!(rt.config().default_namespace, "test");
+        assert_eq!(rt.config().default_namespace.as_str(), "test");
     }
 
     #[test]
-    fn ns_defaults_to_config_namespace() {
+    fn from_backend_uses_provided_backend() {
+        let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::new("lore"),
+        };
+        let rt = KhiveRuntime::from_backend(backend, config);
+        assert_eq!(rt.backend_id().as_str(), "lore");
+        assert!(rt.config().db_path.is_none());
+    }
+
+    #[test]
+    fn backend_id_defaults_to_main() {
         let rt = KhiveRuntime::memory().unwrap();
-        assert_eq!(rt.ns(None), "local");
-        assert_eq!(rt.ns(Some("custom")), "custom");
+        assert_eq!(rt.backend_id().as_str(), BackendId::MAIN);
     }
 
     #[test]
     fn store_accessors_return_ok() {
         let rt = KhiveRuntime::memory().unwrap();
-        assert!(rt.entities(None).is_ok());
-        assert!(rt.graph(None).is_ok());
-        assert!(rt.notes(None).is_ok());
-        assert!(rt.events(None).is_ok());
+        let tok = NamespaceToken::local();
+        assert!(rt.entities(&tok).is_ok());
+        assert!(rt.graph(&tok).is_ok());
+        assert!(rt.notes(&tok).is_ok());
+        assert!(rt.events(&tok).is_ok());
     }
 
     #[test]
     fn vectors_returns_unconfigured_without_model() {
         let rt = KhiveRuntime::memory().unwrap();
-        match rt.vectors(None) {
+        let tok = NamespaceToken::local();
+        match rt.vectors(&tok) {
             Err(crate::RuntimeError::Unconfigured(s)) => assert_eq!(s, "embedding_model"),
             Err(other) => panic!("expected Unconfigured, got {:?}", other),
             Ok(_) => panic!("expected Err, got Ok"),
@@ -323,11 +506,7 @@ mod tests {
     #[test]
     fn default_config_uses_allow_all_gate() {
         let cfg = RuntimeConfig::default();
-        // Default gate is permissive — checked via type identity (no leak of
-        // concrete gate kind otherwise).
-        assert_eq!(cfg.default_namespace, "local");
-        // `gate` is non-`Debug`-comparable; smoke-check by running a request
-        // through it via the registry layer would belong in pack.rs tests.
+        assert_eq!(cfg.default_namespace.as_str(), "local");
         let _: GateRef = cfg.gate.clone();
     }
 
@@ -369,7 +548,6 @@ mod tests {
 
     #[test]
     fn default_config_uses_minilm_when_env_unset() {
-        // Snapshot + clear the env var so this test is deterministic.
         let prior = std::env::var("KHIVE_EMBEDDING_MODEL").ok();
         // SAFETY: tests are serial by default for env mutation here; if other tests
         // mutate this var, mark them with the same scope.

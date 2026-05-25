@@ -1,8 +1,8 @@
 //! pack-kg — Knowledge Graph verb pack for khive.
 //!
-//! Provides 11 verbs for managing entities, notes, edges, and graph queries
-//! in a research knowledge graph. This is the first-party pack shipped with
-//! the khive binary.
+//! Provides 14 verbs for managing entities, notes, edges, graph queries, and
+//! event-sourced proposals (ADR-046) in a research knowledge graph. This is
+//! the first-party pack shipped with the khive binary.
 
 pub mod handlers;
 pub mod vocab;
@@ -11,10 +11,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry};
-use khive_types::{Pack, VerbDef};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
 
-pub use vocab::{EntityKind, NoteKind};
+pub use khive_types::EntityKind;
+pub use vocab::NoteKind;
 
 /// KG pack vocabulary declaration.
 pub struct KgPack {
@@ -30,70 +31,116 @@ impl Pack for KgPack {
         "decision",
         "reference",
     ];
-    const ENTITY_KINDS: &'static [&'static str] =
-        &["concept", "document", "dataset", "project", "person", "org"];
-    const VERBS: &'static [VerbDef] = &KG_VERBS;
+    const ENTITY_KINDS: &'static [&'static str] = &[
+        "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
+    ];
+    const HANDLERS: &'static [HandlerDef] = &KG_HANDLERS;
 }
 
-// ADR-060: Illocutionary classification (Searle 1976)
-//   Assertive — retrieves/presents state of affairs
+// ADR-060 / ADR-025: Illocutionary classification (Searle 1976)
+//   Assertive  — retrieves/presents state of affairs
 //   Commissive — commits caller to a persistent change
 //   Declaration — changes institutional status by fiat
-static KG_VERBS: [VerbDef; 11] = [
+//
+// Verbs 12-14 (propose, review, withdraw) added per ADR-046 (cluster-22).
+static KG_HANDLERS: [HandlerDef; 14] = [
     // Commissive: commits an entity or note to the namespace
-    VerbDef {
+    HandlerDef {
         name: "create",
         description: "Create an entity or note",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     // Assertive: retrieves and presents a record
-    VerbDef {
+    HandlerDef {
         name: "get",
         description: "Fetch any record by UUID",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Assertive: retrieves and presents filtered records
-    VerbDef {
+    HandlerDef {
         name: "list",
         description: "List records with optional filtering",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Declaration: changes entity or edge state by fiat
-    VerbDef {
+    HandlerDef {
         name: "update",
         description: "Patch entity or edge fields",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // Declaration: declares a record removed
-    VerbDef {
+    HandlerDef {
         name: "delete",
         description: "Soft or hard delete a record",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // Declaration: declares two entities identical
-    VerbDef {
+    HandlerDef {
         name: "merge",
         description: "Deduplicate two entities",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // Assertive: retrieves and presents search results
-    VerbDef {
+    HandlerDef {
         name: "search",
         description: "Hybrid FTS + vector search",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Commissive: commits a typed edge to the graph
-    VerbDef {
+    HandlerDef {
         name: "link",
         description: "Create a typed directed edge",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     // Assertive: retrieves immediate graph neighbors
-    VerbDef {
+    HandlerDef {
         name: "neighbors",
         description: "Immediate graph neighbors",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Assertive: retrieves multi-hop traversal results
-    VerbDef {
+    HandlerDef {
         name: "traverse",
         description: "Multi-hop BFS traversal",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Assertive: retrieves pattern-matched results
-    VerbDef {
+    HandlerDef {
         name: "query",
         description: "GQL/SPARQL pattern matching",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+    },
+    // Commissive: commits a proposal to the namespace event log (ADR-046)
+    HandlerDef {
+        name: "propose",
+        description: "Create an event-sourced change proposal",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+    },
+    // Declaration: approves/rejects/comments on a proposal (ADR-046)
+    HandlerDef {
+        name: "review",
+        description: "Approve, reject, comment, or request changes on a proposal",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
+    },
+    // Commissive: rescinds an open proposal (ADR-046)
+    HandlerDef {
+        name: "withdraw",
+        description: "Withdraw an open proposal (proposer-only)",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
 ];
 
@@ -103,7 +150,7 @@ impl KgPack {
     }
 }
 
-// ── ADR-063: inventory self-registration ─────────────────────────────────────
+// ── ADR-027: inventory self-registration ─────────────────────────────────────
 
 struct KgPackFactory;
 
@@ -133,8 +180,8 @@ impl PackRuntime for KgPack {
         <KgPack as Pack>::ENTITY_KINDS
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        &KG_VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        &KG_HANDLERS
     }
 
     async fn dispatch(
@@ -142,19 +189,23 @@ impl PackRuntime for KgPack {
         verb: &str,
         params: Value,
         registry: &VerbRegistry,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "create" => self.handle_create(params, registry).await,
-            "get" => self.handle_get(params).await,
-            "list" => self.handle_list(params, registry).await,
-            "update" => self.handle_update(params).await,
-            "delete" => self.handle_delete(params).await,
-            "merge" => self.handle_merge(params).await,
-            "search" => self.handle_search(params, registry).await,
-            "link" => self.handle_link(params).await,
-            "neighbors" => self.handle_neighbors(params).await,
-            "traverse" => self.handle_traverse(params).await,
-            "query" => self.handle_query(params).await,
+            "create" => self.handle_create(token, params, registry).await,
+            "get" => self.handle_get(token, params).await,
+            "list" => self.handle_list(token, params, registry).await,
+            "update" => self.handle_update(token, params, registry).await,
+            "delete" => self.handle_delete(token, params, registry).await,
+            "merge" => self.handle_merge(token, params, registry).await,
+            "search" => self.handle_search(token, params, registry).await,
+            "link" => self.handle_link(token, params).await,
+            "neighbors" => self.handle_neighbors(token, params).await,
+            "traverse" => self.handle_traverse(token, params).await,
+            "query" => self.handle_query(token, params).await,
+            "propose" => self.handle_propose(token, params).await,
+            "review" => self.handle_review(token, params).await,
+            "withdraw" => self.handle_withdraw(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "kg pack does not handle verb {verb:?}"
             ))),

@@ -146,14 +146,13 @@ pub use khive_hnsw::{
     DistanceMetric, HnswCheckpointConfig, HnswConfig, HnswIndex, HnswSearchContext, HnswSnapshot,
     NodeId, RebuildStats, TombstoneStats,
 };
-// TODO(port-checkpoint): HnswCheckpoint/HnswCheckpointStore depend on khive_fold::Checkpoint
-// which doesn't exist in the current khive-fold API. Re-enable when ported.
-// #[cfg(feature = "checkpoint")]
-// pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
+// Formal proof: khive.Retrieval.HNSW.checkpoint_correctness
 pub use hybrid::{
     fuse_search_results, DualIndexConfig, DualIndexRouter, DualIndexStrategy, HybridConfig,
     HybridSearcher, KeywordSearch, Query, Reranker, VectorSearch,
 };
+#[cfg(feature = "checkpoint")]
+pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
 // TODO(port-rerank): native cross-encoder reranking deferred; khive-inference not ported yet
 // #[cfg(feature = "native-rerank")]
 // pub use hybrid::{CrossEncoderScorer, NativeCrossEncoderReranker, RerankDocumentResolver};

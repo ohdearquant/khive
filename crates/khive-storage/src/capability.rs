@@ -5,10 +5,10 @@
 pub enum StorageCapability {
     Sql,
     Notes,
-    Vectors,
-    Text,
-    Graph,
-    Event,
     Entities,
-    Admin,
+    Graph,
+    Events,
+    Vectors,
+    Sparse,
+    Text,
 }

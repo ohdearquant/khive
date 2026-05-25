@@ -10,7 +10,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, Resolved, RuntimeError};
+use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
+use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::EdgeRelation;
 
 use crate::schema::{
@@ -19,11 +20,86 @@ use crate::schema::{
 };
 use crate::GtdPack;
 
+// ── lifecycle audit schema (ADR-019 §schema_plan) ───────────────────────────
+
+/// Ensure `gtd_lifecycle_audit` and its index exist on the given runtime.
+///
+/// Idempotent (`CREATE TABLE IF NOT EXISTS`).  Applied lazily on the first
+/// `transition` or `complete` call.  Logs a warning and continues if the DDL
+/// fails (e.g. read-only replica) — the audit is best-effort, not load-bearing.
+///
+/// We intentionally apply the DDL on each call rather than using a global
+/// `OnceLock`, because each `KhiveRuntime::memory()` in tests creates a fresh
+/// in-memory database that needs its own schema bootstrap.  In production the
+/// DDL is idempotent and cheap (SQLite skips `IF NOT EXISTS` tables instantly).
+async fn ensure_audit_schema(runtime: &KhiveRuntime) {
+    let script = crate::GTD_SCHEMA_PLAN_STMTS.join(";");
+    match runtime.sql().writer().await {
+        Ok(mut w) => {
+            if let Err(e) = w.execute_script(script).await {
+                tracing::warn!(error = %e, "gtd: failed to apply lifecycle_audit schema (non-fatal)");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "gtd: failed to acquire SQL writer for audit schema (non-fatal)");
+        }
+    }
+}
+
+/// Append one row to `gtd_lifecycle_audit`.
+///
+/// Best-effort: failures are logged and swallowed.  The note's successful
+/// write has already happened; a missing audit row is degraded, not a failure.
+async fn write_audit_record(
+    runtime: &KhiveRuntime,
+    note_id: Uuid,
+    from: &str,
+    to: &str,
+    transition_note: Option<&str>,
+) {
+    let now = Utc::now().timestamp_micros();
+    let stmt = SqlStatement {
+        sql: "INSERT INTO gtd_lifecycle_audit (note_id, from_state, to_state, note, at) \
+              VALUES (?1, ?2, ?3, ?4, ?5)"
+            .into(),
+        params: vec![
+            SqlValue::Text(note_id.as_hyphenated().to_string()),
+            SqlValue::Text(from.to_string()),
+            SqlValue::Text(to.to_string()),
+            match transition_note {
+                Some(n) => SqlValue::Text(n.to_string()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(now),
+        ],
+        label: Some("gtd_audit".into()),
+    };
+    match runtime.sql().writer().await {
+        Ok(mut w) => {
+            if let Err(e) = w.execute(stmt).await {
+                tracing::warn!(
+                    note_id = %note_id,
+                    from,
+                    to,
+                    error = %e,
+                    "gtd: audit write failed (non-fatal)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                note_id = %note_id,
+                error = %e,
+                "gtd: failed to acquire SQL writer for audit write (non-fatal)"
+            );
+        }
+    }
+}
+
 // ── param structs ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct AssignParams {
-    namespace: Option<String>,
     title: String,
     #[serde(default)]
     description: Option<String>,
@@ -47,7 +123,6 @@ struct AssignParams {
 
 #[derive(Deserialize)]
 struct NextParams {
-    namespace: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
     #[serde(default)]
@@ -56,7 +131,6 @@ struct NextParams {
 
 #[derive(Deserialize)]
 struct CompleteParams {
-    namespace: Option<String>,
     id: String,
     #[serde(default)]
     result: Option<String>,
@@ -64,7 +138,6 @@ struct CompleteParams {
 
 #[derive(Deserialize)]
 struct TasksParams {
-    namespace: Option<String>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -79,7 +152,6 @@ struct TasksParams {
 
 #[derive(Deserialize)]
 struct TransitionParams {
-    namespace: Option<String>,
     id: String,
     status: String,
     #[serde(default)]
@@ -100,13 +172,13 @@ fn short_id(uuid: Uuid) -> String {
 pub(crate) async fn resolve_uuid(
     s: &str,
     runtime: &KhiveRuntime,
-    namespace: Option<&str>,
+    token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
     if let Ok(uuid) = Uuid::from_str(s) {
         return Ok(uuid);
     }
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return match runtime.resolve_prefix(namespace, s).await? {
+        return match runtime.resolve_prefix(token, s).await? {
             Some(uuid) => Ok(uuid),
             None => Err(RuntimeError::InvalidInput(format!(
                 "no record matches prefix: {s:?}"
@@ -190,12 +262,12 @@ fn ts_to_rfc(micros: i64) -> String {
 /// actually `kind = "task"`. Used by `complete` and `transition`.
 async fn load_task(
     runtime: &KhiveRuntime,
-    namespace: Option<&str>,
+    token: &NamespaceToken,
     raw_id: &str,
 ) -> Result<(khive_storage::note::Note, String), RuntimeError> {
-    let uuid = resolve_uuid(raw_id, runtime, namespace).await?;
-    let ns = runtime.ns(namespace);
-    let store = runtime.notes(namespace)?;
+    let uuid = resolve_uuid(raw_id, runtime, token).await?;
+    let ns = token.namespace().as_str();
+    let store = runtime.notes(token)?;
     let note = store
         .get_note(uuid)
         .await
@@ -222,7 +294,11 @@ async fn load_task(
 // ── handlers ─────────────────────────────────────────────────────────────────
 
 impl GtdPack {
-    pub(crate) async fn handle_assign(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_assign(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: AssignParams = deser(params)?;
         if p.title.trim().is_empty() {
             return Err(RuntimeError::InvalidInput("title must not be empty".into()));
@@ -255,8 +331,7 @@ impl GtdPack {
         let mut resolved_deps: Vec<Uuid> = Vec::new();
         if let Some(ref deps) = p.depends_on {
             for raw in deps {
-                resolved_deps
-                    .push(resolve_uuid(raw, self.runtime(), p.namespace.as_deref()).await?);
+                resolved_deps.push(resolve_uuid(raw, self.runtime(), token).await?);
             }
         }
 
@@ -268,11 +343,7 @@ impl GtdPack {
         // link failure here would diverge `assign` from `create(note_kind="task")`
         // and violate the "no failure after successful write" rule).
         for dep_uuid in &resolved_deps {
-            match self
-                .runtime()
-                .resolve(p.namespace.as_deref(), *dep_uuid)
-                .await?
-            {
+            match self.runtime().resolve(token, *dep_uuid).await? {
                 Some(Resolved::Note(n)) if n.kind == "task" => {}
                 Some(Resolved::Note(n)) => {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -342,11 +413,11 @@ impl GtdPack {
         let note = self
             .runtime()
             .create_note(
-                p.namespace.as_deref(),
+                token,
                 "task",
                 Some(p.title.as_str()),
                 &content,
-                salience,
+                Some(salience),
                 Some(props),
                 Vec::new(),
             )
@@ -362,13 +433,7 @@ impl GtdPack {
         for dep_uuid in resolved_deps {
             if let Err(e) = self
                 .runtime()
-                .link(
-                    p.namespace.as_deref(),
-                    note.id,
-                    dep_uuid,
-                    EdgeRelation::DependsOn,
-                    1.0,
-                )
+                .link(token, note.id, dep_uuid, EdgeRelation::DependsOn, 1.0, None)
                 .await
             {
                 tracing::warn!(
@@ -383,7 +448,11 @@ impl GtdPack {
         Ok(render_task(&note))
     }
 
-    pub(crate) async fn handle_next(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_next(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: NextParams = deser(params)?;
         let limit = p.limit.unwrap_or(10).clamp(1, 200);
 
@@ -391,7 +460,7 @@ impl GtdPack {
         // 500 covers typical inbox/next/active backlogs without paging.
         let notes = self
             .runtime()
-            .list_notes(p.namespace.as_deref(), Some("task"), 500, 0)
+            .list_notes(token, Some("task"), 500, 0)
             .await?;
 
         let mut actionable: Vec<&khive_storage::note::Note> = notes
@@ -422,9 +491,13 @@ impl GtdPack {
         Ok(Value::Array(result))
     }
 
-    pub(crate) async fn handle_complete(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_complete(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: CompleteParams = deser(params)?;
-        let (mut note, current) = load_task(self.runtime(), p.namespace.as_deref(), &p.id).await?;
+        let (mut note, current) = load_task(self.runtime(), token, &p.id).await?;
 
         if !can_transition(&current, "done") {
             let allowed = allowed_transitions(&current).join(", ");
@@ -445,10 +518,14 @@ impl GtdPack {
         note.updated_at = Utc::now().timestamp_micros();
 
         self.runtime()
-            .notes(p.namespace.as_deref())?
+            .notes(token)?
             .upsert_note(note.clone())
             .await
             .map_err(|e| RuntimeError::Internal(format!("upsert_note: {e}")))?;
+
+        // ADR-019: write lifecycle audit record (best-effort).
+        ensure_audit_schema(self.runtime()).await;
+        write_audit_record(self.runtime(), note.id, &current, "done", None).await;
 
         Ok(json!({
             "completed": true,
@@ -460,7 +537,11 @@ impl GtdPack {
         }))
     }
 
-    pub(crate) async fn handle_tasks(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_tasks(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: TasksParams = deser(params)?;
         let limit = p.limit.unwrap_or(50).clamp(1, 200);
         let offset = p.offset.unwrap_or(0) as usize;
@@ -490,7 +571,7 @@ impl GtdPack {
         let window = (offset as u32).saturating_add(limit).saturating_add(500);
         let notes = self
             .runtime()
-            .list_notes(p.namespace.as_deref(), Some("task"), window, 0)
+            .list_notes(token, Some("task"), window, 0)
             .await?;
 
         let filtered: Vec<&khive_storage::note::Note> = notes
@@ -531,7 +612,11 @@ impl GtdPack {
         Ok(Value::Array(result))
     }
 
-    pub(crate) async fn handle_transition(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_transition(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: TransitionParams = deser(params)?;
         let target = normalize_status(&p.status);
         if !is_valid_status(target) {
@@ -542,7 +627,7 @@ impl GtdPack {
             )));
         }
 
-        let (mut note, current) = load_task(self.runtime(), p.namespace.as_deref(), &p.id).await?;
+        let (mut note, current) = load_task(self.runtime(), token, &p.id).await?;
 
         if current == target {
             // Idempotent — no write, no transition.
@@ -576,10 +661,14 @@ impl GtdPack {
         note.updated_at = Utc::now().timestamp_micros();
 
         self.runtime()
-            .notes(p.namespace.as_deref())?
+            .notes(token)?
             .upsert_note(note.clone())
             .await
             .map_err(|e| RuntimeError::Internal(format!("upsert_note: {e}")))?;
+
+        // ADR-019 + ADR-101: write lifecycle audit record (best-effort).
+        ensure_audit_schema(self.runtime()).await;
+        write_audit_record(self.runtime(), note.id, &current, target, p.note.as_deref()).await;
 
         Ok(json!({
             "transitioned": true,

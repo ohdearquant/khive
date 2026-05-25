@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry};
-use khive_types::{Pack, VerbDef};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
 
 use crate::config::RecallConfig;
 
@@ -32,39 +32,58 @@ impl Pack for MemoryPack {
     const NAME: &'static str = "memory";
     const NOTE_KINDS: &'static [&'static str] = &["memory"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const VERBS: &'static [VerbDef] = &MEMORY_VERBS;
+    const HANDLERS: &'static [HandlerDef] = &MEMORY_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
-// ADR-060: Illocutionary classification (Searle 1976)
+// ADR-025: Illocutionary classification (Searle 1976)
 //   Commissive — commits caller to a persistent change
-//   Assertive — retrieves/presents state of affairs
-static MEMORY_VERBS: [VerbDef; 6] = [
+//   Assertive  — retrieves/presents state of affairs
+static MEMORY_HANDLERS: [HandlerDef; 7] = [
     // Commissive: commits a memory to the namespace
-    VerbDef {
+    HandlerDef {
         name: "remember",
         description: "Create a memory note with salience and decay",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     // Assertive: retrieves memory notes via decay-aware ranking
-    VerbDef {
+    HandlerDef {
         name: "recall",
         description: "Recall memory notes with decay-aware hybrid ranking",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
-    VerbDef {
+    HandlerDef {
         name: "recall.embed",
         description: "Return the embedding vector used by memory recall",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
-    VerbDef {
+    HandlerDef {
         name: "recall.candidates",
         description: "Return raw memory recall candidates by retrieval source",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
-    VerbDef {
+    HandlerDef {
         name: "recall.fuse",
         description: "Return fused memory recall candidates before final scoring",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
-    VerbDef {
+    // ADR-033 §2, F222: rerank stage between fuse and score
+    HandlerDef {
+        name: "recall.rerank",
+        description: "Apply configured rerankers to fused candidates (ADR-033 §2)",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
+    },
+    HandlerDef {
         name: "recall.score",
         description: "Score a memory recall candidate and return score breakdown",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
 ];
 
@@ -77,7 +96,7 @@ impl MemoryPack {
     }
 }
 
-// ── ADR-063: inventory self-registration ─────────────────────────────────────
+// ── ADR-027: inventory self-registration ─────────────────────────────────────
 
 struct MemoryPackFactory;
 
@@ -111,8 +130,8 @@ impl PackRuntime for MemoryPack {
         <MemoryPack as Pack>::ENTITY_KINDS
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        &MEMORY_VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        &MEMORY_HANDLERS
     }
 
     fn requires(&self) -> &'static [&'static str] {
@@ -124,13 +143,15 @@ impl PackRuntime for MemoryPack {
         verb: &str,
         params: Value,
         registry: &VerbRegistry,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "remember" => self.handle_remember(params).await,
-            "recall" => self.handle_recall(params, registry).await,
+            "remember" => self.handle_remember(token, params).await,
+            "recall" => self.handle_recall(token, params, registry).await,
             "recall.embed" => self.handle_recall_embed(params).await,
-            "recall.candidates" => self.handle_recall_candidates(params).await,
-            "recall.fuse" => self.handle_recall_fuse(params, registry).await,
+            "recall.candidates" => self.handle_recall_candidates(token, params).await,
+            "recall.fuse" => self.handle_recall_fuse(token, params, registry).await,
+            "recall.rerank" => self.handle_recall_rerank(params).await,
             "recall.score" => self.handle_recall_score(params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "memory pack does not handle verb {verb:?}"

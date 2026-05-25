@@ -23,8 +23,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, KindHook, RuntimeError, VerbRegistry};
-use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, Pack, VerbDef};
+use khive_runtime::{
+    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, NoteLifecycleSpec, PackSchemaPlan,
+    RuntimeError, SchemaPlan, VerbRegistry,
+};
+use khive_types::{
+    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack, VerbCategory, Visibility,
+};
 
 use crate::hook::TaskHook;
 
@@ -37,9 +42,14 @@ impl Pack for GtdPack {
     const NAME: &'static str = "gtd";
     const NOTE_KINDS: &'static [&'static str] = &["task"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const VERBS: &'static [VerbDef] = &GTD_VERBS;
+    const HANDLERS: &'static [HandlerDef] = &GTD_HANDLERS;
     const EDGE_RULES: &'static [EdgeEndpointRule] = &GTD_EDGE_RULES;
     const REQUIRES: &'static [&'static str] = &["kg"];
+    const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &GTD_NOTE_KIND_SPECS;
+    const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
+        pack: "gtd",
+        statements: &GTD_SCHEMA_PLAN_STMTS,
+    });
 }
 
 /// ADR-031: GTD opts task notes into `depends_on` between tasks. The base
@@ -51,35 +61,113 @@ static GTD_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
     target: EndpointKind::NoteOfKind("task"),
 }];
 
-// ADR-060: Illocutionary classification (Searle 1976)
-//   Directive — attempts to get hearer to do something
-//   Assertive — retrieves/presents state of affairs
+/// ADR-004 §NoteKindSpec: lifecycle declaration for the `task` note kind.
+///
+/// The lifecycle field is named `kind_status` (not `properties["status"]`) to
+/// avoid the semantic collision with `Note.status` (NoteStatus visibility).
+///
+/// Phase 1: this spec is declared and collected by the runtime for introspection
+/// and documentation.  The `task` note kind currently stores lifecycle state in
+/// `properties["status"]` (status quo); Phase 2 will migrate to a first-class
+/// `kind_status` column once the runtime enforcement layer is in place (c11/c12).
+static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
+    kind: "task",
+    aliases: &["todo", "issue"],
+    lifecycle: NoteLifecycleSpec {
+        // ADR-004: lifecycle field name must NOT be "status" to avoid collision
+        // with NoteStatus. The canonical name is "kind_status".
+        field: "kind_status",
+        initial: "inbox",
+        terminal: &["done", "cancelled"],
+        transitions: &[
+            ("inbox", "next"),
+            ("inbox", "waiting"),
+            ("inbox", "someday"),
+            ("inbox", "active"),
+            ("inbox", "done"),
+            ("inbox", "cancelled"),
+            ("next", "active"),
+            ("next", "waiting"),
+            ("next", "someday"),
+            ("next", "done"),
+            ("next", "cancelled"),
+            ("active", "next"),
+            ("active", "waiting"),
+            ("active", "done"),
+            ("active", "cancelled"),
+            ("waiting", "next"),
+            ("waiting", "active"),
+            ("waiting", "done"),
+            ("waiting", "cancelled"),
+            ("someday", "next"),
+            ("someday", "active"),
+            ("someday", "done"),
+            ("someday", "cancelled"),
+            // Reopen paths.
+            ("done", "next"),
+            ("done", "active"),
+            ("cancelled", "next"),
+            ("cancelled", "active"),
+        ],
+    },
+}];
+
+/// ADR-019 §schema_plan: pack-auxiliary schema for GTD lifecycle audit.
+///
+/// `gtd_lifecycle_audit` records every `transition` (and `complete`) invocation
+/// for replay and compliance auditing.  The table is idempotent (`CREATE TABLE
+/// IF NOT EXISTS`) and is NOT part of the core versioned migration chain.
+pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
+    "CREATE TABLE IF NOT EXISTS gtd_lifecycle_audit (\
+        note_id    TEXT NOT NULL,\
+        from_state TEXT NOT NULL,\
+        to_state   TEXT NOT NULL,\
+        note       TEXT,\
+        at         INTEGER NOT NULL\
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_gtd_audit_note \
+        ON gtd_lifecycle_audit(note_id, at DESC)",
+];
+
+// ADR-025: Illocutionary classification (Searle 1976)
+//   Directive  — attempts to get hearer to do something
+//   Assertive  — retrieves/presents state of affairs
 //   Declaration — changes institutional status by fiat
-static GTD_VERBS: [VerbDef; 5] = [
+static GTD_HANDLERS: [HandlerDef; 5] = [
     // Directive: directs an actor to perform work
-    VerbDef {
+    HandlerDef {
         name: "assign",
         description: "Create a GTD task (note with kind=task)",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Directive,
     },
     // Assertive: retrieves actionable tasks
-    VerbDef {
+    HandlerDef {
         name: "next",
         description: "List actionable tasks (status=next or active) by priority",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Declaration: declares a task done
-    VerbDef {
+    HandlerDef {
         name: "complete",
         description: "Mark a task done with an optional result note",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // Assertive: retrieves filtered task listing
-    VerbDef {
+    HandlerDef {
         name: "tasks",
         description: "List tasks filtered by status, assignee, priority",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Declaration: changes task lifecycle status
-    VerbDef {
+    HandlerDef {
         name: "transition",
         description: "Explicit GTD status transition with lifecycle validation",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
 ];
 
@@ -93,7 +181,7 @@ impl GtdPack {
     }
 }
 
-// ── ADR-063: inventory self-registration ─────────────────────────────────────
+// ── ADR-027: inventory self-registration ─────────────────────────────────────
 
 struct GtdPackFactory;
 
@@ -127,8 +215,8 @@ impl PackRuntime for GtdPack {
         <GtdPack as Pack>::ENTITY_KINDS
     }
 
-    fn verbs(&self) -> &'static [VerbDef] {
-        &GTD_VERBS
+    fn handlers(&self) -> &'static [HandlerDef] {
+        &GTD_HANDLERS
     }
 
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
@@ -137,6 +225,17 @@ impl PackRuntime for GtdPack {
 
     fn requires(&self) -> &'static [&'static str] {
         <GtdPack as Pack>::REQUIRES
+    }
+
+    fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
+        <GtdPack as Pack>::NOTE_KIND_SPECS
+    }
+
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "gtd",
+            statements: &GTD_SCHEMA_PLAN_STMTS,
+        }
     }
 
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
@@ -151,13 +250,14 @@ impl PackRuntime for GtdPack {
         verb: &str,
         params: Value,
         _registry: &VerbRegistry,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "assign" => self.handle_assign(params).await,
-            "next" => self.handle_next(params).await,
-            "complete" => self.handle_complete(params).await,
-            "tasks" => self.handle_tasks(params).await,
-            "transition" => self.handle_transition(params).await,
+            "assign" => self.handle_assign(token, params).await,
+            "next" => self.handle_next(token, params).await,
+            "complete" => self.handle_complete(token, params).await,
+            "tasks" => self.handle_tasks(token, params).await,
+            "transition" => self.handle_transition(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "gtd pack does not handle verb {verb:?}"
             ))),

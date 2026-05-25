@@ -67,16 +67,19 @@ async fn main() -> anyhow::Result<()> {
         args.pack
     };
 
+    let default_namespace = khive_runtime::Namespace::parse(&args.namespace)
+        .map_err(|e| anyhow::anyhow!("invalid --namespace {:?}: {e}", args.namespace))?;
+
     let config = RuntimeConfig {
         db_path,
-        default_namespace: args.namespace,
+        default_namespace,
         embedding_model,
         packs,
         ..RuntimeConfig::default()
     };
 
     let runtime = KhiveRuntime::new(config)?;
-    let server = KhiveMcpServer::new(runtime);
+    let server = KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))?;
     server.serve_stdio().await?;
     Ok(())
 }

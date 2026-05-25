@@ -16,6 +16,7 @@ pub mod edge;
 pub mod entity;
 pub mod error;
 pub mod event;
+pub mod hash;
 pub mod header;
 pub mod id;
 pub mod khive_error;
@@ -29,13 +30,23 @@ pub mod vector;
 pub use edge::{EdgeCategory, EdgeRelation};
 pub use entity::{Entity, EntityKind, Link, PropertyValue};
 pub use error::{TypeError, UnknownVariant};
-pub use event::{Event, EventBuilder, EventOutcome};
+pub use event::{
+    AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
+    ProposalAppliedPayload, ProposalChangeset, ProposalCreatedPayload, ProposalDecision,
+    ProposalReviewedPayload, ProposalWithdrawnPayload, RerankExecutedPayload,
+};
+pub use hash::Hash32;
 pub use header::Header;
 pub use id::{Id128, ParseIdError};
 pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};
 pub use namespace::Namespace;
-pub use note::{Note, NoteKind, NoteStatus};
-pub use pack::{EdgeEndpointRule, EndpointKind, Pack, VerbDef};
+pub use note::{Note, NoteStatus};
+#[allow(deprecated)]
+pub use pack::VerbDef;
+pub use pack::{
+    EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, Pack,
+    PackSchemaPlan, VerbCategory, Visibility,
+};
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;

@@ -109,6 +109,7 @@ const DEFAULTS: KhiveConfig = {
     fields: { include: ["name", "description"] },
   },
   schema: { strict: true },
+  // TODO: replace this placeholder with the real auth endpoint before commercial auth ships.
   auth: { api_url: "https://api.khive.ai" },
 };
 

@@ -18,21 +18,27 @@ members = [
     "khive-pack-gtd",
     "khive-pack-memory",
     "khive-pack-brain",
+    "khive-pack-comm",
+    "khive-pack-schedule",
+    "khive-pack-template",
     "khive-mcp",
     "khive-vcs",
+    "khive-vcs-adapters",
     "kkernel",
     "khive-retrieval",
 ]
-# khive-merge excluded — forward-deployed (ADR-043) but not yet compilable
-# against restructured khive-vcs. Will be re-added when ADR-043 integrates.
+# khive-merge removed — the custom three-way merge engine was superseded for v1
+# by git's line merge on sorted NDJSON (ADR-010, ADR-020). The conflict taxonomy
+# from ADR-043 is retained for a future conflict-resolution ADR; the crate is
+# excluded until that work is scoped.
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
 repository = "https://github.com/ohdearquant/khive"
-homepage = "https://khive.ai"
+homepage = "https://github.com/ohdearquant"
 keywords = ["knowledge-graph", "semantic-search", "mcp", "ai-tools", "graph-database"]
 categories = ["database", "command-line-utilities"]
 
@@ -49,7 +55,7 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
-lattice-embed = "0.1.2"
+lattice-embed = "0.2.3"
 parking_lot = "0.12"
 
 [profile.release]

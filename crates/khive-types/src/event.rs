@@ -6,6 +6,7 @@
 
 extern crate alloc;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
 
 use crate::{Header, Id128, SubstrateKind};
@@ -16,20 +17,22 @@ use crate::{Header, Id128, SubstrateKind};
 pub struct Event {
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub header: Header,
-    /// The verb that was executed (e.g., "create", "search", "traverse").
+    /// The verb that produced the event.
     pub verb: String,
     /// Which substrate type was acted upon.
     pub substrate: SubstrateKind,
-    /// Who performed the action (free-form actor string).
-    pub actor: String,
-    /// Outcome of the verb execution.
-    pub outcome: EventOutcome,
-    /// Optional verb-specific structured data (JSON in DB).
-    pub data: Option<String>,
-    /// Duration of the verb execution in microseconds.
-    pub duration_us: u64,
-    /// ID of the substrate record that was acted upon, if applicable.
-    pub target_id: Option<Id128>,
+    /// Who performed the action. Profile- or system-produced events may omit it.
+    pub actor: Option<String>,
+    /// Typed event discriminant used by replay, projections, and workers.
+    pub kind: EventKind,
+    /// Typed payload surface for known event families; raw JSON is still allowed.
+    pub payload: EventPayload,
+    /// Payload schema version interpreted per `kind`.
+    pub payload_schema_version: u32,
+    /// Brain profile state version observed when the event was emitted.
+    pub profile_state_version: Option<u64>,
+    /// Logical aggregate threaded across related event ids.
+    pub aggregate: Option<AggregateRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -58,15 +61,321 @@ impl fmt::Display for EventOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum EventKind {
+    Audit,
+    RecallExecuted,
+    RerankExecuted,
+    SearchExecuted,
+    LinkCreated,
+    EntityCreated,
+    EntityUpdated,
+    EntityDeleted,
+    EntityMerged,
+    NoteCreated,
+    NoteUpdated,
+    NoteDeleted,
+    EdgeUpdated,
+    EdgeDeleted,
+    TaskTransitioned,
+    FeedbackExplicit,
+    ProfileResolutionRecommended,
+    ProfileMerged,
+    EmbeddingModelChanged,
+    EmbeddingMigrationCompleted,
+    EmbeddingMigrationFailed,
+    EmbeddingDriftDetected,
+    ProposalCreated,
+    ProposalReviewed,
+    ProposalApplied,
+    ProposalWithdrawn,
+}
+
+impl EventKind {
+    pub const ALL: [Self; 26] = [
+        Self::Audit,
+        Self::RecallExecuted,
+        Self::RerankExecuted,
+        Self::SearchExecuted,
+        Self::LinkCreated,
+        Self::EntityCreated,
+        Self::EntityUpdated,
+        Self::EntityDeleted,
+        Self::EntityMerged,
+        Self::NoteCreated,
+        Self::NoteUpdated,
+        Self::NoteDeleted,
+        Self::EdgeUpdated,
+        Self::EdgeDeleted,
+        Self::TaskTransitioned,
+        Self::FeedbackExplicit,
+        Self::ProfileResolutionRecommended,
+        Self::ProfileMerged,
+        Self::EmbeddingModelChanged,
+        Self::EmbeddingMigrationCompleted,
+        Self::EmbeddingMigrationFailed,
+        Self::EmbeddingDriftDetected,
+        Self::ProposalCreated,
+        Self::ProposalReviewed,
+        Self::ProposalApplied,
+        Self::ProposalWithdrawn,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Audit => "audit",
+            Self::RecallExecuted => "recall_executed",
+            Self::RerankExecuted => "rerank_executed",
+            Self::SearchExecuted => "search_executed",
+            Self::LinkCreated => "link_created",
+            Self::EntityCreated => "entity_created",
+            Self::EntityUpdated => "entity_updated",
+            Self::EntityDeleted => "entity_deleted",
+            Self::EntityMerged => "entity_merged",
+            Self::NoteCreated => "note_created",
+            Self::NoteUpdated => "note_updated",
+            Self::NoteDeleted => "note_deleted",
+            Self::EdgeUpdated => "edge_updated",
+            Self::EdgeDeleted => "edge_deleted",
+            Self::TaskTransitioned => "task_transitioned",
+            Self::FeedbackExplicit => "feedback_explicit",
+            Self::ProfileResolutionRecommended => "profile_resolution_recommended",
+            Self::ProfileMerged => "profile_merged",
+            Self::EmbeddingModelChanged => "embedding_model_changed",
+            Self::EmbeddingMigrationCompleted => "embedding_migration_completed",
+            Self::EmbeddingMigrationFailed => "embedding_migration_failed",
+            Self::EmbeddingDriftDetected => "embedding_drift_detected",
+            Self::ProposalCreated => "proposal_created",
+            Self::ProposalReviewed => "proposal_reviewed",
+            Self::ProposalApplied => "proposal_applied",
+            Self::ProposalWithdrawn => "proposal_withdrawn",
+        }
+    }
+}
+
+impl fmt::Display for EventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+const EVENT_KIND_VALID: &[&str] = &[
+    "audit",
+    "recall_executed",
+    "rerank_executed",
+    "search_executed",
+    "link_created",
+    "entity_created",
+    "entity_updated",
+    "entity_deleted",
+    "entity_merged",
+    "note_created",
+    "note_updated",
+    "note_deleted",
+    "edge_updated",
+    "edge_deleted",
+    "task_transitioned",
+    "feedback_explicit",
+    "profile_resolution_recommended",
+    "profile_merged",
+    "embedding_model_changed",
+    "embedding_migration_completed",
+    "embedding_migration_failed",
+    "embedding_drift_detected",
+    "proposal_created",
+    "proposal_reviewed",
+    "proposal_applied",
+    "proposal_withdrawn",
+];
+
+impl core::str::FromStr for EventKind {
+    type Err = crate::error::UnknownVariant;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "audit" => Ok(Self::Audit),
+            "recall_executed" => Ok(Self::RecallExecuted),
+            "rerank_executed" => Ok(Self::RerankExecuted),
+            "search_executed" => Ok(Self::SearchExecuted),
+            "link_created" => Ok(Self::LinkCreated),
+            "entity_created" => Ok(Self::EntityCreated),
+            "entity_updated" => Ok(Self::EntityUpdated),
+            "entity_deleted" => Ok(Self::EntityDeleted),
+            "entity_merged" => Ok(Self::EntityMerged),
+            "note_created" => Ok(Self::NoteCreated),
+            "note_updated" => Ok(Self::NoteUpdated),
+            "note_deleted" => Ok(Self::NoteDeleted),
+            "edge_updated" => Ok(Self::EdgeUpdated),
+            "edge_deleted" => Ok(Self::EdgeDeleted),
+            "task_transitioned" => Ok(Self::TaskTransitioned),
+            "feedback_explicit" => Ok(Self::FeedbackExplicit),
+            "profile_resolution_recommended" => Ok(Self::ProfileResolutionRecommended),
+            "profile_merged" => Ok(Self::ProfileMerged),
+            "embedding_model_changed" => Ok(Self::EmbeddingModelChanged),
+            "embedding_migration_completed" => Ok(Self::EmbeddingMigrationCompleted),
+            "embedding_migration_failed" => Ok(Self::EmbeddingMigrationFailed),
+            "embedding_drift_detected" => Ok(Self::EmbeddingDriftDetected),
+            "proposal_created" => Ok(Self::ProposalCreated),
+            "proposal_reviewed" => Ok(Self::ProposalReviewed),
+            "proposal_applied" => Ok(Self::ProposalApplied),
+            "proposal_withdrawn" => Ok(Self::ProposalWithdrawn),
+            other => Err(crate::error::UnknownVariant::new(
+                "event_kind",
+                other,
+                EVENT_KIND_VALID,
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AggregateRef {
+    pub kind: String,
+    pub id: Id128,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(tag = "kind", content = "payload", rename_all = "snake_case")
+)]
+pub enum EventPayload {
+    Json(String),
+    RerankExecuted(RerankExecutedPayload),
+    ProposalCreated(ProposalCreatedPayload),
+    ProposalReviewed(ProposalReviewedPayload),
+    ProposalApplied(ProposalAppliedPayload),
+    ProposalWithdrawn(ProposalWithdrawnPayload),
+}
+
+impl Default for EventPayload {
+    fn default() -> Self {
+        Self::Json("{}".into())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RerankExecutedPayload {
+    pub served_by_profile_id: Option<String>,
+    pub model_id: Id128,
+    pub candidates: Vec<Id128>,
+    pub reranked: Vec<(Id128, Vec<(String, f32)>)>,
+    pub final_scores: Vec<(Id128, f32)>,
+    pub latency_us: u64,
+    pub hook_applied: bool,
+    pub hook_target_match: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProposalCreatedPayload {
+    pub proposal_id: Id128,
+    pub proposer: String,
+    pub title: String,
+    pub description: String,
+    pub changeset: ProposalChangeset,
+    pub reviewers: Vec<String>,
+    pub expiry: Option<crate::Timestamp>,
+    pub parent_id: Option<Id128>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
+pub enum ProposalChangeset {
+    AddEntity {
+        entity: String,
+    },
+    UpdateEntity {
+        id: Id128,
+        patch: String,
+    },
+    AddEdge {
+        source: Id128,
+        target: Id128,
+        relation: crate::EdgeRelation,
+        weight: Option<f32>,
+    },
+    AddNote {
+        note: String,
+    },
+    MergeEntities {
+        into: Id128,
+        from: Id128,
+    },
+    SupersedeEntity {
+        old: Id128,
+        new: Id128,
+    },
+    Compound {
+        steps: Vec<ProposalChangeset>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProposalReviewedPayload {
+    pub proposal_id: Id128,
+    pub reviewer: String,
+    pub decision: ProposalDecision,
+    pub comment: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ProposalDecision {
+    Approve,
+    Reject,
+    Comment,
+    RequestChanges,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProposalAppliedPayload {
+    pub proposal_id: Id128,
+    pub applied_at: crate::Timestamp,
+    pub applied_by: String,
+    pub result: ApplyResult,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ApplyResult {
+    Success {
+        created_records: Vec<Id128>,
+    },
+    Failed {
+        error: String,
+        applied_step_count: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProposalWithdrawnPayload {
+    pub proposal_id: Id128,
+    pub by: String,
+    pub reason: Option<String>,
+}
+
 /// Builder for events. Used by the verb dispatch path.
 pub struct EventBuilder {
     verb: String,
     substrate: SubstrateKind,
-    actor: String,
-    outcome: EventOutcome,
-    data: Option<String>,
-    duration_us: u64,
-    target_id: Option<Id128>,
+    actor: Option<String>,
+    kind: EventKind,
+    payload: EventPayload,
+    payload_schema_version: u32,
+    profile_state_version: Option<u64>,
+    aggregate: Option<AggregateRef>,
 }
 
 impl EventBuilder {
@@ -78,31 +387,37 @@ impl EventBuilder {
         Self {
             verb: verb.into(),
             substrate,
-            actor: actor.into(),
-            outcome: EventOutcome::Success,
-            data: None,
-            duration_us: 0,
-            target_id: None,
+            actor: Some(actor.into()),
+            kind: EventKind::Audit,
+            payload: EventPayload::default(),
+            payload_schema_version: 1,
+            profile_state_version: None,
+            aggregate: None,
         }
     }
 
-    pub fn outcome(mut self, outcome: EventOutcome) -> Self {
-        self.outcome = outcome;
+    pub fn kind(mut self, kind: EventKind) -> Self {
+        self.kind = kind;
         self
     }
 
-    pub fn data(mut self, data: impl Into<String>) -> Self {
-        self.data = Some(data.into());
+    pub fn payload(mut self, payload: EventPayload) -> Self {
+        self.payload = payload;
         self
     }
 
-    pub fn duration_us(mut self, us: u64) -> Self {
-        self.duration_us = us;
+    pub fn payload_schema_version(mut self, version: u32) -> Self {
+        self.payload_schema_version = version;
         self
     }
 
-    pub fn target_id(mut self, id: Id128) -> Self {
-        self.target_id = Some(id);
+    pub fn profile_state_version(mut self, version: u64) -> Self {
+        self.profile_state_version = Some(version);
+        self
+    }
+
+    pub fn aggregate(mut self, aggregate: AggregateRef) -> Self {
+        self.aggregate = Some(aggregate);
         self
     }
 
@@ -112,48 +427,77 @@ impl EventBuilder {
             verb: self.verb,
             substrate: self.substrate,
             actor: self.actor,
-            outcome: self.outcome,
-            data: self.data,
-            duration_us: self.duration_us,
-            target_id: self.target_id,
+            kind: self.kind,
+            payload: self.payload,
+            payload_schema_version: self.payload_schema_version,
+            profile_state_version: self.profile_state_version,
+            aggregate: self.aggregate,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
     use super::*;
     use crate::{Namespace, Timestamp};
 
     fn header() -> Header {
         Header::new(
             Id128::from_u128(1),
-            Namespace::default(),
+            Namespace::local(),
             Timestamp::from_secs(1700000000),
         )
     }
 
     #[test]
-    fn event_builder() {
-        let event = EventBuilder::new("search", SubstrateKind::Note, "agent:research")
-            .outcome(EventOutcome::Success)
-            .duration_us(1500)
-            .target_id(Id128::from_u128(42))
-            .build(header());
-
-        assert_eq!(event.verb, "search");
-        assert_eq!(event.substrate, SubstrateKind::Note);
-        assert_eq!(event.actor, "agent:research");
-        assert_eq!(event.outcome, EventOutcome::Success);
-        assert_eq!(event.duration_us, 1500);
-        assert_eq!(event.target_id, Some(Id128::from_u128(42)));
+    fn event_kind_parse_roundtrip() {
+        for kind in EventKind::ALL {
+            let parsed: EventKind = kind
+                .name()
+                .parse()
+                .expect("EventKind::name must parse back");
+            assert_eq!(parsed, kind);
+        }
     }
 
     #[test]
-    fn denied_outcome() {
-        let event = EventBuilder::new("create", SubstrateKind::Note, "user:ocean")
-            .outcome(EventOutcome::Denied)
+    fn rerank_payload_records_served_profile() {
+        let payload = EventPayload::RerankExecuted(RerankExecutedPayload {
+            served_by_profile_id: Some("profile-a".into()),
+            model_id: Id128::from_u128(1),
+            candidates: Vec::new(),
+            reranked: Vec::new(),
+            final_scores: Vec::new(),
+            latency_us: 100,
+            hook_applied: false,
+            hook_target_match: false,
+        });
+        let event = EventBuilder::new("rerank", SubstrateKind::Note, "agent:test")
+            .kind(EventKind::RerankExecuted)
+            .payload(payload)
             .build(header());
-        assert_eq!(event.outcome, EventOutcome::Denied);
+
+        if let EventPayload::RerankExecuted(ref p) = event.payload {
+            assert_eq!(p.served_by_profile_id.as_deref(), Some("profile-a"));
+        } else {
+            panic!("unexpected payload variant");
+        }
+    }
+
+    #[test]
+    fn proposal_payloads_are_typed() {
+        let payload = EventPayload::ProposalReviewed(ProposalReviewedPayload {
+            proposal_id: Id128::from_u128(42),
+            reviewer: "ocean".into(),
+            decision: ProposalDecision::Approve,
+            comment: None,
+        });
+        let event = EventBuilder::new("review", SubstrateKind::Entity, "ocean")
+            .kind(EventKind::ProposalReviewed)
+            .payload(payload)
+            .build(header());
+        assert_eq!(event.kind.name(), "proposal_reviewed");
     }
 }

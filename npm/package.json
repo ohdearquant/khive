@@ -1,16 +1,17 @@
 {
   "name": "khive",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Research knowledge graph CLI — git-native KG versioning",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/ohdearquant/khive"
   },
-  "homepage": "https://khive.ai",
+  "homepage": "https://github.com/ohdearquant",
   "keywords": ["knowledge-graph", "research", "git", "ndjson", "cli"],
   "bin": {
-    "khive": "bin/khive"
+    "khive": "bin/khive",
+    "khive-mcp": "bin/khive-mcp"
   },
   "files": [
     "bin/",
@@ -20,5 +21,13 @@
   "cpu": ["arm64", "x64"],
   "engines": {
     "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@khive/kernel-darwin-arm64": "0.2.1",
+    "@khive/kernel-darwin-x64": "0.2.1",
+    "@khive/kernel-linux-x64-gnu": "0.2.1",
+    "@khive/kernel-linux-x64-musl": "0.2.1",
+    "@khive/kernel-linux-arm64": "0.2.1",
+    "@khive/kernel-win32-x64": "0.2.1"
   }
 }

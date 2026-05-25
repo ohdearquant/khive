@@ -348,7 +348,7 @@ fn triples_to_ast(
     let mut node_kinds: HashMap<String, String> = HashMap::new();
     let mut node_props: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut edges: Vec<(String, String, String, usize, usize)> = Vec::new(); // (src, tgt, rel, min, max)
-    let mut where_conditions: Vec<Condition> = Vec::new();
+    let mut where_cond_list: Vec<Condition> = Vec::new();
 
     for triple in triples {
         match triple.predicate {
@@ -378,7 +378,7 @@ fn triples_to_ast(
                         .insert(name, val);
                 }
                 Object::NumberLiteral(val) => {
-                    where_conditions.push(Condition {
+                    where_cond_list.push(Condition {
                         variable: triple.subject,
                         property: name,
                         op: CompareOp::Eq,
@@ -394,6 +394,17 @@ fn triples_to_ast(
             },
         }
     }
+
+    // Fold the flat condition list into a left-associative AND tree.
+    let where_conditions = where_cond_list
+        .into_iter()
+        .fold(WhereExpr::True, |acc, cond| {
+            let leaf = WhereExpr::Condition(cond);
+            match acc {
+                WhereExpr::True => leaf,
+                other => WhereExpr::And(Box::new(other), Box::new(leaf)),
+            }
+        });
 
     if edges.is_empty() {
         return Err(QueryError::Parse {
@@ -502,10 +513,13 @@ fn triples_to_ast(
     let mut elements: Vec<PatternElement> = Vec::new();
 
     let first_var = &ordered_edges[0].0;
+    let mut first_props = node_props.get(first_var).cloned().unwrap_or_default();
+    let first_entity_type = first_props.remove("entity_type");
     elements.push(PatternElement::Node(NodePattern {
         variable: Some(first_var.clone()),
         kind: node_kinds.get(first_var).cloned(),
-        properties: node_props.get(first_var).cloned().unwrap_or_default(),
+        entity_type: first_entity_type,
+        properties: first_props,
     }));
 
     for (_, tgt, rel, min_hops, max_hops) in &ordered_edges {
@@ -516,10 +530,13 @@ fn triples_to_ast(
             min_hops: *min_hops,
             max_hops: *max_hops,
         }));
+        let mut tgt_props = node_props.get(tgt).cloned().unwrap_or_default();
+        let tgt_entity_type = tgt_props.remove("entity_type");
         elements.push(PatternElement::Node(NodePattern {
             variable: Some(tgt.clone()),
             kind: node_kinds.get(tgt).cloned(),
-            properties: node_props.get(tgt).cloned().unwrap_or_default(),
+            entity_type: tgt_entity_type,
+            properties: tgt_props,
         }));
     }
 

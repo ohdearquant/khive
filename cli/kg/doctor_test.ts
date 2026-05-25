@@ -21,10 +21,10 @@ async function setupKg(
   edges: unknown[],
 ): Promise<void> {
   await Deno.mkdir(`${dir}/.khive/kg`, { recursive: true });
-  const entitiesNdjson =
-    entities.map((e) => JSON.stringify(e)).join("\n") + (entities.length > 0 ? "\n" : "");
-  const edgesNdjson =
-    edges.map((e) => JSON.stringify(e)).join("\n") + (edges.length > 0 ? "\n" : "");
+  const entitiesNdjson = entities.map((e) => JSON.stringify(e)).join("\n") +
+    (entities.length > 0 ? "\n" : "");
+  const edgesNdjson = edges.map((e) => JSON.stringify(e)).join("\n") +
+    (edges.length > 0 ? "\n" : "");
   await Deno.writeTextFile(`${dir}/.khive/kg/entities.ndjson`, entitiesNdjson);
   await Deno.writeTextFile(`${dir}/.khive/kg/edges.ndjson`, edgesNdjson);
 }

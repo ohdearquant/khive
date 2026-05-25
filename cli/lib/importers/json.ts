@@ -1,12 +1,12 @@
 /**
- * JSON array adapter (ADR-055 §2 P0 — "JSON" format).
+ * JSON array adapter (ADR-036 §2 P0 — "JSON" format).
  *
  * Reads a JSON file containing an array of objects. Each object is either an
  * entity or an edge depending on which fields are present:
  *   - has source + target  → edge
  *   - otherwise            → entity (name required)
  *
- * Entity fields recognized case-insensitively (ADR-055 §JSON-detection):
+ * Entity fields recognized case-insensitively (ADR-036 §JSON-detection):
  *   id, name, kind, description, tags.
  * Everything else collects into `properties`. Edge fields recognized:
  *   edge_id, source, target, relation, weight; everything else → properties.
@@ -85,7 +85,7 @@ export function adaptJson(
 
   for (let i = 0; i < parsed.length; i++) {
     const item = parsed[i];
-    // Non-object items are a fatal structural error (ADR-055 §5: all-or-nothing).
+    // Non-object items are a fatal structural error (ADR-036 §5: all-or-nothing).
     if (!item || typeof item !== "object" || Array.isArray(item)) {
       throw new Error(
         `item ${i}: expected a JSON object, got ${Array.isArray(item) ? "array" : typeof item}`,

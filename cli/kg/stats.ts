@@ -126,7 +126,9 @@ function formatStats(stats: KgStats, json: boolean): string {
 
   const cov = stats.schemaCoverage;
   lines.push(`\n  Schema coverage:`);
-  lines.push(`    Entity kinds:   ${cov.entityKindsKnown} known, ${cov.entityKindsUnknown} unknown`);
+  lines.push(
+    `    Entity kinds:   ${cov.entityKindsKnown} known, ${cov.entityKindsUnknown} unknown`,
+  );
   lines.push(
     `    Edge relations: ${cov.edgeRelationsKnown} known, ${cov.edgeRelationsUnknown} unknown`,
   );

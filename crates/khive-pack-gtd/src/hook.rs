@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, KindHook, Resolved, RuntimeError};
+use khive_runtime::{KhiveRuntime, KindHook, Namespace, Resolved, RuntimeError};
 use khive_storage::EdgeRelation;
 
 use crate::handlers::resolve_uuid;
@@ -70,10 +70,12 @@ impl KindHook for TaskHook {
         }
         let salience = priority.as_deref().map(priority_to_salience).unwrap_or(0.5);
 
-        let namespace = args
+        let token = args
             .get("namespace")
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .and_then(|s| Namespace::parse(s).ok())
+            .map(|ns| runtime.authorize(ns))
+            .unwrap_or_else(|| runtime.authorize(Namespace::local()));
 
         // Resolve depends_on entries (full UUID or 8+ hex prefix) to canonical
         // UUID strings — matches the shape gtd's `assign` produces. Also
@@ -87,8 +89,8 @@ impl KindHook for TaskHook {
                 let raw = entry.as_str().ok_or_else(|| {
                     RuntimeError::InvalidInput("depends_on entries must be strings".into())
                 })?;
-                let uuid = resolve_uuid(raw, runtime, namespace.as_deref()).await?;
-                match runtime.resolve(namespace.as_deref(), uuid).await? {
+                let uuid = resolve_uuid(raw, runtime, &token).await?;
+                match runtime.resolve(&token, uuid).await? {
                     Some(Resolved::Note(n)) if n.kind == "task" => {}
                     Some(Resolved::Note(n)) => {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -183,7 +185,12 @@ impl KindHook for TaskHook {
             .and_then(Value::as_array);
 
         if let Some(arr) = deps {
-            let namespace = args.get("namespace").and_then(Value::as_str);
+            let token = args
+                .get("namespace")
+                .and_then(Value::as_str)
+                .and_then(|s| Namespace::parse(s).ok())
+                .map(|ns| runtime.authorize(ns))
+                .unwrap_or_else(|| runtime.authorize(Namespace::local()));
             for entry in arr {
                 let Some(raw) = entry.as_str() else { continue };
                 let target = match Uuid::parse_str(raw) {
@@ -194,7 +201,7 @@ impl KindHook for TaskHook {
                     }
                 };
                 if let Err(e) = runtime
-                    .link(namespace, id, target, EdgeRelation::DependsOn, 1.0)
+                    .link(&token, id, target, EdgeRelation::DependsOn, 1.0, None)
                     .await
                 {
                     tracing::warn!(
