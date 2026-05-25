@@ -1245,9 +1245,16 @@ impl KhiveRuntime {
                     .map_err(|e| RuntimeError::Internal(format!("stored UUID is invalid: {e}")))?;
                 Ok(Some(uuid))
             }
-            _ => Err(RuntimeError::Ambiguous(format!(
-                "prefix '{prefix}' matches multiple UUIDs"
-            ))),
+            _ => {
+                let uuids: Vec<uuid::Uuid> = matches
+                    .iter()
+                    .filter_map(|s| Uuid::from_str(s).ok())
+                    .collect();
+                Err(RuntimeError::AmbiguousPrefix {
+                    prefix: prefix.to_string(),
+                    matches: uuids,
+                })
+            }
         }
     }
 

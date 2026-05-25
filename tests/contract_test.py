@@ -87,10 +87,17 @@ def _recv(proc: subprocess.Popen) -> dict:
 def _request_raw(proc: subprocess.Popen, ops_string: str) -> dict:
     """Call the single `request` MCP tool and return the parsed response body.
 
+    Uses ``presentation: "verbose"`` so test assertions receive full canonical
+    UUIDs and timestamps (ADR-045 — scripted/CI callers default to Verbose).
+
     Returns {"_rpc_error": {...}} if the server replied with a JSON-RPC error
     (i.e. the DSL itself was rejected — malformed input).
     """
-    _send(proc, "tools/call", {"name": "request", "arguments": {"ops": ops_string}})
+    _send(
+        proc,
+        "tools/call",
+        {"name": "request", "arguments": {"ops": ops_string, "presentation": "verbose"}},
+    )
     resp = _recv(proc)
     if "error" in resp:
         return {"_rpc_error": resp["error"]}

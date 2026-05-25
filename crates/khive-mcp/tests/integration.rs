@@ -71,12 +71,19 @@ async fn call(
 }
 
 /// Helper: run a single op via `request` and return the parsed `result` field
-/// of the first entry. Panics if the op failed.
+/// of the first entry. Uses `presentation: "verbose"` so tests receive full
+/// canonical UUIDs and timestamps (not Agent-mode short forms). Panics if the
+/// op failed.
 async fn ok_one(
     client: &impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>,
     ops: &str,
 ) -> anyhow::Result<Value> {
-    let result = call(client, "request", json!({"ops": ops})).await?;
+    let result = call(
+        client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = body["results"].get(0).cloned().unwrap_or(Value::Null);
     assert_eq!(
