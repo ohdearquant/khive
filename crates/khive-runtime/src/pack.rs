@@ -172,6 +172,24 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
+    /// Register custom embedding providers with the runtime (ADR-031 extension).
+    ///
+    /// Called by the transport during pack initialisation, before the first verb
+    /// dispatch, so that `KhiveRuntime::embedder(name)` resolves provider names
+    /// declared here.
+    ///
+    /// Implement this method to contribute non-lattice embedding backends:
+    ///
+    /// ```ignore
+    /// fn register_embedders(&self, runtime: &KhiveRuntime) {
+    ///     runtime.register_embedder(MyCustomProvider::new());
+    /// }
+    /// ```
+    ///
+    /// The default no-op preserves backwards compatibility — packs that only
+    /// use built-in lattice models do not need to override this method.
+    fn register_embedders(&self, _runtime: &KhiveRuntime) {}
+
     /// Dispatch a verb call. Returns serialized JSON response.
     ///
     /// The `registry` parameter gives the handler access to the merged
@@ -947,6 +965,22 @@ impl VerbRegistry {
     /// skip empty plans should check `plan.is_empty()`.
     pub fn all_schema_plans(&self) -> Vec<SchemaPlan> {
         self.packs.iter().map(|p| p.schema_plan()).collect()
+    }
+
+    /// Invoke `PackRuntime::register_embedders` on every registered pack
+    /// (ADR-031 extension — pack embedder hook).
+    ///
+    /// Called by the transport during startup, after the registry is built and
+    /// before the first verb dispatch, so that custom embedding providers
+    /// contributed by packs are reachable via `KhiveRuntime::embedder(name)`.
+    ///
+    /// Packs whose `register_embedders` is the default no-op pay no overhead.
+    /// The method is idempotent when the underlying registry uses last-wins
+    /// semantics for duplicate provider names.
+    pub fn call_register_embedders(&self, runtime: &KhiveRuntime) {
+        for pack in self.packs.iter() {
+            pack.register_embedders(runtime);
+        }
     }
 
     /// Apply all non-empty pack-auxiliary schema plans to the given backend

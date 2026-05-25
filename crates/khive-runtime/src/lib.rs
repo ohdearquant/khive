@@ -20,6 +20,7 @@
 //! ```
 
 pub mod curation;
+pub mod embedder_registry;
 pub mod error;
 pub mod fusion;
 pub mod graph_traversal;
@@ -37,6 +38,7 @@ pub use curation::{
     ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
     MergeSummary, NotePatch,
 };
+pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use error::{RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::{PathNode, TraversalOptions};

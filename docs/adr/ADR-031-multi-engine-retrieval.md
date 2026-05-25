@@ -773,4 +773,67 @@ existing single-engine deployments see no behavior change.
 - khive-internal `apps/cli/src/server/unified.rs:414-664` — `resolve_embed_models`,
   historical multi-engine wiring; D2 pattern source
 - khive-internal summary `summary_20260326_165542_recall_overhaul_multi_index_architecture.md`
+
+---
+
+## Addendum — Pack-extensible EmbedderRegistry (PR #397, 2026-05-25)
+
+### Motivation
+
+ADR-031 §D2 describes registering multiple lattice embedding models at boot time via
+`RuntimeConfig::additional_embedding_models`. However, the registry was a closed `HashMap<String,
+EmbedderEntry>` wrapping only `lattice_embed::EmbeddingModel` variants — packs could not
+contribute non-lattice embedding backends.
+
+### Decision
+
+A new `EmbedderProvider` async trait and `EmbedderRegistry` struct replace the private
+`HashMap<String, EmbedderEntry>` inside `KhiveRuntime`.
+
+**EmbedderProvider contract**:
+
+```rust
+#[async_trait]
+pub trait EmbedderProvider: Send + Sync {
+    fn name(&self) -> &str;            // stable, unique name
+    fn dimensions(&self) -> usize;     // output vector dimension
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError>;
+}
+```
+
+**EmbedderRegistry** stores `Box<dyn EmbedderProvider>` + a `OnceCell` per entry (lazy init,
+cached). Last-writer-wins on duplicate name registration (pack order is not guaranteed).
+
+**KhiveRuntime integration**:
+- `embedder_registry: Arc<RwLock<EmbedderRegistry>>` replaces `embedders: Arc<HashMap<...>>`.
+- `KhiveRuntime::register_embedder(provider)` — public, callable post-construction.
+- Existing `embedder(name)`, `resolve_embedding_model(name)`, `registered_embedding_model_names()`
+  continue to work: alias resolution still normalises lattice short-names before registry lookup;
+  custom (non-lattice) provider names bypass alias resolution and look up the registry directly.
+- `RwLockGuard` is never held across `await` — entries are cloned before `OnceCell::get_or_init`.
+
+**Pack extension hook**:
+
+```rust
+// PackRuntime trait (khive-runtime/src/pack.rs)
+fn register_embedders(&self, _runtime: &KhiveRuntime) {}   // default no-op
+```
+
+Packs that provide custom embedding backends implement this method; the transport should call it
+during pack initialisation before the first verb dispatch.
+
+**Backwards compatibility**: `RuntimeConfig::embedding_model` and
+`additional_embedding_models` remain. Built-in lattice models are pre-registered as
+`LatticeEmbedderProvider` instances during `KhiveRuntime::new` / `from_backend`. No callers
+need changes.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `crates/khive-runtime/src/embedder_registry.rs` | New — `EmbedderProvider`, `EmbedderRegistry`, `LatticeEmbedderProvider`, unit tests |
+| `crates/khive-runtime/src/runtime.rs` | Refactored — `embedder_registry` field, `register_embedder`, updated `embedder`/`resolve_embedding_model`/`registered_embedding_model_names` |
+| `crates/khive-runtime/src/pack.rs` | `PackRuntime::register_embedders` default no-op added |
+| `crates/khive-runtime/src/lib.rs` | `pub mod embedder_registry`; re-exports |
+| `crates/khive-runtime/tests/integration.rs` | 4 new integration tests in `embedder_registry_tests` module |
   — Chinese-blindspot crisis; per-engine calibration history

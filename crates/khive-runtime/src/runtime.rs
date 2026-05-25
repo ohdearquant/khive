@@ -1,18 +1,12 @@
 //! KhiveRuntime — composable handle to all storage capabilities.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use khive_db::StorageBackend;
 use khive_gate::{ActorRef, AllowAllGate, GateRef};
 use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
 use khive_types::{EdgeEndpointRule, Namespace};
-use lattice_embed::{
-    CachedEmbeddingService, EmbeddingModel, EmbeddingService, NativeEmbeddingService,
-};
-use tokio::sync::OnceCell;
+use lattice_embed::{EmbeddingModel, EmbeddingService};
 
 use crate::error::RuntimeResult;
 
@@ -206,12 +200,6 @@ impl Default for RuntimeConfig {
 
 // ---- KhiveRuntime ----
 
-#[derive(Clone)]
-struct EmbedderEntry {
-    model: EmbeddingModel,
-    cell: Arc<OnceCell<Arc<dyn EmbeddingService>>>,
-}
-
 /// Composable runtime handle used by the MCP server.
 ///
 /// Wraps a `StorageBackend` and provides namespace-scoped accessor methods
@@ -220,7 +208,13 @@ struct EmbedderEntry {
 pub struct KhiveRuntime {
     backend: Arc<StorageBackend>,
     config: RuntimeConfig,
-    embedders: Arc<HashMap<String, EmbedderEntry>>,
+    /// Pack-extensible embedder registry (ADR-031 extension).
+    ///
+    /// Shared across clones via `Arc<RwLock<_>>` so that
+    /// [`register_embedder`](Self::register_embedder) after clone is visible
+    /// to all handles. Built-in lattice models are pre-registered during
+    /// construction; packs may add more via [`PackRuntime::register_embedders`].
+    embedder_registry: Arc<std::sync::RwLock<crate::embedder_registry::EmbedderRegistry>>,
     default_embedder_name: Arc<str>,
     /// Pack-extensible edge endpoint rules (ADR-031). Shared across clones
     /// via `Arc<RwLock<_>>`; installed once by the transport after the
@@ -246,11 +240,11 @@ impl KhiveRuntime {
             None => StorageBackend::memory()?,
         };
         register_configured_embedding_models(&backend, &config)?;
-        let (embedders, default_embedder_name) = build_embedder_registry(&config);
+        let (registry, default_embedder_name) = build_embedder_registry(&config);
         Ok(Self {
             backend: Arc::new(backend),
             config,
-            embedders: Arc::new(embedders),
+            embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
         })
@@ -269,11 +263,11 @@ impl KhiveRuntime {
         if let Err(err) = register_configured_embedding_models(&backend, &config) {
             tracing::warn!(error = %err, "failed to register configured embedding models");
         }
-        let (embedders, default_embedder_name) = build_embedder_registry(&config);
+        let (registry, default_embedder_name) = build_embedder_registry(&config);
         Self {
             backend,
             config,
-            embedders: Arc::new(embedders),
+            embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
         }
@@ -357,13 +351,49 @@ impl KhiveRuntime {
     }
 
     /// Get a VectorStore for a specific named embedding model, scoped to the token's namespace.
+    ///
+    /// Accepts both built-in lattice model names/aliases and custom provider names
+    /// registered via [`register_embedder`](Self::register_embedder). Lattice names
+    /// are routed through the enum-backed path; custom provider names use the
+    /// provider's declared `dimensions()` directly so that the vector store key
+    /// is consistent with how vectors were written during `remember`/`recall`.
     pub fn vectors_for_model(
         &self,
         token: &NamespaceToken,
         model_name: &str,
     ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
-        let model = self.resolve_embedding_model(Some(model_name))?;
-        self.vectors_for_embedding_model(token, model)
+        // Try the lattice enum path first (handles aliases like "paraphrase").
+        if let Some(model) = parse_embedding_model_alias(model_name) {
+            // Only proceed via the lattice path if this model is actually in the
+            // registry; otherwise fall through to the custom-provider path.
+            let key = model.to_string();
+            let in_registry = self
+                .embedder_registry
+                .read()
+                .map(|reg| reg.contains(&key))
+                .unwrap_or(false);
+            if in_registry {
+                return self.vectors_for_embedding_model(token, model);
+            }
+        }
+        // Custom provider path: look up dimensions from the registry and build
+        // the vector store using the sanitized provider name as the table key.
+        let dims = {
+            let registry = self.embedder_registry.read().map_err(|_| {
+                crate::RuntimeError::Internal("embedder registry lock poisoned".into())
+            })?;
+            registry
+                .get_provider(model_name)
+                .map(|p| p.dimensions())
+                .ok_or_else(|| crate::RuntimeError::UnknownModel(model_name.to_string()))?
+        };
+        let model_key = sanitize_key(model_name);
+        Ok(self.backend.vectors_for_namespace(
+            &model_key,
+            model_name,
+            dims,
+            token.namespace().as_str(),
+        )?)
     }
 
     fn vectors_for_embedding_model(
@@ -446,7 +476,12 @@ impl KhiveRuntime {
                 .ok_or_else(|| crate::RuntimeError::Unconfigured("embedding_model".into()))?,
         };
         let key = model.to_string();
-        if self.embedders.contains_key(&key) {
+        let contains = self
+            .embedder_registry
+            .read()
+            .map(|reg| reg.contains(&key))
+            .unwrap_or(false);
+        if contains {
             Ok(model)
         } else {
             Err(crate::RuntimeError::UnknownModel(
@@ -458,35 +493,76 @@ impl KhiveRuntime {
 
     /// Names of all registered embedding models in this runtime.
     ///
+    /// Includes both built-in lattice models and any custom embedders
+    /// registered by packs via [`register_embedder`](Self::register_embedder).
     /// Useful for operations that must touch every model's storage (e.g.,
     /// scoped vector deletion on note delete — codex High 2 (PR #407)).
     /// The default model is included.
     pub fn registered_embedding_model_names(&self) -> Vec<String> {
-        self.embedders.keys().cloned().collect()
+        self.embedder_registry
+            .read()
+            .map(|reg| reg.names())
+            .unwrap_or_default()
     }
 
     /// Get the lazily-initialized embedding service for the named model.
     ///
-    /// Returns a `CachedEmbeddingService` wrapping a `NativeEmbeddingService`.
-    /// First call loads the model (cold start cost); subsequent calls are cheap and
-    /// benefit from LRU caching of repeated inputs.
+    /// Accepts both built-in lattice model names (e.g. `"all-minilm-l6-v2"`,
+    /// `"paraphrase"`) and custom provider names registered via
+    /// [`register_embedder`](Self::register_embedder).
+    ///
+    /// For lattice model names, aliases (e.g. `"paraphrase"`) are resolved to
+    /// their canonical key before looking up the registry. For custom providers
+    /// the name must match exactly as supplied during registration.
+    ///
+    /// First call for any name loads the underlying service (cold start cost);
+    /// subsequent calls are cheap (registry caches the `Arc`).
     pub async fn embedder(&self, name: &str) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        let model = self.resolve_embedding_model(Some(name))?;
-        let key = model.to_string();
-        let entry = self
-            .embedders
-            .get(&key)
-            .ok_or_else(|| crate::RuntimeError::UnknownModel(name.to_string()))?
-            .clone();
-        Ok(entry
-            .cell
-            .get_or_init(|| async move {
-                let native = Arc::new(NativeEmbeddingService::with_model(entry.model));
-                let cached = CachedEmbeddingService::with_default_cache(native);
-                Arc::new(cached) as Arc<dyn EmbeddingService>
-            })
-            .await
-            .clone())
+        // Try to resolve as a lattice alias first (normalises "paraphrase" →
+        // "paraphrase-multilingual-minilm-l12-v2", etc.).  If that succeeds,
+        // use the canonical key; otherwise fall back to the literal name so
+        // custom providers registered with non-lattice names are reachable.
+        let canonical_key = match parse_embedding_model_alias(name) {
+            Some(model) => model.to_string(),
+            None => name.to_owned(),
+        };
+        // Clone the entry before releasing the lock so we don't hold a
+        // RwLockGuard across the async OnceCell initialisation (Send bound).
+        let entry = {
+            let registry = self.embedder_registry.read().map_err(|_| {
+                crate::RuntimeError::Internal("embedder registry lock poisoned".into())
+            })?;
+            registry
+                .get_entry(&canonical_key)
+                .ok_or_else(|| crate::RuntimeError::UnknownModel(name.to_string()))?
+        };
+        entry.resolve().await
+    }
+
+    /// Register a custom embedding provider with this runtime.
+    ///
+    /// The provider is added to the shared [`EmbedderRegistry`] so all clones
+    /// of this runtime see the new provider immediately. If a provider with the
+    /// same name already exists it is replaced (last-writer wins — see
+    /// [`EmbedderRegistry::register`] for the rationale).
+    ///
+    /// Packs should call this from [`PackRuntime::register_embedders`] (the
+    /// hook is invoked by the transport during pack initialisation, before the
+    /// first verb dispatch).
+    ///
+    /// [`EmbedderRegistry`]: crate::embedder_registry::EmbedderRegistry
+    pub fn register_embedder(
+        &self,
+        provider: impl crate::embedder_registry::EmbedderProvider + 'static,
+    ) {
+        if let Ok(mut registry) = self.embedder_registry.write() {
+            registry.register(provider);
+        } else {
+            tracing::warn!(
+                "embedder registry lock poisoned — embedder {} not registered",
+                std::any::type_name::<dyn crate::embedder_registry::EmbedderProvider>()
+            );
+        }
     }
 }
 
@@ -502,22 +578,19 @@ fn sanitize_key(s: &str) -> String {
         .collect()
 }
 
-fn build_embedder_registry(config: &RuntimeConfig) -> (HashMap<String, EmbedderEntry>, Arc<str>) {
-    let mut embedders = HashMap::new();
+fn build_embedder_registry(
+    config: &RuntimeConfig,
+) -> (crate::embedder_registry::EmbedderRegistry, Arc<str>) {
+    use crate::embedder_registry::{EmbedderRegistry, LatticeEmbedderProvider};
+    let mut registry = EmbedderRegistry::new();
     for model in configured_embedding_models(config) {
-        embedders.insert(
-            model.to_string(),
-            EmbedderEntry {
-                model,
-                cell: Arc::new(OnceCell::new()),
-            },
-        );
+        registry.register(LatticeEmbedderProvider::new(model));
     }
     let default_embedder_name = config
         .embedding_model
         .map(|model| Arc::<str>::from(model.to_string()))
         .unwrap_or_else(|| Arc::<str>::from(""));
-    (embedders, default_embedder_name)
+    (registry, default_embedder_name)
 }
 
 fn configured_embedding_models(config: &RuntimeConfig) -> Vec<EmbeddingModel> {

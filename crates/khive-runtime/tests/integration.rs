@@ -689,3 +689,295 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
             .collect::<Vec<_>>()
     );
 }
+
+// =============================================================================
+// EmbedderRegistry integration tests (#397)
+// =============================================================================
+
+mod embedder_registry_tests {
+    use async_trait::async_trait;
+    use khive_gate::AllowAllGate;
+    use khive_runtime::{EmbedderProvider, KhiveRuntime, RuntimeConfig, RuntimeError};
+    use khive_types::Namespace;
+    use lattice_embed::{EmbeddingModel, EmbeddingService};
+    use std::sync::Arc;
+
+    // ── MockEmbedderProvider ─────────────────────────────────────────────────
+
+    /// A synthetic embedding provider that returns a fixed vector of `42.0` values.
+    ///
+    /// Used to verify that custom providers are reachable via
+    /// `KhiveRuntime::embedder` after registration.
+    struct MockEmbedderProvider {
+        name: String,
+        dims: usize,
+    }
+
+    impl MockEmbedderProvider {
+        fn new(name: &str, dims: usize) -> Self {
+            Self {
+                name: name.to_owned(),
+                dims,
+            }
+        }
+    }
+
+    struct MockEmbeddingService {
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for MockEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts.iter().map(|_| vec![42.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-embedding-service"
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for MockEmbedderProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+            Ok(Arc::new(MockEmbeddingService { dims: self.dims }))
+        }
+    }
+
+    fn memory_rt_no_model() -> KhiveRuntime {
+        KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+        })
+        .expect("in-memory runtime")
+    }
+
+    // ── Test: register + embedder round-trip ─────────────────────────────────
+
+    #[tokio::test]
+    async fn register_embedder_and_retrieve_via_embedder_method() {
+        let rt = memory_rt_no_model();
+        rt.register_embedder(MockEmbedderProvider::new("mock", 384));
+
+        let service = rt
+            .embedder("mock")
+            .await
+            .expect("embedder lookup must succeed after registration");
+
+        let texts = vec!["hello world".to_string()];
+        let vecs = service
+            .embed(&texts, EmbeddingModel::AllMiniLmL6V2)
+            .await
+            .expect("mock service must embed successfully");
+
+        assert_eq!(vecs.len(), 1);
+        assert_eq!(vecs[0].len(), 384);
+        assert!(
+            vecs[0].iter().all(|&v| (v - 42.0_f32).abs() < 1e-6),
+            "mock service must return constant 42.0 vector"
+        );
+    }
+
+    // ── Test: registered names include custom provider ────────────────────────
+
+    #[tokio::test]
+    async fn registered_names_includes_custom_provider() {
+        let rt = memory_rt_no_model();
+        rt.register_embedder(MockEmbedderProvider::new("my-encoder", 128));
+
+        let names = rt.registered_embedding_model_names();
+        assert!(
+            names.contains(&"my-encoder".to_string()),
+            "registered_embedding_model_names must include custom provider 'my-encoder'; got {names:?}"
+        );
+    }
+
+    // ── Test: dual-embedding regression — both MiniLM and paraphrase reachable ─
+
+    #[tokio::test]
+    async fn dual_embedding_regression_both_models_registered() {
+        use khive_runtime::RuntimeConfig;
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+            additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+        })
+        .expect("runtime with two models");
+
+        let names = rt.registered_embedding_model_names();
+
+        assert!(
+            names.contains(&"all-minilm-l6-v2".to_string()),
+            "MiniLM must be registered; names: {names:?}"
+        );
+        assert!(
+            names.contains(&"paraphrase-multilingual-minilm-l12-v2".to_string()),
+            "paraphrase must be registered; names: {names:?}"
+        );
+
+        // Verify resolve_embedding_model works for both.
+        rt.resolve_embedding_model(Some("all-minilm-l6-v2"))
+            .expect("MiniLM must resolve");
+        rt.resolve_embedding_model(Some("paraphrase"))
+            .expect("paraphrase alias must resolve");
+    }
+
+    // ── Test: unknown embedder returns UnknownModel ───────────────────────────
+
+    #[tokio::test]
+    async fn embedder_unknown_name_returns_error() {
+        let rt = memory_rt_no_model();
+        let err = rt
+            .embedder("no-such-model")
+            .await
+            .err()
+            .expect("expected Err for unknown embedder name, got Ok");
+        assert!(
+            matches!(err, RuntimeError::UnknownModel(ref n) if n == "no-such-model"),
+            "expected UnknownModel for unregistered name; got {err:?}"
+        );
+    }
+
+    // ── Test: custom provider registered via pack hook is reachable end-to-end ─
+    //
+    // This is the integration counterpart to the unit tests in
+    // `embedder_registry.rs`. It verifies the full stack: a pack overrides
+    // `register_embedders`, the transport calls `VerbRegistry::call_register_embedders`,
+    // and the custom provider can be resolved and used via `rt.embedder(name)`.
+
+    #[tokio::test]
+    async fn pack_register_embedders_hook_makes_provider_reachable() {
+        use async_trait::async_trait;
+        use khive_runtime::pack::HandlerDef;
+        use khive_runtime::NamespaceToken;
+        use khive_runtime::{PackRuntime, VerbRegistry, VerbRegistryBuilder};
+        use khive_types::Pack;
+        use serde_json::Value;
+
+        struct EmbedderPack;
+
+        impl Pack for EmbedderPack {
+            const NAME: &'static str = "embedder-test-pack";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
+        }
+
+        #[async_trait]
+        impl PackRuntime for EmbedderPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            fn register_embedders(&self, runtime: &KhiveRuntime) {
+                runtime.register_embedder(MockEmbedderProvider::new("pack-custom-encoder", 256));
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, khive_runtime::RuntimeError> {
+                Ok(Value::Null)
+            }
+        }
+
+        let rt = memory_rt_no_model();
+        // Simulate what the transport does: build the registry, then call the hook.
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(EmbedderPack);
+        let registry = builder.build().expect("registry builds");
+        registry.call_register_embedders(&rt);
+
+        // After the hook fires, the custom provider must be reachable.
+        let service = rt
+            .embedder("pack-custom-encoder")
+            .await
+            .expect("pack-contributed provider must be reachable after call_register_embedders");
+
+        let texts = vec!["test sentence".to_string()];
+        let vecs = service
+            .embed(&texts, EmbeddingModel::AllMiniLmL6V2)
+            .await
+            .expect("custom service must embed without error");
+        assert_eq!(vecs.len(), 1);
+        assert_eq!(
+            vecs[0].len(),
+            256,
+            "dims must match provider declaration (256)"
+        );
+    }
+
+    // ── Test: failing provider build() returns Err instead of panicking ───────
+
+    #[tokio::test]
+    async fn failing_provider_build_returns_err_not_panic() {
+        struct FailingProvider;
+
+        #[async_trait]
+        impl EmbedderProvider for FailingProvider {
+            fn name(&self) -> &str {
+                "failing-provider"
+            }
+            fn dimensions(&self) -> usize {
+                128
+            }
+            async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+                Err(RuntimeError::Internal(
+                    "simulated provider construction failure".into(),
+                ))
+            }
+        }
+
+        let rt = memory_rt_no_model();
+        rt.register_embedder(FailingProvider);
+
+        let result = rt.embedder("failing-provider").await;
+        assert!(
+            result.is_err(),
+            "embedder() must return Err when build() fails, not panic; got Ok"
+        );
+        let err = result.err().expect("checked above");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("simulated provider construction failure")
+                || msg.contains("build() failed")
+                || msg.contains("Internal"),
+            "error must carry build failure context; got: {msg}"
+        );
+    }
+}

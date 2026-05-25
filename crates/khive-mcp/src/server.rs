@@ -186,6 +186,11 @@ impl KhiveMcpServer {
         // ADR-031: aggregate pack-declared edge endpoint rules into the runtime
         // so `validate_edge_relation_endpoints` can consult them.
         runtime.install_edge_rules(registry.all_edge_rules());
+        // ADR-031 extension: invoke `PackRuntime::register_embedders` on every
+        // pack so custom embedding providers are available before the first verb
+        // dispatch. Must happen after the registry is built (packs are ordered)
+        // and before any `remember`/`recall` calls that would resolve embedders.
+        registry.call_register_embedders(&runtime);
         // ADR-017 §c12: apply pack-auxiliary schema plans at startup so pack
         // tables are present before any handler runs. Errors are logged but
         // not propagated so a single pack's schema failure cannot abort startup.
