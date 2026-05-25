@@ -39,36 +39,42 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Return current BrainState snapshot for inspection",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "brain.config",
         description: "Return projected config for a named pack parameter",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "brain.events",
         description: "List recent brain-relevant events for debugging",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "brain.profiles",
         description: "List profiles, optionally filtered by lifecycle",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "brain.profile",
         description: "Profile metadata, latest snapshot, current state summary",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "brain.resolve",
         description: "Show which profile would serve a caller context",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     // ── Commissive (write state) verbs ────────────────────────────────────
     HandlerDef {
@@ -76,30 +82,35 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Move a profile to Active (start live update loop)",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[],
     },
     HandlerDef {
         name: "brain.deactivate",
         description: "Move a profile to Inactive (stop live updates, retain state)",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[],
     },
     HandlerDef {
         name: "brain.archive",
         description: "Move a profile to Archived (read-only, audit-retained)",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[],
     },
     HandlerDef {
         name: "brain.reset",
         description: "Reset posteriors to priors (preserves event history)",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[],
     },
     HandlerDef {
         name: "brain.feedback",
         description: "Emit a FeedbackExplicit event into the shared log",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[],
     },
     // ── Declaration verbs ─────────────────────────────────────────────────
     HandlerDef {
@@ -107,12 +118,14 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Write a row in the profile resolution table",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[],
     },
     HandlerDef {
         name: "brain.unbind",
         description: "Remove rows from the profile resolution table",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[],
     },
     // ── Legacy / internal ─────────────────────────────────────────────────
     HandlerDef {
@@ -120,6 +133,7 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Manually emit a feedback event (deprecated; use brain.feedback)",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Commissive,
+        params: &[],
     },
 ];
 

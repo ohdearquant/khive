@@ -23,7 +23,7 @@ use serde_json::Value;
 
 pub use khive_types::{
     EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, PackSchemaPlan,
-    VerbCategory, Visibility,
+    ParamDef, VerbCategory, Visibility,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -550,9 +550,75 @@ pub struct VerbRegistry {
 }
 
 impl VerbRegistry {
+    /// Return the help schema envelope for a verb (issue #287).
+    ///
+    /// Called by `dispatch` when `params["help"] == true`. Walks all registered
+    /// packs to find the first `HandlerDef` whose `name` matches `verb`, then
+    /// returns a structured envelope:
+    ///
+    /// ```json
+    /// {
+    ///   "verb": "recall",
+    ///   "pack": "memory",
+    ///   "description": "...",
+    ///   "category": "Assertive",
+    ///   "params": [
+    ///     { "name": "query", "type": "string", "required": true, "description": "..." },
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// Returns `Err(RuntimeError::InvalidInput(...))` when the verb is unknown
+    /// to all loaded packs — identical to the error the normal dispatch path
+    /// would emit (so callers get consistent feedback for unknown verbs).
+    pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
+        for pack in self.packs.iter() {
+            for handler in pack.handlers().iter() {
+                if handler.name == verb {
+                    let category = format!("{:?}", handler.category);
+                    let params_arr: Vec<Value> = handler
+                        .params
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "name": p.name,
+                                "type": p.param_type,
+                                "required": p.required,
+                                "description": p.description,
+                            })
+                        })
+                        .collect();
+                    return Ok(serde_json::json!({
+                        "verb": verb,
+                        "pack": pack.name(),
+                        "description": handler.description,
+                        "category": category,
+                        "params": params_arr,
+                    }));
+                }
+            }
+        }
+        let available: Vec<&str> = self
+            .packs
+            .iter()
+            .flat_map(|p| p.handlers().iter().map(|v| v.name))
+            .collect();
+        Err(RuntimeError::InvalidInput(format!(
+            "unknown verb {verb:?}; available: {}",
+            available.join(", ")
+        )))
+    }
+
     /// Dispatch a verb to the first pack that handles it.
     ///
     /// When multiple packs declare the same verb, the first registered pack wins.
+    ///
+    /// **`help=true` interception (issue #287)**: when `params` contains
+    /// `"help": true`, dispatch is short-circuited before gate evaluation and
+    /// pack invocation. The call returns a schema envelope for the verb:
+    /// `{ verb, pack, description, category, params: [{name, type, required, description}] }`.
+    /// This is a read-only introspection path; no side effects occur.
     ///
     /// The configured [`Gate`](khive_gate::Gate) is consulted before dispatch
     /// (ADR-029, ADR-035). `Deny` decisions return
@@ -581,6 +647,10 @@ impl VerbRegistry {
     /// Transports that have richer caller context (auth headers, session
     /// info) will gain a sibling dispatch path in a follow-up.
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
+        // help=true interception (issue #287) — short-circuit before gate/pack.
+        if params.get("help").and_then(Value::as_bool) == Some(true) {
+            return self.describe_verb(verb);
+        }
         // Resolve namespace as an owned String before `params` is moved into
         // pack.dispatch, so the post-dispatch hook can reference it.
         let ns_str: String = params
@@ -1029,12 +1099,14 @@ mod tests {
                 description: "create a widget",
                 visibility: Visibility::Verb,
                 category: VerbCategory::Commissive,
+                params: &[],
             },
             HandlerDef {
                 name: "list",
                 description: "list widgets",
                 visibility: Visibility::Verb,
                 category: VerbCategory::Assertive,
+                params: &[],
             },
         ];
     }
@@ -1076,6 +1148,7 @@ mod tests {
                 description: "send alert",
                 visibility: Visibility::Verb,
                 category: VerbCategory::Commissive,
+                params: &[],
             },
             // "create" is Subhandler so it does NOT collide with AlphaPack's
             // Verb-visibility "create" — subhandlers are pack-internal and
@@ -1085,6 +1158,7 @@ mod tests {
                 description: "beta internal create (subhandler)",
                 visibility: Visibility::Subhandler,
                 category: VerbCategory::Commissive,
+                params: &[],
             },
         ];
     }
@@ -1114,6 +1188,7 @@ mod tests {
             description: "duplicate Verb-visibility create",
             visibility: Visibility::Verb,
             category: VerbCategory::Commissive,
+            params: &[],
         }];
     }
 
@@ -1220,6 +1295,7 @@ mod tests {
                 description: "internal create",
                 visibility: Visibility::Subhandler,
                 category: VerbCategory::Commissive,
+                params: &[],
             }];
         }
         #[async_trait]
@@ -1958,6 +2034,7 @@ mod tests {
                 description: "a guarded verb",
                 visibility: Visibility::Verb,
                 category: VerbCategory::Assertive,
+                params: &[],
             }];
         }
 
@@ -2924,6 +3001,7 @@ mod hook_tests {
             description: "ping",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
+            params: &[],
         }];
     }
 
@@ -3100,5 +3178,227 @@ mod hook_tests {
 
         let res = reg.dispatch("ping", Value::Null).await.unwrap();
         assert_eq!(res["verb"], "ping");
+    }
+}
+
+// ── help=true tests (issue #287) ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use khive_types::Pack;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    // ── HelpPack: a minimal pack with one handler that records invocation count.
+    //
+    // Used to verify that help=true never reaches the pack's dispatch method.
+
+    static CREATE_PARAMS: [ParamDef; 2] = [
+        ParamDef {
+            name: "kind",
+            param_type: "string",
+            required: true,
+            description: "Granular kind (concept | document | ...).",
+        },
+        ParamDef {
+            name: "name",
+            param_type: "string",
+            required: false,
+            description: "Human-readable name.",
+        },
+    ];
+
+    static RECALL_PARAMS: [ParamDef; 2] = [
+        ParamDef {
+            name: "query",
+            param_type: "string",
+            required: true,
+            description: "Semantic recall query.",
+        },
+        ParamDef {
+            name: "limit",
+            param_type: "integer",
+            required: false,
+            description: "Maximum memories to return.",
+        },
+    ];
+
+    struct HelpPack {
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl Pack for HelpPack {
+        const NAME: &'static str = "helptest";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[
+            HandlerDef {
+                name: "create",
+                description: "Create an entity or note",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &CREATE_PARAMS,
+            },
+            HandlerDef {
+                name: "recall",
+                description: "Recall memory notes with decay-aware hybrid ranking",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &RECALL_PARAMS,
+            },
+        ];
+    }
+
+    #[async_trait]
+    impl PackRuntime for HelpPack {
+        fn name(&self) -> &str {
+            HelpPack::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            HelpPack::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            HelpPack::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            HelpPack::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({ "pack": "helptest", "verb": verb }))
+        }
+    }
+
+    fn build_help_registry(invocations: Arc<AtomicUsize>) -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(HelpPack { invocations });
+        builder.build().expect("help registry builds")
+    }
+
+    /// help=true on `create` returns a schema envelope with the correct verb name,
+    /// pack name, description, and at least the required `kind` parameter.
+    #[tokio::test]
+    async fn test_help_true_returns_schema_for_kg_create() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let reg = build_help_registry(invocations.clone());
+
+        let result = reg
+            .dispatch("create", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed for a known verb");
+
+        // Shape checks.
+        assert_eq!(result["verb"], "create", "envelope must name the verb");
+        assert_eq!(
+            result["pack"], "helptest",
+            "envelope must name the owning pack"
+        );
+        assert!(
+            result["description"].as_str().is_some(),
+            "description must be a string"
+        );
+
+        // Params array must be present and non-empty.
+        let params = result["params"]
+            .as_array()
+            .expect("params must be a JSON array");
+        assert!(!params.is_empty(), "params array must not be empty");
+
+        // The required `kind` param must appear.
+        let kind_param = params.iter().find(|p| p["name"] == "kind");
+        assert!(
+            kind_param.is_some(),
+            "params array must include the 'kind' parameter"
+        );
+        let kind_param = kind_param.unwrap();
+        assert_eq!(
+            kind_param["required"],
+            serde_json::json!(true),
+            "'kind' must be required"
+        );
+        assert_eq!(kind_param["type"], "string", "'kind' type must be 'string'");
+    }
+
+    /// help=true on `recall` returns a schema envelope including the `query` param.
+    #[tokio::test]
+    async fn test_help_true_returns_schema_for_recall() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let reg = build_help_registry(invocations.clone());
+
+        let result = reg
+            .dispatch("recall", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed for recall");
+
+        assert_eq!(result["verb"], "recall");
+        assert_eq!(result["pack"], "helptest");
+
+        let params = result["params"]
+            .as_array()
+            .expect("params must be a JSON array");
+
+        // `query` must be present and required.
+        let query_param = params.iter().find(|p| p["name"] == "query");
+        assert!(query_param.is_some(), "params must include 'query'");
+        let query_param = query_param.unwrap();
+        assert_eq!(
+            query_param["required"],
+            serde_json::json!(true),
+            "'query' must be required"
+        );
+
+        // `limit` must be present and optional.
+        let limit_param = params.iter().find(|p| p["name"] == "limit");
+        assert!(limit_param.is_some(), "params must include 'limit'");
+        let limit_param = limit_param.unwrap();
+        assert_eq!(
+            limit_param["required"],
+            serde_json::json!(false),
+            "'limit' must be optional"
+        );
+    }
+
+    /// help=true is intercepted before pack dispatch — the pack's dispatch method
+    /// must never be invoked when help=true is in the params.
+    #[tokio::test]
+    async fn test_help_true_does_not_execute_the_verb() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let reg = build_help_registry(invocations.clone());
+
+        // Call both verbs with help=true.
+        reg.dispatch("create", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed");
+        reg.dispatch("recall", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true must succeed");
+
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "pack dispatch MUST NOT be invoked when help=true; \
+             got {} invocation(s)",
+            invocations.load(Ordering::SeqCst)
+        );
+
+        // Confirm that a normal call (without help=true) DOES invoke dispatch.
+        reg.dispatch("create", serde_json::json!({}))
+            .await
+            .expect("normal dispatch must succeed");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "pack dispatch must fire exactly once for a normal call"
+        );
     }
 }

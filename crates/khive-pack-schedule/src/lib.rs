@@ -26,24 +26,28 @@ static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
         description: "Create a time-triggered reminder.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
+        params: &[],
     },
     HandlerDef {
         name: "schedule",
         description: "Schedule a future verb dispatch.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
+        params: &[],
     },
     HandlerDef {
         name: "agenda",
         description: "List upcoming scheduled events.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "cancel",
         description: "Cancel a scheduled event.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
+        params: &[],
     },
 ];
 

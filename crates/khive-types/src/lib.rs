@@ -45,7 +45,7 @@ pub use note::{Note, NoteStatus};
 pub use pack::VerbDef;
 pub use pack::{
     EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, Pack,
-    PackSchemaPlan, VerbCategory, Visibility,
+    PackSchemaPlan, ParamDef, VerbCategory, Visibility,
 };
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;

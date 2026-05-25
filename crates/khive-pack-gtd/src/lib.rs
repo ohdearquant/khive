@@ -28,7 +28,8 @@ use khive_runtime::{
     RuntimeError, SchemaPlan, VerbRegistry,
 };
 use khive_types::{
-    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack, VerbCategory, Visibility,
+    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack, ParamDef, VerbCategory,
+    Visibility,
 };
 
 use crate::hook::TaskHook;
@@ -136,6 +137,50 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
         description: "Create a GTD task (note with kind=task)",
         visibility: Visibility::Verb,
         category: VerbCategory::Directive,
+        params: &[
+            ParamDef {
+                name: "title",
+                param_type: "string",
+                required: true,
+                description: "Task title.",
+            },
+            ParamDef {
+                name: "status",
+                param_type: "string",
+                required: false,
+                description: "Initial status: inbox | next | waiting | someday | active (default inbox).",
+            },
+            ParamDef {
+                name: "priority",
+                param_type: "string",
+                required: false,
+                description: "Priority: p0 | p1 | p2 | p3 (default p2).",
+            },
+            ParamDef {
+                name: "assignee",
+                param_type: "string",
+                required: false,
+                description: "Assignee identifier.",
+            },
+            ParamDef {
+                name: "due",
+                param_type: "string",
+                required: false,
+                description: "Due date (ISO-8601).",
+            },
+            ParamDef {
+                name: "depends_on",
+                param_type: "array of uuid",
+                required: false,
+                description: "UUIDs of blocking tasks.",
+            },
+            ParamDef {
+                name: "tags",
+                param_type: "array of string",
+                required: false,
+                description: "Tag list.",
+            },
+        ],
     },
     // Assertive: retrieves actionable tasks
     HandlerDef {
@@ -143,6 +188,20 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
         description: "List actionable tasks (status=next or active) by priority",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum tasks to return (default 10).",
+            },
+            ParamDef {
+                name: "assignee",
+                param_type: "string",
+                required: false,
+                description: "Filter to this assignee.",
+            },
+        ],
     },
     // Declaration: declares a task done
     HandlerDef {
@@ -150,6 +209,20 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
         description: "Mark a task done with an optional result note",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the task to complete.",
+            },
+            ParamDef {
+                name: "result",
+                param_type: "string",
+                required: false,
+                description: "Optional result or completion note.",
+            },
+        ],
     },
     // Assertive: retrieves filtered task listing
     HandlerDef {
@@ -157,6 +230,38 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
         description: "List tasks filtered by status, assignee, priority",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "status",
+                param_type: "string",
+                required: false,
+                description: "Filter by status: inbox | next | waiting | someday | active | done | cancelled.",
+            },
+            ParamDef {
+                name: "assignee",
+                param_type: "string",
+                required: false,
+                description: "Filter by assignee.",
+            },
+            ParamDef {
+                name: "priority",
+                param_type: "string",
+                required: false,
+                description: "Filter by priority: p0 | p1 | p2 | p3.",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum results (default 20).",
+            },
+            ParamDef {
+                name: "offset",
+                param_type: "integer",
+                required: false,
+                description: "Pagination offset (default 0).",
+            },
+        ],
     },
     // Declaration: changes task lifecycle status
     HandlerDef {
@@ -164,6 +269,26 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
         description: "Explicit GTD status transition with lifecycle validation",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the task to transition.",
+            },
+            ParamDef {
+                name: "status",
+                param_type: "string",
+                required: true,
+                description: "Target status: inbox | next | waiting | someday | active | done | cancelled.",
+            },
+            ParamDef {
+                name: "note",
+                param_type: "string",
+                required: false,
+                description: "Optional note to attach to the transition.",
+            },
+        ],
     },
 ];
 

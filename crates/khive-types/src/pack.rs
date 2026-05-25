@@ -48,12 +48,38 @@ pub enum VerbCategory {
     // `Expressive` is intentionally absent — no verb currently uses it (ADR-025 §Why expressive stays empty).
 }
 
+/// Parameter type for `help=true` schema envelopes.
+///
+/// Declares the name, type hint, required flag, and one-line description for
+/// a single verb parameter. Stored as a `&'static` slice on [`HandlerDef`] so
+/// the registry can return it without any allocation at call time.
+///
+/// The `param_type` field is a free-form string (e.g. `"string"`, `"uuid"`,
+/// `"bool"`, `"integer"`, `"string | null"`) — it is documentation-only and
+/// not used for validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParamDef {
+    /// Parameter name as used in the DSL (e.g. `"id"`, `"kind"`, `"query"`).
+    pub name: &'static str,
+    /// Free-form type hint for documentation (e.g. `"string"`, `"uuid"`, `"bool"`).
+    pub param_type: &'static str,
+    /// Whether the caller must supply this parameter.
+    pub required: bool,
+    /// One-line human-readable description.
+    pub description: &'static str,
+}
+
 /// Handler metadata for discovery and documentation (ADR-023, ADR-025).
 ///
 /// Replaces the previous `VerbDef`. Every entry carries a `visibility` tag
 /// so the registry can separate the MCP-exposed surface from internal handlers,
 /// and a `category` that classifies the illocutionary force of the verb
 /// per the speech-act taxonomy in ADR-025.
+///
+/// The `params` slice is used by `VerbRegistry::describe_verb` to build the
+/// `help=true` schema envelope (issue #287). Packs that predate this field
+/// leave it empty (`&[]`) which is backward-compatible — callers receive a
+/// schema envelope with zero params rather than an error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandlerDef {
     pub name: &'static str,
@@ -62,6 +88,11 @@ pub struct HandlerDef {
     /// Illocutionary force classification (ADR-025). Use `Assertive` for
     /// `Subhandler` entries that have no external callers.
     pub category: VerbCategory,
+    /// Parameter schema for `help=true` introspection (issue #287).
+    ///
+    /// Empty (`&[]`) is the correct default for handlers that predate this
+    /// field or have no fixed parameter schema (e.g. free-form query verbs).
+    pub params: &'static [ParamDef],
 }
 
 /// Backward-compatible type alias.  Existing code that names `VerbDef` still
@@ -250,6 +281,7 @@ mod tests {
             description: "does a thing",
             visibility: Visibility::Verb,
             category: VerbCategory::Commissive,
+            params: &[],
         }];
     }
 

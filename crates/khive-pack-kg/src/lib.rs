@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
+use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
 pub use khive_types::EntityKind;
 pub use vocab::NoteKind;
@@ -64,6 +64,56 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Create an entity or note",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: true,
+                description: "Substrate or granular kind: \"entity\" | \"note\" | \"concept\" | \"document\" | \"observation\" | …",
+            },
+            ParamDef {
+                name: "name",
+                param_type: "string",
+                required: false,
+                description: "Human-readable name (entities).",
+            },
+            ParamDef {
+                name: "entity_kind",
+                param_type: "string",
+                required: false,
+                description: "Fine-grained entity kind when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service).",
+            },
+            ParamDef {
+                name: "note_kind",
+                param_type: "string",
+                required: false,
+                description: "Fine-grained note kind when kind=\"note\" (observation | insight | question | decision | reference).",
+            },
+            ParamDef {
+                name: "content",
+                param_type: "string",
+                required: false,
+                description: "Body text (notes).",
+            },
+            ParamDef {
+                name: "description",
+                param_type: "string",
+                required: false,
+                description: "Free-text description (entities).",
+            },
+            ParamDef {
+                name: "tags",
+                param_type: "array of string",
+                required: false,
+                description: "Tag list.",
+            },
+            ParamDef {
+                name: "properties",
+                param_type: "object",
+                required: false,
+                description: "Arbitrary JSON properties.",
+            },
+        ],
     },
     // Assertive: retrieves and presents a record
     HandlerDef {
@@ -71,6 +121,12 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Fetch any record by UUID",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "id",
+            param_type: "uuid",
+            required: true,
+            description: "UUID of the entity, note, or edge to fetch.",
+        }],
     },
     // Assertive: retrieves and presents filtered records
     HandlerDef {
@@ -78,6 +134,32 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "List records with optional filtering",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: true,
+                description: "Substrate or granular kind to list: \"entity\" | \"note\" | \"edge\" | granular kinds.",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum records to return (default 20).",
+            },
+            ParamDef {
+                name: "offset",
+                param_type: "integer",
+                required: false,
+                description: "Pagination offset (default 0).",
+            },
+            ParamDef {
+                name: "tags",
+                param_type: "array of string",
+                required: false,
+                description: "Filter by all listed tags.",
+            },
+        ],
     },
     // Declaration: changes entity or edge state by fiat
     HandlerDef {
@@ -85,6 +167,38 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Patch entity or edge fields",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the entity or edge to patch.",
+            },
+            ParamDef {
+                name: "name",
+                param_type: "string",
+                required: false,
+                description: "New name (entities only).",
+            },
+            ParamDef {
+                name: "description",
+                param_type: "string",
+                required: false,
+                description: "New description (entities only).",
+            },
+            ParamDef {
+                name: "properties",
+                param_type: "object",
+                required: false,
+                description: "Properties to merge in (shallow merge).",
+            },
+            ParamDef {
+                name: "tags",
+                param_type: "array of string",
+                required: false,
+                description: "Replace tag list.",
+            },
+        ],
     },
     // Declaration: declares a record removed
     HandlerDef {
@@ -92,6 +206,20 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Soft or hard delete a record",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the record to delete.",
+            },
+            ParamDef {
+                name: "hard",
+                param_type: "bool",
+                required: false,
+                description: "If true, permanently remove with edge cascade (default false = soft delete).",
+            },
+        ],
     },
     // Declaration: declares two entities identical
     HandlerDef {
@@ -99,6 +227,20 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Deduplicate two entities",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "into_id",
+                param_type: "uuid",
+                required: true,
+                description: "The entity that survives the merge (canonical).",
+            },
+            ParamDef {
+                name: "from_id",
+                param_type: "uuid",
+                required: true,
+                description: "The entity to merge from (will be soft-deleted after merge).",
+            },
+        ],
     },
     // Assertive: retrieves and presents search results
     HandlerDef {
@@ -106,6 +248,26 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Hybrid FTS + vector search",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: true,
+                description: "Substrate or granular kind to search.",
+            },
+            ParamDef {
+                name: "query",
+                param_type: "string",
+                required: true,
+                description: "Free-text search query.",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum results to return (default 10).",
+            },
+        ],
     },
     // Commissive: commits a typed edge to the graph
     HandlerDef {
@@ -113,6 +275,32 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Create a typed directed edge",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "source_id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the source node.",
+            },
+            ParamDef {
+                name: "target_id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the target node.",
+            },
+            ParamDef {
+                name: "relation",
+                param_type: "string",
+                required: true,
+                description: "Edge relation (contains | part_of | instance_of | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates).",
+            },
+            ParamDef {
+                name: "weight",
+                param_type: "number",
+                required: false,
+                description: "Edge weight 0.0–1.0 (default 1.0). 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible.",
+            },
+        ],
     },
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
@@ -120,6 +308,26 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Immediate graph neighbors",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "node_id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the node whose neighbors to return.",
+            },
+            ParamDef {
+                name: "direction",
+                param_type: "string",
+                required: false,
+                description: "Edge direction: \"outgoing\" | \"incoming\" | \"both\" (default \"both\").",
+            },
+            ParamDef {
+                name: "relations",
+                param_type: "array of string",
+                required: false,
+                description: "Filter to these relation types only.",
+            },
+        ],
     },
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
@@ -127,6 +335,26 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Multi-hop BFS traversal",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "roots",
+                param_type: "array of uuid",
+                required: true,
+                description: "Starting node UUIDs for the traversal.",
+            },
+            ParamDef {
+                name: "max_depth",
+                param_type: "integer",
+                required: false,
+                description: "Maximum traversal depth (default 3).",
+            },
+            ParamDef {
+                name: "relations",
+                param_type: "array of string",
+                required: false,
+                description: "Restrict traversal to these relation types.",
+            },
+        ],
     },
     // Assertive: retrieves pattern-matched results
     HandlerDef {
@@ -134,6 +362,12 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "GQL/SPARQL pattern matching",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "query",
+            param_type: "string",
+            required: true,
+            description: "GQL or SPARQL pattern query string.",
+        }],
     },
     // Commissive: commits a proposal to the namespace event log (ADR-046)
     HandlerDef {
@@ -141,6 +375,26 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Create an event-sourced change proposal",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "target_id",
+                param_type: "uuid",
+                required: true,
+                description: "Entity targeted by the proposal.",
+            },
+            ParamDef {
+                name: "changeset",
+                param_type: "object",
+                required: true,
+                description: "Proposed changes (field patches).",
+            },
+            ParamDef {
+                name: "rationale",
+                param_type: "string",
+                required: false,
+                description: "Explanation for the proposed change.",
+            },
+        ],
     },
     // Declaration: approves/rejects/comments on a proposal (ADR-046)
     HandlerDef {
@@ -148,6 +402,26 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Approve, reject, comment, or request changes on a proposal",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "proposal_id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the proposal to review.",
+            },
+            ParamDef {
+                name: "decision",
+                param_type: "string",
+                required: true,
+                description: "Review outcome: \"approve\" | \"reject\" | \"comment\" | \"request_changes\".",
+            },
+            ParamDef {
+                name: "comment",
+                param_type: "string",
+                required: false,
+                description: "Optional reviewer comment.",
+            },
+        ],
     },
     // Commissive: rescinds an open proposal (ADR-046)
     HandlerDef {
@@ -155,6 +429,12 @@ static KG_HANDLERS: [HandlerDef; 14] = [
         description: "Withdraw an open proposal (proposer-only)",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[ParamDef {
+            name: "proposal_id",
+            param_type: "uuid",
+            required: true,
+            description: "UUID of the proposal to withdraw.",
+        }],
     },
 ];
 

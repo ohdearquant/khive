@@ -948,6 +948,7 @@ impl khive_types::Pack for ErrorInjectPack {
         description: "always returns a KhiveError::unavailable with code + details",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[],
     }];
 }
 

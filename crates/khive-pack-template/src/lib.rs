@@ -55,6 +55,7 @@ static TEMPLATE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
     description: "Replace with your verb's description.",
     visibility: Visibility::Verb,
     category: khive_types::VerbCategory::Directive,
+    params: &[],
 }];
 
 impl TemplatePack {

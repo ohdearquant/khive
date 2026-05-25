@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
+use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
 use crate::config::RecallConfig;
 
@@ -47,6 +47,38 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
         description: "Create a memory note with salience and decay",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "content",
+                param_type: "string",
+                required: true,
+                description: "Memory content to store.",
+            },
+            ParamDef {
+                name: "importance",
+                param_type: "number",
+                required: false,
+                description: "Importance weight 0.0–1.0 (default 0.5).",
+            },
+            ParamDef {
+                name: "decay_factor",
+                param_type: "number",
+                required: false,
+                description: "Decay rate 0.0–1.0 (default 0.1). Higher = faster decay.",
+            },
+            ParamDef {
+                name: "memory_type",
+                param_type: "string",
+                required: false,
+                description: "Memory type tag (e.g. \"episodic\", \"semantic\").",
+            },
+            ParamDef {
+                name: "source_id",
+                param_type: "uuid",
+                required: false,
+                description: "UUID of the entity or note this memory annotates.",
+            },
+        ],
     },
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
@@ -54,24 +86,59 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
         description: "Recall memory notes with decay-aware hybrid ranking",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "query",
+                param_type: "string",
+                required: true,
+                description: "Semantic recall query.",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum memories to return (default 10).",
+            },
+            ParamDef {
+                name: "min_score",
+                param_type: "number",
+                required: false,
+                description: "Minimum relevance score 0.0–1.0 (default none; 0.3–0.7 typical for production).",
+            },
+            ParamDef {
+                name: "min_salience",
+                param_type: "number",
+                required: false,
+                description: "Minimum salience score filter.",
+            },
+            ParamDef {
+                name: "memory_type",
+                param_type: "string",
+                required: false,
+                description: "Filter to this memory_type.",
+            },
+        ],
     },
     HandlerDef {
         name: "recall.embed",
         description: "Return the embedding vector used by memory recall",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "recall.candidates",
         description: "Return raw memory recall candidates by retrieval source",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "recall.fuse",
         description: "Return fused memory recall candidates before final scoring",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     // ADR-033 §2, F222: rerank stage between fuse and score
     HandlerDef {
@@ -79,12 +146,14 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
         description: "Apply configured rerankers to fused candidates (ADR-033 §2)",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
+        params: &[],
     },
     HandlerDef {
         name: "recall.score",
         description: "Score a memory recall candidate and return score breakdown",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
+        params: &[],
     },
 ];
 
