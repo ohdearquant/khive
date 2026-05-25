@@ -12,6 +12,7 @@ description = "khive kernel — admin/management Rust binary (sync, pack introsp
 
 [dependencies]
 khive-runtime = { version = "0.2.2", path = "../khive-runtime" }
+khive-score = { version = "0.2.2", path = "../khive-score" }
 khive-db = { version = "0.2.2", path = "../khive-db" }
 khive-storage = { version = "0.2.2", path = "../khive-storage" }
 khive-types = { version = "0.2.2", path = "../khive-types" }
