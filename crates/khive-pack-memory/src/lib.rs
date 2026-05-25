@@ -1,5 +1,6 @@
 pub mod config;
 pub mod handlers;
+pub mod rerank;
 pub mod tunable;
 
 use std::sync::Mutex;

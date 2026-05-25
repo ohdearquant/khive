@@ -18,6 +18,7 @@ use khive_storage::types::{
 use khive_types::SubstrateKind;
 
 use crate::config::{RecallConfig, ScoreBreakdown, WeightedContributions};
+use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::MemoryPack;
 
 fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError> {
@@ -552,8 +553,30 @@ impl MemoryPack {
 
             let age_micros = (now_micros - note.created_at).max(0) as f64;
             let age_days = age_micros / (1_000_000.0 * 86_400.0);
-            let (final_score, breakdown) =
+            let (base_score, breakdown) =
                 compute_score(&cfg, relevance, salience, decay_factor, age_days);
+
+            // ADR-033 §6, weighted feature-combination reranker (PR #375).
+            //
+            // Strategy: REPLACE. When `reranker_weights` is non-empty the
+            // reranker's output becomes the final score, replacing `compute_score`.
+            // Rationale: the five reranker features cover the same axes as
+            // `compute_score` (relevance, importance, temporal) plus retrieval-
+            // source bonuses. A caller who configures `reranker_weights` is
+            // explicitly taking over scoring — blending via a hidden α would
+            // require yet another config knob and make the weighting opaque.
+            let final_score = if cfg.reranker_weights.is_empty() {
+                base_score
+            } else {
+                let features = RerankFeatures {
+                    relevance,
+                    importance: breakdown.importance_decayed,
+                    temporal: breakdown.temporal,
+                    text_match: matches!(hit.source, SearchSource::Text | SearchSource::Both),
+                    vector_match: matches!(hit.source, SearchSource::Vector | SearchSource::Both),
+                };
+                weighted_rerank(&features, &cfg.reranker_weights)
+            };
 
             if final_score < cfg.min_score {
                 continue;
@@ -736,16 +759,32 @@ impl MemoryPack {
         }))
     }
 
-    /// Apply configured rerankers to fused candidates (ADR-033 §2, F222).
+    /// Apply the weighted feature-combination reranker to fused candidates (ADR-033 §6, PR #375).
     ///
-    /// In v1 with no active rerankers (empty `reranker_weights`), this is a
-    /// pass-through: each candidate is returned with an empty `rerank_scores` map.
-    /// When reranker weights are configured in `RecallConfig.reranker_weights`, the
-    /// named rerankers will populate `rerank_scores[name]` for downstream scoring.
+    /// Each candidate may carry optional feature fields in addition to the
+    /// required `note_id`. Supported fields (all optional, default 0.0):
+    ///
+    /// - `fused_score` — mapped to `relevance` feature
+    /// - `salience` — used with `age_days` to produce `importance`
+    ///   (exponential decay: `salience * exp(-decay_factor * age_days)`)
+    /// - `decay_factor` — per-note decay rate; defaults to 0.01 when absent
+    /// - `age_days` — note age in days; defaults to 0.0 when absent
+    /// - `temporal` — recency score; if absent, computed as
+    ///   `exp(-ln2/half_life * age_days)` from config
+    /// - `source` — `"text"`, `"vector"`, or `"both"` for boolean features
+    ///
+    /// The response shape is unchanged: `{reranked: [{note_id, rerank_scores}], active_rerankers}`.
+    /// `rerank_scores` is now keyed by feature names from `reranker_weights`, each value being
+    /// the weighted contribution from that feature (weight × feature_value).
+    ///
+    /// When `reranker_weights` is empty, this is a pass-through: each candidate is returned
+    /// with an empty `rerank_scores` map — identical to the previous stub behavior.
     pub(crate) async fn handle_recall_rerank(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         struct RerankParams {
-            /// Fused candidate IDs to rerank (from recall_fuse output).
+            /// Fused candidates to rerank. Each entry must have `note_id`; other
+            /// fields (`fused_score`, `salience`, `age_days`, `decay_factor`,
+            /// `temporal`, `source`) are optional feature inputs.
             candidates: Vec<serde_json::Value>,
             config: Option<RecallConfig>,
         }
@@ -753,15 +792,12 @@ impl MemoryPack {
         let cfg = p.config.unwrap_or_else(|| self.active_config());
         cfg.validate()?;
 
-        // Build the set of active rerankers (weight > 0).
-        let active: Vec<(&String, &f64)> = cfg
+        let active_rerankers: Vec<&String> = cfg
             .reranker_weights
-            .iter()
-            .filter(|(_, &w)| w > 0.0)
+            .keys()
+            .filter(|k| cfg.reranker_weights[*k] > 0.0)
             .collect();
 
-        // For each candidate, produce a rerank_scores map with scores from active rerankers.
-        // v1: no reranker models are loaded, so all scores are 0.0 (reranker not run).
         let reranked: Vec<serde_json::Value> = p
             .candidates
             .iter()
@@ -770,21 +806,90 @@ impl MemoryPack {
                     .get("note_id")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let mut rerank_scores = serde_json::Map::new();
-                for (name, _weight) in &active {
-                    // v1: reranker model not loaded → score = 0.0
-                    rerank_scores.insert(name.to_string(), json!(0.0_f32));
+
+                if cfg.reranker_weights.is_empty() {
+                    // Pass-through: empty reranker_weights → empty rerank_scores.
+                    return json!({
+                        "note_id": id,
+                        "rerank_scores": {},
+                        "rerank_score": 0.0_f64,
+                    });
                 }
+
+                // Extract per-candidate feature inputs from the JSON payload.
+                let fused_score = candidate
+                    .get("fused_score")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let salience = candidate
+                    .get("salience")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let decay_factor = candidate
+                    .get("decay_factor")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.01);
+                let age_days = candidate
+                    .get("age_days")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let temporal = candidate
+                    .get("temporal")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or_else(|| {
+                        let k = std::f64::consts::LN_2 / cfg.temporal_half_life_days;
+                        (-k * age_days).exp()
+                    });
+                let importance = cfg.decay_model.apply(
+                    salience,
+                    age_days,
+                    decay_factor,
+                    cfg.temporal_half_life_days,
+                );
+                let source_str = candidate
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let text_match = matches!(source_str, "text" | "both");
+                let vector_match = matches!(source_str, "vector" | "both");
+
+                let features = RerankFeatures {
+                    relevance: fused_score,
+                    importance,
+                    temporal,
+                    text_match,
+                    vector_match,
+                };
+                let rerank_score = weighted_rerank(&features, &cfg.reranker_weights);
+
+                // Build per-feature score breakdown so callers can inspect contributions.
+                let mut rerank_scores = serde_json::Map::new();
+                for (name, &weight) in &cfg.reranker_weights {
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    let fv = match name.as_str() {
+                        "relevance" => features.relevance,
+                        "importance" => features.importance,
+                        "temporal" => features.temporal,
+                        "text_match" => f64::from(features.text_match),
+                        "vector_match" => f64::from(features.vector_match),
+                        _ => continue,
+                    };
+                    rerank_scores.insert(name.clone(), json!(weight * fv));
+                }
+
                 json!({
                     "note_id": id,
                     "rerank_scores": rerank_scores,
+                    "rerank_score": rerank_score,
                 })
             })
             .collect();
 
         to_json(&json!({
             "reranked": reranked,
-            "active_rerankers": active.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "active_rerankers": active_rerankers.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
         }))
     }
 

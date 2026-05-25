@@ -274,7 +274,7 @@ document its Hoare triple:
 | Component         | Recall instantiation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Precondition**  | Query string is non-empty. Namespace contains memory-kind notes. RecallConfig is valid: all weights non-negative, `relevance_weight + importance_weight + temporal_weight > 0`. Embedding model is configured if the vector path is active.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| **Program**       | Stage 1 (`memory.recall_embed`): query → embedding via multi-engine fan-out. Stage 2 (`memory.recall_candidates`): broad recall from FTS5 + vector, `candidate_multiplier × limit` candidates per path. Stage 3 (`memory.recall_fuse`): apply `fusion_strategy` (default RRF) to produce fused hits. Stage 4 (`memory.recall_rerank`, ADR-042 §7): run all rerankers whose weight in `reranker_weights` is > 0; each writes its score to `candidate.rerank_scores[name]`. Stage 5 (`memory.recall_score`): apply `ComposePipeline` with `WeightedObjective` over the three base Objectives plus one `RerankerObjective` per active reranker. Stage 6 (select): truncate to `limit`; apply `budget` via `GreedySelector` if set. |
+| **Program**       | Stage 1 (`memory.recall_embed`): query → embedding via multi-engine fan-out. Stage 2 (`memory.recall_candidates`): broad recall from FTS5 + vector, `candidate_multiplier × limit` candidates per path. Stage 3 (`memory.recall_fuse`): apply `fusion_strategy` (default RRF) to produce fused hits. Stage 4 (`memory.recall_rerank`): **REPLACE strategy** — if `reranker_weights` is non-empty, build the five rerank features per candidate (`relevance`, `importance`, `temporal`, `text_match`, `vector_match`) and call `weighted_rerank`; the normalized weighted score becomes the final score directly, replacing `compute_score`. If `reranker_weights` is empty (the default), this stage is skipped. Stage 5 (`memory.recall_score`): **only when `reranker_weights` is empty** — apply `compute_score` using the three base weights (`relevance_weight`, `importance_weight`, `temporal_weight`). When Stage 4 ran, Stage 5 is a no-op (final scores are already set). Stage 6 (select): truncate to `limit`; apply `budget` via `GreedySelector` if set. |
 | **Postcondition** | Output is a deterministic list of memory notes ordered by composite score, within `limit`. All returned notes are alive (not soft-deleted) and `kind = memory`. Score breakdown is available on request via `memory.recall_score`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 ### 6.1 Per-request knobs (ADR-033 §6 addendum)
@@ -313,6 +313,47 @@ This returns at most 5 results, fused via union strategy, with composite score �
 and pack-level tuning. Resolution order: `top_k`/`fusion_strategy`/`score_floor` (request)
 
 > `config` object (per-call) > pack active config (tunable) > `RecallConfig::default()`.
+
+### 6.2 Weighted feature-combination reranker (PR #375)
+
+The first concrete reranker ships in PR #375 as `crates/khive-pack-memory/src/rerank.rs`.
+It does not depend on a cross-encoder model. It is purely arithmetic: a weighted sum of
+pre-computed candidate features.
+
+**Strategy: REPLACE.** When `RecallConfig.reranker_weights` is non-empty, the reranker
+score replaces the `compute_score` output as the final score. When `reranker_weights` is
+empty (the default), the reranker stage is skipped and `compute_score` runs as before.
+Rationale: the five reranker features cover the same axes as `compute_score` (relevance,
+importance, temporal) plus retrieval-source bonuses. A caller who configures
+`reranker_weights` is explicitly taking over scoring — blending via a hidden α would
+require a sixth config knob and make the weighting opaque.
+
+**Five supported feature names** (keys in `reranker_weights`):
+
+| Feature name   | Source                                                        | Range   |
+| -------------- | ------------------------------------------------------------- | ------- |
+| `relevance`    | Fused retrieval score (RRF/weighted fusion output)            | [0, 1]  |
+| `importance`   | Note salience after applying configured decay model           | [0, 1]  |
+| `temporal`     | `exp(-ln2/half_life × age_days)` — recency half-life score    | (0, 1]  |
+| `text_match`   | 1.0 when candidate appeared in FTS text results, else 0.0    | {0, 1}  |
+| `vector_match` | 1.0 when candidate appeared in vector results, else 0.0      | {0, 1}  |
+
+**Formula:** `rerank_score = Σ(weights[feature] × feature_value) / Σ(weights[feature])` over
+recognized feature names with positive weight.  Normalizing by the positive weight sum makes
+the score scale-invariant: doubling all weights leaves ranks unchanged.  Unknown keys are
+silently ignored for forward-compat and do not contribute to the weight sum.
+
+**Opt-in / passthrough:** `RecallConfig.reranker_weights` defaults to `HashMap::new()`
+(empty). Deployments that do not configure reranker weights see no behavior change.
+
+**Extension surface:** New feature names can be added to `rerank.rs` as new match arms
+in `weighted_rerank` — no schema change, no ADR amendment required for features. A new
+_model class_ (e.g., cross-encoder, graph-proximate) would require a new ADR.
+
+**`recall.rerank` subhandler:** Accepts fused candidates (with optional `fused_score`,
+`salience`, `age_days`, `decay_factor`, `temporal`, `source` fields) plus a `config`
+override. Returns `{reranked: [{note_id, rerank_scores, rerank_score}], active_rerankers}`.
+When weights are empty, returns candidates with empty `rerank_scores` (pass-through).
 
 ### 7. Calibration protocol
 
