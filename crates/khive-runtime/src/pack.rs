@@ -23,11 +23,50 @@ use serde_json::Value;
 
 pub use khive_types::{
     EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, PackSchemaPlan,
-    Visibility,
+    VerbCategory, Visibility,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
 pub use khive_types::VerbDef;
+
+use crate::validation::ValidationRule;
+
+/// Pack-auxiliary schema plan (ADR-017 §Storage profile and pack-auxiliary schema).
+///
+/// Declares `CREATE TABLE IF NOT EXISTS` statements for pack-owned tables that
+/// are NOT part of the core substrate schema (entities, notes, edges, events).
+/// Applied at boot via `StorageBackend::apply_schema` / `apply_pack_schema_plan`.
+///
+/// Core substrate tables evolve through versioned migrations (ADR-015). Pack
+/// schema is strictly for pack-auxiliary tables (e.g. GTD lifecycle audit,
+/// memory index). v1 pack schemas are non-versioned.
+#[derive(Debug, Default, Clone)]
+pub struct SchemaPlan {
+    /// Owning pack name.
+    pub pack: &'static str,
+    /// DDL statements applied idempotently at boot.
+    /// Each entry must be a self-contained `CREATE TABLE IF NOT EXISTS` or
+    /// similar idempotent statement.
+    pub statements: &'static [&'static str],
+}
+
+impl SchemaPlan {
+    /// Construct a `SchemaPlan` with no statements.
+    ///
+    /// Packs whose state lives entirely in the core substrate tables (entities,
+    /// notes, edges) use this as their `schema_plan()` return value.
+    pub const fn empty() -> Self {
+        Self {
+            pack: "",
+            statements: &[],
+        }
+    }
+
+    /// Returns `true` when the plan contains no DDL statements.
+    pub fn is_empty(&self) -> bool {
+        self.statements.is_empty()
+    }
+}
 
 /// Hook called after every successful verb dispatch (Issue #158).
 ///
@@ -92,22 +131,6 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
-    /// Pack-auxiliary schema plan (ADR-019).
-    ///
-    /// Packs that require auxiliary tables (e.g. `gtd_lifecycle_audit`)
-    /// return a `PackSchemaPlan` whose `statements` are idempotent DDL.
-    /// Defaults to `None` so packs with no auxiliary schema cost nothing.
-    ///
-    /// **Current state:** plans are aggregated via `VerbRegistry::all_schema_plans()`
-    /// but the runtime does not yet apply them at registration. Packs that need
-    /// their schema present (e.g. GTD) self-bootstrap by running the DDL lazily
-    /// on first call inside their handlers. Centralized startup application is
-    /// deferred to c11/c12 (HandlerDef + PackVerbRegistry) when the runtime
-    /// gains a unified pack-registration lifecycle.
-    fn schema_plan(&self) -> Option<PackSchemaPlan> {
-        None
-    }
-
     /// Optional per-kind hook for shared CRUD specialization (ADR-030).
     ///
     /// When a kind is owned by this pack (declared in `note_kinds()` or
@@ -117,6 +140,37 @@ pub trait PackRuntime: Send + Sync {
     /// the kind as plain storage with no specialization.
     fn kind_hook(&self, _kind: &str) -> Option<Arc<dyn KindHook>> {
         None
+    }
+
+    /// Pack-auxiliary schema (ADR-017 §Storage profile and pack-auxiliary schema).
+    ///
+    /// Returns DDL statements for pack-owned tables that are NOT part of the
+    /// core substrate schema. Statements are idempotent (`CREATE TABLE IF NOT
+    /// EXISTS`) so callers can apply them safely on every registration. Core
+    /// substrate tables evolve through versioned migrations (ADR-015); pack
+    /// schema is strictly pack-auxiliary.
+    ///
+    /// Defaults to an empty plan — packs that store everything in the core
+    /// substrate tables (entities, notes, edges, events) return this default.
+    ///
+    /// **Current state:** plans are aggregated via
+    /// [`VerbRegistry::all_schema_plans`] but the runtime does not yet apply
+    /// them at registration. Packs that need their schema present (e.g. GTD)
+    /// self-bootstrap by running the DDL lazily on first call. Centralized
+    /// startup application is deferred to c12 (PackVerbRegistry).
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan::empty()
+    }
+
+    /// Domain-specific validation rules contributed by this pack (ADR-034 §9).
+    ///
+    /// Rule IDs MUST follow the `<pack>/<rule-id>` namespace convention.
+    /// Built-in rules (no pack prefix) are reserved for the `khive-runtime`
+    /// validation infrastructure.
+    ///
+    /// Defaults to empty — packs with no domain-specific rules return `&[]`.
+    fn validation_rules(&self) -> &'static [ValidationRule] {
+        &[]
     }
 
     /// Dispatch a verb call. Returns serialized JSON response.
@@ -761,12 +815,26 @@ impl VerbRegistry {
             .collect()
     }
 
-    /// Collect all pack-auxiliary schema plans from every loaded pack (ADR-019).
+    /// All pack-contributed validation rules across registered packs (ADR-034 §9).
     ///
-    /// The runtime applies these once at startup so each pack's auxiliary tables
-    /// exist before any verbs are dispatched.
-    pub fn all_schema_plans(&self) -> Vec<PackSchemaPlan> {
-        self.packs.iter().filter_map(|p| p.schema_plan()).collect()
+    /// Returns references into the pack-owned `'static` slices — no allocation
+    /// beyond the outer `Vec`. Rule IDs are namespaced by pack; callers can
+    /// group by `rule.id.split_once('/')` to attribute rules to their packs.
+    pub fn all_validation_rules(&self) -> Vec<&'static ValidationRule> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.validation_rules().iter())
+            .collect()
+    }
+
+    /// Pack-auxiliary schema plans for all registered packs (ADR-017).
+    ///
+    /// Returns one `SchemaPlan` per pack. Callers (typically the runtime
+    /// bootstrap) apply each plan to the pack's assigned backend. Empty plans
+    /// are included so the caller can iterate uniformly; callers that want to
+    /// skip empty plans should check `plan.is_empty()`.
+    pub fn all_schema_plans(&self) -> Vec<SchemaPlan> {
+        self.packs.iter().map(|p| p.schema_plan()).collect()
     }
 }
 
@@ -894,11 +962,13 @@ mod tests {
                 name: "create",
                 description: "create a widget",
                 visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
             },
             HandlerDef {
                 name: "list",
                 description: "list widgets",
                 visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
             },
         ];
     }
@@ -939,11 +1009,13 @@ mod tests {
                 name: "notify",
                 description: "send alert",
                 visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
             },
             HandlerDef {
                 name: "create",
                 description: "create a gadget",
                 visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
             },
         ];
     }
@@ -1681,6 +1753,7 @@ mod tests {
                 name: "guarded",
                 description: "a guarded verb",
                 visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
             }];
         }
 
@@ -2646,6 +2719,7 @@ mod hook_tests {
             name: "ping",
             description: "ping",
             visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
         }];
     }
 

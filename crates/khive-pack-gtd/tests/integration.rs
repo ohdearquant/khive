@@ -4,7 +4,7 @@ use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::HandlerDef;
 use khive_runtime::{
-    KhiveRuntime, Namespace, NoteKindSpec, PackSchemaPlan, RuntimeError, VerbRegistry,
+    KhiveRuntime, Namespace, NoteKindSpec, SchemaPlan, RuntimeError, VerbRegistry,
     VerbRegistryBuilder,
 };
 use serde_json::{json, Value};
@@ -430,9 +430,8 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
 async fn pack_runtime_exposes_schema_plan() {
     use khive_runtime::PackRuntime;
     let pack = GtdPack::new(rt());
-    let plan: Option<PackSchemaPlan> = pack.schema_plan();
-    assert!(plan.is_some(), "GtdPack must return Some(PackSchemaPlan)");
-    let plan = plan.unwrap();
+    let plan: SchemaPlan = pack.schema_plan();
+    assert!(!plan.is_empty(), "GtdPack must return a non-empty SchemaPlan");
     assert_eq!(plan.pack, "gtd");
     assert!(
         !plan.statements.is_empty(),

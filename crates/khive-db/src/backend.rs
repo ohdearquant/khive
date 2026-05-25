@@ -92,6 +92,34 @@ impl StorageBackend {
         crate::migrations::apply_schema_plan(writer.conn(), plan)
     }
 
+    /// Apply pack-auxiliary DDL statements (ADR-017 §Storage profile and
+    /// pack-auxiliary schema).
+    ///
+    /// Executes each DDL statement idempotently via `execute_batch`. Each
+    /// statement MUST be self-contained and use `CREATE TABLE IF NOT EXISTS`
+    /// (or equivalent idempotent DDL) so that calling this method more than
+    /// once does not fail.
+    ///
+    /// Pack auxiliary tables are NOT tracked in `_schema_versions` — they are
+    /// non-versioned in v1 (ADR-017). Use `apply_schema` with a
+    /// `ServiceSchemaPlan` when version tracking is needed.
+    ///
+    /// This method is lower-level than `PackRuntime::schema_plan()` — the
+    /// runtime bootstrap calls `pack.schema_plan().statements` and passes the
+    /// slice here. The `SchemaPlan` type lives in `khive-runtime` (above this
+    /// crate in the dep chain); this method accepts a plain `&[&'static str]`
+    /// to avoid a circular dependency.
+    pub fn apply_pack_ddl_statements(
+        &self,
+        statements: &[&'static str],
+    ) -> Result<(), SqliteError> {
+        let writer = self.pool.try_writer()?;
+        for &stmt in statements {
+            writer.conn().execute_batch(stmt)?;
+        }
+        Ok(())
+    }
+
     /// Get an EntityStore. Applies the entities DDL if not already present.
     ///
     /// Idempotent — safe to call multiple times.

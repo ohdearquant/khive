@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, Pack, Visibility};
+use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
 
 pub use khive_types::EntityKind;
 pub use vocab::NoteKind;
@@ -37,8 +37,8 @@ impl Pack for KgPack {
     const HANDLERS: &'static [HandlerDef] = &KG_HANDLERS;
 }
 
-// ADR-060: Illocutionary classification (Searle 1976)
-//   Assertive — retrieves/presents state of affairs
+// ADR-025: Illocutionary classification (Searle 1976)
+//   Assertive  — retrieves/presents state of affairs
 //   Commissive — commits caller to a persistent change
 //   Declaration — changes institutional status by fiat
 static KG_HANDLERS: [HandlerDef; 11] = [
@@ -47,66 +47,77 @@ static KG_HANDLERS: [HandlerDef; 11] = [
         name: "create",
         description: "Create an entity or note",
         visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     // Assertive: retrieves and presents a record
     HandlerDef {
         name: "get",
         description: "Fetch any record by UUID",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
         description: "List records with optional filtering",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Declaration: changes entity or edge state by fiat
     HandlerDef {
         name: "update",
         description: "Patch entity or edge fields",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // Declaration: declares a record removed
     HandlerDef {
         name: "delete",
         description: "Soft or hard delete a record",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // Declaration: declares two entities identical
     HandlerDef {
         name: "merge",
         description: "Deduplicate two entities",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
         description: "Hybrid FTS + vector search",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Commissive: commits a typed edge to the graph
     HandlerDef {
         name: "link",
         description: "Create a typed directed edge",
         visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
         description: "Immediate graph neighbors",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
         name: "traverse",
         description: "Multi-hop BFS traversal",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Assertive: retrieves pattern-matched results
     HandlerDef {
         name: "query",
         description: "GQL/SPARQL pattern matching",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
 ];
 
