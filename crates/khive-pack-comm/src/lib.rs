@@ -25,21 +25,25 @@ static COMM_HANDLERS: [HandlerDef; 4] = [
         name: "send",
         description: "Send a message, optionally threaded.",
         visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Directive,
     },
     HandlerDef {
         name: "inbox",
         description: "List inbound messages for the caller.",
         visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
     },
     HandlerDef {
         name: "read",
         description: "Mark a message as read.",
         visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Declaration,
     },
     HandlerDef {
         name: "reply",
         description: "Reply to a message, threading linkage.",
         visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Directive,
     },
 ];
 
