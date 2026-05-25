@@ -3,7 +3,25 @@ name: Release
 # Triggered by a version tag push (e.g. v0.2.0).
 # Builds Rust binaries per-platform, publishes each @khive/kernel-{platform}
 # npm subpackage, then publishes the umbrella khive package.
-# Per ADR-026: all subpackage jobs must succeed before the umbrella publishes.
+#
+# Per ADR-026 §"Atomic release semantics": all subpackage publishes must
+# succeed before the umbrella publishes. This is enforced by separating the
+# workflow into two phases:
+#
+#   Phase 1 (build-platform matrix): compile binaries, stage into subpackage
+#     bin/, remove .gitkeep, and upload the whole subpackage as a GH Actions
+#     artifact. No `npm publish` happens here.
+#
+#   Phase 2 (publish-all, single job): downloads all six platform artifacts,
+#     updates versions, publishes the six subpackages, then publishes the
+#     umbrella — in a single sequential job. If any subpackage publish fails,
+#     the umbrella is never published. Because publishing is serialised in one
+#     job, partial failure cannot leave mismatched versions permanently on the
+#     registry (any already-published subpackage can be unpublished within 72h
+#     via `npm unpublish` before the version is re-released).
+#
+# This satisfies the ADR guarantee: partial failure leaves the user able to
+# install the previous khive version unchanged.
 
 on:
   push:
@@ -18,11 +36,8 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
-  # Build Rust binaries per platform and publish each subpackage.
-  # darwin-arm64 and darwin-x64 run on macOS runners.
-  # linux-x64-gnu runs natively on ubuntu.
-  # linux-x64-musl and linux-arm64 cross-compile via cargo-zigbuild.
-  # win32-x64 runs on Windows.
+  # Phase 1: Build Rust binaries per platform and upload as GH artifacts.
+  # No npm publish happens here — that is deferred to Phase 2.
   # ─────────────────────────────────────────────────────────────────────────
   build-platform:
     strategy:
@@ -89,6 +104,8 @@ jobs:
         run: |
           PKG_DIR="npm/kernel-${{ matrix.platform }}/bin"
           SRC="crates/target/${{ matrix.target }}/release"
+          # Remove the placeholder so it is not shipped in the published tarball (MIN-1).
+          rm -f "${PKG_DIR}/.gitkeep"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             cp "${SRC}/kkernel.exe"    "${PKG_DIR}/kkernel.exe"
             cp "${SRC}/khive-mcp.exe" "${PKG_DIR}/khive-mcp.exe"
@@ -98,58 +115,114 @@ jobs:
             chmod +x "${PKG_DIR}/kkernel" "${PKG_DIR}/khive-mcp"
           fi
 
-      - name: Set subpackage version from tag
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          PKG_JSON="npm/kernel-${{ matrix.platform }}/package.json"
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('${PKG_JSON}'));
-            pkg.version = '${VERSION}';
-            fs.writeFileSync('${PKG_JSON}', JSON.stringify(pkg, null, 2) + '\n');
-          "
-
-      - uses: actions/setup-node@v4
+      - name: Upload subpackage artifact
+        uses: actions/upload-artifact@v4
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-
-      - name: Publish @khive/kernel-${{ matrix.platform }}
-        working-directory: npm/kernel-${{ matrix.platform }}
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          name: kernel-${{ matrix.platform }}
+          path: npm/kernel-${{ matrix.platform }}/
+          # Retain for 1 day — only needed during this release run.
+          retention-days: 1
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Publish the umbrella khive package after ALL subpackages succeed.
-  # Updates optionalDependencies to pin the exact released version.
+  # Phase 2: Publish all subpackages + umbrella atomically in a single job.
+  # Runs only after ALL Phase 1 jobs succeed (needs: build-platform with
+  # fail-fast: true propagates any single failure here).
   # ─────────────────────────────────────────────────────────────────────────
-  publish-umbrella:
+  publish-all:
     needs: build-platform
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set umbrella version and pin subpackage versions from tag
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('npm/package.json'));
-            pkg.version = '${VERSION}';
-            // Pin each optional dep to the exact same version
-            for (const k of Object.keys(pkg.optionalDependencies || {})) {
-              pkg.optionalDependencies[k] = '${VERSION}';
-            }
-            fs.writeFileSync('npm/package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+
+      # Extract the version from the git tag (strip leading "v").
+      # Passed via env var to avoid shell-interpolation issues in node -e (MIN-3).
+      - name: Extract version
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+
+      # Download all six platform artifacts into their respective directories.
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # Download to npm/ — each artifact named kernel-{platform} lands in
+          # npm/kernel-{platform}/ matching the checkout layout.
+          path: npm/
+          # pattern matches kernel-* artifacts from Phase 1
+          pattern: kernel-*
+
+      # Set the version in each subpackage's package.json.
+      # VERSION and PKG_JSON are passed via env vars to avoid shell-interpolation
+      # of special characters inside the node -e script (MIN-3).
+      - name: Set subpackage versions
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-x64-gnu linux-x64-musl linux-arm64 win32-x64; do
+            PKG_JSON="npm/kernel-${platform}/package.json" VERSION="${{ env.VERSION }}" node -e "
+              const fs = require('fs');
+              const pkg = JSON.parse(fs.readFileSync(process.env.PKG_JSON));
+              pkg.version = process.env.VERSION;
+              fs.writeFileSync(process.env.PKG_JSON, JSON.stringify(pkg, null, 2) + '\n');
+            "
+          done
+
+      # Publish all six subpackages. If any fails, subsequent steps (including
+      # umbrella publish) do not run. GitHub Actions sequential steps in a
+      # single job guarantee this ordering.
+      - name: Publish @khive/kernel-darwin-arm64
+        working-directory: npm/kernel-darwin-arm64
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @khive/kernel-darwin-x64
+        working-directory: npm/kernel-darwin-x64
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @khive/kernel-linux-x64-gnu
+        working-directory: npm/kernel-linux-x64-gnu
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @khive/kernel-linux-x64-musl
+        working-directory: npm/kernel-linux-x64-musl
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @khive/kernel-linux-arm64
+        working-directory: npm/kernel-linux-arm64
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @khive/kernel-win32-x64
+        working-directory: npm/kernel-win32-x64
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Only reached if all six subpackage publishes succeeded.
+      - name: Set umbrella version and pin subpackage versions
+        env:
+          VERSION: ${{ env.VERSION }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('npm/package.json'));
+            pkg.version = process.env.VERSION;
+            for (const k of Object.keys(pkg.optionalDependencies || {})) {
+              pkg.optionalDependencies[k] = process.env.VERSION;
+            }
+            fs.writeFileSync('npm/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
 
       - name: Publish khive (umbrella)
         working-directory: npm

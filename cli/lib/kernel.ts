@@ -15,26 +15,63 @@ import { dirname, fromFileUrl, join } from "@std/path";
 
 /**
  * Detect whether the Linux runtime links against musl (Alpine etc.) or glibc.
- * Reads /proc/self/maps looking for "musl" or checks /lib/ld-musl-*.
- * Returns "linux-x64-musl" or "linux-x64-gnu".
+ * Returns "gnu" or "musl". Defaults to "gnu" if detection is inconclusive.
+ *
+ * Detection order (most-reliable first):
+ *   1. `ldd --version` — invokes the actual system linker (same as the Node
+ *      shim in npm/bin/khive). More reliable than /proc/self/maps which
+ *      reflects the Deno process's own loader, not the child binary's.
+ *   2. `/lib/ld-musl-*` glob — fast filesystem check, no subprocess.
+ *
+ * NOTE: npm/bin/khive and npm/bin/khive-mcp use the same ordered detection.
+ * Keep all three in sync.
  */
-function linuxVariant(arch: "x86_64" | "aarch64"): string {
-  // arm64 only has a glibc subpackage in v1; musl arm64 is not yet released.
-  if (arch === "aarch64") return "linux-arm64";
+function detectLibc(): "gnu" | "musl" {
   try {
-    const maps = Deno.readTextFileSync("/proc/self/maps");
-    if (maps.toLowerCase().includes("musl")) return "linux-x64-musl";
+    const result = new Deno.Command("ldd", {
+      args: ["--version"],
+      stdin: "null",
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    const out = new TextDecoder()
+      .decode(result.stdout)
+      .toLowerCase()
+      .concat(new TextDecoder().decode(result.stderr).toLowerCase());
+    if (out.includes("musl")) return "musl";
+    return "gnu";
   } catch {
-    // /proc not available (e.g. macOS test env) — fall through
+    // ldd not available — fall through
   }
   try {
     for (const entry of Deno.readDirSync("/lib")) {
-      if (entry.name.startsWith("ld-musl-")) return "linux-x64-musl";
+      if (entry.name.startsWith("ld-musl-")) return "musl";
     }
   } catch {
     // /lib not readable — fall through
   }
-  return "linux-x64-gnu";
+  return "gnu";
+}
+
+/**
+ * Resolve the platform suffix for the @khive/kernel-{platform} subpackage on
+ * Linux. Returns the suffix string, or throws with a clear "unsupported"
+ * message for musl arm64 (not in the v1 matrix).
+ */
+function linuxVariant(arch: "x86_64" | "aarch64"): string {
+  const libc = detectLibc();
+  if (arch === "aarch64") {
+    if (libc === "musl") {
+      throw new Error(
+        "khive does not support linux-arm64 with musl libc in v1.\n" +
+          "linux-arm64 with musl is not in the v1 release matrix.\n" +
+          "Supported: darwin-arm64, darwin-x64, linux-x64-gnu, linux-x64-musl, linux-arm64 (glibc), win32-x64.\n" +
+          "File an issue at https://github.com/ohdearquant/khive/issues if you need this target.",
+      );
+    }
+    return "linux-arm64";
+  }
+  return libc === "musl" ? "linux-x64-musl" : "linux-x64-gnu";
 }
 
 function platformKey(): string {

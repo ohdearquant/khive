@@ -10,7 +10,8 @@
   "homepage": "https://khive.ai",
   "keywords": ["knowledge-graph", "research", "git", "ndjson", "cli"],
   "bin": {
-    "khive": "bin/khive"
+    "khive": "bin/khive",
+    "khive-mcp": "bin/khive-mcp"
   },
   "files": [
     "bin/",
