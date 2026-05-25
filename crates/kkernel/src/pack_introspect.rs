@@ -37,7 +37,8 @@ pub struct PackInfo {
 fn build_registry() -> Result<(VerbRegistry, KhiveRuntime)> {
     let config = RuntimeConfig {
         db_path: None,
-        default_namespace: "kkernel-introspect".to_string(),
+        default_namespace: khive_runtime::Namespace::parse("kkernel-introspect")
+            .unwrap_or_else(|_| khive_runtime::Namespace::local()),
         embedding_model: None,
         ..RuntimeConfig::default()
     };

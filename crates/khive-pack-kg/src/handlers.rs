@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use khive_runtime::{
     ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
-    KhiveRuntime, LinkSpec, MergeSummary, NotePatch, RuntimeError, VerbRegistry,
+    KhiveRuntime, LinkSpec, MergeSummary, NamespaceToken, NotePatch, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{
     Direction, NeighborQuery, PageRequest, TraversalOptions, TraversalRequest,
@@ -187,7 +187,6 @@ fn reconcile_specific(
 #[derive(Deserialize)]
 struct CreateParams {
     kind: String,
-    namespace: Option<String>,
     entity_type: Option<String>,
     name: Option<String>,
     description: Option<String>,
@@ -200,14 +199,12 @@ struct CreateParams {
 
 #[derive(Deserialize)]
 struct GetParams {
-    namespace: Option<String>,
     id: String,
 }
 
 #[derive(Deserialize)]
 struct ListParams {
     kind: String,
-    namespace: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
     entity_kind: Option<String>,
@@ -230,7 +227,6 @@ struct ListParams {
 
 #[derive(Deserialize)]
 struct UpdateParams {
-    namespace: Option<String>,
     id: String,
     kind: String,
     name: Option<Value>,
@@ -248,7 +244,6 @@ struct UpdateParams {
 
 #[derive(Deserialize)]
 struct DeleteParams {
-    namespace: Option<String>,
     id: String,
     kind: String,
     hard: Option<bool>,
@@ -256,7 +251,6 @@ struct DeleteParams {
 
 #[derive(Deserialize)]
 struct MergeParams {
-    namespace: Option<String>,
     into_id: String,
     from_id: String,
     kind: Option<String>,
@@ -270,7 +264,6 @@ struct MergeParams {
 #[derive(Deserialize)]
 struct SearchParams {
     kind: String,
-    namespace: Option<String>,
     query: String,
     limit: Option<u32>,
     entity_kind: Option<String>,
@@ -293,7 +286,6 @@ struct BulkLinkEntry {
 
 #[derive(Deserialize)]
 struct LinkParams {
-    namespace: Option<String>,
     // Singleton fields (required unless `links` is provided).
     source_id: Option<String>,
     target_id: Option<String>,
@@ -317,7 +309,6 @@ struct LinkParams {
 
 #[derive(Deserialize)]
 struct NeighborsParams {
-    namespace: Option<String>,
     /// Accepts either `id` (canonical, ADR-148 normalized) or `node_id` (legacy).
     #[serde(alias = "node_id")]
     id: String,
@@ -329,7 +320,6 @@ struct NeighborsParams {
 
 #[derive(Deserialize)]
 struct TraverseParams {
-    namespace: Option<String>,
     /// Accepts either `roots` (legacy) or `ids` (normalized). Each entry may
     /// be a full UUID or an 8-char prefix; resolved via `resolve_uuid_async`.
     #[serde(alias = "ids")]
@@ -344,7 +334,6 @@ struct TraverseParams {
 
 #[derive(Deserialize)]
 struct QueryParams {
-    namespace: Option<String>,
     query: String,
 }
 
@@ -362,7 +351,7 @@ struct QueryParams {
 async fn resolve_name_async(
     name: &str,
     runtime: &KhiveRuntime,
-    namespace: Option<&str>,
+    token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
     // Use EntityFilter.name_prefix with the full name to do an exact match.
     // The DB implements `name LIKE '?%'` so we get back all names that start
@@ -372,9 +361,9 @@ async fn resolve_name_async(
         ..Default::default()
     };
     let page = runtime
-        .entities(namespace)?
+        .entities(token)?
         .query_entities(
-            runtime.ns(namespace),
+            token.namespace().as_str(),
             filter,
             khive_storage::types::PageRequest {
                 offset: 0,
@@ -418,13 +407,13 @@ async fn resolve_name_async(
 async fn resolve_uuid_async(
     s: &str,
     runtime: &KhiveRuntime,
-    namespace: Option<&str>,
+    token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
     if let Ok(uuid) = Uuid::from_str(s) {
         return Ok(uuid);
     }
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        match runtime.resolve_prefix(namespace, s).await {
+        match runtime.resolve_prefix(token, s).await {
             Ok(Some(uuid)) => return Ok(uuid),
             Ok(None) => {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -435,7 +424,7 @@ async fn resolve_uuid_async(
         }
     }
     // Fall back to name-based resolution (issue #65).
-    resolve_name_async(s, runtime, namespace).await
+    resolve_name_async(s, runtime, token).await
 }
 
 // ---- Output formatting helpers (issue #66) ----
@@ -603,14 +592,11 @@ fn parse_content_strategy(s: &str) -> Result<ContentMergeStrategy, RuntimeError>
 
 async fn ensure_entity_kind(
     runtime: &KhiveRuntime,
-    namespace: Option<&str>,
+    token: &NamespaceToken,
     id: Uuid,
     expected_kind: Option<&str>,
 ) -> Result<(), RuntimeError> {
-    let entity = runtime
-        .get_entity(namespace, id)
-        .await?
-        .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
+    let entity = runtime.get_entity(token, id).await?;
     if let Some(k) = expected_kind {
         if entity.kind != k {
             return Err(RuntimeError::NotFound(format!("{k} {id}")));
@@ -621,12 +607,12 @@ async fn ensure_entity_kind(
 
 async fn ensure_note_kind(
     runtime: &KhiveRuntime,
-    namespace: Option<&str>,
+    token: &NamespaceToken,
     id: Uuid,
     expected_kind: Option<&str>,
 ) -> Result<(), RuntimeError> {
     let note = runtime
-        .notes(namespace)?
+        .notes(token)?
         .get_note(id)
         .await
         .map_err(RuntimeError::Storage)?
@@ -685,6 +671,7 @@ fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Er
 impl KgPack {
     pub(crate) async fn handle_create(
         &self,
+        token: &NamespaceToken,
         mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
@@ -767,6 +754,13 @@ impl KgPack {
             }
         }
 
+        // Propagate the authorized namespace into params so KindHooks can build
+        // their own NamespaceToken (hooks don't receive a token directly).
+        if let Some(obj) = params.as_object_mut() {
+            obj.entry("namespace")
+                .or_insert_with(|| json!(token.namespace().as_str()));
+        }
+
         if let Some(ref h) = hook {
             h.prepare_create(&self.runtime, &mut params).await?;
         }
@@ -783,7 +777,7 @@ impl KgPack {
                 let entity = self
                     .runtime
                     .create_entity(
-                        p.namespace.as_deref(),
+                        token,
                         &canonical,
                         p.entity_type.as_deref(),
                         &name,
@@ -804,13 +798,12 @@ impl KgPack {
                 })?;
                 let mut annotates = Vec::new();
                 for s in p.annotates.unwrap_or_default() {
-                    annotates
-                        .push(resolve_uuid_async(&s, &self.runtime, p.namespace.as_deref()).await?);
+                    annotates.push(resolve_uuid_async(&s, &self.runtime, token).await?);
                 }
                 let note = self
                     .runtime
                     .create_note(
-                        p.namespace.as_deref(),
+                        token,
                         &canonical,
                         p.name.as_deref(),
                         &content,
@@ -843,39 +836,42 @@ impl KgPack {
         Ok(response)
     }
 
-    pub(crate) async fn handle_get(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_get(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params)?;
-        let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
-        let ns = p.namespace.as_deref();
+        let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
 
-        if let Some(entity) = self.runtime.get_entity(ns, id).await? {
+        if let Ok(entity) = self.runtime.get_entity(token, id).await {
             return to_json(&serde_json::json!({"kind": "entity", "data": entity}));
         }
 
         if let Some(note) = self
             .runtime
-            .notes(ns)?
+            .notes(token)?
             .get_note(id)
             .await
             .map_err(RuntimeError::Storage)?
         {
-            if note.namespace == self.runtime.ns(ns) {
+            if note.namespace == token.namespace().as_str() {
                 return to_json(&serde_json::json!({"kind": "note", "data": note}));
             }
         }
 
-        if let Some(edge) = self.runtime.get_edge(ns, id).await? {
+        if let Some(edge) = self.runtime.get_edge(token, id).await? {
             return to_json(&serde_json::json!({"kind": "edge", "data": edge}));
         }
 
         if let Some(event) = self
             .runtime
-            .events(ns)?
+            .events(token)?
             .get_event(id)
             .await
             .map_err(RuntimeError::Storage)?
         {
-            if event.namespace == self.runtime.ns(ns) {
+            if event.namespace == token.namespace().as_str() {
                 return to_json(&serde_json::json!({"kind": "event", "data": event}));
             }
         }
@@ -885,6 +881,7 @@ impl KgPack {
 
     pub(crate) async fn handle_list(
         &self,
+        token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
@@ -903,7 +900,7 @@ impl KgPack {
                 let entities = self
                     .runtime
                     .list_entities(
-                        p.namespace.as_deref(),
+                        token,
                         kind_filter.as_deref(),
                         p.entity_type.as_deref(),
                         limit,
@@ -914,15 +911,11 @@ impl KgPack {
             }
             KindSpec::Edge => {
                 let source_id = match p.source_id.as_deref() {
-                    Some(s) => {
-                        Some(resolve_uuid_async(s, &self.runtime, p.namespace.as_deref()).await?)
-                    }
+                    Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
                     None => None,
                 };
                 let target_id = match p.target_id.as_deref() {
-                    Some(s) => {
-                        Some(resolve_uuid_async(s, &self.runtime, p.namespace.as_deref()).await?)
-                    }
+                    Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
                     None => None,
                 };
                 let relations: Vec<EdgeRelation> = p
@@ -939,10 +932,7 @@ impl KgPack {
                     max_weight: p.max_weight,
                 };
                 let limit = p.limit.unwrap_or(100);
-                let edges = self
-                    .runtime
-                    .list_edges(p.namespace.as_deref(), filter, limit)
-                    .await?;
+                let edges = self.runtime.list_edges(token, filter, limit).await?;
                 to_json(&edges)
             }
             KindSpec::Note { specific } => {
@@ -956,12 +946,7 @@ impl KgPack {
                 let offset = p.offset.unwrap_or(0);
                 let notes = self
                     .runtime
-                    .list_notes(
-                        p.namespace.as_deref(),
-                        kind_filter.as_deref(),
-                        limit,
-                        offset,
-                    )
+                    .list_notes(token, kind_filter.as_deref(), limit, offset)
                     .await?;
                 to_json(&notes)
             }
@@ -984,12 +969,7 @@ impl KgPack {
                         let batch_size = 100u32.min(remaining);
                         let page = self
                             .runtime
-                            .list_events(
-                                p.namespace.as_deref(),
-                                filter.clone(),
-                                batch_size,
-                                raw_offset,
-                            )
+                            .list_events(token, filter.clone(), batch_size, raw_offset)
                             .await?;
                         let batch_len = page.items.len() as u32;
                         if batch_len == 0 {
@@ -1020,7 +1000,7 @@ impl KgPack {
                 } else {
                     let page = self
                         .runtime
-                        .list_events(p.namespace.as_deref(), filter, limit, offset)
+                        .list_events(token, filter, limit, offset)
                         .await?;
                     to_json(&page.items)
                 }
@@ -1030,21 +1010,18 @@ impl KgPack {
 
     pub(crate) async fn handle_update(
         &self,
+        token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: UpdateParams = deser(params)?;
-        let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
-        let ns = p.namespace.as_deref();
+        let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
         let spec = resolve_kind_spec(&p.kind, registry)?;
 
         match spec {
             KindSpec::Entity { specific } => {
-                let entity = self.runtime.get_entity(ns, id).await?;
-                if entity
-                    .as_ref()
-                    .is_none_or(|e| specific.as_ref().is_some_and(|k| e.kind != *k))
-                {
+                let entity = self.runtime.get_entity(token, id).await?;
+                if specific.as_ref().is_some_and(|k| entity.kind != *k) {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
                 }
                 let patch = EntityPatch {
@@ -1053,7 +1030,7 @@ impl KgPack {
                     properties: p.properties,
                     tags: p.tags,
                 };
-                to_json(&self.runtime.update_entity(ns, id, patch).await?)
+                to_json(&self.runtime.update_entity(token, id, patch).await?)
             }
             KindSpec::Edge => {
                 let relation = p.relation.as_deref().map(parse_relation).transpose()?;
@@ -1062,12 +1039,12 @@ impl KgPack {
                     weight: p.weight,
                     properties: p.properties,
                 };
-                to_json(&self.runtime.update_edge(ns, id, patch).await?)
+                to_json(&self.runtime.update_edge(token, id, patch).await?)
             }
             KindSpec::Note { specific } => {
                 let note = self
                     .runtime
-                    .notes(ns)?
+                    .notes(token)?
                     .get_note(id)
                     .await
                     .map_err(RuntimeError::Storage)?;
@@ -1084,7 +1061,7 @@ impl KgPack {
                     p.decay_factor,
                     p.properties,
                 );
-                to_json(&self.runtime.update_note(ns, id, patch).await?)
+                to_json(&self.runtime.update_note(token, id, patch).await?)
             }
             KindSpec::Event => Err(immutable_event_error()),
         }
@@ -1092,25 +1069,25 @@ impl KgPack {
 
     pub(crate) async fn handle_delete(
         &self,
+        token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: DeleteParams = deser(params)?;
-        let id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
-        let ns = p.namespace.as_deref();
+        let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
         let spec = resolve_kind_spec(&p.kind, registry)?;
 
         match spec {
             KindSpec::Entity { specific } => {
                 if let Some(ref expected) = specific {
-                    let entity = self.runtime.get_entity(ns, id).await?;
-                    if entity.as_ref().is_none_or(|e| e.kind != *expected) {
+                    let entity = self.runtime.get_entity(token, id).await?;
+                    if entity.kind != *expected {
                         return Err(RuntimeError::NotFound(format!("{} {}", expected, p.id)));
                     }
                 }
                 let deleted = self
                     .runtime
-                    .delete_entity(ns, id, p.hard.unwrap_or(false))
+                    .delete_entity(token, id, p.hard.unwrap_or(false))
                     .await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
@@ -1121,7 +1098,7 @@ impl KgPack {
                 if let Some(ref expected) = specific {
                     let note = self
                         .runtime
-                        .notes(ns)?
+                        .notes(token)?
                         .get_note(id)
                         .await
                         .map_err(RuntimeError::Storage)?;
@@ -1131,7 +1108,7 @@ impl KgPack {
                 }
                 let deleted = self
                     .runtime
-                    .delete_note(ns, id, p.hard.unwrap_or(false))
+                    .delete_note(token, id, p.hard.unwrap_or(false))
                     .await?;
                 if !deleted {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
@@ -1141,7 +1118,7 @@ impl KgPack {
             KindSpec::Edge => {
                 let deleted = self
                     .runtime
-                    .delete_edge(ns, id, p.hard.unwrap_or(false))
+                    .delete_edge(token, id, p.hard.unwrap_or(false))
                     .await?;
                 to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": "edge" }))
             }
@@ -1151,12 +1128,13 @@ impl KgPack {
 
     pub(crate) async fn handle_merge(
         &self,
+        token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: MergeParams = deser(params)?;
-        let into_id = resolve_uuid_async(&p.into_id, &self.runtime, p.namespace.as_deref()).await?;
-        let from_id = resolve_uuid_async(&p.from_id, &self.runtime, p.namespace.as_deref()).await?;
+        let into_id = resolve_uuid_async(&p.into_id, &self.runtime, token).await?;
+        let from_id = resolve_uuid_async(&p.from_id, &self.runtime, token).await?;
         let raw_kind = p.kind.as_deref().unwrap_or("entity");
         let spec = resolve_kind_spec(raw_kind, registry)?;
         let policy = parse_entity_policy(p.strategy.as_deref().unwrap_or("prefer_into"))?;
@@ -1166,48 +1144,17 @@ impl KgPack {
 
         let summary: MergeSummary = match spec {
             KindSpec::Entity { specific } => {
-                ensure_entity_kind(
-                    &self.runtime,
-                    p.namespace.as_deref(),
-                    into_id,
-                    specific.as_deref(),
-                )
-                .await?;
-                ensure_entity_kind(
-                    &self.runtime,
-                    p.namespace.as_deref(),
-                    from_id,
-                    specific.as_deref(),
-                )
-                .await?;
+                ensure_entity_kind(&self.runtime, token, into_id, specific.as_deref()).await?;
+                ensure_entity_kind(&self.runtime, token, from_id, specific.as_deref()).await?;
                 self.runtime
-                    .merge_entity(p.namespace.as_deref(), into_id, from_id, policy, dry_run)
+                    .merge_entity(token, into_id, from_id, policy, dry_run)
                     .await?
             }
             KindSpec::Note { specific } => {
-                ensure_note_kind(
-                    &self.runtime,
-                    p.namespace.as_deref(),
-                    into_id,
-                    specific.as_deref(),
-                )
-                .await?;
-                ensure_note_kind(
-                    &self.runtime,
-                    p.namespace.as_deref(),
-                    from_id,
-                    specific.as_deref(),
-                )
-                .await?;
+                ensure_note_kind(&self.runtime, token, into_id, specific.as_deref()).await?;
+                ensure_note_kind(&self.runtime, token, from_id, specific.as_deref()).await?;
                 self.runtime
-                    .merge_note(
-                        p.namespace.as_deref(),
-                        into_id,
-                        from_id,
-                        policy,
-                        content_strategy,
-                        dry_run,
-                    )
+                    .merge_note(token, into_id, from_id, policy, content_strategy, dry_run)
                     .await?
             }
             KindSpec::Edge => {
@@ -1222,6 +1169,7 @@ impl KgPack {
 
     pub(crate) async fn handle_search(
         &self,
+        token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
@@ -1253,7 +1201,7 @@ impl KgPack {
                 let hits = self
                     .runtime
                     .hybrid_search(
-                        p.namespace.as_deref(),
+                        token,
                         &p.query,
                         None,
                         search_limit,
@@ -1273,9 +1221,9 @@ impl KgPack {
                 } else {
                     let entities_page = self
                         .runtime
-                        .entities(p.namespace.as_deref())?
+                        .entities(token)?
                         .query_entities(
-                            self.runtime.ns(p.namespace.as_deref()),
+                            token.namespace().as_str(),
                             EntityFilter {
                                 ids: candidate_ids,
                                 ..EntityFilter::default()
@@ -1335,7 +1283,7 @@ impl KgPack {
                 let hits = self
                     .runtime
                     .search_notes(
-                        p.namespace.as_deref(),
+                        token,
                         &p.query,
                         None,
                         limit,
@@ -1349,7 +1297,7 @@ impl KgPack {
                 let note_kinds: HashMap<Uuid, String> = if hits.is_empty() {
                     HashMap::new()
                 } else {
-                    let note_store = self.runtime.notes(p.namespace.as_deref())?;
+                    let note_store = self.runtime.notes(token)?;
                     let mut map = HashMap::new();
                     for h in &hits {
                         if let Ok(Some(n)) = note_store.get_note(h.note_id).await {
@@ -1382,10 +1330,13 @@ impl KgPack {
         }
     }
 
-    pub(crate) async fn handle_link(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_link(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: LinkParams = deser(params)?;
         let verbose = p.verbose.unwrap_or(false);
-        let ns = p.namespace.as_deref();
 
         if let Some(entries) = p.links {
             let attempted = entries.len();
@@ -1400,8 +1351,8 @@ impl KgPack {
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
                 for entry in entries {
-                    let source = resolve_uuid_async(&entry.source_id, &self.runtime, ns).await?;
-                    let target = resolve_uuid_async(&entry.target_id, &self.runtime, ns).await?;
+                    let source = resolve_uuid_async(&entry.source_id, &self.runtime, token).await?;
+                    let target = resolve_uuid_async(&entry.target_id, &self.runtime, token).await?;
                     let relation = parse_relation(&entry.relation)?;
                     let (source, target) = if relation.is_symmetric() && target < source {
                         (target, source)
@@ -1416,7 +1367,7 @@ impl KgPack {
                     let weight = entry.weight.unwrap_or(1.0).clamp(0.0, 1.0);
                     let metadata = merge_entry_metadata(entry.metadata, entry.dependency_kind)?;
                     specs.push(LinkSpec {
-                        namespace: p.namespace.clone(),
+                        namespace: Some(token.namespace().as_str().to_owned()),
                         source_id: source,
                         target_id: target,
                         relation,
@@ -1442,22 +1393,22 @@ impl KgPack {
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
                 for (idx, entry) in entries.into_iter().enumerate() {
-                    let source = match resolve_uuid_async(&entry.source_id, &self.runtime, ns).await
-                    {
-                        Ok(id) => id,
-                        Err(e) => {
-                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
-                            continue;
-                        }
-                    };
-                    let target = match resolve_uuid_async(&entry.target_id, &self.runtime, ns).await
-                    {
-                        Ok(id) => id,
-                        Err(e) => {
-                            error_list.push(json!({"index": idx, "error": format!("{e}")}));
-                            continue;
-                        }
-                    };
+                    let source =
+                        match resolve_uuid_async(&entry.source_id, &self.runtime, token).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                                continue;
+                            }
+                        };
+                    let target =
+                        match resolve_uuid_async(&entry.target_id, &self.runtime, token).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                                continue;
+                            }
+                        };
                     let relation = match parse_relation(&entry.relation) {
                         Ok(r) => r,
                         Err(e) => {
@@ -1486,7 +1437,7 @@ impl KgPack {
                     };
                     match self
                         .runtime
-                        .link(ns, source, target, relation, weight, metadata)
+                        .link(token, source, target, relation, weight, metadata)
                         .await
                     {
                         Ok(edge) => results.push(to_json(&edge)?),
@@ -1517,22 +1468,26 @@ impl KgPack {
         let relation_str = p.relation.ok_or_else(|| {
             RuntimeError::InvalidInput("link requires relation (or links for bulk)".into())
         })?;
-        let source = resolve_uuid_async(&source_id_str, &self.runtime, ns).await?;
-        let target = resolve_uuid_async(&target_id_str, &self.runtime, ns).await?;
+        let source = resolve_uuid_async(&source_id_str, &self.runtime, token).await?;
+        let target = resolve_uuid_async(&target_id_str, &self.runtime, token).await?;
         let weight = p.weight.unwrap_or(1.0).clamp(0.0, 1.0);
         let relation = parse_relation(&relation_str)?;
         let metadata = merge_entry_metadata(p.metadata, p.dependency_kind)?;
         let edge = self
             .runtime
-            .link(ns, source, target, relation, weight, metadata)
+            .link(token, source, target, relation, weight, metadata)
             .await?;
         let raw = to_json(&edge)?;
         Ok(format_edge_output(raw, verbose))
     }
 
-    pub(crate) async fn handle_neighbors(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_neighbors(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: NeighborsParams = deser(params)?;
-        let node_id = resolve_uuid_async(&p.id, &self.runtime, p.namespace.as_deref()).await?;
+        let node_id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
         let direction = parse_direction(p.direction.as_deref());
         let relations: Option<Vec<EdgeRelation>> = p
             .relations
@@ -1545,7 +1500,7 @@ impl KgPack {
         let hits = self
             .runtime
             .neighbors_with_query(
-                p.namespace.as_deref(),
+                token,
                 node_id,
                 NeighborQuery {
                     direction,
@@ -1558,11 +1513,15 @@ impl KgPack {
         to_json(&hits)
     }
 
-    pub(crate) async fn handle_traverse(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_traverse(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: TraverseParams = deser(params)?;
         let mut roots = Vec::with_capacity(p.roots.len());
         for s in &p.roots {
-            roots.push(resolve_uuid_async(s, &self.runtime, p.namespace.as_deref()).await?);
+            roots.push(resolve_uuid_async(s, &self.runtime, token).await?);
         }
         let direction = parse_direction(p.direction.as_deref());
         let relations: Option<Vec<EdgeRelation>> = p
@@ -1585,19 +1544,17 @@ impl KgPack {
             options,
             include_roots: p.include_roots.unwrap_or(true),
         };
-        let paths = self
-            .runtime
-            .traverse(p.namespace.as_deref(), request)
-            .await?;
+        let paths = self.runtime.traverse(token, request).await?;
         to_json(&paths)
     }
 
-    pub(crate) async fn handle_query(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_query(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         let p: QueryParams = deser(params)?;
-        let result = self
-            .runtime
-            .query_with_metadata(p.namespace.as_deref(), &p.query)
-            .await?;
+        let result = self.runtime.query_with_metadata(token, &p.query).await?;
         to_json(&result)
     }
 }

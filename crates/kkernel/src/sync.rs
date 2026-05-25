@@ -109,9 +109,11 @@ pub async fn run_sync(repo_root: &Path, db_path: &Path, namespace: &str) -> Resu
     // Build the runtime against the tmp file. Vector embedding is disabled
     // because sync runs without an embedding model loaded — vectors are
     // computed lazily on access via the MCP server if needed.
+    let ns = khive_runtime::Namespace::parse(namespace)
+        .with_context(|| format!("invalid namespace {namespace:?}"))?;
     let config = RuntimeConfig {
         db_path: Some(tmp_path.clone()),
-        default_namespace: namespace.to_string(),
+        default_namespace: ns,
         embedding_model: None,
         ..RuntimeConfig::default()
     };
@@ -203,9 +205,10 @@ async fn upsert_entities(
     namespace: &str,
     records: Vec<NdjsonEntity>,
 ) -> Result<usize> {
-    let store = runtime
-        .entities(Some(namespace))
-        .context("opening entity store")?;
+    let ns = khive_runtime::Namespace::parse(namespace)
+        .with_context(|| format!("invalid namespace {namespace:?}"))?;
+    let tok = runtime.authorize(ns);
+    let store = runtime.entities(&tok).context("opening entity store")?;
     let mut count = 0;
     for r in records {
         let created_at = parse_ts_micros(r.created_at.as_deref());
@@ -239,9 +242,10 @@ async fn upsert_edges(
     namespace: &str,
     records: Vec<NdjsonEdge>,
 ) -> Result<usize> {
-    let graph = runtime
-        .graph(Some(namespace))
-        .context("opening graph store")?;
+    let ns = khive_runtime::Namespace::parse(namespace)
+        .with_context(|| format!("invalid namespace {namespace:?}"))?;
+    let tok = runtime.authorize(ns);
+    let graph = runtime.graph(&tok).context("opening graph store")?;
     let mut count = 0;
     for r in records {
         let relation: EdgeRelation = r
@@ -276,6 +280,7 @@ async fn upsert_edges(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_runtime::Namespace;
     use tempfile::TempDir;
 
     fn write_repo(dir: &Path, entities_ndjson: &str, edges_ndjson: &str) {
@@ -336,13 +341,14 @@ mod tests {
         // Re-open the DB via the runtime and verify the records persisted.
         let config = RuntimeConfig {
             db_path: Some(db_path.clone()),
-            default_namespace: "test-ns".into(),
+            default_namespace: Namespace::parse("test-ns").unwrap(),
             embedding_model: None,
             ..RuntimeConfig::default()
         };
         let rt = KhiveRuntime::new(config).unwrap();
+        let tok = rt.authorize(Namespace::parse("test-ns").unwrap());
         let alpha = rt
-            .entities(Some("test-ns"))
+            .entities(&tok)
             .unwrap()
             .get_entity(id_a.parse().unwrap())
             .await

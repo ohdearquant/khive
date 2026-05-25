@@ -128,7 +128,7 @@ mod tests {
     fn header() -> Header {
         Header::new(
             Id128::from_u128(1),
-            Namespace::default(),
+            Namespace::local(),
             Timestamp::from_secs(1700000000),
         )
     }

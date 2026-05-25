@@ -14,7 +14,7 @@ use khive_types::SubstrateKind;
 
 use crate::error::RuntimeResult;
 use crate::retrieval::{SearchHit, SearchSource};
-use crate::runtime::KhiveRuntime;
+use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 const CANDIDATE_MULTIPLIER: u32 = 4;
 
@@ -60,7 +60,7 @@ impl KhiveRuntime {
     /// Hybrid search with a caller-supplied fusion strategy.
     pub async fn hybrid_search_with_strategy(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         query_text: &str,
         query_vector: Option<Vec<f32>>,
         strategy: FusionStrategy,
@@ -68,9 +68,9 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<SearchHit>> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
-        let ns = self.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_owned();
         let text_hits = self
-            .text(namespace)?
+            .text(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
                 mode: TextQueryMode::Plain,
@@ -85,7 +85,7 @@ impl KhiveRuntime {
 
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
             self.vector_search(
-                namespace,
+                token,
                 query_vector,
                 Some(query_text),
                 candidates,
@@ -103,9 +103,9 @@ impl KhiveRuntime {
         if !fused.is_empty() {
             let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
             let alive_page = self
-                .entities(namespace)?
+                .entities(token)?
                 .query_entities(
-                    self.ns(namespace),
+                    token.namespace().as_str(),
                     EntityFilter {
                         ids: candidate_ids,
                         ..EntityFilter::default()

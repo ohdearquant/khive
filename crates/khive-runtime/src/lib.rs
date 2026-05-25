@@ -6,18 +6,17 @@
 //!
 //! ```ignore
 //! use khive_runtime::{KhiveRuntime, RuntimeConfig};
+//! use khive_types::Namespace;
 //!
 //! // In-memory for tests:
 //! let rt = KhiveRuntime::memory()?;
-//!
-//! // Default (production): reads ~/.khive/khive-graph.db
-//! let rt = KhiveRuntime::new(RuntimeConfig::default())?;
+//! let tok = rt.authorize(Namespace::local());
 //!
 //! // Create an entity:
-//! let entity = rt.create_entity(None, "concept", "LoRA", None, None, vec![]).await?;
+//! let entity = rt.create_entity(&tok, "concept", None, "LoRA", None, None, vec![]).await?;
 //!
-//! // Link two entities (EdgeRelation is the typed relation):
-//! let edge = rt.link(None, entity.id, other_id, EdgeRelation::Extends, 1.0, None).await?;
+//! // Link two entities:
+//! let edge = rt.link(&tok, entity.id, other_id, EdgeRelation::Extends, 1.0, None).await?;
 //! ```
 
 pub mod curation;
@@ -43,6 +42,7 @@ pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
     GateRef, GateRequest, Obligation,
 };
+pub use khive_types::namespace::Namespace;
 pub use objectives::{
     GraphProximityObjective, RetrievalCandidate, RrfFusionObjective, TextRelevanceObjective,
     VectorSimilarityObjective,
@@ -55,4 +55,4 @@ pub use pack::{
 pub use portability::{ImportSummary, KgArchive};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
-pub use runtime::{parse_pack_list, KhiveRuntime, RuntimeConfig};
+pub use runtime::{parse_pack_list, KhiveRuntime, NamespaceToken, RuntimeConfig};

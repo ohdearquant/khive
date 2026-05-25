@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::runtime::NamespaceToken;
 use async_trait::async_trait;
 use khive_gate::{ActorRef, AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
 use khive_storage::{Event, EventStore, SubstrateKind};
@@ -99,11 +100,14 @@ pub trait PackRuntime: Send + Sync {
     ///
     /// The `registry` parameter gives the handler access to the merged
     /// vocabulary and kind hooks across all loaded packs (ADR-030).
+    /// The `token` is an authorized namespace token minted by the dispatch
+    /// boundary after gate authorization — handlers must use it directly.
     async fn dispatch(
         &self,
         verb: &str,
         params: Value,
         registry: &VerbRegistry,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError>;
 }
 
@@ -177,7 +181,7 @@ impl VerbRegistryBuilder {
         Self {
             packs: Vec::new(),
             gate: std::sync::Arc::new(AllowAllGate),
-            default_namespace: Namespace::default_ns().as_str().to_string(),
+            default_namespace: Namespace::local().as_str().to_string(),
             event_store: None,
             dispatch_hook: None,
         }
@@ -481,12 +485,9 @@ impl VerbRegistry {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| self.default_namespace.clone());
-        let gate_req = GateRequest::new(
-            ActorRef::anonymous(),
-            Namespace::new(&ns_str),
-            verb,
-            params.clone(),
-        );
+        let ns = Namespace::parse(&ns_str)
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
+        let gate_req = GateRequest::new(ActorRef::anonymous(), ns, verb, params.clone());
 
         // Consult the gate (ADR-029, ADR-035).
         //
@@ -559,9 +560,17 @@ impl VerbRegistry {
             });
         }
 
+        // Mint the authorized namespace token at the dispatch boundary (ADR-007).
+        // ns_str was already validated above when building the gate request.
+        let token = NamespaceToken::mint_authorized(
+            Namespace::parse(&ns_str)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?,
+            ActorRef::anonymous(),
+        );
+
         for pack in self.packs.iter() {
             if pack.handlers().iter().any(|v| v.name == verb) {
-                let result = pack.dispatch(verb, params, self).await;
+                let result = pack.dispatch(verb, params, self, &token).await;
 
                 // Post-dispatch hook: fires on success, opt-in (Issue #158).
                 if let (Ok(_), Some(hook)) = (&result, &self.dispatch_hook) {
@@ -862,6 +871,7 @@ mod tests {
             verb: &str,
             _params: Value,
             _registry: &VerbRegistry,
+            _token: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
         }
@@ -906,6 +916,7 @@ mod tests {
             verb: &str,
             _params: Value,
             _registry: &VerbRegistry,
+            _token: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "pack": "beta", "verb": verb }))
         }
@@ -1011,6 +1022,7 @@ mod tests {
                 _verb: &str,
                 _params: Value,
                 _registry: &VerbRegistry,
+                _token: &NamespaceToken,
             ) -> Result<Value, RuntimeError> {
                 Ok(Value::Null)
             }
@@ -1166,16 +1178,18 @@ mod tests {
             .unwrap();
         // Missing namespace → registry default.
         reg.dispatch("list", Value::Null).await.unwrap();
-        // Explicit empty namespace string is preserved (it is what
-        // `KhiveRuntime::ns` would also see). Gate and runtime MUST agree on
-        // the namespace they observe; coercing here while the runtime
-        // continues to honor `""` would create an audit blind spot.
-        reg.dispatch("list", serde_json::json!({"namespace": ""}))
+        // Empty string is rejected: Namespace::parse("") fails → InvalidInput error.
+        let err = reg
+            .dispatch("list", serde_json::json!({"namespace": ""}))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "empty namespace must return InvalidInput, got {err:?}"
+        );
 
         let seen = gate.seen.lock().unwrap().clone();
-        assert_eq!(seen, vec!["tenant-y", "tenant-x", ""]);
+        assert_eq!(seen, vec!["tenant-y", "tenant-x"]);
     }
 
     #[tokio::test]
@@ -1517,6 +1531,7 @@ mod tests {
 
     // ---- Hard enforcement + EventStore persistence (ADR-035) ----
 
+    use crate::runtime::NamespaceToken;
     use async_trait::async_trait;
     use khive_storage::{
         BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, SubstrateKind,
@@ -1637,6 +1652,7 @@ mod tests {
                 _verb: &str,
                 _params: Value,
                 _registry: &VerbRegistry,
+                _token: &NamespaceToken,
             ) -> Result<Value, RuntimeError> {
                 self.invoked.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::json!({"invoked": true}))
@@ -2001,8 +2017,9 @@ mod tests {
         // events_for_namespace ensures the events schema and returns a SqlEventStore
         // scoped to "test-ns". The pool is shared so reads and writes see the same data.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let test_tok = NamespaceToken::for_namespace(Namespace::parse("test-ns").unwrap());
         let sql_store = rt
-            .events(Some("test-ns"))
+            .events(&test_tok)
             .expect("events_for_namespace must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -2103,8 +2120,9 @@ mod tests {
         }
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let test_tok = NamespaceToken::for_namespace(Namespace::parse("test-ns").unwrap());
         let sql_store = rt
-            .events(Some("test-ns"))
+            .events(&test_tok)
             .expect("events_for_namespace must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -2337,6 +2355,7 @@ mod dep_tests {
             verb: &str,
             _: Value,
             _: &VerbRegistry,
+            _: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Err(RuntimeError::InvalidInput(format!(
                 "KgDepPack has no verbs: {verb}"
@@ -2366,6 +2385,7 @@ mod dep_tests {
             verb: &str,
             _: Value,
             _: &VerbRegistry,
+            _: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Err(RuntimeError::InvalidInput(format!(
                 "MemoryDepPack has no verbs: {verb}"
@@ -2395,6 +2415,7 @@ mod dep_tests {
             verb: &str,
             _: Value,
             _: &VerbRegistry,
+            _: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Err(RuntimeError::InvalidInput(format!(
                 "ADepPack has no verbs: {verb}"
@@ -2424,6 +2445,7 @@ mod dep_tests {
             verb: &str,
             _: Value,
             _: &VerbRegistry,
+            _: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Err(RuntimeError::InvalidInput(format!(
                 "BDepPack has no verbs: {verb}"
@@ -2528,6 +2550,7 @@ mod dep_tests {
                 verb: &str,
                 _: Value,
                 _: &VerbRegistry,
+                _: &NamespaceToken,
             ) -> Result<Value, RuntimeError> {
                 Err(RuntimeError::InvalidInput(format!("NoDepsA: {verb}")))
             }
@@ -2552,6 +2575,7 @@ mod dep_tests {
                 verb: &str,
                 _: Value,
                 _: &VerbRegistry,
+                _: &NamespaceToken,
             ) -> Result<Value, RuntimeError> {
                 Err(RuntimeError::InvalidInput(format!("NoDepsB: {verb}")))
             }
@@ -2608,6 +2632,7 @@ mod hook_tests {
             verb: &str,
             _params: Value,
             _registry: &VerbRegistry,
+            _token: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "verb": verb }))
         }

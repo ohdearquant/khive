@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, Pack, Visibility};
 
 use crate::config::RecallConfig;
@@ -130,13 +130,14 @@ impl PackRuntime for MemoryPack {
         verb: &str,
         params: Value,
         registry: &VerbRegistry,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "remember" => self.handle_remember(params).await,
-            "recall" => self.handle_recall(params, registry).await,
+            "remember" => self.handle_remember(token, params).await,
+            "recall" => self.handle_recall(token, params, registry).await,
             "recall.embed" => self.handle_recall_embed(params).await,
-            "recall.candidates" => self.handle_recall_candidates(params).await,
-            "recall.fuse" => self.handle_recall_fuse(params, registry).await,
+            "recall.candidates" => self.handle_recall_candidates(token, params).await,
+            "recall.fuse" => self.handle_recall_fuse(token, params, registry).await,
             "recall.score" => self.handle_recall_score(params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "memory pack does not handle verb {verb:?}"

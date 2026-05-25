@@ -15,7 +15,7 @@ use khive_storage::types::{EdgeFilter, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::runtime::KhiveRuntime;
+use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -168,19 +168,17 @@ impl KhiveRuntime {
     /// namespace. This enforces ADR-007 namespace isolation at the runtime layer.
     pub async fn update_entity(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<Entity> {
-        let store = self.entities(namespace)?;
+        let store = self.entities(token)?;
         let mut entity = store
             .get_entity(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
 
-        if entity.namespace != self.ns(namespace) {
-            return Err(RuntimeError::NotFound(format!("entity {id}")));
-        }
+        self.ensure_namespace(&entity.namespace, token, id)?;
 
         let mut text_changed = false;
 
@@ -208,7 +206,7 @@ impl KhiveRuntime {
         store.upsert_entity(entity.clone()).await?;
 
         if text_changed {
-            self.reindex_entity(namespace, &entity).await?;
+            self.reindex_entity(token, &entity).await?;
         }
 
         Ok(entity)
@@ -228,7 +226,7 @@ impl KhiveRuntime {
     /// `into_id` is performed after the transaction (requires async embedding computation).
     pub async fn merge_entity(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         into_id: Uuid,
         from_id: Uuid,
         strategy: EntityDedupMergePolicy,
@@ -239,7 +237,7 @@ impl KhiveRuntime {
                 "cannot merge an entity into itself".into(),
             ));
         }
-        let ns = self.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_owned();
         let sanitized_ns: String = ns
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -256,11 +254,11 @@ impl KhiveRuntime {
 
         // Ensure all required tables exist before entering the transaction.
         // Each accessor applies its DDL idempotently via `CREATE TABLE IF NOT EXISTS`.
-        let _ = self.entities(namespace)?;
-        let _ = self.graph(namespace)?;
-        let _ = self.text(namespace)?;
+        let _ = self.entities(token)?;
+        let _ = self.graph(token)?;
+        let _ = self.text(token)?;
         if self.config().embedding_model.is_some() {
-            let _ = self.vectors(namespace)?;
+            let _ = self.vectors(token)?;
         }
 
         let pool = self.backend().pool_arc();
@@ -279,7 +277,7 @@ impl KhiveRuntime {
         // If vectors are configured, reindex into_entity (requires async embedding).
         // FTS and vec-delete were already committed inside the transaction above.
         if !dry_run && self.config().embedding_model.is_some() {
-            self.reindex_entity(namespace, &updated_entity).await?;
+            self.reindex_entity(token, &updated_entity).await?;
         }
 
         Ok(summary)
@@ -294,16 +292,16 @@ impl KhiveRuntime {
     /// reindex from writing the search document into the wrong namespace's FTS index.
     pub(crate) async fn reindex_entity(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         entity: &Entity,
     ) -> RuntimeResult<()> {
         let body = match &entity.description {
             Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
             _ => entity.name.clone(),
         };
-        // Use entity.namespace (authoritative) rather than self.ns(namespace) (caller claim).
+        // Use entity.namespace (authoritative) rather than token.namespace().as_str() (caller claim).
         let ns = entity.namespace.clone();
-        self.text(namespace)?
+        self.text(token)?
             .upsert_document(TextDocument {
                 subject_id: entity.id,
                 kind: SubstrateKind::Entity,
@@ -318,7 +316,7 @@ impl KhiveRuntime {
 
         if self.config().embedding_model.is_some() {
             let vector = self.embed(&body).await?;
-            self.vectors(namespace)?
+            self.vectors(token)?
                 .insert(entity.id, SubstrateKind::Entity, &ns, vector)
                 .await?;
         }
@@ -329,13 +327,13 @@ impl KhiveRuntime {
     /// Remove an entity from FTS5 and (if configured) vector indexes.
     pub(crate) async fn remove_from_indexes(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<()> {
-        let ns = self.ns(namespace).to_string();
-        self.text(namespace)?.delete_document(&ns, id).await?;
+        let ns = token.namespace().as_str().to_owned();
+        self.text(token)?.delete_document(&ns, id).await?;
         if self.config().embedding_model.is_some() {
-            self.vectors(namespace)?.delete(id).await?;
+            self.vectors(token)?.delete(id).await?;
         }
         Ok(())
     }
@@ -343,11 +341,11 @@ impl KhiveRuntime {
     /// Re-upsert FTS5 document (and vector if model configured) for the note.
     pub(crate) async fn reindex_note(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         note: &khive_storage::note::Note,
     ) -> RuntimeResult<()> {
         let ns = note.namespace.clone();
-        self.text(namespace)?
+        self.text_for_notes(token)?
             .upsert_document(TextDocument {
                 subject_id: note.id,
                 kind: SubstrateKind::Note,
@@ -362,7 +360,7 @@ impl KhiveRuntime {
 
         if self.config().embedding_model.is_some() {
             let vector = self.embed(&note.content).await?;
-            self.vectors(namespace)?
+            self.vectors(token)?
                 .insert(note.id, SubstrateKind::Note, &ns, vector)
                 .await?;
         }
@@ -372,17 +370,17 @@ impl KhiveRuntime {
     /// Patch-style note update.
     pub async fn update_note(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         id: Uuid,
         patch: NotePatch,
     ) -> RuntimeResult<khive_storage::note::Note> {
-        let store = self.notes(namespace)?;
+        let store = self.notes(token)?;
         let mut note = store
             .get_note(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
 
-        if note.namespace != self.ns(namespace) {
+        if note.namespace != token.namespace().as_str() {
             return Err(RuntimeError::NotFound(format!("note {id}")));
         }
 
@@ -418,7 +416,7 @@ impl KhiveRuntime {
         store.upsert_note(note.clone()).await?;
 
         if text_changed {
-            self.reindex_note(namespace, &note).await?;
+            self.reindex_note(token, &note).await?;
         }
 
         Ok(note)
@@ -434,7 +432,7 @@ impl KhiveRuntime {
     /// any rows, edges, or indexes.
     pub async fn merge_note(
         &self,
-        namespace: Option<&str>,
+        token: &NamespaceToken,
         into_id: Uuid,
         from_id: Uuid,
         strategy: EntityDedupMergePolicy,
@@ -446,12 +444,12 @@ impl KhiveRuntime {
                 "cannot merge a note into itself".into(),
             ));
         }
-        let ns = self.ns(namespace).to_string();
+        let ns = token.namespace().as_str().to_string();
         let sanitized_ns: String = ns
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        let fts_table = format!("fts_entities_{}", sanitized_ns);
+        let fts_table = format!("fts_notes_{}", sanitized_ns);
         let vec_table = self.config().embedding_model.map(|model| {
             let key: String = model
                 .to_string()
@@ -461,11 +459,11 @@ impl KhiveRuntime {
             format!("vec_{}", key)
         });
 
-        let _ = self.notes(namespace)?;
-        let _ = self.graph(namespace)?;
-        let _ = self.text(namespace)?;
+        let _ = self.notes(token)?;
+        let _ = self.graph(token)?;
+        let _ = self.text_for_notes(token)?;
         if self.config().embedding_model.is_some() {
-            let _ = self.vectors(namespace)?;
+            let _ = self.vectors(token)?;
         }
 
         let pool = self.backend().pool_arc();
@@ -489,7 +487,7 @@ impl KhiveRuntime {
         .map_err(|e| RuntimeError::Internal(e.to_string()))??;
 
         if !dry_run && self.config().embedding_model.is_some() {
-            self.reindex_note(namespace, &updated_note).await?;
+            self.reindex_note(token, &updated_note).await?;
         }
         Ok(summary)
     }
@@ -1387,7 +1385,7 @@ fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::KhiveRuntime;
+    use crate::runtime::{KhiveRuntime, NamespaceToken};
     use khive_storage::types::{Direction, TextFilter, TextQueryMode, TextSearchRequest};
 
     fn rt() -> KhiveRuntime {
@@ -1395,9 +1393,9 @@ mod tests {
     }
 
     // Helper: search FTS5 for `query` in a runtime namespace.
-    async fn fts_hit(rt: &KhiveRuntime, namespace: Option<&str>, query: &str) -> Vec<Uuid> {
-        let ns = rt.ns(namespace).to_string();
-        rt.text(namespace)
+    async fn fts_hit(rt: &KhiveRuntime, token: &NamespaceToken, query: &str) -> Vec<Uuid> {
+        let ns = token.namespace().as_str().to_string();
+        rt.text(token)
             .unwrap()
             .search(TextSearchRequest {
                 query: query.to_string(),
@@ -1419,9 +1417,10 @@ mod tests {
     #[tokio::test]
     async fn update_entity_patch_changes_only_specified_fields() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "OriginalName",
@@ -1434,7 +1433,7 @@ mod tests {
 
         let updated = rt
             .update_entity(
-                None,
+                &tok,
                 entity.id,
                 EntityPatch {
                     description: Some(Some("new desc".to_string())),
@@ -1452,9 +1451,10 @@ mod tests {
     #[tokio::test]
     async fn update_entity_clear_description_with_some_none() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "ClearDesc",
@@ -1467,7 +1467,7 @@ mod tests {
 
         let updated = rt
             .update_entity(
-                None,
+                &tok,
                 entity.id,
                 EntityPatch {
                     description: Some(None),
@@ -1486,20 +1486,21 @@ mod tests {
     #[tokio::test]
     async fn update_entity_reindexes_when_name_changes() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
-            .create_entity(None, "concept", None, "OldName", None, None, vec![])
+            .create_entity(&tok, "concept", None, "OldName", None, None, vec![])
             .await
             .unwrap();
 
         // Old name is findable.
-        let hits_before = fts_hit(&rt, None, "OldName").await;
+        let hits_before = fts_hit(&rt, &tok, "OldName").await;
         assert!(
             hits_before.contains(&entity.id),
             "entity should be findable by old name"
         );
 
         rt.update_entity(
-            None,
+            &tok,
             entity.id,
             EntityPatch {
                 name: Some("NewName".to_string()),
@@ -1509,8 +1510,8 @@ mod tests {
         .await
         .unwrap();
 
-        let hits_old = fts_hit(&rt, None, "OldName").await;
-        let hits_new = fts_hit(&rt, None, "NewName").await;
+        let hits_old = fts_hit(&rt, &tok, "OldName").await;
+        let hits_new = fts_hit(&rt, &tok, "NewName").await;
 
         // After rename, old name no longer matches this entity (FTS index updated).
         assert!(
@@ -1526,9 +1527,10 @@ mod tests {
     #[tokio::test]
     async fn update_entity_properties_merges_preserving_existing_keys() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "MergeProps",
@@ -1545,7 +1547,7 @@ mod tests {
 
         let updated = rt
             .update_entity(
-                None,
+                &tok,
                 entity.id,
                 EntityPatch {
                     properties: Some(serde_json::json!({"status": "implemented"})),
@@ -1567,18 +1569,19 @@ mod tests {
     #[tokio::test]
     async fn update_entity_skips_reindex_when_only_properties_change() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let entity = rt
-            .create_entity(None, "concept", None, "StableIndexed", None, None, vec![])
+            .create_entity(&tok, "concept", None, "StableIndexed", None, None, vec![])
             .await
             .unwrap();
 
         // Verify it's in the index before.
-        let hits_before = fts_hit(&rt, None, "StableIndexed").await;
+        let hits_before = fts_hit(&rt, &tok, "StableIndexed").await;
         assert!(hits_before.contains(&entity.id));
 
         // Only patch properties — text index should be untouched (still findable).
         rt.update_entity(
-            None,
+            &tok,
             entity.id,
             EntityPatch {
                 properties: Some(serde_json::json!({"new": "prop"})),
@@ -1588,7 +1591,7 @@ mod tests {
         .await
         .unwrap();
 
-        let hits_after = fts_hit(&rt, None, "StableIndexed").await;
+        let hits_after = fts_hit(&rt, &tok, "StableIndexed").await;
         assert!(
             hits_after.contains(&entity.id),
             "still findable after props-only patch"
@@ -1598,33 +1601,34 @@ mod tests {
     #[tokio::test]
     async fn merge_entity_rewires_edges() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", None, "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let c = rt
-            .create_entity(None, "concept", None, "C", None, None, vec![])
+            .create_entity(&tok, "concept", None, "C", None, None, vec![])
             .await
             .unwrap();
         let d = rt
-            .create_entity(None, "concept", None, "D", None, None, vec![])
+            .create_entity(&tok, "concept", None, "D", None, None, vec![])
             .await
             .unwrap();
 
         // A→B and C→B; merge B into D → should become A→D and C→D.
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        rt.link(None, c.id, b.id, EdgeRelation::Extends, 1.0, None)
+        rt.link(&tok, c.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
         let summary = rt
-            .merge_entity(None, d.id, b.id, EntityDedupMergePolicy::PreferInto, false)
+            .merge_entity(&tok, d.id, b.id, EntityDedupMergePolicy::PreferInto, false)
             .await
             .unwrap();
 
@@ -1634,14 +1638,14 @@ mod tests {
 
         // Verify edges now point to D.
         let a_neighbors = rt
-            .neighbors(None, a.id, Direction::Out, None, None)
+            .neighbors(&tok, a.id, Direction::Out, None, None)
             .await
             .unwrap();
         assert_eq!(a_neighbors.len(), 1);
         assert_eq!(a_neighbors[0].node_id, d.id);
 
         let c_neighbors = rt
-            .neighbors(None, c.id, Direction::Out, None, None)
+            .neighbors(&tok, c.id, Direction::Out, None, None)
             .await
             .unwrap();
         assert_eq!(c_neighbors.len(), 1);
@@ -1651,12 +1655,13 @@ mod tests {
     #[tokio::test]
     async fn merge_entity_self_merge_rejected() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let err = rt
-            .merge_entity(None, a.id, a.id, EntityDedupMergePolicy::PreferInto, false)
+            .merge_entity(&tok, a.id, a.id, EntityDedupMergePolicy::PreferInto, false)
             .await
             .unwrap_err();
         assert!(
@@ -1668,9 +1673,10 @@ mod tests {
     #[tokio::test]
     async fn merge_entity_prefer_into_strategy() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let into = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "Into",
@@ -1682,7 +1688,7 @@ mod tests {
             .unwrap();
         let from = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "From",
@@ -1694,7 +1700,7 @@ mod tests {
             .unwrap();
 
         rt.merge_entity(
-            None,
+            &tok,
             into.id,
             from.id,
             EntityDedupMergePolicy::PreferInto,
@@ -1703,7 +1709,7 @@ mod tests {
         .await
         .unwrap();
 
-        let kept = rt.get_entity(None, into.id).await.unwrap().unwrap();
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
         let props = kept.properties.unwrap();
         // a stays as 1 (into wins), b is added from from.
         assert_eq!(props["a"], 1);
@@ -1713,9 +1719,10 @@ mod tests {
     #[tokio::test]
     async fn merge_entity_prefer_from_strategy() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let into = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "Into",
@@ -1727,7 +1734,7 @@ mod tests {
             .unwrap();
         let from = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "From",
@@ -1739,7 +1746,7 @@ mod tests {
             .unwrap();
 
         rt.merge_entity(
-            None,
+            &tok,
             into.id,
             from.id,
             EntityDedupMergePolicy::PreferFrom,
@@ -1748,7 +1755,7 @@ mod tests {
         .await
         .unwrap();
 
-        let kept = rt.get_entity(None, into.id).await.unwrap().unwrap();
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
         let props = kept.properties.unwrap();
         // from wins on a, b also from from.
         assert_eq!(props["a"], 2);
@@ -1758,9 +1765,10 @@ mod tests {
     #[tokio::test]
     async fn merge_entity_union_strategy() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let into = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "Into",
@@ -1772,7 +1780,7 @@ mod tests {
             .unwrap();
         let from = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "From",
@@ -1783,11 +1791,11 @@ mod tests {
             .await
             .unwrap();
 
-        rt.merge_entity(None, into.id, from.id, EntityDedupMergePolicy::Union, false)
+        rt.merge_entity(&tok, into.id, from.id, EntityDedupMergePolicy::Union, false)
             .await
             .unwrap();
 
-        let kept = rt.get_entity(None, into.id).await.unwrap().unwrap();
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
         let props = kept.properties.unwrap();
         // Scalar conflict: into wins → a=1. b added from from.
         assert_eq!(props["a"], 1);
@@ -1797,9 +1805,10 @@ mod tests {
     #[tokio::test]
     async fn merge_entity_unions_tags() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let into = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "Into",
@@ -1811,7 +1820,7 @@ mod tests {
             .unwrap();
         let from = rt
             .create_entity(
-                None,
+                &tok,
                 "concept",
                 None,
                 "From",
@@ -1823,7 +1832,7 @@ mod tests {
             .unwrap();
 
         rt.merge_entity(
-            None,
+            &tok,
             into.id,
             from.id,
             EntityDedupMergePolicy::PreferInto,
@@ -1832,7 +1841,7 @@ mod tests {
         .await
         .unwrap();
 
-        let kept = rt.get_entity(None, into.id).await.unwrap().unwrap();
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
         let mut tags = kept.tags.clone();
         tags.sort();
         assert_eq!(tags, vec!["x", "y", "z"]);
@@ -1841,22 +1850,23 @@ mod tests {
     #[tokio::test]
     async fn merge_entity_drops_self_loops() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", None, "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
 
         // A `extends` B — merging B into A would produce A `extends` A → drop it.
-        rt.link(None, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
 
         let summary = rt
-            .merge_entity(None, a.id, b.id, EntityDedupMergePolicy::PreferInto, false)
+            .merge_entity(&tok, a.id, b.id, EntityDedupMergePolicy::PreferInto, false)
             .await
             .unwrap();
 
@@ -1866,7 +1876,7 @@ mod tests {
         );
 
         let a_out = rt
-            .neighbors(None, a.id, Direction::Out, None, None)
+            .neighbors(&tok, a.id, Direction::Out, None, None)
             .await
             .unwrap();
         assert!(a_out.is_empty(), "no self-loop should remain");
@@ -1903,18 +1913,19 @@ mod tests {
     #[tokio::test]
     async fn merge_entity_tombstones_source_with_provenance() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let into = rt
-            .create_entity(None, "concept", None, "Into", None, None, vec![])
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
             .await
             .unwrap();
         let from = rt
-            .create_entity(None, "concept", None, "From", None, None, vec![])
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
             .await
             .unwrap();
         let from_id = from.id;
 
         rt.merge_entity(
-            None,
+            &tok,
             into.id,
             from_id,
             EntityDedupMergePolicy::PreferInto,
@@ -1923,9 +1934,9 @@ mod tests {
         .await
         .unwrap();
 
-        // After merge, get_entity returns None (soft-deleted rows are excluded).
+        // After merge, get_entity returns an error (soft-deleted rows are excluded).
         assert!(
-            rt.get_entity(None, from_id).await.unwrap().is_none(),
+            rt.get_entity(&tok, from_id).await.is_err(),
             "tombstoned source should not be returned by get_entity"
         );
 
@@ -1959,9 +1970,10 @@ mod tests {
     #[tokio::test]
     async fn merge_note_same_kind_appends_content() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let into = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "Into content",
@@ -1973,7 +1985,7 @@ mod tests {
             .unwrap();
         let from = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "From content",
@@ -1987,7 +1999,7 @@ mod tests {
 
         let summary = rt
             .merge_note(
-                None,
+                &tok,
                 into.id,
                 from_id,
                 EntityDedupMergePolicy::PreferInto,
@@ -2003,7 +2015,7 @@ mod tests {
         assert!(!summary.dry_run);
 
         // Source is no longer findable.
-        let from_store = rt.notes(None).unwrap();
+        let from_store = rt.notes(&tok).unwrap();
         assert!(
             from_store.get_note(from_id).await.unwrap().is_none(),
             "merged-from note should be soft-deleted"
@@ -2013,18 +2025,19 @@ mod tests {
     #[tokio::test]
     async fn merge_note_different_kinds_rejected() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let into = rt
-            .create_note(None, "observation", None, "Into", None, None, vec![])
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
             .await
             .unwrap();
         let from = rt
-            .create_note(None, "decision", None, "From", None, None, vec![])
+            .create_note(&tok, "decision", None, "From", None, None, vec![])
             .await
             .unwrap();
 
         let result = rt
             .merge_note(
-                None,
+                &tok,
                 into.id,
                 from.id,
                 EntityDedupMergePolicy::PreferInto,
@@ -2038,9 +2051,10 @@ mod tests {
     #[tokio::test]
     async fn merge_note_dry_run_leaves_notes_unchanged() {
         let rt = rt();
+        let tok = NamespaceToken::local();
         let into = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "Into content",
@@ -2052,7 +2066,7 @@ mod tests {
             .unwrap();
         let from = rt
             .create_note(
-                None,
+                &tok,
                 "observation",
                 None,
                 "From content",
@@ -2067,7 +2081,7 @@ mod tests {
 
         let summary = rt
             .merge_note(
-                None,
+                &tok,
                 into_id,
                 from_id,
                 EntityDedupMergePolicy::PreferInto,
@@ -2080,7 +2094,7 @@ mod tests {
         assert!(summary.dry_run);
 
         // Both notes still exist unchanged.
-        let store = rt.notes(None).unwrap();
+        let store = rt.notes(&tok).unwrap();
         let into_after = store.get_note(into_id).await.unwrap().unwrap();
         let from_after = store.get_note(from_id).await.unwrap().unwrap();
         assert_eq!(
@@ -2097,23 +2111,24 @@ mod tests {
     async fn update_edge_updates_properties() {
         use khive_storage::EdgeRelation;
         let rt = rt();
+        let tok = NamespaceToken::local();
         let a = rt
-            .create_entity(None, "concept", None, "A", None, None, vec![])
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
             .unwrap();
         let b = rt
-            .create_entity(None, "concept", None, "B", None, None, vec![])
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
         let edge = rt
-            .link(None, a.id, b.id, EdgeRelation::Extends, 0.5, None)
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.5, None)
             .await
             .unwrap();
         let edge_id: Uuid = edge.id.into();
 
         let updated = rt
             .update_edge(
-                None,
+                &tok,
                 edge_id,
                 EdgePatch {
                     properties: Some(serde_json::json!({"source": "manual"})),

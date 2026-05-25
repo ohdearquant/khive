@@ -13,12 +13,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn request(verb: &str) -> GateRequest {
-    GateRequest::new(
-        ActorRef::anonymous(),
-        Namespace::default_ns(),
-        verb,
-        json!({}),
-    )
+    GateRequest::new(ActorRef::anonymous(), Namespace::local(), verb, json!({}))
 }
 
 #[test]
@@ -79,7 +74,7 @@ fn namespace_scoped_policy_emits_audit_obligation() {
 
     let mut req = GateRequest::new(
         ActorRef::new("user", "ocean"),
-        Namespace::default_ns(),
+        Namespace::local(),
         "search",
         json!({}),
     );

@@ -3,7 +3,7 @@
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::HandlerDef;
-use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistry, VerbRegistryBuilder};
 use serde_json::{json, Value};
 
 fn rt() -> KhiveRuntime {
@@ -210,7 +210,15 @@ async fn complete_rejects_non_task_notes() {
     // the task-kind guard fires.
     let runtime = rt();
     let note = runtime
-        .create_note(None, "observation", None, "hello", Some(0.5), None, vec![])
+        .create_note(
+            &runtime.authorize(Namespace::local()),
+            "observation",
+            None,
+            "hello",
+            Some(0.5),
+            None,
+            vec![],
+        )
         .await
         .unwrap();
     let pack = pack(runtime);
@@ -326,7 +334,9 @@ async fn assign_creates_depends_on_edge_between_tasks() {
     let dep_uuid = uuid::Uuid::parse_str(dep_full).unwrap();
     let blocker_uuid = uuid::Uuid::parse_str(blocker_full).unwrap();
 
-    let graph = rt.graph(None).expect("graph store");
+    let graph = rt
+        .graph(&rt.authorize(Namespace::local()))
+        .expect("graph store");
     let neighbors = graph
         .neighbors(
             dep_uuid,
@@ -359,7 +369,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
     // the task is never persisted (ADR-030: no failure after successful write).
     let other = rt
         .create_note(
-            None,
+            &rt.authorize(Namespace::local()),
             "observation",
             None,
             "an observation",
@@ -385,7 +395,9 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
     );
 
     // Atomicity: the rejected `assign` must not leave a task row behind.
-    let notes = rt.notes(None).expect("note store");
+    let notes = rt
+        .notes(&rt.authorize(Namespace::local()))
+        .expect("note store");
     let task_page = notes
         .query_notes(
             "local",

@@ -1,7 +1,7 @@
 use khive_pack_brain::tunable::PackTunable;
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
-use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder};
 use khive_types::Pack;
 use serde_json::json;
 use uuid::Uuid;
@@ -92,7 +92,7 @@ async fn test_recall_decay_ranking() {
 
     // Manually backdate the old note to simulate age
     let old_uuid: uuid::Uuid = old_id.parse().unwrap();
-    let note_store = rt.notes(None).unwrap();
+    let note_store = rt.notes(&rt.authorize(Namespace::local())).unwrap();
     let mut old_note = note_store.get_note(old_uuid).await.unwrap().unwrap();
     old_note.created_at -= 90 * 86_400_000_000i64; // 90 days in microseconds
     note_store.upsert_note(old_note).await.unwrap();
@@ -275,7 +275,9 @@ async fn test_remember_source_id_not_in_properties() {
         .parse()
         .expect("valid uuid");
 
-    let note_store = rt.notes(None).expect("note store");
+    let note_store = rt
+        .notes(&rt.authorize(Namespace::local()))
+        .expect("note store");
     let note = note_store
         .get_note(note_id)
         .await
@@ -314,7 +316,9 @@ async fn test_remember_decay_factor_clamped() {
         .parse()
         .expect("valid uuid");
 
-    let note_store = rt.notes(None).expect("note store");
+    let note_store = rt
+        .notes(&rt.authorize(Namespace::local()))
+        .expect("note store");
     let note = note_store
         .get_note(note_id)
         .await
@@ -554,9 +558,10 @@ async fn test_recall_excludes_non_memory_notes() {
 
     // Create 50 observation notes whose content matches the recall query — enough to
     // dominate a `limit=5` candidate pool at `limit * 4 = 20` without pre-filtering.
+    let tok = rt.authorize(Namespace::local());
     for i in 0..50 {
         rt.create_note(
-            None,
+            &tok,
             "observation",
             None,
             &format!("observation {i} about attention mechanisms in neural networks"),
