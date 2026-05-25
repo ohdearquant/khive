@@ -96,8 +96,14 @@ pub trait PackRuntime: Send + Sync {
     ///
     /// Packs that require auxiliary tables (e.g. `gtd_lifecycle_audit`)
     /// return a `PackSchemaPlan` whose `statements` are idempotent DDL.
-    /// The runtime applies them once at registration / startup time.
     /// Defaults to `None` so packs with no auxiliary schema cost nothing.
+    ///
+    /// **Current state:** plans are aggregated via `VerbRegistry::all_schema_plans()`
+    /// but the runtime does not yet apply them at registration. Packs that need
+    /// their schema present (e.g. GTD) self-bootstrap by running the DDL lazily
+    /// on first call inside their handlers. Centralized startup application is
+    /// deferred to c11/c12 (HandlerDef + PackVerbRegistry) when the runtime
+    /// gains a unified pack-registration lifecycle.
     fn schema_plan(&self) -> Option<PackSchemaPlan> {
         None
     }
