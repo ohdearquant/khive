@@ -1,5 +1,5 @@
 /**
- * Shared types for the format adapters under cli/lib/importers/ (ADR-055).
+ * Shared types for the format adapters under cli/lib/importers/ (ADR-036).
  *
  * Each adapter returns these records; the dispatcher merges them and writes
  * them as sorted NDJSON via the standard `khive kg import` pipeline.
