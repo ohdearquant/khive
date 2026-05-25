@@ -242,40 +242,37 @@ impl KhiveMcpServer {
         let ParsedOp { tool, args } = op;
 
         // Resolve args — substitute $prev references when prev_result is Some.
+        // Handles flat PrevRef as well as Array/Object containing nested refs.
         let mut resolved: serde_json::Map<String, Value> = serde_json::Map::new();
         for (name, arg_val) in args {
-            let value = match &arg_val {
-                ArgValue::Value(v) => v.clone(),
-                ArgValue::PrevRef { path } => {
-                    let prev = prev_result.ok_or_else(|| {
-                        (
-                            tool.clone(),
-                            json!({
-                                "kind": "substitution_error",
-                                "message": format!(
-                                    "argument {name:?}: $prev reference in non-chain context"
-                                )
-                            }),
-                        )
-                    })?;
-                    let extracted = arg_val.resolve_prev(prev).ok_or_else(|| {
-                        let display_path = if path.is_empty() {
-                            "$prev".to_string()
-                        } else {
-                            format!("$prev.{path}")
-                        };
-                        (
-                            tool.clone(),
-                            json!({
-                                "kind": "substitution_error",
-                                "message": format!(
-                                    "argument {name:?}: path {display_path:?} not found in prior result"
-                                ),
-                                "path": display_path
-                            }),
-                        )
-                    })?;
-                    extracted.clone()
+            let needs_prev = !matches!(&arg_val, ArgValue::Value(_));
+            let value = if needs_prev {
+                let prev = prev_result.ok_or_else(|| {
+                    (
+                        tool.clone(),
+                        json!({
+                            "kind": "substitution_error",
+                            "message": format!(
+                                "argument {name:?}: $prev reference in non-chain context"
+                            )
+                        }),
+                    )
+                })?;
+                arg_val.resolve_all(prev).ok_or_else(|| {
+                    (
+                        tool.clone(),
+                        json!({
+                            "kind": "substitution_error",
+                            "message": format!(
+                                "argument {name:?}: one or more $prev paths not found in prior result"
+                            ),
+                        }),
+                    )
+                })?
+            } else {
+                match arg_val {
+                    ArgValue::Value(v) => v,
+                    _ => unreachable!(),
                 }
             };
             resolved.insert(name, value);
@@ -371,24 +368,29 @@ impl KhiveMcpServer {
                             } else {
                                 op_mode
                             };
-                        // No $prev in parallel/single mode.
+                        // No $prev in parallel/single mode — PrevRef, Array(PrevRef),
+                        // and Object(PrevRef) are all errors here.
                         let mut resolved: serde_json::Map<String, Value> =
                             serde_json::Map::new();
+                        let mut prev_error: Option<Value> = None;
                         for (name, arg_val) in &op.args {
-                            let value = match arg_val {
-                                ArgValue::Value(v) => v.clone(),
-                                ArgValue::PrevRef { .. } => {
-                                    // $prev in non-chain context: treat as error for this op.
-                                    return json!({
-                                        "ok": false,
-                                        "tool": tool,
-                                        "error": format!(
-                                            "argument {name:?}: $prev reference is only valid in chain (|) mode"
-                                        )
-                                    });
+                            if matches!(arg_val, ArgValue::Value(_)) {
+                                if let ArgValue::Value(v) = arg_val {
+                                    resolved.insert(name.clone(), v.clone());
                                 }
-                            };
-                            resolved.insert(name.clone(), value);
+                            } else {
+                                prev_error = Some(json!({
+                                    "ok": false,
+                                    "tool": tool,
+                                    "error": format!(
+                                        "argument {name:?}: $prev reference is only valid in chain (|) mode"
+                                    )
+                                }));
+                                break;
+                            }
+                        }
+                        if let Some(err) = prev_error {
+                            return err;
                         }
                         let args_value = Value::Object(resolved);
 

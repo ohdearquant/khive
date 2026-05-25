@@ -619,11 +619,14 @@ impl GtdPack {
             .list_notes(token, Some("task"), window, 0)
             .await?;
 
+        // When no status= is provided, exclude terminal states (done, cancelled)
+        // so the default listing shows only active work. Pass status= explicitly
+        // to see terminal tasks (e.g. tasks(status="done") for review).
         let filtered: Vec<&khive_storage::note::Note> = notes
             .iter()
             .filter(|n| n.deleted_at.is_none())
             .filter(|n| match status_filter.as_deref() {
-                None => true,
+                None => !is_terminal(&task_status(n.properties.as_ref())),
                 Some(want) => task_status(n.properties.as_ref()) == want,
             })
             .filter(|n| match p.assignee.as_deref() {

@@ -58,15 +58,28 @@ pub enum ExecutionMode {
 /// semantics), arguments may reference the preceding op's result via `$prev`
 /// or `$prev.dotted.path`. Substitution happens at dispatch time, not at parse
 /// time, because the prior result isn't known until runtime.
+///
+/// `$prev` references may also appear inside array or object literals, which is
+/// why `Array` and `Object` variants exist alongside the flat `PrevRef` variant.
+/// The dispatcher resolves these recursively before calling the verb handler.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArgValue {
-    /// A concrete JSON value.
+    /// A concrete JSON value (no `$prev` references anywhere inside).
     Value(Value),
     /// A `$prev` or `$prev.field.path` reference — chain mode only.
     ///
     /// `path` is the dot-separated field path after `$prev`. Empty string means
     /// the whole prior result (`$prev` with no field selector).
     PrevRef { path: String },
+    /// An array literal whose elements may themselves be `ArgValue`s (including
+    /// nested `PrevRef` or further `Array`/`Object`).  Used when at least one
+    /// element contains a `$prev` reference; pure-JSON arrays are still
+    /// represented as `Value(Value::Array(_))` for efficiency.
+    Array(Vec<ArgValue>),
+    /// An object literal whose values may themselves be `ArgValue`s.  Used when
+    /// at least one value contains a `$prev` reference; pure-JSON objects are
+    /// still represented as `Value(Value::Object(_))`.
+    Object(Vec<(String, ArgValue)>),
 }
 
 impl ArgValue {
@@ -74,7 +87,7 @@ impl ArgValue {
     pub fn as_value(&self) -> Option<&Value> {
         match self {
             ArgValue::Value(v) => Some(v),
-            ArgValue::PrevRef { .. } => None,
+            ArgValue::PrevRef { .. } | ArgValue::Array(_) | ArgValue::Object(_) => None,
         }
     }
 
@@ -99,6 +112,34 @@ impl ArgValue {
             cur = cur.get(segment)?;
         }
         Some(cur)
+    }
+
+    /// Recursively resolve all `$prev` references within this value.
+    ///
+    /// - `PrevRef`: resolved via `resolve_prev`.
+    /// - `Array`/`Object`: each element/value is resolved recursively.
+    /// - `Value`: returned as-is (no `$prev` anywhere inside).
+    ///
+    /// Returns `None` if any `$prev` path is missing from `prev_result`.
+    pub fn resolve_all<'a>(&'a self, prev_result: &'a Value) -> Option<Value> {
+        match self {
+            ArgValue::Value(v) => Some(v.clone()),
+            ArgValue::PrevRef { .. } => self.resolve_prev(prev_result).cloned(),
+            ArgValue::Array(elements) => {
+                let mut out = Vec::with_capacity(elements.len());
+                for el in elements {
+                    out.push(el.resolve_all(prev_result)?);
+                }
+                Some(Value::Array(out))
+            }
+            ArgValue::Object(pairs) => {
+                let mut map = serde_json::Map::with_capacity(pairs.len());
+                for (key, val) in pairs {
+                    map.insert(key.clone(), val.resolve_all(prev_result)?);
+                }
+                Some(Value::Object(map))
+            }
+        }
     }
 }
 
@@ -536,14 +577,157 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse an argument value — either a `$prev` reference or a JSON literal.
+    /// Parse an argument value — either a `$prev` reference, an array/object
+    /// literal (which may contain `$prev` refs), or a plain JSON literal.
     fn parse_arg_value(&mut self) -> Result<ArgValue, DslError> {
         self.skip_ws();
         if self.peek() == Some('$') {
             return self.parse_prev_ref();
         }
+        if self.peek() == Some('[') {
+            return self.parse_array_arg();
+        }
+        if self.peek() == Some('{') {
+            return self.parse_object_arg();
+        }
         let v = self.parse_value()?;
         Ok(ArgValue::Value(v))
+    }
+
+    /// Parse an array argument: `[elem, elem, ...]` where each element may be
+    /// a `$prev` reference, a nested array/object, or a plain JSON literal.
+    ///
+    /// When no element contains a `$prev` reference, the result is folded back
+    /// into an `ArgValue::Value(Array(_))` so pure-JSON callers see no change.
+    fn parse_array_arg(&mut self) -> Result<ArgValue, DslError> {
+        self.advance(1); // consume '['
+        self.skip_ws();
+        let mut elements: Vec<ArgValue> = Vec::new();
+        if self.peek() == Some(']') {
+            self.advance(1);
+            return Ok(ArgValue::Value(Value::Array(vec![])));
+        }
+        loop {
+            self.skip_ws();
+            let elem = self.parse_arg_value()?;
+            elements.push(elem);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.advance(1);
+                }
+                Some(']') => {
+                    self.advance(1);
+                    break;
+                }
+                Some(c) => {
+                    return Err(DslError::UnexpectedChar {
+                        pos: self.pos,
+                        found: c,
+                        expected: "',' or ']'",
+                    });
+                }
+                None => return Err(DslError::UnexpectedEof { expected: "']'" }),
+            }
+        }
+        // If no element is a PrevRef/Array/Object, fold to Value for efficiency.
+        let has_dynamic = elements.iter().any(|e| !matches!(e, ArgValue::Value(_)));
+        if has_dynamic {
+            Ok(ArgValue::Array(elements))
+        } else {
+            let vals: Vec<Value> = elements
+                .into_iter()
+                .map(|e| match e {
+                    ArgValue::Value(v) => v,
+                    _ => unreachable!(),
+                })
+                .collect();
+            Ok(ArgValue::Value(Value::Array(vals)))
+        }
+    }
+
+    /// Parse an object argument: `{"key": value, ...}`.
+    ///
+    /// Keys must be quoted strings (JSON-style). Values may contain `$prev` refs.
+    /// Pure-JSON objects without any `$prev` fold back into `ArgValue::Value`.
+    fn parse_object_arg(&mut self) -> Result<ArgValue, DslError> {
+        self.advance(1); // consume '{'
+        self.skip_ws();
+        let mut pairs: Vec<(String, ArgValue)> = Vec::new();
+        if self.peek() == Some('}') {
+            self.advance(1);
+            return Ok(ArgValue::Value(Value::Object(serde_json::Map::new())));
+        }
+        loop {
+            self.skip_ws();
+            // Key must be a quoted string — parse it directly (not via parse_value,
+            // which uses scan_value_end and would greedily consume `:value`).
+            let key = match self.peek() {
+                Some('"') => {
+                    let start = self.pos;
+                    let end = scan_string_end(self.src, start)?;
+                    let raw = std::str::from_utf8(&self.src[start..end]).expect("utf8 key literal");
+                    let s: String =
+                        serde_json::from_str(raw).map_err(|e| DslError::InvalidValue {
+                            pos: start,
+                            error: e.to_string(),
+                        })?;
+                    self.pos = end;
+                    s
+                }
+                Some(c) => {
+                    return Err(DslError::UnexpectedChar {
+                        pos: self.pos,
+                        found: c,
+                        expected: "quoted string key",
+                    });
+                }
+                None => {
+                    return Err(DslError::UnexpectedEof {
+                        expected: "object key",
+                    })
+                }
+            };
+            self.skip_ws();
+            self.expect_char(':')?;
+            self.skip_ws();
+            let val = self.parse_arg_value()?;
+            pairs.push((key, val));
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.advance(1);
+                }
+                Some('}') => {
+                    self.advance(1);
+                    break;
+                }
+                Some(c) => {
+                    return Err(DslError::UnexpectedChar {
+                        pos: self.pos,
+                        found: c,
+                        expected: "',' or '}'",
+                    });
+                }
+                None => return Err(DslError::UnexpectedEof { expected: "'}'" }),
+            }
+        }
+        // Fold pure-JSON objects back to Value.
+        let has_dynamic = pairs.iter().any(|(_, v)| !matches!(v, ArgValue::Value(_)));
+        if has_dynamic {
+            Ok(ArgValue::Object(pairs))
+        } else {
+            let mut map = serde_json::Map::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                match v {
+                    ArgValue::Value(val) => {
+                        map.insert(k, val);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Ok(ArgValue::Value(Value::Object(map)))
+        }
     }
 
     /// Parse a `$prev` or `$prev.field.path` reference.
@@ -623,6 +807,12 @@ impl<'a> Parser<'a> {
                 '{' => depth_brace += 1,
                 '}' => {
                     if depth_brace == 0 {
+                        // Closing brace outside any open brace — terminates the
+                        // current value (e.g. a string value inside an object literal
+                        // parsed by parse_object_arg).
+                        if depth_paren == 0 && depth_brack == 0 {
+                            return Ok(i);
+                        }
                         return Err(DslError::UnclosedBracket { kind: '{' });
                     }
                     depth_brace -= 1;
@@ -696,12 +886,18 @@ mod tests {
         req(s).ops
     }
 
-    /// Extract the concrete `Value` from an `ArgValue::Value`, panicking on `PrevRef`.
+    /// Extract the concrete `Value` from an `ArgValue::Value`, panicking on dynamic variants.
     fn val(arg: &ArgValue) -> &Value {
         match arg {
             ArgValue::Value(v) => v,
             ArgValue::PrevRef { path } => {
                 panic!("expected Value, got PrevRef {{ path: {path:?} }}")
+            }
+            ArgValue::Array(els) => {
+                panic!("expected Value, got Array with {} elements", els.len())
+            }
+            ArgValue::Object(pairs) => {
+                panic!("expected Value, got Object with {} keys", pairs.len())
             }
         }
     }
@@ -1056,5 +1252,145 @@ mod tests {
     fn arg_value_value_returns_none_for_resolve_prev() {
         let r = ArgValue::Value(json!("hello"));
         assert_eq!(r.resolve_prev(&json!({})), None);
+    }
+
+    // ── G-C1: $prev inside array / object literals (regression) ──────────────
+
+    #[test]
+    fn chain_prev_in_single_element_array() {
+        // `assign(title="root") | assign(title="dep", depends_on=[$prev.full_id])`
+        let r = req(r#"assign(title="root") | assign(title="dep", depends_on=[$prev.full_id])"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(r.ops.len(), 2);
+        match &r.ops[1].args["depends_on"] {
+            ArgValue::Array(els) => {
+                assert_eq!(els.len(), 1);
+                assert_eq!(
+                    els[0],
+                    ArgValue::PrevRef {
+                        path: "full_id".into()
+                    }
+                );
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_prev_in_mixed_array() {
+        // `[$prev.id, "literal-uuid"]` — first element is PrevRef, second is literal.
+        let r = req(
+            r#"assign(title="root") | assign(title="dep", depends_on=[$prev.id, "literal-uuid"])"#,
+        );
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        match &r.ops[1].args["depends_on"] {
+            ArgValue::Array(els) => {
+                assert_eq!(els.len(), 2);
+                assert_eq!(els[0], ArgValue::PrevRef { path: "id".into() });
+                assert_eq!(els[1], ArgValue::Value(json!("literal-uuid")));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_prev_multiple_in_array() {
+        // `depends_on=[$prev.field.deep, $prev.other]`
+        let r = req(
+            r#"assign(title="root") | assign(title="dep", depends_on=[$prev.field.deep, $prev.other])"#,
+        );
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        match &r.ops[1].args["depends_on"] {
+            ArgValue::Array(els) => {
+                assert_eq!(els.len(), 2);
+                assert_eq!(
+                    els[0],
+                    ArgValue::PrevRef {
+                        path: "field.deep".into()
+                    }
+                );
+                assert_eq!(
+                    els[1],
+                    ArgValue::PrevRef {
+                        path: "other".into()
+                    }
+                );
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_prev_inside_object_inside_array() {
+        // `properties={"refs":[$prev.id]}` — nested: object containing array containing PrevRef
+        let r =
+            req(r#"assign(title="root") | assign(title="dep", properties={"refs": [$prev.id]})"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        match &r.ops[1].args["properties"] {
+            ArgValue::Object(pairs) => {
+                assert_eq!(pairs.len(), 1);
+                assert_eq!(pairs[0].0, "refs");
+                match &pairs[0].1 {
+                    ArgValue::Array(els) => {
+                        assert_eq!(els.len(), 1);
+                        assert_eq!(els[0], ArgValue::PrevRef { path: "id".into() });
+                    }
+                    other => panic!("expected inner Array, got {other:?}"),
+                }
+            }
+            other => panic!("expected Object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pure_json_array_folds_to_value() {
+        // An array with no $prev refs should still produce ArgValue::Value(Array(...))
+        let v = ops(r#"assign(title="x", depends_on=["a", "b"])"#);
+        assert_eq!(val(&v[0].args["depends_on"]), &json!(["a", "b"]));
+    }
+
+    #[test]
+    fn pure_json_object_folds_to_value() {
+        // An object with no $prev refs should still produce ArgValue::Value(Object(...))
+        let v = ops(r#"assign(title="x", properties={"k": "v"})"#);
+        assert_eq!(val(&v[0].args["properties"]), &json!({"k": "v"}));
+    }
+
+    #[test]
+    fn resolve_all_on_array_with_prev_ref() {
+        let prev = json!({"full_id": "abc-def-123"});
+        let arr = ArgValue::Array(vec![ArgValue::PrevRef {
+            path: "full_id".into(),
+        }]);
+        assert_eq!(arr.resolve_all(&prev), Some(json!(["abc-def-123"])));
+    }
+
+    #[test]
+    fn resolve_all_on_mixed_array() {
+        let prev = json!({"id": "x"});
+        let arr = ArgValue::Array(vec![
+            ArgValue::PrevRef { path: "id".into() },
+            ArgValue::Value(json!("literal")),
+        ]);
+        assert_eq!(arr.resolve_all(&prev), Some(json!(["x", "literal"])));
+    }
+
+    #[test]
+    fn resolve_all_on_nested_object() {
+        let prev = json!({"id": "obj-id"});
+        let obj = ArgValue::Object(vec![(
+            "refs".into(),
+            ArgValue::Array(vec![ArgValue::PrevRef { path: "id".into() }]),
+        )]);
+        assert_eq!(obj.resolve_all(&prev), Some(json!({"refs": ["obj-id"]})));
+    }
+
+    #[test]
+    fn resolve_all_missing_path_returns_none() {
+        let prev = json!({"id": "x"});
+        let arr = ArgValue::Array(vec![ArgValue::PrevRef {
+            path: "missing".into(),
+        }]);
+        assert_eq!(arr.resolve_all(&prev), None);
     }
 }

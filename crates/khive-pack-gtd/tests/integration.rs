@@ -1269,3 +1269,139 @@ async fn transition_writes_status_column() {
         "notes.status column must be 'next' after transition (Fix 3); got: {data_status}"
     );
 }
+
+// ── G-C2: tasks() default excludes terminal statuses (regression) ─────────────
+
+/// `tasks(priority=X)` without `status=` must exclude done/cancelled tasks.
+/// `tasks(priority=X, status="done")` must still return done tasks.
+#[tokio::test]
+async fn tasks_priority_filter_excludes_terminal_by_default() {
+    let pack = pack(rt());
+
+    // Create 4 tasks: A(p0,inbox), B(p0,done), C(p0,next), D(p0,cancelled).
+    let a = assign(
+        &pack,
+        json!({"title": "A", "priority": "p0", "status": "inbox"}),
+    )
+    .await;
+    let b = assign(
+        &pack,
+        json!({"title": "B", "priority": "p0", "status": "inbox"}),
+    )
+    .await;
+    let _c = assign(
+        &pack,
+        json!({"title": "C", "priority": "p0", "status": "next"}),
+    )
+    .await;
+    let d = assign(
+        &pack,
+        json!({"title": "D", "priority": "p0", "status": "inbox"}),
+    )
+    .await;
+
+    // Transition B → done, D → cancelled.
+    let b_id = b["full_id"].as_str().unwrap().to_string();
+    let d_id = d["full_id"].as_str().unwrap().to_string();
+    pack.dispatch("transition", json!({"id": b_id, "status": "done"}))
+        .await
+        .expect("B→done");
+    pack.dispatch("transition", json!({"id": d_id, "status": "cancelled"}))
+        .await
+        .expect("D→cancelled");
+
+    // tasks(priority="p0") — no status filter — must return A and C only.
+    let resp = pack
+        .dispatch("tasks", json!({"priority": "p0"}))
+        .await
+        .unwrap();
+    let arr = resp.as_array().unwrap();
+    let titles: Vec<&str> = arr
+        .iter()
+        .map(|t| t["title"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(
+        !titles.contains(&"B"),
+        "tasks(priority=p0) must exclude done task B; got: {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"D"),
+        "tasks(priority=p0) must exclude cancelled task D; got: {titles:?}"
+    );
+    assert!(
+        titles.contains(&"A"),
+        "tasks(priority=p0) must include inbox task A; got: {titles:?}"
+    );
+    assert!(
+        titles.contains(&"C"),
+        "tasks(priority=p0) must include next task C; got: {titles:?}"
+    );
+    assert_eq!(arr.len(), 2, "expected exactly A and C; got: {titles:?}");
+
+    // tasks(priority="p0", status="done") — explicit status — must return only B.
+    let resp_done = pack
+        .dispatch("tasks", json!({"priority": "p0", "status": "done"}))
+        .await
+        .unwrap();
+    let arr_done = resp_done.as_array().unwrap();
+    assert_eq!(
+        arr_done.len(),
+        1,
+        "explicit status=done must return exactly B"
+    );
+    assert_eq!(arr_done[0]["title"], "B");
+
+    // tasks() — no filter at all — must not include B or D.
+    let resp_all = pack.dispatch("tasks", json!({})).await.unwrap();
+    let all_titles: Vec<&str> = resp_all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["title"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(
+        !all_titles.contains(&"B"),
+        "tasks() default must exclude done task B; got: {all_titles:?}"
+    );
+    assert!(
+        !all_titles.contains(&"D"),
+        "tasks() default must exclude cancelled task D; got: {all_titles:?}"
+    );
+
+    // Also confirm the unused `a` ID is valid (suppress unused-variable lint).
+    let _ = a["full_id"].as_str();
+}
+
+/// `next()` must already correctly filter to actionable tasks only.
+/// This test ensures the G-C2 fix does not regress `next`.
+#[tokio::test]
+async fn next_excludes_terminal_tasks() {
+    let pack = pack(rt());
+
+    let t1 = assign(&pack, json!({"title": "active-task", "status": "next"})).await;
+    let t2 = assign(&pack, json!({"title": "done-task", "status": "inbox"})).await;
+    let t2_id = t2["full_id"].as_str().unwrap().to_string();
+
+    pack.dispatch("transition", json!({"id": t2_id, "status": "done"}))
+        .await
+        .expect("done transition");
+
+    let resp = pack.dispatch("next", json!({})).await.unwrap();
+    let titles: Vec<&str> = resp
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["title"].as_str().unwrap_or("?"))
+        .collect();
+
+    assert!(
+        titles.contains(&"active-task"),
+        "next must include actionable task; got: {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"done-task"),
+        "next must not include done task; got: {titles:?}"
+    );
+
+    let _ = t1["full_id"].as_str();
+}
