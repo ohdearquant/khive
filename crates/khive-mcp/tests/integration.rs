@@ -26,7 +26,7 @@ fn make_server() -> KhiveMcpServer {
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
-    KhiveMcpServer::new(runtime)
+    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd")
 }
 
 #[derive(Clone, Default)]
@@ -339,7 +339,7 @@ async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).unwrap();
-    let server = KhiveMcpServer::new(runtime);
+    let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
     let info = server.get_info();
     let instructions = info.instructions.unwrap_or_default();
     assert!(instructions.contains("create"), "kg verb missing");
@@ -350,9 +350,9 @@ async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
 }
 
 #[tokio::test]
-async fn pack_gtd_auto_loads_kg_via_transitive_requires() {
-    // GTD declares requires(&["kg"]) — requesting only "gtd" must auto-load "kg"
-    // so that kg verbs (e.g. "create") are present alongside gtd verbs (e.g. "assign").
+async fn pack_gtd_without_kg_fails_at_boot() {
+    // ADR-027: gtd declares requires=["kg"]; omitting "kg" from the pack list
+    // must fail at boot with a clear error — not silently auto-add kg.
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
@@ -361,14 +361,34 @@ async fn pack_gtd_auto_loads_kg_via_transitive_requires() {
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).unwrap();
-    let server = KhiveMcpServer::new(runtime);
+    match KhiveMcpServer::new(runtime) {
+        Ok(_) => panic!("gtd without kg must fail: missing dependency is a boot error (ADR-027)"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("kg") || msg.contains("unknown pack"),
+                "error must name the missing dependency: {msg}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pack_gtd_with_kg_explicit_works() {
+    // When both kg and gtd are listed, gtd's requires=["kg"] is satisfied.
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("test").unwrap(),
+        embedding_model: None,
+        packs: vec!["kg".to_string(), "gtd".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).unwrap();
+    let server = KhiveMcpServer::new(runtime).expect("kg+gtd builds");
     let info = server.get_info();
     let instructions = info.instructions.unwrap_or_default();
     assert!(instructions.contains("assign"), "gtd verb must be present");
-    assert!(
-        instructions.contains("create"),
-        "kg verb must be auto-loaded via gtd's transitive requires"
-    );
+    assert!(instructions.contains("create"), "kg verb must be present");
 }
 
 #[tokio::test]

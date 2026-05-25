@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let runtime = KhiveRuntime::new(config)?;
-    let server = KhiveMcpServer::new(runtime);
+    let server = KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))?;
     server.serve_stdio().await?;
     Ok(())
 }
