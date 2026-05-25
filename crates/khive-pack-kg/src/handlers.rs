@@ -486,6 +486,50 @@ fn format_edge_output(v: Value, _verbose: bool) -> Value {
     v
 }
 
+/// Remap note response fields so pack-owned lifecycle status is visible at the
+/// top level (Option A — ADR-004).
+///
+/// The storage-layer `Note.status` field carries row-visibility state
+/// (`"active"` | `"archived"` | `"deleted"`). Packs that own a note kind can
+/// store their own lifecycle status in `properties.status` — e.g. the GTD pack
+/// stores `"inbox"` / `"next"` / `"done"` / … for `kind = "task"`.
+///
+/// When a note kind has a `properties.status` entry we remap:
+/// - `status`    → GTD lifecycle value (from `properties.status`)
+/// - `lifecycle` → row-visibility value (what was `status`)
+///
+/// For note kinds without a pack-owned lifecycle (e.g. `"observation"`,
+/// `"insight"`, `"memory"`) `properties.status` is absent, so the note is
+/// returned unchanged — `status` continues to reflect row-visibility.
+///
+/// This transform is applied at the response boundary (KG `get`, `list`,
+/// `create`) so every path that serializes a raw storage `Note` to MCP output
+/// exposes the right semantic field to callers.
+fn remap_note_status(mut note_value: Value) -> Value {
+    let Some(obj) = note_value.as_object_mut() else {
+        return note_value;
+    };
+    // Only remap when `properties.status` exists — that signals a pack-owned
+    // lifecycle.  `kind` is checked as a belt-and-suspenders guard, but the
+    // real discriminator is whether properties carries a status field at all.
+    let lifecycle_status = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("status"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+
+    if let Some(gtd_status) = lifecycle_status {
+        // Move the row-visibility value to `lifecycle`.
+        if let Some(row_vis) = obj.remove("status") {
+            obj.insert("lifecycle".to_string(), row_vis);
+        }
+        // Surface the pack-owned lifecycle status as the primary `status`.
+        obj.insert("status".to_string(), Value::String(gtd_status));
+    }
+    note_value
+}
+
 fn parse_direction(s: Option<&str>) -> Direction {
     match s {
         Some("in") => Direction::In,
@@ -916,7 +960,7 @@ impl KgPack {
                     )
                     .await?;
                 let id = note.id;
-                (to_json(&note)?, id)
+                (remap_note_status(to_json(&note)?), id)
             }
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -959,7 +1003,9 @@ impl KgPack {
             .map_err(RuntimeError::Storage)?
         {
             if note.namespace == token.namespace().as_str() {
-                return to_json(&serde_json::json!({"kind": "note", "data": note}));
+                let note_val = to_json(&note)?;
+                let remapped = remap_note_status(note_val);
+                return to_json(&serde_json::json!({"kind": "note", "data": remapped}));
             }
         }
 
@@ -1064,7 +1110,15 @@ impl KgPack {
                     .runtime
                     .list_notes(token, kind_filter.as_deref(), limit, offset)
                     .await?;
-                to_json(&notes)
+                let remapped: Vec<Value> = notes
+                    .iter()
+                    .map(|n| {
+                        to_json(n)
+                            .map(remap_note_status)
+                            .unwrap_or_else(|_| serde_json::json!({}))
+                    })
+                    .collect();
+                to_json(&remapped)
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {

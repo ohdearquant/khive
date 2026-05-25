@@ -2431,3 +2431,70 @@ async fn list_event_observed_filter_invalid_uuid_returns_invalid_input() {
         "invalid UUID in observed must return InvalidInput; got {err:?}"
     );
 }
+
+// ── Response-layer status remap: non-lifecycle notes unaffected ───────────────
+//
+// Non-task note kinds (observation, insight, etc.) do NOT carry a
+// pack-owned lifecycle in `properties.status`.  The remap must leave these
+// notes unchanged — `status` stays as the row-visibility value ("active"),
+// and no spurious `lifecycle` field is injected.
+
+/// create(kind=observation) → get → data.status == "active" (row-visibility, no remap)
+#[tokio::test]
+async fn get_observation_note_status_is_row_visibility_unchanged() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "row-visibility test content"}),
+        )
+        .await
+        .expect("create observation must succeed");
+
+    let note_id = created["id"].as_str().expect("id field must be present");
+    let got = pack
+        .dispatch("get", json!({"id": note_id}))
+        .await
+        .expect("get must succeed");
+
+    // Non-task notes must NOT be remapped: status stays as row-visibility.
+    assert_eq!(
+        got["data"]["status"], "active",
+        "observation note data.status must be row-visibility 'active'; got: {got}"
+    );
+    // No lifecycle field injected for non-lifecycle notes.
+    assert!(
+        got["data"].get("lifecycle").is_none(),
+        "observation note must NOT have a lifecycle field; got: {got}"
+    );
+}
+
+/// list(kind=observation) → items have row-visibility status, no lifecycle field
+#[tokio::test]
+async fn list_observation_notes_status_is_row_visibility_unchanged() {
+    let pack = pack();
+    pack.dispatch(
+        "create",
+        json!({"kind": "observation", "content": "list remap guard content"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let list_resp = pack
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .expect("list must succeed");
+    let items = list_resp.as_array().expect("list must return array");
+    assert!(!items.is_empty(), "expected at least one observation");
+
+    for item in items {
+        assert_eq!(
+            item["status"], "active",
+            "observation status must be row-visibility 'active'; got item: {item}"
+        );
+        assert!(
+            item.get("lifecycle").is_none(),
+            "observation must NOT have lifecycle field; got item: {item}"
+        );
+    }
+}

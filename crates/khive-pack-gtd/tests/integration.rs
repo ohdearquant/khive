@@ -751,6 +751,144 @@ async fn test_complete_on_already_done_returns_clear_error() {
     );
 }
 
+// ── Response-layer status remap (note.status vs task.status) ─────────────────
+//
+// Option A fix: when a note kind carries a pack-owned lifecycle in
+// `properties.status`, the KG `get` and `list` response serialization layer
+// promotes `properties.status` to the top-level `status` field and moves the
+// row-visibility value to `lifecycle`.  These tests verify that contract from
+// the consumer's perspective.
+
+/// assign(title="t") → get(id) → data.status == "inbox"
+///
+/// Verifies that the KG `get` verb exposes the GTD status at `data.status`,
+/// NOT the row-visibility value ("active").
+#[tokio::test]
+async fn get_task_exposes_gtd_status_not_row_visibility() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "status remap test"})).await;
+    let full_id = resp["full_id"].as_str().unwrap().to_string();
+
+    let got = pack
+        .dispatch("get", json!({"id": full_id}))
+        .await
+        .expect("get must succeed");
+
+    // data.status must be the GTD lifecycle value.
+    assert_eq!(
+        got["data"]["status"], "inbox",
+        "get(task) must expose GTD status 'inbox' at data.status; got: {got}"
+    );
+    // data.lifecycle must hold the row-visibility value.
+    assert_eq!(
+        got["data"]["lifecycle"], "active",
+        "get(task) must move row-visibility to data.lifecycle; got: {got}"
+    );
+}
+
+/// assign → transition(active) → get → data.status == "active"
+///
+/// When the GTD status happens to equal the row-visibility string ("active"),
+/// the remap still produces the correct result: `status` = GTD "active",
+/// `lifecycle` = row-visibility "active".  Both fields agree here but they
+/// are semantically distinct.
+#[tokio::test]
+async fn get_task_after_transition_exposes_updated_gtd_status() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "transition remap test"})).await;
+    let full_id = resp["full_id"].as_str().unwrap().to_string();
+
+    pack.dispatch("transition", json!({"id": full_id, "status": "active"}))
+        .await
+        .expect("transition to active must succeed");
+
+    let got = pack
+        .dispatch("get", json!({"id": full_id}))
+        .await
+        .expect("get after transition must succeed");
+
+    assert_eq!(
+        got["data"]["status"], "active",
+        "after transition to active, data.status must be 'active' (GTD); got: {got}"
+    );
+    assert_eq!(
+        got["data"]["lifecycle"], "active",
+        "row-visibility must remain 'active' for a live task; got: {got}"
+    );
+}
+
+/// assign → complete → get → data.status == "done"
+///
+/// Verifies the "done" terminal state is surfaced correctly.
+#[tokio::test]
+async fn get_task_after_complete_exposes_done_status() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "complete remap test"})).await;
+    let full_id = resp["full_id"].as_str().unwrap().to_string();
+
+    pack.dispatch("complete", json!({"id": full_id, "result": "shipped"}))
+        .await
+        .expect("complete must succeed");
+
+    let got = pack
+        .dispatch("get", json!({"id": full_id}))
+        .await
+        .expect("get after complete must succeed");
+
+    assert_eq!(
+        got["data"]["status"], "done",
+        "after complete, data.status must be 'done'; got: {got}"
+    );
+    assert_eq!(
+        got["data"]["lifecycle"], "active",
+        "soft-completed task row-visibility is still 'active'; got: {got}"
+    );
+}
+
+/// list(kind=task) → each item's `status` == GTD status, not row-visibility
+///
+/// The `list` path in the KG handler also applies the remap.
+#[tokio::test]
+async fn list_task_exposes_gtd_status_not_row_visibility() {
+    let pack = pack(rt());
+    assign(&pack, json!({"title": "list remap inbox"})).await;
+    assign(&pack, json!({"title": "list remap next", "status": "next"})).await;
+
+    let list_resp = pack
+        .dispatch("list", json!({"kind": "task"}))
+        .await
+        .expect("list must succeed");
+    let items = list_resp.as_array().expect("list must return array");
+
+    // Collect statuses from the response.
+    let statuses: Vec<&str> = items.iter().filter_map(|n| n["status"].as_str()).collect();
+
+    // Both GTD statuses must appear, neither should be "active" (row-visibility)
+    // unless a task was explicitly assigned with status="active".
+    assert!(
+        statuses.contains(&"inbox"),
+        "list(task) must expose 'inbox' GTD status; got: {statuses:?}"
+    );
+    assert!(
+        statuses.contains(&"next"),
+        "list(task) must expose 'next' GTD status; got: {statuses:?}"
+    );
+    // Row-visibility "active" must NOT appear as a status unless one of the tasks
+    // actually has GTD status="active" (none assigned above).
+    assert!(
+        !statuses.iter().all(|&s| s == "active"),
+        "list(task) must NOT return row-visibility 'active' as the only status; got: {statuses:?}"
+    );
+
+    // Every item must also carry `lifecycle` = "active" (row-visibility for live rows).
+    for item in items {
+        assert_eq!(
+            item["lifecycle"], "active",
+            "list(task) must include lifecycle field for row-visibility; got item: {item}"
+        );
+    }
+}
+
 /// F101: idempotent same-status transition does NOT write an audit record.
 ///
 /// Strategy: perform one real transition (inbox → next) to initialize the audit
