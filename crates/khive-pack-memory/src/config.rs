@@ -51,6 +51,11 @@ pub struct RecallConfig {
     pub fallback_during_migration: bool,
 }
 
+// Tuning artifact: tests/khive-contract/tune/ swept 116 configs but the synthetic corpus
+// produced an identical recall@10 = 0.9333 for every config — i.e. a flat landscape that
+// cannot empirically distinguish these parameters. Defaults below stay at the prior values
+// until a harder corpus (embed-enabled, synonym queries, partial matches) provides signal.
+// See tests/khive-contract/tune/REPORT.md for the analysis.
 impl Default for RecallConfig {
     fn default() -> Self {
         Self {

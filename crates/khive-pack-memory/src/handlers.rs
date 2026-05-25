@@ -813,6 +813,7 @@ impl MemoryPack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DecayModel;
 
     #[test]
     fn validate_memory_type_rejects_invalid() {
@@ -1046,9 +1047,14 @@ mod tests {
 
     #[test]
     fn compute_score_exponential_decay_at_decay_factor_half_life() {
-        let cfg = RecallConfig::default(); // temporal_half_life = 30 days, default decay_factor=0.01
-                                           // ADR-021 §5: importance_decayed = salience * exp(-decay_factor * age_days)
-                                           // At age = ln(2)/0.01 ≈ 69.3 days: importance_decayed ≈ 0.5
+        // Use explicit exponential decay config — not relying on default decay_model.
+        // ADR-021 §5: importance_decayed = salience * exp(-decay_factor * age_days)
+        // At age = ln(2)/0.01 ≈ 69.3 days: importance_decayed ≈ 0.5
+        let cfg = RecallConfig {
+            decay_model: DecayModel::Exponential,
+            temporal_half_life_days: 30.0,
+            ..RecallConfig::default()
+        };
         let age_days = std::f64::consts::LN_2 / 0.01;
         let (_, bd) = compute_score(&cfg, 0.5, 1.0, 0.01, age_days);
         assert!(
@@ -1063,7 +1069,11 @@ mod tests {
 
     #[test]
     fn compute_score_temporal_halves_at_temporal_half_life() {
-        let cfg = RecallConfig::default(); // temporal_half_life = 30 days
+        // Use explicit half_life=30 — not relying on default temporal_half_life_days.
+        let cfg = RecallConfig {
+            temporal_half_life_days: 30.0,
+            ..RecallConfig::default()
+        };
         let (_, bd) = compute_score(&cfg, 0.5, 1.0, 0.01, 30.0);
         // At age = temporal_half_life = 30 days: temporal = exp(-ln2/30 * 30) = 0.5
         assert!(

@@ -1,0 +1,2680 @@
+[
+  {
+    "config_index": 0,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28148540113761555
+  },
+  {
+    "config_index": 1,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2686937492399011
+  },
+  {
+    "config_index": 2,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.29486264975275844
+  },
+  {
+    "config_index": 3,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2862915989680914
+  },
+  {
+    "config_index": 4,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2918167483585421
+  },
+  {
+    "config_index": 5,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28529789960884955
+  },
+  {
+    "config_index": 6,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2831625501130475
+  },
+  {
+    "config_index": 7,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2803040999424411
+  },
+  {
+    "config_index": 8,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2848207499482669
+  },
+  {
+    "config_index": 9,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27973329997621477
+  },
+  {
+    "config_index": 10,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2801396494760411
+  },
+  {
+    "config_index": 11,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28181665038573556
+  },
+  {
+    "config_index": 12,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.29417920086416416
+  },
+  {
+    "config_index": 13,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2827333999448456
+  },
+  {
+    "config_index": 14,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28087909959140234
+  },
+  {
+    "config_index": 15,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.3020208008820191
+  },
+  {
+    "config_index": 16,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28055835064151324
+  },
+  {
+    "config_index": 17,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28160629990452435
+  },
+  {
+    "config_index": 18,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.29320840003492776
+  },
+  {
+    "config_index": 19,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2866227991034975
+  },
+  {
+    "config_index": 20,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2897542504797457
+  },
+  {
+    "config_index": 21,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.29314370003703516
+  },
+  {
+    "config_index": 22,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2905041001213249
+  },
+  {
+    "config_index": 23,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2886353995563695
+  },
+  {
+    "config_index": 24,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28937284951098263
+  },
+  {
+    "config_index": 25,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2861790999304503
+  },
+  {
+    "config_index": 26,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.31045204887050204
+  },
+  {
+    "config_index": 27,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2888021495891735
+  },
+  {
+    "config_index": 28,
+    "config": {
+      "relevance_weight": 0.7,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2846291503374232
+  },
+  {
+    "config_index": 29,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27716039949154947
+  },
+  {
+    "config_index": 30,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2801395508868154
+  },
+  {
+    "config_index": 31,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27901260036742315
+  },
+  {
+    "config_index": 32,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28072700115444604
+  },
+  {
+    "config_index": 33,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28003539991914295
+  },
+  {
+    "config_index": 34,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2829062992532272
+  },
+  {
+    "config_index": 35,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2766604502539849
+  },
+  {
+    "config_index": 36,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2769689010165166
+  },
+  {
+    "config_index": 37,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27942089982389007
+  },
+  {
+    "config_index": 38,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27995829987048637
+  },
+  {
+    "config_index": 39,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.280987650694442
+  },
+  {
+    "config_index": 40,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2805270501994528
+  },
+  {
+    "config_index": 41,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2790415495837806
+  },
+  {
+    "config_index": 42,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2858790994650917
+  },
+  {
+    "config_index": 43,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27572910039452836
+  },
+  {
+    "config_index": 44,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28704375072265975
+  },
+  {
+    "config_index": 45,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.281006250588689
+  },
+  {
+    "config_index": 46,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2943519994005328
+  },
+  {
+    "config_index": 47,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28374790090310853
+  },
+  {
+    "config_index": 48,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2794124502543127
+  },
+  {
+    "config_index": 49,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28600204932445195
+  },
+  {
+    "config_index": 50,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2889624494855525
+  },
+  {
+    "config_index": 51,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2864793004846433
+  },
+  {
+    "config_index": 52,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27940414984186646
+  },
+  {
+    "config_index": 53,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2789604495774256
+  },
+  {
+    "config_index": 54,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2787499499390833
+  },
+  {
+    "config_index": 55,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2868397506972542
+  },
+  {
+    "config_index": 56,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.284945898965816
+  },
+  {
+    "config_index": 57,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.3,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2812874005030608
+  },
+  {
+    "config_index": 58,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28095219931856263
+  },
+  {
+    "config_index": 59,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2758167509455234
+  },
+  {
+    "config_index": 60,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2824979506840464
+  },
+  {
+    "config_index": 61,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.282977097958792
+  },
+  {
+    "config_index": 62,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2763854499789886
+  },
+  {
+    "config_index": 63,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.27764179903897457
+  },
+  {
+    "config_index": 64,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2787354511383455
+  },
+  {
+    "config_index": 65,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2802791514113778
+  },
+  {
+    "config_index": 66,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2792020015476737
+  },
+  {
+    "config_index": 67,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27800425050372723
+  },
+  {
+    "config_index": 68,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2789042016956955
+  },
+  {
+    "config_index": 69,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2812332495523151
+  },
+  {
+    "config_index": 70,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2767645495623583
+  },
+  {
+    "config_index": 71,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.27748339998652227
+  },
+  {
+    "config_index": 72,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2761915504379431
+  },
+  {
+    "config_index": 73,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2803582996421028
+  },
+  {
+    "config_index": 74,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27802289987448603
+  },
+  {
+    "config_index": 75,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2767853995464975
+  },
+  {
+    "config_index": 76,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28124175005359575
+  },
+  {
+    "config_index": 77,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2837229010765441
+  },
+  {
+    "config_index": 78,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2874540507036727
+  },
+  {
+    "config_index": 79,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2787061999697471
+  },
+  {
+    "config_index": 80,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2805125004670117
+  },
+  {
+    "config_index": 81,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2797540499159368
+  },
+  {
+    "config_index": 82,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2792020997731015
+  },
+  {
+    "config_index": 83,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2798353001708165
+  },
+  {
+    "config_index": 84,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2828772005159408
+  },
+  {
+    "config_index": 85,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.279381150539848
+  },
+  {
+    "config_index": 86,
+    "config": {
+      "relevance_weight": 0.6,
+      "importance_weight": 0.2,
+      "temporal_weight": 0.2,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28124165000917856
+  },
+  {
+    "config_index": 87,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27987510002276395
+  },
+  {
+    "config_index": 88,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2800395010126522
+  },
+  {
+    "config_index": 89,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2810250996844843
+  },
+  {
+    "config_index": 90,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28223335029906593
+  },
+  {
+    "config_index": 91,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28449174933484755
+  },
+  {
+    "config_index": 92,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28110419916629326
+  },
+  {
+    "config_index": 93,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 10,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.27862714960065205
+  },
+  {
+    "config_index": 94,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2819332996295998
+  },
+  {
+    "config_index": 95,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28068960054952186
+  },
+  {
+    "config_index": 96,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2806042510201223
+  },
+  {
+    "config_index": 97,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.27994805022899527
+  },
+  {
+    "config_index": 98,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2773583990347106
+  },
+  {
+    "config_index": 99,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28961035059182905
+  },
+  {
+    "config_index": 100,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28000009879178833
+  },
+  {
+    "config_index": 101,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28202285029692575
+  },
+  {
+    "config_index": 102,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28163114984636195
+  },
+  {
+    "config_index": 103,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28272290037421044
+  },
+  {
+    "config_index": 104,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.29119380087649915
+  },
+  {
+    "config_index": 105,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28479799948399886
+  },
+  {
+    "config_index": 106,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28276649973122403
+  },
+  {
+    "config_index": 107,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 40,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28361035001580603
+  },
+  {
+    "config_index": 108,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 20
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28614999901037663
+  },
+  {
+    "config_index": 109,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 60
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2842709007381927
+  },
+  {
+    "config_index": 110,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "rrf": {
+          "k": 100
+        }
+      },
+      "decay_model": "exponential",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.28580209873325657
+  },
+  {
+    "config_index": 111,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2826500996889081
+  },
+  {
+    "config_index": 112,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.75,
+            0.25
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2826354011631338
+  },
+  {
+    "config_index": 113,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.5,
+            0.5
+          ]
+        }
+      },
+      "decay_model": "hyperbolic",
+      "temporal_half_life_days": 60.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.2808332999848062
+  },
+  {
+    "config_index": 114,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.25,
+            0.75
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 14.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.95,
+    "mean_latency_ms": 0.28887504995509516
+  },
+  {
+    "config_index": 115,
+    "config": {
+      "relevance_weight": 0.8,
+      "importance_weight": 0.1,
+      "temporal_weight": 0.1,
+      "candidate_multiplier": 20,
+      "fuse_strategy": {
+        "weighted": {
+          "weights": [
+            0.0,
+            1.0
+          ]
+        }
+      },
+      "decay_model": "none",
+      "temporal_half_life_days": 30.0,
+      "min_score": 0.0,
+      "min_salience": 0.0,
+      "candidate_limit": 100
+    },
+    "recall_at_10": 0.9333333333333333,
+    "mrr": 0.925,
+    "mean_latency_ms": 0.2837999494659016
+  }
+]
