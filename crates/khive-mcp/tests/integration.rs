@@ -9,7 +9,8 @@ use khive_runtime::{
     VerbRegistry, VerbRegistryBuilder,
 };
 use khive_types::{
-    Details, ErrorCode as KhiveErrorCode, ErrorDomain, HandlerDef, KhiveError, Pack, Visibility,
+    Details, ErrorCode as KhiveErrorCode, ErrorDomain, HandlerDef, KhiveError, Pack, VerbCategory,
+    Visibility,
 };
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult, ClientInfo, ErrorCode},
@@ -919,6 +920,7 @@ impl khive_types::Pack for ErrorInjectPack {
         name: "always_fail",
         description: "always returns a KhiveError::unavailable with code + details",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     }];
 }
 

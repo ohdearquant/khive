@@ -30,6 +30,7 @@ pub mod portability;
 pub mod registry;
 pub mod retrieval;
 pub mod runtime;
+pub mod validation;
 
 pub use curation::{
     ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
@@ -50,10 +51,14 @@ pub use objectives::{
 };
 pub use operations::{LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
-    DispatchHook, KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
-    VerbRegistryBuilder,
+    DispatchHook, KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, SchemaPlan,
+    VerbRegistry, VerbRegistryBuilder,
 };
 pub use portability::{ImportSummary, KgArchive};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{parse_pack_list, KhiveRuntime, NamespaceToken, RuntimeConfig};
+pub use validation::{
+    GraphPatch, GraphSnapshot, RuleFn, RuleId, Severity, ValidationContext, ValidationReport,
+    ValidationRule, Violation,
+};

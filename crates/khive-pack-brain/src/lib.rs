@@ -17,7 +17,7 @@ use khive_runtime::{
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
-use khive_types::{HandlerDef, Pack, Visibility};
+use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
 
 use crate::fold::BalancedRecallFold;
 use crate::state::{BrainState, ProfileBinding, ProfileLifecycle, ProfileRecord};
@@ -30,80 +30,96 @@ const ENTITY_CACHE_CAPACITY: usize = 10_000;
 ///
 /// Visibility::Verb  = exposed on the MCP `request` tool.
 /// Visibility::Subhandler = internal / operator-only.
+///
+/// ADR-025: illocutionary classification applied.
 static BRAIN_HANDLERS: &[HandlerDef] = &[
     // ── Assertive (read) verbs ────────────────────────────────────────────
     HandlerDef {
         name: "brain.state",
         description: "Return current BrainState snapshot for inspection",
         visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
     HandlerDef {
         name: "brain.config",
         description: "Return projected config for a named pack parameter",
         visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
     HandlerDef {
         name: "brain.events",
         description: "List recent brain-relevant events for debugging",
         visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
     HandlerDef {
         name: "brain.profiles",
         description: "List profiles, optionally filtered by lifecycle",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     HandlerDef {
         name: "brain.profile",
         description: "Profile metadata, latest snapshot, current state summary",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     HandlerDef {
         name: "brain.resolve",
         description: "Show which profile would serve a caller context",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // ── Commissive (write state) verbs ────────────────────────────────────
     HandlerDef {
         name: "brain.activate",
         description: "Move a profile to Active (start live update loop)",
         visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     HandlerDef {
         name: "brain.deactivate",
         description: "Move a profile to Inactive (stop live updates, retain state)",
         visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     HandlerDef {
         name: "brain.archive",
         description: "Move a profile to Archived (read-only, audit-retained)",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     HandlerDef {
         name: "brain.reset",
         description: "Reset posteriors to priors (preserves event history)",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     HandlerDef {
         name: "brain.feedback",
         description: "Emit a FeedbackExplicit event into the shared log",
         visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     // ── Declaration verbs ─────────────────────────────────────────────────
     HandlerDef {
         name: "brain.bind",
         description: "Write a row in the profile resolution table",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     HandlerDef {
         name: "brain.unbind",
         description: "Remove rows from the profile resolution table",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // ── Legacy / internal ─────────────────────────────────────────────────
     HandlerDef {
         name: "brain.emit",
         description: "Manually emit a feedback event (deprecated; use brain.feedback)",
         visibility: Visibility::Subhandler,
+        category: VerbCategory::Commissive,
     },
 ];
 

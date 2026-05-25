@@ -24,7 +24,9 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack, Visibility};
+use khive_types::{
+    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack, VerbCategory, Visibility,
+};
 
 use crate::hook::TaskHook;
 
@@ -51,9 +53,9 @@ static GTD_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
     target: EndpointKind::NoteOfKind("task"),
 }];
 
-// ADR-060: Illocutionary classification (Searle 1976)
-//   Directive — attempts to get hearer to do something
-//   Assertive — retrieves/presents state of affairs
+// ADR-025: Illocutionary classification (Searle 1976)
+//   Directive  — attempts to get hearer to do something
+//   Assertive  — retrieves/presents state of affairs
 //   Declaration — changes institutional status by fiat
 static GTD_HANDLERS: [HandlerDef; 5] = [
     // Directive: directs an actor to perform work
@@ -61,30 +63,35 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
         name: "assign",
         description: "Create a GTD task (note with kind=task)",
         visibility: Visibility::Verb,
+        category: VerbCategory::Directive,
     },
     // Assertive: retrieves actionable tasks
     HandlerDef {
         name: "next",
         description: "List actionable tasks (status=next or active) by priority",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Declaration: declares a task done
     HandlerDef {
         name: "complete",
         description: "Mark a task done with an optional result note",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
     // Assertive: retrieves filtered task listing
     HandlerDef {
         name: "tasks",
         description: "List tasks filtered by status, assignee, priority",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     // Declaration: changes task lifecycle status
     HandlerDef {
         name: "transition",
         description: "Explicit GTD status transition with lifecycle validation",
         visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
     },
 ];
 

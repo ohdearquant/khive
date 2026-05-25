@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, Pack, Visibility};
+use khive_types::{HandlerDef, Pack, VerbCategory, Visibility};
 
 use crate::config::RecallConfig;
 
@@ -36,41 +36,47 @@ impl Pack for MemoryPack {
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
-// ADR-060: Illocutionary classification (Searle 1976)
+// ADR-025: Illocutionary classification (Searle 1976)
 //   Commissive — commits caller to a persistent change
-//   Assertive — retrieves/presents state of affairs
+//   Assertive  — retrieves/presents state of affairs
 static MEMORY_HANDLERS: [HandlerDef; 6] = [
     // Commissive: commits a memory to the namespace
     HandlerDef {
         name: "remember",
         description: "Create a memory note with salience and decay",
         visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
     },
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
         name: "recall",
         description: "Recall memory notes with decay-aware hybrid ranking",
         visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
     },
     HandlerDef {
         name: "recall.embed",
         description: "Return the embedding vector used by memory recall",
         visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
     HandlerDef {
         name: "recall.candidates",
         description: "Return raw memory recall candidates by retrieval source",
         visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
     HandlerDef {
         name: "recall.fuse",
         description: "Return fused memory recall candidates before final scoring",
         visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
     HandlerDef {
         name: "recall.score",
         description: "Score a memory recall candidate and return score breakdown",
         visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
     },
 ];
 

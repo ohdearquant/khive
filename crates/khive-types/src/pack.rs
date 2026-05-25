@@ -23,15 +23,45 @@ pub enum Visibility {
     Subhandler,
 }
 
-/// Handler metadata for discovery and documentation (ADR-023).
+/// Illocutionary force classification for a verb handler (ADR-025).
+///
+/// Follows Searle's five speech-act categories (1976). Every `Visibility::Verb`
+/// handler in the MCP surface MUST carry a category. `Subhandler` entries may
+/// use the category of their parent verb or `Assertive` as a sensible default.
+///
+/// The category is a documentation / introspection tag. It is NOT used for
+/// permission checking, transport routing, or return-shape selection (ADR-025 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerbCategory {
+    /// Speaker represents a state of affairs — retrieves and presents facts.
+    /// Examples: `get`, `list`, `search`, `recall`.
+    Assertive,
+    /// Speaker attempts to get the hearer to do something.
+    /// Examples: `assign`, `transition`.
+    Directive,
+    /// Speaker commits to a persistent change.
+    /// Examples: `create`, `remember`, `link`, `send`.
+    Commissive,
+    /// Speaker changes institutional status by fiat.
+    /// Examples: `update`, `delete`, `merge`, `complete`.
+    Declaration,
+    // `Expressive` is intentionally absent — no verb currently uses it (ADR-025 §Why expressive stays empty).
+}
+
+/// Handler metadata for discovery and documentation (ADR-023, ADR-025).
 ///
 /// Replaces the previous `VerbDef`. Every entry carries a `visibility` tag
-/// so the registry can separate the MCP-exposed surface from internal handlers.
+/// so the registry can separate the MCP-exposed surface from internal handlers,
+/// and a `category` that classifies the illocutionary force of the verb
+/// per the speech-act taxonomy in ADR-025.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandlerDef {
     pub name: &'static str,
     pub description: &'static str,
     pub visibility: Visibility,
+    /// Illocutionary force classification (ADR-025). Use `Assertive` for
+    /// `Subhandler` entries that have no external callers.
+    pub category: VerbCategory,
 }
 
 /// Backward-compatible type alias.  Existing code that names `VerbDef` still
@@ -117,6 +147,20 @@ pub trait Pack {
     /// loaded pack set before any pack is registered. Defaults to empty
     /// so existing packs compile without changes.
     const REQUIRES: &'static [&'static str] = &[];
+
+    /// Validation rule IDs contributed by this pack (ADR-034).
+    ///
+    /// Rule IDs are namespaced by pack name: `<pack-name>/<rule-id>`.
+    /// The runtime merges rule IDs from all packs; the actual rule
+    /// implementations live in `khive-runtime::validation::ValidationRule`
+    /// (not in `khive-types`, which stays `no_std`). This const serves as
+    /// the declarative catalog of rule identifiers so the validation
+    /// infrastructure can enumerate what rules a pack claims without
+    /// loading the runtime.
+    ///
+    /// Defaults to empty — packs with no domain-specific validation rules
+    /// can leave this unset.
+    const VALIDATION_RULES: &'static [&'static str] = &[];
 }
 
 #[cfg(test)]
@@ -133,6 +177,7 @@ mod tests {
             name: "do_thing",
             description: "does a thing",
             visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
         }];
     }
 
@@ -144,5 +189,21 @@ mod tests {
         assert_eq!(TestPack::HANDLERS.len(), 1);
         assert_eq!(TestPack::HANDLERS[0].name, "do_thing");
         assert_eq!(TestPack::HANDLERS[0].visibility, Visibility::Verb);
+        assert_eq!(TestPack::HANDLERS[0].category, VerbCategory::Commissive);
+    }
+
+    #[test]
+    fn verb_category_variants_exist() {
+        // Just ensuring the enum variants are accessible — no runtime assertion
+        // needed beyond confirming they exist at compile time.
+        let _ = VerbCategory::Assertive;
+        let _ = VerbCategory::Directive;
+        let _ = VerbCategory::Commissive;
+        let _ = VerbCategory::Declaration;
+    }
+
+    #[test]
+    fn pack_validation_rules_default_empty() {
+        assert!(TestPack::VALIDATION_RULES.is_empty());
     }
 }

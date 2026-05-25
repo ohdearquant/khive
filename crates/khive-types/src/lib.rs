@@ -43,7 +43,7 @@ pub use namespace::Namespace;
 pub use note::{Note, NoteStatus};
 #[allow(deprecated)]
 pub use pack::VerbDef;
-pub use pack::{EdgeEndpointRule, EndpointKind, HandlerDef, Pack, Visibility};
+pub use pack::{EdgeEndpointRule, EndpointKind, HandlerDef, Pack, VerbCategory, Visibility};
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;
