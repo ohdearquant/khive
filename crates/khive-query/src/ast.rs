@@ -2,12 +2,77 @@
 
 use std::collections::HashMap;
 
+/// A SQL parameter value local to the query layer.
+///
+/// Deliberately mirrors the subset of `khive_storage::types::SqlValue` that the
+/// query compiler needs to emit.  The runtime converts these to the storage-layer
+/// `SqlValue` at the query–storage boundary (ADR-008 §"Query crate compiles
+/// against khive-types only").
+#[derive(Clone, Debug)]
+pub enum QueryValue {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
 #[derive(Debug, Clone)]
 pub struct GqlQuery {
     pub pattern: MatchPattern,
-    pub where_clause: Vec<Condition>,
+    pub where_clause: WhereExpr,
     pub return_items: Vec<ReturnItem>,
     pub limit: Option<usize>,
+}
+
+/// A WHERE expression tree supporting AND, OR, and leaf conditions (ADR-008
+/// §"GQL WHERE expression").
+#[derive(Debug, Clone)]
+pub enum WhereExpr {
+    /// AND of two sub-expressions.
+    And(Box<WhereExpr>, Box<WhereExpr>),
+    /// OR of two sub-expressions.
+    Or(Box<WhereExpr>, Box<WhereExpr>),
+    /// A single scalar condition.
+    Condition(Condition),
+    /// Always-true — used when there is no WHERE clause.
+    True,
+}
+
+impl WhereExpr {
+    /// Iterate all leaf conditions in the expression tree (depth-first).
+    pub fn conditions(&self) -> impl Iterator<Item = &Condition> {
+        let mut stack = vec![self];
+        let mut out: Vec<&Condition> = Vec::new();
+        while let Some(expr) = stack.pop() {
+            match expr {
+                WhereExpr::Condition(c) => out.push(c),
+                WhereExpr::And(l, r) | WhereExpr::Or(l, r) => {
+                    stack.push(r);
+                    stack.push(l);
+                }
+                WhereExpr::True => {}
+            }
+        }
+        out.into_iter()
+    }
+
+    /// Mutable walk — applies `f` to every leaf condition.
+    pub fn for_each_condition_mut(&mut self, f: &mut impl FnMut(&mut Condition)) {
+        match self {
+            WhereExpr::Condition(c) => f(c),
+            WhereExpr::And(l, r) | WhereExpr::Or(l, r) => {
+                l.for_each_condition_mut(f);
+                r.for_each_condition_mut(f);
+            }
+            WhereExpr::True => {}
+        }
+    }
+
+    /// Return `true` when the expression has no conditions (is always-true).
+    pub fn is_true(&self) -> bool {
+        matches!(self, WhereExpr::True)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

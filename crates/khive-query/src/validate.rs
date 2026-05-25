@@ -14,9 +14,9 @@
 //!    `namespace` in node property maps or `WHERE` conditions — the only valid
 //!    source of namespace filtering is `CompileOptions::scopes`. This matches
 //!    ADR-008 §Validation: "never trust query strings to set namespaces."
-//! 4. **Traversal depth** is capped at [`MAX_DEPTH`] (10 hops). Requests above
-//!    the cap are clamped, not rejected — this matches the cap the compiler
-//!    applies when generating recursive CTEs.
+//! 4. **Traversal depth** is limited to [`MAX_DEPTH`] (10 hops). Requests that
+//!    exceed the cap are rejected with [`QueryError::InvalidInput`] at validation
+//!    time (ADR-008 §"Depth limits").
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -41,7 +41,7 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
 ///
 /// Currently warns when `max_hops` is clamped to [`MAX_DEPTH`].
 pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, QueryError> {
-    let mut warnings = Vec::new();
+    let warnings: Vec<String> = Vec::new();
 
     // Pattern variables are bindings — the same variable name appearing twice
     // would mean "same node/edge" and require alias-equality predicates in
@@ -84,6 +84,13 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
             }
             PatternElement::Edge(edge) => {
                 for relation in edge.relations.iter_mut() {
+                    // Synthetic ADR-041 relations (observed_as_*) do not exist
+                    // in the closed EdgeRelation enum — skip taxonomy validation
+                    // for them and leave the string unchanged.  The SQL compiler
+                    // handles them via the event_observations join path.
+                    if relation.starts_with("observed_as_") {
+                        continue;
+                    }
                     let parsed = EdgeRelation::from_str(relation)
                         .map_err(|err| QueryError::Validation(err.to_string()))?;
                     *relation = parsed.as_str().to_string();
@@ -112,13 +119,12 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
                         edge.min_hops, MAX_DEPTH
                     )));
                 }
-                // Clamp max_hops to the depth cap; report the narrowing to callers.
+                // Reject max_hops above the depth cap (ADR-008 §"Depth limits").
                 if edge.max_hops > MAX_DEPTH {
-                    let requested = edge.max_hops;
-                    edge.max_hops = MAX_DEPTH;
-                    warnings.push(format!(
-                        "Query depth capped at {MAX_DEPTH} hops (requested {requested})"
-                    ));
+                    return Err(QueryError::InvalidInput(format!(
+                        "max_hops {} exceeds the depth cap of {}; reduce the range or use a smaller bound",
+                        edge.max_hops, MAX_DEPTH
+                    )));
                 }
             }
         }
@@ -144,13 +150,23 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
         }
     }
 
-    for cond in query.where_clause.iter_mut() {
+    // Walk all leaf conditions in the WHERE expression tree.
+    let mut validate_err: Option<QueryError> = None;
+    query.where_clause.for_each_condition_mut(&mut |cond| {
+        if validate_err.is_some() {
+            return;
+        }
         let is_edge = var_kinds
             .get(cond.variable.as_str())
             .copied()
             .unwrap_or(VarKind::Node)
             == VarKind::Edge;
-        validate_condition(cond, is_edge)?;
+        if let Err(e) = validate_condition(cond, is_edge) {
+            validate_err = Some(e);
+        }
+    });
+    if let Some(e) = validate_err {
+        return Err(e);
     }
 
     Ok(warnings)
@@ -226,24 +242,29 @@ mod tests {
     }
 
     #[test]
-    fn clamps_depth_above_max() {
+    fn rejects_depth_above_max() {
+        // ADR-008 §"Depth limits": exceeding MAX_DEPTH is an InvalidInput error,
+        // not a silent clamp.
         let mut q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
-        validate(&mut q).unwrap();
-        let edge = q.pattern.edges().next().unwrap();
-        assert_eq!(edge.max_hops, MAX_DEPTH);
-        assert!(edge.min_hops <= edge.max_hops);
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("50"),
+            "error should mention requested depth: {err}"
+        );
     }
 
     #[test]
-    fn warns_when_clamping_depth_above_max() {
+    fn rejects_depth_above_max_warnings_path() {
+        // validate_with_warnings must also reject (not clamp + warn).
         let mut q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
-        let warnings = validate_with_warnings(&mut q).unwrap();
-        assert_eq!(q.pattern.edges().next().unwrap().max_hops, MAX_DEPTH);
+        let err = validate_with_warnings(&mut q).unwrap_err();
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("Query depth capped at 10")),
-            "warnings: {warnings:?}"
+            matches!(err, QueryError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
         );
     }
 
@@ -284,17 +305,20 @@ mod tests {
         assert!(err.to_string().contains("related_to"), "msg: {err}");
     }
 
+    fn first_condition_string_value(q: &GqlQuery) -> String {
+        match q.where_clause.conditions().next().unwrap().value {
+            ConditionValue::String(ref s) => s.clone(),
+            _ => panic!("expected string condition value"),
+        }
+    }
+
     #[test]
     fn unknown_kind_in_where_passes_through() {
         // Entity kinds are pack-agnostic strings — any kind string is accepted.
         let mut q =
             gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'gizmo' RETURN a").unwrap();
         validate(&mut q).unwrap();
-        let val = match &q.where_clause[0].value {
-            ConditionValue::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
-        assert_eq!(val, "gizmo");
+        assert_eq!(first_condition_string_value(&q), "gizmo");
     }
 
     #[test]
@@ -303,11 +327,7 @@ mod tests {
         let mut q =
             gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'paper' RETURN a").unwrap();
         validate(&mut q).unwrap();
-        let val = match &q.where_clause[0].value {
-            ConditionValue::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
-        assert_eq!(val, "paper");
+        assert_eq!(first_condition_string_value(&q), "paper");
     }
 
     #[test]
@@ -316,11 +336,7 @@ mod tests {
             gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'Introduced_By' RETURN a")
                 .unwrap();
         validate(&mut q).unwrap();
-        let val = match &q.where_clause[0].value {
-            ConditionValue::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
-        assert_eq!(val, "introduced_by");
+        assert_eq!(first_condition_string_value(&q), "introduced_by");
     }
 
     #[test]
@@ -423,13 +439,14 @@ mod tests {
     }
 
     #[test]
-    fn clamps_max_but_keeps_satisfiable_min() {
-        // *2..50 — min 2 is satisfiable, max gets clamped to MAX_DEPTH.
+    fn rejects_max_above_depth_cap_with_satisfiable_min() {
+        // *2..50 — min 2 is satisfiable but max 50 exceeds MAX_DEPTH; must error.
         let mut q = gql::parse("MATCH (a)-[:extends*2..50]->(b) RETURN b").unwrap();
-        validate(&mut q).unwrap();
-        let edge = q.pattern.edges().next().unwrap();
-        assert_eq!(edge.min_hops, 2);
-        assert_eq!(edge.max_hops, MAX_DEPTH);
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
     }
 
     #[test]
@@ -439,11 +456,7 @@ mod tests {
         let mut q =
             gql::parse("MATCH (a)-[:extends]->(b) WHERE a.relation = 'external' RETURN a").unwrap();
         validate(&mut q).unwrap();
-        let val = match &q.where_clause[0].value {
-            ConditionValue::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
-        assert_eq!(val, "external");
+        assert_eq!(first_condition_string_value(&q), "external");
     }
 
     #[test]

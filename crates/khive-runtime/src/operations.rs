@@ -1402,6 +1402,9 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         query: &str,
     ) -> RuntimeResult<QueryResult> {
+        use khive_query::QueryValue;
+        use khive_storage::types::SqlValue;
+
         let ns = token.namespace().as_str();
         let ast = khive_query::parse_auto(query)?;
         let opts = khive_query::CompileOptions {
@@ -1410,10 +1413,25 @@ impl KhiveRuntime {
         };
         let compiled = khive_query::compile(&ast, &opts)?;
         let warnings = compiled.warnings;
+
+        // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
+        // at the query–storage boundary (ADR-008 §"Query crate compiles against khive-types only").
+        let params: Vec<SqlValue> = compiled
+            .params
+            .into_iter()
+            .map(|qv| match qv {
+                QueryValue::Null => SqlValue::Null,
+                QueryValue::Integer(n) => SqlValue::Integer(n),
+                QueryValue::Float(f) => SqlValue::Float(f),
+                QueryValue::Text(s) => SqlValue::Text(s),
+                QueryValue::Blob(b) => SqlValue::Blob(b),
+            })
+            .collect();
+
         let mut reader = self.sql().reader().await?;
         let stmt = SqlStatement {
             sql: compiled.sql,
-            params: compiled.params,
+            params,
             label: None,
         };
         let rows = reader.query_all(stmt).await?;
