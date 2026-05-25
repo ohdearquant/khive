@@ -7,7 +7,7 @@
     "type": "git",
     "url": "https://github.com/ohdearquant/khive"
   },
-  "homepage": "https://khive.ai",
+  "homepage": "https://github.com/ohdearquant",
   "keywords": ["knowledge-graph", "research", "git", "ndjson", "cli"],
   "bin": {
     "khive": "bin/khive",
