@@ -148,6 +148,8 @@ impl KhiveMcpServer {
     #[allow(clippy::result_large_err)]
     pub fn new(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
         let packs: Vec<String> = runtime.config().packs.clone();
+        // ADR-014 (c14 hardening): fail-fast on bad packs so callers can decide
+        // recovery. The c12 schema_plan application happens inside with_packs.
         Self::with_packs(runtime, &packs)
     }
 
@@ -181,6 +183,10 @@ impl KhiveMcpServer {
         // ADR-031: aggregate pack-declared edge endpoint rules into the runtime
         // so `validate_edge_relation_endpoints` can consult them.
         runtime.install_edge_rules(registry.all_edge_rules());
+        // ADR-017 §c12: apply pack-auxiliary schema plans at startup so pack
+        // tables are present before any handler runs. Errors are logged but
+        // not propagated so a single pack's schema failure cannot abort startup.
+        registry.apply_schema_plans(runtime.backend());
         Ok(Self { registry })
     }
 
