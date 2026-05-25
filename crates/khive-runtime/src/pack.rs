@@ -129,16 +129,22 @@ pub trait PackRuntime: Send + Sync {
         None
     }
 
-    /// Pack-auxiliary schema applied at boot (ADR-017 §Storage profile and
-    /// pack-auxiliary schema).
+    /// Pack-auxiliary schema (ADR-017 §Storage profile and pack-auxiliary schema).
     ///
     /// Returns DDL statements for pack-owned tables that are NOT part of the
-    /// core substrate schema. Applied via `CREATE TABLE IF NOT EXISTS` so the
-    /// call is idempotent. Core substrate tables evolve through versioned
-    /// migrations (ADR-015); pack schema is strictly pack-auxiliary.
+    /// core substrate schema. Statements are idempotent (`CREATE TABLE IF NOT
+    /// EXISTS`) so callers can apply them safely on every registration. Core
+    /// substrate tables evolve through versioned migrations (ADR-015); pack
+    /// schema is strictly pack-auxiliary.
     ///
     /// Defaults to an empty plan — packs that store everything in the core
     /// substrate tables (entities, notes, edges, events) return this default.
+    ///
+    /// **Current state:** plans are aggregated via
+    /// [`VerbRegistry::all_schema_plans`] but the runtime does not yet apply
+    /// them at registration. Packs that need their schema present (e.g. GTD)
+    /// self-bootstrap by running the DDL lazily on first call. Centralized
+    /// startup application is deferred to c12 (PackVerbRegistry).
     fn schema_plan(&self) -> SchemaPlan {
         SchemaPlan::empty()
     }
