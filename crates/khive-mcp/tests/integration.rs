@@ -305,10 +305,16 @@ async fn transition_lifecycle_rejection_is_per_op_not_protocol_error() -> anyhow
     let body: Value = serde_json::from_str(&first_text(&result))?;
     let first = &body["results"][0];
     assert_eq!(first["ok"], false);
-    assert!(first["error"]
-        .as_str()
-        .unwrap()
-        .contains("cannot transition"));
+    // Per P15 (PR #418), terminal states (done/cancelled) reject ALL outgoing
+    // transitions with "task X is in terminal state Y; no further transitions allowed".
+    assert!(
+        first["error"]
+            .as_str()
+            .unwrap()
+            .contains("terminal state"),
+        "expected terminal-state rejection, got: {}",
+        first["error"]
+    );
     Ok(())
 }
 
