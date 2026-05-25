@@ -805,6 +805,7 @@ pub trait EmbedderProvider: Send + Sync {
 cached). Last-writer-wins on duplicate name registration (pack order is not guaranteed).
 
 **KhiveRuntime integration**:
+
 - `embedder_registry: Arc<RwLock<EmbedderRegistry>>` replaces `embedders: Arc<HashMap<...>>`.
 - `KhiveRuntime::register_embedder(provider)` — public, callable post-construction.
 - Existing `embedder(name)`, `resolve_embedding_model(name)`, `registered_embedding_model_names()`
@@ -829,11 +830,11 @@ need changes.
 
 ### Files
 
-| File | Change |
-|------|--------|
-| `crates/khive-runtime/src/embedder_registry.rs` | New — `EmbedderProvider`, `EmbedderRegistry`, `LatticeEmbedderProvider`, unit tests |
-| `crates/khive-runtime/src/runtime.rs` | Refactored — `embedder_registry` field, `register_embedder`, updated `embedder`/`resolve_embedding_model`/`registered_embedding_model_names` |
-| `crates/khive-runtime/src/pack.rs` | `PackRuntime::register_embedders` default no-op added |
-| `crates/khive-runtime/src/lib.rs` | `pub mod embedder_registry`; re-exports |
-| `crates/khive-runtime/tests/integration.rs` | 4 new integration tests in `embedder_registry_tests` module |
-  — Chinese-blindspot crisis; per-engine calibration history
+| File                                                       | Change                                                                                                                                       |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/khive-runtime/src/embedder_registry.rs`            | New — `EmbedderProvider`, `EmbedderRegistry`, `LatticeEmbedderProvider`, unit tests                                                          |
+| `crates/khive-runtime/src/runtime.rs`                      | Refactored — `embedder_registry` field, `register_embedder`, updated `embedder`/`resolve_embedding_model`/`registered_embedding_model_names` |
+| `crates/khive-runtime/src/pack.rs`                         | `PackRuntime::register_embedders` default no-op added                                                                                        |
+| `crates/khive-runtime/src/lib.rs`                          | `pub mod embedder_registry`; re-exports                                                                                                      |
+| `crates/khive-runtime/tests/integration.rs`                | 4 new integration tests in `embedder_registry_tests` module                                                                                  |
+| — Chinese-blindspot crisis; per-engine calibration history |                                                                                                                                              |
