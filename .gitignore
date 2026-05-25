@@ -80,3 +80,5 @@ docs/adr/_review/
 
 # Compiled CLI binaries (built by scripts/compile.sh, not committed)
 npm/bin/khive-*
+# Exception: npm/bin/khive-mcp is the Node shim for the MCP binary, not a compiled binary.
+!npm/bin/khive-mcp

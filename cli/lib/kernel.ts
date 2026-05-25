@@ -1,10 +1,10 @@
 /**
- * Resolve the path to the `kkernel` Rust binary (ADR-076, ADR-077).
+ * Resolve the path to the `kkernel` Rust binary (ADR-026).
  *
  * Strategy (in order):
  *   1. `KKERNEL_BINARY` env var — explicit override, used in dev and tests.
  *   2. `@khive/kernel-<platform>/bin/kkernel` under node_modules — production
- *      install via npm optional dependencies (ADR-077).
+ *      install via npm optional dependencies (ADR-026).
  *   3. `<repo>/crates/target/release/kkernel` — monorepo dev convenience.
  *   4. `<repo>/crates/target/debug/kkernel` — last-resort dev fallback.
  *
@@ -13,14 +13,74 @@
 
 import { dirname, fromFileUrl, join } from "@std/path";
 
+/**
+ * Detect whether the Linux runtime links against musl (Alpine etc.) or glibc.
+ * Returns "gnu" or "musl". Defaults to "gnu" if detection is inconclusive.
+ *
+ * Detection order (most-reliable first):
+ *   1. `ldd --version` — invokes the actual system linker (same as the Node
+ *      shim in npm/bin/khive). More reliable than /proc/self/maps which
+ *      reflects the Deno process's own loader, not the child binary's.
+ *   2. `/lib/ld-musl-*` glob — fast filesystem check, no subprocess.
+ *
+ * NOTE: npm/bin/khive and npm/bin/khive-mcp use the same ordered detection.
+ * Keep all three in sync.
+ */
+function detectLibc(): "gnu" | "musl" {
+  try {
+    const result = new Deno.Command("ldd", {
+      args: ["--version"],
+      stdin: "null",
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    const out = new TextDecoder()
+      .decode(result.stdout)
+      .toLowerCase()
+      .concat(new TextDecoder().decode(result.stderr).toLowerCase());
+    if (out.includes("musl")) return "musl";
+    return "gnu";
+  } catch {
+    // ldd not available — fall through
+  }
+  try {
+    for (const entry of Deno.readDirSync("/lib")) {
+      if (entry.name.startsWith("ld-musl-")) return "musl";
+    }
+  } catch {
+    // /lib not readable — fall through
+  }
+  return "gnu";
+}
+
+/**
+ * Resolve the platform suffix for the @khive/kernel-{platform} subpackage on
+ * Linux. Returns the suffix string, or throws with a clear "unsupported"
+ * message for musl arm64 (not in the v1 matrix).
+ */
+function linuxVariant(arch: "x86_64" | "aarch64"): string {
+  const libc = detectLibc();
+  if (arch === "aarch64") {
+    if (libc === "musl") {
+      throw new Error(
+        "khive does not support linux-arm64 with musl libc in v1.\n" +
+          "linux-arm64 with musl is not in the v1 release matrix.\n" +
+          "Supported: darwin-arm64, darwin-x64, linux-x64-gnu, linux-x64-musl, linux-arm64 (glibc), win32-x64.\n" +
+          "File an issue at https://github.com/ohdearquant/khive/issues if you need this target.",
+      );
+    }
+    return "linux-arm64";
+  }
+  return libc === "musl" ? "linux-x64-musl" : "linux-x64-gnu";
+}
+
 function platformKey(): string {
   const os = Deno.build.os;
   const arch = Deno.build.arch;
+  if (os === "linux") return linuxVariant(arch as "x86_64" | "aarch64");
   const map: Record<string, string> = {
     "darwin-aarch64": "darwin-arm64",
     "darwin-x86_64": "darwin-x64",
-    "linux-x86_64": "linux-x64-gnu",
-    "linux-aarch64": "linux-arm64",
     "windows-x86_64": "win32-x64",
   };
   const key = `${os}-${arch}`;
@@ -103,7 +163,7 @@ export function kkernelPath(repoRoot?: string): string {
       `  @khive/kernel-${platformKey()}/bin/${exe} (npm install)\n` +
       `  ${candidates.join("\n  ")}\n` +
       `If you're developing locally, run: (cd crates && cargo build --release -p kkernel)\n` +
-      `Supported platforms: darwin-arm64, darwin-x64, linux-x64-gnu, linux-arm64, win32-x64.`,
+      `Supported platforms: darwin-arm64, darwin-x64, linux-x64-gnu, linux-x64-musl, linux-arm64, win32-x64.`,
   );
 }
 

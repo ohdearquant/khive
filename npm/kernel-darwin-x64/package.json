@@ -1,0 +1,18 @@
+{
+  "name": "@khive/kernel-darwin-x64",
+  "version": "0.2.0",
+  "description": "khive Rust binaries for macOS Intel (x64)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ohdearquant/khive"
+  },
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
