@@ -24,7 +24,7 @@
 //! - `similarity_bounded`: 0 ≤ sim ≤ 1 for d ≥ 0
 
 use super::config::DistanceMetric;
-use khive_score::DeterministicScore;
+pub(crate) use khive_score::score_from_distance;
 
 /// Compute cosine distance from pre-computed dot product and norms.
 ///
@@ -123,26 +123,6 @@ pub(crate) fn compute_ordering_distance(
         DistanceMetric::L2 => lattice_embed::simd::squared_euclidean_distance(a, b),
         other => compute_distance(a, a_norm, b, b_norm, other),
     }
-}
-
-/// Convert distance to a `DeterministicScore` (higher score = more similar).
-///
-/// Replaces the former `distance_to_similarity -> f32` at the HNSW output boundary
-/// so that score arithmetic stays in fixed-point throughout the result pipeline.
-///
-/// **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.similarity_mono
-/// Similarity conversion is monotonically decreasing in distance:
-/// d1 < d2 implies sim(d1) > sim(d2)
-#[inline]
-pub(crate) fn score_from_distance(dist: f32, metric: DistanceMetric) -> DeterministicScore {
-    let d = if dist.is_nan() { 0.0 } else { dist } as f64;
-    let similarity = match metric {
-        DistanceMetric::Cosine => 1.0 - d,
-        DistanceMetric::Dot => -d,
-        DistanceMetric::L2 => 1.0 / (1.0 + d.max(0.0)),
-        _ => 1.0 - d,
-    };
-    DeterministicScore::from_f64(similarity)
 }
 
 /// Ordered wrapper for f32 to enable use in BinaryHeap.

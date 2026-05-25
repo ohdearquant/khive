@@ -12,7 +12,7 @@ description = "HNSW (Hierarchical Navigable Small World) vector index with INT8 
 
 [dependencies]
 khive-score = { version = "0.2.2", path = "../khive-score" }
-khive-types = { version = "0.2.2", path = "../khive-types" }
+khive-types = { version = "0.2.2", path = "../khive-types", features = ["serde"] }
 khive-fold = { version = "0.2.2", path = "../khive-fold", optional = true }
 lattice-embed = { workspace = true }
 serde = { workspace = true }

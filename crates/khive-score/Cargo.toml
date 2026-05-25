@@ -14,4 +14,5 @@ default = ["serde"]
 serde = ["dep:serde"]
 
 [dependencies]
+khive-types = { version = "0.2.2", path = "../khive-types" }
 serde = { workspace = true, optional = true, features = ["derive"] }
