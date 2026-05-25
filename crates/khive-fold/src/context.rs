@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
@@ -74,6 +75,7 @@ impl PartialEq<serde_json::Value> for SharedJson {
     }
 }
 
+#[cfg(feature = "serde")]
 impl Serialize for SharedJson {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -83,6 +85,7 @@ impl Serialize for SharedJson {
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for SharedJson {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -96,34 +99,33 @@ impl<'de> Deserialize<'de> for SharedJson {
 ///
 /// The context parameterizes fold behavior — same entries with
 /// different contexts may produce different derived states.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `as_of` defaults to the Unix epoch (`DateTime::<Utc>::default()`).
+/// Callers that need "now" must pass it explicitly via [`FoldContext::at`].
+/// This preserves the ADR-024 "no clock" invariant for the foundation layer.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FoldContext {
     /// Point in time to evaluate (for temporal queries)
     pub as_of: DateTime<Utc>,
 
     /// Correlation ID for tracing
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub correlation_id: Option<Uuid>,
 
     /// Additional context as shared JSON.
     ///
     /// Uses `SharedJson` (Arc-backed) so clones are cheap in hot paths.
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub extra: SharedJson,
 }
 
-impl Default for FoldContext {
-    fn default() -> Self {
-        Self {
-            as_of: Utc::now(),
-            correlation_id: None,
-            extra: SharedJson::default(),
-        }
-    }
-}
-
 impl FoldContext {
-    /// Create a new context with current time.
+    /// Create a new context with the Unix epoch as `as_of`.
+    ///
+    /// Per ADR-024 ("no clock"), the foundation layer does not call `Utc::now()`.
+    /// Pass an explicit timestamp via [`FoldContext::at`] when a real wall-clock
+    /// instant is needed.
     pub fn new() -> Self {
         Self::default()
     }
@@ -171,6 +173,13 @@ mod tests {
         assert_eq!(ctx.as_of, past);
     }
 
+    #[test]
+    fn test_context_new_is_epoch() {
+        let ctx = FoldContext::new();
+        assert_eq!(ctx.as_of, DateTime::<Utc>::default());
+    }
+
+    #[cfg(feature = "serde")]
     #[test]
     fn test_shared_json_round_trip() {
         let ctx = FoldContext::new().with_extra(serde_json::json!({"count": 3, "flag": true}));

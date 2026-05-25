@@ -389,9 +389,10 @@ mod tests {
     #[test]
     fn test_recency_objective() {
         let objective = RecencyObjective::hours(1.0);
-        let context = ObjectiveContext::new();
-
         let now = chrono::Utc::now();
+        // Pass current time explicitly — ObjectiveContext::new() gives epoch per ADR-024.
+        let context = ObjectiveContext::at(now);
+
         let old = now - chrono::Duration::hours(2);
 
         let new_item = TestItem {
@@ -415,9 +416,9 @@ mod tests {
     #[test]
     fn test_relevance_objective() {
         let objective = RelevanceObjective::balanced(3600.0);
-        let context = ObjectiveContext::new();
-
         let now = chrono::Utc::now();
+        // Pass current time explicitly — ObjectiveContext::new() gives epoch per ADR-024.
+        let context = ObjectiveContext::at(now);
 
         let item = TestItem {
             _value: 1,
@@ -433,10 +434,11 @@ mod tests {
     #[test]
     fn test_relevance_uses_context_relevance_score() {
         let objective = RelevanceObjective::balanced(3600.0);
-        let context =
-            ObjectiveContext::new().with_extra(serde_json::json!({"relevance_score": 0.42}));
-
         let now = chrono::Utc::now();
+        // Pass current time explicitly — ObjectiveContext::new() gives epoch per ADR-024.
+        let context =
+            ObjectiveContext::at(now).with_extra(serde_json::json!({"relevance_score": 0.42}));
+
         let item = TestItem {
             _value: 1,
             timestamp: now,

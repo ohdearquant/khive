@@ -10,13 +10,15 @@
 //! caller materializes an [`AnchorGraph`] as `Vec<AnchorRef>` and passes it
 //! by reference; implementations walk the graph without async IO.
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::FoldError;
 
 /// A reference to an anchor (a source of truth for a claim or artifact).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AnchorRef {
     /// Unique identifier for this anchor.
     pub id: Uuid,
@@ -29,7 +31,8 @@ pub struct AnchorRef {
 /// A graph of anchors, forming a causal chain.
 ///
 /// Callers persist this across sessions. Brain navigates but doesn't own.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AnchorGraph {
     /// All anchor nodes in this graph.
     pub nodes: Vec<AnchorRef>,

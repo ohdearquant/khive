@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -46,7 +47,8 @@ use crate::error::FoldError;
 ///
 /// Carries metadata (ID, timestamp, hash, fold version) alongside the
 /// serializable state so consumers can verify and load the correct snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Checkpoint<S> {
     /// Human-readable checkpoint identifier (e.g. `"hnsw_idx:ckpt-1"`).
     pub id: String,
@@ -100,7 +102,9 @@ impl<S: Serialize> Checkpoint<S> {
             entries_processed,
             context,
             fold_version,
-            created_at: Utc::now(),
+            // ADR-024: no clock calls in the foundation layer.
+            // Callers that need the current time should set created_at after construction.
+            created_at: DateTime::<Utc>::default(),
         })
     }
 
@@ -126,7 +130,8 @@ impl<S: Serialize> Checkpoint<S> {
             entries_processed,
             context,
             fold_version,
-            created_at: Utc::now(),
+            // ADR-024: no clock calls in the foundation layer.
+            created_at: DateTime::<Utc>::default(),
         }
     }
 }
@@ -315,16 +320,22 @@ mod tests {
 
     #[test]
     fn load_latest_returns_most_recent() {
-        let store: InMemoryCheckpointStore<String> = InMemoryCheckpointStore::new();
+        use chrono::Duration;
 
-        let ckpt1 = sample_checkpoint("idx:ckpt-1", 10);
+        let store: InMemoryCheckpointStore<String> = InMemoryCheckpointStore::new();
+        let base = DateTime::<Utc>::default();
+
+        // Build checkpoints with explicit, strictly ordered created_at values
+        // so load_latest is deterministic without relying on wall-clock time.
+        let mut ckpt1 = sample_checkpoint("idx:ckpt-1", 10);
+        ckpt1.created_at = base;
+        let mut ckpt2 = sample_checkpoint("idx:ckpt-2", 20);
+        ckpt2.created_at = base + Duration::milliseconds(5);
+        let mut ckpt3 = sample_checkpoint("idx:ckpt-3", 30);
+        ckpt3.created_at = base + Duration::milliseconds(10);
+
         store.save(ckpt1).unwrap();
-        // small sleep so created_at differs
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let ckpt2 = sample_checkpoint("idx:ckpt-2", 20);
         store.save(ckpt2).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let ckpt3 = sample_checkpoint("idx:ckpt-3", 30);
         store.save(ckpt3).unwrap();
 
         let latest = store.load_latest("idx").unwrap().unwrap();
@@ -359,6 +370,7 @@ mod tests {
 
     // --- Additional tests (F-NEW-8) ---
 
+    #[cfg(feature = "serde")]
     #[test]
     fn serde_roundtrip() {
         let ckpt = sample_checkpoint("serde:test", 42);

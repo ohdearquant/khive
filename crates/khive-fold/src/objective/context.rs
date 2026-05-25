@@ -1,10 +1,16 @@
 //! Objective evaluation context
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// Context for objective evaluation
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `as_of` defaults to the Unix epoch (`DateTime::<Utc>::default()`).
+/// Callers that need "now" must pass it explicitly via [`ObjectiveContext::at`].
+/// This preserves the ADR-024 "no clock" invariant for the foundation layer.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ObjectiveContext {
     /// Evaluation time
     pub as_of: DateTime<Utc>,
@@ -13,17 +19,18 @@ pub struct ObjectiveContext {
     /// Minimum score threshold
     pub min_score: Option<f64>,
     /// Extra context data
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub extra: serde_json::Value,
 }
 
 impl ObjectiveContext {
-    /// Create a new context with current time
+    /// Create a new context with the Unix epoch as `as_of`.
+    ///
+    /// Per ADR-024 ("no clock"), the foundation layer does not call `Utc::now()`.
+    /// Pass an explicit timestamp via [`ObjectiveContext::at`] when a real
+    /// wall-clock instant is needed.
     pub fn new() -> Self {
-        Self {
-            as_of: Utc::now(),
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Create context for a specific time

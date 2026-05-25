@@ -3,12 +3,14 @@
 //! Collapses a set of inputs into a compressed representation that fits a
 //! target budget (tokens, bytes, count). Pure in-memory, synchronous collapse.
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::error::FoldError;
 
 /// A single input item to a selector operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SelectorInput<T> {
     pub id: String,
     pub content: T,
@@ -17,7 +19,7 @@ pub struct SelectorInput<T> {
     /// Pre-computed relevance score.
     pub score: f32,
     /// Optional category for diversity and category-weight scoring.
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub category: Option<String>,
     /// Pre-computed information gain (KL divergence proxy) for this candidate.
     ///
@@ -25,12 +27,13 @@ pub struct SelectorInput<T> {
     /// access to the embedding space required to estimate KL divergence. When
     /// `None` (the default), the value is treated as 0.0. Only has an effect
     /// when `SelectorWeights.epistemic_weight > 0.0` (ADR-059).
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub information_gain: Option<f32>,
 }
 
 /// Result of a selector operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SelectorOutput<T> {
     /// Selected inputs in final order.
     pub selected: Vec<SelectorInput<T>>,
@@ -43,7 +46,8 @@ pub struct SelectorOutput<T> {
 /// Learned weights that a selector implementation may use.
 ///
 /// Callers persist this across sessions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SelectorWeights {
     /// Weight multiplier by input category.
     pub category_weights: std::collections::BTreeMap<String, f32>,
@@ -56,7 +60,7 @@ pub struct SelectorWeights {
     /// The effective selection score is `pragmatic_score + epistemic_weight * information_gain`.
     /// Default 0.0 (pure pragmatic). Higher values prefer candidates that reduce uncertainty.
     /// When 0.0, behavior is identical to ADR-058 (backwards-compatible, ADR-059).
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub epistemic_weight: f32,
 }
 

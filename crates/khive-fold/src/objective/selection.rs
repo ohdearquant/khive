@@ -1,9 +1,11 @@
 //! Selection result from objective functions
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// A selection result from an objective function
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[must_use = "selections should be used after creation"]
 pub struct Selection<T> {
     /// The selected item
@@ -14,7 +16,7 @@ pub struct Selection<T> {
     ///
     /// The effective ranking score is `score * precision`. When precision is 1.0 (the
     /// default), ranking is identical to raw score ordering (ADR-059).
-    #[serde(default = "default_precision")]
+    #[cfg_attr(feature = "serde", serde(default = "default_precision"))]
     pub precision: f64,
     /// Index in the original candidates
     pub index: usize,
@@ -23,7 +25,7 @@ pub struct Selection<T> {
     /// Number of candidates that passed threshold
     pub passed: usize,
     /// Reason for selection
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub reason: Option<String>,
 }
 
