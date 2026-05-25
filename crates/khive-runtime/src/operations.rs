@@ -1709,24 +1709,32 @@ impl KhiveRuntime {
     /// canonicalization, `dependency_kind` inference and metadata validation).
     /// Returns the constructed `Edge` on success; the caller is responsible for
     /// persisting it (e.g. via `upsert_edge` or `link_many`).
-    pub async fn build_edge(&self, spec: &LinkSpec) -> RuntimeResult<Edge> {
-        let ns_str = spec.namespace.as_deref().unwrap_or("local");
-        let ns = crate::Namespace::parse(ns_str)
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-        let token = self.authorize(ns);
-        self.validate_edge_relation_endpoints(
-            &token,
-            spec.source_id,
-            spec.target_id,
-            spec.relation,
-        )
-        .await?;
+    ///
+    /// The `token` must be a pre-authorized namespace token from the dispatch
+    /// layer. If `spec.namespace` is set it must match `token.namespace()`;
+    /// a mismatch returns `RuntimeError::InvalidInput` (ADR-007).
+    pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        let ns_str = match &spec.namespace {
+            Some(s) => {
+                let spec_ns = crate::Namespace::parse(s)
+                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
+                if &spec_ns != token.namespace() {
+                    return Err(RuntimeError::InvalidInput(
+                        "LinkSpec namespace does not match token namespace".into(),
+                    ));
+                }
+                s.as_str()
+            }
+            None => token.namespace().as_str(),
+        };
+        self.validate_edge_relation_endpoints(token, spec.source_id, spec.target_id, spec.relation)
+            .await?;
         let (source_id, target_id) =
             canonical_edge_endpoints(spec.relation, spec.source_id, spec.target_id);
         let metadata = if spec.relation == EdgeRelation::DependsOn {
             match (
-                self.resolve(&token, source_id).await?,
-                self.resolve(&token, target_id).await?,
+                self.resolve(token, source_id).await?,
+                self.resolve(token, target_id).await?,
             ) {
                 (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
                     merge_dependency_kind(&src_e.kind, &tgt_e.kind, spec.metadata.clone())
@@ -1760,21 +1768,21 @@ impl KhiveRuntime {
     /// (no writes occur). On success, all edges are persisted in a single
     /// atomic transaction via `upsert_edges`.
     ///
-    /// All specs must share the same namespace; the namespace of the first
-    /// spec is used as the graph store scope.
-    pub async fn link_many(&self, specs: Vec<LinkSpec>) -> RuntimeResult<Vec<Edge>> {
+    /// All specs must share the same namespace; the namespace is taken from
+    /// `token` (or validated against it if `spec.namespace` is set).
+    pub async fn link_many(
+        &self,
+        token: &NamespaceToken,
+        specs: Vec<LinkSpec>,
+    ) -> RuntimeResult<Vec<Edge>> {
         if specs.is_empty() {
             return Ok(vec![]);
         }
-        let ns_str = specs[0].namespace.as_deref().unwrap_or("local");
-        let ns = crate::Namespace::parse(ns_str)
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
-        let token = self.authorize(ns);
         let mut edges = Vec::with_capacity(specs.len());
         for spec in &specs {
-            edges.push(self.build_edge(spec).await?);
+            edges.push(self.build_edge(token, spec).await?);
         }
-        self.graph(&token)?.upsert_edges(edges.clone()).await?;
+        self.graph(token)?.upsert_edges(edges.clone()).await?;
         Ok(edges)
     }
 }
@@ -4749,7 +4757,7 @@ mod tests {
                 metadata: None,
             },
         ];
-        let edges = rt.link_many(specs).await.unwrap();
+        let edges = rt.link_many(&tok, specs).await.unwrap();
         for edge in &edges {
             assert!(
                 edge.target_backend.is_none(),

@@ -1520,7 +1520,7 @@ impl KgPack {
                         metadata,
                     });
                 }
-                let edges = self.runtime.link_many(specs).await?;
+                let edges = self.runtime.link_many(token, specs).await?;
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
                     "created": edges.len(),
