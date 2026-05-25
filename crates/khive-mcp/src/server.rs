@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
 use khive_runtime::{
-    present, KhiveRuntime, PackRegistry, PresentationMode, RuntimeError, VerbRegistry,
-    VerbRegistryBuilder,
+    present, KhiveRuntime, PackRegistry, PresentationMode, RuntimeError, VerbPresentationPolicy,
+    VerbRegistry, VerbRegistryBuilder,
 };
 
 use crate::tools::request::RequestParams;
@@ -282,6 +282,26 @@ impl KhiveMcpServer {
         }
 
         let args_value = Value::Object(resolved);
+
+        // ADR-017 §Visibility: Subhandler verbs are operator-only.
+        // Block them at the MCP wire boundary; internal callers that call
+        // VerbRegistry::dispatch directly are not affected.
+        // Exception: `help=true` is short-circuited in VerbRegistry::dispatch
+        // before reaching the pack — pass it through so introspection works.
+        let is_help = args_value
+            .get("help")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !is_help && self.registry.is_subhandler_verb(&tool) {
+            return Err((
+                tool.clone(),
+                json!(format!(
+                    "permission denied for verb {tool:?}: verb '{tool}' is an internal \
+                     subhandler and cannot be invoked via the MCP request surface"
+                )),
+            ));
+        }
+
         match self.registry.dispatch(&tool, args_value).await {
             Ok(result) => Ok(json!({ "ok": true, "tool": tool, "result": result })),
             Err(RuntimeError::Khive(k)) => {
@@ -342,6 +362,15 @@ impl KhiveMcpServer {
                     let op_mode = mode_for_op(i);
                     async move {
                         let tool = op.tool.clone();
+                        // ADR-045 §6: AlwaysVerbose verbs override the caller's mode.
+                        let effective_mode =
+                            if registry.presentation_policy_for(&tool)
+                                == VerbPresentationPolicy::AlwaysVerbose
+                            {
+                                PresentationMode::Verbose
+                            } else {
+                                op_mode
+                            };
                         // No $prev in parallel/single mode.
                         let mut resolved: serde_json::Map<String, Value> =
                             serde_json::Map::new();
@@ -362,9 +391,30 @@ impl KhiveMcpServer {
                             resolved.insert(name.clone(), value);
                         }
                         let args_value = Value::Object(resolved);
+
+                        // ADR-017 §Visibility: block Subhandler verbs at the
+                        // MCP wire boundary.  Exception: help=true is
+                        // short-circuited in VerbRegistry::dispatch before the
+                        // pack — pass it through so introspection works.
+                        let is_help = args_value
+                            .get("help")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if !is_help && registry.is_subhandler_verb(&tool) {
+                            return json!({
+                                "ok": false,
+                                "tool": tool,
+                                "error": format!(
+                                    "permission denied for verb {tool:?}: verb '{tool}' is an \
+                                     internal subhandler and cannot be invoked via the MCP \
+                                     request surface"
+                                )
+                            });
+                        }
+
                         match registry.dispatch(&tool, args_value).await {
                             Ok(result) => {
-                                let presented = present(result, op_mode, now_unix);
+                                let presented = present(result, effective_mode, now_unix);
                                 json!({ "ok": true, "tool": tool, "result": presented })
                             }
                             Err(RuntimeError::Khive(k)) => {
@@ -406,13 +456,22 @@ impl KhiveMcpServer {
                         continue;
                     }
                     let op_mode = mode_for_op(i);
+                    // ADR-045 §6: AlwaysVerbose verbs override the caller's mode.
+                    let effective_mode = if self.registry.presentation_policy_for(&op.tool)
+                        == VerbPresentationPolicy::AlwaysVerbose
+                    {
+                        PresentationMode::Verbose
+                    } else {
+                        op_mode
+                    };
                     match self.dispatch_op(op, prev_result.as_ref()).await {
                         Ok(result_obj) => {
                             // Extract canonical result for $prev (pre-presentation).
                             prev_result = result_obj.get("result").cloned();
-                            // Apply presentation to the result field only.
+                            // Apply presentation to the result field only,
+                            // using the effective mode (AlwaysVerbose override honored).
                             let presented_obj =
-                                apply_presentation_to_result(result_obj, op_mode, now_unix);
+                                apply_presentation_to_result(result_obj, effective_mode, now_unix);
                             results.push(presented_obj);
                         }
                         Err((tool, error_payload)) => {

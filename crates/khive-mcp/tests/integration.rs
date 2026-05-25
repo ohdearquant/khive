@@ -1682,3 +1682,251 @@ async fn remind_help_returns_required_content_and_at() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── Fix 1: run_migrations() at MCP startup ──────────────────────────────────
+
+/// V15 (`proposals_open`) and V16/V17 (vec `embedding_model` column) are
+/// applied by `KhiveRuntime::new` before any pack handler runs.  Without the
+/// fix, `propose(...)` fails with "no such table: proposals_open" on a fresh
+/// file-backed database.
+///
+/// This test creates a fresh tempfile-backed runtime (the path is not
+/// pre-migrated), creates a `propose` op, and asserts it succeeds — proving
+/// the migration ran at construction time.
+#[tokio::test]
+async fn startup_migrations_applied_to_fresh_file_backed_db() -> anyhow::Result<()> {
+    let db_file = tempfile::NamedTempFile::new()?;
+    let config = RuntimeConfig {
+        db_path: Some(db_file.path().to_path_buf()),
+        default_namespace: Namespace::parse("fix1test").unwrap(),
+        embedding_model: None,
+        packs: vec!["kg".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("fresh file-backed runtime");
+    let server = KhiveMcpServer::new(runtime).expect("server builds");
+
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+
+    // First create an entity to propose a change against.
+    let entity = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="MigrationTarget")"#,
+    )
+    .await?;
+    // Entity create in verbose mode returns `id` (full UUID), not `full_id`.
+    let eid = entity["id"].as_str().unwrap().to_string();
+
+    // `propose` writes to proposals_open (V15). Before the fix this would
+    // crash with "no such table: proposals_open" on a fresh DB.
+    //
+    // Use the JSON batch form to pass the nested changeset without DSL quoting
+    // issues — the JSON form is equivalent per ADR-020 §§.
+    let ops = serde_json::to_string(&json!([{
+        "tool": "propose",
+        "args": {
+            "title": "migration regression test",
+            "description": "fix1: run_migrations at startup",
+            "changeset": {
+                "kind": "add_entity",
+                "entity": format!(r#"{{"kind":"concept","name":"fix1-{eid}"}}"#)
+            }
+        }
+    }]))
+    .unwrap();
+    let result = call(
+        &client,
+        "request",
+        json!({
+            "ops": ops,
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"], true,
+        "propose must succeed on a freshly-migrated DB; got: {first}"
+    );
+    Ok(())
+}
+
+// ── Fix 2: Visibility::Subhandler gate ──────────────────────────────────────
+
+/// `brain.state`, `brain.config`, `brain.events`, and `brain.emit` are
+/// tagged `Visibility::Subhandler` in the brain pack.  The MCP request
+/// surface must reject them with a per-op `{ok: false}` rather than routing
+/// to the handler.  `help=true` introspection must still work (short-circuit
+/// before the gate).
+fn make_brain_server() -> KhiveMcpServer {
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("braintest").unwrap(),
+        embedding_model: None,
+        packs: vec!["kg".to_string(), "brain".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("kg+brain runtime");
+    KhiveMcpServer::new(runtime).expect("server builds with kg+brain")
+}
+
+#[tokio::test]
+async fn subhandler_verbs_are_blocked_at_mcp_boundary() -> anyhow::Result<()> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = make_brain_server();
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+
+    // All four Subhandler verbs must be rejected.
+    for verb in &["brain.state", "brain.config", "brain.events", "brain.emit"] {
+        let result = call(&client, "request", json!({"ops": format!("{verb}()")})).await?;
+        let body: Value = serde_json::from_str(&first_text(&result))?;
+        let first = &body["results"][0];
+        assert_eq!(
+            first["ok"], false,
+            "Subhandler verb {verb:?} must be blocked: got {first}"
+        );
+        let err = first["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("permission denied") || err.contains("subhandler"),
+            "error for {verb:?} must mention permission/subhandler: {err}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn subhandler_verb_help_introspection_still_works() -> anyhow::Result<()> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = make_brain_server();
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+
+    // `help=true` is short-circuited before the visibility gate — must succeed.
+    let result = ok_one(&client, r#"brain.state(help=true)"#).await?;
+    // Help response includes the verb name or param list.
+    let text = serde_json::to_string(&result).unwrap_or_default();
+    assert!(
+        text.contains("brain.state") || text.contains("params") || text.contains("help"),
+        "help response for Subhandler verb must return introspection data: {text}"
+    );
+    Ok(())
+}
+
+// ── Fix 3: AlwaysVerbose verbs return full UUIDs in default (Agent) mode ────
+
+/// `get` and `link` are declared AlwaysVerbose (ADR-045 §6).  Without the
+/// fix, they return 8-char short UUIDs in default (Agent) mode — callers
+/// cannot chain them into subsequent operations that require full UUIDs.
+///
+/// With the fix, both verbs return full 36-char UUIDs even when the request
+/// uses the default presentation (Agent mode).
+#[tokio::test]
+async fn get_returns_full_uuid_in_default_agent_mode() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create in verbose mode so we have the full UUID.
+    // Entity create returns `id` (full UUID) in verbose mode.
+    let created = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="AlwaysVerboseEntity")"#,
+    )
+    .await?;
+    let full_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(full_id.len(), 36, "created entity must have full UUID");
+
+    // Fetch via `get` WITHOUT specifying presentation — default is Agent mode.
+    // AlwaysVerbose must override and return the full UUID in the `id` field.
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": format!(r#"get(id="{full_id}")"#)}),
+        // Deliberately no `presentation` key — defaults to Agent.
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(first["ok"], true, "get must succeed: {first}");
+
+    // `get` wraps the entity in {"kind": "entity", "data": <entity>}.
+    // The entity's UUID lives at result["data"]["id"].
+    let entity = &first["result"];
+    let returned_id = entity["data"]["id"].as_str().unwrap_or("");
+    assert_eq!(
+        returned_id.len(),
+        36,
+        "get in default (Agent) mode must return full 36-char UUID in data.id; got {returned_id:?}"
+    );
+    assert_eq!(
+        returned_id, full_id,
+        "returned id must match the created entity's full UUID"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn link_returns_full_uuids_in_default_agent_mode() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create two entities in verbose mode.
+    let a = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="NodeA")"#,
+    )
+    .await?;
+    let b = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="NodeB")"#,
+    )
+    .await?;
+    // Entity create returns `id` (full UUID) in verbose mode.
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+
+    // Call `link` WITHOUT presentation=verbose — default is Agent mode.
+    // AlwaysVerbose must override and return full UUIDs in source_id / target_id.
+    let result = call(
+        &client,
+        "request",
+        json!({
+            "ops": format!(
+                r#"link(source_id="{a_id}", target_id="{b_id}", relation="extends")"#
+            )
+            // No `presentation` key — defaults to Agent.
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(first["ok"], true, "link must succeed: {first}");
+
+    let edge = &first["result"];
+    let src = edge["source_id"].as_str().unwrap_or("");
+    let tgt = edge["target_id"].as_str().unwrap_or("");
+    assert_eq!(
+        src.len(),
+        36,
+        "link source_id must be full 36-char UUID in default mode; got {src:?}"
+    );
+    assert_eq!(
+        tgt.len(),
+        36,
+        "link target_id must be full 36-char UUID in default mode; got {tgt:?}"
+    );
+    Ok(())
+}

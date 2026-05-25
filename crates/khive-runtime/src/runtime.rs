@@ -239,6 +239,16 @@ impl KhiveRuntime {
             }
             None => StorageBackend::memory()?,
         };
+        // Run versioned migrations (V1..V17) at startup so file-backed and
+        // in-memory DBs both have proposals_open (V15) and the embedding_model
+        // columns (V16/V17) before any pack handler runs.  Migration is
+        // idempotent — already-applied versions are skipped.  A failure here
+        // aborts construction so the caller sees a clear error rather than a
+        // cryptic "no such table" on the first verb dispatch.
+        {
+            let mut writer = backend.pool().try_writer()?;
+            khive_db::run_migrations(writer.conn_mut())?;
+        }
         register_configured_embedding_models(&backend, &config)?;
         let (registry, default_embedder_name) = build_embedder_registry(&config);
         Ok(Self {

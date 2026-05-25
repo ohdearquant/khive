@@ -95,6 +95,46 @@ pub struct HandlerDef {
     pub params: &'static [ParamDef],
 }
 
+/// Presentation override for a verb handler (ADR-045 §6 per-verb opt-out).
+///
+/// Most verbs use the default `Standard` policy which allows the caller's
+/// requested `PresentationMode` to apply.  A small set declare `AlwaysVerbose`
+/// because Agent-mode trimming (UUID shortening, empty-field dropping) would
+/// corrupt their response for downstream chaining — e.g. `get` returns UUIDs
+/// that callers pipe into `link`; shortening them here breaks the chain.
+///
+/// The policy is carried as a `const` in [`HandlerDef`] so the registry can
+/// consult it before applying the presentation transform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VerbPresentationPolicy {
+    /// Apply the caller's requested `PresentationMode` unchanged.
+    #[default]
+    Standard,
+    /// Always use `Verbose` output regardless of the caller's mode.
+    ///
+    /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`.
+    AlwaysVerbose,
+}
+
+impl HandlerDef {
+    /// Resolve the presentation policy for this handler.
+    ///
+    /// Returns [`VerbPresentationPolicy::AlwaysVerbose`] for verbs whose
+    /// semantics demand full output (full UUIDs, complete timestamps) regardless
+    /// of the caller's requested presentation mode.
+    ///
+    /// The set is derived from ADR-045 §6.  New verbs that need this override
+    /// must be added here; omission from the list means `Standard` applies.
+    pub fn presentation_policy(&self) -> VerbPresentationPolicy {
+        match self.name {
+            "get" | "link" | "query" | "traverse" | "neighbors" => {
+                VerbPresentationPolicy::AlwaysVerbose
+            }
+            _ => VerbPresentationPolicy::Standard,
+        }
+    }
+}
+
 /// Backward-compatible type alias.  Existing code that names `VerbDef` still
 /// compiles; new code should use `HandlerDef` directly (ADR-023).
 #[deprecated(since = "0.2.0", note = "Use HandlerDef instead (ADR-023)")]

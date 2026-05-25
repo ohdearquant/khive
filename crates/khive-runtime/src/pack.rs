@@ -24,7 +24,7 @@ use serde_json::Value;
 
 pub use khive_types::{
     EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, PackSchemaPlan,
-    ParamDef, VerbCategory, Visibility,
+    ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -1003,6 +1003,36 @@ impl VerbRegistry {
         for pack in self.packs.iter() {
             pack.register_embedders(runtime);
         }
+    }
+
+    /// Resolve the presentation policy for a verb name (ADR-045 §6).
+    ///
+    /// Walks all registered handlers (including subhandlers) for the first
+    /// matching name and returns its declared [`VerbPresentationPolicy`].
+    /// Returns `Standard` for unknown verbs — unknown verbs will fail at
+    /// dispatch anyway, so the fallback here is safe.
+    pub fn presentation_policy_for(&self, verb: &str) -> khive_types::VerbPresentationPolicy {
+        for pack in self.packs.iter() {
+            if let Some(handler) = pack.handlers().iter().find(|h| h.name == verb) {
+                return handler.presentation_policy();
+            }
+        }
+        khive_types::VerbPresentationPolicy::Standard
+    }
+
+    /// Returns `true` if the named verb exists and is tagged
+    /// `Visibility::Subhandler` (internal / operator-only).
+    ///
+    /// Used by the MCP server to gate subhandler invocation at the wire
+    /// boundary (ADR-017 §Visibility) without blocking internal callers that
+    /// invoke the same verbs through the runtime directly.
+    pub fn is_subhandler_verb(&self, verb: &str) -> bool {
+        for pack in self.packs.iter() {
+            if let Some(handler) = pack.handlers().iter().find(|h| h.name == verb) {
+                return matches!(handler.visibility, Visibility::Subhandler);
+            }
+        }
+        false
     }
 
     /// Apply all non-empty pack-auxiliary schema plans to the given backend
