@@ -308,10 +308,7 @@ async fn transition_lifecycle_rejection_is_per_op_not_protocol_error() -> anyhow
     // Per P15 (PR #418), terminal states (done/cancelled) reject ALL outgoing
     // transitions with "task X is in terminal state Y; no further transitions allowed".
     assert!(
-        first["error"]
-            .as_str()
-            .unwrap()
-            .contains("terminal state"),
+        first["error"].as_str().unwrap().contains("terminal state"),
         "expected terminal-state rejection, got: {}",
         first["error"]
     );
