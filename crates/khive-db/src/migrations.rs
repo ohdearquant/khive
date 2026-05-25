@@ -324,6 +324,32 @@ const V12_NULLABLE_NOTE_METRICS: &str = "\
 // (which includes the new columns) does not fail with "duplicate column name".
 const V13_EVENT_OBSERVABILITY_PROVENANCE: &str = "__v13_computed_at_runtime__";
 
+/// DDL for the `_embedding_models` registry table (ADR-043 §1).
+///
+/// Shared between the V14 migration (`build_v14_embedding_model_registry_sql`) and
+/// the belt-and-suspenders creation in `StorageBackend::vectors_for_namespace`.
+/// Both sites reference this constant so the schema cannot silently diverge if the
+/// registry evolves (ADR-043 §8 step 4 mandates a future schema tightening).
+pub const EMBEDDING_MODELS_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS _embedding_models (\
+        id              BLOB PRIMARY KEY,\
+        engine_name     TEXT NOT NULL,\
+        model_id        TEXT NOT NULL,\
+        key_version     TEXT NOT NULL,\
+        dim             INTEGER NOT NULL,\
+        output_dim      INTEGER,\
+        status          TEXT NOT NULL CHECK (status IN ('pending', 'active', 'superseded', 'archived')),\
+        activated_at    INTEGER,\
+        superseded_at   INTEGER,\
+        superseded_by   BLOB,\
+        canonical_key   BLOB NOT NULL UNIQUE,\
+        created_at      INTEGER NOT NULL\
+    );\
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_embed_models_one_active \
+        ON _embedding_models(engine_name) WHERE status = 'active';\
+    CREATE INDEX IF NOT EXISTS idx_embed_models_engine_status \
+        ON _embedding_models(engine_name, status);";
+
 /// V14: Embedding model registry (`_embedding_models`) and per-engine model FK column.
 ///
 /// Creates the `_embedding_models` registry table that tracks which embedding model
@@ -333,8 +359,12 @@ const V13_EVENT_OBSERVABILITY_PROVENANCE: &str = "__v13_computed_at_runtime__";
 ///
 /// sqlite-vec virtual tables (`vec0`) do not support `ALTER TABLE ADD COLUMN`;
 /// for those tables the column is added during the startup backfill rebuild
-/// (ADR-043 §8) which runs after this migration. New tables created after V14
-/// include `embedding_model_id` from creation via the updated DDL in backend.rs.
+/// (ADR-043 §8 steps 2-4), which is deferred to a follow-up PR — see the tracking
+/// issue filed in MAJ-2 of codex round-1.
+///
+/// New `vec_<engine>` tables created via `StorageBackend::vectors_for_namespace`
+/// after V14 do NOT yet include `embedding_model_id` at creation time; that column
+/// will be present only after the ADR-043 §8 step-4 rebuild lands.
 ///
 /// The migration SQL is computed at runtime via `build_v14_embedding_model_registry_sql`
 /// to discover existing `vec_<engine>` tables dynamically and skip the `ALTER TABLE`
@@ -373,6 +403,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     // V5, V9, and V13 instead (slot assignments shifted as clusters merged).  V6–V8
     // were absorbed as no-ops to keep the contiguity check passing.  Their names are
     // frozen — V1-V13 are production schema.
+    //
+    // NOTE: V6 was originally named "reserved_adr043_embedding_pipeline_extensions"
+    // because it was intended to hold ADR-043 work.  The actual ADR-043 migration
+    // landed at V14 (cluster-20).  V6 retains its original name to avoid breaking the
+    // production tracking table on existing deployments.
     VersionedMigration {
         version: 6,
         name: "reserved_adr043_embedding_pipeline_extensions",
@@ -744,41 +779,35 @@ fn build_v13_event_observability_sql(conn: &Connection) -> Result<String, rusqli
 ///
 /// sqlite-vec virtual tables (`vec0`) do not support `ALTER TABLE ADD COLUMN`;
 /// those tables are handled by the startup backfill rebuild (ADR-043 §8) which
-/// runs after the SQL migration completes. New `vec_<engine>` tables created
-/// after V14 include `embedding_model_id` from the start via the updated DDL
-/// in `StorageBackend::vectors_for_namespace`.
+/// runs after the SQL migration completes.  New `vec_<engine>` tables created
+/// after V14 do NOT yet include `embedding_model_id` at creation — that column
+/// will be present only after the ADR-043 §8 step-4 rebuild lands (follow-up).
 fn build_v14_embedding_model_registry_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
-    let mut sql = String::from(
-        "CREATE TABLE IF NOT EXISTS _embedding_models (\
-            id              BLOB PRIMARY KEY,\
-            engine_name     TEXT NOT NULL,\
-            model_id        TEXT NOT NULL,\
-            key_version     TEXT NOT NULL,\
-            dim             INTEGER NOT NULL,\
-            output_dim      INTEGER,\
-            status          TEXT NOT NULL CHECK (status IN ('pending', 'active', 'superseded', 'archived')),\
-            activated_at    INTEGER,\
-            superseded_at   INTEGER,\
-            superseded_by   BLOB,\
-            canonical_key   BLOB NOT NULL UNIQUE,\
-            created_at      INTEGER NOT NULL\
-        );\
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_embed_models_one_active \
-            ON _embedding_models(engine_name) WHERE status = 'active';\
-        CREATE INDEX IF NOT EXISTS idx_embed_models_engine_status \
-            ON _embedding_models(engine_name, status);",
-    );
+    let mut sql = String::from(EMBEDDING_MODELS_DDL);
 
-    // Discover existing regular (non-virtual) vec_<engine> tables. sqlite-vec virtual
-    // tables carry type='table' in sqlite_master with sql beginning 'CREATE VIRTUAL
-    // TABLE'; we exclude them here since ALTER TABLE ADD COLUMN is not supported for
-    // virtual tables. Those tables receive the column during startup backfill rebuild.
+    // Discover existing regular (non-virtual) vec_<engine> tables.
+    //
+    // Exclusion rationale:
+    // - `sql NOT LIKE '%VIRTUAL%'` drops vec0 virtual tables (type='table' but DDL
+    //   starts with "CREATE VIRTUAL TABLE").
+    // - `sql NOT LIKE '%vec0%'` is a belt-and-suspenders drop for any DDL that still
+    //   contains the vec0 keyword.
+    // - The four `NOT LIKE` suffix clauses exclude the sqlite-vec internal shadow tables
+    //   that are created as plain regular tables alongside each vec0 virtual table:
+    //     vec_<x>_chunks, vec_<x>_rowids, vec_<x>_info, vec_<x>_vector_chunks00
+    //   (see sqlite-vec 0.1.9 sqlite-vec.c:3423-3468; these tables own sqlite-vec's
+    //   internal layout and must never receive extraneous columns).
+    //   The ESCAPE '\' form is required because '%' and '_' are SQL LIKE wildcards.
     let mut stmt = conn.prepare(
         "SELECT name FROM sqlite_master \
          WHERE type = 'table' \
            AND name LIKE 'vec_%' \
            AND sql NOT LIKE '%VIRTUAL%' \
-           AND sql NOT LIKE '%vec0%'",
+           AND sql NOT LIKE '%vec0%' \
+           AND name NOT LIKE '%\\_chunks' ESCAPE '\\' \
+           AND name NOT LIKE '%\\_rowids' ESCAPE '\\' \
+           AND name NOT LIKE '%\\_info' ESCAPE '\\' \
+           AND name NOT LIKE '%\\_vector\\_chunks%' ESCAPE '\\'",
     )?;
     let vec_tables: Vec<String> = stmt
         .query_map([], |row| row.get(0))?
@@ -1483,6 +1512,58 @@ mod tests {
         // Running migrations again must be idempotent (column already present).
         let version2 = run_migrations(&mut conn).expect("second run must succeed");
         assert_eq!(version2, 14);
+    }
+
+    /// CRIT-2 regression: V14 discovery filter must NOT match sqlite-vec internal
+    /// shadow tables (`vec_<x>_chunks`, `_rowids`, `_info`, `_vector_chunks00`).
+    ///
+    /// sqlite-vec 0.1.9 creates these as plain `CREATE TABLE` entries (no VIRTUAL,
+    /// no vec0 keyword in their DDL) for each vec0 virtual table.  The filter added
+    /// in PR #374 c20 must exclude them via explicit suffix negation so that
+    /// `ALTER TABLE … ADD COLUMN` is never issued against sqlite-vec's internal tables.
+    ///
+    /// We simulate the shadow tables as plain regular tables (sqlite-vec is not
+    /// available in the unit-test environment) because the sqlite_master DDL format
+    /// is what the filter inspects — the table content is irrelevant for this test.
+    #[test]
+    fn migration_v14_does_not_alter_sqlite_vec_shadow_tables() {
+        let mut conn = open_memory();
+
+        // Create the four canonical sqlite-vec shadow table shapes for a notional
+        // vec0 table named `vec_test`.  Their DDL intentionally lacks VIRTUAL/vec0
+        // so they would have matched the old (pre-fix) filter.
+        conn.execute_batch(
+            "CREATE TABLE vec_test_chunks    (x INTEGER);\
+             CREATE TABLE vec_test_rowids    (x INTEGER);\
+             CREATE TABLE vec_test_info      (x INTEGER);\
+             CREATE TABLE vec_test_vector_chunks00 (x INTEGER);",
+        )
+        .unwrap();
+
+        // Run the full migration suite — V14 must not add `embedding_model_id` to
+        // any of the four shadow tables above.
+        let version = run_migrations(&mut conn).expect("migrations should succeed");
+        assert_eq!(version, 14);
+
+        for shadow in [
+            "vec_test_chunks",
+            "vec_test_rowids",
+            "vec_test_info",
+            "vec_test_vector_chunks00",
+        ] {
+            let col_added: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) \
+                     WHERE name = 'embedding_model_id'",
+                    rusqlite::params![shadow],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                !col_added,
+                "CRIT-2: V14 must NOT add embedding_model_id to sqlite-vec shadow table '{shadow}'"
+            );
+        }
     }
 
     /// Helper: apply a single migration in a transaction, recording it in the

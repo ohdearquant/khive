@@ -324,29 +324,21 @@ impl StorageBackend {
         // first calling run_migrations() (e.g., tests that create stores directly).
         // Production callers are expected to call run_migrations() at startup, which
         // creates the registry via V14; this is a belt-and-suspenders fallback.
-        writer.conn().execute_batch(
-            "CREATE TABLE IF NOT EXISTS _embedding_models (\
-                id              BLOB PRIMARY KEY,\
-                engine_name     TEXT NOT NULL,\
-                model_id        TEXT NOT NULL,\
-                key_version     TEXT NOT NULL,\
-                dim             INTEGER NOT NULL,\
-                output_dim      INTEGER,\
-                status          TEXT NOT NULL CHECK (status IN ('pending', 'active', 'superseded', 'archived')),\
-                activated_at    INTEGER,\
-                superseded_at   INTEGER,\
-                superseded_by   BLOB,\
-                canonical_key   BLOB NOT NULL UNIQUE,\
-                created_at      INTEGER NOT NULL\
-            );\
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_embed_models_one_active \
-                ON _embedding_models(engine_name) WHERE status = 'active';\
-            CREATE INDEX IF NOT EXISTS idx_embed_models_engine_status \
-                ON _embedding_models(engine_name, status);",
-        )?;
+        // Schema is defined in `migrations::EMBEDDING_MODELS_DDL` (single source of
+        // truth) to prevent the two copies from silently drifting.
+        writer
+            .conn()
+            .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
 
-        // Create the vec0 virtual table with the full ADR-044 schema. Idempotent
-        // on fresh databases and after the old-schema rebuild above.
+        // Create the vec0 virtual table. Idempotent on fresh databases and after the
+        // old-schema rebuild above.
+        //
+        // NOTE: `embedding_model_id` is NOT included in this DDL because sqlite-vec
+        // enforces NOT NULL on TEXT metadata columns at insert time, so the column
+        // cannot be added at virtual-table creation as a nullable FK.  The column will
+        // be present after the ADR-043 §8 startup backfill rebuild (steps 2-4), which
+        // is deferred to a follow-up PR — see the tracking issue filed against MAJ-2
+        // of codex round-1 review of PR #374.
         let ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
              subject_id TEXT PRIMARY KEY, \
