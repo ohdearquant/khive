@@ -26,7 +26,9 @@ pub use capability::StorageCapability;
 pub use entity::{Entity, EntityFilter, EntityStore};
 pub use error::StorageError;
 
-pub use event::{Event, EventFilter, EventStore};
+pub use event::{
+    Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
+};
 pub use graph::GraphStore;
 pub use note::{Note, NoteStore};
 pub use sparse::SparseStore;

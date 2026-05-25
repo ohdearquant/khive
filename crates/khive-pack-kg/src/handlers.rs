@@ -18,7 +18,7 @@ use khive_storage::types::{
 };
 use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
 
-use khive_types::EntityKind;
+use khive_types::{EntityKind, EventKind};
 
 use crate::vocab::NoteKind;
 use crate::KgPack;
@@ -223,6 +223,11 @@ struct ListParams {
     substrate: Option<String>,
     since: Option<i64>,
     until: Option<i64>,
+    event_kind: Option<String>,
+    event_kinds: Option<Vec<String>>,
+    session_id: Option<String>,
+    observed: Option<Vec<String>>,
+    selected: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -507,6 +512,11 @@ fn parse_event_substrate(raw: &str) -> Result<SubstrateKind, RuntimeError> {
         })
 }
 
+fn parse_event_kind(raw: &str) -> Result<EventKind, RuntimeError> {
+    raw.parse::<EventKind>()
+        .map_err(|e| RuntimeError::InvalidInput(format!("unknown event_kind {raw:?}: {e}")))
+}
+
 fn event_filter_from_params(
     p: &ListParams,
 ) -> Result<(EventFilter, Option<EventOutcome>), RuntimeError> {
@@ -525,6 +535,47 @@ fn event_filter_from_params(
 
     let outcome = p.outcome.as_deref().map(parse_event_outcome).transpose()?;
 
+    let mut kinds: Vec<EventKind> = Vec::new();
+    if let Some(k) = &p.event_kind {
+        kinds.push(parse_event_kind(k)?);
+    }
+    if let Some(ks) = &p.event_kinds {
+        for k in ks {
+            kinds.push(parse_event_kind(k)?);
+        }
+    }
+
+    let session_id = p
+        .session_id
+        .as_deref()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid session_id {s:?}: {e}")))
+        })
+        .transpose()?;
+
+    let observed = p
+        .observed
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid observed id {s:?}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let selected = p
+        .selected
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| {
+            Uuid::from_str(s)
+                .map_err(|e| RuntimeError::InvalidInput(format!("invalid selected id {s:?}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok((
         EventFilter {
             verbs,
@@ -532,6 +583,10 @@ fn event_filter_from_params(
             actors: p.actor.clone().into_iter().collect(),
             after: p.since,
             before: p.until,
+            kinds,
+            session_id,
+            observed,
+            selected,
             ..EventFilter::default()
         },
         outcome,
@@ -969,7 +1024,14 @@ impl KgPack {
                         let batch_size = 100u32.min(remaining);
                         let page = self
                             .runtime
-                            .list_events(token, filter.clone(), batch_size, raw_offset)
+                            .list_events(
+                                token,
+                                filter.clone(),
+                                PageRequest {
+                                    limit: batch_size,
+                                    offset: raw_offset.into(),
+                                },
+                            )
                             .await?;
                         let batch_len = page.items.len() as u32;
                         if batch_len == 0 {
@@ -1000,7 +1062,14 @@ impl KgPack {
                 } else {
                     let page = self
                         .runtime
-                        .list_events(token, filter, limit, offset)
+                        .list_events(
+                            token,
+                            filter,
+                            PageRequest {
+                                limit,
+                                offset: offset.into(),
+                            },
+                        )
                         .await?;
                     to_json(&page.items)
                 }

@@ -13,6 +13,7 @@ use uuid::Uuid;
 use khive_db::SqliteError;
 use khive_storage::types::{EdgeFilter, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
+use khive_types::EventKind;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
@@ -181,14 +182,17 @@ impl KhiveRuntime {
         self.ensure_namespace(&entity.namespace, token, id)?;
 
         let mut text_changed = false;
+        let mut changed_fields: Vec<&'static str> = Vec::new();
 
         if let Some(name) = patch.name {
             text_changed |= entity.name != name;
             entity.name = name;
+            changed_fields.push("name");
         }
         if let Some(desc_patch) = patch.description {
             text_changed |= entity.description != desc_patch;
             entity.description = desc_patch;
+            changed_fields.push("description");
         }
         if let Some(props) = patch.properties {
             let (merged, _) = merge_properties(
@@ -197,9 +201,11 @@ impl KhiveRuntime {
                 EntityDedupMergePolicy::PreferFrom,
             );
             entity.properties = merged;
+            changed_fields.push("properties");
         }
         if let Some(tags) = patch.tags {
             entity.tags = tags;
+            changed_fields.push("tags");
         }
 
         entity.updated_at = chrono::Utc::now().timestamp_micros();
@@ -208,6 +214,24 @@ impl KhiveRuntime {
         if text_changed {
             self.reindex_entity(token, &entity).await?;
         }
+
+        let event_store = self.events(token)?;
+        let event = khive_storage::event::Event::new(
+            entity.namespace.clone(),
+            "update",
+            EventKind::EntityUpdated,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(entity.id)
+        .with_payload(serde_json::json!({
+            "id": entity.id,
+            "namespace": entity.namespace,
+            "changed_fields": changed_fields,
+        }));
+        event_store.append_event(event).await.map_err(|e| {
+            RuntimeError::Internal(format!("update_entity: event store write failed: {e}"))
+        })?;
 
         Ok(entity)
     }
@@ -279,6 +303,32 @@ impl KhiveRuntime {
         if !dry_run && self.config().embedding_model.is_some() {
             self.reindex_entity(token, &updated_entity).await?;
         }
+
+        let event_store = self.events(token)?;
+        // Mirror the wire-level strategy spelling from MergeParams so consumers
+        // can round-trip the policy string back into a request.
+        let policy_str = match strategy {
+            EntityDedupMergePolicy::PreferInto => "prefer_into",
+            EntityDedupMergePolicy::PreferFrom => "prefer_from",
+            EntityDedupMergePolicy::Union => "union",
+        };
+        let event = khive_storage::event::Event::new(
+            updated_entity.namespace.clone(),
+            "merge",
+            EventKind::EntityMerged,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(summary.kept_id)
+        .with_payload(serde_json::json!({
+            "into_id": summary.kept_id,
+            "from_id": summary.removed_id,
+            "policy": policy_str,
+            "edges_rewired": summary.edges_rewired,
+        }));
+        event_store.append_event(event).await.map_err(|e| {
+            RuntimeError::Internal(format!("merge_entity: event store write failed: {e}"))
+        })?;
 
         Ok(summary)
     }

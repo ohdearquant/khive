@@ -14,7 +14,7 @@ use khive_storage::types::{
     TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
-use khive_types::{EdgeEndpointRule, EndpointKind, SubstrateKind};
+use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
@@ -415,26 +415,17 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// List events in a namespace, optionally filtered.
+    /// List events in the namespace proven by the caller token.
     pub async fn list_events(
         &self,
         token: &NamespaceToken,
         filter: EventFilter,
-        limit: u32,
-        offset: u32,
+        page: PageRequest,
     ) -> RuntimeResult<Page<Event>> {
-        let limit = limit.clamp(1, 1000);
-        let page = self
-            .events(token)?
-            .query_events(
-                filter,
-                PageRequest {
-                    offset: offset.into(),
-                    limit,
-                },
-            )
-            .await?;
-        Ok(page)
+        self.events(token)?
+            .query_events(filter, page)
+            .await
+            .map_err(Into::into)
     }
 
     // ---- Edge operations ----
@@ -1365,6 +1356,22 @@ impl KhiveRuntime {
                 self.vectors(token)?.delete(id).await?;
             }
         }
+        if deleted {
+            let event_store = self.events(token)?;
+            let ns_str = ns.to_string();
+            let event = khive_storage::event::Event::new(
+                ns_str.clone(),
+                "delete",
+                EventKind::NoteDeleted,
+                SubstrateKind::Note,
+                "",
+            )
+            .with_target(id)
+            .with_payload(serde_json::json!({"id": id, "namespace": ns_str, "hard": hard}));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("delete_note: event store write failed: {e}"))
+            })?;
+        }
         Ok(deleted)
     }
 }
@@ -1466,6 +1473,22 @@ impl KhiveRuntime {
         if !hard && deleted {
             self.remove_from_indexes(token, id).await?;
         }
+        if deleted {
+            let event_store = self.events(token)?;
+            let ns = entity.namespace.clone();
+            let event = khive_storage::event::Event::new(
+                ns.clone(),
+                "delete",
+                EventKind::EntityDeleted,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(id)
+            .with_payload(serde_json::json!({"id": id, "namespace": ns, "hard": hard}));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("delete_entity: event store write failed: {e}"))
+            })?;
+        }
         Ok(deleted)
     }
 
@@ -1539,20 +1562,41 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
 
+        let mut changed_fields: Vec<&'static str> = Vec::new();
         if let Some(r) = patch.relation {
             // Validate before mutating — use the existing endpoints with the new relation.
             self.validate_edge_relation_endpoints(token, edge.source_id, edge.target_id, r)
                 .await?;
             edge.relation = r;
+            changed_fields.push("relation");
         }
         if let Some(w) = patch.weight {
             edge.weight = w.clamp(0.0, 1.0);
+            changed_fields.push("weight");
         }
         if let Some(props) = patch.properties {
             edge.metadata = Some(props);
         }
 
         graph.upsert_edge(edge.clone()).await?;
+
+        let event_store = self.events(token)?;
+        let ns = token.namespace().as_str().to_string();
+        let event = khive_storage::event::Event::new(
+            ns.clone(),
+            "update",
+            EventKind::EdgeUpdated,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(edge_id)
+        .with_payload(
+            serde_json::json!({"id": edge_id, "namespace": ns, "changed_fields": changed_fields}),
+        );
+        event_store.append_event(event).await.map_err(|e| {
+            RuntimeError::Internal(format!("update_edge: event store write failed: {e}"))
+        })?;
+
         Ok(edge)
     }
 
@@ -1605,7 +1649,24 @@ impl KhiveRuntime {
                 .await?;
         }
 
-        Ok(graph.delete_edge(LinkId::from(edge_id), mode).await?)
+        let deleted = graph.delete_edge(LinkId::from(edge_id), mode).await?;
+        if deleted {
+            let event_store = self.events(token)?;
+            let ns = token.namespace().as_str().to_string();
+            let event = khive_storage::event::Event::new(
+                ns.clone(),
+                "delete",
+                EventKind::EdgeDeleted,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(edge_id)
+            .with_payload(serde_json::json!({"id": edge_id, "namespace": ns, "hard": hard}));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("delete_edge: event store write failed: {e}"))
+            })?;
+        }
+        Ok(deleted)
     }
 
     /// Count edges matching `filter`.
@@ -2560,12 +2621,18 @@ mod tests {
     #[tokio::test]
     async fn resolve_finds_event_by_full_uuid() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let tok = NamespaceToken::local();
         let ns = tok.namespace().as_str();
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "actor",
+        );
         let event_id = event.id;
         rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
@@ -2579,12 +2646,18 @@ mod tests {
     #[tokio::test]
     async fn resolve_prefix_finds_event() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let tok = NamespaceToken::local();
         let ns = tok.namespace().as_str();
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "actor",
+        );
         let event_id = event.id;
         rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
@@ -3085,7 +3158,7 @@ mod tests {
     #[tokio::test]
     async fn link_note_to_event_annotates_succeeds() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let tok = NamespaceToken::local();
@@ -3104,7 +3177,13 @@ mod tests {
 
         // Build an event directly via the store (no runtime create_event exists).
         let ns = tok.namespace().as_str();
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
         rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
@@ -3121,12 +3200,18 @@ mod tests {
     #[tokio::test]
     async fn create_note_annotates_event_succeeds() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let tok = NamespaceToken::local();
         let ns = tok.namespace().as_str();
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
         rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
@@ -3313,12 +3398,18 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_event_source_returns_invalid_input() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let tok = NamespaceToken::local();
         let ns = tok.namespace().as_str();
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
         rt.events(&tok).unwrap().append_event(event).await.unwrap();
 
@@ -3350,12 +3441,18 @@ mod tests {
     #[tokio::test]
     async fn link_supersedes_event_target_returns_invalid_input() {
         use khive_storage::Event;
-        use khive_types::SubstrateKind;
+        use khive_types::{EventKind, SubstrateKind};
 
         let rt = rt();
         let tok = NamespaceToken::local();
         let ns = tok.namespace().as_str();
-        let event = Event::new(ns, "test_verb", SubstrateKind::Entity, "test_actor");
+        let event = Event::new(
+            ns,
+            "test_verb",
+            EventKind::Audit,
+            SubstrateKind::Entity,
+            "test_actor",
+        );
         let event_id = event.id;
         rt.events(&tok).unwrap().append_event(event).await.unwrap();
 

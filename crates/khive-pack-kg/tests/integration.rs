@@ -2140,3 +2140,289 @@ async fn bulk_link_verbose_controls_edges_key() {
         "edges must be present with verbose=true (ADR-038 F205); got {result_verbose:?}"
     );
 }
+
+// ---- ADR-014 curation event payload regression tests (codex round-2) ----
+
+/// Update an entity → list entity_updated events → assert payload has id, namespace,
+/// changed_fields per ADR-014.
+#[tokio::test]
+async fn curation_update_entity_event_payload_has_adr014_fields() {
+    let pack = pack_with_events();
+
+    // Create then update with a name change.
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "PayloadTestEntity"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    pack.dispatch(
+        "update",
+        json!({"id": entity_id, "kind": "entity", "name": "PayloadTestEntityRenamed"}),
+    )
+    .await
+    .expect("update must succeed");
+
+    // Retrieve the entity_updated event.
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "entity_updated", "limit": 10}),
+        )
+        .await
+        .expect("list entity_updated events must succeed");
+    let arr = events.as_array().expect("list must return array");
+    assert!(
+        !arr.is_empty(),
+        "at least one entity_updated event must be present after update"
+    );
+
+    // Find the event for our specific entity (by target_id).
+    let our_event = arr
+        .iter()
+        .find(|e| {
+            e.get("target_id")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == entity_id || t.starts_with(&entity_id[..8]))
+        })
+        .unwrap_or(&arr[0]);
+
+    let payload = our_event
+        .get("payload")
+        .expect("event must have payload field");
+    assert!(
+        payload.get("id").is_some(),
+        "entity_updated payload must contain 'id'; got {payload}"
+    );
+    assert!(
+        payload.get("namespace").is_some(),
+        "entity_updated payload must contain 'namespace'; got {payload}"
+    );
+    let changed = payload
+        .get("changed_fields")
+        .and_then(Value::as_array)
+        .expect("entity_updated payload must contain 'changed_fields' array");
+    assert!(
+        changed.iter().any(|v| v.as_str() == Some("name")),
+        "changed_fields must include 'name' when name was updated; got {changed:?}"
+    );
+}
+
+/// Merge two entities → list entity_merged events → assert payload has into_id, from_id,
+/// policy, edges_rewired per ADR-014.
+#[tokio::test]
+async fn curation_merge_entity_event_payload_has_adr014_fields() {
+    let pack = pack_with_events();
+
+    let into_e = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "MergeIntoEntity"}),
+        )
+        .await
+        .expect("create into must succeed");
+    let into_id = into_e
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    let from_e = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "MergeFromEntity"}),
+        )
+        .await
+        .expect("create from must succeed");
+    let from_id = from_e
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    pack.dispatch("merge", json!({"into_id": into_id, "from_id": from_id}))
+        .await
+        .expect("merge must succeed");
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "entity_merged", "limit": 10}),
+        )
+        .await
+        .expect("list entity_merged events must succeed");
+    let arr = events.as_array().expect("list must return array");
+    assert!(
+        !arr.is_empty(),
+        "at least one entity_merged event must be present"
+    );
+
+    let event = &arr[0];
+    let payload = event.get("payload").expect("event must have payload field");
+    assert!(
+        payload.get("into_id").is_some(),
+        "entity_merged payload must contain 'into_id'; got {payload}"
+    );
+    assert!(
+        payload.get("from_id").is_some(),
+        "entity_merged payload must contain 'from_id'; got {payload}"
+    );
+    assert!(
+        payload.get("policy").is_some(),
+        "entity_merged payload must contain 'policy'; got {payload}"
+    );
+    assert!(
+        payload.get("edges_rewired").is_some(),
+        "entity_merged payload must contain 'edges_rewired'; got {payload}"
+    );
+}
+
+/// Delete an entity with hard=true → list entity_deleted events → assert payload has
+/// id, namespace, hard=true per ADR-014.
+#[tokio::test]
+async fn curation_delete_entity_hard_event_payload_has_adr014_fields() {
+    let pack = pack_with_events();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "HardDeletePayloadEntity"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    pack.dispatch(
+        "delete",
+        json!({"id": entity_id, "kind": "entity", "hard": true}),
+    )
+    .await
+    .expect("hard delete must succeed");
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "entity_deleted", "limit": 10}),
+        )
+        .await
+        .expect("list entity_deleted events must succeed");
+    let arr = events.as_array().expect("list must return array");
+    assert!(
+        !arr.is_empty(),
+        "at least one entity_deleted event must be present"
+    );
+
+    let event = &arr[0];
+    let payload = event.get("payload").expect("event must have payload field");
+    assert!(
+        payload.get("id").is_some(),
+        "entity_deleted payload must contain 'id'; got {payload}"
+    );
+    assert!(
+        payload.get("namespace").is_some(),
+        "entity_deleted payload must contain 'namespace'; got {payload}"
+    );
+    assert_eq!(
+        payload.get("hard").and_then(Value::as_bool),
+        Some(true),
+        "entity_deleted payload must have hard=true for hard delete; got {payload}"
+    );
+}
+
+// ---- ADR-022 provenance filter regression tests (codex round-2) ----
+
+/// list(kind="event", observed=[uuid]) must pass the filter down to storage and
+/// return only events whose observed list contains that UUID.
+#[tokio::test]
+async fn list_event_observed_filter_is_wired_through_to_storage() {
+    let pack = pack_with_events();
+
+    // Create an entity so we have at least one known-good UUID to search with.
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "ObservedFilterEntity"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    // Query with observed=[entity_id] — may return 0 results if the store has no
+    // observed projections for this entity, but must NOT return an error.
+    // What we validate: the filter parses and reaches storage without a parse error.
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "observed": [entity_id], "limit": 10}),
+        )
+        .await
+        .expect("list(kind=event, observed=[...]) must not return an error");
+    assert!(
+        result.as_array().is_some(),
+        "list with observed filter must return an array; got {result}"
+    );
+}
+
+/// list(kind="event", selected=[uuid]) must pass the filter down to storage without
+/// returning a parse error.
+#[tokio::test]
+async fn list_event_selected_filter_is_wired_through_to_storage() {
+    let pack = pack_with_events();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "SelectedFilterEntity"}),
+        )
+        .await
+        .expect("create must succeed");
+    let entity_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "selected": [entity_id], "limit": 10}),
+        )
+        .await
+        .expect("list(kind=event, selected=[...]) must not return an error");
+    assert!(
+        result.as_array().is_some(),
+        "list with selected filter must return an array; got {result}"
+    );
+}
+
+/// list(kind="event", observed=["not-a-uuid"]) must return InvalidInput.
+#[tokio::test]
+async fn list_event_observed_filter_invalid_uuid_returns_invalid_input() {
+    let pack = pack_with_events();
+    let err = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "observed": ["not-a-valid-uuid"], "limit": 10}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "invalid UUID in observed must return InvalidInput; got {err:?}"
+    );
+}

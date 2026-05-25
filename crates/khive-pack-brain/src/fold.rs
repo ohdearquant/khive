@@ -81,11 +81,11 @@ impl Fold<Event, BrainState> for EventFold {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_types::{EventOutcome, SubstrateKind};
+    use khive_types::{EventKind, EventOutcome, SubstrateKind};
     use uuid::Uuid;
 
     fn make_event(verb: &str, outcome: EventOutcome, target: Option<Uuid>) -> Event {
-        let mut e = Event::new("test", verb, SubstrateKind::Note, "brain");
+        let mut e = Event::new("test", verb, EventKind::Audit, SubstrateKind::Note, "brain");
         e.outcome = outcome;
         e.target_id = target;
         e
@@ -155,7 +155,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         let mut event = make_event("brain.emit", EventOutcome::Success, Some(id));
-        event.data = Some(serde_json::json!({"signal": "not_useful"}));
+        event.payload = serde_json::json!({"signal": "not_useful"});
         state = fold.reduce(state, &event, &ctx);
 
         assert_eq!(state.total_events, 1);

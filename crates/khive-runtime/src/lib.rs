@@ -42,6 +42,7 @@ pub use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
     GateRef, GateRequest, Obligation,
 };
+pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use objectives::{
     GraphProximityObjective, RetrievalCandidate, RrfFusionObjective, TextRelevanceObjective,

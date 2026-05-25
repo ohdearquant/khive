@@ -181,6 +181,13 @@ const V1_UP: &str = "\
 /// metadata (target_backend) to graph_edges. Uses table rebuild to work around
 /// SQLite's limited ALTER TABLE support. Backfills updated_at = created_at for
 /// existing rows and sets deleted_at = NULL, target_backend = NULL.
+///
+/// V13 note: Adds event observability + provenance columns (kind, payload,
+/// payload_schema_version, profile_state_version, session_id, aggregate_kind,
+/// aggregate_id) and the event_observations table. The DDL is computed at runtime
+/// via `build_v13_event_observability_sql` so that running migrations on a DB
+/// already bootstrapped by `ensure_events_schema` does not fail with "duplicate
+/// column name".
 const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     DELETE FROM graph_edges \
     WHERE rowid NOT IN (\
@@ -311,6 +318,12 @@ const V12_NULLABLE_NOTE_METRICS: &str = "\
     CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);\
 ";
 
+// V13 adds event observability + provenance columns and the event_observations table.
+// The DDL is computed at runtime via `build_v13_event_observability_sql` so that
+// running migrations on a database already bootstrapped by `ensure_events_schema`
+// (which includes the new columns) does not fail with "duplicate column name".
+const V13_EVENT_OBSERVABILITY_PROVENANCE: &str = "__v13_computed_at_runtime__";
+
 pub const MIGRATIONS: &[VersionedMigration] = &[
     VersionedMigration {
         version: 1,
@@ -374,6 +387,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 12,
         name: "nullable_note_metrics",
         up: V12_NULLABLE_NOTE_METRICS,
+    },
+    VersionedMigration {
+        version: 13,
+        name: "event_observability_provenance",
+        up: V13_EVENT_OBSERVABILITY_PROVENANCE,
     },
 ];
 
@@ -581,7 +599,16 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             error: e.to_string(),
         })?;
 
-        tx.execute_batch(migration.up)
+        let up_sql = if migration.version == 13 {
+            build_v13_event_observability_sql(&tx).map_err(|e| SqliteError::Migration {
+                version: migration.version,
+                error: e.to_string(),
+            })?
+        } else {
+            migration.up.to_string()
+        };
+
+        tx.execute_batch(&up_sql)
             .map_err(|e| SqliteError::Migration {
                 version: migration.version,
                 error: e.to_string(),
@@ -608,6 +635,77 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     Ok(applied_version)
 }
 
+fn table_has_column(
+    conn: &Connection,
+    table: &'static str,
+    column: &'static str,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+        rusqlite::params![table, column],
+        |row| row.get(0),
+    )
+}
+
+fn build_v13_event_observability_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
+    let mut sql = String::new();
+    for (column, ddl) in [
+        (
+            "kind",
+            "ALTER TABLE events ADD COLUMN kind TEXT NOT NULL DEFAULT 'audit';",
+        ),
+        (
+            "payload",
+            "ALTER TABLE events ADD COLUMN payload TEXT NOT NULL DEFAULT '{}';",
+        ),
+        (
+            "payload_schema_version",
+            "ALTER TABLE events ADD COLUMN payload_schema_version INTEGER NOT NULL DEFAULT 1;",
+        ),
+        (
+            "profile_state_version",
+            "ALTER TABLE events ADD COLUMN profile_state_version INTEGER;",
+        ),
+        (
+            "session_id",
+            "ALTER TABLE events ADD COLUMN session_id TEXT;",
+        ),
+        (
+            "aggregate_kind",
+            "ALTER TABLE events ADD COLUMN aggregate_kind TEXT;",
+        ),
+        (
+            "aggregate_id",
+            "ALTER TABLE events ADD COLUMN aggregate_id TEXT;",
+        ),
+    ] {
+        if !table_has_column(conn, "events", column)? {
+            sql.push_str(ddl);
+        }
+    }
+    // Migrate legacy data column into payload if both exist.
+    if table_has_column(conn, "events", "data")? && table_has_column(conn, "events", "payload")? {
+        sql.push_str("UPDATE events SET payload = data WHERE data IS NOT NULL AND data <> '';");
+    }
+    sql.push_str(
+        "CREATE TABLE IF NOT EXISTS event_observations (\
+            event_id TEXT NOT NULL,\
+            entity_id TEXT NOT NULL,\
+            referent_kind TEXT NOT NULL,\
+            role TEXT NOT NULL,\
+            position INTEGER NOT NULL,\
+            PRIMARY KEY (event_id, role, position)\
+        );\
+        CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);\
+        CREATE INDEX IF NOT EXISTS idx_events_session ON events(namespace, session_id, created_at, id);\
+        CREATE INDEX IF NOT EXISTS idx_events_ns_created_id ON events(namespace, created_at DESC, id DESC);\
+        CREATE INDEX IF NOT EXISTS idx_events_payload_proposal_id ON events(json_extract(payload, '$.proposal_id'));\
+        CREATE INDEX IF NOT EXISTS idx_event_obs_entity ON event_observations(entity_id, role);\
+        CREATE INDEX IF NOT EXISTS idx_event_obs_event_role ON event_observations(event_id, role);",
+    );
+    Ok(sql)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -624,17 +722,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
 
-        // Verify the tracking table has rows for V1 through V12.
+        // Verify the tracking table has rows for V1 through V13.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 12);
+        assert_eq!(count, 13);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -709,6 +807,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(salience_notnull, 0, "V12 must make salience nullable");
+
+        // Verify V13 added event observability columns to events.
+        for col in [
+            "kind",
+            "payload",
+            "payload_schema_version",
+            "profile_state_version",
+            "session_id",
+            "aggregate_kind",
+            "aggregate_id",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('events') WHERE name = ?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "V13 must add events.{col}");
+        }
+
+        // Verify event_observations table exists.
+        let obs_tbl: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='event_observations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_tbl, 1, "V13 must create event_observations table");
+
+        // Verify V13 indexes exist.
+        for idx in [
+            "idx_events_ns_created_id",
+            "idx_events_session",
+            "idx_events_payload_proposal_id",
+            "idx_event_obs_entity",
+            "idx_event_obs_event_role",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "V13 must create index {idx}");
+        }
     }
 
     #[test]
@@ -716,16 +862,16 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 12);
-        assert_eq!(v2, 12);
+        assert_eq!(v1, 13);
+        assert_eq!(v2, 13);
 
-        // Should still have exactly twelve rows in the tracking table (V1..V12).
+        // Should still have exactly thirteen rows in the tracking table (V1..V13).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 12);
+        assert_eq!(count, 13);
     }
 
     // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
@@ -735,8 +881,8 @@ mod tests {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
         assert_eq!(
-            version, 12,
-            "F052: latest migration must be V12 (nullable note metrics)"
+            version, 13,
+            "F052: latest migration must be V13 (event observability provenance)"
         );
         let col: i64 = conn
             .query_row(
@@ -764,40 +910,40 @@ mod tests {
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v13 = VersionedMigration {
-            version: 13,
+        let bad_v14 = VersionedMigration {
+            version: 14,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1..V12) so the DB is at V12.
-        run_migrations(&mut conn).expect("V1..V12 should apply cleanly");
+        // Apply all real migrations (V1..V13) so the DB is at V13.
+        run_migrations(&mut conn).expect("V1..V13 should apply cleanly");
 
-        // Now manually drive the bad V13 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v13);
+        // Now manually drive the bad V14 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v14);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V12 — no V13 row in tracking.
-        let v13_count: i64 = conn
+        // DB should still be at V13 — no V14 row in tracking.
+        let v14_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 13",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 14",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v13_count, 0, "V13 must not be recorded after rollback");
+        assert_eq!(v14_count, 0, "V14 must not be recorded after rollback");
 
-        // V1..V12 should still be there.
+        // V1..V13 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(applied_count, 12, "V1..V12 must still be recorded");
+        assert_eq!(applied_count, 13, "V1..V13 must still be recorded");
     }
 
     #[test]
@@ -828,9 +974,10 @@ mod tests {
         // and skip; V5 should detect entity_type already present via ENTITIES_DDL and skip;
         // V9 rebuilds graph_edges with lifecycle columns; V10 should detect the existing
         // status column and skip; V11 should detect the existing merged_into column and skip;
-        // V12 should detect that salience is already nullable and skip.
+        // V12 should detect that salience is already nullable and skip;
+        // V13 adds event observability columns and event_observations table.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -910,6 +1057,19 @@ mod tests {
             v12_count, 1,
             "V12 must be recorded even when salience is already nullable via NOTES_DDL"
         );
+
+        // V13 (event observability) must be recorded.
+        let v13_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 13",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v13_count, 1,
+            "V13 must be recorded after store-DDL + migrations"
+        );
     }
 
     /// Verify that V12 rebuilds a V1-era notes table so salience/decay_factor
@@ -981,9 +1141,9 @@ mod tests {
         )
         .unwrap();
 
-        // Run V2-V12 migrations.
+        // Run V2-V13 migrations.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
 
         // After V12, salience must be nullable (notnull=0).
         let notnull: i64 = conn
@@ -1014,6 +1174,29 @@ mod tests {
             stored_salience.is_none(),
             "salience must be NULL when not supplied"
         );
+    }
+
+    #[test]
+    fn store_ddl_then_event_migration_is_idempotent() {
+        use crate::stores::event::ensure_events_schema;
+
+        let mut conn = open_memory();
+
+        // Simulate the StorageBackend path: ensure_events_schema creates the
+        // events table WITH the new columns. Running V13 on top must not fail.
+        ensure_events_schema(&conn).expect("store DDL should create events");
+
+        let version = run_migrations(&mut conn).expect("migrations after events store DDL");
+        assert_eq!(version, 13, "must reach V13 even when events DDL ran first");
+
+        let v13_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 13",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v13_count, 1, "V13 must be recorded");
     }
 
     /// Helper: apply a single migration in a transaction, recording it in the
