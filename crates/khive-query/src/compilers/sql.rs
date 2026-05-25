@@ -712,6 +712,190 @@ fn reject_or_spanning_impl(
     }
 }
 
+/// Compile a leaf condition for the variable-length path, routing it to the correct
+/// alias (`s` for start, `r` for end).
+fn compile_var_len_condition(
+    cond: &Condition,
+    start_var: Option<&str>,
+    end_var: Option<&str>,
+    params: &mut Vec<QueryValue>,
+) -> Result<(String, &'static str), QueryError> {
+    let col_alias = if start_var == Some(cond.variable.as_str()) {
+        "s"
+    } else if end_var == Some(cond.variable.as_str()) {
+        "r"
+    } else {
+        return Err(QueryError::Compile(format!(
+            "variable '{}' in WHERE not supported in variable-length pattern \
+             (only start/end node variables)",
+            cond.variable
+        )));
+    };
+
+    let col_expr =
+        if cond.property == "name" || cond.property == "kind" || cond.property == "entity_type" {
+            format!("{col_alias}.{}", cond.property)
+        } else {
+            format!(
+                "json_extract({col_alias}.properties, '$.{}')",
+                cond.property.replace('\'', "''")
+            )
+        };
+
+    let op_str = match cond.op {
+        CompareOp::Eq => "=",
+        CompareOp::Neq => "!=",
+        CompareOp::Gt => ">",
+        CompareOp::Lt => "<",
+        CompareOp::Gte => ">=",
+        CompareOp::Lte => "<=",
+        CompareOp::Like => "LIKE",
+    };
+
+    let sql = match &cond.value {
+        ConditionValue::String(s) => {
+            params.push(QueryValue::Text(s.clone()));
+            let collate = if matches!(cond.op, CompareOp::Eq | CompareOp::Like) {
+                " COLLATE NOCASE"
+            } else {
+                ""
+            };
+            format!("{col_expr} {op_str} ?{}{collate}", params.len())
+        }
+        ConditionValue::Number(n) => {
+            params.push(QueryValue::Float(*n));
+            format!("{col_expr} {op_str} ?{}", params.len())
+        }
+        ConditionValue::Bool(b) => {
+            params.push(QueryValue::Integer(if *b { 1 } else { 0 }));
+            format!("{col_expr} {op_str} ?{}", params.len())
+        }
+    };
+    Ok((sql, col_alias))
+}
+
+/// Walk the `WhereExpr` tree for variable-length patterns, preserving Or/And
+/// connectives and routing each leaf to `start_conditions` or `end_conditions`.
+///
+/// Because `reject_or_spanning_endpoints` has already verified that no `Or` node
+/// straddles both endpoints, every sub-tree roots in at most one endpoint.  When a
+/// sub-tree is purely one endpoint we compile it as a single SQL fragment and push
+/// it directly into that endpoint's condition vec.  The function returns `Ok(None)`
+/// in all handled cases; `Ok(Some(_))` is never produced (the signature reserves it
+/// for `WhereExpr::True` which is a no-op).
+fn compile_variable_length_where(
+    expr: &WhereExpr,
+    start_var: Option<&str>,
+    end_var: Option<&str>,
+    params: &mut Vec<QueryValue>,
+    start_conditions: &mut Vec<String>,
+    end_conditions: &mut Vec<String>,
+) -> Result<Option<String>, QueryError> {
+    match expr {
+        WhereExpr::True => Ok(None),
+        WhereExpr::Condition(cond) => {
+            let (sql, alias) = compile_var_len_condition(cond, start_var, end_var, params)?;
+            if alias == "s" {
+                start_conditions.push(sql);
+            } else {
+                end_conditions.push(sql);
+            }
+            Ok(None)
+        }
+        WhereExpr::And(l, r) => {
+            compile_variable_length_where(
+                l,
+                start_var,
+                end_var,
+                params,
+                start_conditions,
+                end_conditions,
+            )?;
+            compile_variable_length_where(
+                r,
+                start_var,
+                end_var,
+                params,
+                start_conditions,
+                end_conditions,
+            )?;
+            Ok(None)
+        }
+        WhereExpr::Or(l, r) => {
+            // After reject_or_spanning_endpoints we know this Or does not straddle
+            // both endpoints.  Compile each branch to a SQL string, then combine
+            // with OR and push into the appropriate condition list.
+            let l_sql = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
+            let r_sql = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
+            match (l_sql, r_sql) {
+                (None, None) => {}
+                (Some((ls, la)), None) => {
+                    if la == "s" {
+                        start_conditions.push(ls);
+                    } else {
+                        end_conditions.push(ls);
+                    }
+                }
+                (None, Some((rs, ra))) => {
+                    if ra == "s" {
+                        start_conditions.push(rs);
+                    } else {
+                        end_conditions.push(rs);
+                    }
+                }
+                (Some((ls, la)), Some((rs, _ra))) => {
+                    // Both non-None and same alias (guaranteed by the spanning check).
+                    let combined = format!("({ls} OR {rs})");
+                    if la == "s" {
+                        start_conditions.push(combined);
+                    } else {
+                        end_conditions.push(combined);
+                    }
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Compile a `WhereExpr` sub-tree to a SQL string plus the endpoint alias it
+/// targets (`"s"` or `"r"`).  Returns `Ok(None)` for `WhereExpr::True`.
+///
+/// Used by `compile_variable_length_where` to collect the two sides of an `Or`
+/// before joining them with ` OR `.
+fn compile_variable_length_where_to_sql(
+    expr: &WhereExpr,
+    start_var: Option<&str>,
+    end_var: Option<&str>,
+    params: &mut Vec<QueryValue>,
+) -> Result<Option<(String, &'static str)>, QueryError> {
+    match expr {
+        WhereExpr::True => Ok(None),
+        WhereExpr::Condition(cond) => {
+            let (sql, alias) = compile_var_len_condition(cond, start_var, end_var, params)?;
+            Ok(Some((sql, alias)))
+        }
+        WhereExpr::And(l, r) => {
+            let ls = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
+            let rs = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
+            Ok(match (ls, rs) {
+                (None, None) => None,
+                (Some(s), None) | (None, Some(s)) => Some(s),
+                (Some((lsql, la)), Some((rsql, _))) => Some((format!("{lsql} AND {rsql}"), la)),
+            })
+        }
+        WhereExpr::Or(l, r) => {
+            let ls = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
+            let rs = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
+            Ok(match (ls, rs) {
+                (None, None) => None,
+                (Some(s), None) | (None, Some(s)) => Some(s),
+                (Some((lsql, la)), Some((rsql, _))) => Some((format!("({lsql} OR {rsql})"), la)),
+            })
+        }
+    }
+}
+
 /// Compile variable-length patterns to a recursive CTE.
 ///
 /// Depth is capped at min(requested, 10) — MAJ-2 (parameterized min_depth, not literal).
@@ -850,77 +1034,25 @@ fn compile_variable_length(
     }
 
     // WHERE clause conditions for variable-length patterns.
-    // Each leaf condition is routed to start_conditions (alias s) or end_conditions
-    // (alias r) based on which variable it references.  OR expressions that span
-    // both start and end nodes are not supported — reject explicitly with an
-    // actionable error message rather than silently converting OR to AND.
+    // OR expressions that span both start and end nodes are not supported — reject
+    // explicitly with an actionable error message rather than silently converting OR to AND.
     reject_or_spanning_endpoints(&query.where_clause, start, end)?;
 
-    for cond in query.where_clause.conditions() {
-        let col_alias = if start.variable.as_deref() == Some(cond.variable.as_str()) {
-            "s"
-        } else if end.variable.as_deref() == Some(cond.variable.as_str()) {
-            "r"
-        } else {
-            return Err(QueryError::Compile(format!(
-                "variable '{}' in WHERE not supported in variable-length pattern (only start/end node variables)",
-                cond.variable
-            )));
-        };
-
-        let col_expr =
-            if cond.property == "name" || cond.property == "kind" || cond.property == "entity_type"
-            {
-                format!("{col_alias}.{}", cond.property)
-            } else {
-                format!(
-                    "json_extract({col_alias}.properties, '$.{}')",
-                    cond.property.replace('\'', "''")
-                )
-            };
-
-        let op_str = match cond.op {
-            CompareOp::Eq => "=",
-            CompareOp::Neq => "!=",
-            CompareOp::Gt => ">",
-            CompareOp::Lt => "<",
-            CompareOp::Gte => ">=",
-            CompareOp::Lte => "<=",
-            CompareOp::Like => "LIKE",
-        };
-
-        match &cond.value {
-            ConditionValue::String(s) => {
-                params.push(QueryValue::Text(s.clone()));
-                let collate = if matches!(cond.op, CompareOp::Eq | CompareOp::Like) {
-                    " COLLATE NOCASE"
-                } else {
-                    ""
-                };
-                if col_alias == "s" {
-                    start_conditions
-                        .push(format!("{col_expr} {op_str} ?{}{collate}", params.len()));
-                } else {
-                    end_conditions.push(format!("{col_expr} {op_str} ?{}{collate}", params.len()));
-                }
-            }
-            ConditionValue::Number(n) => {
-                params.push(QueryValue::Float(*n));
-                if col_alias == "s" {
-                    start_conditions.push(format!("{col_expr} {op_str} ?{}", params.len()));
-                } else {
-                    end_conditions.push(format!("{col_expr} {op_str} ?{}", params.len()));
-                }
-            }
-            ConditionValue::Bool(b) => {
-                params.push(QueryValue::Integer(if *b { 1 } else { 0 }));
-                if col_alias == "s" {
-                    start_conditions.push(format!("{col_expr} {op_str} ?{}", params.len()));
-                } else {
-                    end_conditions.push(format!("{col_expr} {op_str} ?{}", params.len()));
-                }
-            }
-        }
+    // Compile the WHERE tree preserving Or/And connectives.  After the spanning
+    // check above we know every Or node touches at most one endpoint, so we can
+    // safely route whole sub-trees to start_conditions or end_conditions.
+    if let Some(where_sql) = compile_variable_length_where(
+        &query.where_clause,
+        start.variable.as_deref(),
+        end.variable.as_deref(),
+        &mut params,
+        &mut start_conditions,
+        &mut end_conditions,
+    )? {
+        // A non-None return means the expression spans no variable (WhereExpr::True
+        // is the only such case and returns None).  This branch is unreachable given
+        // the reject_or_spanning_endpoints guard above, but handle it safely.
+        start_conditions.push(where_sql);
     }
 
     // MAJ-2: min_depth is always a bound parameter, never a literal
@@ -1784,6 +1916,87 @@ mod tests {
         assert!(
             result.is_ok(),
             "AND across endpoints must compile; got {result:?}"
+        );
+    }
+
+    // --- Regression tests for #379: variable-length WHERE OR must not flatten to AND ---
+
+    #[test]
+    fn test_variable_length_or_compiles_to_or() {
+        // #379: MATCH (a)-[*1..3 WHERE p1 OR p2]-> in GQL surface maps to a single-endpoint
+        // OR in the WHERE clause.  The compiled SQL must contain OR, not AND.
+        let q = gql::parse(
+            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'LoRA' OR a.name = 'QLoRA' RETURN b",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // The start_conditions list must contain an OR fragment, not two AND-joined conditions.
+        assert!(
+            compiled.sql.contains(" OR "),
+            "#379: variable-length single-endpoint OR must produce SQL OR; sql: {}",
+            compiled.sql
+        );
+        // Both values must appear as bound parameters.
+        let has_lora = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "LoRA"));
+        let has_qlora = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "QLoRA"));
+        assert!(has_lora && has_qlora, "both OR values must be bound params");
+    }
+
+    #[test]
+    fn test_single_endpoint_or_at_depth_1() {
+        // #379: single-hop pattern with single-endpoint OR in WHERE.
+        // The OR must appear in the compiled SQL (not silently become AND).
+        let q = gql::parse(
+            "MATCH (a)-[r:extends]->(b) WHERE r.weight > 0.5 OR r.relation = 'extends' RETURN a",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains(" OR "),
+            "#379: fixed-length single-endpoint OR must produce SQL OR; sql: {}",
+            compiled.sql
+        );
+        let has_extends = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "extends"));
+        assert!(
+            has_extends,
+            "relation value 'extends' must be a bound param"
+        );
+    }
+
+    #[test]
+    fn test_and_still_works() {
+        // #379: regression guard — simple WHERE p1 AND p2 must still emit AND.
+        let q = gql::parse(
+            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'LoRA' AND a.kind = 'concept' RETURN b",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // The SQL must not contain a bare " OR " from the AND expression.
+        assert!(
+            !compiled.sql.contains(" OR "),
+            "#379: AND must not produce OR; sql: {}",
+            compiled.sql
+        );
+        let has_lora = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "LoRA"));
+        let has_concept = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "concept"));
+        assert!(
+            has_lora && has_concept,
+            "both AND values must be bound params"
         );
     }
 }
