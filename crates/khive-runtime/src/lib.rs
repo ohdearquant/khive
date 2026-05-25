@@ -50,8 +50,8 @@ pub use objectives::{
 };
 pub use operations::{LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
-    DispatchHook, KindHook, PackFactory, PackRegistration, PackRegistry, PackRuntime, VerbRegistry,
-    VerbRegistryBuilder,
+    DispatchHook, KindHook, NoteKindSpec, NoteLifecycleSpec, PackFactory, PackRegistration,
+    PackRegistry, PackRuntime, PackSchemaPlan, VerbRegistry, VerbRegistryBuilder,
 };
 pub use portability::{ImportSummary, KgArchive};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};

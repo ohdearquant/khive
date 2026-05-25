@@ -3,7 +3,10 @@
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::HandlerDef;
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    KhiveRuntime, Namespace, NoteKindSpec, PackSchemaPlan, RuntimeError, VerbRegistry,
+    VerbRegistryBuilder,
+};
 use serde_json::{json, Value};
 
 fn rt() -> KhiveRuntime {
@@ -417,5 +420,304 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
             .iter()
             .filter_map(|n| n.name.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+// ── ADR-004 / ADR-019 cluster-15 tests ───────────────────────────────────────
+
+/// F100: GtdPack exposes a schema_plan() returning the gtd_lifecycle_audit DDL.
+#[tokio::test]
+async fn pack_runtime_exposes_schema_plan() {
+    use khive_runtime::PackRuntime;
+    let pack = GtdPack::new(rt());
+    let plan: Option<PackSchemaPlan> = pack.schema_plan();
+    assert!(plan.is_some(), "GtdPack must return Some(PackSchemaPlan)");
+    let plan = plan.unwrap();
+    assert_eq!(plan.pack, "gtd");
+    assert!(
+        !plan.statements.is_empty(),
+        "schema plan must have at least one DDL statement"
+    );
+    let combined = plan.statements.join(" ");
+    assert!(
+        combined.contains("gtd_lifecycle_audit"),
+        "schema plan must reference gtd_lifecycle_audit table; got: {combined}"
+    );
+    assert!(
+        combined.contains("CREATE TABLE IF NOT EXISTS"),
+        "schema plan DDL must be idempotent (CREATE TABLE IF NOT EXISTS)"
+    );
+}
+
+/// F100: VerbRegistry aggregates schema plans from loaded packs.
+#[tokio::test]
+async fn verb_registry_aggregates_schema_plans() {
+    let fixture = pack(rt());
+    let plans = fixture.registry.all_schema_plans();
+    assert!(
+        plans.iter().any(|p| p.pack == "gtd"),
+        "registry must expose GTD schema plan; got packs: {:?}",
+        plans.iter().map(|p| p.pack).collect::<Vec<_>>()
+    );
+}
+
+/// F100 + ADR-004: GtdPack exposes NoteKindSpec for the task kind with lifecycle.
+#[tokio::test]
+async fn pack_runtime_exposes_note_kind_spec_for_task() {
+    use khive_runtime::PackRuntime;
+    let pack = GtdPack::new(rt());
+    let specs: &[NoteKindSpec] = pack.note_kind_specs();
+    assert!(
+        !specs.is_empty(),
+        "GtdPack must declare at least one NoteKindSpec"
+    );
+
+    let task_spec = specs
+        .iter()
+        .find(|s| s.kind == "task")
+        .expect("GtdPack must have NoteKindSpec for 'task'");
+
+    // ADR-004: lifecycle field must be "kind_status", NOT "status".
+    assert_eq!(
+        task_spec.lifecycle.field, "kind_status",
+        "ADR-004: lifecycle field must be 'kind_status' to avoid collision with NoteStatus"
+    );
+    assert_eq!(
+        task_spec.lifecycle.initial, "inbox",
+        "task lifecycle must start at 'inbox'"
+    );
+    assert!(
+        task_spec.lifecycle.terminal.contains(&"done"),
+        "terminal states must include 'done'"
+    );
+    assert!(
+        task_spec.lifecycle.terminal.contains(&"cancelled"),
+        "terminal states must include 'cancelled'"
+    );
+}
+
+/// F100: VerbRegistry aggregates NoteKindSpecs from loaded packs.
+#[tokio::test]
+async fn verb_registry_aggregates_note_kind_specs() {
+    let fixture = pack(rt());
+    let specs = fixture.registry.all_note_kind_specs();
+    assert!(
+        specs.iter().any(|s| s.kind == "task"),
+        "registry must aggregate task NoteKindSpec"
+    );
+}
+
+/// ADR-004: lifecycle transitions in NoteKindSpec match the runtime schema.
+#[tokio::test]
+async fn note_kind_spec_transitions_match_runtime_schema() {
+    use khive_pack_gtd::schema::{can_transition, is_terminal};
+    use khive_runtime::PackRuntime;
+
+    let pack = GtdPack::new(rt());
+    let specs = pack.note_kind_specs();
+    let task_spec = specs.iter().find(|s| s.kind == "task").unwrap();
+
+    // Every declared transition in the spec must agree with can_transition().
+    for &(from, to) in task_spec.lifecycle.transitions {
+        assert!(
+            can_transition(from, to),
+            "NoteKindSpec declares ({from}→{to}) but schema::can_transition disagrees"
+        );
+    }
+    // Every terminal status in the spec must agree with is_terminal().
+    for &t in task_spec.lifecycle.terminal {
+        assert!(
+            is_terminal(t),
+            "NoteKindSpec declares '{t}' as terminal but schema::is_terminal disagrees"
+        );
+    }
+}
+
+/// F101: transition writes an audit record to gtd_lifecycle_audit.
+#[tokio::test]
+async fn transition_writes_lifecycle_audit_record() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let rt = rt();
+    let fixture = pack(rt.clone());
+
+    let resp = assign(
+        &fixture,
+        json!({"title": "audit test task", "status": "inbox"}),
+    )
+    .await;
+    let task_id = resp["full_id"].as_str().unwrap().to_string();
+
+    fixture
+        .dispatch(
+            "transition",
+            json!({"id": task_id, "status": "next", "note": "moved to next"}),
+        )
+        .await
+        .expect("transition should succeed");
+
+    // Query the audit table.
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT note_id, from_state, to_state, note FROM gtd_lifecycle_audit \
+                  WHERE note_id = ?1"
+                .into(),
+            params: vec![SqlValue::Text(task_id.clone())],
+            label: None,
+        })
+        .await
+        .expect("audit query");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "F101: transition must write exactly one audit row; got {rows:?}"
+    );
+    let row = &rows[0];
+    assert_eq!(
+        row.get("from_state").and_then(|v| {
+            if let SqlValue::Text(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        }),
+        Some("inbox"),
+        "audit from_state must be 'inbox'"
+    );
+    assert_eq!(
+        row.get("to_state").and_then(|v| {
+            if let SqlValue::Text(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        }),
+        Some("next"),
+        "audit to_state must be 'next'"
+    );
+    assert_eq!(
+        row.get("note").and_then(|v| {
+            if let SqlValue::Text(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        }),
+        Some("moved to next"),
+        "audit note field must be recorded"
+    );
+}
+
+/// F101: complete writes an audit record to gtd_lifecycle_audit.
+#[tokio::test]
+async fn complete_writes_lifecycle_audit_record() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let rt = rt();
+    let fixture = pack(rt.clone());
+
+    let resp = assign(&fixture, json!({"title": "audit complete test"})).await;
+    let task_id = resp["full_id"].as_str().unwrap().to_string();
+
+    fixture
+        .dispatch("complete", json!({"id": task_id, "result": "done!"}))
+        .await
+        .expect("complete should succeed");
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT from_state, to_state FROM gtd_lifecycle_audit WHERE note_id = ?1".into(),
+            params: vec![SqlValue::Text(task_id.clone())],
+            label: None,
+        })
+        .await
+        .expect("audit query");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "F101: complete must write one audit row; got {rows:?}"
+    );
+    let row = &rows[0];
+    assert_eq!(
+        row.get("to_state").and_then(|v| {
+            if let SqlValue::Text(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        }),
+        Some("done"),
+        "audit to_state must be 'done'"
+    );
+}
+
+/// F101: idempotent same-status transition does NOT write an audit record.
+///
+/// Strategy: perform one real transition (inbox → next) to initialize the audit
+/// schema and record a baseline row, then attempt a noop (next → next) and
+/// confirm only the baseline row exists (count stays at 1, not 2).
+#[tokio::test]
+async fn noop_transition_does_not_write_audit_record() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let rt = rt();
+    let fixture = pack(rt.clone());
+
+    let resp = assign(
+        &fixture,
+        json!({"title": "noop audit test", "status": "inbox"}),
+    )
+    .await;
+    let task_id = resp["full_id"].as_str().unwrap().to_string();
+
+    // Real transition — initializes the audit schema and writes one row.
+    fixture
+        .dispatch("transition", json!({"id": task_id, "status": "next"}))
+        .await
+        .expect("real transition should succeed");
+
+    // Noop transition — must not write a second row.
+    let r = fixture
+        .dispatch("transition", json!({"id": task_id, "status": "next"}))
+        .await
+        .expect("noop transition should return ok");
+    assert_eq!(
+        r["transitioned"], false,
+        "noop must return transitioned=false"
+    );
+
+    // Should still have exactly ONE audit row (from the real transition above).
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT COUNT(*) as cnt FROM gtd_lifecycle_audit WHERE note_id = ?1".into(),
+            params: vec![SqlValue::Text(task_id.clone())],
+            label: None,
+        })
+        .await
+        .expect("audit count query");
+
+    let count = rows
+        .first()
+        .and_then(|r| r.get("cnt"))
+        .and_then(|v| {
+            if let SqlValue::Integer(n) = v {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(-1);
+
+    assert_eq!(
+        count, 1,
+        "noop transition must not insert an audit row (expected 1 baseline row, got {count})"
     );
 }

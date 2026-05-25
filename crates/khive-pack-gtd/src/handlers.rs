@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
+use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::EdgeRelation;
 
 use crate::schema::{
@@ -18,6 +19,82 @@ use crate::schema::{
     is_valid_status, normalize_status, priority_to_salience,
 };
 use crate::GtdPack;
+
+// ── lifecycle audit schema (ADR-019 §schema_plan) ───────────────────────────
+
+/// Ensure `gtd_lifecycle_audit` and its index exist on the given runtime.
+///
+/// Idempotent (`CREATE TABLE IF NOT EXISTS`).  Applied lazily on the first
+/// `transition` or `complete` call.  Logs a warning and continues if the DDL
+/// fails (e.g. read-only replica) — the audit is best-effort, not load-bearing.
+///
+/// We intentionally apply the DDL on each call rather than using a global
+/// `OnceLock`, because each `KhiveRuntime::memory()` in tests creates a fresh
+/// in-memory database that needs its own schema bootstrap.  In production the
+/// DDL is idempotent and cheap (SQLite skips `IF NOT EXISTS` tables instantly).
+async fn ensure_audit_schema(runtime: &KhiveRuntime) {
+    let script = crate::GTD_SCHEMA_PLAN_STMTS.join(";");
+    match runtime.sql().writer().await {
+        Ok(mut w) => {
+            if let Err(e) = w.execute_script(script).await {
+                tracing::warn!(error = %e, "gtd: failed to apply lifecycle_audit schema (non-fatal)");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "gtd: failed to acquire SQL writer for audit schema (non-fatal)");
+        }
+    }
+}
+
+/// Append one row to `gtd_lifecycle_audit`.
+///
+/// Best-effort: failures are logged and swallowed.  The note's successful
+/// write has already happened; a missing audit row is degraded, not a failure.
+async fn write_audit_record(
+    runtime: &KhiveRuntime,
+    note_id: Uuid,
+    from: &str,
+    to: &str,
+    transition_note: Option<&str>,
+) {
+    let now = Utc::now().timestamp_micros();
+    let stmt = SqlStatement {
+        sql: "INSERT INTO gtd_lifecycle_audit (note_id, from_state, to_state, note, at) \
+              VALUES (?1, ?2, ?3, ?4, ?5)"
+            .into(),
+        params: vec![
+            SqlValue::Text(note_id.as_hyphenated().to_string()),
+            SqlValue::Text(from.to_string()),
+            SqlValue::Text(to.to_string()),
+            match transition_note {
+                Some(n) => SqlValue::Text(n.to_string()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(now),
+        ],
+        label: Some("gtd_audit".into()),
+    };
+    match runtime.sql().writer().await {
+        Ok(mut w) => {
+            if let Err(e) = w.execute(stmt).await {
+                tracing::warn!(
+                    note_id = %note_id,
+                    from,
+                    to,
+                    error = %e,
+                    "gtd: audit write failed (non-fatal)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                note_id = %note_id,
+                error = %e,
+                "gtd: failed to acquire SQL writer for audit write (non-fatal)"
+            );
+        }
+    }
+}
 
 // ── param structs ────────────────────────────────────────────────────────────
 
@@ -446,6 +523,10 @@ impl GtdPack {
             .await
             .map_err(|e| RuntimeError::Internal(format!("upsert_note: {e}")))?;
 
+        // ADR-019: write lifecycle audit record (best-effort).
+        ensure_audit_schema(self.runtime()).await;
+        write_audit_record(self.runtime(), note.id, &current, "done", None).await;
+
         Ok(json!({
             "completed": true,
             "id": short_id(note.id),
@@ -584,6 +665,10 @@ impl GtdPack {
             .upsert_note(note.clone())
             .await
             .map_err(|e| RuntimeError::Internal(format!("upsert_note: {e}")))?;
+
+        // ADR-019 + ADR-101: write lifecycle audit record (best-effort).
+        ensure_audit_schema(self.runtime()).await;
+        write_audit_record(self.runtime(), note.id, &current, target, p.note.as_deref()).await;
 
         Ok(json!({
             "transitioned": true,
