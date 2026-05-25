@@ -303,26 +303,33 @@ impl StorageBackend {
             .is_some();
 
         if table_exists {
-            let (has_field, has_embedding_model) = {
-                let pragma = format!("PRAGMA table_xinfo({})", table);
-                let mut stmt = writer.conn().prepare(&pragma)?;
-                let mut rows = stmt.query([])?;
-                let mut has_field = false;
-                let mut has_embedding_model = false;
-                while let Some(row) = rows.next()? {
-                    let name: String = row.get(1)?;
-                    if name == "field" {
-                        has_field = true;
-                    }
-                    if name == "embedding_model" {
-                        has_embedding_model = true;
-                    }
+            // V17 migration (vector_embedding_model_tag_preserving_rebuild) adds
+            // `field` and `embedding_model` to all pre-existing vec0 tables at
+            // migration time.  If this table still lacks either column post-migration
+            // that indicates the database was not migrated — return a hard error
+            // rather than silently dropping data.
+            let pragma = format!("PRAGMA table_xinfo({})", table);
+            let mut stmt = writer.conn().prepare(&pragma)?;
+            let mut rows = stmt.query([])?;
+            let mut has_field = false;
+            let mut has_embedding_model = false;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == "field" {
+                    has_field = true;
                 }
-                (has_field, has_embedding_model)
-            };
+                if name == "embedding_model" {
+                    has_embedding_model = true;
+                }
+            }
             if !has_field || !has_embedding_model {
-                let drop_ddl = format!("DROP TABLE IF EXISTS {}", table);
-                writer.conn().execute_batch(&drop_ddl)?;
+                return Err(SqliteError::InvalidData(format!(
+                    "vec0 table '{}' is missing required column(s) (field={}, \
+                     embedding_model={}); run `kkernel db migrate` to apply V17 \
+                     (vector_embedding_model_tag_preserving_rebuild) before opening \
+                     this vector store",
+                    table, has_field, has_embedding_model,
+                )));
             }
         }
 

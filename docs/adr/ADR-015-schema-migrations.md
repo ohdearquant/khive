@@ -46,6 +46,7 @@ The canonical ledger of database schema migration versions. Migration versions a
 |     V14 | c20/ADR-043  | embedding_model_registry                          | shipped |
 |     V15 | c22/ADR-046  | proposals_open                                    | shipped |
 |     V16 | v022/ADR-043 | vector_embedding_model_tag                        | shipped |
+|     V17 | v023/ADR-043 | vector_embedding_model_tag_preserving_rebuild     | shipped |
 
 > **Amendment (2026-05-24, cluster-24 + post-integration)**: The ledger above reflects what
 > actually shipped on `integration/v1-adr-alignment` after parallel cluster landings c01, c03,
@@ -64,6 +65,15 @@ The canonical ledger of database schema migration versions. Migration versions a
 > the dual-embedding plumbing described in ADR-043 §1. sqlite-vec virtual tables are handled
 > at open time via schema rebuild because vec0 does not support `ALTER TABLE`. Versions V1–V16
 > are production schema and are frozen.
+>
+> **V17 amendment (2026-05-25, cluster v023/ADR-043)**: V17 (`vector_embedding_model_tag_preserving_rebuild`)
+> closes the data-loss risk documented in ADR-043 §1.1 final paragraph. The open-time DROP path
+> in `backend.rs` is replaced with a migration-time copy-with-default rebuild that preserves
+> existing vec0 rows. Model name is inferred from the table suffix (`vec_paraphrase` →
+> `'paraphrase'`); unknown suffixes fall back to `'all-minilm-l6-v2'`. The V16 and V14
+> discovery queries also gained `AND name NOT LIKE '%\_metadata%'` to exclude newer sqlite-vec
+> shadow tables (`_metadatachunks00`, `_metadatatext00`, etc.). Versions V1–V17 are production
+> schema and are frozen.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
