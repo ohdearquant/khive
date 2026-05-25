@@ -52,8 +52,8 @@ If two entities refer to the same real-world thing (e.g., "LoRA" and "Low-Rank A
 merge(into_id="<keep-id>", from_id="<remove-id>")
 ```
 
-`merge` is entity-only in v0.1. Properties combine, tags union, edges rewire to the kept
-entity, the other is removed. Both must be entities (not notes).
+`merge` deduplicates entities. Properties combine, tags union, edges rewire to the kept
+entity, and the duplicate is removed. Both IDs must refer to entities.
 
 For duplicate **notes** — use supersession instead:
 
@@ -102,9 +102,9 @@ Check for:
 Fix with:
 
 ```
-update(id="<edge-id>", relation="<correct-relation>")
-update(id="<edge-id>", weight=1.0)
-delete(id="<edge-id>")  # if the edge is just wrong
+update(kind="edge", id="<edge-id>", relation="<correct-relation>")
+update(kind="edge", id="<edge-id>", weight=1.0)
+delete(kind="edge", id="<edge-id>")  # if the edge is just wrong
 ```
 
 ### 6. Report

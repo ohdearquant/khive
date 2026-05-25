@@ -11,7 +11,7 @@ The MCP server exposes one tool — `request` — that takes the verb call as a 
 
 ```text
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
-request(ops="[create(...), create(...), link(...)]")   # parallel batch
+request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\"), create(kind=\"entity\", entity_kind=\"document\", name=\"LoRA paper\"), link(source_id=\"<concept-id>\", target_id=\"<paper-id>\", relation=\"introduced_by\")]")   # parallel batch
 ```
 
 The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
@@ -36,7 +36,7 @@ create(kind="entity", entity_kind="<kind>", name="<short canonical name>",
   properties={"domain": "...", "type": "...", "year": "..."})
 ```
 
-**6 entity kinds** (closed — pick the best fit, don't invent):
+**8 entity kinds** (closed — pick the best fit, don't invent):
 
 | Kind       | Use for                                                      |
 | ---------- | ------------------------------------------------------------ |
@@ -46,6 +46,8 @@ create(kind="entity", entity_kind="<kind>", name="<short canonical name>",
 | `project`  | Codebases, libraries, tools, frameworks                      |
 | `person`   | Researchers, engineers, authors                              |
 | `org`      | Labs, companies, institutions                                |
+| `artifact` | Generated files, model artifacts, build outputs              |
+| `service`  | Long-running services, APIs, deployed systems                |
 
 **Naming**: short canonical name people actually say. `LoRA` not `Low-Rank Adaptation of Large Language Models`. Full titles go in `properties`.
 
@@ -57,7 +59,7 @@ For each relationship you identified in the material:
 link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.0>)
 ```
 
-**13 relations** (closed — map to these, don't invent):
+**15 relations** (closed — map to these, don't invent):
 
 | Category       | Relation        | Direction              | When                      |
 | -------------- | --------------- | ---------------------- | ------------------------- |
@@ -68,6 +70,8 @@ link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.
 | Derivation     | `variant_of`    | variant → original     | Modified version          |
 | Derivation     | `introduced_by` | concept → paper/person | First described in        |
 | Derivation     | `supersedes`    | new → old              | Replaces entirely         |
+| Provenance     | `derived_from`  | derived → source       | Data/artifact lineage     |
+| Temporal       | `precedes`      | earlier → later        | Ordering over time        |
 | Dependency     | `depends_on`    | consumer → dep         | Hard requirement          |
 | Dependency     | `enables`       | prerequisite → outcome | Makes possible            |
 | Implementation | `implements`    | code → concept         | Code realizes algorithm   |
@@ -115,5 +119,5 @@ Material exhausted. Every entity above minimum density. No orphans (0-edge nodes
 If a tool returns an error, read the message — it lists valid values. Common cases:
 
 - Invalid `entity_kind` or `note_kind` → the error says which values are valid
-- Invalid `relation` → use only the 13 above
+- Invalid `relation` → use only the 15 above
 - ID not found → check the UUID; use `search` to find the correct one

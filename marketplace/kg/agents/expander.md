@@ -116,7 +116,6 @@ If you filed a `question` note instead of expanding:
 
 ```
 complete(id="<your-task-id>",
-         status="done",
          result="Cannot expand without external input. Question note filed: <note-id>. Reason: <…>")
 ```
 

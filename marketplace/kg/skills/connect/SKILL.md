@@ -33,7 +33,7 @@ create(kind="entity", entity_kind="<kind>", name="<short canonical name>",
   description="<what it is>", properties={...})
 ```
 
-Pick from 6 kinds: `concept`, `document`, `dataset`, `project`, `person`, `org`.
+Pick from 8 kinds: `concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service`.
 
 ### 3. Find what it connects to
 
@@ -72,7 +72,7 @@ link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.
 | `implements`    | code → concept        | "lattice-inference implements GQA"         |
 | `depends_on`    | consumer → dependency | "quantization depends_on calibration data" |
 
-If the relationship doesn't fit any of the 13 relations, it's probably a **property** on the entity (e.g., "published in 2021" → `properties.year: "2021"`, not an edge).
+If the relationship doesn't fit any of the 15 relations, it's probably a **property** on the entity (e.g., "published in 2021" → `properties.year: "2021"`, not an edge).
 
 ### 5. Verify density
 

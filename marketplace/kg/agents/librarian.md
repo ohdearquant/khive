@@ -68,7 +68,7 @@ For each agent's queue:
 Then check `question` notes:
 
 ```
-list(kind="note", filter={"note_kind": "question"}, limit=50)
+list(kind="note", note_kind="question", limit=50)
 ```
 
 Filter for notes older than 7 days. Each is a research-direction the swarm couldn't
@@ -79,7 +79,7 @@ autonomously resolve. Group by tag / domain to surface patterns.
 ## Taxonomy questions
 
 When gap-analyst queues a `kg:meta + taxonomy` task, the gap requires a relation
-that doesn't exist in the closed 13-relation set. Librarian's job:
+that doesn't exist in the closed 15-relation set. Librarian's job:
 
 1. Read the gap analyst's report and the affected entities.
 2. Determine whether the missing relation is genuine or whether the gap can be
@@ -115,7 +115,7 @@ the swarm:
 ```
 create(kind="note", note_kind="decision",
        content="Recommend running 3 parallel polisher agents to drain backlog. Current depth 50, normal depth <10.",
-       tags=["library:recommendation"])
+       properties={"tags": ["library:recommendation"]})
 ```
 
 ---

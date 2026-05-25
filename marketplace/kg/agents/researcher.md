@@ -55,10 +55,12 @@ Do not begin external research until you've exhausted what's already in the grap
 
 ### Edge creation rules
 
-Use only these 13 relations (no others — the parser rejects unknown relations):
+Use only these 15 relations (no others — the parser rejects unknown relations):
 
 - Structure: `contains`, `part_of`, `instance_of`
 - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
+- Provenance: `derived_from`
+- Temporal: `precedes`
 - Dependency: `depends_on`, `enables`
 - Implementation: `implements`
 - Lateral: `competes_with`, `composed_with`
@@ -106,8 +108,8 @@ Never store findings ONLY as notes. If a concept is worth naming, it's an entity
 "What does entity X connect to?"     → neighbors(node_id=X, direction="both")
 "What builds on X? (lineage)"        → traverse(roots=[X], direction="in", relations=["extends","variant_of"])
 "What does X depend on?"             → traverse(roots=[X], direction="out", relations=["depends_on"])
-"All concepts in domain Y"           → query("MATCH (a:concept) WHERE a.domain='Y' RETURN a.name, a.id LIMIT 50")
-"Implementations of concept X"       → query("MATCH (p:project)-[:implements]->(c:concept) WHERE c.name='X' RETURN p.name, c.name LIMIT 20")
+"All concepts in domain Y"           → query(query="MATCH (a:concept) WHERE a.domain='Y' RETURN a.name, a.id LIMIT 50")
+"Implementations of concept X"       → query(query="MATCH (p:project)-[:implements]->(c:concept) WHERE c.name='X' RETURN p.name, c.name LIMIT 20")
 "What concepts did paper P introduce?"→ neighbors(node_id=paper_id, direction="in", relations=["introduced_by"])
 "Previously observed/decided on X"   → search(kind="note", query=X)
 ```
@@ -134,7 +136,7 @@ Mandatory verification before reporting:
 
 3. **Update status** if research changed maturity:
    ```python
-   update(id=<entity-id>, properties={"status": "researched"})
+   update(kind="entity", id="<entity-id>", properties={"status": "researched"})
    ```
 
 4. **Decision note** if a choice was made:
@@ -172,7 +174,7 @@ Density: 47 edges / 11 entities = 4.3 (was 3.8 before)
 
 - Do not search externally for things already in the graph — check the graph first
 - Do not create entities without edges — orphans degrade graph quality immediately
-- Do not use ad-hoc edge relations (`uses`, `related_to`, `references`) — map to the 13 or don't link
+- Do not use ad-hoc edge relations (`uses`, `related_to`, `references`) — map to the 15 or don't link
 - Do not reverse `introduced_by` — direction is concept → paper/person, never paper → person
 - Do not use entity names as strings in `source_id`/`target_id` — always use IDs from prior responses
 - Do not use `traverse` when `neighbors` suffices — use the cheapest retrieval that answers the question

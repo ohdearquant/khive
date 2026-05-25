@@ -41,7 +41,7 @@ Or add to your project's `.mcp.json`:
 
 ## What You Get
 
-### 1 MCP tool (`request`), 11 verbs inside it
+### 1 MCP tool (`request`), 14 verbs inside it
 
 The MCP server exposes a single tool, `request`, that takes the verb call as a string:
 
@@ -55,7 +55,7 @@ request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\
 | `create`    | Create entities or notes                    |
 | `get`       | Fetch any record by UUID (or 8-char prefix) |
 | `list`      | Browse with filters                         |
-| `update`    | Patch entity/edge fields                    |
+| `update`    | Patch entity, note, or edge fields          |
 | `delete`    | Soft or hard delete                         |
 | `merge`     | Deduplicate two entities                    |
 | `search`    | Hybrid FTS5 + vector search                 |
@@ -63,17 +63,23 @@ request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\
 | `neighbors` | Immediate graph neighbors                   |
 | `traverse`  | Multi-hop BFS                               |
 | `query`     | GQL/SPARQL pattern matching                 |
+| `propose`   | Create an event-sourced change proposal     |
+| `review`    | Review a proposal                           |
+| `withdraw`  | Withdraw an open proposal                   |
 
-### 6 Skills (workflow-shaped, not verb docs)
+### 9 Skills (workflow-shaped, not verb docs)
 
-| Skill   | Command       | What it does                                                                                     |
-| ------- | ------------- | ------------------------------------------------------------------------------------------------ |
-| digest  | `/kg:digest`  | Ingest material into the graph — extract entities, link them, verify density                     |
-| explore | `/kg:explore` | Discover what the graph knows about a topic — traverse, narrate, surface gaps                    |
-| connect | `/kg:connect` | Wire a new concept into existing knowledge — find relations, reach density                       |
-| polish  | `/kg:polish`  | Audit and fix — orphans, low-degree nodes, duplicates, stale edges                               |
-| gap     | `/kg:gap`     | Strategic-gap survey — researched-but-unbuilt, decision debt, frontier ranking for planning      |
-| expand  | `/kg:expand`  | Self-expansion — take a gap and grow the graph to close it (promote / bridge / extend / resolve) |
+| Skill    | Command        | What it does                                                                                     |
+| -------- | -------------- | ------------------------------------------------------------------------------------------------ |
+| digest   | `/kg:digest`   | Ingest material into the graph — extract entities, link them, verify density                     |
+| explore  | `/kg:explore`  | Discover what the graph knows about a topic — traverse, narrate, surface gaps                    |
+| connect  | `/kg:connect`  | Wire a new concept into existing knowledge — find relations, reach density                       |
+| polish   | `/kg:polish`   | Audit and fix — orphans, low-degree nodes, duplicates, stale edges                               |
+| gap      | `/kg:gap`      | Strategic-gap survey — researched-but-unbuilt, decision debt, frontier ranking for planning      |
+| expand   | `/kg:expand`   | Self-expansion — take a gap and grow the graph to close it (promote / bridge / extend / resolve) |
+| propose  | `/kg:propose`  | Draft event-sourced KG changes for review                                                        |
+| review   | `/kg:review`   | Approve, reject, comment on, or request changes for proposals                                    |
+| withdraw | `/kg:withdraw` | Withdraw an open proposal with rationale                                                         |
 
 ### 6 Agents (specialized + a generic backstop)
 
@@ -122,11 +128,11 @@ to keep the swarm moving; no central orchestrator required.
 
 ## Schema
 
-**6 entity kinds**: concept, document, dataset, project, person, org
+**8 entity kinds**: concept, document, dataset, project, person, org, artifact, service
 
-**13 edge relations**: contains, part_of, instance_of, extends, variant_of,
-introduced_by, supersedes, depends_on, enables, implements, competes_with,
-composed_with, annotates
+**15 edge relations**: contains, part_of, instance_of, extends, variant_of,
+introduced_by, supersedes, derived_from, precedes, depends_on, enables,
+implements, competes_with, composed_with, annotates
 
 **5 note kinds**: observation, insight, question, decision, reference
 

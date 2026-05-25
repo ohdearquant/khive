@@ -55,7 +55,7 @@ Common traversal patterns:
 For complex structural queries, use GQL:
 
 ```
-query("MATCH (a:concept)-[:extends]->(b:concept) WHERE b.name = 'LoRA' RETURN a.name, a.id LIMIT 20")
+query(query="MATCH (a:concept)-[:extends]->(b:concept) WHERE b.name = 'LoRA' RETURN a.name, a.id LIMIT 20")
 ```
 
 **GQL constraints** (the parser is limited):
@@ -64,7 +64,7 @@ query("MATCH (a:concept)-[:extends]->(b:concept) WHERE b.name = 'LoRA' RETURN a.
 - For JSON properties: use `a.domain`, `a.type` etc. (accessed via json_extract internally)
 - `RETURN a.properties` gets the full JSON blob
 - NOT supported: `WHERE NOT`, `COUNT`, `ORDER BY`, `[*..N]` variable-length without min
-- Relations in patterns: use the 13 canonical relation names
+- Relations in patterns: use the 15 canonical relation names
 
 ### 4. Narrate
 
@@ -93,7 +93,7 @@ Report gaps as actionable next steps (e.g., "X exists but has no `introduced_by`
 | Find by content/similarity | `search(kind="entity\|note", query="...")`             |
 | Immediate connections      | `neighbors(node_id, direction, relations)`             |
 | Multi-hop reachability     | `traverse(roots, max_depth, direction, relations)`     |
-| Structural patterns        | `query("MATCH ... RETURN ...")`                        |
+| Structural patterns        | `query(query="MATCH ... RETURN ...")`                  |
 | Browse a category          | `list(kind="entity", entity_kind="concept", limit=50)` |
 
 ## Stop condition

@@ -21,7 +21,7 @@ The MCP server exposes one tool — `request` — that takes the verb call as a 
 
 ```text
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"…\")")
-request(ops="[create(...), link(...), link(...)]")  # parallel batch
+request(ops="[create(kind=\"entity\", entity_kind=\"project\", name=\"lora-tools\"), link(source_id=\"<project-id>\", target_id=\"<concept-id>\", relation=\"implements\"), link(source_id=\"<project-id>\", target_id=\"<dependency-id>\", relation=\"depends_on\")]")  # parallel batch
 ```
 
 The verb examples below show the inner call. Wrap each one as `request(ops="…")`.
@@ -165,7 +165,7 @@ Workflow:
 1. For each member, pull description + properties:
 
 ```
-[get(id="<m1-id>"), get(id="<m2-id>"), ...]
+request(ops="[get(id=\"<m1-id>\"), get(id=\"<m2-id>\")]")
 ```
 
 2. Identify the comparison axes that matter (drawn from descriptions, properties,
@@ -182,7 +182,7 @@ Workflow:
 ```
 create(kind="note", note_kind="decision",
   content="Comparison of <clique-members>. Axes: <axes>. Recommended: <member>. Assumptions: <list>.",
-  annotates=[<all clique member UUIDs>])
+  annotates=["<member-1-uuid>", "<member-2-uuid>"])
 ```
 
 4. If the recommendation is strong (cited by an existing ADR or backed by
@@ -230,7 +230,7 @@ State for the record:
 3. **Every new entity needs a citation.** A description sentence sourced from
    an existing entity, a paper, an ADR, or a code reference. No source = no
    create. File a question note instead.
-4. **Do not create entities outside the closed taxonomies.** 6 kinds, 13
+4. **Do not create entities outside the closed taxonomies.** 8 kinds, 15
    relations, 5 note kinds. If your expansion needs a new kind, that is an
    ADR, not a skill invocation — stop and surface to a human.
 5. **Re-read the source after expansion** to verify you didn't drift. A
