@@ -739,6 +739,32 @@ impl Bm25Index {
         }
     }
 
+    /// Rebuild `forward_index` from the inverted index.
+    ///
+    /// Called after deserialization to restore the forward map so that
+    /// `remove_document` can operate in O(|terms_in_doc|) instead of
+    /// falling back to the O(|vocabulary|) full scan.
+    ///
+    /// This mirrors the `ensure_doc_lengths_vec` pattern: the forward index is
+    /// not stored on disk (it is fully derivable from the inverted index), but
+    /// it must be populated before any removal takes place.
+    ///
+    /// Idempotent: returns immediately when the forward index is already populated
+    /// or when the inverted index is empty.
+    pub fn ensure_forward_index(&mut self) {
+        if !self.forward_index.is_empty() || self.inverted_index.is_empty() {
+            return;
+        }
+        for (term, postings) in &self.inverted_index {
+            for &doc_id in &postings.doc_ids {
+                self.forward_index
+                    .entry(doc_id)
+                    .or_default()
+                    .push(term.clone());
+            }
+        }
+    }
+
     /// Get statistics about the index.
     pub fn stats(&self) -> Bm25Stats {
         Bm25Stats {

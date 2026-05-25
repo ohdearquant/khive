@@ -1016,6 +1016,167 @@ mod memory_budget_tests {
     }
 }
 
+/// Tests for forward index persistence and O(|doc|) remove behaviour (issue #307).
+#[cfg(test)]
+mod forward_index_tests {
+    use crate::{Bm25Config, Bm25Index};
+
+    /// After a serde round-trip, `ensure_forward_index` must rebuild the forward map
+    /// so that subsequent removes take the fast O(|terms_in_doc|) path rather than
+    /// the O(|vocabulary|) fallback.
+    #[test]
+    fn test_forward_index_persisted_across_save_load_cycle() {
+        let mut index = Bm25Index::default();
+        index.index_document("doc1", "quick brown fox").unwrap();
+        index.index_document("doc2", "lazy brown dog").unwrap();
+        index.index_document("doc3", "quick fox jumps").unwrap();
+
+        // Serialize (forward_index is #[serde(skip)] — intentionally not in snapshot).
+        let json = serde_json::to_string(&index).unwrap();
+
+        // Deserialize — forward_index is empty at this point.
+        let mut restored: Bm25Index = serde_json::from_str(&json).unwrap();
+
+        // Forward index is empty after deserialization.
+        assert!(
+            restored.forward_index.is_empty(),
+            "forward_index must be empty right after deserialization"
+        );
+
+        // Calling ensure_forward_index must rebuild it from the inverted index.
+        restored.ensure_forward_index();
+
+        assert!(
+            !restored.forward_index.is_empty(),
+            "forward_index must be populated after ensure_forward_index()"
+        );
+
+        // Every document that has a doc_lengths entry must appear in the forward index.
+        for internal_id in restored.doc_lengths.keys() {
+            assert!(
+                restored.forward_index.contains_key(internal_id),
+                "doc {internal_id} missing from rebuilt forward_index"
+            );
+        }
+    }
+
+    /// `remove_document` on a deserialized index must use the forward index
+    /// (O(|terms_in_doc|) path) rather than the O(|vocabulary|) full scan.
+    ///
+    /// We verify the algorithm by inspecting the forward index state: after the
+    /// first remove call on a fresh-deserialized index, `ensure_forward_index`
+    /// must have populated the map, and subsequent removes must still work
+    /// correctly regardless of vocabulary size.
+    #[test]
+    fn test_remove_uses_forward_index_not_full_scan() {
+        // Build an index with a meaningful vocabulary.
+        let mut index = Bm25Index::default();
+        let words = [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+        ];
+        for (i, word) in words.iter().enumerate() {
+            index
+                .index_document(format!("doc{i}"), &format!("{word} shared_term"))
+                .unwrap();
+        }
+
+        // Serialize and restore (forward_index stripped by #[serde(skip)]).
+        let json = serde_json::to_string(&index).unwrap();
+        let mut restored: Bm25Index = serde_json::from_str(&json).unwrap();
+
+        // Precondition: forward index starts empty after deserialization.
+        assert!(restored.forward_index.is_empty());
+
+        // Remove a document — this triggers ensure_forward_index() internally.
+        let removed = restored.remove_document("doc0");
+        assert!(
+            removed,
+            "remove_document must return true for an existing doc"
+        );
+
+        // After removal: doc0 must be gone, forward index populated for remaining docs.
+        assert!(!restored.contains_document("doc0"));
+        assert_eq!(
+            restored.doc_count(),
+            words.len() - 1,
+            "doc_count must decrease by exactly one"
+        );
+
+        // The forward index must now be populated (lazily rebuilt on first remove).
+        assert!(
+            !restored.forward_index.is_empty(),
+            "forward_index must be populated after the first remove on a deserialized index"
+        );
+
+        // Remove remaining documents one by one — must all succeed cleanly.
+        for i in 1..words.len() {
+            let doc_id = format!("doc{i}");
+            let ok = restored.remove_document(&doc_id);
+            assert!(ok, "remove_document must succeed for {doc_id}");
+        }
+        assert_eq!(restored.doc_count(), 0);
+        assert!(
+            restored.inverted_index.is_empty(),
+            "inverted index must be empty after all removes"
+        );
+    }
+
+    /// Search results must be identical before and after a save/load/remove cycle
+    /// for documents that remain in the index.
+    ///
+    /// This is the regression guard: the forward-index change must not alter
+    /// the scoring or result ordering for documents that were not removed.
+    ///
+    /// Strategy: build baseline on an index without doc4, add doc4, round-trip
+    /// through serde, remove doc4 — then assert results match the original baseline.
+    #[test]
+    fn test_search_results_unchanged_after_add_remove_cycle() {
+        // Step 1: baseline on a 3-document index (no doc4).
+        let mut baseline_index = Bm25Index::new(Bm25Config::default());
+        baseline_index
+            .index_document("doc1", "quick brown fox")
+            .unwrap();
+        baseline_index
+            .index_document("doc2", "lazy brown dog")
+            .unwrap();
+        baseline_index
+            .index_document("doc3", "quick fox jumps")
+            .unwrap();
+        let baseline = baseline_index.search("quick brown fox", 10);
+
+        // Step 2: add doc4 to introduce it, then round-trip through serde.
+        baseline_index
+            .index_document("doc4", "unrelated zebra content")
+            .unwrap();
+        let json = serde_json::to_string(&baseline_index).unwrap();
+        let mut restored: Bm25Index = serde_json::from_str(&json).unwrap();
+        restored.ensure_doc_lengths_vec();
+
+        // Step 3: remove doc4 on the restored index.
+        let removed = restored.remove_document("doc4");
+        assert!(removed, "doc4 must be removable from the restored index");
+
+        // Step 4: results must match the original 3-document baseline exactly.
+        let after = restored.search("quick brown fox", 10);
+
+        assert_eq!(
+            baseline.len(),
+            after.len(),
+            "result count must match the original 3-doc baseline after remove cycle"
+        );
+        for (base, post) in baseline.iter().zip(after.iter()) {
+            assert_eq!(
+                base.0, post.0,
+                "doc_id ordering must be preserved after remove cycle"
+            );
+            assert_eq!(
+                base.1, post.1,
+                "BM25 scores must be identical after remove cycle"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod metrics_tests {
     use crate::metrics::{names, MetricValue, RecordingSink};

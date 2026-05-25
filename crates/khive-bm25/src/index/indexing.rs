@@ -161,8 +161,11 @@ impl Bm25Index {
         // Update total tokens
         self.total_tokens = self.total_tokens.saturating_sub(doc_length);
 
+        // Ensure the forward index is populated (rebuilds lazily from the inverted
+        // index after deserialization so that removes are always O(|terms_in_doc|)).
+        self.ensure_forward_index();
+
         // Remove from posting lists using the forward index (O(terms_in_doc) not O(|V|)).
-        // Falls back to full scan when the forward index is absent (e.g. after deserialization).
         if let Some(terms) = self.forward_index.remove(&internal_id) {
             for term in &terms {
                 if let Some(postings) = self.inverted_index.get_mut(term) {
@@ -175,17 +178,6 @@ impl Bm25Index {
                     }
                 }
             }
-        } else {
-            // Fallback: forward index not available (deserialized index).
-            // Scan all posting lists (original O(|V|) behavior).
-            for (_term, postings) in self.inverted_index.iter_mut() {
-                let idx = postings.partition_point_by_doc_id(internal_id);
-                if idx < postings.len() && postings.doc_ids[idx] == internal_id {
-                    postings.remove(idx);
-                }
-            }
-            self.inverted_index
-                .retain(|_, postings| !postings.is_empty());
         }
 
         // Remove from ID maps
