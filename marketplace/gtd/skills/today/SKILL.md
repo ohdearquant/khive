@@ -62,7 +62,7 @@ request(ops="transition(id=\"<id>\", status=\"waiting\", note=\"blocked on revie
 request(ops="complete(id=\"<id>\", result=\"shipped in v0.2.1\")")
 ```
 
-`complete` records `completed_at` automatically and validates the transition. You can re-open later with `transition(..., status="next")` if it turns out the work wasn't done.
+`complete` records `completed_at` automatically and validates the transition. `done` is a **terminal state** — no further transitions are allowed. If the work turns out to be incomplete, cancel the task and create a fresh one instead.
 
 ## Patterns
 

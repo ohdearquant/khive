@@ -66,8 +66,8 @@ pub fn is_terminal(s: &str) -> bool {
 /// - `active`    → next | waiting | done | cancelled
 /// - `waiting`   → next | active | done | cancelled
 /// - `someday`   → next | active | done | cancelled
-/// - `done`      → next | active   (reopen)
-/// - `cancelled` → next | active   (reopen)
+/// - `done`      → (terminal — no outgoing transitions)
+/// - `cancelled` → (terminal — no outgoing transitions)
 pub fn allowed_transitions(from: &str) -> &'static [&'static str] {
     match from {
         "inbox" => &["next", "waiting", "someday", "active", "done", "cancelled"],
@@ -75,8 +75,8 @@ pub fn allowed_transitions(from: &str) -> &'static [&'static str] {
         "active" => &["next", "waiting", "done", "cancelled"],
         "waiting" => &["next", "active", "done", "cancelled"],
         "someday" => &["next", "active", "done", "cancelled"],
-        "done" => &["next", "active"],
-        "cancelled" => &["next", "active"],
+        "done" => &[],
+        "cancelled" => &[],
         _ => &[],
     }
 }
@@ -131,9 +131,23 @@ mod tests {
         assert!(can_transition("active", "done"));
         assert!(!can_transition("active", "inbox"));
         assert!(!can_transition("done", "waiting"));
-        // Reopen paths.
-        assert!(can_transition("done", "next"));
-        assert!(can_transition("cancelled", "active"));
+        // Terminal states have no outgoing transitions (enforced per #273).
+        assert!(!can_transition("done", "next"));
+        assert!(!can_transition("done", "active"));
+        assert!(!can_transition("cancelled", "next"));
+        assert!(!can_transition("cancelled", "active"));
+    }
+
+    #[test]
+    fn terminal_states_have_no_allowed_transitions() {
+        assert!(
+            allowed_transitions("done").is_empty(),
+            "done must have no allowed transitions"
+        );
+        assert!(
+            allowed_transitions("cancelled").is_empty(),
+            "cancelled must have no allowed transitions"
+        );
     }
 
     #[test]

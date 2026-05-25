@@ -185,12 +185,12 @@ async fn complete_marks_task_done_and_is_idempotent_via_load_check() {
     assert_eq!(done["from"], "inbox");
     assert_eq!(done["to"], "done");
 
-    // Second complete must fail because "done" → "done" isn't an allowed transition.
+    // Second complete must fail because "done" is a terminal state.
     let err = pack
         .dispatch("complete", json!({"id": id}))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("cannot transition"));
+    assert!(err.to_string().contains("terminal state"));
 }
 
 #[tokio::test]
@@ -656,6 +656,98 @@ async fn complete_writes_lifecycle_audit_record() {
         }),
         Some("done"),
         "audit to_state must be 'done'"
+    );
+}
+
+// ── #273: terminal-state enforcement tests ───────────────────────────────────
+
+/// Transitioning out of `done` must be rejected with a clear terminal-state error.
+#[tokio::test]
+async fn test_transition_from_done_rejected() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "terminal done test"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // Move to done.
+    pack.dispatch("transition", json!({"id": id, "status": "done"}))
+        .await
+        .expect("transition to done must succeed");
+
+    // Any further transition out of done must fail.
+    for target in &["next", "active", "inbox", "waiting", "someday", "cancelled"] {
+        let err = pack
+            .dispatch("transition", json!({"id": id, "status": target}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("terminal state"),
+            "transition from done to {target:?} must mention terminal state; got: {msg}"
+        );
+        assert!(
+            msg.contains("done"),
+            "error must include current state 'done'; got: {msg}"
+        );
+    }
+}
+
+/// Transitioning out of `cancelled` must be rejected with a clear terminal-state error.
+#[tokio::test]
+async fn test_transition_from_cancelled_rejected() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "terminal cancelled test"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // Move to cancelled.
+    pack.dispatch("transition", json!({"id": id, "status": "cancelled"}))
+        .await
+        .expect("transition to cancelled must succeed");
+
+    // Any further transition out of cancelled must fail.
+    for target in &["next", "active", "inbox", "waiting", "someday", "done"] {
+        let err = pack
+            .dispatch("transition", json!({"id": id, "status": target}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("terminal state"),
+            "transition from cancelled to {target:?} must mention terminal state; got: {msg}"
+        );
+        assert!(
+            msg.contains("cancelled"),
+            "error must include current state 'cancelled'; got: {msg}"
+        );
+    }
+}
+
+/// Calling `complete` on an already-done task must return an explicit terminal-state error.
+#[tokio::test]
+async fn test_complete_on_already_done_returns_clear_error() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "double complete test"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // First complete succeeds.
+    let done = pack
+        .dispatch("complete", json!({"id": id, "result": "shipped"}))
+        .await
+        .expect("first complete must succeed");
+    assert_eq!(done["to"], "done");
+
+    // Second complete on an already-done task must fail with a clear error.
+    let err = pack
+        .dispatch("complete", json!({"id": id}))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("terminal state"),
+        "complete on already-done must mention terminal state; got: {msg}"
+    );
+    assert!(
+        msg.contains("done"),
+        "error must name the current terminal state; got: {msg}"
     );
 }
 

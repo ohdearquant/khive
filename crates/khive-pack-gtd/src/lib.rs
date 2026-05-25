@@ -103,11 +103,7 @@ static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
             ("someday", "active"),
             ("someday", "done"),
             ("someday", "cancelled"),
-            // Reopen paths.
-            ("done", "next"),
-            ("done", "active"),
-            ("cancelled", "next"),
-            ("cancelled", "active"),
+            // done and cancelled are terminal — no outgoing transitions (#273).
         ],
     },
 }];

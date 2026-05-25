@@ -4,6 +4,8 @@ GTD-style task lifecycle for AI agents on top of [khive-mcp](https://github.com/
 
 A task is a note with `kind = "task"`. GTD state (`inbox`/`next`/`waiting`/`someday`/`active`/`done`/`cancelled`), priority (p0–p3), assignee, due date, and dependencies live in `properties`. Hybrid search and graph traversal work on tasks the same as on any other note — `search(kind="note", ...)` surfaces them, and the `kg` pack's `link` connects them to entities.
 
+`done` and `cancelled` are **terminal states**. Once a task reaches either, no further `transition` or `complete` calls are accepted. To restart work abandoned in error, create a new task.
+
 ## Verbs
 
 All verbs are dispatched through the single MCP `request` tool ([ADR-020](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-020-request-dsl.md)).
@@ -12,7 +14,7 @@ All verbs are dispatched through the single MCP `request` tool ([ADR-020](https:
 | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | `assign(title, priority?, status?, assignee?, due?, start?, end?, depends_on?, tags?, description?)` | Create a task. Defaults to `status=inbox`, priority salience 0.5. |
 | `next(limit?, assignee?)`                                                              | Actionable tasks (status in `{next, active}`), priority-sorted.   |
-| `complete(id, result?)`                                                                | Mark done. Records `completed_at` and validates the transition.   |
+| `complete(id, result?)`                                                                | Mark done. Records `completed_at` and validates the transition. `done` is terminal — no further transitions. |
 | `tasks(status?, assignee?, priority?, limit?, offset?)`                                | Filtered listing.                                                 |
 | `transition(id, status, note?)`                                                        | Explicit GTD state change with lifecycle validation.              |
 

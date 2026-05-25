@@ -499,6 +499,12 @@ impl GtdPack {
         let p: CompleteParams = deser(params)?;
         let (mut note, current) = load_task(self.runtime(), token, &p.id).await?;
 
+        if is_terminal(&current) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "task {} is in terminal state {current:?}; no further transitions allowed",
+                short_id(note.id)
+            )));
+        }
         if !can_transition(&current, "done") {
             let allowed = allowed_transitions(&current).join(", ");
             return Err(RuntimeError::InvalidInput(format!(
@@ -639,6 +645,12 @@ impl GtdPack {
                 "to": target,
                 "note": "already in target status",
             }));
+        }
+        if is_terminal(&current) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "task {} is in terminal state {current:?}; no further transitions allowed",
+                short_id(note.id)
+            )));
         }
         if !can_transition(&current, target) {
             let allowed = allowed_transitions(&current).join(", ");
