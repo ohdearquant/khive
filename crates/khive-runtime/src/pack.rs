@@ -21,7 +21,10 @@ use khive_storage::{Event, EventStore, EventView, SubstrateKind};
 use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
-pub use khive_types::{EdgeEndpointRule, EndpointKind, HandlerDef, Visibility};
+pub use khive_types::{
+    EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, PackSchemaPlan,
+    Visibility,
+};
 // Backward-compat re-export.
 #[allow(deprecated)]
 pub use khive_types::VerbDef;
@@ -77,6 +80,26 @@ pub trait PackRuntime: Send + Sync {
     /// Defaults to empty so existing packs compile without changes.
     fn requires(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// NoteKindSpec declarations for note kinds this pack owns (ADR-004).
+    ///
+    /// Packs that introduce note kinds with explicit lifecycle semantics
+    /// declare the spec here.  The runtime collects these for introspection
+    /// and future enforcement.  Defaults to empty so existing packs compile
+    /// without changes.
+    fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
+        &[]
+    }
+
+    /// Pack-auxiliary schema plan (ADR-019).
+    ///
+    /// Packs that require auxiliary tables (e.g. `gtd_lifecycle_audit`)
+    /// return a `PackSchemaPlan` whose `statements` are idempotent DDL.
+    /// The runtime applies them once at registration / startup time.
+    /// Defaults to `None` so packs with no auxiliary schema cost nothing.
+    fn schema_plan(&self) -> Option<PackSchemaPlan> {
+        None
     }
 
     /// Optional per-kind hook for shared CRUD specialization (ADR-030).
@@ -720,6 +743,24 @@ impl VerbRegistry {
             .iter()
             .flat_map(|p| p.edge_rules().iter().copied())
             .collect()
+    }
+
+    /// Collect all `NoteKindSpec` declarations from every loaded pack (ADR-004).
+    ///
+    /// Used by the runtime for lifecycle introspection and future enforcement.
+    pub fn all_note_kind_specs(&self) -> Vec<&'static NoteKindSpec> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.note_kind_specs().iter())
+            .collect()
+    }
+
+    /// Collect all pack-auxiliary schema plans from every loaded pack (ADR-019).
+    ///
+    /// The runtime applies these once at startup so each pack's auxiliary tables
+    /// exist before any verbs are dispatched.
+    pub fn all_schema_plans(&self) -> Vec<PackSchemaPlan> {
+        self.packs.iter().filter_map(|p| p.schema_plan()).collect()
     }
 }
 

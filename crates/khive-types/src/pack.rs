@@ -76,6 +76,62 @@ pub struct EdgeEndpointRule {
     pub target: EndpointKind,
 }
 
+/// Lifecycle specification for a note kind (ADR-004 §NoteKindSpec).
+///
+/// Declares which field holds the kind's domain state, the initial value,
+/// terminal values, and allowed transitions.  The runtime uses this to
+/// validate lifecycle operations at the verb boundary without hard-coding
+/// kind-specific logic in the shared CRUD path.
+///
+/// Phase 1 (current): packs declare the spec; the runtime records it for
+/// documentation and future enforcement.
+/// Phase 2 (future ADR): the runtime uses `field` to route lifecycle writes
+/// to a first-class column rather than `properties`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteLifecycleSpec {
+    /// The field name that holds the kind's lifecycle state.
+    ///
+    /// ADR-004 mandates `"kind_status"` for pack-owned lifecycle fields to
+    /// avoid the semantic collision with `Note.status` (NoteStatus).
+    pub field: &'static str,
+    /// The value assigned when a note of this kind is first created.
+    pub initial: &'static str,
+    /// Values from which no further transitions are possible.
+    pub terminal: &'static [&'static str],
+    /// Allowed `(from, to)` transitions. `"*"` as `from` matches any state.
+    pub transitions: &'static [(&'static str, &'static str)],
+}
+
+/// Kind-level schema specification for a note kind (ADR-004 §NoteKindSpec).
+///
+/// Each pack-registered note kind may declare a `NoteKindSpec` to describe
+/// its lifecycle semantics.  The runtime collects these at boot time via
+/// [`Pack::NOTE_KIND_SPECS`] for documentation, introspection, and (in future
+/// ADRs) enforcement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteKindSpec {
+    /// The note kind string this spec governs (e.g. `"task"`).
+    pub kind: &'static str,
+    /// Alternate names this kind accepts on the wire.
+    pub aliases: &'static [&'static str],
+    /// Lifecycle state machine for this kind.
+    pub lifecycle: NoteLifecycleSpec,
+}
+
+/// DDL statements the pack needs applied to the auxiliary schema (ADR-019).
+///
+/// Pack-auxiliary tables use idempotent `CREATE TABLE IF NOT EXISTS`; they are
+/// not part of the core versioned migration chain.  The runtime applies these
+/// statements once at pack registration time (or startup) against the active
+/// storage backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackSchemaPlan {
+    /// The pack this schema plan belongs to (used for error reporting).
+    pub pack: &'static str,
+    /// Idempotent SQL statements to apply.
+    pub statements: &'static [&'static str],
+}
+
 /// A composable module that contributes vocabulary, verbs, and edge endpoint
 /// rules to the khive runtime.
 ///
@@ -117,6 +173,22 @@ pub trait Pack {
     /// loaded pack set before any pack is registered. Defaults to empty
     /// so existing packs compile without changes.
     const REQUIRES: &'static [&'static str] = &[];
+
+    /// Lifecycle and schema specs for note kinds this pack owns (ADR-004).
+    ///
+    /// Packs that introduce note kinds with explicit lifecycle semantics
+    /// (e.g. GTD's `task` kind) declare the spec here.  The runtime collects
+    /// these at boot time for introspection and future enforcement.  Defaults
+    /// to empty so existing packs compile without changes.
+    const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &[];
+
+    /// Pack-auxiliary schema plan (ADR-019).
+    ///
+    /// Packs that need their own auxiliary tables (e.g. GTD's
+    /// `gtd_lifecycle_audit`) declare idempotent DDL statements here.
+    /// The runtime applies them once at registration time.  Defaults to
+    /// `None` so packs with no auxiliary schema cost nothing.
+    const SCHEMA_PLAN: Option<PackSchemaPlan> = None;
 }
 
 #[cfg(test)]
