@@ -1,8 +1,8 @@
 //! pack-kg — Knowledge Graph verb pack for khive.
 //!
-//! Provides 11 verbs for managing entities, notes, edges, and graph queries
-//! in a research knowledge graph. This is the first-party pack shipped with
-//! the khive binary.
+//! Provides 14 verbs for managing entities, notes, edges, graph queries, and
+//! event-sourced proposals (ADR-046) in a research knowledge graph. This is
+//! the first-party pack shipped with the khive binary.
 
 pub mod handlers;
 pub mod vocab;
@@ -37,11 +37,13 @@ impl Pack for KgPack {
     const HANDLERS: &'static [HandlerDef] = &KG_HANDLERS;
 }
 
-// ADR-025: Illocutionary classification (Searle 1976)
+// ADR-060 / ADR-025: Illocutionary classification (Searle 1976)
 //   Assertive  — retrieves/presents state of affairs
 //   Commissive — commits caller to a persistent change
 //   Declaration — changes institutional status by fiat
-static KG_HANDLERS: [HandlerDef; 11] = [
+//
+// Verbs 12-14 (propose, review, withdraw) added per ADR-046 (cluster-22).
+static KG_HANDLERS: [HandlerDef; 14] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -119,6 +121,24 @@ static KG_HANDLERS: [HandlerDef; 11] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
     },
+    // Commissive: commits a proposal to the namespace event log (ADR-046)
+    HandlerDef {
+        name: "propose",
+        description: "Create an event-sourced change proposal",
+        visibility: Visibility::Verb,
+    },
+    // Declaration: approves/rejects/comments on a proposal (ADR-046)
+    HandlerDef {
+        name: "review",
+        description: "Approve, reject, comment, or request changes on a proposal",
+        visibility: Visibility::Verb,
+    },
+    // Commissive: rescinds an open proposal (ADR-046)
+    HandlerDef {
+        name: "withdraw",
+        description: "Withdraw an open proposal (proposer-only)",
+        visibility: Visibility::Verb,
+    },
 ];
 
 impl KgPack {
@@ -180,6 +200,9 @@ impl PackRuntime for KgPack {
             "neighbors" => self.handle_neighbors(token, params).await,
             "traverse" => self.handle_traverse(token, params).await,
             "query" => self.handle_query(token, params).await,
+            "propose" => self.handle_propose(token, params).await,
+            "review" => self.handle_review(token, params).await,
+            "withdraw" => self.handle_withdraw(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "kg pack does not handle verb {verb:?}"
             ))),
