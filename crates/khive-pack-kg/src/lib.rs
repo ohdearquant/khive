@@ -371,14 +371,14 @@ static KG_HANDLERS: [HandlerDef; 14] = [
     // Assertive: retrieves pattern-matched results
     HandlerDef {
         name: "query",
-        description: "GQL/SPARQL pattern matching",
+        description: "GQL pattern matching",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[ParamDef {
             name: "query",
             param_type: "string",
             required: true,
-            description: "GQL or SPARQL pattern query string.",
+            description: "GQL pattern query string.",
         }],
     },
     // Commissive: commits a proposal to the namespace event log (ADR-046)

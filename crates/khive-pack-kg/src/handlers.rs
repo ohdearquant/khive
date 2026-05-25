@@ -534,9 +534,10 @@ fn remap_note_status(mut note_value: Value) -> Value {
 
 fn parse_direction(s: Option<&str>) -> Direction {
     match s {
-        Some("in") => Direction::In,
+        Some("in") | Some("incoming") => Direction::In,
         Some("both") => Direction::Both,
-        _ => Direction::Out,
+        Some("out") | Some("outgoing") | None => Direction::Out,
+        Some(_) => Direction::Out,
     }
 }
 
@@ -1728,7 +1729,16 @@ impl KgPack {
             .runtime
             .link(token, source, target, relation, weight, metadata)
             .await?;
-        let raw = to_json(&edge)?;
+        let mut raw = to_json(&edge)?;
+        // K-C1: for symmetric relations the runtime stores a canonical (lower-UUID-first)
+        // endpoint order. Restore the caller's original positions in the response so the
+        // caller sees exactly what they specified, not the internal storage order.
+        if relation.is_symmetric() {
+            if let Some(obj) = raw.as_object_mut() {
+                obj.insert("source_id".to_string(), json!(source.to_string()));
+                obj.insert("target_id".to_string(), json!(target.to_string()));
+            }
+        }
         Ok(format_edge_output(raw, verbose))
     }
 

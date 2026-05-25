@@ -2725,3 +2725,179 @@ async fn traverse_excludes_soft_deleted_entity() {
         "traverse must not include soft-deleted node; ids: {all_ids:?}"
     );
 }
+
+// ---- K-C1: link response preserves caller source/target for symmetric relations ----
+
+/// K-C1 regression: for `competes_with` (symmetric), the runtime canonicalises
+/// endpoint order (lower UUID first). The response MUST reflect the caller's
+/// original source_id / target_id, not the internal storage order.
+#[tokio::test]
+async fn link_symmetric_relation_response_preserves_caller_order() {
+    let pack = pack();
+
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "EntityA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A must succeed");
+    let a_full_id = a
+        .get("full_id")
+        .and_then(Value::as_str)
+        .or_else(|| a.get("id").and_then(Value::as_str))
+        .expect("A must have an id")
+        .to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "EntityB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B must succeed");
+    let b_full_id = b
+        .get("full_id")
+        .and_then(Value::as_str)
+        .or_else(|| b.get("id").and_then(Value::as_str))
+        .expect("B must have an id")
+        .to_string();
+
+    // Link A → B with competes_with. One of A/B will have the lower UUID.
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": a_full_id,
+                "target_id": b_full_id,
+                "relation": "competes_with"
+            }),
+        )
+        .await
+        .expect("link competes_with must succeed");
+
+    // K-C1: regardless of internal canonical ordering, the response source_id
+    // must equal A's id and target_id must equal B's id.
+    let resp_source = edge
+        .get("source_id")
+        .and_then(Value::as_str)
+        .expect("response must have source_id");
+    let resp_target = edge
+        .get("target_id")
+        .and_then(Value::as_str)
+        .expect("response must have target_id");
+
+    assert!(
+        resp_source.starts_with(&a_full_id[..8]) || a_full_id.starts_with(resp_source),
+        "K-C1: response source_id must be A's id; got source={resp_source}, expected A={a_full_id}"
+    );
+    assert!(
+        resp_target.starts_with(&b_full_id[..8]) || b_full_id.starts_with(resp_target),
+        "K-C1: response target_id must be B's id; got target={resp_target}, expected B={b_full_id}"
+    );
+}
+
+// ---- K-C2: neighbors direction filter is respected ----
+
+/// K-C2 regression: `direction="incoming"` must return edges where the queried
+/// node is the target; `direction="outgoing"` must return edges where it is the
+/// source. Both canonical (`"in"` / `"out"`) and verbose (`"incoming"` / `"outgoing"`)
+/// spellings must work.
+#[tokio::test]
+async fn neighbors_direction_filter_incoming_outgoing() {
+    let pack = pack();
+
+    // Create A, B, C. Link A-->B and C-->B (so B has one outgoing and two incoming).
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "NeighDir_A", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "NeighDir_B", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create B");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let c = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "NeighDir_C", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create C");
+    let c_id = c.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // A-->B (B is target of A, so B has incoming from A)
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->B");
+
+    // B-->C (B is source, C is target, so B has outgoing to C)
+    pack.dispatch(
+        "link",
+        json!({"source_id": b_id, "target_id": c_id, "relation": "extends"}),
+    )
+    .await
+    .expect("link B->C");
+
+    // neighbors(B, incoming) must return A.
+    for dir_spelling in ["in", "incoming"] {
+        let incoming = pack
+            .dispatch("neighbors", json!({"id": b_id, "direction": dir_spelling}))
+            .await
+            .expect("neighbors incoming must succeed");
+        let items = incoming.as_array().expect("must be array");
+        let node_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|v| v.get("id").and_then(Value::as_str))
+            .collect();
+        assert!(
+            node_ids
+                .iter()
+                .any(|&id| id == a_id || a_id.starts_with(id) || id.starts_with(&a_id[..8])),
+            "K-C2: neighbors(B, {dir_spelling}) must return A; got: {node_ids:?}"
+        );
+        assert!(
+            !node_ids
+                .iter()
+                .any(|&id| id == c_id || c_id.starts_with(id) || id.starts_with(&c_id[..8])),
+            "K-C2: neighbors(B, {dir_spelling}) must NOT return C; got: {node_ids:?}"
+        );
+    }
+
+    // neighbors(B, outgoing) must return C.
+    for dir_spelling in ["out", "outgoing"] {
+        let outgoing = pack
+            .dispatch("neighbors", json!({"id": b_id, "direction": dir_spelling}))
+            .await
+            .expect("neighbors outgoing must succeed");
+        let items = outgoing.as_array().expect("must be array");
+        let node_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|v| v.get("id").and_then(Value::as_str))
+            .collect();
+        assert!(
+            node_ids
+                .iter()
+                .any(|&id| id == c_id || c_id.starts_with(id) || id.starts_with(&c_id[..8])),
+            "K-C2: neighbors(B, {dir_spelling}) must return C; got: {node_ids:?}"
+        );
+        assert!(
+            !node_ids
+                .iter()
+                .any(|&id| id == a_id || a_id.starts_with(id) || id.starts_with(&a_id[..8])),
+            "K-C2: neighbors(B, {dir_spelling}) must NOT return A; got: {node_ids:?}"
+        );
+    }
+}
