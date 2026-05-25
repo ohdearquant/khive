@@ -23,6 +23,9 @@ import { DEFAULT_SCHEMA_YAML } from "../lib/schema.ts";
 import { canonicalEdgeJson, canonicalEntityJson } from "../lib/canonical.ts";
 import { readNdjson } from "../lib/ndjson.ts";
 import { validate } from "./validate.ts";
+import { adaptCsv } from "../lib/importers/csv.ts";
+import { adaptJson } from "../lib/importers/json.ts";
+import type { EdgeRecord, EntityRecord } from "../lib/importers/types.ts";
 
 // ─── KgArchive types ──────────────────────────────────────────────────────────
 
@@ -93,13 +96,14 @@ interface ImportJournal {
 // ─── Conflict resolution (for --on-conflict) ──────────────────────────────────
 
 /**
- * Per-record conflict policy when importing into an existing KG.
+ * Per-record conflict policy when importing into an existing KG (ADR-036 §5).
  *   error   — default; fail if any live files exist (file-level, not record-level)
  *   skip    — keep the existing record, ignore the incoming one
- *   replace — overwrite the existing record with the incoming one
- *   merge   — deep-merge properties, union tags, preserve existing scalars
+ *   replace — overwrite the existing record with the incoming one (legacy alias for update)
+ *   merge   — deep-merge properties, union tags, preserve existing scalars (legacy alias for update)
+ *   update  — patch existing record: deep-merge properties, union tags (ADR-036 canonical name)
  */
-export type ConflictPolicy = "error" | "skip" | "replace" | "merge";
+export type ConflictPolicy = "error" | "skip" | "replace" | "merge" | "update";
 
 async function readExistingArchive(repoRoot: string): Promise<KgArchive> {
   const entities: KgArchiveEntity[] = [];
@@ -149,7 +153,8 @@ function mergeEntityConflict(
 ): KgArchiveEntity | null {
   if (policy === "skip") return null;
   if (policy === "replace") return incoming;
-  // merge: deep-merge properties, union+sort tags, prefer existing scalar fields
+  // update / merge: deep-merge properties, union+sort tags, prefer existing scalar fields.
+  // ADR-036 §5 canonical name is "update"; "merge" is a legacy alias.
   const mergedProperties = deepMergeObjects(
     existing.properties ?? {},
     incoming.properties ?? {},
@@ -174,7 +179,7 @@ function mergeEdgeConflict(
 ): KgArchiveEdge | null {
   if (policy === "skip") return null;
   if (policy === "replace") return incoming;
-  // merge: deep-merge properties, prefer incoming weight when present
+  // update / merge: deep-merge properties, prefer incoming weight when present.
   const mergedProperties = deepMergeObjects(
     existing.properties ?? {},
     incoming.properties ?? {},
@@ -809,54 +814,261 @@ export async function importArchive(
   );
 }
 
+// ─── Format adapter helpers ───────────────────────────────────────────────────
+
+/**
+ * Detect format from a file path extension (ADR-036 §1 extension table).
+ * Returns the format string or undefined when the extension is ambiguous.
+ */
+function detectFormat(filePath: string): string | undefined {
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith(".ndjson")) return "ndjson";
+  if (lower.endsWith(".csv")) return "csv";
+  if (lower.endsWith(".tsv")) return "tsv";
+  // .json is intentionally excluded: both KgArchive and generic JSON use .json.
+  // Use --format json explicitly to invoke the JSON adapter; without the flag,
+  // .json files fall through to the default (ndjson / archive path).
+  return undefined;
+}
+
+/**
+ * Convert adapter records (EntityRecord[] + EdgeRecord[]) into a KgArchive
+ * so they can be passed to `importArchive` for durable, validated publish.
+ */
+function adapterResultToArchive(
+  entities: EntityRecord[],
+  edges: EdgeRecord[],
+): KgArchive {
+  const archiveEntities: KgArchiveEntity[] = entities.map((e) => ({
+    id: e.id,
+    kind: e.kind,
+    name: e.name,
+    description: e.description,
+    properties: e.properties as Record<string, unknown>,
+    tags: e.tags,
+  }));
+  const archiveEdges: KgArchiveEdge[] = edges.map((e) => ({
+    edge_id: e.edge_id,
+    source: e.source,
+    target: e.target,
+    relation: e.relation,
+    weight: e.weight,
+    properties: e.properties as Record<string, unknown>,
+  }));
+  return {
+    format: "khive-kg",
+    version: "0.1",
+    entities: archiveEntities,
+    edges: archiveEdges,
+  };
+}
+
+/**
+ * Import via a format adapter (CSV, TSV, JSON).
+ *
+ * Reads the source file, converts records using the appropriate adapter,
+ * builds a KgArchive, then delegates to `importArchive` for durable publish.
+ *
+ * @param repoRoot    Repository root.
+ * @param sourcePath  Path to the source file.
+ * @param format      Normalized format name: "csv", "tsv", or "json".
+ * @param defaultKind Default entity kind when source rows omit `kind`.
+ * @param options     Import options forwarded to `importArchive`.
+ */
+async function importViaAdapter(
+  repoRoot: string,
+  sourcePath: string,
+  format: string,
+  defaultKind: string | undefined,
+  options: {
+    overwrite?: boolean;
+    onConflict?: ConflictPolicy;
+  } = {},
+): Promise<void> {
+  let text: string;
+  try {
+    text = await Deno.readTextFile(sourcePath);
+  } catch (err) {
+    if (err instanceof Deno.errors.NotFound) {
+      throw new Error(`source file not found: ${sourcePath}`);
+    }
+    throw new Error(`Error reading source file: ${(err as Error).message}`);
+  }
+
+  let entities: EntityRecord[];
+  let edges: EdgeRecord[];
+
+  if (format === "csv" || format === "tsv") {
+    const result = adaptCsv(text, {
+      separator: format === "tsv" ? "\t" : ",",
+      defaultKind,
+    });
+    entities = result.entities;
+    edges = result.edges;
+    if (result.warnings.length > 0) {
+      for (const w of result.warnings) console.warn(`Warning: ${w}`);
+    }
+  } else if (format === "json") {
+    const result = adaptJson(text, defaultKind);
+    entities = result.entities;
+    edges = result.edges;
+    if (result.warnings.length > 0) {
+      for (const w of result.warnings) console.warn(`Warning: ${w}`);
+    }
+  } else {
+    throw new Error(
+      `format '${format}' is not yet implemented.\n` +
+        `Supported formats (P0): ndjson, csv, tsv, json.\n` +
+        `See ADR-036 for the deferred format roadmap.`,
+    );
+  }
+
+  const archive = adapterResultToArchive(entities, edges);
+
+  // Write archive to a temp JSON file so importArchive can read it.
+  const tmpFile = await Deno.makeTempFile({ prefix: ".khive-import-adapter-", suffix: ".json" });
+  try {
+    await Deno.writeTextFile(tmpFile, JSON.stringify(archive));
+    await importArchive(repoRoot, tmpFile, options);
+  } finally {
+    await Deno.remove(tmpFile).catch(() => {});
+  }
+
+  console.log(
+    `Imported ${entities.length} entities and ${edges.length} edges from ${sourcePath} (format: ${format})`,
+  );
+}
+
 // ─── CLI entry point ──────────────────────────────────────────────────────────
 
 /**
- * `khive kg import [--overwrite] [--on-conflict <skip|replace|merge>] <archive-file>`
+ * `khive kg import [--format <fmt>] [--default-kind <kind>] [--overwrite]
+ *                  [--on-conflict <error|skip|update|replace|merge>] <source-file>`
  *
  * Args:
- *   <archive-file>              Path to a KgArchive JSON file (required).
+ *   <source-file>               Path to the source file (required).
+ *   --format <fmt>              Source format: ndjson (default), csv, tsv, json.
+ *                               Inferred from file extension when absent (ADR-036 §1).
+ *   --default-kind <kind>       Default entity kind when source rows omit `kind`.
  *   --overwrite                 Replace existing NDJSON files wholesale.
- *   --on-conflict <policy>      Per-record conflict handling: skip | replace | merge.
- *                               Bypasses the file-level overwrite check.
+ *   --on-conflict <policy>      Per-record conflict: error | skip | update | replace | merge.
+ *                               `update` is the ADR-036 canonical name; `replace` and `merge`
+ *                               are legacy aliases retained for backward compatibility.
+ *
+ * Deferred flags (ADR-036 §9 — CLI rejects with "not yet implemented"):
+ *   --mapping <path>            Column/field mapping file (P1).
+ *   --schema-mode <mode>        Schema validation behavior (P1).
  *
  * Validates against schema.yaml before writing. Publishes durably via journal
  * protocol (crash-safe: recoverImportJournal handles process death mid-publish).
  * Exits 0 on success, 1 on error.
  */
 export async function runImport(repoRoot: string, args: string[]): Promise<void> {
-  const overwrite = args.includes("--overwrite");
+  // Reject deferred flags with a clear "not yet implemented" message (ADR-036 §9).
+  if (args.includes("--mapping")) {
+    console.error(
+      "Error: --mapping is not yet implemented (deferred to P1 per ADR-036).",
+    );
+    Deno.exit(1);
+  }
+  if (args.includes("--schema-mode")) {
+    console.error(
+      "Error: --schema-mode is not yet implemented (deferred to P1 per ADR-036).",
+    );
+    Deno.exit(1);
+  }
 
-  // Parse --on-conflict <value>
+  const overwrite = args.includes("--overwrite");
+  const isContinue = args.includes("--continue");
+
+  // Parse --on-conflict <value> (ADR-036 canonical: error|skip|update; legacy: replace|merge)
   let onConflict: ConflictPolicy | undefined;
   const conflictIdx = args.indexOf("--on-conflict");
   if (conflictIdx !== -1) {
     const value = args[conflictIdx + 1];
-    if (value === "skip" || value === "replace" || value === "merge") {
+    if (value === "skip" || value === "replace" || value === "merge" || value === "update") {
       onConflict = value;
+    } else if (value === "error") {
+      // "error" is the default; no-op but explicit.
+      onConflict = undefined;
     } else {
       console.error(
-        `Error: --on-conflict value must be 'skip', 'replace', or 'merge'; ` +
+        `Error: --on-conflict value must be 'error', 'skip', 'update', 'replace', or 'merge'; ` +
           `got '${value ?? "(missing)"}'`,
       );
       Deno.exit(1);
     }
   }
 
-  // Positional arg: first non-flag argument, excluding the --on-conflict value
-  const archivePath = args.find((a, i) => !a.startsWith("-") && args[i - 1] !== "--on-conflict");
-  if (!archivePath) {
+  // --continue is sugar for --on-conflict skip (ADR-036 §5).
+  if (isContinue) {
+    if (onConflict !== undefined) {
+      console.error(
+        "Error: --continue and --on-conflict cannot be combined (ADR-036 §5).",
+      );
+      Deno.exit(1);
+    }
+    onConflict = "skip";
+  }
+
+  // Parse --format <value>
+  let explicitFormat: string | undefined;
+  const formatIdx = args.indexOf("--format");
+  if (formatIdx !== -1) {
+    explicitFormat = args[formatIdx + 1];
+    if (!explicitFormat || explicitFormat.startsWith("-")) {
+      console.error("Error: --format requires a format argument");
+      Deno.exit(1);
+    }
+  }
+
+  // Parse --default-kind <value>
+  let defaultKind: string | undefined;
+  const kindIdx = args.indexOf("--default-kind");
+  if (kindIdx !== -1) {
+    defaultKind = args[kindIdx + 1];
+    if (!defaultKind || defaultKind.startsWith("-")) {
+      console.error("Error: --default-kind requires a kind argument");
+      Deno.exit(1);
+    }
+  }
+
+  // Positional arg: first non-flag argument, excluding known flag values.
+  const flagsWithValues = new Set(["--on-conflict", "--format", "--default-kind"]);
+  const sourcePath = args.find((a, i) => {
+    if (a.startsWith("-")) return false;
+    const prev = args[i - 1];
+    return !flagsWithValues.has(prev);
+  });
+  if (!sourcePath) {
     console.error(
-      "Usage: khive kg import [--overwrite] [--on-conflict <skip|replace|merge>] <archive-file>",
+      "Usage: khive kg import [--format <fmt>] [--default-kind <kind>]\n" +
+        "                       [--overwrite] [--on-conflict <error|skip|update>] <source-file>",
     );
-    console.error("  <archive-file>              Path to a KgArchive JSON file (required)");
+    console.error("  <source-file>               Path to the source file (required)");
+    console.error("  --format <fmt>              ndjson (default), csv, tsv, json");
+    console.error("  --default-kind <kind>       Default entity kind when source omits kind");
     console.error("  --overwrite                 Replace existing NDJSON files without error");
-    console.error("  --on-conflict <policy>      Per-record conflict: skip | replace | merge");
+    console.error(
+      "  --on-conflict <policy>      Per-record: error (default) | skip | update | replace | merge",
+    );
     Deno.exit(1);
   }
 
+  // Resolve the format (explicit flag > file extension detection).
+  const resolvedFormat = explicitFormat ?? detectFormat(sourcePath) ?? "ndjson";
+
   try {
-    await importArchive(repoRoot, archivePath, { overwrite, onConflict });
+    if (resolvedFormat === "ndjson") {
+      // Native NDJSON/archive path: source must be a KgArchive JSON file.
+      await importArchive(repoRoot, sourcePath, { overwrite, onConflict });
+    } else {
+      // Adapter path: CSV, TSV, or JSON format via format adapters (ADR-036).
+      await importViaAdapter(repoRoot, sourcePath, resolvedFormat, defaultKind, {
+        overwrite,
+        onConflict,
+      });
+    }
   } catch (err) {
     console.error(`Error: ${(err as Error).message}`);
     Deno.exit(1);

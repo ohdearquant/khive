@@ -20,6 +20,7 @@ members = [
     "khive-pack-brain",
     "khive-mcp",
     "khive-vcs",
+    "khive-vcs-adapters",
     "kkernel",
     "khive-retrieval",
 ]

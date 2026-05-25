@@ -23,9 +23,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
-use khive_storage::entity::Entity as StorageEntity;
-use khive_storage::types::Edge;
-use khive_storage::LinkId;
+use khive_storage::types::{Edge, TextDocument};
+use khive_storage::{LinkId, SubstrateKind};
 use khive_types::EdgeRelation;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -213,19 +212,25 @@ async fn upsert_entities(
         .map_err(|e| anyhow!("invalid namespace {namespace:?}: {e}"))?;
     let token = runtime.authorize(ns);
     let store = runtime.entities(&token).context("opening entity store")?;
+    let text = runtime.text(&token).context("opening text store")?;
     let mut count = 0;
     for r in records {
         let created_at = parse_ts_micros(r.created_at.as_deref());
         let updated_at = parse_ts_micros(r.updated_at.as_deref());
-        let entity = StorageEntity {
+        // Build the FTS body from name + description (same as create_entity in operations.rs).
+        let body = match &r.description {
+            Some(d) if !d.is_empty() => format!("{} {}", r.name, d),
+            _ => r.name.clone(),
+        };
+        let entity = khive_storage::entity::Entity {
             id: r.id,
             namespace: namespace.to_string(),
-            kind: r.kind,
+            kind: r.kind.clone(),
             entity_type: None,
-            name: r.name,
-            description: r.description,
-            properties: r.properties,
-            tags: r.tags,
+            name: r.name.clone(),
+            description: r.description.clone(),
+            properties: r.properties.clone(),
+            tags: r.tags.clone(),
             created_at,
             updated_at,
             deleted_at: None,
@@ -236,6 +241,22 @@ async fn upsert_entities(
             .upsert_entity(entity)
             .await
             .with_context(|| format!("upsert entity {}", r.id))?;
+        // Populate FTS5 index so text search works after sync.
+        // Vectors are intentionally skipped: they are local-only derived state
+        // (ADR-035 §6) and will be computed by `kkernel kg embed` when needed.
+        text.upsert_document(TextDocument {
+            subject_id: r.id,
+            kind: SubstrateKind::Entity,
+            title: Some(r.name.clone()),
+            body,
+            tags: r.tags.clone(),
+            namespace: namespace.to_string(),
+            metadata: r.properties.clone(),
+            updated_at: chrono::DateTime::from_timestamp_micros(updated_at)
+                .unwrap_or_else(chrono::Utc::now),
+        })
+        .await
+        .with_context(|| format!("fts index entity {}", r.id))?;
         count += 1;
     }
     Ok(count)
@@ -393,5 +414,61 @@ mod tests {
         let report = run_sync(repo, &db_path, "test-ns").await.unwrap();
         assert_eq!(report.entities, 0);
         assert_eq!(report.edges, 0);
+    }
+
+    /// F195: verify that FTS5 is populated during sync so text search works
+    /// after sync without a separate `kkernel kg embed` pass (ADR-035 §5).
+    #[tokio::test]
+    async fn sync_populates_fts_for_text_search() {
+        use khive_runtime::RuntimeConfig;
+        use khive_storage::types::{TextFilter, TextQueryMode, TextSearchRequest};
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let db_path = repo.join(".khive/state/working.db");
+
+        let id_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let line_a = format!(
+            r#"{{"id":"{id_a}","kind":"concept","name":"FlashAttention","description":"Fast attention algorithm","properties":{{}},"tags":[]}}"#
+        );
+        write_repo(repo, &line_a, "");
+
+        run_sync(repo, &db_path, "test-ns").await.unwrap();
+
+        let ns = khive_types::Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path.clone()),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::new(config).unwrap();
+        let token = rt.authorize(ns);
+
+        let hits = rt
+            .text(&token)
+            .expect("text store must be available")
+            .search(TextSearchRequest {
+                query: "FlashAttention".to_string(),
+                filter: Some(TextFilter {
+                    namespaces: vec!["test-ns".to_string()],
+                    ..Default::default()
+                }),
+                mode: TextQueryMode::Phrase,
+                top_k: 10,
+                snippet_chars: 128,
+            })
+            .await
+            .expect("text search must succeed after sync");
+
+        assert!(
+            !hits.is_empty(),
+            "FTS search for 'FlashAttention' must return results after sync (F195)"
+        );
+        assert_eq!(
+            hits[0].subject_id.to_string(),
+            id_a,
+            "FTS hit must reference the synced entity UUID"
+        );
     }
 }

@@ -98,8 +98,7 @@ export async function inspectKg(repoRoot: string): Promise<DoctorReport> {
         code: "DUPLICATE_ID",
         file: ENTITIES_FILE,
         line: entry.line,
-        message:
-          `Duplicate entity id '${id}' (first seen on line ${entityFirstLine.get(id)})`,
+        message: `Duplicate entity id '${id}' (first seen on line ${entityFirstLine.get(id)})`,
       });
     } else {
       entityIds.add(id);
@@ -237,8 +236,7 @@ export async function inspectKg(repoRoot: string): Promise<DoctorReport> {
           code: "DUPLICATE_NATURAL_KEY",
           file: EDGES_FILE,
           line: entry.line,
-          message:
-            `Duplicate edge (source=${source}, target=${target}, relation=${relation})`,
+          message: `Duplicate edge (source=${source}, target=${target}, relation=${relation})`,
         });
       } else {
         naturalKeys.add(naturalKey);
@@ -292,9 +290,7 @@ function formatDoctor(report: DoctorReport, json: boolean): string {
   ];
 
   for (const issue of report.issues) {
-    const loc = issue.line !== undefined
-      ? `${issue.file}:${issue.line}`
-      : issue.file;
+    const loc = issue.line !== undefined ? `${issue.file}:${issue.line}` : issue.file;
     const prefix = issue.severity === "error" ? "ERROR" : "WARN ";
     lines.push(`  [${prefix}] ${issue.code}: ${issue.message} (${loc})`);
   }

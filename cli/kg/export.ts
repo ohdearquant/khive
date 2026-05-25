@@ -273,6 +273,17 @@ export async function runExport(repoRoot: string, args: string[]): Promise<void>
     return;
   }
 
+  if (format !== "ndjson") {
+    // ADR-036 §8: the --format flag on export is reserved; any non-ndjson value
+    // is rejected with a "not yet implemented" error until P1/P2 adapters ship.
+    console.error(
+      `Error: --format ${JSON.stringify(format)} is not yet implemented for export.\n` +
+        `Supported: ndjson (default), archive.\n` +
+        `Non-NDJSON export formats are deferred to P1/P2 (ADR-036 §8).`,
+    );
+    Deno.exit(1);
+  }
+
   // Default: canonical NDJSON export
   try {
     await exportCanonical(repoRoot);

@@ -84,20 +84,32 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
     }
     if (schema.remotes && schema.remotes.length > 0) {
       for (const r of schema.remotes) {
-        if (!r.name || !r.repo || !r.path || !r.commit) {
+        // ADR-037 §schema.yaml remotes section: required fields are name, url, ref, namespace.
+        const missing: string[] = [];
+        if (!r.name) missing.push("name");
+        if (!r.url) missing.push("url");
+        if (!r.ref) missing.push("ref");
+        if (!r.namespace) missing.push("namespace");
+        if (missing.length > 0) {
           errors.push({
             file: SCHEMA_FILE,
             line: 0,
-            message: `Remote '${
-              r.name || "(unnamed)"
-            }' missing required fields (name, repo, path, commit)`,
+            message: `Remote '${r.name || "(unnamed)"}' missing required fields: ${
+              missing.join(", ")
+            }`,
           });
-        } else if (!/^[0-9a-f]{40}$/i.test(r.commit)) {
-          errors.push({
-            file: SCHEMA_FILE,
-            line: 0,
-            message: `Remote '${r.name}' commit must be a 40-character SHA, got '${r.commit}'`,
-          });
+        }
+        // Optional pin must be exactly "sha256:" + 64 lowercase hex chars (ADR-037 §pin format).
+        if (r.pin !== undefined && r.pin !== null) {
+          if (!/^sha256:[0-9a-f]{64}$/.test(r.pin)) {
+            errors.push({
+              file: SCHEMA_FILE,
+              line: 0,
+              message: `Remote '${
+                r.name || "(unnamed)"
+              }' pin must be "sha256:" followed by 64 lowercase hex chars, got '${r.pin}'`,
+            });
+          }
         }
         if (r.name) schemaRemotes.add(r.name);
       }

@@ -123,6 +123,27 @@ pub enum RuntimeError {
     /// cross-namespace existence information (ADR-007 timing-oracle mitigation).
     #[error("not found in this namespace")]
     NamespaceMismatch { id: uuid::Uuid },
+
+    // ── ADR-037: Remote Resolution and Content-Hash Verification ─────────────
+    /// A `kg://` ref names a remote not declared in `schema.yaml`.
+    #[error("unknown remote: {name:?}")]
+    UnknownRemote { name: String },
+
+    /// A remote cache entry is absent and `--fetch` was not requested.
+    #[error("remote cache missing for remote={remote:?} namespace={namespace:?}")]
+    RemoteCacheMissing { remote: String, namespace: String },
+
+    /// A short ID matches multiple entities in the same namespace or remote cache.
+    #[error("ambiguous id {id:?}: matched {count} records")]
+    AmbiguousId { id: String, count: usize },
+
+    /// A write operation targeted a remote namespace, which is read-only.
+    #[error("cross-namespace write denied: cannot write to remote namespace {namespace:?}")]
+    CrossNamespaceWrite { namespace: String },
+
+    /// A remote fetch failed (network error, authentication failure, etc.).
+    #[error("remote fetch error for remote={remote:?}: {message}")]
+    RemoteFetchError { remote: String, message: String },
 }
 
 impl From<khive_types::KhiveError> for RuntimeError {
