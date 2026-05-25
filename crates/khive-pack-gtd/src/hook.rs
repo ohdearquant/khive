@@ -20,8 +20,10 @@ use uuid::Uuid;
 use khive_runtime::{KhiveRuntime, KindHook, Namespace, Resolved, RuntimeError};
 use khive_storage::EdgeRelation;
 
-use crate::handlers::resolve_uuid;
-use crate::schema::{is_valid_priority, is_valid_status, normalize_status, priority_to_salience};
+use crate::handlers::{parse_due, resolve_uuid};
+use crate::schema::{
+    is_terminal, is_valid_priority, is_valid_status, normalize_status, priority_to_salience,
+};
 
 #[derive(Debug, Default)]
 pub struct TaskHook;
@@ -54,6 +56,12 @@ impl KindHook for TaskHook {
             return Err(RuntimeError::InvalidInput(format!(
                 "invalid status {status_in:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
                  (aliases: in_progress, todo, blocked, later, finished)"
+            )));
+        }
+        if is_terminal(status) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "cannot create task in terminal state {status:?}; \
+                 use one of: inbox, next, waiting, someday, active"
             )));
         }
 
@@ -145,7 +153,7 @@ impl KindHook for TaskHook {
             .unwrap_or_else(|| "p2".to_string());
         obj.insert("priority".into(), json!(priority_value));
         if let Some(v) = args.get("due").and_then(Value::as_str) {
-            obj.insert("due".into(), json!(v));
+            obj.insert("due".into(), json!(parse_due(v)?));
         }
         if let Some(v) = args.get("start").and_then(Value::as_str) {
             obj.insert("start".into(), json!(v));

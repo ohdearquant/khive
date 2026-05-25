@@ -5,7 +5,7 @@
 
 use std::str::FromStr;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -252,6 +252,34 @@ fn render_task(note: &khive_storage::note::Note) -> Value {
     })
 }
 
+/// Parse a user-supplied due-date string as an ISO-8601 / RFC 3339 timestamp.
+///
+/// Accepts full RFC 3339 (e.g. `2026-06-01T00:00:00Z`) or date-only
+/// (e.g. `2026-06-01`) by appending midnight UTC if necessary.
+/// Returns the canonical RFC 3339 string stored in `properties.due`.
+/// Shared with `hook.rs`.
+pub(crate) fn parse_due(value: &str) -> Result<String, RuntimeError> {
+    // Try full RFC 3339 / ISO-8601 with time zone first.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.with_timezone(&Utc).to_rfc3339());
+    }
+    // Fallback: try date-only "YYYY-MM-DD", treat as midnight UTC.
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {value:?}"
+            ))
+            })?;
+        return Ok(dt.to_rfc3339());
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {value:?}"
+    )))
+}
+
 fn ts_to_rfc(micros: i64) -> String {
     chrono::DateTime::<Utc>::from_timestamp_micros(micros)
         .unwrap_or_else(Utc::now)
@@ -310,6 +338,12 @@ impl GtdPack {
             return Err(RuntimeError::InvalidInput(format!(
                 "invalid status {status_in:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
                  (aliases: in_progress, todo, blocked, later, finished)"
+            )));
+        }
+        if is_terminal(status) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "cannot create task in terminal state {status:?}; \
+                 use one of: inbox, next, waiting, someday, active"
             )));
         }
         if let Some(ref pri) = p.priority {
@@ -387,7 +421,7 @@ impl GtdPack {
             props["assignee"] = json!(assignee);
         }
         if let Some(ref due) = p.due {
-            props["due"] = json!(due);
+            props["due"] = json!(parse_due(due)?);
         }
         if let Some(ref start) = p.start {
             props["start"] = json!(start);
@@ -512,10 +546,11 @@ impl GtdPack {
             )));
         }
 
+        let completed_at = Utc::now().to_rfc3339();
         let mut props = note.properties.take().unwrap_or(json!({}));
         if let Some(obj) = props.as_object_mut() {
             obj.insert("status".into(), json!("done"));
-            obj.insert("completed_at".into(), json!(Utc::now().to_rfc3339()));
+            obj.insert("completed_at".into(), json!(completed_at));
             if let Some(ref result) = p.result {
                 obj.insert("result".into(), json!(result));
             }
@@ -539,6 +574,7 @@ impl GtdPack {
             "full_id": note.id.as_hyphenated().to_string(),
             "from": current,
             "to": "done",
+            "completed_at": completed_at,
             "is_terminal": is_terminal("done"),
         }))
     }
@@ -682,13 +718,18 @@ impl GtdPack {
         ensure_audit_schema(self.runtime()).await;
         write_audit_record(self.runtime(), note.id, &current, target, p.note.as_deref()).await;
 
+        let task = render_task(&note);
         Ok(json!({
             "transitioned": true,
-            "id": short_id(note.id),
-            "full_id": note.id.as_hyphenated().to_string(),
+            "id": task["id"],
+            "full_id": task["full_id"],
             "from": current,
             "to": target,
             "is_terminal": is_terminal(target),
+            "title": task["title"],
+            "priority": task["priority"],
+            "assignee": task["assignee"],
+            "due": task["due"],
         }))
     }
 }

@@ -815,3 +815,268 @@ async fn noop_transition_does_not_write_audit_record() {
         "noop transition must not insert an audit row (expected 1 baseline row, got {count})"
     );
 }
+
+// ── Wave-1 fix tests ──────────────────────────────────────────────────────────
+
+/// Fix 1: assign(status="done") must be rejected at creation time.
+#[tokio::test]
+async fn assign_rejects_terminal_status_done() {
+    let pack = pack(rt());
+    let err = pack
+        .dispatch(
+            "assign",
+            json!({"title": "terminal task", "status": "done"}),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot create task in terminal state"),
+        "expected terminal-state rejection; got: {msg}"
+    );
+    assert!(
+        msg.contains("done"),
+        "error must name the bad status; got: {msg}"
+    );
+}
+
+/// Fix 1: assign(status="cancelled") must be rejected at creation time.
+#[tokio::test]
+async fn assign_rejects_terminal_status_cancelled() {
+    let pack = pack(rt());
+    let err = pack
+        .dispatch(
+            "assign",
+            json!({"title": "terminal task", "status": "cancelled"}),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot create task in terminal state"),
+        "expected terminal-state rejection; got: {msg}"
+    );
+    assert!(
+        msg.contains("cancelled"),
+        "error must name the bad status; got: {msg}"
+    );
+}
+
+/// Fix 1: assign(status="inbox") must succeed (non-terminal initial status).
+#[tokio::test]
+async fn assign_accepts_inbox_status() {
+    let pack = pack(rt());
+    let resp = pack
+        .dispatch("assign", json!({"title": "inbox task", "status": "inbox"}))
+        .await
+        .expect("inbox is a valid initial status");
+    assert_eq!(resp["status"], "inbox");
+}
+
+/// Fix 2: assign(due="2026-06-01T00:00:00Z") must succeed and store RFC 3339.
+#[tokio::test]
+async fn assign_due_iso8601_full_accepted() {
+    let pack = pack(rt());
+    let resp = pack
+        .dispatch(
+            "assign",
+            json!({"title": "iso due", "due": "2026-06-01T00:00:00Z"}),
+        )
+        .await
+        .expect("full ISO-8601 due must be accepted");
+    let due = resp["due"].as_str().expect("due must be a string");
+    // Must be parseable as RFC 3339.
+    chrono::DateTime::parse_from_rfc3339(due)
+        .unwrap_or_else(|e| panic!("due not RFC 3339: {due} — {e}"));
+}
+
+/// Fix 2: assign(due="2026-06-01") (date-only) must succeed and store RFC 3339.
+#[tokio::test]
+async fn assign_due_date_only_accepted() {
+    let pack = pack(rt());
+    let resp = pack
+        .dispatch(
+            "assign",
+            json!({"title": "date-only due", "due": "2026-06-01"}),
+        )
+        .await
+        .expect("date-only due must be accepted");
+    let due = resp["due"].as_str().expect("due must be a string");
+    chrono::DateTime::parse_from_rfc3339(due)
+        .unwrap_or_else(|e| panic!("due not RFC 3339: {due} — {e}"));
+}
+
+/// Fix 2: assign(due="tomorrow") must be rejected with a clear error.
+#[tokio::test]
+async fn assign_due_free_text_rejected() {
+    let pack = pack(rt());
+    let err = pack
+        .dispatch("assign", json!({"title": "vague due", "due": "tomorrow"}))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("due must be ISO-8601"),
+        "expected ISO-8601 error; got: {msg}"
+    );
+    assert!(
+        msg.contains("tomorrow"),
+        "error must echo the bad value; got: {msg}"
+    );
+}
+
+/// Fix 2: assign(due="June 1st 2026") must be rejected.
+#[tokio::test]
+async fn assign_due_natural_language_rejected() {
+    let pack = pack(rt());
+    let err = pack
+        .dispatch(
+            "assign",
+            json!({"title": "vague due", "due": "June 1st 2026"}),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("due must be ISO-8601"),
+        "expected ISO-8601 error; got: {msg}"
+    );
+}
+
+/// Fix 3: complete response must include completed_at field.
+#[tokio::test]
+async fn complete_response_includes_completed_at() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "track completion time"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let done = pack
+        .dispatch("complete", json!({"id": id, "result": "shipped"}))
+        .await
+        .expect("complete must succeed");
+
+    let completed_at = done["completed_at"]
+        .as_str()
+        .expect("completed_at must be in response");
+    chrono::DateTime::parse_from_rfc3339(completed_at)
+        .unwrap_or_else(|e| panic!("completed_at not RFC 3339: {completed_at} — {e}"));
+}
+
+/// Fix 3: get(id) after complete must show GTD status as "done".
+#[tokio::test]
+async fn complete_sets_properties_status_to_done() {
+    let rt = rt();
+    let fixture = pack(rt.clone());
+
+    let resp = assign(&fixture, json!({"title": "check status after complete"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+    let uuid = uuid::Uuid::parse_str(&id).unwrap();
+
+    fixture
+        .dispatch("complete", json!({"id": id}))
+        .await
+        .expect("complete must succeed");
+
+    let token = rt.authorize(khive_runtime::Namespace::local());
+    let note = rt
+        .notes(&token)
+        .expect("note store")
+        .get_note(uuid)
+        .await
+        .expect("get_note")
+        .expect("note must exist");
+
+    let gtd_status = note
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("status"))
+        .and_then(|v| v.as_str())
+        .expect("properties.status must be set");
+    assert_eq!(
+        gtd_status, "done",
+        "properties.status must be 'done' after complete"
+    );
+
+    let has_completed_at = note
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("completed_at"))
+        .is_some();
+    assert!(
+        has_completed_at,
+        "properties.completed_at must be set after complete"
+    );
+}
+
+/// Fix 4: transition response must include full task snapshot fields.
+#[tokio::test]
+async fn transition_response_includes_task_fields() {
+    let pack = pack(rt());
+    let resp = assign(
+        &pack,
+        json!({"title": "snapshot task", "priority": "p1", "assignee": "alice"}),
+    )
+    .await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let r = pack
+        .dispatch("transition", json!({"id": id, "status": "next"}))
+        .await
+        .expect("transition must succeed");
+
+    assert_eq!(r["transitioned"], true);
+    assert_eq!(r["title"], "snapshot task", "response must include title");
+    assert_eq!(r["priority"], "p1", "response must include priority");
+    assert_eq!(r["assignee"], "alice", "response must include assignee");
+    // due was not set; must be present but null.
+    assert!(
+        r.get("due").is_some(),
+        "response must include due (null if unset)"
+    );
+}
+
+/// Fix 5: timestamp format is RFC 3339 across assign/tasks/complete/get.
+#[tokio::test]
+async fn timestamps_are_rfc3339_across_verbs() {
+    let pack = pack(rt());
+    let resp = assign(
+        &pack,
+        json!({"title": "ts check", "due": "2026-06-01T00:00:00Z"}),
+    )
+    .await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // assign response: created_at, updated_at must be RFC 3339.
+    for field in &["created_at", "updated_at"] {
+        let ts = resp[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} missing"));
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .unwrap_or_else(|e| panic!("{field} not RFC 3339: {ts} — {e}"));
+    }
+    // due must be RFC 3339 after parsing.
+    let due = resp["due"].as_str().expect("due must be a string");
+    chrono::DateTime::parse_from_rfc3339(due)
+        .unwrap_or_else(|e| panic!("due not RFC 3339: {due} — {e}"));
+
+    // tasks listing: same fields.
+    let tasks = pack.dispatch("tasks", json!({})).await.unwrap();
+    let task = tasks
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("at least one task");
+    for field in &["created_at", "updated_at"] {
+        let ts = task[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("tasks.{field} missing"));
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .unwrap_or_else(|e| panic!("tasks.{field} not RFC 3339: {ts} — {e}"));
+    }
+
+    // complete response: completed_at must be RFC 3339.
+    let done = pack.dispatch("complete", json!({"id": id})).await.unwrap();
+    let completed_at = done["completed_at"].as_str().expect("completed_at missing");
+    chrono::DateTime::parse_from_rfc3339(completed_at)
+        .unwrap_or_else(|e| panic!("completed_at not RFC 3339: {completed_at} — {e}"));
+}
