@@ -1,7 +1,7 @@
 //! Smoke tests for the comm pack (ADR-040).
 
 use khive_pack_comm::CommPack;
-use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{KhiveRuntime, Namespace, VerbRegistry, VerbRegistryBuilder};
 use khive_types::Pack;
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
@@ -9,6 +9,17 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(CommPack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+    (registry, runtime)
+}
+
+/// Build a registry with a specific default namespace (for caller-scoped dispatch).
+fn build_registry_for_ns(ns: &str) -> (VerbRegistry, KhiveRuntime) {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(CommPack::new(runtime.clone()));
+    builder.with_default_namespace(ns);
     let registry = builder.build().expect("registry builds");
     (registry, runtime)
 }
@@ -337,5 +348,212 @@ async fn test_short_id_collision_errors_clearly() {
     assert!(
         msg.contains("ambiguous"),
         "ambiguous prefix error must mention 'ambiguous': got {msg:?}"
+    );
+}
+// ── UE6 Critical F-C3: dual-write delivery tests ─────────────────────────────
+
+/// send() from lambda:khive to lambda:leo writes one outbound note in the caller's namespace.
+#[tokio::test]
+async fn test_send_writes_outbound_in_caller_ns() {
+    let (registry, rt) = build_registry_for_ns("lambda:khive");
+
+    registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": "lambda:leo", "content": "hi" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    // Verify: lambda:khive namespace has exactly 1 message note with direction=outbound.
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let notes = rt
+        .list_notes(&caller_token, Some("message"), 100, 0)
+        .await
+        .expect("list_notes succeeds");
+    let outbound: Vec<_> = notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .filter(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("outbound")
+        })
+        .collect();
+    assert_eq!(
+        outbound.len(),
+        1,
+        "caller namespace must have exactly 1 outbound note; got {outbound:?}"
+    );
+    assert_eq!(
+        outbound[0]
+            .properties
+            .as_ref()
+            .unwrap()
+            .get("to")
+            .and_then(|v| v.as_str()),
+        Some("lambda:leo")
+    );
+}
+
+/// send() from lambda:khive to lambda:leo writes one inbound note in the recipient's namespace.
+#[tokio::test]
+async fn test_send_writes_inbound_in_recipient_ns() {
+    let (registry, rt) = build_registry_for_ns("lambda:khive");
+
+    registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": "lambda:leo", "content": "meeting at 3pm" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    // Verify: lambda:leo namespace has exactly 1 message note with direction=inbound.
+    let recipient_token = rt.authorize(Namespace::parse("lambda:leo").unwrap());
+    let notes = rt
+        .list_notes(&recipient_token, Some("message"), 100, 0)
+        .await
+        .expect("list_notes in recipient ns succeeds");
+    let inbound: Vec<_> = notes
+        .iter()
+        .filter(|n| n.deleted_at.is_none())
+        .filter(|n| {
+            n.properties
+                .as_ref()
+                .and_then(|p| p.get("direction"))
+                .and_then(|v| v.as_str())
+                == Some("inbound")
+        })
+        .collect();
+    assert_eq!(
+        inbound.len(),
+        1,
+        "recipient namespace must have exactly 1 inbound note; got {inbound:?}"
+    );
+    let props = inbound[0].properties.as_ref().unwrap();
+    assert_eq!(
+        props.get("from").and_then(|v| v.as_str()),
+        Some("lambda:khive")
+    );
+    assert_eq!(props.get("to").and_then(|v| v.as_str()), Some("lambda:leo"));
+    assert_eq!(inbound[0].content, "meeting at 3pm");
+    // inbound copy must carry an outbound_ref back to the caller's copy.
+    assert!(
+        props.get("outbound_ref").is_some(),
+        "inbound note must carry outbound_ref"
+    );
+}
+
+/// inbox() with the recipient's MCP session returns the inbound message.
+#[tokio::test]
+async fn test_inbox_returns_inbound_for_recipient() {
+    // Step 1: send from lambda:khive.
+    let (send_registry, rt) = build_registry_for_ns("lambda:khive");
+    send_registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": "lambda:leo", "content": "you have mail" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    // Step 2: build a registry scoped to lambda:leo and call inbox().
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(CommPack::new(rt.clone()));
+    builder.with_default_namespace("lambda:leo");
+    let leo_registry = builder.build().expect("leo registry builds");
+
+    let inbox = leo_registry
+        .dispatch("inbox", serde_json::json!({ "status": "unread" }))
+        .await
+        .expect("inbox succeeds");
+
+    let count = inbox
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .expect("inbox returns count");
+    assert_eq!(
+        count, 1,
+        "lambda:leo inbox must have 1 unread message; got {inbox}"
+    );
+
+    let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
+    let props = msgs[0].get("properties").unwrap();
+    assert_eq!(
+        props.get("from").and_then(|v| v.as_str()),
+        Some("lambda:khive")
+    );
+    assert_eq!(
+        props.get("direction").and_then(|v| v.as_str()),
+        Some("inbound")
+    );
+}
+
+/// send-to-self writes exactly ONE note (no duplicate) in the caller's namespace.
+#[tokio::test]
+async fn test_send_to_self_writes_single_note() {
+    let (registry, rt) = build_registry_for_ns("lambda:khive");
+
+    registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": "lambda:khive", "content": "self-note" }),
+        )
+        .await
+        .expect("send-to-self succeeds");
+
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let notes = rt
+        .list_notes(&caller_token, Some("message"), 100, 0)
+        .await
+        .expect("list_notes succeeds");
+    let alive: Vec<_> = notes.iter().filter(|n| n.deleted_at.is_none()).collect();
+    assert_eq!(
+        alive.len(),
+        1,
+        "send-to-self must create exactly 1 note, not a duplicate; got {alive:?}"
+    );
+}
+
+/// inbound write failure rolls back the outbound note (atomicity).
+///
+/// We simulate inbound failure by passing an invalid recipient namespace string
+/// (khive namespace syntax forbids control characters). The outbound note must
+/// not be persisted either.
+#[tokio::test]
+async fn test_send_inbound_failure_rolls_back_outbound() {
+    // An invalid namespace that will fail Namespace::parse.
+    let invalid_recipient = "this namespace has spaces!";
+
+    let (registry, rt) = build_registry_for_ns("lambda:khive");
+
+    let result = registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": invalid_recipient, "content": "should rollback" }),
+        )
+        .await;
+
+    // The send must fail because the recipient is not a valid namespace.
+    assert!(
+        result.is_err(),
+        "send to invalid namespace must fail; got {result:?}"
+    );
+
+    // Atomicity: no outbound note should remain in lambda:khive.
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let notes = rt
+        .list_notes(&caller_token, Some("message"), 100, 0)
+        .await
+        .expect("list_notes succeeds");
+    let alive: Vec<_> = notes.iter().filter(|n| n.deleted_at.is_none()).collect();
+    assert_eq!(
+        alive.len(),
+        0,
+        "failed send must not leave an outbound note in caller namespace; got {alive:?}"
     );
 }

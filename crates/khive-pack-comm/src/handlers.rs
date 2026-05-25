@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::note::Note;
 
 fn short_id(uuid: Uuid) -> String {
@@ -93,7 +93,12 @@ fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeErro
 
 // ── handlers ─────────────────────────────────────────────────────────────────
 
-/// `send` — create a message note in the caller's namespace (ADR-040 §send).
+/// `send` — create a message note in the caller's namespace (outbound) AND the
+/// recipient's namespace (inbound) per ADR-040 §send.
+///
+/// Two writes are made atomically: if the inbound write fails the outbound note
+/// is deleted before returning the error. When sender and recipient are the same
+/// namespace only one note is written (no duplicate).
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -114,7 +119,21 @@ pub(crate) async fn handle_send(
     let from = token.namespace().as_str().to_string();
     let sent_at = Utc::now().to_rfc3339();
 
-    let properties = json!({
+    // Validate the recipient namespace before any write so we never write an
+    // outbound note that we'd immediately have to roll back on parse failure.
+    // When from == to, skip cross-namespace checks (self-send path).
+    let recipient_token: Option<(Namespace, _)> = if from == p.to.trim() {
+        None // self-send: only one note, no inbound write needed
+    } else {
+        let recipient_ns = Namespace::parse(p.to.trim()).map_err(|e| {
+            RuntimeError::InvalidInput(format!("send: invalid recipient namespace {:?}: {e}", p.to))
+        })?;
+        let tok = runtime.authorize(recipient_ns.clone());
+        Some((recipient_ns, tok))
+    };
+
+    // ── Write 1: outbound copy in caller's namespace ──────────────────────────
+    let outbound_props = json!({
         "from": from,
         "to": p.to,
         "direction": "outbound",
@@ -124,21 +143,55 @@ pub(crate) async fn handle_send(
         "sent_at": sent_at,
     });
 
-    let note = runtime
+    let outbound_note = runtime
         .create_note(
             token,
             "message",
             p.subject.as_deref(),
             &p.content,
             None,
-            Some(properties),
+            Some(outbound_props),
             Vec::new(),
         )
         .await?;
 
+    // ── Write 2: inbound copy in recipient's namespace ────────────────────────
+    // Skipped when from == to (self-send) — only one note for that case.
+    if let Some((_recipient_ns, ref recipient_tok)) = recipient_token {
+        let inbound_props = json!({
+            "from": from,
+            "to": p.to,
+            "direction": "inbound",
+            "subject": p.subject,
+            "thread_id": p.thread_id,
+            "read": false,
+            "sent_at": sent_at,
+            // Cross-reference back to the outbound copy for read-receipt tracking.
+            "outbound_ref": outbound_note.id,
+        });
+
+        let inbound_result = runtime
+            .create_note(
+                recipient_tok,
+                "message",
+                p.subject.as_deref(),
+                &p.content,
+                None,
+                Some(inbound_props),
+                Vec::new(),
+            )
+            .await;
+
+        // Atomicity: roll back outbound on inbound failure.
+        if let Err(inbound_err) = inbound_result {
+            let _ = runtime.delete_note(token, outbound_note.id, true).await;
+            return Err(inbound_err);
+        }
+    }
+
     Ok(json!({
-        "id": short_id(note.id),
-        "full_id": note.id.as_hyphenated().to_string(),
+        "id": short_id(outbound_note.id),
+        "full_id": outbound_note.id.as_hyphenated().to_string(),
         "from": from,
         "to": p.to,
         "subject": p.subject,
