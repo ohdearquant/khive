@@ -4,7 +4,7 @@ use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::HandlerDef;
 use khive_runtime::{
-    KhiveRuntime, Namespace, NoteKindSpec, SchemaPlan, RuntimeError, VerbRegistry,
+    KhiveRuntime, Namespace, NoteKindSpec, RuntimeError, SchemaPlan, VerbRegistry,
     VerbRegistryBuilder,
 };
 use serde_json::{json, Value};
@@ -431,7 +431,10 @@ async fn pack_runtime_exposes_schema_plan() {
     use khive_runtime::PackRuntime;
     let pack = GtdPack::new(rt());
     let plan: SchemaPlan = pack.schema_plan();
-    assert!(!plan.is_empty(), "GtdPack must return a non-empty SchemaPlan");
+    assert!(
+        !plan.is_empty(),
+        "GtdPack must return a non-empty SchemaPlan"
+    );
     assert_eq!(plan.pack, "gtd");
     assert!(
         !plan.statements.is_empty(),

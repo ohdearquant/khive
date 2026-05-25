@@ -103,6 +103,19 @@ pub enum RuntimeError {
         second_idx: usize,
     },
 
+    /// Two packs declared the same `Visibility::Verb` handler name (ADR-017
+    /// §Boot-time collision checks). `Visibility::Subhandler` entries are
+    /// pack-prefixed and do not participate in cross-pack collision checks.
+    #[error(
+        "verb collision: verb {verb:?} declared by both pack {first_pack:?} and pack \
+         {second_pack:?}; rename one handler or use Visibility::Subhandler for internal verbs"
+    )]
+    VerbCollision {
+        verb: String,
+        first_pack: String,
+        second_pack: String,
+    },
+
     /// Gate denied this verb invocation (ADR-035).
     ///
     /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns

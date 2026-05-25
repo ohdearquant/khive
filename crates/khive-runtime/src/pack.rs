@@ -153,11 +153,10 @@ pub trait PackRuntime: Send + Sync {
     /// Defaults to an empty plan — packs that store everything in the core
     /// substrate tables (entities, notes, edges, events) return this default.
     ///
-    /// **Current state:** plans are aggregated via
-    /// [`VerbRegistry::all_schema_plans`] but the runtime does not yet apply
-    /// them at registration. Packs that need their schema present (e.g. GTD)
-    /// self-bootstrap by running the DDL lazily on first call. Centralized
-    /// startup application is deferred to c12 (PackVerbRegistry).
+    /// Plans are aggregated via [`VerbRegistry::all_schema_plans`] and applied
+    /// at startup via `KhiveMcpServer::with_packs` (c12). Packs that need their
+    /// schema present (e.g. GTD) also self-bootstrap lazily on first call for
+    /// robustness in test contexts that create fresh in-memory databases.
     fn schema_plan(&self) -> SchemaPlan {
         SchemaPlan::empty()
     }
@@ -411,6 +410,7 @@ impl VerbRegistryBuilder {
             .collect();
 
         validate_unique_note_kinds(&ordered_packs)?;
+        validate_unique_verb_names(&ordered_packs)?;
 
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
@@ -436,6 +436,32 @@ fn validate_unique_note_kinds(packs: &[Box<dyn PackRuntime>]) -> Result<(), Runt
                     "duplicate note kind {kind:?}: claimed by both {first_pack:?} and {:?}",
                     pack.name()
                 )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that no two packs declare the same `Visibility::Verb` handler name
+/// (ADR-017 §Boot-time collision checks, F093).
+///
+/// `Visibility::Subhandler` entries are pack-prefixed by convention and excluded
+/// from cross-pack collision detection. Two packs declaring the same subhandler
+/// name prefix (e.g. `recall.embed`) would be a pack-authoring error but does not
+/// produce a cross-pack routing conflict since only the owning pack dispatches them.
+fn validate_unique_verb_names(packs: &[Box<dyn PackRuntime>]) -> Result<(), RuntimeError> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for pack in packs {
+        for handler in pack.handlers() {
+            if !matches!(handler.visibility, Visibility::Verb) {
+                continue;
+            }
+            if let Some(first_pack) = seen.insert(handler.name, pack.name()) {
+                return Err(RuntimeError::VerbCollision {
+                    verb: handler.name.to_string(),
+                    first_pack: first_pack.to_string(),
+                    second_pack: pack.name().to_string(),
+                });
             }
         }
     }
@@ -700,24 +726,40 @@ impl VerbRegistry {
         None
     }
 
-    /// All handler definitions across all registered packs.
+    /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
     ///
-    /// Returned with `'static` lifetime since pack handlers are `&'static [HandlerDef]`
-    /// constants — callers can keep the slice references beyond the registry's
-    /// borrow.
+    /// Subhandlers (`Visibility::Subhandler`) are excluded — they are internal
+    /// pipeline steps not surfaced on the MCP wire (ADR-017 §Visibility filtering,
+    /// F118). Returned with `'static` lifetime since pack handlers are `&'static
+    /// [HandlerDef]` constants.
     pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
         self.packs
             .iter()
             .flat_map(|p| p.handlers().iter())
+            .filter(|h| matches!(h.visibility, Visibility::Verb))
             .collect()
     }
 
-    /// All handler definitions paired with the name of the pack that owns them.
+    /// All MCP-exposed handlers paired with the name of the pack that owns them
+    /// (`Visibility::Verb` only).
     ///
-    /// Useful for building catalogs that attribute each handler to its source pack.
-    /// The pack name has the same lifetime as `&self`; the `HandlerDef` reference
-    /// is `'static`.
+    /// Subhandlers (`Visibility::Subhandler`) are excluded from the MCP catalog
+    /// (ADR-017 §Visibility filtering, F118-F123). Use `all_handlers_with_names`
+    /// when internal handlers must also be enumerated (e.g. runtime introspection).
     pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
+            .filter(|(_, h)| matches!(h.visibility, Visibility::Verb))
+            .collect()
+    }
+
+    /// All handler definitions across all registered packs, including subhandlers.
+    ///
+    /// Unlike `all_verbs`, this includes `Visibility::Subhandler` entries. Useful
+    /// for runtime introspection (e.g. `list_handlers`) and tooling that needs
+    /// the complete handler surface (ADR-017 §Introspection).
+    pub fn all_handlers_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
         self.packs
             .iter()
             .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
@@ -835,6 +877,33 @@ impl VerbRegistry {
     /// skip empty plans should check `plan.is_empty()`.
     pub fn all_schema_plans(&self) -> Vec<SchemaPlan> {
         self.packs.iter().map(|p| p.schema_plan()).collect()
+    }
+
+    /// Apply all non-empty pack-auxiliary schema plans to the given backend
+    /// (ADR-017 §c12 startup application).
+    ///
+    /// This is the centralized startup hook that replaced the previous lazy
+    /// per-pack self-bootstrap pattern. Each pack's `SchemaPlan` carries
+    /// idempotent `CREATE TABLE IF NOT EXISTS` DDL; calling this more than once
+    /// is safe. Empty plans are skipped.
+    ///
+    /// Errors from individual plans are logged via `tracing::warn!` and not
+    /// propagated so that a single pack's schema failure does not prevent the
+    /// rest from loading. Callers that need hard-failure semantics should call
+    /// `all_schema_plans()` and apply each plan individually.
+    pub fn apply_schema_plans(&self, backend: &khive_db::StorageBackend) {
+        for plan in self.all_schema_plans() {
+            if plan.is_empty() {
+                continue;
+            }
+            if let Err(e) = backend.apply_pack_ddl_statements(plan.statements) {
+                tracing::warn!(
+                    pack = plan.pack,
+                    error = %e,
+                    "failed to apply pack schema plan at startup (non-fatal)"
+                );
+            }
+        }
     }
 }
 
@@ -1011,13 +1080,69 @@ mod tests {
                 visibility: Visibility::Verb,
                 category: VerbCategory::Commissive,
             },
+            // "create" is Subhandler so it does NOT collide with AlphaPack's
+            // Verb-visibility "create" — subhandlers are pack-internal and
+            // excluded from cross-pack collision detection (ADR-017).
             HandlerDef {
                 name: "create",
-                description: "create a gadget",
-                visibility: Visibility::Verb,
+                description: "beta internal create (subhandler)",
+                visibility: Visibility::Subhandler,
                 category: VerbCategory::Commissive,
             },
         ];
+    }
+
+    /// Build a registry with AlphaPack + BetaPack.
+    ///
+    /// BetaPack's `create` is Subhandler so there is no Verb-visibility
+    /// collision with AlphaPack's `create` Verb. Tests that need a collision
+    /// use `build_colliding_registry()` instead.
+    fn build_registry() -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.register(BetaPack);
+        builder.build().expect("registry builds without collision")
+    }
+
+    /// Build a registry with two packs that declare the same Verb-visibility
+    /// handler — used to test that `VerbCollision` is raised at build time.
+    struct CollidingPack;
+
+    impl Pack for CollidingPack {
+        const NAME: &'static str = "colliding";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "create",
+            description: "duplicate Verb-visibility create",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for CollidingPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({ "pack": "colliding", "verb": verb }))
+        }
     }
 
     #[async_trait]
@@ -1045,13 +1170,6 @@ mod tests {
         }
     }
 
-    fn build_registry() -> VerbRegistry {
-        let mut builder = VerbRegistryBuilder::new();
-        builder.register(AlphaPack);
-        builder.register(BetaPack);
-        builder.build().expect("registry builds")
-    }
-
     #[tokio::test]
     async fn dispatch_routes_to_correct_pack() {
         let reg = build_registry();
@@ -1063,12 +1181,80 @@ mod tests {
         assert_eq!(res["pack"], "beta");
     }
 
-    #[tokio::test]
-    async fn dispatch_first_registered_wins_on_collision() {
-        let reg = build_registry();
+    /// ADR-017 §Boot-time collision checks (F093/F094): two packs declaring the
+    /// same `Visibility::Verb` handler must be rejected at build time — the old
+    /// "first registered wins" behaviour is replaced by a boot error.
+    #[test]
+    fn verb_collision_is_boot_time_error() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.register(CollidingPack);
+        let err = builder
+            .build()
+            .err()
+            .expect("duplicate Verb-visibility handler must be rejected at build time");
+        assert!(
+            matches!(err, RuntimeError::VerbCollision { ref verb, .. } if verb == "create"),
+            "expected VerbCollision for 'create', got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("create"),
+            "error must name the colliding verb: {msg}"
+        );
+        assert!(
+            msg.contains("alpha") || msg.contains("colliding"),
+            "error must name one of the conflicting packs: {msg}"
+        );
+    }
 
-        let res = reg.dispatch("create", Value::Null).await.unwrap();
-        assert_eq!(res["pack"], "alpha", "first registered pack wins");
+    /// Subhandler-visibility handlers with the same name across packs are NOT
+    /// a collision — they are pack-internal and excluded from cross-pack
+    /// collision detection (ADR-017 §Boot-time collision checks).
+    #[test]
+    fn subhandler_same_name_across_packs_is_not_a_collision() {
+        struct SubhandlerPack;
+        impl Pack for SubhandlerPack {
+            const NAME: &'static str = "subhandler_pack";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+                name: "create",
+                description: "internal create",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Commissive,
+            }];
+        }
+        #[async_trait]
+        impl PackRuntime for SubhandlerPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                verb: &str,
+                _: Value,
+                _: &VerbRegistry,
+                _: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                Ok(serde_json::json!({"pack": "subhandler_pack", "verb": verb}))
+            }
+        }
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack); // AlphaPack has Verb "create"
+        builder.register(SubhandlerPack); // SubhandlerPack has Subhandler "create" — no collision
+        builder
+            .build()
+            .expect("subhandler same name must NOT be a collision");
     }
 
     #[tokio::test]
@@ -1081,21 +1267,42 @@ mod tests {
         assert!(msg.contains("create"));
     }
 
+    /// `all_verbs` returns only `Visibility::Verb` entries (ADR-017 F118).
+    ///
+    /// BetaPack's `create` is `Visibility::Subhandler` — it must NOT appear
+    /// in `all_verbs()` even though it has the same name as a Verb in AlphaPack.
     #[test]
-    fn all_verbs_aggregates_across_packs() {
+    fn all_verbs_aggregates_across_packs_excludes_subhandlers() {
         let reg = build_registry();
         let verbs: Vec<&str> = reg.all_verbs().iter().map(|v| v.name).collect();
-        assert_eq!(verbs, vec!["create", "list", "notify", "create"]);
+        // BetaPack's "create" (Subhandler) is absent; only Verb-visibility entries appear.
+        assert_eq!(verbs, vec!["create", "list", "notify"]);
     }
 
     #[test]
-    fn all_verbs_with_names_pairs_pack_name() {
+    fn all_verbs_with_names_pairs_pack_name_excludes_subhandlers() {
         let reg = build_registry();
         let pairs: Vec<(&str, &str)> = reg
             .all_verbs_with_names()
             .iter()
             .map(|(pack, v)| (*pack, v.name))
             .collect();
+        // BetaPack's "create" is Subhandler and must NOT appear here.
+        assert_eq!(
+            pairs,
+            vec![("alpha", "create"), ("alpha", "list"), ("beta", "notify"),]
+        );
+    }
+
+    #[test]
+    fn all_handlers_with_names_includes_subhandlers() {
+        let reg = build_registry();
+        let pairs: Vec<(&str, &str)> = reg
+            .all_handlers_with_names()
+            .iter()
+            .map(|(pack, v)| (*pack, v.name))
+            .collect();
+        // BetaPack's Subhandler "create" IS present in the full handler list.
         assert_eq!(
             pairs,
             vec![

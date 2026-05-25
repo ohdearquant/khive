@@ -165,6 +165,7 @@ impl KhiveMcpServer {
             .expect("kg is a known pack name");
             let registry = builder.build().expect("fallback kg registry builds");
             recovered_runtime.install_edge_rules(registry.all_edge_rules());
+            registry.apply_schema_plans(recovered_runtime.backend());
             Self { registry }
         })
     }
@@ -199,6 +200,10 @@ impl KhiveMcpServer {
         // ADR-031: aggregate pack-declared edge endpoint rules into the runtime
         // so `validate_edge_relation_endpoints` can consult them.
         runtime.install_edge_rules(registry.all_edge_rules());
+        // ADR-017 §c12: apply pack-auxiliary schema plans at startup so pack
+        // tables are present before any handler runs. Errors are logged but
+        // not propagated so a single pack's schema failure cannot abort startup.
+        registry.apply_schema_plans(runtime.backend());
         Ok(Self { registry })
     }
 
