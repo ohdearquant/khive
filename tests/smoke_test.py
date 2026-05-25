@@ -332,9 +332,15 @@ def main():
             "include_roots": False,
         })
         # #148: traverse response uses canonical "id" (not "node_id")
+        # Traverse returns full 36-char UUIDs; create returns short 8-char ids by default
+        # (W1-K #447). Match by prefix to bridge the two id forms.
         all_node_ids = [n["id"] for p in paths for n in p.get("nodes", [])]
-        assert b["id"] in all_node_ids, "B must be reachable"
-        assert c["id"] in all_node_ids, "C must be reachable at depth 2"
+        assert any(nid.startswith(b["id"]) for nid in all_node_ids), (
+            f"B must be reachable: b={b['id']!r} nodes={all_node_ids}"
+        )
+        assert any(nid.startswith(c["id"]) for nid in all_node_ids), (
+            f"C must be reachable at depth 2: c={c['id']!r}"
+        )
         print(f"  [ok] traverse — depth-2 multi-hop")
 
         # 23. Parallel batch — independent ops must all succeed in one request call.

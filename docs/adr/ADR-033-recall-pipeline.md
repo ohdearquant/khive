@@ -355,6 +355,50 @@ _model class_ (e.g., cross-encoder, graph-proximate) would require a new ADR.
 override. Returns `{reranked: [{note_id, rerank_scores, rerank_score}], active_rerankers}`.
 When weights are empty, returns candidates with empty `rerank_scores` (pass-through).
 
+### 6.3 Multi-model vector fusion (v024/multi-vector-fusion)
+
+When multiple embedding models are registered in the runtime (via `RuntimeConfig.embedding_model`
+plus `additional_embedding_models`, or via `KhiveRuntime::register_embedder`), the recall
+pipeline fans out across all registered models for both `remember` and `recall`:
+
+**`remember`-side (write fan-out):**
+
+When `remember` is called without an explicit `embedding_model` parameter:
+
+1. `registered_embedding_model_names()` enumerates all models in the `EmbedderRegistry`.
+2. Embedding runs in parallel via `tokio::spawn` — one task per model.
+3. One `VectorRecord` is inserted per model into its own vector store partition.
+
+When `embedding_model` is explicitly set, only that model's VectorRecord is written
+(single-model path, backward-compatible).
+
+**`recall`-side (multi-source fusion):**
+
+When `recall` is called without an explicit `embedding_model` parameter:
+
+1. The query is embedded in parallel with each registered model.
+2. Each model's vector store is queried with its corresponding query embedding.
+3. `RecallCandidateSet.vector_hits_per_model` collects `(model_name, Vec<VectorSearchHit>)`
+   tuples — one per model.
+4. `fuse_candidates` builds N vector sources (one per model) plus 1 text source and passes all
+   sources to `khive_retrieval::fuse_search_results`. For N=0 models an empty placeholder
+   source is prepended to maintain the 2-source layout required for consistent fusion
+   strategy behavior (RRF and Weighted do not apply their full algorithm to a single-source
+   input — `fuse_search_results` returns raw scores when `sources.len() == 1`).
+
+**Wire shape is unchanged:** `recall` always returns `[{note_id, score, ...}]`. The
+per-model vector breakdown is only exposed via the `recall.candidates` sub-handler's
+`vector_candidates_per_model` field, which appears only when two or more models are active.
+
+**Explicit-model scoping:** passing `embedding_model` to `recall` queries only that model's
+vector store (single-model path). `recall.candidates` will not include
+`vector_candidates_per_model` in this case.
+
+**Strategy guidance for N > 1 models:** The `Weighted` fusion strategy uses two
+configurable weights (vector, keyword). With N > 1 models, the N vector sources and 1 text
+source exceed the expected 2-source layout. Use `"rrf"` (default) or `"union"` when multiple
+models are active; `"weighted"` maps only the first two sources to the configured weights.
+
 ### 7. Calibration protocol
 
 To calibrate recall parameters for a deployment:

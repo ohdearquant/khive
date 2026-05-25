@@ -1631,7 +1631,10 @@ async fn schedule_help_returns_required_action_and_at() -> anyhow::Result<()> {
     let params = result["params"]
         .as_array()
         .expect("params must be an array");
-    assert!(!params.is_empty(), "schedule help must have non-empty params");
+    assert!(
+        !params.is_empty(),
+        "schedule help must have non-empty params"
+    );
 
     let action = params
         .iter()

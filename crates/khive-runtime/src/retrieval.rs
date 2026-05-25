@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::runtime::{KhiveRuntime, NamespaceToken};
+use crate::runtime::{parse_embedding_model_alias, KhiveRuntime, NamespaceToken};
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
@@ -54,10 +54,24 @@ impl KhiveRuntime {
     }
 
     /// Generate an embedding vector for `text` using the named model.
+    ///
+    /// Accepts both built-in lattice model names/aliases and custom provider
+    /// names registered via [`KhiveRuntime::register_embedder`]. For lattice
+    /// models the resolved `EmbeddingModel` enum is forwarded to `embed_one`
+    /// so the service can select the correct model variant. For custom
+    /// providers, `embed_one` is called with `EmbeddingModel::default()`
+    /// because custom services are expected to ignore the enum argument (they
+    /// own a single model implicitly).
+    ///
+    /// Returns `UnknownModel` if `model_name` is not in the embedder registry.
     pub async fn embed_with_model(&self, model_name: &str, text: &str) -> RuntimeResult<Vec<f32>> {
-        let model = self.resolve_embedding_model(Some(model_name))?;
+        // Try to resolve as a lattice alias. If that succeeds, use the enum to
+        // inform the service which model to run. If not, fall through to the
+        // custom-provider path — custom services ignore the EmbeddingModel arg.
+        let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
-        Ok(service.embed_one(text, model).await?)
+        let emb_model = model.unwrap_or_default();
+        Ok(service.embed_one(text, emb_model).await?)
     }
 
     /// Generate embeddings for multiple texts in one call using the configured default model.
@@ -79,6 +93,9 @@ impl KhiveRuntime {
     }
 
     /// Generate embeddings for multiple texts using the named model.
+    ///
+    /// Accepts lattice model names/aliases and custom provider names.
+    /// Returns `UnknownModel` if `model_name` is not in the embedder registry.
     pub async fn embed_batch_with_model(
         &self,
         model_name: &str,
@@ -87,9 +104,10 @@ impl KhiveRuntime {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let model = self.resolve_embedding_model(Some(model_name))?;
+        let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
-        Ok(service.embed(texts, model).await?)
+        let emb_model = model.unwrap_or_default();
+        Ok(service.embed(texts, emb_model).await?)
     }
 
     /// Search vectors using either a caller-provided embedding or query text.

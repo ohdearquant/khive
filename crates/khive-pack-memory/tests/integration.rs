@@ -1,9 +1,14 @@
+use async_trait::async_trait;
 use khive_pack_brain::tunable::PackTunable;
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
-use khive_runtime::{FusionStrategy, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder};
+use khive_runtime::{
+    EmbedderProvider, FusionStrategy, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder,
+};
 use khive_types::Pack;
+use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::json;
+use std::sync::Arc;
 use uuid::Uuid;
 
 fn make_runtime() -> KhiveRuntime {
@@ -1766,5 +1771,203 @@ async fn test_recall_verbose_presentation_includes_breakdown() {
     assert!(
         bd.get("temporal").is_some(),
         "breakdown must have temporal field; got: {bd}"
+    );
+}
+
+// ── Codex High fixes regressions (#444) ──────────────────────────────────────
+
+/// Trivial constant-vector embedding service for testing without real model weights.
+/// The `_model` parameter is ignored; returns a synthetic `dims × seed` vector.
+struct ConstVecService {
+    dims: usize,
+    seed: f32,
+}
+
+#[async_trait]
+impl EmbeddingService for ConstVecService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts.iter().map(|_| vec![self.seed; self.dims]).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "const-vec"
+    }
+}
+
+struct ConstVecProvider {
+    provider_name: String,
+    dims: usize,
+    seed: f32,
+}
+
+impl ConstVecProvider {
+    fn new(name: &str, dims: usize, seed: f32) -> Self {
+        Self {
+            provider_name: name.to_owned(),
+            dims,
+            seed,
+        }
+    }
+}
+
+#[async_trait]
+impl EmbedderProvider for ConstVecProvider {
+    fn name(&self) -> &str {
+        &self.provider_name
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(ConstVecService {
+            dims: self.dims,
+            seed: self.seed,
+        }))
+    }
+}
+
+/// Fix 1 regression (codex High #1, PR #444): a runtime with no lattice
+/// `embedding_model` in config but a custom registered embedder must fan out
+/// `remember` through that embedder and store a vector.
+///
+/// Previously the fan-out gate checked `config().embedding_model.is_some()`;
+/// custom-only runtimes fell through to `vec![]`.
+#[tokio::test]
+async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
+    const MODEL_A: &str = "custom-enc-a";
+    const DIMS: usize = 4;
+
+    // Runtime with no lattice model, only a custom embedder.
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new(MODEL_A, DIMS, 0.9));
+
+    assert!(rt.config().embedding_model.is_none());
+    assert!(
+        rt.registered_embedding_model_names()
+            .contains(&MODEL_A.to_string()),
+        "custom embedder must be in registry"
+    );
+
+    let registry = make_registry(rt.clone());
+
+    // remember — must not fail even with no lattice model.
+    let result = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "custom embedder fanout regression test content alpha",
+                "importance": 0.8
+            }),
+        )
+        .await
+        .expect("remember with custom-only embedder must succeed");
+
+    let note_id = result["note_id"].as_str().expect("note_id present");
+    assert!(!note_id.is_empty());
+
+    // recall — custom embedder must have participated: at least the text path
+    // should return the note.
+    let recall_result = registry
+        .dispatch(
+            "recall",
+            json!({ "query": "custom embedder fanout regression" }),
+        )
+        .await
+        .expect("recall after custom-embedder remember");
+
+    let hits = recall_result.as_array().expect("array");
+    let ids: Vec<&str> = hits
+        .iter()
+        .map(|h| h["note_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&note_id),
+        "recall must find the note created via custom embedder; got: {ids:?}"
+    );
+}
+
+/// Fix 2 regression (codex High #2, PR #444): Weighted fusion with N > 1
+/// vector models must not zero-weight the text source.
+///
+/// Previously `fuse_candidates` passed [vec_a, vec_b, text] as 3 sources to
+/// `fuse_search_results(Weighted)`.  `normalized_weights()` returns exactly 2
+/// weights; sources beyond index 1 received weight 0.0, silently dropping text.
+///
+/// After the fix, N > 1 vector sources are Union-combined into one before
+/// passing [combined_vector, text] — preserving the 2-source Weighted contract.
+///
+/// This test verifies that a memory created with two registered embedders is
+/// returned by recall under the Weighted strategy (text contributes).
+#[tokio::test]
+async fn test_weighted_fusion_multi_model_text_not_zeroed() {
+    const MODEL_A: &str = "enc-model-a";
+    const MODEL_B: &str = "enc-model-b";
+    const DIMS: usize = 4;
+
+    // Runtime with two custom embedders and no lattice model.
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new(MODEL_A, DIMS, 0.5));
+    rt.register_embedder(ConstVecProvider::new(MODEL_B, DIMS, 0.6));
+
+    assert_eq!(rt.registered_embedding_model_names().len(), 2);
+
+    let registry = make_registry(rt.clone());
+
+    // Store a memory with distinctive text content.
+    let result = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "weighted fusion multi model text contribution regression beta",
+                "importance": 0.7
+            }),
+        )
+        .await
+        .expect("remember with two custom embedders");
+
+    let note_id = result["note_id"].as_str().expect("note_id");
+
+    // Recall with explicit Weighted strategy — text must not be zeroed.
+    let recall = registry
+        .dispatch(
+            "recall",
+            json!({
+                "query": "weighted fusion multi model text",
+                "fusion_strategy": "weighted",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall with weighted fusion and 2 vector models");
+
+    let hits = recall.as_array().expect("array");
+    let ids: Vec<&str> = hits
+        .iter()
+        .map(|h| h["note_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&note_id),
+        "weighted fusion with N>1 vector models must not zero-weight text — \
+         note {note_id} must appear in results; got: {ids:?}"
     );
 }

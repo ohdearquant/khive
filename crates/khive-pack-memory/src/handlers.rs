@@ -11,6 +11,7 @@ use khive_runtime::{
     FusionStrategy as RuntimeFusionStrategy, NamespaceToken, RuntimeError, SearchHit, SearchSource,
     VerbRegistry,
 };
+use khive_score::DeterministicScore;
 use khive_storage::types::{
     TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
     VectorSearchRequest,
@@ -168,7 +169,28 @@ fn compute_score(
 struct RecallCandidateSet {
     namespace: String,
     text_hits: Vec<TextSearchHit>,
-    vector_hits: Vec<VectorSearchHit>,
+    /// One entry per embedding model: (model_name, hits).
+    /// When a single explicit model is queried, this has one entry.
+    /// When all registered models are queried (embedding_model=None), this has N entries.
+    vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
+}
+
+impl RecallCandidateSet {
+    /// Flatten all per-model vector hits into a single list.
+    ///
+    /// Used when the caller needs a unified view of all vector candidates
+    /// (e.g., for note batch-load or response serialization).
+    ///
+    /// NOTE: the flat-map does NOT deduplicate — the same note_id may appear
+    /// once per model. Consumers that need one hit per note should dedup by
+    /// subject_id.
+    // TODO(P2): deduplicate by note_id (codex review #444)
+    fn all_vector_hits(&self) -> Vec<&VectorSearchHit> {
+        self.vector_hits_per_model
+            .iter()
+            .flat_map(|(_, hits)| hits.iter())
+            .collect()
+    }
 }
 
 fn recall_candidate_count(cfg: &RecallConfig, limit: u32) -> u32 {
@@ -227,55 +249,127 @@ fn source_from_meta(meta: &CandidateMeta) -> SearchSource {
     }
 }
 
+/// Combine N per-model vector source lists into one via Union (max score per ID).
+///
+/// Used by `fuse_candidates` when the `Weighted` strategy is selected with
+/// more than one vector model active. The `Weighted` fusion contract requires
+/// exactly 2 sources ([vector, text]); combining all per-model hits into a
+/// single vector source preserves that contract while retaining the best
+/// score any model assigned to each note (codex High #2, PR #444).
+fn combine_vector_sources_union(
+    sources: Vec<Vec<(Uuid, DeterministicScore)>>,
+) -> Vec<(Uuid, DeterministicScore)> {
+    use std::collections::hash_map::Entry;
+    let capacity: usize = sources.iter().map(|s| s.len()).sum();
+    let mut combined: HashMap<Uuid, DeterministicScore> = HashMap::with_capacity(capacity);
+    for source in sources {
+        for (id, score) in source {
+            match combined.entry(id) {
+                Entry::Occupied(mut e) => {
+                    if score > *e.get() {
+                        *e.get_mut() = score;
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(score);
+                }
+            }
+        }
+    }
+    let mut result: Vec<(Uuid, DeterministicScore)> = combined.into_iter().collect();
+    result.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then(a.cmp(b)));
+    result
+}
+
 fn fuse_candidates(
-    text_hits: Vec<TextSearchHit>,
-    vector_hits: Vec<VectorSearchHit>,
+    candidates: &RecallCandidateSet,
     memory_ids: &HashSet<Uuid>,
     cfg: &RecallConfig,
     limit: usize,
 ) -> Vec<SearchHit> {
     let mut meta = HashMap::<Uuid, CandidateMeta>::new();
 
-    let text_source: Vec<_> = text_hits
-        .into_iter()
-        .filter(|h| memory_ids.contains(&h.subject_id))
-        .map(|h| {
-            let TextSearchHit {
-                subject_id,
-                score,
-                title,
-                snippet,
-                ..
-            } = h;
-            let entry = meta.entry(subject_id).or_default();
-            entry.in_text = true;
-            if entry.title.is_none() {
-                entry.title = title;
-            }
-            if entry.snippet.is_none() {
-                entry.snippet = snippet;
-            }
-            (subject_id, score)
-        })
-        .collect();
-
-    let vector_source: Vec<_> = vector_hits
-        .into_iter()
+    let text_source: Vec<_> = candidates
+        .text_hits
+        .iter()
         .filter(|h| memory_ids.contains(&h.subject_id))
         .map(|h| {
             let entry = meta.entry(h.subject_id).or_default();
-            entry.in_vector = true;
+            entry.in_text = true;
+            if entry.title.is_none() {
+                entry.title = h.title.clone();
+            }
+            if entry.snippet.is_none() {
+                entry.snippet = h.snippet.clone();
+            }
             (h.subject_id, h.score)
         })
         .collect();
 
+    // Build one source vec per model, marking in_vector for each contributing ID.
+    let vector_sources: Vec<Vec<_>> = candidates
+        .vector_hits_per_model
+        .iter()
+        .map(|(_, hits)| {
+            hits.iter()
+                .filter(|h| memory_ids.contains(&h.subject_id))
+                .map(|h| {
+                    meta.entry(h.subject_id).or_default().in_vector = true;
+                    (h.subject_id, h.score)
+                })
+                .collect()
+        })
+        .collect();
+
     let vector_only = matches!(&cfg.fuse_strategy, RuntimeFusionStrategy::VectorOnly);
-    let sources = if vector_only {
-        vec![vector_source]
+    let is_weighted = matches!(&cfg.fuse_strategy, RuntimeFusionStrategy::Weighted { .. });
+
+    // Assemble ordered source list passed to fuse_search_results.
+    //
+    // HybridConfig / Weighted contract: exactly 2 sources — [vector, text].
+    // With N > 1 vector models the naive approach of passing N+1 sources
+    // breaks Weighted because normalized_weights() only yields 2 values;
+    // sources beyond index 1 receive weight 0.0, silently dropping text
+    // (codex High #2, PR #444).
+    //
+    // Fix (Weighted, N > 1): combine all per-model vector sources into one
+    // via a Union (max-score per note_id) before adding text, so the final
+    // list is always [combined_vector, text] — preserving the 2-source
+    // Weighted contract. The Union step is intentional: each model may rank
+    // the same note; we take the best score any model assigned.
+    //
+    // For RRF / Union strategies, pass N separate vector sources — those
+    // strategies handle arbitrary source counts correctly.
+    //
+    // When no models are registered, insert an empty vector placeholder so we
+    // always pass at least 2 sources to fuse_search_results. This preserves
+    // the pre-multi-model behavior: fuse_search_results has a single-source
+    // shortcut that returns raw scores without applying the fusion strategy;
+    // with 2 sources the shortcut is bypassed and strategy is correctly applied.
+    let sources: Vec<Vec<_>> = if vector_only {
+        // VectorOnly: pass per-model sources as-is (no text).
+        vector_sources
+    } else if is_weighted && vector_sources.len() > 1 {
+        // Weighted + N > 1 vector models: combine into one vector source so
+        // the 2-source [vector, text] layout is preserved. Union (max-score)
+        // is used; per-model relative ordering is captured by the max score.
+        let combined_vector = combine_vector_sources_union(vector_sources);
+        vec![combined_vector, text_source]
     } else {
-        // HybridConfig weighted convention: vector first, keyword second.
-        vec![vector_source, text_source]
+        let mut s = if vector_sources.is_empty() {
+            // No vector models — use empty placeholder to keep 2-source layout.
+            vec![vec![]]
+        } else {
+            vector_sources
+        };
+        s.push(text_source);
+        s
     };
+
+    // When there are no sources at all (no models, no text), return empty.
+    if sources.is_empty() || sources.iter().all(|s| s.is_empty()) {
+        return vec![];
+    }
 
     let retrieval_cfg = retrieval_hybrid_config(&cfg.fuse_strategy, limit);
     fuse_search_results(sources, &retrieval_cfg)
@@ -325,49 +419,93 @@ impl MemoryPack {
             })
             .await?;
 
-        let vector_hits =
-            if self.runtime.config().embedding_model.is_some() || embedding_model.is_some() {
-                let model_name: String = embedding_model
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| self.runtime.default_embedder_name().to_string());
-                let vec = self.runtime.embed_with_model(&model_name, query).await?;
-                self.runtime
+        // Determine which embedding models to query.
+        //   - explicit embedding_model → query only that model (single-model path)
+        //   - None + models configured → query ALL registered models in parallel
+        //   - None + no model configured → skip vector search
+        let model_names: Vec<String> = if let Some(m) = embedding_model {
+            vec![m.to_string()]
+        } else {
+            // Fan out to ALL registered models — includes both lattice models
+            // from RuntimeConfig and any custom providers added via
+            // register_embedder() (codex High #1, PR #444).
+            // Gate on the registry, not config().embedding_model, so that
+            // custom-only runtimes (no lattice model in config) also fan out.
+            let names = self.runtime.registered_embedding_model_names();
+            if names.is_empty() {
+                // No models configured at all — skip vector search.
+                vec![]
+            } else {
+                names
+            }
+        };
+
+        let vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)> = if model_names.is_empty() {
+            vec![]
+        } else {
+            // Phase 1: embed the query with each model in parallel.
+            // Spawning separate tasks allows the embedding services to run
+            // concurrently even though KhiveRuntime::embed_with_model is async.
+            let mut embed_handles = Vec::with_capacity(model_names.len());
+            for model_name in model_names.iter().cloned() {
+                let rt = self.runtime.clone();
+                let q = query.to_string();
+                embed_handles.push(tokio::spawn(async move {
+                    rt.embed_with_model(&model_name, &q)
+                        .await
+                        .map(|v| (model_name, v))
+                }));
+            }
+            let mut query_vecs: Vec<(String, Vec<f32>)> = Vec::with_capacity(embed_handles.len());
+            for handle in embed_handles {
+                let pair: (String, Vec<f32>) = handle.await.map_err(|e| {
+                    RuntimeError::Internal(format!("recall embed task panicked: {e}"))
+                })??;
+                query_vecs.push(pair);
+            }
+
+            // Phase 2: search each model's vector store with the pre-embedded query.
+            let mut results = Vec::with_capacity(query_vecs.len());
+            for (model_name, vec) in query_vecs {
+                let hits = self
+                    .runtime
                     .vectors_for_model(token, &model_name)?
                     .search(VectorSearchRequest {
                         query_vectors: vec![vec],
                         top_k: candidate_limit,
                         namespace: Some(ns.clone()),
-                        // F111: already restricts to Note substrate kind
                         kind: Some(SubstrateKind::Note),
-                        embedding_model: Some(model_name),
+                        embedding_model: Some(model_name.clone()),
                         filter: None,
                         backend_hints: None,
                     })
-                    .await?
-            } else {
-                Vec::new()
-            };
+                    .await?;
+                results.push((model_name, hits));
+            }
+            results
+        };
 
         Ok(RecallCandidateSet {
             namespace: ns,
             text_hits,
-            vector_hits,
+            vector_hits_per_model,
         })
     }
 
     async fn load_memory_candidate_notes(
         &self,
         token: &NamespaceToken,
-        text_hits: &[TextSearchHit],
-        vector_hits: &[VectorSearchHit],
+        candidates: &RecallCandidateSet,
     ) -> Result<(HashSet<Uuid>, HashMap<Uuid, khive_storage::note::Note>), RuntimeError> {
+        let all_vector_hits = candidates.all_vector_hits();
         let candidate_ids: Vec<Uuid> = {
             let mut seen = HashSet::new();
             let mut ids = Vec::new();
-            for id in text_hits
+            for id in candidates
+                .text_hits
                 .iter()
                 .map(|h| h.subject_id)
-                .chain(vector_hits.iter().map(|h| h.subject_id))
+                .chain(all_vector_hits.iter().map(|h| h.subject_id))
             {
                 if seen.insert(id) {
                     ids.push(id);
@@ -542,17 +680,10 @@ impl MemoryPack {
                 p.embedding_model.as_deref(),
             )
             .await?;
-        let (memory_ids, mut notes_by_id) = self
-            .load_memory_candidate_notes(token, &candidates.text_hits, &candidates.vector_hits)
-            .await?;
+        let (memory_ids, mut notes_by_id) =
+            self.load_memory_candidate_notes(token, &candidates).await?;
 
-        let fused = fuse_candidates(
-            candidates.text_hits,
-            candidates.vector_hits,
-            &memory_ids,
-            &cfg,
-            candidate_limit as usize,
-        );
+        let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize);
 
         if fused.is_empty() {
             return to_json(&Vec::<Value>::new());
@@ -705,8 +836,13 @@ impl MemoryPack {
                 })
             })
             .collect();
-        let vector_candidates: Vec<Value> = candidates
-            .vector_hits
+
+        // Flatten all per-model vector hits for the response. The legacy single
+        // field `vector_candidates` is preserved for backward compat — it contains
+        // the union of all models' hits. A new `vector_candidates_per_model` field
+        // is added when multiple models are present.
+        let all_vector_hits = candidates.all_vector_hits();
+        let vector_candidates: Vec<Value> = all_vector_hits
             .iter()
             .map(|hit| {
                 json!({
@@ -717,12 +853,35 @@ impl MemoryPack {
             })
             .collect();
 
-        to_json(&json!({
+        let mut response = json!({
             "namespace": candidates.namespace,
             "candidate_limit": candidate_limit,
             "text_candidates": text_candidates,
             "vector_candidates": vector_candidates,
-        }))
+        });
+
+        if candidates.vector_hits_per_model.len() > 1 {
+            let per_model: serde_json::Map<String, Value> = candidates
+                .vector_hits_per_model
+                .iter()
+                .map(|(model, hits)| {
+                    let hits_json: Vec<Value> = hits
+                        .iter()
+                        .map(|h| {
+                            json!({
+                                "note_id": h.subject_id.to_string(),
+                                "score": h.score.to_f64(),
+                                "rank": h.rank,
+                            })
+                        })
+                        .collect();
+                    (model.clone(), Value::Array(hits_json))
+                })
+                .collect();
+            response["vector_candidates_per_model"] = Value::Object(per_model);
+        }
+
+        to_json(&response)
     }
 
     pub(crate) async fn handle_recall_fuse(
@@ -749,17 +908,10 @@ impl MemoryPack {
                 p.embedding_model.as_deref(),
             )
             .await?;
-        let (memory_ids, notes_by_id) = self
-            .load_memory_candidate_notes(token, &candidates.text_hits, &candidates.vector_hits)
-            .await?;
+        let (memory_ids, notes_by_id) =
+            self.load_memory_candidate_notes(token, &candidates).await?;
 
-        let fused = fuse_candidates(
-            candidates.text_hits,
-            candidates.vector_hits,
-            &memory_ids,
-            &cfg,
-            candidate_limit as usize,
-        );
+        let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize);
 
         let fused_candidates: Vec<Value> = fused
             .into_iter()
@@ -1138,19 +1290,23 @@ mod tests {
         ];
         let memory_ids: HashSet<Uuid> = [id_a, id_b, id_c].into_iter().collect();
 
+        let candidates_rrf = RecallCandidateSet {
+            namespace: "local".to_string(),
+            text_hits: text_hits.clone(),
+            vector_hits_per_model: vec![("mock".to_string(), vector_hits.clone())],
+        };
         let cfg_rrf = RecallConfig {
             fuse_strategy: RuntimeFusionStrategy::Rrf { k: 60 },
             ..RecallConfig::default()
         };
-        let rrf_results = fuse_candidates(
-            text_hits.clone(),
-            vector_hits.clone(),
-            &memory_ids,
-            &cfg_rrf,
-            10,
-        );
+        let rrf_results = fuse_candidates(&candidates_rrf, &memory_ids, &cfg_rrf, 10);
         let rrf_order: Vec<Uuid> = rrf_results.iter().map(|h| h.entity_id).collect();
 
+        let candidates_weighted = RecallCandidateSet {
+            namespace: "local".to_string(),
+            text_hits,
+            vector_hits_per_model: vec![("mock".to_string(), vector_hits)],
+        };
         let cfg_weighted = RecallConfig {
             fuse_strategy: RuntimeFusionStrategy::Weighted {
                 weights: vec![0.1, 0.9],
@@ -1158,7 +1314,7 @@ mod tests {
             ..RecallConfig::default()
         };
         let weighted_results =
-            fuse_candidates(text_hits, vector_hits, &memory_ids, &cfg_weighted, 10);
+            fuse_candidates(&candidates_weighted, &memory_ids, &cfg_weighted, 10);
         let weighted_order: Vec<Uuid> = weighted_results.iter().map(|h| h.entity_id).collect();
 
         // RRF on this fixture: id_a in both sources gets highest combined rank score;

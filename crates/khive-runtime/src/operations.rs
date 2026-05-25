@@ -1005,18 +1005,30 @@ impl KhiveRuntime {
             })
             .await?;
 
-        let embed_model_name: Option<String> =
-            if self.config().embedding_model.is_some() || embedding_model.is_some() {
-                Some(
-                    embedding_model
-                        .map(|m| m.to_string())
-                        .unwrap_or_else(|| self.default_embedder_name().to_string()),
-                )
+        // Multi-model vector embedding:
+        //   - explicit embedding_model → single model (existing behaviour)
+        //   - None + any models registered → ALL registered models in parallel
+        //   - None + no models configured → skip (text-only)
+        let embed_model_names: Vec<String> = if let Some(m) = embedding_model {
+            vec![m.to_string()]
+        } else {
+            // Fan out to ALL registered models — includes both lattice models
+            // from RuntimeConfig and any custom providers added via
+            // register_embedder() (codex High #1, PR #444).
+            // Gate on the registry, not config().embedding_model, so that
+            // custom-only runtimes (no lattice model in config) also fan out.
+            let names = self.registered_embedding_model_names();
+            if names.is_empty() {
+                // No models configured at all — skip vector embedding.
+                vec![]
             } else {
-                None
-            };
+                names
+            }
+        };
 
-        if let Some(ref model_name) = embed_model_name {
+        if embed_model_names.len() == 1 {
+            // Single-model path: preserves original sequential behaviour.
+            let model_name = &embed_model_names[0];
             let vector = self.embed_with_model(model_name, &note.content).await?;
             self.vectors_for_model(token, model_name)?
                 .insert(
@@ -1027,6 +1039,39 @@ impl KhiveRuntime {
                     vec![vector],
                 )
                 .await?;
+        } else if !embed_model_names.is_empty() {
+            // Multi-model path: embed with each model in parallel via spawned tasks,
+            // then insert one VectorRecord per model.
+            let rt_clone = self.clone();
+            let content_owned = note.content.clone();
+            let mut handles = Vec::with_capacity(embed_model_names.len());
+            for model_name in &embed_model_names {
+                let rt = rt_clone.clone();
+                let text = content_owned.clone();
+                let name = model_name.clone();
+                handles.push(tokio::spawn(async move {
+                    rt.embed_with_model(&name, &text).await
+                }));
+            }
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(embed_model_names.len());
+            for handle in handles {
+                let vec = handle
+                    .await
+                    .map_err(|e| RuntimeError::Internal(format!("embed task panicked: {e}")))??;
+                vectors.push(vec);
+            }
+            // TODO(P2): parallelize vector inserts (codex review #444)
+            for (model_name, vector) in embed_model_names.iter().zip(vectors.into_iter()) {
+                self.vectors_for_model(token, model_name)?
+                    .insert(
+                        note.id,
+                        SubstrateKind::Note,
+                        ns,
+                        "note.content",
+                        vec![vector],
+                    )
+                    .await?;
+            }
         }
 
         // Create annotates edges, compensating on failure to preserve atomicity.
@@ -1106,7 +1151,7 @@ impl KhiveRuntime {
                     if let Ok(fts) = self.text_for_notes(token) {
                         let _ = fts.delete_document(ns, note.id).await;
                     }
-                    if let Some(ref model_name) = embed_model_name {
+                    for model_name in &embed_model_names {
                         if let Ok(vs) = self.vectors_for_model(token, model_name) {
                             let _ = vs.delete(note.id).await;
                         }
@@ -1927,11 +1972,190 @@ pub struct LinkSpec {
 mod tests {
     use super::*;
     use crate::curation::EdgeListFilter;
+    use crate::embedder_registry::EmbedderProvider;
+    use crate::error::RuntimeError;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
     use crate::Namespace;
+    use async_trait::async_trait;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
+    }
+
+    // ── Fix-1 regression (codex High #1, PR #444) ────────────────────────────
+    // A runtime with no `config.embedding_model` but a custom registered
+    // embedder must fan out create_note through that embedder and store a
+    // vector so recall can find the note.
+
+    /// Trivial constant-vector embedding service.  The model argument is ignored;
+    /// the service always returns a synthetic `dims × 1.0f32` vector.
+    struct ConstVecService {
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for ConstVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "const-vec"
+        }
+    }
+
+    struct ConstVecProvider {
+        provider_name: String,
+        dims: usize,
+        pub build_count: Arc<AtomicUsize>,
+    }
+
+    impl ConstVecProvider {
+        fn new(name: &str, dims: usize) -> (Self, Arc<AtomicUsize>) {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let provider = Self {
+                provider_name: name.to_owned(),
+                dims,
+                build_count: Arc::clone(&counter),
+            };
+            (provider, counter)
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for ConstVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            self.build_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(ConstVecService { dims: self.dims }))
+        }
+    }
+
+    /// Fix 1 regression: custom embedder with no lattice model in config must
+    /// participate in fan-out.
+    ///
+    /// This test was previously broken because the fan-out gate checked
+    /// `config().embedding_model.is_some()`.  With only a custom provider
+    /// registered and `embedding_model = None` in config, the gate fell through
+    /// to `vec![]` and no vector was written.  After the fix the gate checks
+    /// `registered_embedding_model_names()` instead.
+    #[tokio::test]
+    async fn custom_embedder_only_runtime_fanout_stores_vector() {
+        const MODEL_NAME: &str = "test-custom-encoder";
+        const DIMS: usize = 8;
+
+        // Build a runtime with no lattice embedding_model.
+        let rt = KhiveRuntime::memory().unwrap();
+
+        // Register the custom provider — this is the only embedder configured.
+        let (provider, _counter) = ConstVecProvider::new(MODEL_NAME, DIMS);
+        rt.register_embedder(provider);
+
+        // Sanity: config.embedding_model is None, but the registry has one entry.
+        assert!(rt.config().embedding_model.is_none());
+        assert_eq!(rt.registered_embedding_model_names(), vec![MODEL_NAME]);
+
+        let tok = NamespaceToken::local();
+
+        // create_note should fan out to the custom embedder and store a vector.
+        let note = rt
+            .create_note(
+                &tok,
+                "memory",
+                None,
+                "custom embedder integration test content",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_note with custom-only embedder must succeed");
+
+        // Verify: a vector was written in the custom model's store.
+        use khive_storage::types::VectorSearchRequest;
+        let query_vec = vec![1.0_f32; DIMS];
+        let hits = rt
+            .vectors_for_model(&tok, MODEL_NAME)
+            .expect("vector store for custom model must be accessible")
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vec],
+                top_k: 5,
+                namespace: Some(tok.namespace().as_str().to_string()),
+                kind: Some(khive_types::SubstrateKind::Note),
+                embedding_model: Some(MODEL_NAME.to_string()),
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .expect("vector search succeeds");
+
+        assert!(
+            hits.iter().any(|h| h.subject_id == note.id),
+            "custom embedder must have written a vector for note {}: hits={hits:?}",
+            note.id
+        );
+    }
+
+    /// Fix 1 regression (recall path): custom-only embedder participates in
+    /// embed_with_model so recall fan-out also works.
+    ///
+    /// Previously `embed_with_model` called `resolve_embedding_model` which
+    /// required a lattice alias; custom provider names were rejected with
+    /// `UnknownModel`.  After the fix, the lattice alias parse is optional
+    /// and the embedder registry is consulted directly.
+    #[tokio::test]
+    async fn embed_with_model_accepts_custom_provider_name() {
+        const MODEL_NAME: &str = "my-custom-enc";
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider, _counter) = ConstVecProvider::new(MODEL_NAME, DIMS);
+        rt.register_embedder(provider);
+
+        let result = rt
+            .embed_with_model(MODEL_NAME, "hello world")
+            .await
+            .expect("embed_with_model must accept custom provider names");
+
+        assert_eq!(
+            result.len(),
+            DIMS,
+            "embedding dimension must match provider"
+        );
+        assert!(
+            result.iter().all(|&v| (v - 1.0_f32).abs() < 1e-6),
+            "ConstVecService must produce all-ones vector; got: {result:?}"
+        );
+    }
+
+    /// Fix 1 regression: embed_with_model must still reject names that are not
+    /// in the registry (neither lattice aliases nor custom providers).
+    #[tokio::test]
+    async fn embed_with_model_rejects_unregistered_name() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let result = rt.embed_with_model("nonexistent-model", "hello").await;
+        assert!(
+            matches!(result.unwrap_err(), RuntimeError::UnknownModel(ref n) if n == "nonexistent-model"),
+            "unregistered model name must return UnknownModel"
+        );
     }
 
     #[tokio::test]

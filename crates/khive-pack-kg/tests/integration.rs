@@ -2497,6 +2497,8 @@ async fn list_observation_notes_status_is_row_visibility_unchanged() {
             "observation must NOT have lifecycle field; got item: {item}"
         );
     }
+}
+
 // ---- Fix 1: update/delete accept absent `kind`, resolving substrate from UUID ----
 
 /// ADR-014: `update` without `kind` resolves the substrate from the UUID.

@@ -704,7 +704,7 @@ fn parse_embedding_model_list(s: &str) -> Vec<EmbeddingModel> {
         .collect()
 }
 
-fn parse_embedding_model_alias(name: &str) -> Option<EmbeddingModel> {
+pub(crate) fn parse_embedding_model_alias(name: &str) -> Option<EmbeddingModel> {
     let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
     match normalized.as_str() {
         "paraphrase" => Some(EmbeddingModel::ParaphraseMultilingualMiniLmL12V2),

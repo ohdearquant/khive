@@ -850,17 +850,17 @@ strategy; no automatic wiring exists yet.
 
 ### Files
 
-| File | Change |
-|------|--------|
+| File                                        | Change                                                                              |
+| ------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `crates/khive-runtime/src/engine_config.rs` | New — `EngineConfig`, `KhiveConfig`, `ConfigError`, `config_from_env`, 9 unit tests |
-| `crates/khive-runtime/src/runtime.rs` | Added `runtime_config_from_khive_config` |
-| `crates/khive-runtime/src/lib.rs` | `pub mod engine_config`; re-exports |
-| `crates/khive-runtime/Cargo.toml` | Added `toml = { workspace = true }` |
-| `crates/Cargo.toml` | Added `toml = "0.8"` to workspace deps |
-| `crates/khive-mcp/src/main.rs` | `--config` / `KHIVE_CONFIG` flag; `resolve_embedding_config` |
-| `crates/khive-mcp/Cargo.toml` | `tempfile` in dev-deps |
-| `crates/khive-mcp/tests/integration.rs` | `engine_config_three_engines_all_registered` test |
-| `docs/khive-config-example.toml` | New — annotated example config |
+| `crates/khive-runtime/src/runtime.rs`       | Added `runtime_config_from_khive_config`                                            |
+| `crates/khive-runtime/src/lib.rs`           | `pub mod engine_config`; re-exports                                                 |
+| `crates/khive-runtime/Cargo.toml`           | Added `toml = { workspace = true }`                                                 |
+| `crates/Cargo.toml`                         | Added `toml = "0.8"` to workspace deps                                              |
+| `crates/khive-mcp/src/main.rs`              | `--config` / `KHIVE_CONFIG` flag; `resolve_embedding_config`                        |
+| `crates/khive-mcp/Cargo.toml`               | `tempfile` in dev-deps                                                              |
+| `crates/khive-mcp/tests/integration.rs`     | `engine_config_three_engines_all_registered` test                                   |
+| `docs/khive-config-example.toml`            | New — annotated example config                                                      |
 
 ---
 

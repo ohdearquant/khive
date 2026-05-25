@@ -14,6 +14,7 @@ description = "Memory verb pack — remember/recall semantics with decay-aware r
 khive-types = { version = "0.2.2", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.2.2", path = "../khive-runtime" }
 khive-retrieval = { version = "0.2.2", path = "../khive-retrieval" }
+khive-score = { version = "0.2.2", path = "../khive-score" }
 khive-pack-brain = { version = "0.2.2", path = "../khive-pack-brain" }
 inventory = { workspace = true }
 khive-storage = { version = "0.2.2", path = "../khive-storage" }
@@ -23,10 +24,13 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 khive-pack-kg = { version = "0.2.2", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["test-util"] }
+lattice-embed = { workspace = true }
+async-trait = { workspace = true }
 
 [[test]]
 name = "integration"
