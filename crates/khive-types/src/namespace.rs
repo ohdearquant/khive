@@ -4,7 +4,7 @@
 //! `"lattice-project"`). It groups records and supports cross-namespace
 //! queries via the entity graph.
 //!
-//! Multi-tenant deployments (e.g., khive.ai hosted) add capability-based
+//! Multi-tenant deployments (hosted khive deployments) add capability-based
 //! access controls on top in a separate crate — those are not part of the
 //! open-source runtime.
 

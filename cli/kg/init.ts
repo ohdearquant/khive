@@ -33,7 +33,7 @@ import {
 const DEFAULT_CONFIG_TOML = `\
 # .khive/config.toml — project KG configuration
 # Committed to git. All collaborators use these settings.
-# See: https://khive.ai/docs/adr/ADR-057
+# See: https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-035-cli-config-and-auto-embed.md
 
 [embed]
 model = "mE5-small"

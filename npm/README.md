@@ -23,4 +23,3 @@ khive kg status            # Show entity/edge counts and uncommitted changes
 ## Documentation
 
 - [GitHub](https://github.com/ohdearquant/khive)
-- [khive.ai](https://khive.ai)
