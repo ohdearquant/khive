@@ -16,9 +16,13 @@ use khive_runtime::{
 use khive_storage::types::{
     Direction, NeighborQuery, PageRequest, TraversalOptions, TraversalRequest,
 };
+use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
 
-use khive_types::{EntityKind, EventKind};
+use khive_types::{
+    EntityKind, EventKind, ProposalChangeset, ProposalCreatedPayload, ProposalDecision,
+    ProposalReviewedPayload, ProposalWithdrawnPayload,
+};
 
 use crate::vocab::NoteKind;
 use crate::KgPack;
@@ -86,6 +90,8 @@ pub(crate) enum KindSpec {
     Edge,
     /// `kind="event"` — only valid for `list`; `get` resolves events by UUID.
     Event,
+    /// `kind="proposal"` — queries the `proposals_open` projection table (ADR-046).
+    Proposal,
 }
 
 impl KindSpec {
@@ -95,6 +101,7 @@ impl KindSpec {
             KindSpec::Note { .. } => "note",
             KindSpec::Edge => "edge",
             KindSpec::Event => "event",
+            KindSpec::Proposal => "proposal",
         }
     }
 }
@@ -118,6 +125,7 @@ pub(crate) fn resolve_kind_spec(
         "note" => return Ok(KindSpec::Note { specific: None }),
         "edge" => return Ok(KindSpec::Edge),
         "event" => return Ok(KindSpec::Event),
+        "proposal" => return Ok(KindSpec::Proposal),
         _ => {}
     }
 
@@ -150,6 +158,7 @@ pub(crate) fn resolve_kind_spec(
         "note".into(),
         "edge".into(),
         "event".into(),
+        "proposal".into(),
     ];
     all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
     all.extend(registry.all_note_kinds().iter().map(|s| (*s).to_string()));
@@ -340,6 +349,40 @@ struct TraverseParams {
 #[derive(Deserialize)]
 struct QueryParams {
     query: String,
+}
+
+// ---- Proposal param structs (ADR-046) ----
+
+#[derive(Deserialize)]
+struct ProposeParams {
+    title: String,
+    description: String,
+    changeset: Value,
+    #[serde(default)]
+    reviewers: Vec<String>,
+    expiry: Option<i64>,
+    parent_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReviewParams {
+    proposal_id: String,
+    decision: String,
+    comment: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WithdrawParams {
+    proposal_id: String,
+    rationale: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListProposalsParams {
+    status: Option<String>,
+    proposer: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
 }
 
 // ---- Helpers ----
@@ -788,6 +831,11 @@ impl KgPack {
                     "kind=edge is not creatable via `create` — use `link` for edges".into(),
                 ));
             }
+            KindSpec::Proposal => {
+                return Err(RuntimeError::InvalidInput(
+                    "kind=proposal is not creatable via `create` — use `propose` to create a proposal".into(),
+                ));
+            }
         };
 
         // Rewrite `kind` to the substrate label so downstream `CreateParams`
@@ -804,7 +852,7 @@ impl KgPack {
                     KindSpec::Note { .. } => {
                         obj.insert("note_kind".into(), json!(canonical));
                     }
-                    KindSpec::Edge | KindSpec::Event => {}
+                    KindSpec::Edge | KindSpec::Event | KindSpec::Proposal => {}
                 }
             }
         }
@@ -940,6 +988,19 @@ impl KgPack {
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        // Fast-path: kind=proposal dispatches to the proposals_open projection
+        // before deserializing into ListParams, so proposal-specific fields
+        // (status, proposer) are handled without polluting ListParams.
+        let raw_kind = params
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if raw_kind == "proposal" {
+            return self.handle_list_proposals(token, params).await;
+        }
+
         let p: ListParams = deser(params)?;
         let spec = resolve_kind_spec(&p.kind, registry)?;
         match spec {
@@ -1005,6 +1066,7 @@ impl KgPack {
                     .await?;
                 to_json(&notes)
             }
+            KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
                 let limit = p.limit.unwrap_or(100).clamp(1, 1000);
                 let offset = p.offset.unwrap_or(0);
@@ -1133,6 +1195,9 @@ impl KgPack {
                 to_json(&self.runtime.update_note(token, id, patch).await?)
             }
             KindSpec::Event => Err(immutable_event_error()),
+            KindSpec::Proposal => Err(RuntimeError::InvalidInput(
+                "proposal events are immutable — use `withdraw` to rescind a proposal".into(),
+            )),
         }
     }
 
@@ -1192,6 +1257,9 @@ impl KgPack {
                 to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": "edge" }))
             }
             KindSpec::Event => Err(immutable_event_error()),
+            KindSpec::Proposal => Err(RuntimeError::InvalidInput(
+                "proposal events are immutable — use `withdraw` to rescind a proposal".into(),
+            )),
         }
     }
 
@@ -1232,6 +1300,11 @@ impl KgPack {
                 ))
             }
             KindSpec::Event => return Err(immutable_event_error()),
+            KindSpec::Proposal => {
+                return Err(RuntimeError::InvalidInput(
+                    "proposal events are immutable and cannot be merged".into(),
+                ))
+            }
         };
         to_json(&summary)
     }
@@ -1395,6 +1468,9 @@ impl KgPack {
             )),
             KindSpec::Event => Err(RuntimeError::InvalidInput(
                 "search does not support kind=event — use `list(kind=\"event\", ...)` for event browsing".into(),
+            )),
+            KindSpec::Proposal => Err(RuntimeError::InvalidInput(
+                "search does not support kind=proposal — use `list(kind=\"proposal\", ...)` for proposal browsing".into(),
             )),
         }
     }
@@ -1626,6 +1702,479 @@ impl KgPack {
         let result = self.runtime.query_with_metadata(token, &p.query).await?;
         to_json(&result)
     }
+
+    // ---- Proposal verbs (ADR-046) ----
+
+    /// `propose` — commissive verb. Emits a `ProposalCreated` event and inserts
+    /// a row into the `proposals_open` projection table.
+    pub(crate) async fn handle_propose(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: ProposeParams = deser(params)?;
+        if p.title.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "propose requires a non-empty 'title'".into(),
+            ));
+        }
+        if p.description.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "propose requires a non-empty 'description'".into(),
+            ));
+        }
+
+        let _changeset: ProposalChangeset = serde_json::from_value(p.changeset.clone())
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid changeset: {e}")))?;
+
+        let proposal_id = Uuid::new_v4();
+        let actor = token.actor().id.clone();
+        let ns = token.namespace().as_str().to_owned();
+        let now = chrono::Utc::now().timestamp_micros();
+
+        let payload = ProposalCreatedPayload {
+            proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
+            proposer: actor.clone(),
+            title: p.title.clone(),
+            description: p.description.clone(),
+            changeset: _changeset,
+            reviewers: p.reviewers.clone(),
+            expiry: p
+                .expiry
+                .map(|v| khive_types::Timestamp::from_micros(v as u64)),
+            parent_id: p
+                .parent_id
+                .as_deref()
+                .map(|s| {
+                    Uuid::from_str(s)
+                        .map(|u| khive_types::Id128::from_u128(u.as_u128()))
+                        .map_err(|e| {
+                            RuntimeError::InvalidInput(format!("invalid parent_id {s:?}: {e}"))
+                        })
+                })
+                .transpose()?,
+        };
+
+        let event_payload_json = serde_json::to_value(&payload)
+            .map_err(|e| RuntimeError::Internal(format!("serialize proposal payload: {e}")))?;
+
+        let mut event = khive_storage::event::Event::new(
+            &ns,
+            "propose",
+            EventKind::ProposalCreated,
+            SubstrateKind::Entity,
+            &actor,
+        );
+        event.payload = event_payload_json;
+        event.aggregate_kind = Some("proposal".to_string());
+        event.aggregate_id = Some(proposal_id);
+
+        let event_store = self.runtime.events(token)?;
+        event_store
+            .append_event(event)
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let expiry_val = p.expiry;
+        let sql = self.runtime.sql();
+        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+        writer
+            .execute(SqlStatement {
+                sql: "\
+                    INSERT INTO proposals_open \
+                        (proposal_id, namespace, proposer, title, status, \
+                         created_at, updated_at, expiry) \
+                    VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, ?6)"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns),
+                    SqlValue::Text(actor.clone()),
+                    SqlValue::Text(p.title.clone()),
+                    SqlValue::Integer(now),
+                    match expiry_val {
+                        Some(v) => SqlValue::Integer(v),
+                        None => SqlValue::Null,
+                    },
+                ],
+                label: Some("proposals_open.insert".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        to_json(&serde_json::json!({
+            "proposal_id": proposal_id.to_string(),
+            "status": "open",
+            "proposer": actor,
+            "title": p.title,
+        }))
+    }
+
+    /// `review` — declaration verb. Emits a `ProposalReviewed` event and updates
+    /// the `proposals_open` projection table (counts, status, last_decision).
+    pub(crate) async fn handle_review(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: ReviewParams = deser(params)?;
+        let proposal_id = Uuid::from_str(&p.proposal_id).map_err(|e| {
+            RuntimeError::InvalidInput(format!("invalid proposal_id {:?}: {e}", p.proposal_id))
+        })?;
+        // Actor is always the authenticated token identity — client cannot override.
+        let actor = token.actor().id.clone();
+        let ns = token.namespace().as_str().to_owned();
+        let now = chrono::Utc::now().timestamp_micros();
+
+        let decision: ProposalDecision = match p.decision.trim().to_ascii_lowercase().as_str() {
+            "approve" => ProposalDecision::Approve,
+            "reject" => ProposalDecision::Reject,
+            "comment" => ProposalDecision::Comment,
+            "request_changes" | "requestchanges" => ProposalDecision::RequestChanges,
+            other => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "unknown decision {other:?}; valid: approve | reject | comment | request_changes"
+                )));
+            }
+        };
+
+        let sql = self.runtime.sql();
+        let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT proposer, status FROM proposals_open \
+                      WHERE proposal_id = ?1 AND namespace = ?2"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns.clone()),
+                ],
+                label: Some("proposals_open.get".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?
+            .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.proposal_id)))?;
+
+        let proposer = row
+            .get("proposer")
+            .and_then(|v| {
+                if let SqlValue::Text(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let current_status = row
+            .get("status")
+            .and_then(|v| {
+                if let SqlValue::Text(s) = v {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("open");
+
+        if matches!(current_status, "applied" | "withdrawn" | "rejected") {
+            return Err(RuntimeError::InvalidInput(format!(
+                "proposal {} is already {current_status} and cannot be reviewed",
+                p.proposal_id
+            )));
+        }
+
+        // Self-approval guard: the proposer cannot approve their own proposal.
+        // Exception: OSS local mode (`actor == "local"`) operates as a single-user
+        // system where every operation runs under the same anonymous identity, so
+        // the guard would unconditionally block all approvals. Skip it in that case.
+        // Multi-actor deployments (where distinct actor IDs are assigned) enforce
+        // the guard normally.
+        if decision == ProposalDecision::Approve && actor == proposer && actor != "local" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "self-approval is forbidden: proposer {actor:?} cannot approve their own proposal"
+            )));
+        }
+
+        let payload = ProposalReviewedPayload {
+            proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
+            reviewer: actor.clone(),
+            decision,
+            comment: p.comment.clone(),
+        };
+        let event_payload_json = serde_json::to_value(&payload)
+            .map_err(|e| RuntimeError::Internal(format!("serialize review payload: {e}")))?;
+
+        let mut event = khive_storage::event::Event::new(
+            &ns,
+            "review",
+            EventKind::ProposalReviewed,
+            SubstrateKind::Entity,
+            &actor,
+        );
+        event.payload = event_payload_json;
+        event.aggregate_kind = Some("proposal".to_string());
+        event.aggregate_id = Some(proposal_id);
+
+        let event_store = self.runtime.events(token)?;
+        event_store
+            .append_event(event)
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let (new_status, approve_delta, reject_delta) = match decision {
+            ProposalDecision::Approve => ("approved", 1i64, 0i64),
+            ProposalDecision::Reject => ("rejected", 0, 1),
+            ProposalDecision::Comment => (current_status, 0, 0),
+            ProposalDecision::RequestChanges => ("changes_requested", 0, 0),
+        };
+
+        let last_decision_json = serde_json::to_string(&decision)
+            .map_err(|e| RuntimeError::Internal(format!("serialize decision: {e}")))?;
+
+        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE proposals_open \
+                      SET status = ?1, updated_at = ?2, last_decision = ?3, \
+                          review_count = review_count + 1, \
+                          approve_count = approve_count + ?4, \
+                          reject_count = reject_count + ?5 \
+                      WHERE proposal_id = ?6 AND namespace = ?7"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(new_status.to_string()),
+                    SqlValue::Integer(now),
+                    SqlValue::Text(last_decision_json),
+                    SqlValue::Integer(approve_delta),
+                    SqlValue::Integer(reject_delta),
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns),
+                ],
+                label: Some("proposals_open.update_review".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        to_json(&serde_json::json!({
+            "proposal_id": proposal_id.to_string(),
+            "reviewer": actor,
+            "decision": p.decision,
+            "status": new_status,
+        }))
+    }
+
+    /// `withdraw` — commissive verb. Emits a `ProposalWithdrawn` event and updates
+    /// the `proposals_open` projection table to status='withdrawn'.
+    pub(crate) async fn handle_withdraw(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: WithdrawParams = deser(params)?;
+        let proposal_id = Uuid::from_str(&p.proposal_id).map_err(|e| {
+            RuntimeError::InvalidInput(format!("invalid proposal_id {:?}: {e}", p.proposal_id))
+        })?;
+        // Actor is always the authenticated token identity — client cannot override.
+        let actor = token.actor().id.clone();
+        let ns = token.namespace().as_str().to_owned();
+        let now = chrono::Utc::now().timestamp_micros();
+
+        let sql = self.runtime.sql();
+        let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT proposer, status FROM proposals_open \
+                      WHERE proposal_id = ?1 AND namespace = ?2"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns.clone()),
+                ],
+                label: Some("proposals_open.get_for_withdraw".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?
+            .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.proposal_id)))?;
+
+        let proposer = row
+            .get("proposer")
+            .and_then(|v| {
+                if let SqlValue::Text(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        if actor != proposer {
+            return Err(RuntimeError::InvalidInput(format!(
+                "only the original proposer {proposer:?} may withdraw this proposal"
+            )));
+        }
+
+        let current_status = row
+            .get("status")
+            .and_then(|v| {
+                if let SqlValue::Text(s) = v {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("open");
+
+        if matches!(current_status, "applied" | "withdrawn") {
+            return Err(RuntimeError::InvalidInput(format!(
+                "proposal {} is already {current_status}",
+                p.proposal_id
+            )));
+        }
+
+        let payload = ProposalWithdrawnPayload {
+            proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
+            by: actor.clone(),
+            reason: p.rationale.clone(),
+        };
+        let event_payload_json = serde_json::to_value(&payload)
+            .map_err(|e| RuntimeError::Internal(format!("serialize withdraw payload: {e}")))?;
+
+        let mut event = khive_storage::event::Event::new(
+            &ns,
+            "withdraw",
+            EventKind::ProposalWithdrawn,
+            SubstrateKind::Entity,
+            &actor,
+        );
+        event.payload = event_payload_json;
+        event.aggregate_kind = Some("proposal".to_string());
+        event.aggregate_id = Some(proposal_id);
+
+        let event_store = self.runtime.events(token)?;
+        event_store
+            .append_event(event)
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE proposals_open \
+                      SET status = 'withdrawn', updated_at = ?1 \
+                      WHERE proposal_id = ?2 AND namespace = ?3"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Integer(now),
+                    SqlValue::Text(proposal_id.to_string()),
+                    SqlValue::Text(ns),
+                ],
+                label: Some("proposals_open.withdraw".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        to_json(&serde_json::json!({
+            "proposal_id": proposal_id.to_string(),
+            "status": "withdrawn",
+            "by": actor,
+        }))
+    }
+
+    /// `list(kind=proposal)` — assertive verb. Queries the `proposals_open`
+    /// projection table with optional status / proposer filters.
+    pub(crate) async fn handle_list_proposals(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: ListProposalsParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))?;
+        let ns = token.namespace().as_str().to_owned();
+        let limit = p.limit.unwrap_or(50).min(500) as i64;
+        let offset = p.offset.unwrap_or(0) as i64;
+
+        let mut sql_str = "\
+            SELECT proposal_id, proposer, title, status, created_at, updated_at, \
+                   expiry, last_decision, review_count, approve_count, reject_count \
+            FROM proposals_open \
+            WHERE namespace = ?1"
+            .to_string();
+        let mut sql_params: Vec<SqlValue> = vec![SqlValue::Text(ns)];
+        let mut param_idx = 2usize;
+
+        if let Some(status) = &p.status {
+            sql_str.push_str(&format!(" AND status = ?{param_idx}"));
+            sql_params.push(SqlValue::Text(status.clone()));
+            param_idx += 1;
+        }
+        if let Some(proposer) = &p.proposer {
+            sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
+            sql_params.push(SqlValue::Text(proposer.clone()));
+            param_idx += 1;
+        }
+
+        sql_str.push_str(&format!(
+            " ORDER BY updated_at DESC LIMIT ?{param_idx} OFFSET ?{}",
+            param_idx + 1
+        ));
+        sql_params.push(SqlValue::Integer(limit));
+        sql_params.push(SqlValue::Integer(offset));
+
+        let sql = self.runtime.sql();
+        let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: sql_str,
+                params: sql_params,
+                label: Some("proposals_open.list".into()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let items: Vec<Value> = rows
+            .into_iter()
+            .map(|row| {
+                let get_text = |name: &str| -> String {
+                    row.get(name)
+                        .and_then(|v| {
+                            if let SqlValue::Text(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default()
+                };
+                let get_int = |name: &str| -> Option<i64> {
+                    row.get(name).and_then(|v| {
+                        if let SqlValue::Integer(i) = v {
+                            Some(*i)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                serde_json::json!({
+                    "proposal_id": get_text("proposal_id"),
+                    "proposer": get_text("proposer"),
+                    "title": get_text("title"),
+                    "status": get_text("status"),
+                    "created_at": get_int("created_at"),
+                    "updated_at": get_int("updated_at"),
+                    "expiry": get_int("expiry"),
+                    "last_decision": get_text("last_decision"),
+                    "review_count": get_int("review_count").unwrap_or(0),
+                    "approve_count": get_int("approve_count").unwrap_or(0),
+                    "reject_count": get_int("reject_count").unwrap_or(0),
+                })
+            })
+            .collect();
+
+        to_json(&items)
+    }
 }
 
 #[cfg(test)]
@@ -1708,6 +2257,130 @@ mod tests {
             set.decay_factor,
             Some(Some(0.6)),
             "decay_factor=0.6 must deserialize to Some(Some(0.6)) (set)"
+        );
+    }
+
+    // ADR-046: resolve_kind_spec must recognise "proposal" as KindSpec::Proposal
+    #[test]
+    fn resolve_kind_spec_proposal() {
+        use super::{resolve_kind_spec, KindSpec};
+        use crate::KgPack;
+        use khive_runtime::VerbRegistryBuilder;
+
+        let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let spec = resolve_kind_spec("proposal", &registry).expect("should resolve proposal");
+        assert_eq!(
+            spec,
+            KindSpec::Proposal,
+            "kind=proposal must resolve to KindSpec::Proposal"
+        );
+
+        let spec_upper =
+            resolve_kind_spec("Proposal", &registry).expect("should be case-insensitive");
+        assert_eq!(
+            spec_upper,
+            KindSpec::Proposal,
+            "kind=Proposal (mixed case) must resolve"
+        );
+    }
+
+    // ADR-046: propose param deserialization
+    #[test]
+    fn propose_params_deserialization() {
+        use super::ProposeParams;
+        let p: ProposeParams = serde_json::from_value(json!({
+            "title": "Add RoPE",
+            "description": "Add RoPE entity to the graph",
+            "changeset": {
+                "kind": "add_entity",
+                "entity": "{\"kind\":\"concept\",\"name\":\"RoPE\"}"
+            },
+            "reviewers": ["alice"],
+        }))
+        .expect("ProposeParams must deserialize");
+        assert_eq!(p.title, "Add RoPE");
+        assert_eq!(p.reviewers, vec!["alice"]);
+        assert!(p.parent_id.is_none());
+        assert!(p.expiry.is_none());
+    }
+
+    // ADR-046: review param deserialization with all valid decisions
+    #[test]
+    fn review_params_decisions() {
+        use super::ReviewParams;
+        for decision in ["approve", "reject", "comment", "request_changes"] {
+            let p: ReviewParams = serde_json::from_value(json!({
+                "proposal_id": "00000000-0000-0000-0000-000000000001",
+                "decision": decision,
+            }))
+            .expect("ReviewParams must deserialize");
+            assert_eq!(p.decision, decision);
+        }
+    }
+
+    // CRIT-2 regression: ReviewParams must not accept an `actor` field.
+    // The actor is always derived from the NamespaceToken at dispatch time.
+    // If a client passes actor=<other_id>, the field is ignored (unknown fields
+    // are allowed by serde default, so the struct simply lacks the field).
+    #[test]
+    fn review_params_no_actor_field() {
+        use super::ReviewParams;
+        // Baseline: ReviewParams works without actor.
+        let p: ReviewParams = serde_json::from_value(json!({
+            "proposal_id": "00000000-0000-0000-0000-000000000001",
+            "decision": "approve",
+        }))
+        .expect("ReviewParams must deserialize without actor");
+        assert_eq!(p.proposal_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(p.decision, "approve");
+    }
+
+    // CRIT-2 regression: WithdrawParams must not accept an `actor` field.
+    #[test]
+    fn withdraw_params_no_actor_field() {
+        use super::WithdrawParams;
+        let p: WithdrawParams = serde_json::from_value(json!({
+            "proposal_id": "00000000-0000-0000-0000-000000000002",
+        }))
+        .expect("WithdrawParams must deserialize without actor");
+        assert_eq!(p.proposal_id, "00000000-0000-0000-0000-000000000002");
+        assert!(p.rationale.is_none());
+    }
+
+    // CRIT-2 regression: ProposeParams must not accept an `actor` field.
+    #[test]
+    fn propose_params_no_actor_field() {
+        use super::ProposeParams;
+        let p: ProposeParams = serde_json::from_value(json!({
+            "title": "Fix RoPE",
+            "description": "Fix RoPE entity",
+            "changeset": {"kind": "add_entity", "entity": "{}"},
+        }))
+        .expect("ProposeParams must deserialize without actor");
+        assert_eq!(p.title, "Fix RoPE");
+    }
+
+    // ADR-046: KG pack must expose exactly 14 handlers including propose/review/withdraw
+    #[test]
+    fn kg_pack_exposes_14_handlers() {
+        use crate::KgPack;
+        use khive_types::Pack;
+        let handlers = KgPack::HANDLERS;
+        assert_eq!(
+            handlers.len(),
+            14,
+            "ADR-046: kg pack must expose 14 handlers (was 11, +3 for propose/review/withdraw)"
+        );
+        let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
+        assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
+        assert!(names.contains(&"review"), "review must be in KG_HANDLERS");
+        assert!(
+            names.contains(&"withdraw"),
+            "withdraw must be in KG_HANDLERS"
         );
     }
 }

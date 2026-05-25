@@ -371,6 +371,32 @@ pub const EMBEDDING_MODELS_DDL: &str = "\
 /// step for any table that already has the column.
 const V14_EMBEDDING_MODEL_REGISTRY: &str = "__v14_computed_at_runtime__";
 
+/// V15: proposals_open projection table (ADR-046).
+///
+/// Maintains a fold-derived view of the four proposal EventKinds so that
+/// `list(kind=proposal, status="open")` is an index scan rather than a full
+/// event-log fold. The `idx_events_payload_proposal_id` expression index
+/// (already created in V13) backs the per-proposal event history query.
+const V15_PROPOSALS_OPEN: &str = "\
+    CREATE TABLE IF NOT EXISTS proposals_open (\
+        proposal_id    TEXT PRIMARY KEY,\
+        namespace      TEXT NOT NULL,\
+        proposer       TEXT NOT NULL,\
+        title          TEXT NOT NULL,\
+        status         TEXT NOT NULL CHECK (status IN ('open', 'changes_requested', 'approved', 'rejected', 'applied', 'withdrawn')),\
+        created_at     INTEGER NOT NULL,\
+        updated_at     INTEGER NOT NULL,\
+        expiry         INTEGER,\
+        last_decision  TEXT,\
+        review_count   INTEGER NOT NULL DEFAULT 0,\
+        approve_count  INTEGER NOT NULL DEFAULT 0,\
+        reject_count   INTEGER NOT NULL DEFAULT 0\
+    );\
+    CREATE INDEX IF NOT EXISTS idx_proposals_open_ns_status ON proposals_open(namespace, status);\
+    CREATE INDEX IF NOT EXISTS idx_proposals_open_proposer ON proposals_open(namespace, proposer);\
+    CREATE INDEX IF NOT EXISTS idx_proposals_open_updated ON proposals_open(namespace, updated_at DESC);\
+";
+
 pub const MIGRATIONS: &[VersionedMigration] = &[
     VersionedMigration {
         version: 1,
@@ -452,6 +478,12 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 14,
         name: "embedding_model_registry",
         up: V14_EMBEDDING_MODEL_REGISTRY,
+    },
+    // V15: proposals_open projection table (ADR-046, cluster-22).
+    VersionedMigration {
+        version: 15,
+        name: "proposals_open",
+        up: V15_PROPOSALS_OPEN,
     },
 ];
 
@@ -860,17 +892,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
-        // Verify the tracking table has rows for V1 through V14.
+        // Verify the tracking table has rows for V1 through V15.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 14);
+        assert_eq!(count, 15);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -1018,6 +1050,32 @@ mod tests {
                 .unwrap();
             assert!(exists, "V14 must create index {idx}");
         }
+
+        // Verify V15 created the proposals_open table.
+        let proposals_tbl: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='proposals_open'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proposals_tbl, 1, "V15 must create proposals_open table");
+
+        // Verify V15 indexes on proposals_open.
+        for idx in [
+            "idx_proposals_open_ns_status",
+            "idx_proposals_open_proposer",
+            "idx_proposals_open_updated",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "V15 must create index {idx}");
+        }
     }
 
     #[test]
@@ -1025,16 +1083,16 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 14);
-        assert_eq!(v2, 14);
+        assert_eq!(v1, 15);
+        assert_eq!(v2, 15);
 
-        // Should still have exactly fourteen rows in the tracking table (V1..V14).
+        // Should still have exactly fifteen rows in the tracking table (V1..V15).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 14);
+        assert_eq!(count, 15);
     }
 
     // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
@@ -1044,8 +1102,8 @@ mod tests {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
         assert_eq!(
-            version, 14,
-            "F052: latest migration must be V14 (embedding model registry)"
+            version, 15,
+            "F052: latest migration must be V15 (proposals_open)"
         );
         let col: i64 = conn
             .query_row(
@@ -1073,40 +1131,40 @@ mod tests {
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v15 = VersionedMigration {
-            version: 15,
+        let bad_v16 = VersionedMigration {
+            version: 16,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1..V14) so the DB is at V14.
-        run_migrations(&mut conn).expect("V1..V14 should apply cleanly");
+        // Apply all real migrations (V1..V15) so the DB is at V15.
+        run_migrations(&mut conn).expect("V1..V15 should apply cleanly");
 
-        // Now manually drive the bad V15 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v15);
+        // Now manually drive the bad V16 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v16);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V14 — no V15 row in tracking.
-        let v15_count: i64 = conn
+        // DB should still be at V15 — no V16 row in tracking.
+        let v16_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 15",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 16",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v15_count, 0, "V15 must not be recorded after rollback");
+        assert_eq!(v16_count, 0, "V16 must not be recorded after rollback");
 
-        // V1..V14 should still be there.
+        // V1..V15 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(applied_count, 14, "V1..V14 must still be recorded");
+        assert_eq!(applied_count, 15, "V1..V15 must still be recorded");
     }
 
     #[test]
@@ -1139,9 +1197,10 @@ mod tests {
         // status column and skip; V11 should detect the existing merged_into column and skip;
         // V12 should detect that salience is already nullable and skip;
         // V13 adds event observability columns and event_observations table;
-        // V14 creates the _embedding_models registry table.
+        // V14 creates the _embedding_models registry table;
+        // V15 creates the proposals_open table.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -1247,6 +1306,19 @@ mod tests {
             v14_count, 1,
             "V14 must be recorded after store-DDL + migrations"
         );
+
+        // V15 (proposals_open) must be recorded.
+        let v15_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 15",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            v15_count, 1,
+            "V15 must be recorded after store-DDL + migrations"
+        );
     }
 
     /// Verify that V12 rebuilds a V1-era notes table so salience/decay_factor
@@ -1318,9 +1390,9 @@ mod tests {
         )
         .unwrap();
 
-        // Run V2-V14 migrations.
+        // Run V2-V15 migrations.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         // After V12, salience must be nullable (notnull=0).
         let notnull: i64 = conn
@@ -1364,7 +1436,7 @@ mod tests {
         ensure_events_schema(&conn).expect("store DDL should create events");
 
         let version = run_migrations(&mut conn).expect("migrations after events store DDL");
-        assert_eq!(version, 14, "must reach V14 even when events DDL ran first");
+        assert_eq!(version, 15, "must reach V15 even when events DDL ran first");
 
         let v13_count: i64 = conn
             .query_row(
@@ -1383,6 +1455,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v14_count, 1, "V14 must be recorded");
+
+        let v15_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 15",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v15_count, 1, "V15 must be recorded");
     }
 
     /// F227/F228: V14 must create the _embedding_models registry table and its indexes.
@@ -1396,8 +1477,8 @@ mod tests {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
         assert_eq!(
-            version, 14,
-            "F227: latest migration must be V14 (embedding model registry)"
+            version, 15,
+            "F227: latest migration must be V15 (proposals_open)"
         );
 
         // Verify _embedding_models table exists.
@@ -1494,7 +1575,7 @@ mod tests {
         // Run the full migration suite — V14 should add embedding_model_id to the
         // regular vec_legacy_model table.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         // The embedding_model_id column must now exist.
         let col_exists: bool = conn
@@ -1511,7 +1592,7 @@ mod tests {
 
         // Running migrations again must be idempotent (column already present).
         let version2 = run_migrations(&mut conn).expect("second run must succeed");
-        assert_eq!(version2, 14);
+        assert_eq!(version2, 15);
     }
 
     /// CRIT-2 regression: V14 discovery filter must NOT match sqlite-vec internal
@@ -1543,7 +1624,7 @@ mod tests {
         // Run the full migration suite — V14 must not add `embedding_model_id` to
         // any of the four shadow tables above.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         for shadow in [
             "vec_test_chunks",

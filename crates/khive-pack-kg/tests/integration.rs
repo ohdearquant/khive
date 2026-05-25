@@ -66,13 +66,15 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 
 // ---- PackRuntime trait: verbs() and unknown-verb dispatch ----
 
+// ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
+// handler count from 11 to 14.
 #[test]
-fn pack_verbs_returns_eleven() {
+fn pack_verbs_returns_fourteen() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        11,
-        "KgPack must expose exactly 11 verbs"
+        14,
+        "KgPack must expose exactly 14 verbs (11 original + propose/review/withdraw)"
     );
 }
 
@@ -92,6 +94,9 @@ fn pack_verbs_names_are_correct() {
         "neighbors",
         "traverse",
         "query",
+        "propose",
+        "review",
+        "withdraw",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
