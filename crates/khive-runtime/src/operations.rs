@@ -812,7 +812,7 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
         self.create_note_inner(
-            token, kind, name, content, salience, None, properties, annotates,
+            token, kind, name, content, salience, None, properties, annotates, None,
         )
         .await
     }
@@ -830,6 +830,34 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
+        self.create_note_with_decay_for_embedding_model(
+            token,
+            kind,
+            name,
+            content,
+            salience,
+            decay_factor,
+            properties,
+            annotates,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`create_note_with_decay`] but targets a specific embedding model.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_decay_for_embedding_model(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        salience: Option<f64>,
+        decay_factor: f64,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+        embedding_model: Option<&str>,
+    ) -> RuntimeResult<Note> {
         self.create_note_inner(
             token,
             kind,
@@ -839,6 +867,7 @@ impl KhiveRuntime {
             Some(decay_factor),
             properties,
             annotates,
+            embedding_model,
         )
         .await
     }
@@ -854,6 +883,7 @@ impl KhiveRuntime {
         decay_factor: Option<f64>,
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
+        embedding_model: Option<&str>,
     ) -> RuntimeResult<Note> {
         let ns = token.namespace().as_str();
 
@@ -864,6 +894,14 @@ impl KhiveRuntime {
                     "create_note annotates target {target_id} not found in namespace"
                 )));
             }
+        }
+
+        // Codex round 2 Medium (PR #407): resolve embedding_model BEFORE any
+        // note/FTS/vector write so unknown-model errors are atomic at the
+        // runtime layer, not just at one pack handler. Direct Rust callers
+        // (other packs, integration tests) get the same guarantee.
+        if let Some(model_name) = embedding_model {
+            self.resolve_embedding_model(Some(model_name))?;
         }
 
         let mut note = Note::new(ns, kind, content);
@@ -899,9 +937,20 @@ impl KhiveRuntime {
             })
             .await?;
 
-        if self.config().embedding_model.is_some() {
-            let vector = self.embed(&note.content).await?;
-            self.vectors(token)?
+        let embed_model_name: Option<String> =
+            if self.config().embedding_model.is_some() || embedding_model.is_some() {
+                Some(
+                    embedding_model
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| self.default_embedder_name().to_string()),
+                )
+            } else {
+                None
+            };
+
+        if let Some(ref model_name) = embed_model_name {
+            let vector = self.embed_with_model(model_name, &note.content).await?;
+            self.vectors_for_model(token, model_name)?
                 .insert(
                     note.id,
                     SubstrateKind::Note,
@@ -989,8 +1038,8 @@ impl KhiveRuntime {
                     if let Ok(fts) = self.text_for_notes(token) {
                         let _ = fts.delete_document(ns, note.id).await;
                     }
-                    if self.config().embedding_model.is_some() {
-                        if let Ok(vs) = self.vectors(token) {
+                    if let Some(ref model_name) = embed_model_name {
+                        if let Ok(vs) = self.vectors_for_model(token, model_name) {
                             let _ = vs.delete(note.id).await;
                         }
                     }
@@ -1348,8 +1397,13 @@ impl KhiveRuntime {
             self.text_for_notes(token)?
                 .delete_document(&ns_str, id)
                 .await?;
-            if self.config().embedding_model.is_some() {
-                self.vectors(token)?.delete(id).await?;
+            // Codex High 2 (PR #407): scoped delete — iterate over EVERY
+            // registered embedding model's vector store so non-default vectors
+            // don't orphan when the note is deleted.
+            for model_name in self.registered_embedding_model_names() {
+                self.vectors_for_model(token, &model_name)?
+                    .delete(id)
+                    .await?;
             }
         }
 
@@ -1359,8 +1413,10 @@ impl KhiveRuntime {
             self.text_for_notes(token)?
                 .delete_document(&ns_str, id)
                 .await?;
-            if self.config().embedding_model.is_some() {
-                self.vectors(token)?.delete(id).await?;
+            for model_name in self.registered_embedding_model_names() {
+                self.vectors_for_model(token, &model_name)?
+                    .delete(id)
+                    .await?;
             }
         }
         if deleted {

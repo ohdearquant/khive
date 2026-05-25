@@ -203,36 +203,22 @@ fn cmd_engine_drift_check(_args: EngineDriftCheckArgs) -> Result<()> {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn query_embedding_models(
-    _db: Option<&std::path::Path>,
+    db: Option<&std::path::Path>,
     engine_filter: Option<&str>,
 ) -> Result<Vec<EngineModelRecord>> {
-    // The _embedding_models table is created by the ADR-043 schema migration.
-    // Until that migration lands, the table may not exist; return an empty list
-    // with a log rather than a hard error so `kkernel engine list` is usable
-    // before full ADR-043 deployment.
-    //
-    // A full implementation opens the SQLite DB, queries:
-    //   SELECT engine_name, model_id, key_version, dim, status,
-    //          activated_at, superseded_at
-    //   FROM   _embedding_models
-    //   [WHERE engine_name = ?]
-    //   ORDER  BY engine_name, activated_at NULLS LAST
-    //
-    // and maps rows to EngineModelRecord.
-    //
-    // This scaffold returns an empty list so the CLI compiles and tests can
-    // verify the command routing surface without a live database.
-
-    if let Some(engine) = engine_filter {
-        tracing::debug!(
-            engine,
-            "query_embedding_models: _embedding_models not yet populated"
-        );
-    } else {
-        tracing::debug!("query_embedding_models: _embedding_models not yet populated");
-    }
-
-    Ok(Vec::new())
+    let rows = khive_db::query_embedding_models(db, engine_filter)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| EngineModelRecord {
+            engine_name: r.engine_name,
+            model_id: r.model_id,
+            key_version: r.key_version,
+            dimensions: r.dimensions,
+            status: r.status,
+            activated_at: r.activated_at,
+            superseded_at: r.superseded_at,
+        })
+        .collect())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

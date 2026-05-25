@@ -181,6 +181,8 @@ pub struct VectorRecord {
     pub namespace: String,
     /// Which embedding field this record represents (e.g. `"entity.body"`).
     pub field: String,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
     /// One or many dense vectors; sqlite-vec backends enforce `vectors.len() == 1`.
     pub vectors: Vec<Vec<f32>>,
     pub updated_at: DateTime<Utc>,
@@ -193,6 +195,9 @@ pub struct VectorSearchRequest {
     pub top_k: u32,
     pub namespace: Option<String>,
     pub kind: Option<SubstrateKind>,
+    /// Restrict results to this embedding model. Defaults to the store's own model.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
     /// Optional metadata filter for backends that support pushdown.
     pub filter: Option<VectorMetadataFilter>,
     /// Backend-specific hints (opaque JSON blob, ignored by default).

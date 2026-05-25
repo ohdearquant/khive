@@ -105,24 +105,55 @@ impossible — any attempt to insert a second `active` row for the same engine f
 the constraint. Migrations therefore execute as `BEGIN; UPDATE active→superseded;
 UPDATE pending→active; COMMIT;` — atomic by virtue of the index.
 
-#### Vector store column addition
+#### Vector store column addition (V16, ADR-015)
 
-Each `vec_<engine>` table (ADR-031 D3) gains a column:
+Each regular `vec_<engine>` table (ADR-031 D3) gains a TEXT model tag column.
+This was formalized in migration V16:
 
 ```sql
-ALTER TABLE vec_<engine> ADD COLUMN embedding_model_id BLOB
-    REFERENCES _embedding_models(id);
-CREATE INDEX idx_vec_<engine>_model ON vec_<engine>(embedding_model_id);
+ALTER TABLE vec_<engine> ADD COLUMN embedding_model TEXT NOT NULL
+    DEFAULT 'all-minilm-l6-v2';
+CREATE INDEX idx_vec_<engine>_subject_model
+    ON vec_<engine>(subject_id, embedding_model);
 ```
 
-Backfilled on the same migration: existing rows get the engine's current active
-model's id.
+The composite `(subject_id, embedding_model)` index supports the scoped recall
+SQL: `WHERE subject_id = ? AND embedding_model = ?`. The default value at column
+creation time was chosen so existing rows backfill to the legacy MiniLM model;
+deployments using a non-default model **must** run the dedicated backfill worker
+described in §8 before relying on model-scoped recall.
 
-SQLite does not support `ALTER COLUMN ... SET NOT NULL`. The `embedding_model_id`
-column is enforced via a `CHECK (embedding_model_id IS NOT NULL)` constraint added
-through SQLite's standard table-rebuild pattern (create new table with constraint,
-copy data, drop old, rename) — see ADR-015 for the migration template. This rebuild
-is performed as the final step of the startup backfill described in §8 below.
+**Design trade-off — TEXT vs BLOB FK.** ADR-043's first draft (pre-V16) specified
+`embedding_model_id BLOB REFERENCES _embedding_models(id)`. V16 instead stores
+the model_id directly as TEXT, joining against `_embedding_models.model_id`
+when needed:
+
+- TEXT model_id is the natural primary key used everywhere else in the runtime
+  (kkernel engine list, `EmbeddingService::key_version()`, env var
+  `KHIVE_ADDITIONAL_EMBEDDING_MODELS`) — keeping the same shape end-to-end.
+- BLOB FK would require a sub-select on every vector insert/search to resolve
+  the active model's UUID. The hot path is recall scoring; the join cost is
+  unjustified for a column whose values change only on registry events.
+- Schema-level referential integrity is replaced by application-level
+  validation in the runtime registry: unknown model names are rejected at
+  `KhiveRuntime::embedder(name)` and at `RecallParams.embedding_model`
+  validation.
+
+The `_embedding_models` registry table (V14) still owns the authoritative model
+metadata (dim, output_dim, status, key_version). V16's `embedding_model TEXT`
+column is the foreign-key-by-value reference back to `_embedding_models.model_id`.
+
+**sqlite-vec virtual tables.** vec0 virtual tables cannot accept `ALTER TABLE
+ADD COLUMN` because they declare their columns at `CREATE VIRTUAL TABLE` time.
+V16 handles this via the open-time path in `khive-db/src/backend.rs`: when
+opening a `vec_<engine>` table that lacks `embedding_model`, the runtime
+rebuilds the virtual table with the new schema. **Existing rows are lost on
+rebuild** — this is acceptable for deployments that have not yet enabled
+dual-embedding because vectors will be re-embedded by the next backfill cycle,
+but **operators must take a backup before upgrading any production deployment
+with persisted non-default embeddings**. A follow-up migration (tracked in
+ADR-043 §8.2) will implement a copy-with-default rebuild to preserve old
+vectors with their inferred model tag.
 
 ### 2. Triggers — three sources, one event
 
@@ -326,23 +357,35 @@ All four carry `engine_name` and the relevant `_embedding_models.id`(s) in paylo
 None carries `served_by_profile_id` — these are operator/system events, not
 profile-served (ADR-032 §3 rule).
 
-### 8. Backward compatibility — one-shot startup migration
+### 8. Backward compatibility — one-shot startup migration (V14 + V16)
 
-Deployments predating this ADR have `vec_<engine>` tables without `embedding_model_id`
-and no `_embedding_models` rows. On first startup post-ADR-043:
+Deployments predating this ADR have `vec_<engine>` tables without an
+`embedding_model` column and no `_embedding_models` rows. The startup
+migration runs in two steps, landed in two separate `VersionedMigration`
+slots:
 
-1. Run the schema migration (creates `_embedding_models`, adds `embedding_model_id`
-   to `vec_<engine>` tables as nullable).
-2. For each `[[engines]]` entry: derive `canonical_key` via lattice's
-   `EmbeddingKey::canonical_bytes()`, insert one `_embedding_models` row with
-   `status='active'`, `activated_at=now`, `created_at=now`.
-3. Backfill all `vec_<engine>` rows with that engine's newly-inserted model id.
-4. Tighten the `embedding_model_id` column by rebuilding the table with a
-   `CHECK (embedding_model_id IS NOT NULL)` constraint (SQLite table-rebuild pattern —
-   see §1 and ADR-015). This runs as run-once startup code after the SQL migration
-   completes, not as an additional SQL migration step.
+**V14 — `embedding_model_registry`** (already shipped):
 
-The startup migration emits one `EmbeddingModelChanged` event per engine with
+1. `CREATE TABLE _embedding_models` (per §1 schema).
+2. `CREATE UNIQUE INDEX idx_embed_models_one_active`.
+3. `CREATE INDEX idx_embed_models_engine_status`.
+
+**V16 — `vector_embedding_model_tag`** (shipped in v022-polish):
+
+4. For each existing regular `vec_*` table (discovered at runtime, validated as
+   alphanumeric-suffix only): `ALTER TABLE vec_<engine> ADD COLUMN embedding_model
+   TEXT NOT NULL DEFAULT 'all-minilm-l6-v2'`.
+5. `CREATE INDEX idx_vec_<engine>_subject_model ON vec_<engine>(subject_id, embedding_model)`.
+6. sqlite-vec virtual tables (`vec0`) cannot accept `ALTER TABLE` — handled at
+   open time in `khive-db/src/backend.rs` by rebuilding the virtual table with
+   the new schema. See §1.1 final paragraph for the operator backup warning;
+   a preserving rebuild is the documented follow-up.
+
+Operator population of `_embedding_models` (steps for populating registry rows
+from `[[engines]]` config and emitting `EmbeddingModelChanged` events) is a
+separate startup-code path tracked in #385, not part of the SQL migrations.
+
+The startup population emits one `EmbeddingModelChanged` event per engine with
 `source_model_id = None` and `initiated_by = ConfigDiff` so the audit trail starts
 clean.
 
@@ -398,14 +441,14 @@ Tracked in `.khive/plans/embedding-version-config.md`.
 
 ## Alternatives Considered
 
-| Alternative                                                                  | Why rejected                                                                                |
-| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Reimplement migration state machine in khive                                 | Lattice ships it; duplication has no upside                                                 |
-| Store model id on every record (`notes`, `entities`) row                     | Triple-write cost; the vector table is the right grain — only vectors are model-bound       |
-| Migrate vectors in place (rewrite same table)                                | Loses atomicity. Failure mid-migration leaves a half-rewritten table with no clean rollback |
-| MCP verb `brain.migrate_model` for agent-triggered migrations                | Crosses the brain-substrate boundary; risks the feedback loop described in Rationale        |
-| Auto-archive `superseded` rows after N days                                  | Premature; an explicit `khive engine archive --before <date>` is enough                     |
-| Per-record `model_id` on `vec_<engine>` instead of FK to `_embedding_models` | Denormalized; can't carry the supersession chain or `superseded_by` link                    |
+| Alternative                                                                      | Why rejected                                                                                                                                                                                                                                                                                             |
+| -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Reimplement migration state machine in khive                                     | Lattice ships it; duplication has no upside                                                                                                                                                                                                                                                              |
+| Store model id on every record (`notes`, `entities`) row                         | Triple-write cost; the vector table is the right grain — only vectors are model-bound                                                                                                                                                                                                                    |
+| Migrate vectors in place (rewrite same table)                                    | Loses atomicity. Failure mid-migration leaves a half-rewritten table with no clean rollback                                                                                                                                                                                                              |
+| MCP verb `brain.migrate_model` for agent-triggered migrations                    | Crosses the brain-substrate boundary; risks the feedback loop described in Rationale                                                                                                                                                                                                                     |
+| Auto-archive `superseded` rows after N days                                      | Premature; an explicit `khive engine archive --before <date>` is enough                                                                                                                                                                                                                                  |
+| ~~Per-record `model_id` on `vec_<engine>` instead of FK to `_embedding_models`~~ | **Superseded by V16 (2026-05-25)**: per-record `embedding_model TEXT` is what V16 actually ships. The supersession chain is preserved via `_embedding_models.superseded_by` joined on `model_id`. See §1.1 for the trade-off rationale (hot-path join cost, end-to-end consistency with kkernel/env-var) |
 
 ## Consequences
 
@@ -474,19 +517,23 @@ payload.
 
 ### Migration version
 
-A new `VersionedMigration` in `crates/khive-db/src/migrations.rs` with
-`version = 5` (current latest is V4 — `dedupe_graph_edge_triples`):
+The ADR-043 schema work landed in two ledger versions in
+`crates/khive-db/src/migrations.rs`:
 
-1. `CREATE TABLE _embedding_models` (above)
+**V14 — `embedding_model_registry`** (cluster-20):
+
+1. `CREATE TABLE _embedding_models` (per §1)
 2. `CREATE UNIQUE INDEX idx_embed_models_one_active`
 3. `CREATE INDEX idx_embed_models_engine_status`
-4. For each existing `vec_<engine>` table (discovered via the catalog):
-   - `ALTER TABLE vec_<engine> ADD COLUMN embedding_model_id BLOB REFERENCES _embedding_models(id)`
-   - `CREATE INDEX idx_vec_<engine>_model ON vec_<engine>(embedding_model_id)`
-5. Startup backfill (run-once code, not a SQL migration): populate
-   `_embedding_models` from `[[engines]]`, backfill the FK column, then rebuild
-   `vec_<engine>` with a `CHECK (embedding_model_id IS NOT NULL)` constraint via
-   SQLite's table-rebuild pattern (ADR-015).
+
+**V16 — `vector_embedding_model_tag`** (v022-polish):
+
+4. For each existing regular `vec_*` table (runtime-discovered, name-validated):
+   - `ALTER TABLE vec_<engine> ADD COLUMN embedding_model TEXT NOT NULL DEFAULT 'all-minilm-l6-v2'`
+   - `CREATE INDEX idx_vec_<engine>_subject_model ON vec_<engine>(subject_id, embedding_model)`
+5. Startup backfill (run-once code, tracked separately in #385): populate
+   `_embedding_models` from `[[engines]]`; per-table model-inferred tag rewrite
+   for deployments with non-default models (deferred — see §1.1 final paragraph).
 
 ### Worker registration
 

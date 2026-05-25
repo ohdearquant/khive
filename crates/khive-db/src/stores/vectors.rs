@@ -86,6 +86,7 @@ pub struct SqliteVecStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
     model_key: String,
+    embedding_model: String,
     dimensions: usize,
     table_name: String,
     namespace: String,
@@ -99,6 +100,7 @@ impl SqliteVecStore {
         pool: Arc<ConnectionPool>,
         is_file_backed: bool,
         model_key: String,
+        embedding_model: String,
         dimensions: usize,
         namespace: String,
     ) -> Result<Self, SqliteError> {
@@ -108,6 +110,7 @@ impl SqliteVecStore {
             pool,
             is_file_backed,
             model_key,
+            embedding_model,
             dimensions,
             table_name,
             namespace,
@@ -200,6 +203,7 @@ impl VectorStore for SqliteVecStore {
         let namespace = namespace.to_string();
         let field = field.to_string();
         let kind_str = kind.to_string();
+        let embedding_model = self.embedding_model.clone();
 
         if embedding.len() == dims {
             if let Some(idx) = non_finite_index(&embedding) {
@@ -226,13 +230,21 @@ impl VectorStore for SqliteVecStore {
             )?;
 
             let ins_sql = format!(
-                "INSERT INTO {} (subject_id, namespace, kind, field, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 table
             );
             let blob = f32_slice_as_bytes(&embedding);
             conn.execute(
                 &ins_sql,
-                rusqlite::params![subject_id.to_string(), &namespace, &kind_str, &field, blob],
+                rusqlite::params![
+                    subject_id.to_string(),
+                    &namespace,
+                    &kind_str,
+                    &field,
+                    &embedding_model,
+                    blob
+                ],
             )?;
             Ok(())
         })
@@ -246,6 +258,7 @@ impl VectorStore for SqliteVecStore {
         let table = self.table_name.clone();
         let dims = self.dimensions;
         let attempted = records.len() as u64;
+        let store_embedding_model = self.embedding_model.clone();
 
         self.with_writer("vec_insert_batch", move |conn| {
             let del_sql = format!(
@@ -253,7 +266,8 @@ impl VectorStore for SqliteVecStore {
                 table
             );
             let ins_sql = format!(
-                "INSERT INTO {} (subject_id, namespace, kind, field, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 table
             );
 
@@ -282,7 +296,14 @@ impl VectorStore for SqliteVecStore {
                 let _ = conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace]);
                 match conn.execute(
                     &ins_sql,
-                    rusqlite::params![&id_str, &record.namespace, &kind_str, &record.field, blob],
+                    rusqlite::params![
+                        &id_str,
+                        &record.namespace,
+                        &kind_str,
+                        &record.field,
+                        &store_embedding_model,
+                        blob
+                    ],
                 ) {
                     Ok(_) => affected += 1,
                     Err(_) => failed += 1,
@@ -358,6 +379,11 @@ impl VectorStore for SqliteVecStore {
             .clone()
             .unwrap_or_else(|| self.namespace.clone());
         let kind_filter = request.kind.map(|k| k.to_string());
+        // Use the request's embedding_model filter, or fall back to this store's model.
+        let effective_model = request
+            .embedding_model
+            .clone()
+            .unwrap_or_else(|| self.embedding_model.clone());
 
         if query_embedding.len() == dims {
             if let Some(idx) = non_finite_index(&query_embedding) {
@@ -377,10 +403,10 @@ impl VectorStore for SqliteVecStore {
                 ));
             }
 
-            // Restrict candidate set to namespace (and optionally kind) via subquery,
-            // then MATCH-rank by embedding distance.
+            // Restrict candidate set to namespace+embedding_model (and optionally kind)
+            // via subquery, then MATCH-rank by embedding distance.
             let subquery_kind_clause = if kind_filter.is_some() {
-                "AND kind = ?4"
+                "AND kind = ?5"
             } else {
                 ""
             };
@@ -389,7 +415,8 @@ impl VectorStore for SqliteVecStore {
                  FROM {t} \
                  WHERE embedding MATCH ?1 \
                    AND subject_id IN (\
-                     SELECT subject_id FROM {t} WHERE namespace = ?3 {kind_clause}\
+                     SELECT subject_id FROM {t} \
+                     WHERE namespace = ?3 AND embedding_model = ?4 {kind_clause}\
                    ) \
                  ORDER BY distance \
                  LIMIT ?2",
@@ -405,7 +432,13 @@ impl VectorStore for SqliteVecStore {
             let raw_rows: Vec<rusqlite::Result<(String, f64)>> =
                 if let Some(ref kind_str) = kind_filter {
                     stmt.query_map(
-                        rusqlite::params![query_blob, request.top_k, &namespace, kind_str],
+                        rusqlite::params![
+                            query_blob,
+                            request.top_k,
+                            &namespace,
+                            &effective_model,
+                            kind_str
+                        ],
                         |row| {
                             let id_str: String = row.get(0)?;
                             let distance: f64 = row.get(1)?;
@@ -415,7 +448,7 @@ impl VectorStore for SqliteVecStore {
                     .collect()
                 } else {
                     stmt.query_map(
-                        rusqlite::params![query_blob, request.top_k, &namespace],
+                        rusqlite::params![query_blob, request.top_k, &namespace, &effective_model],
                         |row| {
                             let id_str: String = row.get(0)?;
                             let distance: f64 = row.get(1)?;
@@ -531,6 +564,7 @@ impl SqliteVecStore {
 
         let table = self.table_name.clone();
         let namespace = self.namespace.clone();
+        let embedding_model = self.embedding_model.clone();
         let query_vec = query_embedding.to_vec();
         let ids: Vec<String> = candidate_ids.iter().map(|id| id.to_string()).collect();
 
@@ -542,22 +576,24 @@ impl SqliteVecStore {
                 let placeholders: String = chunk
                     .iter()
                     .enumerate()
-                    .map(|(i, _)| format!("?{}", i + 3))
+                    .map(|(i, _)| format!("?{}", i + 4))
                     .collect::<Vec<_>>()
                     .join(", ");
 
                 let sql = format!(
                     "SELECT e.subject_id, vec_distance_cosine(e.embedding, ?1) as distance \
                      FROM {} e \
-                     WHERE e.namespace = ?2 AND e.subject_id IN ({})",
+                     WHERE e.namespace = ?2 AND e.embedding_model = ?3 \
+                       AND e.subject_id IN ({})",
                     table, placeholders
                 );
 
                 let mut stmt = conn.prepare(&sql)?;
                 stmt.raw_bind_parameter(1, query_blob)?;
                 stmt.raw_bind_parameter(2, namespace.as_str())?;
+                stmt.raw_bind_parameter(3, embedding_model.as_str())?;
                 for (i, id_str) in chunk.iter().enumerate() {
-                    stmt.raw_bind_parameter(i + 3, id_str.as_str())?;
+                    stmt.raw_bind_parameter(i + 4, id_str.as_str())?;
                 }
 
                 let mut rows = stmt.raw_query();
@@ -612,6 +648,7 @@ mod capabilities_tests {
             make_pool(),
             /*is_file_backed=*/ false,
             "test_model".into(),
+            "test_model".into(),
             /*dimensions=*/ 4,
             "ns:test".into(),
         )
@@ -657,6 +694,7 @@ mod capabilities_tests {
             make_pool(),
             false,
             "test_dim_limit".into(),
+            "test_dim_limit".into(),
             /*dimensions=*/ 4,
             "ns:test".into(),
         )
@@ -683,6 +721,7 @@ mod capabilities_tests {
         let store = SqliteVecStore::new(
             make_pool(),
             false,
+            "test_idempotent".into(),
             "test_idempotent".into(),
             4,
             "ns:test".into(),

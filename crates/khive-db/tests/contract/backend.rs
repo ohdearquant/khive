@@ -337,7 +337,7 @@ mod vector_contract {
 
     async fn test_vector_store(backend: &StorageBackend) {
         let store = backend
-            .vectors_for_namespace("ct_model", 4, "ct_ns")
+            .vectors_for_namespace("ct_model", "ct_model", 4, "ct_ns")
             .expect("vector store");
 
         let id = Uuid::new_v4();
@@ -361,6 +361,7 @@ mod vector_contract {
                 top_k: 1,
                 namespace: None,
                 kind: None,
+                embedding_model: None,
                 filter: None,
                 backend_hints: None,
             })

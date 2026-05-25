@@ -28,23 +28,24 @@ mechanism that:
 
 The canonical ledger of database schema migration versions. Migration versions are assigned in ledger order; they are NOT required to match ADR number order.
 
-| Version | Owning ADR  | Migration name                                    | Status  |
-| ------: | ----------- | ------------------------------------------------- | ------- |
-|      V1 | (initial)   | initial_schema                                    | shipped |
-|      V2 | (initial)   | add_name_to_notes                                 | shipped |
-|      V3 | (initial)   | add_events_namespace_created_index                | shipped |
-|      V4 | (initial)   | dedupe_graph_edge_triples                         | shipped |
-|      V5 | c01/ADR-001 | add_entity_type_to_entities                       | shipped |
-|      V6 | (no-op)     | reserved_adr043_embedding_pipeline_extensions     | shipped |
-|      V7 | (no-op)     | reserved_adr046_event_sourced_proposals_index     | shipped |
-|      V8 | (no-op)     | reserved_adr041_event_observations_and_session_id | shipped |
-|      V9 | c03/ADR-004 | edge_lifecycle_and_target_backend                 | shipped |
-|     V10 | c04/ADR-019 | note_status_and_nullable_metrics                  | shipped |
-|     V11 | c04/ADR-014 | entity_tombstone_columns                          | shipped |
-|     V12 | c04/ADR-019 | nullable_note_metrics                             | shipped |
-|     V13 | c06/ADR-041 | event_observability_provenance                    | shipped |
-|     V14 | c20/ADR-043 | embedding_model_registry                          | shipped |
-|     V15 | c22/ADR-046 | proposals_open                                    | shipped |
+| Version | Owning ADR   | Migration name                                    | Status  |
+| ------: | ------------ | ------------------------------------------------- | ------- |
+|      V1 | (initial)    | initial_schema                                    | shipped |
+|      V2 | (initial)    | add_name_to_notes                                 | shipped |
+|      V3 | (initial)    | add_events_namespace_created_index                | shipped |
+|      V4 | (initial)    | dedupe_graph_edge_triples                         | shipped |
+|      V5 | c01/ADR-001  | add_entity_type_to_entities                       | shipped |
+|      V6 | (no-op)      | reserved_adr043_embedding_pipeline_extensions     | shipped |
+|      V7 | (no-op)      | reserved_adr046_event_sourced_proposals_index     | shipped |
+|      V8 | (no-op)      | reserved_adr041_event_observations_and_session_id | shipped |
+|      V9 | c03/ADR-004  | edge_lifecycle_and_target_backend                 | shipped |
+|     V10 | c04/ADR-019  | note_status_and_nullable_metrics                  | shipped |
+|     V11 | c04/ADR-014  | entity_tombstone_columns                          | shipped |
+|     V12 | c04/ADR-019  | nullable_note_metrics                             | shipped |
+|     V13 | c06/ADR-041  | event_observability_provenance                    | shipped |
+|     V14 | c20/ADR-043  | embedding_model_registry                          | shipped |
+|     V15 | c22/ADR-046  | proposals_open                                    | shipped |
+|     V16 | v022/ADR-043 | vector_embedding_model_tag                        | shipped |
 
 > **Amendment (2026-05-24, cluster-24 + post-integration)**: The ledger above reflects what
 > actually shipped on `integration/v1-adr-alignment` after parallel cluster landings c01, c03,
@@ -56,7 +57,13 @@ The canonical ledger of database schema migration versions. Migration versions a
 > integration merge. c20 (embedding model registry per ADR-043) landed at V14 — the same ADR
 > the V6 reservation originally anticipated, hence V6 remains a no-op slot. c22 (proposals_open
 > projection per ADR-046) landed at V15. V6–V8 are no-op placeholder slots to maintain
-> contiguity. Versions V1–V15 are production schema and are frozen.
+> contiguity.
+>
+> **V16 amendment (2026-05-25, show v022-polish)**: V16 (`vector_embedding_model_tag`) adds
+> a TEXT `embedding_model` column and composite index to regular `vec_*` tables, completing
+> the dual-embedding plumbing described in ADR-043 §1. sqlite-vec virtual tables are handled
+> at open time via schema rebuild because vec0 does not support `ALTER TABLE`. Versions V1–V16
+> are production schema and are frozen.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 

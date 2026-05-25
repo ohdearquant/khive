@@ -1,6 +1,9 @@
 //! KhiveRuntime — composable handle to all storage capabilities.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use khive_db::StorageBackend;
 use khive_gate::{ActorRef, AllowAllGate, GateRef};
@@ -136,6 +139,13 @@ pub struct RuntimeConfig {
     /// `EmbedderRegistry`. This field persists for backward compatibility until
     /// the embedder registry is fully plumbed.
     pub embedding_model: Option<EmbeddingModel>,
+    /// Additional embedding models to make available by request name.
+    ///
+    /// `embedding_model` remains the default used by existing `embed()` and
+    /// `embed_batch()` callers. This list adds non-default models that can be
+    /// selected with `embedder(name)`, `embed_with_model(...)`, memory
+    /// `remember.embedding_model`, and memory `recall.embedding_model`.
+    pub additional_embedding_models: Vec<EmbeddingModel>,
     /// Authorization gate consulted before each verb dispatch (ADR-029).
     /// Default: `AllowAllGate` (permissive). For production policy enforcement,
     /// plug in a Rego- or capability-witness-backed impl.
@@ -173,6 +183,10 @@ impl Default for RuntimeConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .or(Some(EmbeddingModel::AllMiniLmL6V2));
+        let additional_embedding_models = std::env::var("KHIVE_ADDITIONAL_EMBEDDING_MODELS")
+            .ok()
+            .map(|s| parse_embedding_model_list(&s))
+            .unwrap_or_default();
         let packs = std::env::var("KHIVE_PACKS")
             .ok()
             .map(|s| parse_pack_list(&s))
@@ -182,6 +196,7 @@ impl Default for RuntimeConfig {
             db_path,
             default_namespace: Namespace::local(),
             embedding_model,
+            additional_embedding_models,
             gate: Arc::new(AllowAllGate),
             packs,
             backend_id: BackendId::main(),
@@ -191,6 +206,12 @@ impl Default for RuntimeConfig {
 
 // ---- KhiveRuntime ----
 
+#[derive(Clone)]
+struct EmbedderEntry {
+    model: EmbeddingModel,
+    cell: Arc<OnceCell<Arc<dyn EmbeddingService>>>,
+}
+
 /// Composable runtime handle used by the MCP server.
 ///
 /// Wraps a `StorageBackend` and provides namespace-scoped accessor methods
@@ -199,7 +220,8 @@ impl Default for RuntimeConfig {
 pub struct KhiveRuntime {
     backend: Arc<StorageBackend>,
     config: RuntimeConfig,
-    embedder: Arc<OnceCell<Arc<dyn EmbeddingService>>>,
+    embedders: Arc<HashMap<String, EmbedderEntry>>,
+    default_embedder_name: Arc<str>,
     /// Pack-extensible edge endpoint rules (ADR-031). Shared across clones
     /// via `Arc<RwLock<_>>`; installed once by the transport after the
     /// `VerbRegistry` is built. Empty until installed — base rules
@@ -223,10 +245,13 @@ impl KhiveRuntime {
             }
             None => StorageBackend::memory()?,
         };
+        register_configured_embedding_models(&backend, &config)?;
+        let (embedders, default_embedder_name) = build_embedder_registry(&config);
         Ok(Self {
             backend: Arc::new(backend),
             config,
-            embedder: Arc::new(OnceCell::new()),
+            embedders: Arc::new(embedders),
+            default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
         })
     }
@@ -241,10 +266,15 @@ impl KhiveRuntime {
     /// storage access is through the provided `backend`. Set `backend_id` and
     /// `default_namespace` via the config builder pattern if non-defaults are needed.
     pub fn from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
+        if let Err(err) = register_configured_embedding_models(&backend, &config) {
+            tracing::warn!(error = %err, "failed to register configured embedding models");
+        }
+        let (embedders, default_embedder_name) = build_embedder_registry(&config);
         Self {
             backend,
             config,
-            embedder: Arc::new(OnceCell::new()),
+            embedders: Arc::new(embedders),
+            default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -255,6 +285,7 @@ impl KhiveRuntime {
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
+            additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
@@ -321,12 +352,28 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
     ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
-        let model = self
-            .config
-            .embedding_model
-            .ok_or_else(|| crate::RuntimeError::Unconfigured("embedding_model".into()))?;
+        let model = self.resolve_embedding_model(None)?;
+        self.vectors_for_embedding_model(token, model)
+    }
+
+    /// Get a VectorStore for a specific named embedding model, scoped to the token's namespace.
+    pub fn vectors_for_model(
+        &self,
+        token: &NamespaceToken,
+        model_name: &str,
+    ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
+        let model = self.resolve_embedding_model(Some(model_name))?;
+        self.vectors_for_embedding_model(token, model)
+    }
+
+    fn vectors_for_embedding_model(
+        &self,
+        token: &NamespaceToken,
+        model: EmbeddingModel,
+    ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
         Ok(self.backend.vectors_for_namespace(
             &vec_model_key(model),
+            &model.to_string(),
             model.dimensions(),
             token.namespace().as_str(),
         )?)
@@ -380,28 +427,66 @@ impl KhiveRuntime {
             .unwrap_or_default()
     }
 
-    /// Get the lazily-initialized embedding service.
+    /// Return the name of the default embedding model (empty string if none configured).
+    pub fn default_embedder_name(&self) -> &str {
+        self.default_embedder_name.as_ref()
+    }
+
+    /// Resolve a model name (or `None` for the default) to an `EmbeddingModel`.
+    ///
+    /// Returns `UnknownModel` if the name is not in the registry, or
+    /// `Unconfigured` if `None` is passed and no default model is set.
+    pub fn resolve_embedding_model(&self, name: Option<&str>) -> RuntimeResult<EmbeddingModel> {
+        let model = match name {
+            Some(raw) => parse_embedding_model_alias(raw)
+                .ok_or_else(|| crate::RuntimeError::UnknownModel(raw.to_string()))?,
+            None => self
+                .config
+                .embedding_model
+                .ok_or_else(|| crate::RuntimeError::Unconfigured("embedding_model".into()))?,
+        };
+        let key = model.to_string();
+        if self.embedders.contains_key(&key) {
+            Ok(model)
+        } else {
+            Err(crate::RuntimeError::UnknownModel(
+                name.unwrap_or_else(|| self.default_embedder_name())
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Names of all registered embedding models in this runtime.
+    ///
+    /// Useful for operations that must touch every model's storage (e.g.,
+    /// scoped vector deletion on note delete — codex High 2 (PR #407)).
+    /// The default model is included.
+    pub fn registered_embedding_model_names(&self) -> Vec<String> {
+        self.embedders.keys().cloned().collect()
+    }
+
+    /// Get the lazily-initialized embedding service for the named model.
     ///
     /// Returns a `CachedEmbeddingService` wrapping a `NativeEmbeddingService`.
     /// First call loads the model (cold start cost); subsequent calls are cheap and
     /// benefit from LRU caching of repeated inputs.
-    ///
-    /// Returns `Unconfigured("embedding_model")` if no model is set.
-    pub async fn embedder(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        let model = self
-            .config
-            .embedding_model
-            .ok_or_else(|| crate::RuntimeError::Unconfigured("embedding_model".into()))?;
-        let service = self
-            .embedder
+    pub async fn embedder(&self, name: &str) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        let model = self.resolve_embedding_model(Some(name))?;
+        let key = model.to_string();
+        let entry = self
+            .embedders
+            .get(&key)
+            .ok_or_else(|| crate::RuntimeError::UnknownModel(name.to_string()))?
+            .clone();
+        Ok(entry
+            .cell
             .get_or_init(|| async move {
-                let native = Arc::new(NativeEmbeddingService::with_model(model));
+                let native = Arc::new(NativeEmbeddingService::with_model(entry.model));
                 let cached = CachedEmbeddingService::with_default_cache(native);
                 Arc::new(cached) as Arc<dyn EmbeddingService>
             })
             .await
-            .clone();
-        Ok(service)
+            .clone())
     }
 }
 
@@ -415,6 +500,81 @@ fn sanitize_key(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+fn build_embedder_registry(config: &RuntimeConfig) -> (HashMap<String, EmbedderEntry>, Arc<str>) {
+    let mut embedders = HashMap::new();
+    for model in configured_embedding_models(config) {
+        embedders.insert(
+            model.to_string(),
+            EmbedderEntry {
+                model,
+                cell: Arc::new(OnceCell::new()),
+            },
+        );
+    }
+    let default_embedder_name = config
+        .embedding_model
+        .map(|model| Arc::<str>::from(model.to_string()))
+        .unwrap_or_else(|| Arc::<str>::from(""));
+    (embedders, default_embedder_name)
+}
+
+fn configured_embedding_models(config: &RuntimeConfig) -> Vec<EmbeddingModel> {
+    let mut models = Vec::new();
+    if let Some(model) = config.embedding_model {
+        models.push(model);
+    }
+    models.extend(config.additional_embedding_models.iter().copied());
+    models.sort_by_key(|model| model.to_string());
+    models.dedup();
+    models
+}
+
+fn register_configured_embedding_models(
+    backend: &StorageBackend,
+    config: &RuntimeConfig,
+) -> RuntimeResult<()> {
+    for model in configured_embedding_models(config) {
+        backend.register_embedding_model(
+            &model.to_string(),
+            model.model_id(),
+            model.key_version(),
+            model.dimensions() as u32,
+        )?;
+    }
+    Ok(())
+}
+
+/// Parse a comma- or whitespace-separated list of embedding model names.
+fn parse_embedding_model_list(s: &str) -> Vec<EmbeddingModel> {
+    parse_pack_list(s)
+        .into_iter()
+        .filter_map(|raw| {
+            let parsed = parse_embedding_model_alias(&raw);
+            if parsed.is_none() && !raw.trim().is_empty() {
+                // Codex Medium (PR #407): silent filter_map masks operator typos. Warn loudly
+                // so misconfiguration surfaces at startup rather than as an UnknownModel error
+                // at request time. We do not fail startup — a partially valid list still
+                // produces a functional runtime — but the warning is unambiguous.
+                tracing::warn!(
+                    model = %raw,
+                    "KHIVE_ADDITIONAL_EMBEDDING_MODELS contains unknown model name; ignored. \
+                     Valid forms: short alias like 'paraphrase' or a fully-qualified key \
+                     from lattice_embed::EmbeddingModel::from_str."
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+fn parse_embedding_model_alias(name: &str) -> Option<EmbeddingModel> {
+    let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "paraphrase" => Some(EmbeddingModel::ParaphraseMultilingualMiniLmL12V2),
+        _ => normalized.parse().ok(),
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +595,7 @@ mod tests {
             db_path: Some(path.clone()),
             default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
+            additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::main(),
@@ -451,6 +612,7 @@ mod tests {
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
+            additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
             backend_id: BackendId::new("lore"),

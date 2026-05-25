@@ -9,7 +9,8 @@ pub mod stores;
 pub use backend::StorageBackend;
 pub use error::SqliteError;
 pub use migrations::{
-    run_migrations, Migration, ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
+    query_embedding_models, run_migrations, EmbeddingModelRegistryRecord, Migration,
+    ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
 };
 pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, WriterGuard};
 pub use sql_bridge::SqlBridge;

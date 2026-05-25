@@ -41,20 +41,26 @@ const RRF_K: usize = 60;
 const CANDIDATE_MULTIPLIER: u32 = 4;
 
 impl KhiveRuntime {
-    /// Generate an embedding vector for `text` using the configured local model.
+    /// Generate an embedding vector for `text` using the configured default model.
     ///
     /// First call lazily loads model weights (cold start cost). Subsequent calls reuse them.
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
     pub async fn embed(&self, text: &str) -> RuntimeResult<Vec<f32>> {
-        let service = self.embedder().await?;
-        let model = self
-            .config()
-            .embedding_model
-            .expect("embedder() returns Unconfigured when model is None");
+        let model_name = self.default_embedder_name();
+        if model_name.is_empty() {
+            return Err(RuntimeError::Unconfigured("embedding_model".into()));
+        }
+        self.embed_with_model(model_name, text).await
+    }
+
+    /// Generate an embedding vector for `text` using the named model.
+    pub async fn embed_with_model(&self, model_name: &str, text: &str) -> RuntimeResult<Vec<f32>> {
+        let model = self.resolve_embedding_model(Some(model_name))?;
+        let service = self.embedder(model_name).await?;
         Ok(service.embed_one(text, model).await?)
     }
 
-    /// Generate embeddings for multiple texts in one call.
+    /// Generate embeddings for multiple texts in one call using the configured default model.
     ///
     /// Delegates to the cached `EmbeddingService::embed`, so repeated texts within
     /// and across calls benefit from the runtime-level LRU cache.
@@ -65,11 +71,24 @@ impl KhiveRuntime {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let service = self.embedder().await?;
-        let model = self
-            .config()
-            .embedding_model
-            .expect("embedder() returns Unconfigured when model is None");
+        let model_name = self.default_embedder_name();
+        if model_name.is_empty() {
+            return Err(RuntimeError::Unconfigured("embedding_model".into()));
+        }
+        self.embed_batch_with_model(model_name, texts).await
+    }
+
+    /// Generate embeddings for multiple texts using the named model.
+    pub async fn embed_batch_with_model(
+        &self,
+        model_name: &str,
+        texts: &[String],
+    ) -> RuntimeResult<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let model = self.resolve_embedding_model(Some(model_name))?;
+        let service = self.embedder(model_name).await?;
         Ok(service.embed(texts, model).await?)
     }
 
@@ -111,6 +130,7 @@ impl KhiveRuntime {
                 top_k,
                 namespace: Some(ns),
                 kind,
+                embedding_model: None,
                 filter: None,
                 backend_hints: None,
             })
@@ -242,6 +262,7 @@ impl KhiveRuntime {
                 top_k,
                 namespace: Some(ns),
                 kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
                 filter: None,
                 backend_hints: None,
             })
@@ -269,6 +290,7 @@ impl KhiveRuntime {
                 top_k: candidate_ids.len() as u32,
                 namespace: Some(ns),
                 kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
                 filter: None,
                 backend_hints: None,
             })

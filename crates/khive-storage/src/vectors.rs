@@ -307,6 +307,7 @@ mod tests {
             top_k: 5,
             namespace: None,
             kind: None,
+            embedding_model: None,
             filter: None,
             backend_hints: None,
         };
@@ -326,6 +327,7 @@ mod tests {
             top_k: 5,
             namespace: None,
             kind: None,
+            embedding_model: None,
             filter: None,
             backend_hints: None,
         };
@@ -352,6 +354,7 @@ mod tests {
                 top_k: 3,
                 namespace: None,
                 kind: None,
+                embedding_model: None,
                 filter: None,
                 backend_hints: None,
             },
@@ -360,6 +363,7 @@ mod tests {
                 top_k: 3,
                 namespace: None,
                 kind: None,
+                embedding_model: None,
                 filter: None,
                 backend_hints: None,
             },
@@ -433,6 +437,7 @@ mod tests {
             top_k: 1,
             namespace: None,
             kind: None,
+            embedding_model: None,
             filter: None,
             backend_hints: None,
         }];

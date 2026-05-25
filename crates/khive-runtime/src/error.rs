@@ -78,6 +78,9 @@ pub enum RuntimeError {
     #[error("unconfigured: {0} is not set")]
     Unconfigured(String),
 
+    #[error("unknown embedding model: {0}")]
+    UnknownModel(String),
+
     #[error("embedding: {0}")]
     Embedding(#[from] lattice_embed::EmbedError),
 

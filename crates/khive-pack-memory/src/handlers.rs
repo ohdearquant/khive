@@ -61,6 +61,8 @@ struct RememberParams {
     #[serde(alias = "source")]
     source_id: Option<String>,
     tags: Option<Vec<String>>,
+    #[serde(default)]
+    embedding_model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +76,8 @@ struct RecallParams {
     top_k: Option<usize>,
     fusion_strategy: Option<String>,
     score_floor: Option<f32>,
+    #[serde(default)]
+    embedding_model: Option<String>,
 }
 
 impl RecallParams {
@@ -279,6 +283,7 @@ impl MemoryPack {
         query: &str,
         token: &NamespaceToken,
         candidate_limit: u32,
+        embedding_model: Option<&str>,
     ) -> Result<RecallCandidateSet, RuntimeError> {
         let ns = token.namespace().as_str().to_string();
         // F111: restrict text candidates to Note substrate kind so entity records
@@ -299,23 +304,28 @@ impl MemoryPack {
             })
             .await?;
 
-        let vector_hits = if self.runtime.config().embedding_model.is_some() {
-            let vec = self.runtime.embed(query).await?;
-            self.runtime
-                .vectors(token)?
-                .search(VectorSearchRequest {
-                    query_vectors: vec![vec],
-                    top_k: candidate_limit,
-                    namespace: Some(ns.clone()),
-                    // F111: already restricts to Note substrate kind
-                    kind: Some(SubstrateKind::Note),
-                    filter: None,
-                    backend_hints: None,
-                })
-                .await?
-        } else {
-            Vec::new()
-        };
+        let vector_hits =
+            if self.runtime.config().embedding_model.is_some() || embedding_model.is_some() {
+                let model_name: String = embedding_model
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| self.runtime.default_embedder_name().to_string());
+                let vec = self.runtime.embed_with_model(&model_name, query).await?;
+                self.runtime
+                    .vectors_for_model(token, &model_name)?
+                    .search(VectorSearchRequest {
+                        query_vectors: vec![vec],
+                        top_k: candidate_limit,
+                        namespace: Some(ns.clone()),
+                        // F111: already restricts to Note substrate kind
+                        kind: Some(SubstrateKind::Note),
+                        embedding_model: Some(model_name),
+                        filter: None,
+                        backend_hints: None,
+                    })
+                    .await?
+            } else {
+                Vec::new()
+            };
 
         Ok(RecallCandidateSet {
             namespace: ns,
@@ -416,9 +426,17 @@ impl MemoryPack {
             }
         }
 
+        // Codex High 3 (PR #407): validate embedding_model BEFORE any note/FTS
+        // write so unknown-model errors are atomic (no half-written rows).
+        // resolve_embedding_model is sync and does not trigger model load — it
+        // only checks the registry contains the name.
+        if let Some(model_name) = p.embedding_model.as_deref() {
+            self.runtime.resolve_embedding_model(Some(model_name))?;
+        }
+
         let note = self
             .runtime
-            .create_note_with_decay(
+            .create_note_with_decay_for_embedding_model(
                 token,
                 "memory",
                 None,
@@ -427,6 +445,7 @@ impl MemoryPack {
                 decay_factor,
                 Some(props),
                 annotates,
+                p.embedding_model.as_deref(),
             )
             .await?;
 
@@ -483,7 +502,12 @@ impl MemoryPack {
         };
         let candidate_limit = recall_candidate_count(&cfg, limit);
         let candidates = self
-            .collect_recall_candidates(&p.query, token, candidate_limit)
+            .collect_recall_candidates(
+                &p.query,
+                token,
+                candidate_limit,
+                p.embedding_model.as_deref(),
+            )
             .await?;
         let (memory_ids, mut notes_by_id) = self
             .load_memory_candidate_notes(token, &candidates.text_hits, &candidates.vector_hits)
@@ -604,7 +628,12 @@ impl MemoryPack {
         let limit = p.limit.unwrap_or(10).min(100);
         let candidate_limit = recall_candidate_count(&cfg, limit);
         let candidates = self
-            .collect_recall_candidates(&p.query, token, candidate_limit)
+            .collect_recall_candidates(
+                &p.query,
+                token,
+                candidate_limit,
+                p.embedding_model.as_deref(),
+            )
             .await?;
 
         let text_candidates: Vec<Value> = candidates
@@ -657,7 +686,12 @@ impl MemoryPack {
         let limit = p.limit.unwrap_or(10).min(100);
         let candidate_limit = recall_candidate_count(&cfg, limit);
         let candidates = self
-            .collect_recall_candidates(&p.query, token, candidate_limit)
+            .collect_recall_candidates(
+                &p.query,
+                token,
+                candidate_limit,
+                p.embedding_model.as_deref(),
+            )
             .await?;
         let (memory_ids, notes_by_id) = self
             .load_memory_candidate_notes(token, &candidates.text_hits, &candidates.vector_hits)
@@ -811,6 +845,7 @@ mod tests {
             top_k: None,
             fusion_strategy: None,
             score_floor: None,
+            embedding_model: None,
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.relevance_weight - 0.70).abs() < 1e-12);
@@ -830,6 +865,7 @@ mod tests {
             top_k: None,
             fusion_strategy: None,
             score_floor: None,
+            embedding_model: None,
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.min_score - 0.5).abs() < 1e-12);
@@ -851,6 +887,7 @@ mod tests {
             top_k: None,
             fusion_strategy: None,
             score_floor: None,
+            embedding_model: None,
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.relevance_weight - 0.50).abs() < 1e-12);
@@ -881,6 +918,7 @@ mod tests {
             top_k: None,
             fusion_strategy: Some("weighted".to_string()),
             score_floor: None,
+            embedding_model: None,
         };
 
         let mut cfg = p.effective_config(base);

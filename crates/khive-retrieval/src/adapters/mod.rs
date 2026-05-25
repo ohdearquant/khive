@@ -110,6 +110,7 @@ impl VectorSearch for StorageVectorSearch {
             top_k: top_k as u32,
             namespace: None,
             kind: None,
+            embedding_model: None,
             filter: None,
             backend_hints: None,
         };

@@ -18,7 +18,9 @@ mod vector_filter_contract {
     #[tokio::test]
     async fn search_with_non_empty_filter_returns_unsupported() {
         let backend = StorageBackend::memory().expect("in-memory backend");
-        let store = backend.vectors("filter_test", 3).expect("vector store");
+        let store = backend
+            .vectors("filter_test", "filter_test", 3)
+            .expect("vector store");
 
         // Insert one record so the table is non-empty.
         let id = Uuid::new_v4();
@@ -39,6 +41,7 @@ mod vector_filter_contract {
             top_k: 5,
             namespace: None,
             kind: None,
+            embedding_model: None,
             filter: Some(VectorMetadataFilter {
                 namespaces: vec!["local".into()],
                 kinds: vec![],
@@ -64,7 +67,9 @@ mod vector_filter_contract {
     #[tokio::test]
     async fn search_with_filter_empty_delegates_and_non_empty_rejects() {
         let backend = StorageBackend::memory().expect("in-memory backend");
-        let store = backend.vectors("filter_delegate", 3).expect("vector store");
+        let store = backend
+            .vectors("filter_delegate", "filter_delegate", 3)
+            .expect("vector store");
 
         let id = Uuid::new_v4();
         store
@@ -83,6 +88,7 @@ mod vector_filter_contract {
             top_k: 1,
             namespace: None,
             kind: None,
+            embedding_model: None,
             filter: None,
             backend_hints: None,
         };
@@ -154,7 +160,7 @@ mod vector_filter_contract {
         // the old schema and rebuild the table transparently.
         let new_backend = StorageBackend::sqlite(&db_path).expect("reopen db");
         let store = new_backend
-            .vectors_for_namespace("old_model", 3, "local")
+            .vectors_for_namespace("old_model", "old_model", 3, "local")
             .expect("vectors_for_namespace must succeed after schema rebuild");
 
         // Step 3: insert and search in the new shape must work.
@@ -176,6 +182,7 @@ mod vector_filter_contract {
                 top_k: 1,
                 namespace: None,
                 kind: None,
+                embedding_model: None,
                 filter: None,
                 backend_hints: None,
             })

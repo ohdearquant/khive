@@ -1023,7 +1023,7 @@ async fn test_recall_default_identity() {
             .expect("remember succeeds");
     }
 
-    // Baseline recall with no knobs — query a term present in all 4 memories
+    // Baseline recall with no knobs
     let base = registry
         .dispatch("recall", json!({ "query": "cell" }))
         .await
