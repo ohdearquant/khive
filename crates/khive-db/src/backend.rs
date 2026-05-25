@@ -318,8 +318,27 @@ impl StorageBackend {
             }
         }
 
-        // Create the vec0 virtual table with the full ADR-044 schema. Idempotent
-        // on fresh databases and after the old-schema rebuild above.
+        // Ensure the _embedding_models registry table exists (ADR-043 §1).
+        // This is a no-op when the table already exists. Running it here ensures
+        // the registry is present for any caller that opens a vector store without
+        // first calling run_migrations() (e.g., tests that create stores directly).
+        // Production callers are expected to call run_migrations() at startup, which
+        // creates the registry via V14; this is a belt-and-suspenders fallback.
+        // Schema is defined in `migrations::EMBEDDING_MODELS_DDL` (single source of
+        // truth) to prevent the two copies from silently drifting.
+        writer
+            .conn()
+            .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
+
+        // Create the vec0 virtual table. Idempotent on fresh databases and after the
+        // old-schema rebuild above.
+        //
+        // NOTE: `embedding_model_id` is NOT included in this DDL because sqlite-vec
+        // enforces NOT NULL on TEXT metadata columns at insert time, so the column
+        // cannot be added at virtual-table creation as a nullable FK.  The column will
+        // be present after the ADR-043 §8 startup backfill rebuild (steps 2-4), which
+        // is deferred to a follow-up PR — see the tracking issue filed against MAJ-2
+        // of codex round-1 review of PR #374.
         let ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
              subject_id TEXT PRIMARY KEY, \
