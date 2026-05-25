@@ -16,6 +16,7 @@ pub mod edge;
 pub mod entity;
 pub mod error;
 pub mod event;
+pub mod hash;
 pub mod header;
 pub mod id;
 pub mod khive_error;
@@ -34,6 +35,7 @@ pub use event::{
     ProposalAppliedPayload, ProposalChangeset, ProposalCreatedPayload, ProposalDecision,
     ProposalReviewedPayload, ProposalWithdrawnPayload, RerankExecutedPayload,
 };
+pub use hash::Hash32;
 pub use header::Header;
 pub use id::{Id128, ParseIdError};
 pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};

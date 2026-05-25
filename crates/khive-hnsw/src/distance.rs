@@ -3,7 +3,7 @@
 //! # Formal Verification
 //!
 //! This implementation corresponds to the formal proofs in
-//! `proofs/Lion/Retrieval/Distance.lean`. Key theorems:
+//! `proofs/Retrieval/Distance.lean` (ADR-030 §Phase 2). Key theorems:
 //!
 //! ## Metric Axioms (Euclidean)
 //! - `euclidean_nonneg`: d(x,y) ≥ 0
@@ -68,10 +68,10 @@ pub fn compute_distance(
         DistanceMetric::Cosine => {
             // ADR-002: khive-embed is the SIMD foundation layer
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Cosine.cosine_sim_bounded
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Cosine.cosine_sim_bounded
             // Cosine similarity is bounded: -1 <= cos(x,y) <= 1 for unit vectors
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Cosine.cauchy_schwarz
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Cosine.cauchy_schwarz
             // Cauchy-Schwarz inequality: |<x,y>| <= ||x|| * ||y||
             let dot = lattice_embed::simd::dot_product(a, b);
             cosine_distance_from_parts(dot, a_norm, b_norm)
@@ -84,13 +84,13 @@ pub fn compute_distance(
         DistanceMetric::L2 => {
             // ADR-002: lattice-embed is the SIMD foundation layer
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Distance.euclidean_nonneg
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.euclidean_nonneg
             // Euclidean distance is non-negative: d(x,y) >= 0
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Distance.euclidean_symm
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.euclidean_symm
             // Euclidean distance is symmetric: d(x,y) = d(y,x)
             //
-            // **PROOF CORRESPONDENCE**: Lion.Retrieval.Distance.euclidean_triangle
+            // **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.euclidean_triangle
             // Triangle inequality: d(x,z) <= d(x,y) + d(y,z)
             lattice_embed::simd::euclidean_distance(a, b)
         }
@@ -130,7 +130,7 @@ pub(crate) fn compute_ordering_distance(
 /// Replaces the former `distance_to_similarity -> f32` at the HNSW output boundary
 /// so that score arithmetic stays in fixed-point throughout the result pipeline.
 ///
-/// **PROOF CORRESPONDENCE**: Lion.Retrieval.Distance.similarity_mono
+/// **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.similarity_mono
 /// Similarity conversion is monotonically decreasing in distance:
 /// d1 < d2 implies sim(d1) > sim(d2)
 #[inline]

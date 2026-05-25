@@ -4,6 +4,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/../crates"
 
+echo "=== Proof Reference Check ==="
+"$SCRIPT_DIR/check-proof-references.sh"
+
 echo "=== Format Check ==="
 cargo fmt --all -- --check
 

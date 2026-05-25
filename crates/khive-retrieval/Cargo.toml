@@ -39,11 +39,9 @@ rand = { version = "0.8", optional = true }
 default = []
 # Policy-based access control for search results (uses khive-gate API)
 policy = ["khive-gate"]
-# HNSW checkpoint integration with khive-fold
-# Note: khive_hnsw::HnswCheckpoint/HnswCheckpointStore depend on khive_fold::Checkpoint
-# which doesn't exist in the current khive-fold API. Those re-exports are gated out
-# until the khive-fold Checkpoint trait is ported.
-checkpoint = ["khive-fold"]
+# HNSW checkpoint integration with khive-fold (ADR-030 F167)
+# Enables HnswCheckpoint/HnswCheckpointStore re-exports and khive-hnsw checkpoint support.
+checkpoint = ["khive-fold", "khive-hnsw/checkpoint"]
 # SQLite-based persistence for HNSW and BM25 indexes
 persist = ["rusqlite", "tracing", "rand"]
 # Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits.

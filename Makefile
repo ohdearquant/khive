@@ -1,4 +1,4 @@
-.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local
+.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local proof-check
 
 check:
 	cd crates && cargo check --workspace
@@ -22,6 +22,9 @@ fmt-check:
 
 build:
 	cd crates && cargo build --workspace --release
+
+proof-check:
+	./scripts/check-proof-references.sh
 
 clean:
 	cd crates && cargo clean

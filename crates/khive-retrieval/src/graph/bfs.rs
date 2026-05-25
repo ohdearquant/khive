@@ -57,10 +57,10 @@ use super::types::{PathNode, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSA
 /// }
 /// ```
 ///
-/// **PROOF CORRESPONDENCE**: `Lion.Retrieval.Graph.bfs_terminates`
+/// **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.bfs_terminates`
 /// Queue shrinks each iteration; visited set prevents re-enqueue; terminates when queue empty.
 ///
-/// **PROOF CORRESPONDENCE**: `Lion.Retrieval.Graph.bfs_complete`
+/// **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.bfs_complete`
 /// All reachable vertices within max_depth are visited; BFS explores level-by-level.
 pub async fn bfs_traverse<S: LinkStore>(
     store: &S,
@@ -75,7 +75,7 @@ pub async fn bfs_traverse<S: LinkStore>(
         .min(MAX_TRAVERSAL_RESULTS);
     let min_weight = options.min_weight.unwrap_or(f64::NEG_INFINITY);
 
-    // **PROOF CORRESPONDENCE**: `Lion.Retrieval.Graph.visited_mono`
+    // **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.visited_mono`
     // Visited set only grows (insert-only); never shrinks during traversal.
     // EntityRef implements Hash + Eq, enabling direct use as HashMap key.
     let mut visited: HashSet<EntityRef> = HashSet::new();

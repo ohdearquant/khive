@@ -13,9 +13,11 @@ categories.workspace = true
 default = ["serde", "std"]
 serde = ["dep:serde"]
 std = []
+blake3 = ["dep:blake3"]
 
 [dependencies]
 serde = { workspace = true, optional = true, features = ["derive"] }
+blake3 = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
 serde_json = { workspace = true }

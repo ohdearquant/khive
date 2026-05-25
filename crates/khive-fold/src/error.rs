@@ -58,6 +58,21 @@ pub enum FoldError {
     /// Required component not configured.
     #[error("required component not configured: {0}")]
     ComponentMissing(String),
+
+    /// Checkpoint integrity check failed: stored hash does not match recomputed hash.
+    #[error("checkpoint integrity mismatch for '{id}': stored {stored}, computed {computed}")]
+    IntegrityMismatch {
+        /// Checkpoint id that failed verification.
+        id: String,
+        /// The hash stored in the checkpoint.
+        stored: String,
+        /// The hash recomputed from the loaded state.
+        computed: String,
+    },
+
+    /// A checkpoint with the given id was not found.
+    #[error("checkpoint not found: {0}")]
+    CheckpointNotFound(String),
 }
 
 #[cfg(test)]

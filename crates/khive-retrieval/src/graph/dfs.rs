@@ -52,7 +52,7 @@ use super::types::{PathNode, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSA
 /// let nodes = dfs_traverse(&store, &ctx, start_ref, &options).await?;
 /// ```
 ///
-/// **PROOF CORRESPONDENCE**: `Lion.Retrieval.Graph.dfs_terminates_bound`
+/// **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.dfs_terminates_bound`
 /// Each vertex visited at most once; |visited| bounded by |V|; stack pops exceed pushes eventually.
 pub async fn dfs_traverse<S: LinkStore>(
     store: &S,
@@ -67,7 +67,7 @@ pub async fn dfs_traverse<S: LinkStore>(
         .min(MAX_TRAVERSAL_RESULTS);
     let min_weight = options.min_weight.unwrap_or(f64::NEG_INFINITY);
 
-    // **PROOF CORRESPONDENCE**: `Lion.Retrieval.Graph.visited_mono`
+    // **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.visited_mono`
     // Visited set only grows (insert-only); never shrinks during traversal.
     // EntityRef implements Hash + Eq, enabling direct use as HashMap key.
     let mut visited: HashSet<EntityRef> = HashSet::new();

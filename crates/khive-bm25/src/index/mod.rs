@@ -824,7 +824,7 @@ impl Bm25Index {
 
 /// Compute IDF from document frequency using the Robertson-Walker variant.
 ///
-/// **PROOF CORRESPONDENCE**: `Lion.Retrieval.BM25.idf_nonneg`
+/// **PROOF CORRESPONDENCE**: `khive.Retrieval.BM25.idf_nonneg`
 /// With +1 inside ln(), IDF(t) >= 0 for all terms regardless of document frequency.
 #[inline]
 pub(crate) fn idf_from_doc_freq(doc_freq: usize, doc_count: usize) -> f64 {
@@ -835,7 +835,7 @@ pub(crate) fn idf_from_doc_freq(doc_freq: usize, doc_count: usize) -> f64 {
 
 /// Compute a single-term BM25 contribution for a posting.
 ///
-/// **PROOF CORRESPONDENCE**: `Lion.Retrieval.BM25.tf_bounded`
+/// **PROOF CORRESPONDENCE**: `khive.Retrieval.BM25.tf_bounded`
 /// TF saturation: tf * (k1 + 1) / (tf + k1 * ...) < k1 + 1 for all tf >= 0.
 #[inline]
 pub(crate) fn bm25_term_score(
