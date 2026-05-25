@@ -600,6 +600,33 @@ impl BrainPack {
             .get_mut(&p.profile_id)
             .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", p.profile_id)))?;
 
+        // Lifecycle DAG (ADR-032 §10):
+        //   defined   → registered → active ⟷ inactive → archived
+        //                         ↗
+        //
+        // Terminal state: archived is read-only/audit-retained.
+        // No transition OUT of archived is legal.
+        //
+        // Active → archived is also illegal; must deactivate first.
+        match (&record.lifecycle, &lifecycle) {
+            // archived is terminal — nothing leaves it
+            (ProfileLifecycle::Archived, _) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "profile {:?} is archived; archive is terminal and no transition is permitted",
+                    p.profile_id
+                )));
+            }
+            // active → archived is illegal (must go through inactive first)
+            (ProfileLifecycle::Active, ProfileLifecycle::Archived) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "profile {:?} is active; deactivate it before archiving",
+                    p.profile_id
+                )));
+            }
+            // all other transitions are permitted
+            _ => {}
+        }
+
         record.lifecycle = lifecycle.clone();
         Ok(json!({
             "profile_id": p.profile_id,
@@ -1162,12 +1189,24 @@ mod tests {
     async fn dispatch_archive_profile() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Lifecycle DAG requires active → inactive before archiving.
+        pack.dispatch(
+            "brain.deactivate",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
         let result = pack
             .dispatch(
                 "brain.archive",
                 json!({"profile_id": "balanced-recall-v1"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &token,
             )
             .await
             .unwrap();
@@ -1269,6 +1308,153 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["unbound"], json!(1u64));
+    }
+
+    // ── B-C1 regression: lifecycle terminal-state enforcement ─────────────────
+    //
+    // archived is terminal: no transition out of archived is permitted.
+    // active → archived is illegal: must deactivate first.
+    // active ⟷ inactive is the only reversible pair.
+
+    #[tokio::test]
+    async fn b_c1_archived_activate_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Deactivate first (active → inactive), then archive (inactive → archived)
+        pack.dispatch(
+            "brain.deactivate",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.archive",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Attempt to activate an archived profile — must fail
+        let err = pack
+            .dispatch(
+                "brain.activate",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("terminal") || msg.contains("archived"),
+                "B-C1: error must mention 'terminal' or 'archived'; got: {msg}"
+            );
+        } else {
+            panic!("B-C1: expected InvalidInput, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn b_c1_archived_deactivate_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Get to archived via active → inactive → archived
+        pack.dispatch(
+            "brain.deactivate",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.archive",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Attempt deactivate on archived profile — must fail
+        let err = pack
+            .dispatch(
+                "brain.deactivate",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "B-C1: deactivate on archived must return InvalidInput, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn b_c1_active_to_archived_direct_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Profile starts active — direct archive must fail (must go through inactive)
+        let err = pack
+            .dispatch(
+                "brain.archive",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("deactivate") || msg.contains("inactive"),
+                "B-C1: active→archived error must hint at deactivate; got: {msg}"
+            );
+        } else {
+            panic!("B-C1: expected InvalidInput for active→archived, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn b_c1_inactive_to_archived_is_permitted() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // active → inactive → archived: legal path
+        pack.dispatch(
+            "brain.deactivate",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        let result = pack
+            .dispatch(
+                "brain.archive",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result["lifecycle"],
+            json!("archived"),
+            "B-C1: inactive→archived must succeed"
+        );
     }
 
     // Regression test for MAJ-002: unbind with multiple filters must use AND semantics,

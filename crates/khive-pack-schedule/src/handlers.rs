@@ -4,7 +4,7 @@
 //! `scheduled_event` notes. Trigger evaluation is NOT performed by the pack —
 //! the pack only stores intent. See ADR-040 §Trigger evaluation for execution modes.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -58,6 +58,21 @@ fn note_to_event_json(note: &Note) -> Value {
 fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
     serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
+}
+
+/// Validate that `at` is a valid RFC 3339 timestamp.
+///
+/// Accepts any RFC 3339 string that `chrono` can parse as a `DateTime<Utc>`
+/// (e.g. "2027-01-01T00:00:00Z" or "2027-01-01T00:00:00+05:30").
+/// Returns an error with the exact invalid value and the expected format so
+/// callers can act on the message without inspecting the type.
+fn validate_at(verb: &str, at: &str) -> Result<(), RuntimeError> {
+    if at.parse::<DateTime<Utc>>().is_err() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}.at: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), got {at:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate a cron expression (5-field) — only basic structure check in v1.
@@ -130,6 +145,7 @@ pub(crate) async fn handle_remind(
             "remind: `at` must not be empty".into(),
         ));
     }
+    validate_at("remind", p.at.trim())?;
     if let Some(ref r) = p.repeat {
         validate_repeat(r)?;
     }
@@ -183,6 +199,7 @@ pub(crate) async fn handle_schedule(
             "schedule: `at` must not be empty".into(),
         ));
     }
+    validate_at("schedule", p.at.trim())?;
     if let Some(ref r) = p.repeat {
         validate_repeat(r)?;
     }

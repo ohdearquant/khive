@@ -144,6 +144,164 @@ async fn test_full_id_returns_36_char_schedule() {
     assert!(full_id.contains('-'), "full_id must be hyphenated format");
 }
 
+// ── S-C1 regression: RFC 3339 timestamp validation ──────────────────────────
+//
+// Invalid `at` values must be rejected before writing to storage.
+// Valid RFC 3339 timestamps must succeed.
+
+#[tokio::test]
+async fn s_c1_schedule_valid_rfc3339_succeeds() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch(
+            "schedule",
+            serde_json::json!({
+                "action": "create(kind=entity, name=test)",
+                "at": "2027-01-01T00:00:00Z"
+            }),
+        )
+        .await
+        .expect("schedule with valid RFC 3339 must succeed");
+
+    assert_eq!(result["status"], "pending");
+}
+
+#[tokio::test]
+async fn s_c1_schedule_invalid_at_not_a_date() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule",
+            serde_json::json!({
+                "action": "create(kind=entity, name=test)",
+                "at": "not-a-date"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RFC 3339") || msg.contains("timestamp") || msg.contains("not-a-date"),
+        "S-C1: error must reference RFC 3339 or the bad value; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn s_c1_schedule_invalid_at_natural_language() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule",
+            serde_json::json!({
+                "action": "create(kind=entity, name=test)",
+                "at": "tomorrow at 3pm"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("RFC 3339") || err.to_string().contains("timestamp"),
+        "S-C1: natural-language at must be rejected with RFC 3339 hint; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn s_c1_schedule_invalid_at_out_of_range_date() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule",
+            serde_json::json!({
+                "action": "create(kind=entity, name=test)",
+                "at": "2027-13-99"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("RFC 3339") || err.to_string().contains("timestamp"),
+        "S-C1: out-of-range date must be rejected; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn s_c1_remind_invalid_at_is_rejected() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "remind",
+            serde_json::json!({
+                "content": "hello",
+                "at": "invalid"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RFC 3339") || msg.contains("timestamp") || msg.contains("invalid"),
+        "S-C1: remind with invalid at must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn s_c1_remind_valid_rfc3339_succeeds() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch(
+            "remind",
+            serde_json::json!({
+                "content": "morning standup",
+                "at": "2027-06-15T09:00:00+00:00"
+            }),
+        )
+        .await
+        .expect("remind with valid RFC 3339 offset format must succeed");
+
+    assert_eq!(result["status"], "pending");
+}
+
+#[tokio::test]
+async fn s_c1_agenda_only_shows_valid_events() {
+    // After at-validation is enforced, agenda() must not show corrupt events.
+    // This test verifies the invariant: all events in agenda have parseable trigger_at.
+    let (registry, _rt) = build_registry();
+
+    registry
+        .dispatch(
+            "remind",
+            serde_json::json!({ "content": "valid event", "at": "2027-01-01T10:00:00Z" }),
+        )
+        .await
+        .expect("remind with valid at must succeed");
+
+    let agenda = registry
+        .dispatch("agenda", serde_json::json!({ "limit": 50 }))
+        .await
+        .expect("agenda must succeed");
+
+    let events = agenda["events"].as_array().expect("events array");
+    for event in events {
+        let trigger_at = event["properties"]["trigger_at"]
+            .as_str()
+            .expect("trigger_at must be a string");
+        assert!(
+            trigger_at.parse::<chrono::DateTime<chrono::Utc>>().is_ok(),
+            "S-C1/M-1: agenda event trigger_at {trigger_at:?} must be a valid RFC 3339 timestamp"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_cancel_accepts_short_id() {
     let (registry, _rt) = build_registry();
