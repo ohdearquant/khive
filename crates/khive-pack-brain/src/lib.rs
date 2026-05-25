@@ -24,6 +24,24 @@ use crate::state::{BrainState, ProfileBinding, ProfileLifecycle, ProfileRecord};
 
 const ENTITY_CACHE_CAPACITY: usize = 10_000;
 
+// ── Profile record sync helper ────────────────────────────────────────────────
+
+/// Sync the `balanced-recall-v1` profile record to match the live
+/// `balanced_recall` state.
+///
+/// Fix #356 (MAJ-003): called from both `handle_feedback` and `on_dispatch`
+/// so the record is never stale regardless of which path updated the state.
+/// Fix #295: also called from `handle_reset` so the profile record reflects
+/// restored domain-informed priors immediately after reset.
+fn sync_balanced_recall_record(state: &mut BrainState) {
+    let total_ev = state.balanced_recall.total_events;
+    let snap_val = serde_json::to_value(state.balanced_recall.to_snapshot()).ok();
+    if let Some(record) = state.profiles.get_mut("balanced-recall-v1") {
+        record.total_events = total_ev;
+        record.state_snapshot = snap_val;
+    }
+}
+
 // ── Handler table ─────────────────────────────────────────────────────────────
 
 /// Brain pack verb surface per ADR-032 §11.
@@ -446,6 +464,9 @@ impl BrainPack {
     async fn handle_reset(&self, _params: Value) -> Result<Value, RuntimeError> {
         let mut state = self.state.lock().unwrap();
         state.reset_posteriors();
+        // Fix #295: sync profile record after reset so brain.profile reflects
+        // the restored domain-informed priors, not stale pre-reset values.
+        sync_balanced_recall_record(&mut state);
         Ok(json!({
             "reset": true,
             "exploration_epoch": state.balanced_recall.exploration_epoch,
@@ -515,13 +536,8 @@ impl BrainPack {
         let updated = self.fold.reduce(current_recall, &event, &ctx);
         state.balanced_recall = updated;
 
-        // Sync profile record metadata — collect values first to avoid borrow conflict.
-        let total_ev = state.balanced_recall.total_events;
-        let snap_val = serde_json::to_value(state.balanced_recall.to_snapshot()).ok();
-        if let Some(record) = state.profiles.get_mut("balanced-recall-v1") {
-            record.total_events = total_ev;
-            record.state_snapshot = snap_val;
-        }
+        // Fix #356 (MAJ-003): sync profile record metadata via shared helper.
+        sync_balanced_recall_record(&mut state);
 
         Ok(json!({
             "emitted": true,
@@ -731,6 +747,15 @@ impl PackRuntime for BrainPack {
 #[async_trait]
 impl DispatchHook for BrainPack {
     async fn on_dispatch(&self, view: &EventView) {
+        // Fix #357 (MAJ-004): Brain observes pack events only — it must never
+        // process its own state-transition events (ADR-032 §1). Skipping
+        // brain.* verbs here prevents double-counting: handle_feedback already
+        // calls fold.reduce directly, so the hook firing afterward would
+        // increment total_events a second time.
+        if view.event.verb.starts_with("brain.") {
+            return;
+        }
+
         let ctx = FoldContext::new();
         let mut state = self.state.lock().unwrap();
         let current = std::mem::replace(
@@ -739,6 +764,10 @@ impl DispatchHook for BrainPack {
         );
         let updated = self.fold.reduce(current, &view.event, &ctx);
         state.balanced_recall = updated;
+
+        // Fix #356 (MAJ-003): sync profile record after every hook fire so that
+        // brain.profile reflects the live total_events and state_snapshot.
+        sync_balanced_recall_record(&mut state);
     }
 }
 
@@ -1184,5 +1213,420 @@ mod tests {
         // Prior is Beta(7,3): mean = 0.7
         let mean = result["mean"].as_f64().unwrap();
         assert!((mean - 0.7).abs() < 1e-6);
+    }
+
+    // ── Regression tests (issues #355, #356, #357, #295) ──────────────────────
+
+    // #356 (MAJ-003): profile_record.total_events must stay in sync with
+    // balanced_recall.total_events via BOTH the handle_feedback path AND the
+    // on_dispatch hook path.  The previous fix only wired the sync helper; this
+    // test pins that removing EITHER call would be caught.
+    //
+    // Part A — handle_feedback path (unchanged from before).
+    // Part B — on_dispatch path: introduce a deliberate desync by reaching into
+    //   the live state directly, then fire on_dispatch to verify the sync
+    //   corrects it.  This would fail if sync_balanced_recall_record is removed
+    //   from on_dispatch.
+    #[tokio::test]
+    async fn test_356_profile_record_total_events_synced_after_feedback() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+        let target = "00000000-0000-0000-0000-000000000001";
+
+        // Part A: handle_feedback path.
+        for _ in 0..3 {
+            pack.dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "useful"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        }
+
+        let snap = pack.snapshot();
+        let live_total = snap.balanced_recall.total_events;
+
+        let record_result = pack
+            .dispatch(
+                "brain.profile",
+                json!({"id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        let record_total = record_result["total_events"].as_u64().unwrap();
+
+        assert_eq!(
+            live_total, record_total,
+            "#356 part-A: profile_record.total_events ({record_total}) must equal \
+             balanced_recall.total_events ({live_total}) after feedback calls"
+        );
+        assert_eq!(live_total, 3, "expected exactly 3 events from part A");
+
+        // Part B: on_dispatch path.
+        // Deliberately desync the record by bumping balanced_recall.total_events
+        // directly (simulating what would happen if only on_dispatch updated the
+        // live state but the sync call were missing).
+        {
+            let mut state = pack.state.lock().unwrap();
+            state.balanced_recall.total_events += 7; // introduce desync
+                                                     // Profile record still says `live_total` at this point.
+        }
+
+        // Fire on_dispatch with an irrelevant (non-brain) verb event — this is
+        // exactly what the runtime hook does for every non-brain verb dispatch.
+        // The sync helper inside on_dispatch must correct the desync.
+        let hook_event = {
+            use khive_types::{EventKind, SubstrateKind};
+            let mut e = khive_storage::event::Event::new(
+                "local",
+                "search",
+                EventKind::Audit,
+                SubstrateKind::Event,
+                "kg",
+            );
+            e.outcome = khive_types::EventOutcome::Success;
+            e
+        };
+        let hook_view = khive_runtime::EventView {
+            event: hook_event,
+            observations: Vec::new(),
+        };
+        pack.on_dispatch(&hook_view).await;
+
+        // After on_dispatch, the record must reflect the new (desynced) live total.
+        let after_hook = pack
+            .dispatch(
+                "brain.profile",
+                json!({"id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        let after_total = after_hook["total_events"].as_u64().unwrap();
+        let live_after = pack.snapshot().balanced_recall.total_events;
+        assert_eq!(
+            after_total, live_after,
+            "#356 part-B: on_dispatch sync must correct desync; \
+             record shows {after_total}, live state shows {live_after}"
+        );
+    }
+
+    // #357 (MAJ-004): brain.feedback must NOT double-count total_events.
+    // The dispatch hook fires for brain.feedback — it must be skipped so the
+    // fold.reduce in handle_feedback is the single source of truth.
+    #[tokio::test]
+    async fn test_357_feedback_no_double_count() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let brain = std::sync::Arc::new(BrainPack::new(rt.clone()));
+        let token = rt.authorize(Namespace::local());
+
+        // Build a registry WITH the hook so we can trigger the double-count path.
+        let mut builder = VerbRegistryBuilder::new();
+        let hook: std::sync::Arc<dyn DispatchHook> = brain.clone();
+        builder.with_dispatch_hook(hook);
+        let registry = builder.build().expect("registry builds");
+
+        let target = "00000000-0000-0000-0000-000000000002";
+
+        // Dispatch brain.feedback through the registry (hook is registered).
+        brain
+            .dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "useful"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+
+        let snap = brain.snapshot();
+        assert_eq!(
+            snap.balanced_recall.total_events, 1,
+            "#357: total_events must be 1 after one brain.feedback call, got {} \
+             (double-count if 2)",
+            snap.balanced_recall.total_events
+        );
+    }
+
+    // #295: brain.reset must restore domain-informed priors, not Beta(1,1).
+    //
+    // Strengthened per codex P12 Medium: this test now exercises the full
+    // production path — handle_reset → reset_posteriors → sync helper — and
+    // verifies that ALL three profile record fields (total_events,
+    // exploration_epoch, state_snapshot) reflect the restored priors.
+    //
+    // It also creates a stale record via hook-only updates (bypassing
+    // handle_feedback) before the reset, so the desync is real and not
+    // incidentally corrected by the feedback path.
+    #[tokio::test]
+    async fn test_295_reset_restores_domain_priors_not_uniform() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Step 1: accumulate state via hook-only updates (no handle_feedback).
+        // This simulates the common case where brain observes external pack
+        // events rather than explicit feedback calls.
+        let hook_event = |verb: &str| {
+            use khive_types::{EventKind, SubstrateKind};
+            let mut e = khive_storage::event::Event::new(
+                "local",
+                verb,
+                EventKind::Audit,
+                SubstrateKind::Event,
+                "kg",
+            );
+            e.outcome = khive_types::EventOutcome::Success;
+            e
+        };
+
+        // Fire 4 hook events for a non-brain verb (simulates external recall/search).
+        for _ in 0..4 {
+            let view = khive_runtime::EventView {
+                event: hook_event("search"),
+                observations: Vec::new(),
+            };
+            pack.on_dispatch(&view).await;
+        }
+
+        // Step 2: also call handle_feedback directly to move importance away from prior.
+        let target = "00000000-0000-0000-0000-000000000003";
+        for _ in 0..5 {
+            pack.dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "useful"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Verify state before reset: posteriors have moved, total_events > 0.
+        let before = pack.snapshot();
+        assert!(
+            before.balanced_recall.importance.alpha > 2.0,
+            "importance.alpha must have grown past prior after useful feedback"
+        );
+        assert!(
+            before.balanced_recall.total_events >= 9,
+            "expected at least 9 total events (4 hook + 5 feedback), got {}",
+            before.balanced_recall.total_events
+        );
+        // Verify record was kept in sync before reset (both paths called sync helper).
+        let pre_reset_record = pack
+            .dispatch(
+                "brain.profile",
+                json!({"id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pre_reset_record["total_events"].as_u64().unwrap(),
+            before.balanced_recall.total_events,
+            "#295 pre-reset: profile record total_events out of sync before reset"
+        );
+
+        // Step 3: call handle_reset via the production path (dispatch → handle_reset).
+        let reset_result = pack
+            .dispatch("brain.reset", json!({}), &registry, &token)
+            .await
+            .unwrap();
+        assert_eq!(reset_result["reset"], json!(true));
+
+        // Verify exploration_epoch incremented (reset_posteriors contract).
+        let epoch_after = reset_result["exploration_epoch"].as_u64().unwrap();
+        assert!(
+            epoch_after > 0,
+            "#295: exploration_epoch must increment after reset"
+        );
+
+        // Step 4: after reset, posteriors must be domain-informed priors — NOT Beta(1,1).
+        let after = pack.snapshot();
+
+        // importance prior = Beta(2,8)
+        assert!(
+            (after.balanced_recall.importance.alpha - 2.0).abs() < 1e-12,
+            "#295: importance.alpha must be 2.0 after reset, got {}",
+            after.balanced_recall.importance.alpha
+        );
+        assert!(
+            (after.balanced_recall.importance.beta - 8.0).abs() < 1e-12,
+            "#295: importance.beta must be 8.0 after reset, got {}",
+            after.balanced_recall.importance.beta
+        );
+
+        // temporal prior = Beta(1,9)
+        assert!(
+            (after.balanced_recall.temporal.alpha - 1.0).abs() < 1e-12,
+            "#295: temporal.alpha must be 1.0 after reset, got {}",
+            after.balanced_recall.temporal.alpha
+        );
+        assert!(
+            (after.balanced_recall.temporal.beta - 9.0).abs() < 1e-12,
+            "#295: temporal.beta must be 9.0 after reset, got {}",
+            after.balanced_recall.temporal.beta
+        );
+
+        // relevance prior = Beta(7,3)
+        assert!(
+            (after.balanced_recall.relevance.alpha - 7.0).abs() < 1e-12,
+            "#295: relevance.alpha must be 7.0 after reset"
+        );
+
+        // Step 5: brain.profile must reflect the reset state — ALL three fields.
+        // This pins the sync_balanced_recall_record call inside handle_reset.
+        // Removing that call would cause this assertion to fail.
+        let record = pack
+            .dispatch(
+                "brain.profile",
+                json!({"id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+
+        // total_events: after reset the state is a fresh BalancedRecallState
+        // (total_events = 0), so the record must reflect that.
+        let record_total = record["total_events"].as_u64().unwrap();
+        assert_eq!(
+            record_total, after.balanced_recall.total_events,
+            "#295: profile record total_events ({record_total}) must match \
+             live state ({}) after reset",
+            after.balanced_recall.total_events
+        );
+
+        // exploration_epoch: record must match the live state.
+        let record_epoch = record["exploration_epoch"].as_u64().unwrap();
+        assert_eq!(
+            record_epoch, epoch_after,
+            "#295: profile record exploration_epoch ({record_epoch}) must match \
+             reset result ({epoch_after})"
+        );
+
+        // state_snapshot: importance.alpha must be the prior value.
+        let snap = &record["state_snapshot"];
+        let imp_alpha = snap["importance"]["alpha"].as_f64().unwrap();
+        assert!(
+            (imp_alpha - 2.0).abs() < 1e-12,
+            "#295: brain.profile state_snapshot importance.alpha must be 2.0 after reset, \
+             got {imp_alpha}"
+        );
+    }
+
+    // #355 (regression — real dispatch path): temporal posterior must update
+    // when a recall hits via the on_dispatch hook carrying real hit/latency.
+    //
+    // This test exercises the production wiring added in the P12 codex fix:
+    // the runtime now embeds duration_us + target_id in the hook event for
+    // "recall" verbs.  Simulates that by constructing the hook event the way
+    // the runtime now would, then verifies temporal.alpha increments.
+    #[tokio::test]
+    async fn test_355_posteriors_update_after_dispatch_via_hook() {
+        let (pack, _rt) = make_pack();
+        let before = pack.snapshot();
+        let tmp_alpha_before = before.balanced_recall.temporal.alpha;
+        let tmp_beta_before = before.balanced_recall.temporal.beta;
+
+        // Simulate the runtime hook event for a fast recall hit:
+        // duration_us ≤ 50_000 (fast) and target_id is present (hit).
+        let target_id = uuid::Uuid::new_v4();
+        let fast_hit_event = {
+            use khive_types::{EventKind, SubstrateKind};
+            let mut e = khive_storage::event::Event::new(
+                "local",
+                "recall",
+                EventKind::Audit,
+                SubstrateKind::Event,
+                "memory",
+            );
+            e.outcome = khive_types::EventOutcome::Success;
+            e.target_id = Some(target_id);
+            e.duration_us = 10_000; // 10 ms — fast hit
+            e
+        };
+        let view = khive_runtime::EventView {
+            event: fast_hit_event,
+            observations: Vec::new(),
+        };
+        pack.on_dispatch(&view).await;
+
+        let after_fast = pack.snapshot();
+        assert!(
+            (after_fast.balanced_recall.temporal.alpha - (tmp_alpha_before + 1.0)).abs() < 1e-12,
+            "#355: fast recall hit must increment temporal.alpha via hook: expected {}, got {}",
+            tmp_alpha_before + 1.0,
+            after_fast.balanced_recall.temporal.alpha
+        );
+        assert!(
+            (after_fast.balanced_recall.temporal.beta - tmp_beta_before).abs() < 1e-12,
+            "#355: fast hit must NOT increment temporal.beta"
+        );
+
+        // Simulate a slow recall hit (duration_us > 50_000) → temporal failure.
+        let slow_hit_event = {
+            use khive_types::{EventKind, SubstrateKind};
+            let mut e = khive_storage::event::Event::new(
+                "local",
+                "recall",
+                EventKind::Audit,
+                SubstrateKind::Event,
+                "memory",
+            );
+            e.outcome = khive_types::EventOutcome::Success;
+            e.target_id = Some(target_id);
+            e.duration_us = 100_000; // 100 ms — slow
+            e
+        };
+        let view2 = khive_runtime::EventView {
+            event: slow_hit_event,
+            observations: Vec::new(),
+        };
+        pack.on_dispatch(&view2).await;
+
+        let after_slow = pack.snapshot();
+        assert!(
+            (after_slow.balanced_recall.temporal.beta - (tmp_beta_before + 1.0)).abs() < 1e-12,
+            "#355: slow recall hit must increment temporal.beta via hook: expected {}, got {}",
+            tmp_beta_before + 1.0,
+            after_slow.balanced_recall.temporal.beta
+        );
+
+        // Simulate a recall miss (no target_id) → temporal failure.
+        let miss_event = {
+            use khive_types::{EventKind, SubstrateKind};
+            let mut e = khive_storage::event::Event::new(
+                "local",
+                "recall",
+                EventKind::Audit,
+                SubstrateKind::Event,
+                "memory",
+            );
+            e.outcome = khive_types::EventOutcome::Success;
+            // target_id = None → RecallMiss
+            e
+        };
+        let view3 = khive_runtime::EventView {
+            event: miss_event,
+            observations: Vec::new(),
+        };
+        pack.on_dispatch(&view3).await;
+
+        let after_miss = pack.snapshot();
+        assert!(
+            (after_miss.balanced_recall.temporal.beta - (tmp_beta_before + 2.0)).abs() < 1e-12,
+            "#355: recall miss must further increment temporal.beta: expected {}, got {}",
+            tmp_beta_before + 2.0,
+            after_miss.balanced_recall.temporal.beta
+        );
     }
 }

@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::runtime::NamespaceToken;
 use async_trait::async_trait;
@@ -762,18 +763,39 @@ impl VerbRegistry {
 
         for pack in self.packs.iter() {
             if pack.handlers().iter().any(|v| v.name == verb) {
+                let dispatch_start = Instant::now();
                 let result = pack.dispatch(verb, params, self, &token).await;
+                let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
 
                 // Post-dispatch hook: fires on success, opt-in (Issue #158).
-                if let (Ok(_), Some(hook)) = (&result, &self.dispatch_hook) {
-                    let dispatch_event = Event::new(
+                if let (Ok(ref ok_val), Some(hook)) = (&result, &self.dispatch_hook) {
+                    let mut dispatch_event = Event::new(
                         ns_str.as_str(),
                         verb,
                         EventKind::Audit,
                         SubstrateKind::Event,
                         pack.name(),
                     )
-                    .with_outcome(EventOutcome::Success);
+                    .with_outcome(EventOutcome::Success)
+                    .with_duration_us(dispatch_us);
+
+                    // For recall verbs: extract the first result's note_id as
+                    // target_id so the brain temporal posterior can observe
+                    // real hit/miss and latency (fix for codex P12 Major).
+                    if verb == "recall" {
+                        let first_note_id = ok_val
+                            .as_array()
+                            .and_then(|arr| arr.first())
+                            .and_then(|v| v.get("note_id"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<uuid::Uuid>().ok());
+                        if let Some(note_id) = first_note_id {
+                            dispatch_event = dispatch_event.with_target(note_id);
+                        }
+                        // No first result → target_id stays None (RecallMiss
+                        // in brain's event interpreter).
+                    }
+
                     let dispatch_view = EventView {
                         event: dispatch_event,
                         observations: Vec::new(),
