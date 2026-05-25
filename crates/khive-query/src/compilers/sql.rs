@@ -101,6 +101,42 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryVa
     }
 }
 
+/// Identifies node indices that are endpoints of synthetic `observed_as_*` edges.
+///
+/// Returns `(source_indices, target_indices)`:
+/// - `source_indices`: node indices bound to the `events` table (the event source node)
+/// - `target_indices`: node indices bound to the `notes` table (the observed note target node)
+fn synthetic_endpoint_node_indices(
+    elements: &[PatternElement],
+) -> (
+    std::collections::HashSet<usize>,
+    std::collections::HashSet<usize>,
+) {
+    let mut source_set = std::collections::HashSet::new();
+    let mut target_set = std::collections::HashSet::new();
+    let mut node_idx = 0usize;
+    let mut prev_node_idx: Option<usize> = None;
+    for element in elements {
+        match element {
+            PatternElement::Node(_) => {
+                prev_node_idx = Some(node_idx);
+                node_idx += 1;
+            }
+            PatternElement::Edge(ep) => {
+                let has_synthetic = ep.relations.iter().any(|r| is_synthetic(r));
+                if has_synthetic {
+                    if let Some(src_idx) = prev_node_idx {
+                        source_set.insert(src_idx);
+                        // The target is the next node (current node_idx).
+                        target_set.insert(node_idx);
+                    }
+                }
+            }
+        }
+    }
+    (source_set, target_set)
+}
+
 /// Compile fixed-length patterns to a chain of JOINs.
 ///
 /// MATCH (a:concept)-[e:introduced_by]->(b:paper) WHERE ... RETURN a, e, b LIMIT 10
@@ -112,6 +148,9 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryVa
 /// WHERE a.kind = 'concept' AND e.relation = 'introduced_by' AND b.kind = 'paper'
 ///   AND a.deleted_at IS NULL AND b.deleted_at IS NULL
 /// LIMIT 10
+///
+/// Synthetic `observed_as_*` patterns (ADR-041 §8) route the event-source node
+/// to the `events` table instead of `entities`.
 fn compile_fixed_length(
     query: &GqlQuery,
     opts: &CompileOptions,
@@ -127,6 +166,11 @@ fn compile_fixed_length(
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
         std::collections::HashMap::new();
 
+    // Pre-compute which node indices are endpoints of synthetic edges.
+    // Source nodes bind to `events`; target nodes bind to `notes`.
+    let (event_source_indices, note_target_indices) =
+        synthetic_endpoint_node_indices(&query.pattern.elements);
+
     let mut node_idx = 0usize;
     let mut edge_idx = 0usize;
 
@@ -136,43 +180,121 @@ fn compile_fixed_length(
                 let alias = format!("n{node_idx}");
                 node_aliases.push(alias.clone());
 
+                let is_event_source = event_source_indices.contains(&node_idx);
+                let is_note_target = note_target_indices.contains(&node_idx);
+
                 if node_idx == 0 {
-                    from_parts.push(format!("entities {alias}"));
-                }
-
-                where_parts.push(format!("{alias}.deleted_at IS NULL"));
-
-                let ns_filter = namespace_filter(&alias, opts, &mut params);
-                if !ns_filter.is_empty() {
-                    where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
-                }
-
-                if let Some(ref kind) = np.kind {
-                    params.push(QueryValue::Text(kind.clone()));
-                    where_parts.push(format!("{alias}.kind = ?{}", params.len()));
-                }
-
-                if let Some(ref et) = np.entity_type {
-                    params.push(QueryValue::Text(et.clone()));
-                    where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
-                }
-
-                for (key, val) in &np.properties {
-                    params.push(QueryValue::Text(val.clone()));
-                    if key == "name" {
-                        where_parts
-                            .push(format!("{alias}.name = ?{} COLLATE NOCASE", params.len()));
+                    if is_event_source {
+                        from_parts.push(format!("events {alias}"));
                     } else {
-                        where_parts.push(format!(
-                            "json_extract({alias}.properties, '$.{}') = ?{} COLLATE NOCASE",
-                            key.replace('\'', "''"),
-                            params.len()
+                        // Note targets are joined by the synthetic edge handler, not FROM.
+                        if !is_note_target {
+                            from_parts.push(format!("entities {alias}"));
+                        }
+                    }
+                }
+
+                if is_event_source {
+                    // Events table does not have `deleted_at`; filter is omitted.
+                    // Namespace filter uses the `events.namespace` column directly.
+                    let ns_filter = namespace_filter(&alias, opts, &mut params);
+                    if !ns_filter.is_empty() {
+                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                    }
+                    // `kind` on an event node filters events.kind (e.g. "recall_executed").
+                    if let Some(ref kind) = np.kind {
+                        params.push(QueryValue::Text(kind.clone()));
+                        where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                    }
+                    // entity_type and properties are not columns on events — reject explicitly.
+                    if np.entity_type.is_some() {
+                        return Err(QueryError::Compile(
+                            "event nodes do not have an entity_type column".into(),
                         ));
+                    }
+                    if !np.properties.is_empty() {
+                        return Err(QueryError::Compile(
+                            "event nodes do not support inline property filters; \
+                             use a WHERE clause on verb, outcome, or payload fields"
+                                .into(),
+                        ));
+                    }
+                } else if is_note_target {
+                    // Note targets: `notes` table (joined by the synthetic edge handler).
+                    where_parts.push(format!("{alias}.deleted_at IS NULL"));
+
+                    let ns_filter = namespace_filter(&alias, opts, &mut params);
+                    if !ns_filter.is_empty() {
+                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                    }
+
+                    if let Some(ref kind) = np.kind {
+                        params.push(QueryValue::Text(kind.clone()));
+                        where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                    }
+
+                    // entity_type does not exist on notes — reject explicitly.
+                    if np.entity_type.is_some() {
+                        return Err(QueryError::Compile(
+                            "observed note targets do not have an entity_type column".into(),
+                        ));
+                    }
+
+                    for (key, val) in &np.properties {
+                        params.push(QueryValue::Text(val.clone()));
+                        if key == "name" || key == "content" {
+                            where_parts
+                                .push(format!("{alias}.{key} = ?{} COLLATE NOCASE", params.len()));
+                        } else {
+                            where_parts.push(format!(
+                                "json_extract({alias}.properties, '$.{}') = ?{} COLLATE NOCASE",
+                                key.replace('\'', "''"),
+                                params.len()
+                            ));
+                        }
+                    }
+                } else {
+                    where_parts.push(format!("{alias}.deleted_at IS NULL"));
+
+                    let ns_filter = namespace_filter(&alias, opts, &mut params);
+                    if !ns_filter.is_empty() {
+                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                    }
+
+                    if let Some(ref kind) = np.kind {
+                        params.push(QueryValue::Text(kind.clone()));
+                        where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                    }
+
+                    if let Some(ref et) = np.entity_type {
+                        params.push(QueryValue::Text(et.clone()));
+                        where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
+                    }
+
+                    for (key, val) in &np.properties {
+                        params.push(QueryValue::Text(val.clone()));
+                        if key == "name" {
+                            where_parts
+                                .push(format!("{alias}.name = ?{} COLLATE NOCASE", params.len()));
+                        } else {
+                            where_parts.push(format!(
+                                "json_extract({alias}.properties, '$.{}') = ?{} COLLATE NOCASE",
+                                key.replace('\'', "''"),
+                                params.len()
+                            ));
+                        }
                     }
                 }
 
                 if let Some(ref var) = np.variable {
-                    var_to_alias.insert(var.clone(), (alias.clone(), VarKind::Node));
+                    let kind = if is_event_source {
+                        VarKind::EventNode
+                    } else if is_note_target {
+                        VarKind::NoteNode
+                    } else {
+                        VarKind::Node
+                    };
+                    var_to_alias.insert(var.clone(), (alias.clone(), kind));
                 }
 
                 node_idx += 1;
@@ -231,8 +353,14 @@ fn compile_fixed_length(
                             .push(format!("{e_alias}.role IN ({})", placeholders.join(", ")));
                     }
                     // Join the target node via event_observations.entity_id.
+                    // The `referent_kind` column discriminates between note and entity
+                    // substrates.  Per ADR-041, recall/rerank observations always target
+                    // notes (`referent_kind='note'`); we filter to note substrate and join
+                    // the `notes` table.  An explicit `AND e0.referent_kind='note'`
+                    // prevents cross-substrate ID collisions.
                     join_parts.push(format!(
-                        "JOIN entities {next_alias} ON {next_alias}.id = {e_alias}.entity_id"
+                        "JOIN notes {next_alias} ON {next_alias}.id = {e_alias}.entity_id \
+                         AND {e_alias}.referent_kind = 'note'"
                     ));
                 } else {
                     // Standard canonical edge: join graph_edges.
@@ -327,6 +455,27 @@ fn compile_fixed_length(
                              {alias}.properties AS {var}_properties, \
                              {alias}.created_at AS {var}_created_at, \
                              {alias}.updated_at AS {var}_updated_at"
+                        ));
+                    }
+                    VarKind::NoteNode => {
+                        select_parts.push(format!(
+                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
+                             {alias}.kind AS {var}_kind, {alias}.status AS {var}_status, \
+                             {alias}.content AS {var}_content, \
+                             {alias}.salience AS {var}_salience, \
+                             {alias}.properties AS {var}_properties, \
+                             {alias}.created_at AS {var}_created_at, \
+                             {alias}.updated_at AS {var}_updated_at"
+                        ));
+                    }
+                    VarKind::EventNode => {
+                        select_parts.push(format!(
+                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
+                             {alias}.verb AS {var}_verb, {alias}.substrate AS {var}_substrate, \
+                             {alias}.actor AS {var}_actor, {alias}.kind AS {var}_kind, \
+                             {alias}.outcome AS {var}_outcome, \
+                             {alias}.payload AS {var}_payload, \
+                             {alias}.created_at AS {var}_created_at"
                         ));
                     }
                     VarKind::Edge => {
@@ -430,6 +579,28 @@ fn compile_single_condition(
                 )
             }
         }
+        VarKind::NoteNode => {
+            if NOTE_COLUMNS.contains(&cond.property.as_str()) {
+                format!("{alias}.{}", cond.property)
+            } else {
+                format!(
+                    "json_extract({alias}.properties, '$.{}')",
+                    cond.property.replace('\'', "''")
+                )
+            }
+        }
+        VarKind::EventNode => {
+            // Events table has direct columns only; reject unknown fields.
+            if EVENT_COLUMNS.contains(&cond.property.as_str()) {
+                format!("{alias}.{}", cond.property)
+            } else {
+                return Err(QueryError::Validation(format!(
+                    "event property '{}' not queryable; valid columns: {}",
+                    cond.property,
+                    EVENT_COLUMNS.join(", ")
+                )));
+            }
+        }
         VarKind::Edge => match cond.property.as_str() {
             "relation" | "weight" => format!("{alias}.{}", cond.property),
             other => {
@@ -470,6 +641,75 @@ fn compile_single_condition(
         }
     };
     Ok(sql)
+}
+
+/// Returns `true` if the given `WhereExpr` subtree references only the start
+/// variable (`start_var`), only the end variable, or neither — but NOT both.
+///
+/// Used to detect OR nodes whose branches reference different endpoints, which
+/// cannot be correctly compiled by the variable-length leaf-routing approach.
+fn expr_endpoint_set(
+    expr: &WhereExpr,
+    start_var: Option<&str>,
+    end_var: Option<&str>,
+) -> (bool, bool) {
+    match expr {
+        WhereExpr::True => (false, false),
+        WhereExpr::Condition(c) => {
+            let is_start = start_var == Some(c.variable.as_str());
+            let is_end = end_var == Some(c.variable.as_str());
+            (is_start, is_end)
+        }
+        WhereExpr::And(l, r) | WhereExpr::Or(l, r) => {
+            let (ls, le) = expr_endpoint_set(l, start_var, end_var);
+            let (rs, re) = expr_endpoint_set(r, start_var, end_var);
+            (ls || rs, le || re)
+        }
+    }
+}
+
+/// Walk the expression tree and return `Err(Unsupported)` if any `Or` node has
+/// branches that span both start and end endpoint variables.  Single-endpoint
+/// ORs (e.g. `a.name='X' OR a.name='Y'`) are fine.
+fn reject_or_spanning_endpoints(
+    expr: &WhereExpr,
+    start: &NodePattern,
+    end: &NodePattern,
+) -> Result<(), QueryError> {
+    let start_var = start.variable.as_deref();
+    let end_var = end.variable.as_deref();
+    reject_or_spanning_impl(expr, start_var, end_var)
+}
+
+fn reject_or_spanning_impl(
+    expr: &WhereExpr,
+    start_var: Option<&str>,
+    end_var: Option<&str>,
+) -> Result<(), QueryError> {
+    match expr {
+        WhereExpr::True | WhereExpr::Condition(_) => Ok(()),
+        WhereExpr::And(l, r) => {
+            reject_or_spanning_impl(l, start_var, end_var)?;
+            reject_or_spanning_impl(r, start_var, end_var)
+        }
+        WhereExpr::Or(l, r) => {
+            let (l_start, l_end) = expr_endpoint_set(l, start_var, end_var);
+            let (r_start, r_end) = expr_endpoint_set(r, start_var, end_var);
+            let spans_start = l_start || r_start;
+            let spans_end = l_end || r_end;
+            if spans_start && spans_end {
+                return Err(QueryError::Unsupported(
+                    "WHERE clauses that span both endpoints in a variable-length pattern \
+                     are not yet supported; rewrite as separate queries or restrict each \
+                     OR branch to one endpoint"
+                        .into(),
+                ));
+            }
+            // Even if this OR is safe, recurse to catch nested ORs.
+            reject_or_spanning_impl(l, start_var, end_var)?;
+            reject_or_spanning_impl(r, start_var, end_var)
+        }
+    }
 }
 
 /// Compile variable-length patterns to a recursive CTE.
@@ -612,7 +852,10 @@ fn compile_variable_length(
     // WHERE clause conditions for variable-length patterns.
     // Each leaf condition is routed to start_conditions (alias s) or end_conditions
     // (alias r) based on which variable it references.  OR expressions that span
-    // both start and end nodes are not yet supported — reject explicitly.
+    // both start and end nodes are not supported — reject explicitly with an
+    // actionable error message rather than silently converting OR to AND.
+    reject_or_spanning_endpoints(&query.where_clause, start, end)?;
+
     for cond in query.where_clause.conditions() {
         let col_alias = if start.variable.as_deref() == Some(cond.variable.as_str()) {
             "s"
@@ -711,6 +954,13 @@ fn compile_variable_length(
             match item {
                 ReturnItem::Property(_, prop) => {
                     let is_start = start.variable.as_deref() == Some(var);
+                    if matches!(kind, VarKind::EventNode | VarKind::NoteNode) {
+                        return Err(QueryError::Unsupported(
+                            "synthetic observed_as_* edges cannot be used in variable-length \
+                             patterns; use a fixed-length edge pattern instead"
+                                .into(),
+                        ));
+                    }
                     if *kind == VarKind::Node {
                         let tbl = if is_start { "s" } else { "r" };
                         if is_start {
@@ -755,6 +1005,15 @@ fn compile_variable_length(
                                  r.updated_at AS {var}_updated_at"
                             ));
                         }
+                    }
+                    VarKind::EventNode | VarKind::NoteNode => {
+                        // Synthetic observed_as_* edges require a fixed-length pattern;
+                        // variable-length recursion over the events/notes tables is not supported.
+                        return Err(QueryError::Unsupported(
+                            "synthetic observed_as_* edges cannot be used in variable-length \
+                             patterns; use a fixed-length edge pattern instead"
+                                .into(),
+                        ));
                     }
                     VarKind::Edge => {
                         select_parts.push(format!(
@@ -835,6 +1094,10 @@ fn compile_variable_length(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VarKind {
     Node,
+    /// Node that maps to the `events` table (synthetic edge source, ADR-041 §8).
+    EventNode,
+    /// Node that maps to the `notes` table (synthetic edge target, ADR-041 §8).
+    NoteNode,
     Edge,
 }
 
@@ -849,20 +1112,47 @@ const NODE_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
+/// Columns available for projection on `notes` table nodes (ADR-041 §8 targets).
+const NOTE_COLUMNS: &[&str] = &[
+    "id",
+    "namespace",
+    "kind",
+    "status",
+    "name",
+    "content",
+    "salience",
+    "decay_factor",
+    "properties",
+    "created_at",
+    "updated_at",
+];
+/// Columns available for projection on `events` table nodes (ADR-041 §8).
+const EVENT_COLUMNS: &[&str] = &[
+    "id",
+    "namespace",
+    "verb",
+    "substrate",
+    "actor",
+    "kind",
+    "outcome",
+    "payload",
+    "duration_us",
+    "target_id",
+    "session_id",
+    "created_at",
+];
 const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
 
 fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
-    let valid = match kind {
-        VarKind::Node => NODE_COLUMNS,
-        VarKind::Edge => EDGE_COLUMNS,
+    let (valid, kind_name) = match kind {
+        VarKind::Node => (NODE_COLUMNS, "node"),
+        VarKind::NoteNode => (NOTE_COLUMNS, "note"),
+        VarKind::EventNode => (EVENT_COLUMNS, "event"),
+        VarKind::Edge => (EDGE_COLUMNS, "edge"),
     };
     if valid.contains(&prop) {
         Ok(prop)
     } else {
-        let kind_name = match kind {
-            VarKind::Node => "node",
-            VarKind::Edge => "edge",
-        };
         Err(QueryError::Compile(format!(
             "unknown {kind_name} property '{prop}' in RETURN projection. \
              Valid: {}",
@@ -1307,6 +1597,91 @@ mod tests {
         assert!(has_role_param, "role 'selected' must be a bound parameter");
     }
 
+    // CRIT-1 regression: event source node must bind to `events` table, not `entities`.
+    // Previously `FROM entities n0 JOIN event_observations e0 ON e0.event_id = n0.id`
+    // was emitted — IDs are disjoint so every query returned zero rows.
+    #[test]
+    fn synthetic_edge_event_source_binds_events_table() {
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN ev, m").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("FROM events "),
+            "CRIT-1: event source must come FROM events table, not entities; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled
+                .sql
+                .starts_with("SELECT * FROM entities n0 JOIN event_observations"),
+            "CRIT-1: must not join events via entities table; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn synthetic_edge_event_observation_join_uses_events_id() {
+        // The JOIN must be `event_observations.event_id = events_alias.id`,
+        // not `event_observations.event_id = entities_alias.id`.
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN m").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // The event alias is n0; the join must reference n0 against `events` table.
+        assert!(
+            compiled
+                .sql
+                .contains("JOIN event_observations e0 ON e0.event_id = n0.id"),
+            "CRIT-1: event_observations must join on events.id (n0 is now events); sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn synthetic_edge_event_node_projects_event_columns() {
+        // The event variable in RETURN must select event-table columns (verb, outcome, …),
+        // not entity columns (name, entity_type, properties, …).
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN ev").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("ev_verb"),
+            "CRIT-1: event variable must project verb column; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("ev_outcome"),
+            "CRIT-1: event variable must project outcome column; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("ev_name,") && !compiled.sql.contains("ev_name "),
+            "CRIT-1: event variable must NOT project entity name column; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("ev_properties"),
+            "CRIT-1: event variable must NOT project entity properties column; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn synthetic_edge_namespace_filter_on_events_table() {
+        // MIN-2: when scoped, the namespace filter must target the events table
+        // (which has a namespace column) — not rely on entities indirection.
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN m").unwrap();
+        let compiled = compile(&q, &scoped("test-ns")).unwrap();
+        // Both the event alias (n0, now from `events`) and the target alias (n1, from `entities`)
+        // must have namespace filters.
+        let ns_count = compiled
+            .params
+            .iter()
+            .filter(|p| matches!(p, QueryValue::Text(s) if s == "test-ns"))
+            .count();
+        assert!(
+            ns_count >= 2,
+            "MIN-2: namespace must be filtered on both events and target; params: {:?}",
+            compiled.params
+        );
+    }
+
     #[test]
     fn synthetic_edge_candidate_role() {
         let q = gql::parse("MATCH (ev)-[:observed_as_candidate]->(m) RETURN ev, m").unwrap();
@@ -1359,6 +1734,56 @@ mod tests {
         assert!(
             matches!(err, QueryError::Compile(_)),
             "inbound synthetic edge must be rejected; got {err:?}"
+        );
+    }
+
+    // --- MAJ-1: OR spanning both endpoints in variable-length patterns must be rejected ---
+
+    #[test]
+    fn variable_length_or_across_endpoints_rejected() {
+        // MAJ-1: `WHERE a.name='X' OR b.name='Y'` in a variable-length pattern must be
+        // rejected with Unsupported — not silently compiled to AND.
+        let q = gql::parse(
+            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' OR b.name = 'Y' RETURN a",
+        )
+        .unwrap();
+        let result = compile(&q, &opts());
+        assert!(
+            matches!(result, Err(QueryError::Unsupported(_))),
+            "MAJ-1: OR spanning both endpoints must return Unsupported; got {result:?}"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("separate queries") || err_msg.contains("one endpoint"),
+            "error must be actionable; got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn variable_length_or_single_endpoint_still_works() {
+        // OR within a single endpoint (same alias) must still compile successfully.
+        let q = gql::parse(
+            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' OR a.name = 'Y' RETURN a",
+        )
+        .unwrap();
+        let result = compile(&q, &opts());
+        assert!(
+            result.is_ok(),
+            "single-endpoint OR must compile; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn variable_length_and_across_endpoints_still_works() {
+        // AND across endpoints must still compile (the existing behavior is correct for AND).
+        let q = gql::parse(
+            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' AND b.name = 'Y' RETURN a",
+        )
+        .unwrap();
+        let result = compile(&q, &opts());
+        assert!(
+            result.is_ok(),
+            "AND across endpoints must compile; got {result:?}"
         );
     }
 }

@@ -5,7 +5,8 @@
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::types::{Direction, TraversalOptions, TraversalRequest};
-use khive_storage::EdgeRelation;
+use khive_storage::{EdgeRelation, Event};
+use khive_types::{EventKind, SubstrateKind};
 use uuid::Uuid;
 
 fn rt() -> KhiveRuntime {
@@ -589,4 +590,98 @@ async fn file_backed_runtime_persists() {
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "Persistent");
     }
+}
+
+// =============================================================================
+// F218 integration: synthetic observed_as_* edge end-to-end (CRIT-1 regression)
+// =============================================================================
+
+/// This test is the ONLY test that would have caught CRIT-1 (wrong JOIN target).
+///
+/// It seeds a real event + event_observations row and executes the canonical
+/// ADR-041 §11 synthetic-edge GQL query end-to-end against an in-memory SQLite
+/// database.  The old code joined `event_observations.event_id = entities.id`,
+/// which can never match because the two ID spaces are disjoint.
+#[tokio::test]
+async fn synthetic_edge_observed_as_selected_returns_memory_note() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local());
+    let ns = "local";
+
+    // Step 1: create a memory note (the observed entity).
+    let memory_note = rt
+        .create_note(
+            &tok,
+            "memory",
+            None,
+            "recalled memory content",
+            Some(0.9),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let memory_id = memory_note.id;
+
+    // Step 2: create an event of kind RerankExecuted with a payload that
+    // includes `selected: [memory_id]`.  The storage layer's `append_event`
+    // implementation calls `decode_rank_observations`, which reads
+    // `payload["selected"]` and inserts a row into `event_observations` with
+    // role="selected" and entity_id=memory_id.
+    let event_store = rt.events(&tok).unwrap();
+    let mut event = Event::new(
+        ns,
+        "rerank",
+        EventKind::RerankExecuted,
+        SubstrateKind::Note,
+        "agent:test",
+    );
+    event.payload = serde_json::json!({
+        "candidates": [],
+        "selected": [memory_id.to_string()]
+    });
+    event_store.append_event(event).await.unwrap();
+
+    // Step 3: execute the canonical ADR-041 §11 GQL query.
+    // Before CRIT-1 fix: `FROM entities n0 JOIN event_observations e0 ON e0.event_id = n0.id`
+    //   — IDs are disjoint, so zero rows returned.
+    // After fix: `FROM events n0 JOIN event_observations e0 ON e0.event_id = n0.id`
+    //   — correct join; the memory note is returned.
+    let rows = rt
+        .query(
+            &tok,
+            "MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN m",
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !rows.is_empty(),
+        "CRIT-1: synthetic edge query must return at least one row (memory note was seeded); \
+         got 0 rows — event_observations join is broken"
+    );
+
+    // Verify the returned row contains our memory note's UUID.
+    let memory_id_str = memory_id.to_string();
+    let found = rows.iter().any(|row| {
+        row.columns.iter().any(|col| {
+            if let khive_storage::types::SqlValue::Text(s) = &col.value {
+                s.contains(&memory_id_str)
+            } else {
+                false
+            }
+        })
+    });
+    assert!(
+        found,
+        "CRIT-1: returned rows must include the seeded memory note id {}; columns: {:?}",
+        memory_id,
+        rows.iter()
+            .map(|r| r
+                .columns
+                .iter()
+                .map(|c| (&c.name, &c.value))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
 }

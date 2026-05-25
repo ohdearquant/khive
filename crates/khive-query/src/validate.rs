@@ -39,7 +39,9 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
 
 /// Validate and normalise an AST in place, returning any warnings generated.
 ///
-/// Currently warns when `max_hops` is clamped to [`MAX_DEPTH`].
+/// Returns an empty `Vec<String>` for forward compatibility; no warning paths
+/// are currently emitted.  The F048 depth-cap path now returns `InvalidInput`
+/// rather than clamping and warning.
 pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, QueryError> {
     let warnings: Vec<String> = Vec::new();
 
