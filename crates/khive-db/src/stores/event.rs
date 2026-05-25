@@ -16,11 +16,11 @@ use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Event, op, e)
+    StorageError::driver(StorageCapability::Events, op, e)
 }
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    StorageError::driver(StorageCapability::Event, op, e)
+    StorageError::driver(StorageCapability::Events, op, e)
 }
 
 /// An EventStore backed by SQLite tables.
@@ -103,7 +103,7 @@ impl SqlEventStore {
             let conn = self.open_standalone_writer()?;
             tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
                 .await
-                .map_err(|e| StorageError::driver(StorageCapability::Event, op, e))?
+                .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
         } else {
             let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {
@@ -111,7 +111,7 @@ impl SqlEventStore {
                 f(guard.conn()).map_err(|e| map_err(e, op))
             })
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Event, op, e))?
+            .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
         }
     }
 
@@ -124,7 +124,7 @@ impl SqlEventStore {
             let conn = self.open_standalone_reader()?;
             tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
                 .await
-                .map_err(|e| StorageError::driver(StorageCapability::Event, op, e))?
+                .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
         } else {
             let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {
@@ -132,7 +132,7 @@ impl SqlEventStore {
                 f(guard.conn()).map_err(|e| map_err(e, op))
             })
             .await
-            .map_err(|e| StorageError::driver(StorageCapability::Event, op, e))?
+            .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
         }
     }
 }

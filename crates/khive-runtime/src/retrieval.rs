@@ -107,10 +107,12 @@ impl KhiveRuntime {
         Ok(self
             .vectors(token)?
             .search(VectorSearchRequest {
-                query_embedding: embedding,
+                query_vectors: vec![embedding],
                 top_k,
                 namespace: Some(ns),
                 kind,
+                filter: None,
+                backend_hints: None,
             })
             .await?)
     }
@@ -236,10 +238,12 @@ impl KhiveRuntime {
         Ok(self
             .vectors(token)?
             .search(VectorSearchRequest {
-                query_embedding: query_vector,
+                query_vectors: vec![query_vector],
                 top_k,
                 namespace: Some(ns),
                 kind: Some(SubstrateKind::Entity),
+                filter: None,
+                backend_hints: None,
             })
             .await?)
     }
@@ -261,10 +265,12 @@ impl KhiveRuntime {
         let all_hits = self
             .vectors(token)?
             .search(VectorSearchRequest {
-                query_embedding: query_vector.to_vec(),
+                query_vectors: vec![query_vector.to_vec()],
                 top_k: candidate_ids.len() as u32,
                 namespace: Some(ns),
                 kind: Some(SubstrateKind::Entity),
+                filter: None,
+                backend_hints: None,
             })
             .await?;
         let mut hits: Vec<VectorSearchHit> = all_hits

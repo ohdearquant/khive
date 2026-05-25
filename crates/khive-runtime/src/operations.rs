@@ -338,7 +338,13 @@ impl KhiveRuntime {
         if self.config().embedding_model.is_some() {
             let vector = self.embed(&body).await?;
             self.vectors(token)?
-                .insert(entity.id, SubstrateKind::Entity, ns, vector)
+                .insert(
+                    entity.id,
+                    SubstrateKind::Entity,
+                    ns,
+                    "entity.body",
+                    vec![vector],
+                )
                 .await?;
         }
 
@@ -905,7 +911,13 @@ impl KhiveRuntime {
         if self.config().embedding_model.is_some() {
             let vector = self.embed(&note.content).await?;
             self.vectors(token)?
-                .insert(note.id, SubstrateKind::Note, ns, vector)
+                .insert(
+                    note.id,
+                    SubstrateKind::Note,
+                    ns,
+                    "note.content",
+                    vec![vector],
+                )
                 .await?;
         }
 

@@ -184,10 +184,12 @@ impl MemoryPack {
             self.runtime
                 .vectors(token)?
                 .search(VectorSearchRequest {
-                    query_embedding: vec,
+                    query_vectors: vec![vec],
                     top_k: candidate_limit,
                     namespace: Some(ns.clone()),
                     kind: Some(SubstrateKind::Note),
+                    filter: None,
+                    backend_hints: None,
                 })
                 .await?
         } else {
