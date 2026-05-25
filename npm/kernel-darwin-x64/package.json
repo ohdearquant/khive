@@ -1,6 +1,6 @@
 {
   "name": "@khive/kernel-darwin-x64",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "khive Rust binaries for macOS Intel (x64)",
   "license": "Apache-2.0",
   "repository": {

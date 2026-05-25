@@ -11,14 +11,14 @@ categories.workspace = true
 description = "khive stdio MCP server — the only user-facing Rust binary"
 
 [dependencies]
-khive-runtime = { version = "0.2.1", path = "../khive-runtime" }
-khive-request = { version = "0.2.1", path = "../khive-request" }
-khive-pack-kg = { version = "0.2.1", path = "../khive-pack-kg" }
-khive-pack-gtd = { version = "0.2.1", path = "../khive-pack-gtd" }
-khive-pack-memory = { version = "0.2.1", path = "../khive-pack-memory" }
-khive-pack-brain = { version = "0.2.1", path = "../khive-pack-brain" }
-khive-pack-comm = { version = "0.2.1", path = "../khive-pack-comm" }
-khive-pack-schedule = { version = "0.2.1", path = "../khive-pack-schedule" }
+khive-runtime = { version = "0.2.2", path = "../khive-runtime" }
+khive-request = { version = "0.2.2", path = "../khive-request" }
+khive-pack-kg = { version = "0.2.2", path = "../khive-pack-kg" }
+khive-pack-gtd = { version = "0.2.2", path = "../khive-pack-gtd" }
+khive-pack-memory = { version = "0.2.2", path = "../khive-pack-memory" }
+khive-pack-brain = { version = "0.2.2", path = "../khive-pack-brain" }
+khive-pack-comm = { version = "0.2.2", path = "../khive-pack-comm" }
+khive-pack-schedule = { version = "0.2.2", path = "../khive-pack-schedule" }
 inventory = { workspace = true }
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 tokio = { workspace = true }
@@ -33,7 +33,7 @@ anyhow = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rmcp = { version = "1.7", features = ["server", "transport-io", "client"] }
-khive-types = { version = "0.2.1", path = "../khive-types" }
+khive-types = { version = "0.2.2", path = "../khive-types" }
 async-trait = { workspace = true }
 
 [[bin]]

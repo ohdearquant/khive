@@ -11,10 +11,10 @@ categories.workspace = true
 description = "Cognitive primitives — Fold, Anchor, Objective, Selector"
 
 [dependencies]
-khive-score = { version = "0.2.1", path = "../khive-score" }
+khive-score = { version = "0.2.2", path = "../khive-score" }
 # ADR-024 target dependency boundary — khive-types added per F134
 # blake3 feature enables Hash32::from_blake3 for checkpoint hashing (F-NEW-5)
-khive-types = { version = "0.2.1", path = "../khive-types", features = ["blake3", "serde"] }
+khive-types = { version = "0.2.2", path = "../khive-types", features = ["blake3", "serde"] }
 # serde/uuid/thiserror/chrono remain because FoldContext uses them (context.rs is out of F134 scope)
 serde = { workspace = true }
 serde_json = { workspace = true }
