@@ -230,13 +230,19 @@ fn micros_to_dt(micros: i64) -> DateTime<Utc> {
 
 /// Escape an FTS5 query string to prevent injection.
 ///
-/// FTS5 special characters (`*`, `"`, `(`, `)`, `+`, `-`, `:`, `^`) are
-/// stripped. For Phrase mode, the caller wraps the result in double quotes.
+/// FTS5 special characters (`*`, `"`, `(`, `)`, `+`, `-`, `:`, `^`) and `.`
+/// are stripped. `.` is not an FTS5 operator but causes "syntax error near '.'"
+/// when it appears between digits (e.g. `0.9`) because the FTS5 tokenizer does
+/// not treat it as part of a word token. For Phrase mode, the caller wraps the
+/// result in double quotes.
 fn sanitize_fts5_query(query: &str) -> String {
     let sanitized: String = query
         .chars()
         .filter(|c| {
-            !matches!(c, '*' | '"' | '(' | ')' | '+' | '-' | ':' | '^' | '\0') && !c.is_control()
+            !matches!(
+                c,
+                '*' | '"' | '(' | ')' | '+' | '-' | ':' | '^' | '.' | '\0'
+            ) && !c.is_control()
         })
         .collect();
     sanitized
@@ -1197,6 +1203,63 @@ mod tests {
         assert_eq!(sanitize_fts5_query("col:value"), "colvalue");
         assert_eq!(sanitize_fts5_query(""), "");
         assert_eq!(sanitize_fts5_query("***"), "");
+        // M-C4: decimal numbers must not produce "syntax error near '.'"
+        assert_eq!(
+            sanitize_fts5_query("salience 0.9 vs 0.3"),
+            "salience 09 vs 03"
+        );
+        assert_eq!(sanitize_fts5_query("version 1.2.3"), "version 123");
+    }
+
+    /// M-C4 regression: searching with decimal numbers must succeed (not crash FTS5).
+    ///
+    /// Previously `.` was not stripped, causing FTS5 to return
+    /// "fts5: syntax error near '.'" when queries contained decimal literals like "0.9".
+    #[tokio::test]
+    async fn test_search_with_decimal_query_does_not_crash() {
+        let store = setup_memory_store("decimal_query");
+
+        // Insert a document that contains decimal-like content.
+        store
+            .upsert_document(make_document(
+                Uuid::new_v4(),
+                "salience thresholds",
+                "salience 09 vs 03 comparison",
+            ))
+            .await
+            .unwrap();
+
+        // Must not return an error — previously "fts5: syntax error near '.'"
+        let result = store
+            .search(TextSearchRequest {
+                query: "salience 0.9 vs 0.3".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "decimal query must succeed, got error: {:?}",
+            result.err()
+        );
+
+        // Also test with version strings.
+        let result2 = store
+            .search(TextSearchRequest {
+                query: "salience 0.9 vs version 1.2.3".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await;
+        assert!(
+            result2.is_ok(),
+            "version-string query must succeed, got error: {:?}",
+            result2.err()
+        );
     }
 
     #[tokio::test]

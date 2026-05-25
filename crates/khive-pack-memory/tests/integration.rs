@@ -1971,3 +1971,164 @@ async fn test_weighted_fusion_multi_model_text_not_zeroed() {
          note {note_id} must appear in results; got: {ids:?}"
     );
 }
+
+// ── Wave-2 regression tests (M-C1..M-C4) ──────────────────────────────────────
+
+/// M-C1: memory_type="procedural" must be rejected with a clear error listing
+/// the valid values ("episodic" | "semantic").
+#[tokio::test]
+async fn test_remember_procedural_memory_type_rejected() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    let result = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "procedural memory of how to deploy",
+                "memory_type": "procedural"
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "memory_type='procedural' must be rejected; got ok: {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("episodic") && msg.contains("semantic"),
+        "error must list valid memory_type values (episodic, semantic); got: {msg}"
+    );
+}
+
+/// M-C1: recall with memory_type="procedural" must also be rejected.
+#[tokio::test]
+async fn test_recall_procedural_memory_type_filter_rejected() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    let result = registry
+        .dispatch(
+            "recall",
+            json!({
+                "query": "deploy procedure",
+                "memory_type": "procedural"
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "recall with memory_type='procedural' must be rejected; got ok: {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("episodic") && msg.contains("semantic"),
+        "error must list valid memory_type values; got: {msg}"
+    );
+}
+
+/// M-C3: composite scores returned by recall are always in [0, 1].
+///
+/// Verifies that the final_score is bounded regardless of fusion strategy.
+/// Specifically, after normalize_relevance + weighted combination, scores must
+/// not exceed 1.0.
+#[tokio::test]
+async fn test_recall_composite_score_bounded_to_unit_interval() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    // Store several memories to exercise the scoring path.
+    for i in 0..5 {
+        registry
+            .dispatch(
+                "remember",
+                json!({
+                    "content": format!("bounded score test memory number {i}"),
+                    "importance": 0.5 + 0.1 * (i as f64),
+                    "decay_factor": 0.0,
+                }),
+            )
+            .await
+            .expect("remember");
+    }
+
+    let result = registry
+        .dispatch(
+            "recall",
+            json!({ "query": "bounded score test memory", "limit": 10 }),
+        )
+        .await
+        .expect("recall succeeds");
+
+    let hits = result.as_array().expect("array of hits");
+    assert!(!hits.is_empty(), "must have hits for bounded score test");
+
+    for hit in hits {
+        let score = hit["score"].as_f64().expect("hit has score");
+        assert!(
+            (0.0..=1.0).contains(&score),
+            "composite score must be in [0, 1]; got {score}. \
+             If score > 1.0, normalize_relevance or weighted combination is broken."
+        );
+    }
+}
+
+/// M-C3: HandlerDef description for min_score must not claim a fixed 0.0-1.0 range
+/// without the qualification that it applies to the composite (not raw fusion) score.
+#[test]
+fn test_handler_def_min_score_description_clarified() {
+    use khive_types::Pack;
+
+    let recall_def = khive_pack_memory::MemoryPack::HANDLERS
+        .iter()
+        .find(|h| h.name == "recall")
+        .expect("recall handler must be registered");
+
+    let min_score_param = recall_def
+        .params
+        .iter()
+        .find(|p| p.name == "min_score")
+        .expect("min_score param must exist");
+
+    // The description must NOT just say "0.0–1.0" without qualification —
+    // it must mention "composite" so callers understand the score applies to
+    // the final weighted output, not the raw FTS/vector fusion score.
+    assert!(
+        min_score_param.description.contains("composite")
+            || min_score_param.description.contains("[0,1]"),
+        "min_score description must clarify the score is composite/[0,1]; got: {:?}",
+        min_score_param.description
+    );
+}
+
+/// M-C1: HandlerDef description for remember.memory_type must list exact valid values.
+#[test]
+fn test_handler_def_remember_memory_type_description_lists_valid_values() {
+    use khive_types::Pack;
+
+    let remember_def = khive_pack_memory::MemoryPack::HANDLERS
+        .iter()
+        .find(|h| h.name == "remember")
+        .expect("remember handler must be registered");
+
+    let mt_param = remember_def
+        .params
+        .iter()
+        .find(|p| p.name == "memory_type")
+        .expect("memory_type param must exist");
+
+    // Must list both valid values explicitly so help text is accurate.
+    assert!(
+        mt_param.description.contains("episodic") && mt_param.description.contains("semantic"),
+        "memory_type description must list valid values 'episodic' and 'semantic'; got: {:?}",
+        mt_param.description
+    );
+    // Must indicate these are the only valid values (not just examples).
+    assert!(
+        !mt_param.description.contains("e.g."),
+        "memory_type description must not use 'e.g.' — values are exhaustive; got: {:?}",
+        mt_param.description
+    );
+}

@@ -70,7 +70,7 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 name: "memory_type",
                 param_type: "string",
                 required: false,
-                description: "Memory type tag (e.g. \"episodic\", \"semantic\").",
+                description: "Memory type tag: \"episodic\" | \"semantic\" (default \"episodic\"). Other values are rejected.",
             },
             ParamDef {
                 name: "source_id",
@@ -115,7 +115,7 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum composite score 0.0–1.0 (default none; 0.3–0.7 typical for production).",
+                description: "Minimum composite score. Composite is always in [0,1] after weighted fusion and temporal decay (default none; 0.3–0.7 typical for production).",
             },
             ParamDef {
                 name: "score_floor",
