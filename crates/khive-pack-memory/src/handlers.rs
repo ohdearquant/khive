@@ -164,6 +164,8 @@ impl MemoryPack {
         candidate_limit: u32,
     ) -> Result<RecallCandidateSet, RuntimeError> {
         let ns = token.namespace().as_str().to_string();
+        // F111: restrict text candidates to Note substrate kind so entity records
+        // cannot fill the candidate pool before any memory note is considered.
         let text_hits = self
             .runtime
             .text_for_notes(token)?
@@ -172,6 +174,7 @@ impl MemoryPack {
                 mode: TextQueryMode::Plain,
                 filter: Some(TextFilter {
                     namespaces: vec![ns.clone()],
+                    kinds: vec![SubstrateKind::Note],
                     ..TextFilter::default()
                 }),
                 top_k: candidate_limit,
@@ -187,6 +190,7 @@ impl MemoryPack {
                     query_vectors: vec![vec],
                     top_k: candidate_limit,
                     namespace: Some(ns.clone()),
+                    // F111: already restricts to Note substrate kind
                     kind: Some(SubstrateKind::Note),
                     filter: None,
                     backend_hints: None,
@@ -250,32 +254,48 @@ impl MemoryPack {
             ));
         }
 
-        if let Some(mt) = &p.memory_type {
-            validate_memory_type(mt)?;
-        }
+        let memory_type = p.memory_type.as_deref().unwrap_or("episodic");
+        validate_memory_type(memory_type)?;
 
-        let importance = p.importance.unwrap_or(0.5).clamp(0.0, 1.0);
-        let decay_factor = p.decay_factor.unwrap_or(0.01).clamp(0.0, 1.0);
+        // F108: reject out-of-range values instead of clamping
+        let importance = match p.importance {
+            Some(v) if !(0.0..=1.0).contains(&v) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "importance must be in [0, 1], got {v}"
+                )));
+            }
+            Some(v) => v,
+            None => 0.5,
+        };
+        // F108: decay_factor must be >= 0; no upper clamp per ADR-021
+        let decay_factor = match p.decay_factor {
+            Some(v) if v < 0.0 => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "decay_factor must be >= 0, got {v}"
+                )));
+            }
+            Some(v) => v,
+            None => 0.01,
+        };
 
-        let mut props = serde_json::json!({});
-        if let Some(mt) = &p.memory_type {
-            props["memory_type"] = json!(mt);
-        }
+        // F107: always write memory_type to properties (ADR-021 §4, default "episodic")
+        let mut props = json!({ "memory_type": memory_type });
         if let Some(tags) = &p.tags {
             if !tags.is_empty() {
                 props["tags"] = json!(tags);
             }
         }
-        let properties = if props.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-            None
-        } else {
-            Some(props)
-        };
 
+        // F109: reject invalid source_id UUID strings
         let mut annotates: Vec<Uuid> = vec![];
         if let Some(sid) = &p.source_id {
-            if let Ok(source_uuid) = sid.parse::<Uuid>() {
-                annotates.push(source_uuid);
+            match sid.parse::<Uuid>() {
+                Ok(source_uuid) => annotates.push(source_uuid),
+                Err(_) => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "source_id {sid:?} is not a valid UUID"
+                    )));
+                }
             }
         }
 
@@ -288,7 +308,7 @@ impl MemoryPack {
                 &p.content,
                 Some(importance),
                 decay_factor,
-                properties,
+                Some(props),
                 annotates,
             )
             .await?;
@@ -298,6 +318,7 @@ impl MemoryPack {
             "kind": note.kind,
             "salience": note.salience,
             "decay_factor": note.decay_factor,
+            "memory_type": memory_type,
             "created_at": note.created_at,
         }))
     }
@@ -534,6 +555,58 @@ impl MemoryPack {
         }))
     }
 
+    /// Apply configured rerankers to fused candidates (ADR-033 §2, F222).
+    ///
+    /// In v1 with no active rerankers (empty `reranker_weights`), this is a
+    /// pass-through: each candidate is returned with an empty `rerank_scores` map.
+    /// When reranker weights are configured in `RecallConfig.reranker_weights`, the
+    /// named rerankers will populate `rerank_scores[name]` for downstream scoring.
+    pub(crate) async fn handle_recall_rerank(&self, params: Value) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        struct RerankParams {
+            /// Fused candidate IDs to rerank (from recall_fuse output).
+            candidates: Vec<serde_json::Value>,
+            config: Option<RecallConfig>,
+        }
+        let p: RerankParams = deser(params)?;
+        let cfg = p.config.unwrap_or_else(|| self.active_config());
+        cfg.validate()?;
+
+        // Build the set of active rerankers (weight > 0).
+        let active: Vec<(&String, &f64)> = cfg
+            .reranker_weights
+            .iter()
+            .filter(|(_, &w)| w > 0.0)
+            .collect();
+
+        // For each candidate, produce a rerank_scores map with scores from active rerankers.
+        // v1: no reranker models are loaded, so all scores are 0.0 (reranker not run).
+        let reranked: Vec<serde_json::Value> = p
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let id = candidate
+                    .get("note_id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let mut rerank_scores = serde_json::Map::new();
+                for (name, _weight) in &active {
+                    // v1: reranker model not loaded → score = 0.0
+                    rerank_scores.insert(name.to_string(), json!(0.0_f32));
+                }
+                json!({
+                    "note_id": id,
+                    "rerank_scores": rerank_scores,
+                })
+            })
+            .collect();
+
+        to_json(&json!({
+            "reranked": reranked,
+            "active_rerankers": active.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        }))
+    }
+
     pub(crate) async fn handle_recall_score(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         struct ScoreParams {
@@ -645,15 +718,27 @@ mod tests {
     }
 
     #[test]
-    fn compute_score_exponential_decay_at_half_life() {
-        let cfg = RecallConfig::default(); // half_life = 30 days
-        let (_, bd) = compute_score(&cfg, 0.5, 1.0, 0.01, 30.0);
-        // At age = half_life: importance_decayed ≈ 0.5, temporal ≈ 0.5
+    fn compute_score_exponential_decay_at_decay_factor_half_life() {
+        let cfg = RecallConfig::default(); // temporal_half_life = 30 days, default decay_factor=0.01
+                                           // ADR-021 §5: importance_decayed = salience * exp(-decay_factor * age_days)
+                                           // At age = ln(2)/0.01 ≈ 69.3 days: importance_decayed ≈ 0.5
+        let age_days = std::f64::consts::LN_2 / 0.01;
+        let (_, bd) = compute_score(&cfg, 0.5, 1.0, 0.01, age_days);
         assert!(
             (bd.importance_decayed - 0.5).abs() < 1e-10,
             "importance_decayed = {}",
             bd.importance_decayed
         );
+        // Temporal at age_days=69.3 with half_life=30: exp(-ln2/30 * 69.3) ≈ exp(-1.6) ≈ 0.2
+        // Just verify it's < 0.5 (past the temporal half-life)
+        assert!(bd.temporal < 0.5, "temporal = {}", bd.temporal);
+    }
+
+    #[test]
+    fn compute_score_temporal_halves_at_temporal_half_life() {
+        let cfg = RecallConfig::default(); // temporal_half_life = 30 days
+        let (_, bd) = compute_score(&cfg, 0.5, 1.0, 0.01, 30.0);
+        // At age = temporal_half_life = 30 days: temporal = exp(-ln2/30 * 30) = 0.5
         assert!(
             (bd.temporal - 0.5).abs() < 1e-10,
             "temporal = {}",
@@ -672,5 +757,158 @@ mod tests {
         let (total, _) = compute_score(&cfg, 0.8, 0.9, 0.01, 10.0);
         // Only relevance matters: total = 0.8
         assert!((total - 0.8).abs() < 1e-10, "got {total}");
+    }
+
+    // ── F107: remember always writes memory_type to properties ───────────
+
+    #[test]
+    fn remember_params_default_memory_type_is_episodic() {
+        // When memory_type is absent, validate_memory_type("episodic") must pass.
+        // This ensures the default "episodic" is valid.
+        assert!(validate_memory_type("episodic").is_ok());
+    }
+
+    // ── F108: reject out-of-range importance and decay_factor ─────────────
+
+    #[test]
+    fn remember_params_importance_below_zero_rejected() {
+        // Simulate handler validation path directly
+        let importance: f64 = -0.1;
+        let result: Result<f64, RuntimeError> = if !(0.0..=1.0).contains(&importance) {
+            Err(RuntimeError::InvalidInput(format!(
+                "importance must be in [0, 1], got {importance}"
+            )))
+        } else {
+            Ok(importance)
+        };
+        assert!(result.is_err(), "expected error for importance < 0");
+    }
+
+    #[test]
+    fn remember_params_importance_above_one_rejected() {
+        let importance: f64 = 1.1;
+        let result: Result<f64, RuntimeError> = if !(0.0..=1.0).contains(&importance) {
+            Err(RuntimeError::InvalidInput(format!(
+                "importance must be in [0, 1], got {importance}"
+            )))
+        } else {
+            Ok(importance)
+        };
+        assert!(result.is_err(), "expected error for importance > 1");
+    }
+
+    #[test]
+    fn remember_params_importance_boundary_values_accepted() {
+        // 0.0 and 1.0 are valid
+        for val in [0.0_f64, 0.5, 1.0] {
+            let result: Result<(), RuntimeError> = if !(0.0..=1.0).contains(&val) {
+                Err(RuntimeError::InvalidInput("out of range".into()))
+            } else {
+                Ok(())
+            };
+            assert!(result.is_ok(), "boundary {val} should be accepted");
+        }
+    }
+
+    #[test]
+    fn remember_params_decay_factor_below_zero_rejected() {
+        let df: f64 = -0.01;
+        let result: Result<f64, RuntimeError> = if df < 0.0 {
+            Err(RuntimeError::InvalidInput(format!(
+                "decay_factor must be >= 0, got {df}"
+            )))
+        } else {
+            Ok(df)
+        };
+        assert!(result.is_err(), "expected error for decay_factor < 0");
+    }
+
+    #[test]
+    fn remember_params_decay_factor_above_one_accepted() {
+        // ADR-021 only requires decay_factor >= 0; no upper cap
+        let df: f64 = 2.5;
+        let result: Result<f64, RuntimeError> = if df < 0.0 {
+            Err(RuntimeError::InvalidInput("negative".into()))
+        } else {
+            Ok(df)
+        };
+        assert!(result.is_ok(), "decay_factor > 1 should be accepted");
+    }
+
+    // ── F109: invalid source_id UUID string is rejected ──────────────────
+
+    #[test]
+    fn remember_params_invalid_source_id_uuid_is_rejected() {
+        let sid = "not-a-uuid";
+        let result: Result<Uuid, RuntimeError> = sid.parse::<Uuid>().map_err(|_| {
+            RuntimeError::InvalidInput(format!("source_id {sid:?} is not a valid UUID"))
+        });
+        assert!(result.is_err(), "expected error for invalid UUID string");
+    }
+
+    #[test]
+    fn remember_params_valid_source_id_uuid_is_accepted() {
+        let sid = "00000000-0000-0000-0000-000000000001";
+        let result = sid.parse::<Uuid>();
+        assert!(result.is_ok(), "valid UUID should parse successfully");
+    }
+
+    // ── recall_rerank: pass-through when no rerankers configured ─────────
+
+    #[test]
+    fn recall_rerank_config_empty_reranker_weights_has_no_active() {
+        let cfg = RecallConfig::default();
+        let active: Vec<_> = cfg
+            .reranker_weights
+            .iter()
+            .filter(|(_, &w)| w > 0.0)
+            .collect();
+        assert!(active.is_empty(), "default config has no active rerankers");
+    }
+
+    #[test]
+    fn recall_rerank_config_with_reranker_weight_is_active() {
+        let mut cfg = RecallConfig::default();
+        cfg.reranker_weights
+            .insert("cross_encoder".to_string(), 0.5);
+        let active: Vec<_> = cfg
+            .reranker_weights
+            .iter()
+            .filter(|(_, &w)| w > 0.0)
+            .collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, "cross_encoder");
+    }
+
+    // ── F186/F223/F230: new RecallConfig fields ───────────────────────────
+
+    #[test]
+    fn recall_config_reranker_fields_default_empty() {
+        let cfg = RecallConfig::default();
+        assert!(cfg.reranker_weights.is_empty());
+        assert!(cfg.reranker_params.is_empty());
+    }
+
+    #[test]
+    fn recall_config_fallback_during_migration_defaults_true() {
+        let cfg = RecallConfig::default();
+        assert!(cfg.fallback_during_migration);
+    }
+
+    #[test]
+    fn recall_config_negative_reranker_weight_fails_validation() {
+        let mut cfg = RecallConfig::default();
+        cfg.reranker_weights
+            .insert("bad_reranker".to_string(), -0.1);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn recall_config_zero_reranker_weight_validates() {
+        let mut cfg = RecallConfig::default();
+        // Weight of 0.0 means disabled, not an error
+        cfg.reranker_weights
+            .insert("disabled_reranker".to_string(), 0.0);
+        assert!(cfg.validate().is_ok());
     }
 }

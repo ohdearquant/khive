@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use khive_runtime::{FusionStrategy, RuntimeError};
@@ -14,6 +16,13 @@ pub struct RecallConfig {
     pub importance_weight: f64,
     /// Weight of pure recency. Default 0.10.
     pub temporal_weight: f64,
+
+    // --- Reranker weights (ADR-033 §1) ---
+    /// Per-reranker weights, keyed by reranker name. Missing keys → 0.0 (disabled).
+    /// v1 built-in names: "cross_encoder", "salience", "graph_proximity".
+    pub reranker_weights: HashMap<String, f64>,
+    /// Per-reranker config params (e.g., graph_proximity anchors, salience α).
+    pub reranker_params: HashMap<String, serde_json::Value>,
 
     // --- Temporal parameters ---
     /// Days for temporal score to halve. Default 30.0.
@@ -35,6 +44,11 @@ pub struct RecallConfig {
     pub min_salience: f64,
     /// Include per-component score breakdowns in recall responses. Default false.
     pub include_breakdown: bool,
+
+    // --- Migration behavior (ADR-033 §1, ADR-043) ---
+    /// When true and no active embedding model is configured, fall back to FTS5-only
+    /// candidate retrieval rather than failing. Default true.
+    pub fallback_during_migration: bool,
 }
 
 impl Default for RecallConfig {
@@ -43,6 +57,8 @@ impl Default for RecallConfig {
             relevance_weight: 0.70,
             importance_weight: 0.20,
             temporal_weight: 0.10,
+            reranker_weights: HashMap::new(),
+            reranker_params: HashMap::new(),
             temporal_half_life_days: 30.0,
             decay_model: DecayModel::default(),
             candidate_multiplier: 20,
@@ -51,6 +67,7 @@ impl Default for RecallConfig {
             min_score: 0.0,
             min_salience: 0.0,
             include_breakdown: false,
+            fallback_during_migration: true,
         }
     }
 }
@@ -59,8 +76,8 @@ impl RecallConfig {
     /// Validate that the config is internally consistent.
     ///
     /// Rejects:
-    /// - Negative weights
-    /// - All three weights summing to zero (no scoring signal)
+    /// - Negative weights (base or reranker)
+    /// - All three base weights summing to zero (no scoring signal)
     /// - Non-positive temporal half-life
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if self.relevance_weight < 0.0 {
@@ -83,6 +100,13 @@ impl RecallConfig {
             return Err(RuntimeError::InvalidInput(
                 "at least one of relevance_weight / importance_weight / temporal_weight must be positive".to_string(),
             ));
+        }
+        for (name, &weight) in &self.reranker_weights {
+            if weight < 0.0 {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "reranker_weights[{name:?}] must be non-negative"
+                )));
+            }
         }
         if self.temporal_half_life_days <= 0.0 {
             return Err(RuntimeError::InvalidInput(
@@ -112,9 +136,11 @@ impl RecallConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DecayModel {
-    /// `salience * exp(-age * ln2 / half_life)`
+    /// `salience * exp(-decay_factor * age_days)` — uses the note's own decay_factor directly.
     ///
-    /// This is the original formula; it is the default.
+    /// This is the ADR-021 §5 formula. The note's `decay_factor` controls the decay rate;
+    /// `temporal_half_life_days` is used only by the temporal recency score, not here.
+    /// Default `decay_factor=0.01` gives a ~69-day half-life: exp(-0.01 * 69.3) ≈ 0.5.
     #[default]
     Exponential,
     /// `salience / (1 + decay_factor * age_days)`
@@ -135,14 +161,13 @@ impl DecayModel {
     /// - `salience`    — raw importance in [0, 1]
     /// - `age_days`    — age of the note in days
     /// - `decay_factor`— per-note decay rate stored on the note (used by Exponential and Hyperbolic)
-    /// - `half_life`   — config half-life, used by Exponential (as formula half-life) and PowerLaw
-    pub fn apply(&self, salience: f64, age_days: f64, decay_factor: f64, half_life: f64) -> f64 {
+    /// - `half_life`   — config half-life, used only by PowerLaw (ignored by Exponential)
+    pub fn apply(&self, salience: f64, age_days: f64, decay_factor: f64, _half_life: f64) -> f64 {
         match self {
             DecayModel::Exponential => {
-                // Uses the proper half-life formula: exp(-age * ln2 / half_life)
-                // This gives exactly 0.5 at age == half_life.
-                let k = std::f64::consts::LN_2 / half_life;
-                salience * (-k * age_days).exp()
+                // ADR-021 §5: effective_importance = salience * exp(-decay_factor * age_days)
+                // Uses the note's own decay_factor, not a half-life-derived constant.
+                salience * (-decay_factor * age_days).exp()
             }
             DecayModel::Hyperbolic => salience / (1.0 + decay_factor * age_days),
             DecayModel::PowerLaw { half_life_days } => {
@@ -195,15 +220,18 @@ mod tests {
     // ── DecayModel ────────────────────────────────────────────────────────────
 
     #[test]
-    fn exponential_halves_at_half_life() {
+    fn exponential_halves_at_decay_factor_half_life() {
+        // ADR-021 §5 formula: salience * exp(-decay_factor * age_days)
+        // Half-life = ln(2) / decay_factor ≈ 69.3 days for decay_factor=0.01
         let model = DecayModel::Exponential;
         let salience = 1.0;
-        let half_life = 30.0;
-        let result = model.apply(salience, half_life, 0.01, half_life);
+        let decay_factor = 0.01;
+        let half_life_days = std::f64::consts::LN_2 / decay_factor;
+        let result = model.apply(salience, half_life_days, decay_factor, 30.0);
         let diff = (result - 0.5).abs();
         assert!(
             diff < 1e-10,
-            "exponential should give 0.5 at half-life, got {result}"
+            "exponential should give 0.5 at ln(2)/decay_factor days, got {result}"
         );
     }
 
@@ -215,6 +243,20 @@ mod tests {
         assert!(
             diff < 1e-12,
             "at age=0 salience should be unchanged, got {result}"
+        );
+    }
+
+    #[test]
+    fn exponential_uses_note_decay_factor_not_half_life() {
+        // Verify the formula uses decay_factor param, not the half_life param.
+        // At age=1 day, decay_factor=1.0 → exp(-1.0) ≈ 0.3679.
+        // If we were using half_life=10 days, exp(-ln2/10) ≈ 0.933.
+        let model = DecayModel::Exponential;
+        let result = model.apply(1.0, 1.0, 1.0, 10.0);
+        let expected = (-1.0f64).exp();
+        assert!(
+            (result - expected).abs() < 1e-12,
+            "expected {expected}, got {result}"
         );
     }
 

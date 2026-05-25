@@ -292,23 +292,25 @@ async fn test_remember_source_id_not_in_properties() {
     }
 }
 
-/// Regression test for issue #100: decay_factor must be clamped to [0, 1].
+/// ADR-021 §4 (F108): decay_factor >= 0 is the only constraint — no upper cap.
+/// Values above 1.0 are valid (fast-fading memories with very short effective half-lives).
+/// Negative values are rejected with InvalidInput.
 #[tokio::test]
-async fn test_remember_decay_factor_clamped() {
+async fn test_remember_decay_factor_no_upper_cap() {
     let rt = make_runtime();
     let registry = make_registry(rt.clone());
 
-    // decay > 1.0 should be clamped to 1.0
+    // decay_factor = 5.0 is valid — no upper cap per ADR-021 §4
     let result = registry
         .dispatch(
             "remember",
             json!({
-                "content": "memory with excessive decay",
+                "content": "memory with high decay rate",
                 "decay": 5.0
             }),
         )
         .await
-        .expect("remember with large decay");
+        .expect("remember with decay_factor > 1.0 should succeed");
 
     let note_id: Uuid = result["note_id"]
         .as_str()
@@ -326,12 +328,153 @@ async fn test_remember_decay_factor_clamped() {
         .expect("note exists");
 
     let df = note.decay_factor.unwrap_or(0.0);
+    // Stored value must match exactly (not clamped to 1.0)
     assert!(
-        df <= 1.0,
-        "decay_factor must be <= 1.0 after clamping, got {}",
-        df
+        (df - 5.0).abs() < 1e-10,
+        "decay_factor should be stored as-is (5.0), got {df}"
     );
-    assert!(df >= 0.0, "decay_factor must be >= 0.0, got {}", df);
+}
+
+/// ADR-021 §4 (F108): negative decay_factor is rejected.
+#[tokio::test]
+async fn test_remember_decay_factor_negative_rejected() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    let result = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "memory with negative decay",
+                "decay": -0.1
+            }),
+        )
+        .await;
+
+    assert!(result.is_err(), "negative decay_factor must be rejected");
+}
+
+/// ADR-021 §4 (F107): remember always writes memory_type to properties.
+/// When memory_type is absent, it defaults to "episodic".
+#[tokio::test]
+async fn test_remember_default_memory_type_written_to_properties() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    let result = registry
+        .dispatch(
+            "remember",
+            json!({ "content": "memory without explicit type" }),
+        )
+        .await
+        .expect("remember without memory_type");
+
+    let note_id: Uuid = result["note_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .expect("valid uuid");
+
+    // The response must carry memory_type
+    assert_eq!(
+        result["memory_type"].as_str(),
+        Some("episodic"),
+        "response must include default memory_type"
+    );
+
+    let note_store = rt
+        .notes(&rt.authorize(Namespace::local()))
+        .expect("note store");
+    let note = note_store
+        .get_note(note_id)
+        .await
+        .expect("get note")
+        .expect("note exists");
+
+    let stored_type = note
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("memory_type"))
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        stored_type,
+        Some("episodic"),
+        "memory_type must be written to properties even when not supplied"
+    );
+}
+
+/// ADR-021 §4 (F109): invalid UUID string in source_id is rejected with an error.
+#[tokio::test]
+async fn test_remember_invalid_source_id_uuid_rejected() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    let result = registry
+        .dispatch(
+            "remember",
+            json!({
+                "content": "memory with bad source_id",
+                "source": "not-a-valid-uuid"
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "invalid source_id UUID must cause an error, got: {result:?}"
+    );
+}
+
+/// ADR-021 §4 (F108): importance outside [0, 1] is rejected.
+#[tokio::test]
+async fn test_remember_importance_out_of_range_rejected() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    let neg = registry
+        .dispatch("remember", json!({ "content": "test", "importance": -0.1 }))
+        .await;
+    assert!(neg.is_err(), "negative importance must be rejected");
+
+    let rt2 = make_runtime();
+    let registry2 = make_registry(rt2);
+    let above = registry2
+        .dispatch("remember", json!({ "content": "test", "importance": 1.1 }))
+        .await;
+    assert!(above.is_err(), "importance > 1 must be rejected");
+}
+
+/// ADR-033 §2 (F222): recall.rerank is callable and returns expected shape.
+#[tokio::test]
+async fn test_recall_rerank_passthrough_with_no_active_rerankers() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    let candidates = json!([
+        { "note_id": "00000000-0000-0000-0000-000000000001", "fused_score": 0.8 },
+        { "note_id": "00000000-0000-0000-0000-000000000002", "fused_score": 0.6 },
+    ]);
+
+    let result = registry
+        .dispatch("recall.rerank", json!({ "candidates": candidates }))
+        .await
+        .expect("recall.rerank with no active rerankers");
+
+    let reranked = result["reranked"].as_array().expect("reranked array");
+    assert_eq!(reranked.len(), 2, "must return one entry per candidate");
+    for entry in reranked {
+        let scores = entry["rerank_scores"]
+            .as_object()
+            .expect("rerank_scores object");
+        assert!(
+            scores.is_empty(),
+            "no active rerankers → empty rerank_scores, got {scores:?}"
+        );
+    }
+    let active = result["active_rerankers"]
+        .as_array()
+        .expect("active_rerankers array");
+    assert!(active.is_empty(), "no active rerankers expected");
 }
 
 #[test]
@@ -341,6 +484,11 @@ fn test_memory_dotted_verbs_registered() {
     assert!(names.contains(&"recall.fuse"));
     assert!(names.contains(&"recall.score"));
     assert!(names.contains(&"recall.embed"));
+    // F222: recall.rerank must be registered (ADR-033 §2)
+    assert!(
+        names.contains(&"recall.rerank"),
+        "recall.rerank not found in: {names:?}"
+    );
 }
 
 #[tokio::test]

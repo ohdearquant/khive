@@ -39,7 +39,7 @@ impl Pack for MemoryPack {
 // ADR-025: Illocutionary classification (Searle 1976)
 //   Commissive — commits caller to a persistent change
 //   Assertive  — retrieves/presents state of affairs
-static MEMORY_HANDLERS: [HandlerDef; 6] = [
+static MEMORY_HANDLERS: [HandlerDef; 7] = [
     // Commissive: commits a memory to the namespace
     HandlerDef {
         name: "remember",
@@ -69,6 +69,13 @@ static MEMORY_HANDLERS: [HandlerDef; 6] = [
     HandlerDef {
         name: "recall.fuse",
         description: "Return fused memory recall candidates before final scoring",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
+    },
+    // ADR-033 §2, F222: rerank stage between fuse and score
+    HandlerDef {
+        name: "recall.rerank",
+        description: "Apply configured rerankers to fused candidates (ADR-033 §2)",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
     },
@@ -144,6 +151,7 @@ impl PackRuntime for MemoryPack {
             "recall.embed" => self.handle_recall_embed(params).await,
             "recall.candidates" => self.handle_recall_candidates(token, params).await,
             "recall.fuse" => self.handle_recall_fuse(token, params, registry).await,
+            "recall.rerank" => self.handle_recall_rerank(params).await,
             "recall.score" => self.handle_recall_score(params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "memory pack does not handle verb {verb:?}"
