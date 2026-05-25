@@ -1,11 +1,11 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! Canonical JSON serialization and SHA-256 snapshot hashing (ADR-042 §1).
+//! Canonical JSON serialization and SHA-256 snapshot hashing.
 //!
-//! The hash algorithm:
+//! Algorithm (ADR-010 §canonical-hash-algorithm, ADR-042 retained):
 //! 1. Collect non-soft-deleted entities; sort by UUID string ascending.
 //! 2. Collect edges; sort by (source, target, relation) ascending.
-//! 3. Serialize as `{"entities":[...],"edges":[...]}` with fixed field order and no whitespace.
+//! 3. Serialize as `{"edges":[...],"entities":[...]}` with fixed field order and no whitespace.
 //! 4. SHA-256 the UTF-8 bytes; prefix with `"sha256:"`.
 
 use serde_json::{Map, Value};

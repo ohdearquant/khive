@@ -1,6 +1,10 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! Core versioning types: `SnapshotId`, `KgSnapshot`, `KgBranch`, `RemoteConfig`.
+//! Core versioning types: `SnapshotId`, `VcsState`.
+//!
+//! Legacy types (`KgSnapshot`, `KgBranch`, `RemoteConfig`) and the `VcsState.dirty`
+//! flag were removed in the ADR-010/ADR-020 alignment pass. KG branches are now
+//! git branches; there is no custom remote protocol (ADR-010, ADR-020).
 
 use serde::{Deserialize, Serialize};
 
@@ -56,109 +60,34 @@ impl std::fmt::Display for SnapshotId {
     }
 }
 
-// ── KgSnapshot ────────────────────────────────────────────────────────────────
+// ── SnapshotCoverage ──────────────────────────────────────────────────────────
 
-/// Immutable point-in-time capture of a namespace's entity and edge set.
+/// Records which record classes are covered by a KG snapshot.
 ///
-/// `id` is the SHA-256 hash of the deterministically serialized archive.
-/// The archive itself is stored separately in `kg_snapshot_archives`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct KgSnapshot {
-    /// Content hash — also the primary key in `kg_snapshots`.
-    pub id: SnapshotId,
-    /// Namespace this snapshot belongs to.
-    pub namespace: String,
-    /// Previous snapshot in this branch's history. `None` for the genesis commit.
-    pub parent_id: Option<SnapshotId>,
-    /// Human-readable description of the changes since the previous snapshot.
-    pub message: String,
-    /// Agent or user identifier for attribution. Optional.
-    pub author: Option<String>,
-    /// Unix microseconds (i64) — compatible with the existing substrate timestamp convention.
-    pub created_at: i64,
-    /// Number of entities in this snapshot.
-    pub entity_count: u64,
-    /// Number of edges in this snapshot.
-    pub edge_count: u64,
+/// v1 covers entities and edges only. Notes are excluded until note packs
+/// define versioned export, import, privacy/redaction, and merge semantics
+/// (ADR-010 §snapshot-coverage).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCoverage {
+    pub entities: bool,
+    pub edges: bool,
+    pub notes: bool,
 }
 
-// ── KgBranch ─────────────────────────────────────────────────────────────────
-
-/// Named mutable pointer to a snapshot within a namespace.
-///
-/// Composite primary key: `(namespace, name)`.
-/// The default branch is `"main"`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct KgBranch {
-    /// Namespace this branch lives in.
-    pub namespace: String,
-    /// Branch name — alphanumeric, hyphens, underscores.
-    pub name: String,
-    /// The snapshot this branch currently points to.
-    pub head_id: SnapshotId,
-    /// Unix microseconds when the branch was first created.
-    pub created_at: i64,
-    /// Unix microseconds of the last HEAD update.
-    pub updated_at: i64,
-}
-
-// ── RemoteConfig ──────────────────────────────────────────────────────────────
-
-/// Connection parameters for a remote khive instance (for push/pull).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RemoteConfig {
-    /// Short name used in CLI commands (e.g. `"origin"`).
-    pub name: String,
-    /// Base URL of the remote khive-sync server (e.g. `"https://khive.example.com"`).
-    pub url: String,
-    /// Authentication credentials for the remote.
-    pub auth: RemoteAuth,
-    /// Optional namespace mapping: `(local_namespace, remote_namespace)`.
-    /// When absent, the local namespace name is used on the remote.
-    pub namespace_map: Option<(String, String)>,
-}
-
-impl RemoteConfig {
-    /// Returns the remote namespace name for a given local namespace.
-    pub fn remote_namespace<'a>(&'a self, local: &'a str) -> &'a str {
-        match &self.namespace_map {
-            Some((from, to)) if from == local => to.as_str(),
-            _ => local,
-        }
-    }
-}
-
-/// Authentication credentials for a remote khive instance.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum RemoteAuth {
-    /// No authentication (anonymous access).
-    None,
-    /// Bearer token (API key).
-    Bearer { token: String },
-    /// HTTP basic authentication.
-    Basic { user: String, password: String },
-}
-
-impl std::fmt::Debug for RemoteAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::None => write!(f, "RemoteAuth::None"),
-            Self::Bearer { .. } => write!(f, "RemoteAuth::Bearer {{ token: \"[REDACTED]\" }}"),
-            Self::Basic { user, .. } => {
-                write!(
-                    f,
-                    "RemoteAuth::Basic {{ user: {:?}, password: \"[REDACTED]\" }}",
-                    user
-                )
-            }
-        }
-    }
-}
+/// v1 coverage constant: entities + edges, notes excluded.
+pub const KG_V1_COVERAGE: SnapshotCoverage = SnapshotCoverage {
+    entities: true,
+    edges: true,
+    notes: false,
+};
 
 // ── VcsState ─────────────────────────────────────────────────────────────────
 
-/// Per-namespace VCS state stored in `kg_vcs_state`.
+/// Per-namespace VCS state.
+///
+/// The `dirty` flag was removed per ADR-020 §7: "There is no dirty flag. The
+/// diff is computed fresh on every invocation." Use `khive kg status` (DB vs
+/// NDJSON diff) to determine uncommitted changes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VcsState {
     pub namespace: String,
@@ -166,8 +95,6 @@ pub struct VcsState {
     pub current_branch: Option<String>,
     /// Last committed snapshot ID. `None` if no commit has been made.
     pub last_committed_id: Option<SnapshotId>,
-    /// Whether uncommitted changes exist since the last commit.
-    pub dirty: bool,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -212,18 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_config_namespace_map() {
-        let cfg = RemoteConfig {
-            name: "origin".into(),
-            url: "https://example.com".into(),
-            auth: RemoteAuth::None,
-            namespace_map: Some(("local".into(), "shared".into())),
-        };
-        assert_eq!(cfg.remote_namespace("local"), "shared");
-        assert_eq!(cfg.remote_namespace("other"), "other");
-    }
-
-    #[test]
     fn snapshot_id_from_hash_accepts_uppercase_and_normalizes() {
         let upper = "A".repeat(64);
         let id = SnapshotId::from_hash(&upper).unwrap();
@@ -256,110 +171,31 @@ mod tests {
     }
 
     #[test]
-    fn kg_snapshot_serde_roundtrip() {
-        let hex = "e".repeat(64);
-        let snap = KgSnapshot {
-            id: SnapshotId::from_hash(&hex).unwrap(),
-            namespace: "test-ns".into(),
-            parent_id: None,
-            message: "initial commit".into(),
-            author: Some("ocean".into()),
-            created_at: 1_700_000_000_000_000,
-            entity_count: 42,
-            edge_count: 7,
-        };
-        let json = serde_json::to_string(&snap).unwrap();
-        let back: KgSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.id, snap.id);
-        assert_eq!(back.namespace, snap.namespace);
-        assert_eq!(back.parent_id, snap.parent_id);
-        assert_eq!(back.entity_count, 42);
-        assert_eq!(back.edge_count, 7);
-        assert_eq!(back.author, Some("ocean".into()));
-    }
-
-    #[test]
-    fn kg_branch_serde_roundtrip() {
-        let branch = KgBranch {
-            namespace: "test-ns".into(),
-            name: "main".into(),
-            head_id: SnapshotId::from_hash(&"f".repeat(64)).unwrap(),
-            created_at: 1_000_000,
-            updated_at: 2_000_000,
-        };
-        let json = serde_json::to_string(&branch).unwrap();
-        let back: KgBranch = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.namespace, branch.namespace);
-        assert_eq!(back.name, branch.name);
-        assert_eq!(back.head_id, branch.head_id);
-        assert_eq!(back.created_at, 1_000_000);
-        assert_eq!(back.updated_at, 2_000_000);
-    }
-
-    #[test]
-    fn remote_auth_bearer_serde_round_trip_and_tag() {
-        let auth = RemoteAuth::Bearer {
-            token: "tok123".into(),
-        };
-        let json = serde_json::to_string(&auth).unwrap();
-        assert!(json.contains("\"type\":\"bearer\""));
-        let back: RemoteAuth = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, RemoteAuth::Bearer { ref token } if token == "tok123"));
-    }
-
-    #[test]
-    fn remote_auth_debug_redacts_bearer_token() {
-        let auth = RemoteAuth::Bearer {
-            token: "super-secret".into(),
-        };
-        let debug = format!("{:?}", auth);
-        assert!(
-            debug.contains("[REDACTED]"),
-            "expected [REDACTED] in: {debug}"
-        );
-        assert!(!debug.contains("super-secret"), "secret leaked in: {debug}");
-    }
-
-    #[test]
-    fn remote_auth_debug_redacts_basic_password() {
-        let auth = RemoteAuth::Basic {
-            user: "alice".into(),
-            password: "hunter2".into(),
-        };
-        let debug = format!("{:?}", auth);
-        assert!(debug.contains("alice"));
-        assert!(
-            debug.contains("[REDACTED]"),
-            "expected [REDACTED] in: {debug}"
-        );
-        assert!(!debug.contains("hunter2"), "password leaked in: {debug}");
-    }
-
-    #[test]
-    fn remote_config_none_namespace_map_returns_local_name() {
-        let cfg = RemoteConfig {
-            name: "origin".into(),
-            url: "https://example.com".into(),
-            auth: RemoteAuth::None,
-            namespace_map: None,
-        };
-        assert_eq!(cfg.remote_namespace("my-ns"), "my-ns");
-        assert_eq!(cfg.remote_namespace("other-ns"), "other-ns");
-    }
-
-    #[test]
     fn vcs_state_serde_roundtrip() {
         let state = VcsState {
             namespace: "proj".into(),
             current_branch: Some("main".into()),
             last_committed_id: Some(SnapshotId::from_hash(&"0".repeat(64)).unwrap()),
-            dirty: true,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: VcsState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.namespace, state.namespace);
         assert_eq!(back.current_branch, Some("main".into()));
-        assert!(back.dirty);
         assert_eq!(back.last_committed_id, state.last_committed_id);
+    }
+
+    #[test]
+    fn snapshot_coverage_v1_entities_and_edges_only() {
+        const { assert!(KG_V1_COVERAGE.entities) };
+        const { assert!(KG_V1_COVERAGE.edges) };
+        const { assert!(!KG_V1_COVERAGE.notes) };
+    }
+
+    #[test]
+    fn snapshot_coverage_serde_roundtrip() {
+        let cov = KG_V1_COVERAGE.clone();
+        let json = serde_json::to_string(&cov).unwrap();
+        let back: SnapshotCoverage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cov);
     }
 }

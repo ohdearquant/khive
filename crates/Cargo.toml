@@ -23,8 +23,10 @@ members = [
     "kkernel",
     "khive-retrieval",
 ]
-# khive-merge excluded — forward-deployed (ADR-043) but not yet compilable
-# against restructured khive-vcs. Will be re-added when ADR-043 integrates.
+# khive-merge removed — the custom three-way merge engine was superseded for v1
+# by git's line merge on sorted NDJSON (ADR-010, ADR-020). The conflict taxonomy
+# from ADR-043 is retained for a future conflict-resolution ADR; the crate is
+# excluded until that work is scoped.
 
 [workspace.package]
 version = "0.2.0"
