@@ -56,9 +56,14 @@ CRATES=(
     khive-pack-gtd
     khive-pack-brain
     khive-pack-memory
+    khive-pack-comm
+    khive-pack-schedule
+    khive-pack-template
     khive-vcs
     # khive-merge — forward-deployed (ADR-043), not yet compilable against
     # restructured khive-vcs. Skipped until ADR-043 integration lands.
+    # khive-bm25/khive-fusion/khive-hnsw/khive-retrieval/khive-vcs-adapters —
+    # workspace-only crates with no reverse deps; not published until wired in.
     khive-mcp
     kkernel
 )
