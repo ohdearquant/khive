@@ -1331,6 +1331,9 @@ async fn test_prev_bare_resolves_full_result() -> anyhow::Result<()> {
 // the HandlerDef.params slices are populated (not left as &[]).
 
 fn make_full_server() -> KhiveMcpServer {
+// ── help=true schema envelopes for comm + schedule verbs (issue #287) ─────────
+
+fn make_comm_schedule_server() -> KhiveMcpServer {
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
@@ -1354,6 +1357,20 @@ async fn connect_full(
     tokio::spawn(async move {
         if let Ok(server_service) = server.serve(server_transport).await {
             let _ = server_service.waiting().await;
+        packs: vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("in-memory runtime with comm+schedule");
+    KhiveMcpServer::new(runtime).expect("server builds with kg+comm+schedule")
+}
+
+async fn connect_comm_schedule(
+) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = make_comm_schedule_server();
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
         }
     });
     let client = DummyClient.serve(client_transport).await?;
@@ -1383,6 +1400,93 @@ async fn help_recall_params_non_empty_with_query_param() -> anyhow::Result<()> {
     let client = connect_full().await?;
     let schema = help_schema(&client, "recall").await?;
     let params = schema["params"]
+/// `send(help=true)` must return a non-empty params array that includes the
+/// required `to` and `content` parameters.
+#[tokio::test]
+async fn send_help_returns_required_to_and_content() -> anyhow::Result<()> {
+    let client = connect_comm_schedule().await?;
+    let result = ok_one(&client, "send(help=true)").await?;
+
+    assert_eq!(result["verb"], "send", "envelope verb must be 'send'");
+    assert_eq!(result["pack"], "comm", "envelope pack must be 'comm'");
+
+    let params = result["params"]
+        .as_array()
+        .expect("params must be an array");
+    assert!(!params.is_empty(), "send help must have non-empty params");
+
+    let to = params
+        .iter()
+        .find(|p| p["name"] == "to")
+        .expect("send help must include 'to'");
+    assert_eq!(
+        to["required"],
+        serde_json::json!(true),
+        "send.to must be required"
+    );
+
+    let content = params
+        .iter()
+        .find(|p| p["name"] == "content")
+        .expect("send help must include 'content'");
+    assert_eq!(
+        content["required"],
+        serde_json::json!(true),
+        "send.content must be required"
+    );
+
+    Ok(())
+}
+
+/// `inbox(help=true)` must return a non-empty params array with optional `limit`
+/// and `status` parameters.
+#[tokio::test]
+async fn inbox_help_returns_optional_limit_and_status() -> anyhow::Result<()> {
+    let client = connect_comm_schedule().await?;
+    let result = ok_one(&client, "inbox(help=true)").await?;
+
+    assert_eq!(result["verb"], "inbox");
+    assert_eq!(result["pack"], "comm");
+
+    let params = result["params"]
+        .as_array()
+        .expect("params must be an array");
+    assert!(!params.is_empty(), "inbox help must have non-empty params");
+
+    let limit = params
+        .iter()
+        .find(|p| p["name"] == "limit")
+        .expect("inbox help must include 'limit'");
+    assert_eq!(
+        limit["required"],
+        serde_json::json!(false),
+        "inbox.limit must be optional"
+    );
+
+    let status = params
+        .iter()
+        .find(|p| p["name"] == "status")
+        .expect("inbox help must include 'status'");
+    assert_eq!(
+        status["required"],
+        serde_json::json!(false),
+        "inbox.status must be optional"
+    );
+
+    Ok(())
+}
+
+/// `schedule(help=true)` must return a non-empty params array that includes the
+/// required `action` and `at` parameters.
+#[tokio::test]
+async fn schedule_help_returns_required_action_and_at() -> anyhow::Result<()> {
+    let client = connect_comm_schedule().await?;
+    let result = ok_one(&client, "schedule(help=true)").await?;
+
+    assert_eq!(result["verb"], "schedule");
+    assert_eq!(result["pack"], "schedule");
+
+    let params = result["params"]
         .as_array()
         .expect("params must be an array");
     assert!(
@@ -1447,5 +1551,76 @@ async fn help_propose_params_non_empty_with_title_description_changeset() -> any
         has_changeset,
         "propose params must include 'changeset'; got: {params:?}"
     );
+        "schedule help must have non-empty params"
+    );
+
+    let action = params
+        .iter()
+        .find(|p| p["name"] == "action")
+        .expect("schedule help must include 'action'");
+    assert_eq!(
+        action["required"],
+        serde_json::json!(true),
+        "schedule.action must be required"
+    );
+
+    let at = params
+        .iter()
+        .find(|p| p["name"] == "at")
+        .expect("schedule help must include 'at'");
+    assert_eq!(
+        at["required"],
+        serde_json::json!(true),
+        "schedule.at must be required"
+    );
+
+    Ok(())
+}
+
+/// `remind(help=true)` must return a non-empty params array that includes the
+/// required `content` and `at` parameters, plus optional `repeat`.
+#[tokio::test]
+async fn remind_help_returns_required_content_and_at() -> anyhow::Result<()> {
+    let client = connect_comm_schedule().await?;
+    let result = ok_one(&client, "remind(help=true)").await?;
+
+    assert_eq!(result["verb"], "remind");
+    assert_eq!(result["pack"], "schedule");
+
+    let params = result["params"]
+        .as_array()
+        .expect("params must be an array");
+    assert!(!params.is_empty(), "remind help must have non-empty params");
+
+    let content = params
+        .iter()
+        .find(|p| p["name"] == "content")
+        .expect("remind help must include 'content'");
+    assert_eq!(
+        content["required"],
+        serde_json::json!(true),
+        "remind.content must be required"
+    );
+
+    let at = params
+        .iter()
+        .find(|p| p["name"] == "at")
+        .expect("remind help must include 'at'");
+    assert_eq!(
+        at["required"],
+        serde_json::json!(true),
+        "remind.at must be required"
+    );
+
+    let repeat = params
+        .iter()
+        .find(|p| p["name"] == "repeat")
+        .expect("remind help must include 'repeat'");
+    assert_eq!(
+        repeat["required"],
+        serde_json::json!(false),
+        "remind.repeat must be optional"
+    );
+
     Ok(())
 }
