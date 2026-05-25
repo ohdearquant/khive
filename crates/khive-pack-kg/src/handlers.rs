@@ -1730,7 +1730,6 @@ impl KgPack {
         let proposal_id = Uuid::new_v4();
         let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
-        let now = chrono::Utc::now().timestamp_micros();
 
         let payload = ProposalCreatedPayload {
             proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
@@ -1775,32 +1774,10 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?;
 
-        let expiry_val = p.expiry;
-        let sql = self.runtime.sql();
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        writer
-            .execute(SqlStatement {
-                sql: "\
-                    INSERT INTO proposals_open \
-                        (proposal_id, namespace, proposer, title, status, \
-                         created_at, updated_at, expiry) \
-                    VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, ?6)"
-                    .to_string(),
-                params: vec![
-                    SqlValue::Text(proposal_id.to_string()),
-                    SqlValue::Text(ns),
-                    SqlValue::Text(actor.clone()),
-                    SqlValue::Text(p.title.clone()),
-                    SqlValue::Integer(now),
-                    match expiry_val {
-                        Some(v) => SqlValue::Integer(v),
-                        None => SqlValue::Null,
-                    },
-                ],
-                label: Some("proposals_open.insert".into()),
-            })
-            .await
-            .map_err(RuntimeError::Storage)?;
+        // ADR-046 §4: projection is maintained by ProposalsProjectionWorker, not inline here.
+        crate::projection_worker::ProposalsProjectionWorker::new(self.runtime.clone())
+            .on_proposal_created(token, proposal_id, &actor, &p.title, p.expiry)
+            .await?;
 
         to_json(&serde_json::json!({
             "proposal_id": proposal_id.to_string(),
@@ -1810,8 +1787,8 @@ impl KgPack {
         }))
     }
 
-    /// `review` — declaration verb. Emits a `ProposalReviewed` event and updates
-    /// the `proposals_open` projection table (counts, status, last_decision).
+    /// `review` — declaration verb. Emits a `ProposalReviewed` event; side effects
+    /// (projection update, changeset apply) are delegated to worker structs (ADR-046 §4-5).
     pub(crate) async fn handle_review(
         &self,
         token: &NamespaceToken,
@@ -1824,7 +1801,6 @@ impl KgPack {
         // Actor is always the authenticated token identity — client cannot override.
         let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
-        let now = chrono::Utc::now().timestamp_micros();
 
         let decision: ProposalDecision = match p.decision.trim().to_ascii_lowercase().as_str() {
             "approve" => ProposalDecision::Approve,
@@ -1923,39 +1899,25 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?;
 
-        let (new_status, approve_delta, reject_delta) = match decision {
-            ProposalDecision::Approve => ("approved", 1i64, 0i64),
-            ProposalDecision::Reject => ("rejected", 0, 1),
-            ProposalDecision::Comment => (current_status, 0, 0),
-            ProposalDecision::RequestChanges => ("changes_requested", 0, 0),
+        // Compute response status for the ACK (mirrors what the projection worker writes).
+        let new_status = match decision {
+            ProposalDecision::Approve => "approved",
+            ProposalDecision::Reject => "rejected",
+            ProposalDecision::Comment => current_status,
+            ProposalDecision::RequestChanges => "changes_requested",
         };
 
-        let last_decision_json = serde_json::to_string(&decision)
-            .map_err(|e| RuntimeError::Internal(format!("serialize decision: {e}")))?;
+        // ADR-046 §4: projection is maintained by ProposalsProjectionWorker.
+        crate::projection_worker::ProposalsProjectionWorker::new(self.runtime.clone())
+            .on_proposal_reviewed(token, &payload)
+            .await?;
 
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        writer
-            .execute(SqlStatement {
-                sql: "UPDATE proposals_open \
-                      SET status = ?1, updated_at = ?2, last_decision = ?3, \
-                          review_count = review_count + 1, \
-                          approve_count = approve_count + ?4, \
-                          reject_count = reject_count + ?5 \
-                      WHERE proposal_id = ?6 AND namespace = ?7"
-                    .to_string(),
-                params: vec![
-                    SqlValue::Text(new_status.to_string()),
-                    SqlValue::Integer(now),
-                    SqlValue::Text(last_decision_json),
-                    SqlValue::Integer(approve_delta),
-                    SqlValue::Integer(reject_delta),
-                    SqlValue::Text(proposal_id.to_string()),
-                    SqlValue::Text(ns),
-                ],
-                label: Some("proposals_open.update_review".into()),
-            })
-            .await
-            .map_err(RuntimeError::Storage)?;
+        // ADR-046 §5: apply worker fires on approval — idempotent on status check.
+        if decision == ProposalDecision::Approve {
+            crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
+                .maybe_apply(token, proposal_id)
+                .await?;
+        }
 
         to_json(&serde_json::json!({
             "proposal_id": proposal_id.to_string(),
@@ -1965,8 +1927,8 @@ impl KgPack {
         }))
     }
 
-    /// `withdraw` — commissive verb. Emits a `ProposalWithdrawn` event and updates
-    /// the `proposals_open` projection table to status='withdrawn'.
+    /// `withdraw` — commissive verb. Emits a `ProposalWithdrawn` event; projection
+    /// is updated by ProposalsProjectionWorker (ADR-046 §4).
     pub(crate) async fn handle_withdraw(
         &self,
         token: &NamespaceToken,
@@ -1979,7 +1941,6 @@ impl KgPack {
         // Actor is always the authenticated token identity — client cannot override.
         let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
-        let now = chrono::Utc::now().timestamp_micros();
 
         let sql = self.runtime.sql();
         let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
@@ -2059,22 +2020,10 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?;
 
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        writer
-            .execute(SqlStatement {
-                sql: "UPDATE proposals_open \
-                      SET status = 'withdrawn', updated_at = ?1 \
-                      WHERE proposal_id = ?2 AND namespace = ?3"
-                    .to_string(),
-                params: vec![
-                    SqlValue::Integer(now),
-                    SqlValue::Text(proposal_id.to_string()),
-                    SqlValue::Text(ns),
-                ],
-                label: Some("proposals_open.withdraw".into()),
-            })
-            .await
-            .map_err(RuntimeError::Storage)?;
+        // ADR-046 §4: projection is maintained by ProposalsProjectionWorker.
+        crate::projection_worker::ProposalsProjectionWorker::new(self.runtime.clone())
+            .on_proposal_withdrawn(token, proposal_id)
+            .await?;
 
         to_json(&serde_json::json!({
             "proposal_id": proposal_id.to_string(),

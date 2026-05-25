@@ -3,8 +3,22 @@
 //! Provides 14 verbs for managing entities, notes, edges, graph queries, and
 //! event-sourced proposals (ADR-046) in a research knowledge graph. This is
 //! the first-party pack shipped with the khive binary.
+//!
+//! ## Proposal worker architecture (ADR-046 §5)
+//!
+//! Proposal side-effects are handled by two workers:
+//!
+//! - [`apply_worker::ProposalApplyWorker`]: subscribes to approved proposals,
+//!   applies the changeset, emits `ProposalApplied`.
+//! - [`projection_worker::ProposalsProjectionWorker`]: maintains the
+//!   `proposals_open` projection table from all four proposal EventKinds.
+//!
+//! The KG handlers emit events first, then call the workers. Handlers do NOT
+//! update `proposals_open` directly.
 
+pub mod apply_worker;
 pub mod handlers;
+pub mod projection_worker;
 pub mod vocab;
 
 use async_trait::async_trait;
