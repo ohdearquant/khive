@@ -16,10 +16,36 @@ fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
+/// Resolve a raw id string to a full UUID.
+///
+/// Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix.
+/// The prefix is resolved via `runtime.resolve_prefix` (namespace-scoped).
+async fn resolve_id(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw: &str,
+    verb: &str,
+) -> Result<Uuid, RuntimeError> {
+    if let Ok(uuid) = raw.parse::<Uuid>() {
+        return Ok(uuid);
+    }
+    if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return match runtime.resolve_prefix(token, raw).await? {
+            Some(uuid) => Ok(uuid),
+            None => Err(RuntimeError::InvalidInput(format!(
+                "{verb}: no record matches prefix: {raw:?}"
+            ))),
+        };
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "{verb}: invalid id {raw:?}; expected full UUID or 8-char hex prefix"
+    )))
+}
+
 fn note_to_event_json(note: &Note) -> Value {
     json!({
         "id": short_id(note.id),
-        "full_id": note.id,
+        "full_id": note.id.as_hyphenated().to_string(),
         "kind": "scheduled_event",
         "content": note.content,
         "namespace": note.namespace,
@@ -132,7 +158,7 @@ pub(crate) async fn handle_remind(
 
     Ok(json!({
         "id": short_id(note.id),
-        "full_id": note.id,
+        "full_id": note.id.as_hyphenated().to_string(),
         "event_type": "remind",
         "trigger_at": p.at,
         "repeat": p.repeat,
@@ -185,7 +211,7 @@ pub(crate) async fn handle_schedule(
 
     Ok(json!({
         "id": short_id(note.id),
-        "full_id": note.id,
+        "full_id": note.id.as_hyphenated().to_string(),
         "event_type": "schedule",
         "trigger_at": p.at,
         "repeat": p.repeat,
@@ -269,8 +295,7 @@ pub(crate) async fn handle_cancel(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: CancelParams = deser(params)?;
-    let id = Uuid::parse_str(&p.id)
-        .map_err(|_| RuntimeError::InvalidInput(format!("cancel: invalid UUID {:?}", p.id)))?;
+    let id = resolve_id(runtime, token, &p.id, "cancel").await?;
 
     let store = runtime.notes(token)?;
     let mut note = store
@@ -305,7 +330,7 @@ pub(crate) async fn handle_cancel(
 
     Ok(json!({
         "id": short_id(id),
-        "full_id": id,
+        "full_id": id.as_hyphenated().to_string(),
         "status": "cancelled",
         "cancelled_at": cancelled_at,
         "properties": props,

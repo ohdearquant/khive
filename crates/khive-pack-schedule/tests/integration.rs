@@ -113,3 +113,81 @@ async fn remind_with_invalid_repeat_is_rejected() {
         .unwrap_err();
     assert!(err.to_string().contains("repeat") || err.to_string().contains("cron"));
 }
+
+#[tokio::test]
+async fn test_full_id_returns_36_char_schedule() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch(
+            "remind",
+            serde_json::json!({ "content": "check status", "at": "2026-06-01T09:00:00Z" }),
+        )
+        .await
+        .expect("remind succeeds");
+
+    let id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id present");
+    let full_id = result
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id present");
+
+    assert_eq!(id.len(), 8, "id must be 8-char short prefix");
+    assert_eq!(full_id.len(), 36, "full_id must be 36-char hyphenated UUID");
+    assert!(
+        full_id.starts_with(id),
+        "full_id must start with the short id prefix"
+    );
+    assert!(full_id.contains('-'), "full_id must be hyphenated format");
+}
+
+#[tokio::test]
+async fn test_cancel_accepts_short_id() {
+    let (registry, _rt) = build_registry();
+
+    let reminded = registry
+        .dispatch(
+            "remind",
+            serde_json::json!({ "content": "cancel me by short id", "at": "2026-07-01T12:00:00Z" }),
+        )
+        .await
+        .expect("remind succeeds");
+
+    let short = reminded
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id present");
+    let full_id = reminded
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id present");
+    assert_eq!(full_id.len(), 36, "full_id from remind must be 36-char");
+
+    // Cancel using only the 8-char short prefix — must succeed.
+    let result = registry
+        .dispatch("cancel", serde_json::json!({ "id": short }))
+        .await
+        .expect("cancel with 8-char short id succeeds");
+
+    assert_eq!(
+        result.get("status").and_then(|v| v.as_str()),
+        Some("cancelled"),
+        "cancel returns status=cancelled — got {result}"
+    );
+    let cancel_full_id = result
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("cancel returns full_id");
+    assert_eq!(
+        cancel_full_id.len(),
+        36,
+        "cancel response full_id must be 36-char"
+    );
+    assert!(
+        cancel_full_id.starts_with(short),
+        "cancel response full_id starts with short prefix"
+    );
+}

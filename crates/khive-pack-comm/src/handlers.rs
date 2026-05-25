@@ -16,10 +16,36 @@ fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
+/// Resolve a raw id string to a full UUID.
+///
+/// Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix.
+/// The prefix is resolved via `runtime.resolve_prefix` (namespace-scoped).
+async fn resolve_id(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw: &str,
+    verb: &str,
+) -> Result<Uuid, RuntimeError> {
+    if let Ok(uuid) = raw.parse::<Uuid>() {
+        return Ok(uuid);
+    }
+    if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return match runtime.resolve_prefix(token, raw).await? {
+            Some(uuid) => Ok(uuid),
+            None => Err(RuntimeError::InvalidInput(format!(
+                "{verb}: no record matches prefix: {raw:?}"
+            ))),
+        };
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "{verb}: invalid id {raw:?}; expected full UUID or 8-char hex prefix"
+    )))
+}
+
 fn note_to_message_json(note: &Note) -> Value {
     json!({
         "id": short_id(note.id),
-        "full_id": note.id,
+        "full_id": note.id.as_hyphenated().to_string(),
         "kind": "message",
         "content": note.content,
         "namespace": note.namespace,
@@ -112,7 +138,7 @@ pub(crate) async fn handle_send(
 
     Ok(json!({
         "id": short_id(note.id),
-        "full_id": note.id,
+        "full_id": note.id.as_hyphenated().to_string(),
         "from": from,
         "to": p.to,
         "subject": p.subject,
@@ -171,8 +197,7 @@ pub(crate) async fn handle_read(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: ReadParams = deser(params)?;
-    let id = Uuid::parse_str(&p.id)
-        .map_err(|_| RuntimeError::InvalidInput(format!("read: invalid UUID {:?}", p.id)))?;
+    let id = resolve_id(runtime, token, &p.id, "read").await?;
 
     let store = runtime.notes(token)?;
     let mut note = store
@@ -204,7 +229,9 @@ pub(crate) async fn handle_read(
         .await
         .map_err(|e| RuntimeError::Internal(format!("read: upsert_note: {e}")))?;
 
-    Ok(json!({ "id": short_id(id), "full_id": id, "read": true, "properties": props }))
+    Ok(
+        json!({ "id": short_id(id), "full_id": id.as_hyphenated().to_string(), "read": true, "properties": props }),
+    )
 }
 
 /// `reply` — reply to a message, threading linkage (ADR-040 §reply).
@@ -214,8 +241,7 @@ pub(crate) async fn handle_reply(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: ReplyParams = deser(params)?;
-    let id = Uuid::parse_str(&p.id)
-        .map_err(|_| RuntimeError::InvalidInput(format!("reply: invalid UUID {:?}", p.id)))?;
+    let id = resolve_id(runtime, token, &p.id, "reply").await?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "reply: `content` must not be empty".into(),
@@ -303,7 +329,7 @@ pub(crate) async fn handle_reply(
 
     Ok(json!({
         "id": short_id(reply_note.id),
-        "full_id": reply_note.id,
+        "full_id": reply_note.id.as_hyphenated().to_string(),
         "thread_id": thread_id,
         "from": from,
         "to": original_sender,
