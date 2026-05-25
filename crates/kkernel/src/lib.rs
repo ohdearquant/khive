@@ -6,11 +6,15 @@
 //!
 //! - [`sync`] — build a queryable SQLite DB from NDJSON sources (issue #174).
 //! - [`pack_introspect`] — enumerate registered packs and their handler surface.
-//!
-//! Migration and other admin operations will land here as separate modules.
+//! - [`kg`] — KG validation, init, and hook management (ADR-034, ADR-035).
+//! - [`engine`] — embedding model lifecycle management (ADR-043).
+//! - [`vector`] — vector store introspection and orphan sweep (ADR-044).
 
+pub mod engine;
+pub mod kg;
 pub mod pack_introspect;
 pub mod sync;
+pub mod vector;
 
 // Force the pack crates into the binary so their `inventory::submit!` blocks
 // run at startup. Cargo deps alone are not enough — the linker drops crates

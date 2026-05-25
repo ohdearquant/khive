@@ -5,8 +5,11 @@
 //!
 //! Subcommands:
 //!
-//! - `sync`  — build a queryable SQLite DB from NDJSON sources (issue #174)
-//! - `pack`  — introspect registered packs (`list`, `handler <name>`)
+//! - `sync`   — build a queryable SQLite DB from NDJSON sources (issue #174)
+//! - `pack`   — introspect registered packs (`list`, `handler <name>`)
+//! - `kg`     — KG validation, init, hook management (ADR-034, ADR-035)
+//! - `engine` — embedding model lifecycle: list/status/migrate/drift-check (ADR-043)
+//! - `vector` — vector store capabilities and orphan sweep (ADR-044)
 //!
 //! All subcommands emit JSON on stdout by default for easy piping/parsing.
 //! Pass `--human` to switch to a readable table where supported.
@@ -16,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use kkernel::{pack_introspect, sync};
+use kkernel::{engine, kg, pack_introspect, sync, vector};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,6 +44,18 @@ enum Command {
     /// Introspect registered packs.
     #[command(subcommand)]
     Pack(PackCommand),
+
+    /// KG validation, init, and hook management (ADR-034, ADR-035).
+    #[command(subcommand)]
+    Kg(kg::KgCommand),
+
+    /// Embedding model lifecycle: list, status, migrate, drift-check (ADR-043).
+    #[command(subcommand)]
+    Engine(engine::EngineCommand),
+
+    /// Vector store capabilities and orphan sweep (ADR-044).
+    #[command(subcommand)]
+    Vector(vector::VectorCommand),
 }
 
 #[derive(Parser, Debug)]
@@ -86,6 +101,9 @@ async fn main() -> Result<()> {
     match args.command {
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
+        Command::Kg(k) => kg::run_kg(k),
+        Command::Engine(e) => engine::run_engine(e),
+        Command::Vector(v) => vector::run_vector(v),
     }
 }
 
