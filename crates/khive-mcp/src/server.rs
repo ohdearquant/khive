@@ -259,12 +259,25 @@ impl KhiveMcpServer {
                     )
                 })?;
                 let resolved_val = arg_val.resolve_all(prev).ok_or_else(|| {
+                    // adr-dsl-packs H3: include available top-level fields in the
+                    // error message, matching the UX of the bare-$prev guard.
+                    let fields_hint = if let Value::Object(map) = prev {
+                        let mut fields: Vec<&str> =
+                            map.keys().map(String::as_str).collect();
+                        fields.sort_unstable();
+                        format!(
+                            " Available top-level fields: [{}]",
+                            fields.join(", ")
+                        )
+                    } else {
+                        String::new()
+                    };
                     (
                         tool.clone(),
                         json!({
                             "kind": "substitution_error",
                             "message": format!(
-                                "argument {name:?}: one or more $prev paths not found in prior result"
+                                "argument {name:?}: one or more $prev paths not found in prior result.{fields_hint}"
                             ),
                         }),
                     )
@@ -570,12 +583,20 @@ ops syntax (ADR-016):
   Single op   : verb(name=value, name=value)
   Batch       : [verb(...), verb(...)]                 — parallel, max 100
   Chain       : verb1(...) | verb2(id=$prev.id)        — sequential, $prev
-  JSON form   : [{"tool":"verb","args":{...}}, ...]    — equivalent
+  JSON form   : [{"tool":"verb","args":{...}}, ...]    — INDEPENDENT ops only
 
 Argument values are JSON literals: strings (double-quoted), numbers, booleans,
 null, arrays, objects. Strings may contain commas / parens; escape with \".
-Chain-only: $prev resolves to the prior op's result; $prev.field.path extracts
-a nested field.
+
+Chain-only: $prev resolves to the prior op's result. Path extraction syntax:
+  $prev               — full result
+  $prev.field         — nested object field
+  $prev.items[0].id   — array index
+  $prev[2]            — top-level array index
+Quoted strings that contain $prev are promoted to substitutions (e.g. id="$prev.id"
+is the same as id=$prev.id). To pass a literal "$prev", escape with backslash:
+\"\\$prev\". JSON form is for independent ops only — any $prev string in JSON
+form is rejected.
 
 Response shape:
 

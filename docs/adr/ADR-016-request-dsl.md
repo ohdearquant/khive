@@ -73,33 +73,77 @@ Mixing `,` and `|` at the top level is rejected as a parse error. A future
 extension may define sub-chain bracketing if a real use case justifies the
 complexity.
 
-**JSON form** is equivalent to function-call form and accepted by clients that
-emit structured objects more easily than they handle string templating:
+**JSON form** is canonical for programmatic input that produces structured objects
+more easily than string templating:
 
 ```json
 [{"tool": "verb1", "args": {...}}, {"tool": "verb2", "args": {...}}]
 ```
 
-Function-call form is canonical for LLM-generated input (denser tokens). JSON
-form is canonical for programmatic input. Both round-trip to the same
-`ParsedRequest`.
+**JSON form does not support `$prev` substitution.** JSON form always runs in
+parallel (`ExecutionMode::Parallel`). Any argument value that is exactly
+`"$prev"`, starts with `"$prev."`, or starts with `"$prev["` — including inside
+nested arrays or objects — is rejected at parse time with
+`DslError::PrevRefInJsonForm { arg_name }`. To use `$prev` substitution, use the
+function-call DSL with the `|` chain operator.
+
+Function-call form is canonical for LLM-generated input (denser tokens). Both
+forms produce the same `ParsedRequest` AST for non-chain ops.
 
 ### Argument value grammar
 
 Argument values use JSON literal syntax inside the function-call form:
 
-| Type                   | Example                             |
-| ---------------------- | ----------------------------------- |
-| String                 | `"hello world"` (double-quoted)     |
-| Number                 | `42`, `3.14`, `-1e6`                |
-| Boolean                | `true`, `false`                     |
-| Null                   | `null`                              |
-| Array                  | `[1, 2, 3]`, `["a", "b"]`           |
-| Object                 | `{"key": "value", "nested": {...}}` |
-| Reference (chain only) | `$prev`, `$prev.field.path`         |
+| Type                   | Example                                       |
+| ---------------------- | --------------------------------------------- |
+| String                 | `"hello world"` (double-quoted)               |
+| Number                 | `42`, `3.14`, `-1e6`                          |
+| Boolean                | `true`, `false`                               |
+| Null                   | `null`                                        |
+| Array                  | `[1, 2, 3]`, `["a", "b"]`                     |
+| Object                 | `{"key": "value", "nested": {...}}`           |
+| Reference (chain only) | `$prev`, `$prev.field.path`, `$prev[N].field` |
 
 String escapes follow JSON: `\\`, `\"`, `\n`, `\t`, `\r`. Other backslash
 sequences are literal.
+
+#### `$prev` reference grammar
+
+`$prev` references are valid only in chain (`|`) mode. In Single and Parallel
+forms they are rejected at parse time with `DslError::PrevRefOutsideChain`.
+
+Reference syntax:
+
+- `$prev` — the whole prior result.
+- `$prev.field` and `$prev.field.nested.path` — dot-separated field path.
+- `$prev[N]` and `$prev[N].field` — zero-based array index, then optional path.
+- Mixed: `$prev.items[0].id` — field, then index, then field.
+
+Array indices must be non-negative integers. Negative indices, non-numeric
+content, and unclosed brackets are parse errors for the unquoted form and are
+treated as literal strings (not promoted) for the quoted form.
+
+#### Quoted `$prev` strings (CC-3)
+
+A string argument like `"$prev.id"` is treated identically to the unquoted
+token `$prev.id` — both produce `ArgValue::PrevRef { path: "id" }`. This
+applies to dotted paths and bracket-index paths.
+
+To pass the **literal** string `$prev.id` as a value (not a reference), escape
+the leading `$` in the DSL source:
+
+```text
+get(id="\\$prev.id")   # delivers the string "$prev.id" to the handler
+```
+
+The DSL source `"\\$prev.id"` deserializes to `\$prev.id` (one backslash). The
+parser strips the backslash and stores `ArgValue::Value("$prev.id")`. The
+handler receives the clean literal string.
+
+Quoted bracket-index strings (`"$prev[N].field"`) are subject to the same
+index-validity rules as unquoted refs: only non-negative integers. Malformed
+bracket content (negative, non-numeric, missing `]`) is NOT promoted to
+`PrevRef` — it is stored as a literal string value.
 
 All arguments are named. Positional arguments are not supported — verbs evolve
 over time, and positional binding fragilely couples to argument order.
@@ -167,8 +211,22 @@ create(kind="entity", entity_kind="concept", name="FlashAttention")
 
 `$prev` resolves to the immediately preceding op's full result JSON.
 `$prev.field` and `$prev.field.nested.path` perform dot-path extraction on the
-prior result. If a referenced field doesn't exist, the chain aborts with
-`SubstitutionError { path, position }`.
+prior result. If a referenced field doesn't exist, the chain aborts with a
+typed substitution error whose message includes `"Available top-level fields: [...]"`
+— listing the keys actually present in the prior result — to aid debugging.
+
+Bare `$prev` (no path) resolving to a map or array is also an error: the
+dispatcher detects the case and emits a substitution error with the available
+field names before passing the value to the handler, preventing confusing
+downstream type errors.
+
+**Typed parser errors added in v0.2.2:**
+
+| Error                                      | When emitted                                          |
+| ------------------------------------------ | ----------------------------------------------------- |
+| `DslError::PrevRefOutsideChain { pos }`    | `$prev` in Single or Parallel form                    |
+| `DslError::PrevRefInJsonForm { arg_name }` | `$prev` string in JSON-form arg (top-level or nested) |
+| `DslError::UnsupportedVerbNesting { pos }` | Verb name with more than one dot (e.g. `a.b.c`)       |
 
 **Chain abort behavior**: If any op fails (or any `$prev` substitution fails),
 remaining ops in the chain are NOT dispatched. They appear in the response with

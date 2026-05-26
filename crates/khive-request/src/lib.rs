@@ -100,6 +100,9 @@ impl ArgValue {
     ///
     /// Returns the extracted field value, or `None` if the path doesn't
     /// exist in `prev_result`. Non-`PrevRef` variants return `None`.
+    ///
+    /// Path segments may include array indices: `$prev.items[0].id` or
+    /// `$prev[0].name`. Bracket indices are parsed as `usize` (ue-dsl-chain H1).
     pub fn resolve_prev<'a>(&self, prev_result: &'a Value) -> Option<&'a Value> {
         let ArgValue::PrevRef { path } = self else {
             return None;
@@ -108,8 +111,8 @@ impl ArgValue {
             return Some(prev_result);
         }
         let mut cur = prev_result;
-        for segment in path.split('.') {
-            cur = cur.get(segment)?;
+        for segment in split_path(path) {
+            cur = apply_path_segment(cur, segment)?;
         }
         Some(cur)
     }
@@ -200,14 +203,35 @@ pub enum DslError {
     UnclosedBracket {
         kind: char,
     },
-    /// `$prev` reference used outside a chain context.
+    /// `$prev` reference used outside a chain context (emitted by the parser for
+    /// Single-op and Parallel-batch forms, and for JSON form).
+    ///
+    /// # Policy
+    ///
+    /// `$prev` references are only meaningful in chain (`|`) mode. If they appear
+    /// in a non-chain context the parser rejects the request here so downstream
+    /// consumers that pattern-match on `DslError` get a typed error rather than
+    /// a runtime string.
     PrevRefOutsideChain {
         pos: usize,
+    },
+    /// `$prev` found in JSON-form input — JSON form does not support chains.
+    ///
+    /// JSON form (`[{"tool":"...","args":{...}},...]`) always runs in parallel.
+    /// To use `$prev` substitution, use the function-call DSL with the `|` chain
+    /// operator: `verb1(...) | verb2(id=$prev.id)`.
+    PrevRefInJsonForm {
+        arg_name: String,
     },
     /// Mixing `,` and `|` at the top level.
     MixedSeparators,
     /// Empty batch `[]` — no ops provided.
     EmptyBatch,
+    /// Dotted verb name with more than one level (e.g. `a.b.c`). Only
+    /// single-level dotted names are supported (`a.b`).
+    UnsupportedVerbNesting {
+        pos: usize,
+    },
 }
 
 impl fmt::Display for DslError {
@@ -245,7 +269,16 @@ impl fmt::Display for DslError {
             DslError::PrevRefOutsideChain { pos } => {
                 write!(
                     f,
-                    "at position {pos}: $prev reference is only valid in chain (|) mode"
+                    "at position {pos}: $prev reference is only valid in chain (|) mode; \
+                     use function-call form with '|' to chain ops"
+                )
+            }
+            DslError::PrevRefInJsonForm { arg_name } => {
+                write!(
+                    f,
+                    "argument {arg_name:?}: $prev substitution requires the function-call DSL \
+                     with the chain (|) operator; JSON form does not support chains. \
+                     Use: verb1(...) | verb2({arg_name}=$prev.id)"
                 )
             }
             DslError::MixedSeparators => {
@@ -256,6 +289,13 @@ impl fmt::Display for DslError {
             }
             DslError::EmptyBatch => {
                 write!(f, "empty batch not allowed; provide at least one op")
+            }
+            DslError::UnsupportedVerbNesting { pos } => {
+                write!(
+                    f,
+                    "at position {pos}: only single-level dotted verb names are supported \
+                     (e.g. brain.state); use a shorter name or register a pack alias"
+                )
             }
         }
     }
@@ -298,6 +338,10 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
 
     if p.eof() {
         // Single op — no separator follows.
+        // PrevRef in a single op is always invalid (adr-dsl-packs H1).
+        if let Some(pos) = find_prev_ref_pos(&first_op) {
+            return Err(DslError::PrevRefOutsideChain { pos });
+        }
         return Ok(ParsedRequest {
             ops: vec![first_op],
             mode: ExecutionMode::Single,
@@ -396,10 +440,16 @@ fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
             }
         };
         // JSON form does not support $prev references — all args are Values.
-        let args: BTreeMap<String, ArgValue> = args_map
-            .into_iter()
-            .map(|(k, v)| (k, ArgValue::Value(v)))
-            .collect();
+        // Recursively scan every arg value (including nested arrays/objects) for
+        // any string matching $prev, $prev.*, or $prev[* and reject with a typed
+        // PrevRefInJsonForm error (ue-dsl-chain C1, fix: recursive scan).
+        let mut args: BTreeMap<String, ArgValue> = BTreeMap::new();
+        for (k, v) in args_map {
+            if json_value_contains_prev_ref(&v) {
+                return Err(DslError::PrevRefInJsonForm { arg_name: k });
+            }
+            args.insert(k, ArgValue::Value(v));
+        }
         ops.push(ParsedOp { tool, args });
     }
     let mode = if is_single {
@@ -455,6 +505,12 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
             found: p.peek().unwrap(),
             expected: "end of input",
         });
+    }
+    // PrevRef inside a function-call parallel batch is invalid (adr-dsl-packs H1).
+    for op in &ops {
+        if let Some(pos) = find_prev_ref_pos(op) {
+            return Err(DslError::PrevRefOutsideChain { pos });
+        }
     }
     Ok(ParsedRequest {
         ops,
@@ -543,6 +599,12 @@ impl<'a> Parser<'a> {
             self.advance(1);
             let sub = self.parse_identifier()?;
             tool = format!("{tool}.{sub}");
+            // Only one level of dotting is supported. A second '.' is a clear
+            // error (adr-dsl-packs H2) — emit UnsupportedVerbNesting instead of
+            // the misleading "expected '|' or end of input, found '.'" message.
+            if self.peek() == Some('.') {
+                return Err(DslError::UnsupportedVerbNesting { pos: self.pos });
+            }
         }
         self.expect_char('(')?;
         self.skip_ws();
@@ -584,6 +646,12 @@ impl<'a> Parser<'a> {
 
     /// Parse an argument value — either a `$prev` reference, an array/object
     /// literal (which may contain `$prev` refs), or a plain JSON literal.
+    ///
+    /// CC-3: a quoted string like `"$prev.id"` is treated identically to the
+    /// unquoted token `$prev.id`. Both resolve to `ArgValue::PrevRef { path: "id" }`.
+    /// To pass the literal string `$prev.id` as a value, escape the leading `$`
+    /// in the JSON string: `"\\$prev.id"` deserializes to `\$prev.id`, which is
+    /// stripped to `$prev.id` and returned as a concrete `ArgValue::Value`.
     fn parse_arg_value(&mut self) -> Result<ArgValue, DslError> {
         self.skip_ws();
         if self.peek() == Some('$') {
@@ -596,6 +664,12 @@ impl<'a> Parser<'a> {
             return self.parse_object_arg();
         }
         let v = self.parse_value()?;
+        // CC-3: promote quoted "$prev[.path]" strings to PrevRef.
+        if let Value::String(s) = &v {
+            if let Some(prev_ref) = Self::string_as_prev_ref(s) {
+                return Ok(prev_ref);
+            }
+        }
         Ok(ArgValue::Value(v))
     }
 
@@ -737,7 +811,12 @@ impl<'a> Parser<'a> {
 
     /// Parse a `$prev` or `$prev.field.path` reference.
     ///
-    /// Grammar: `$prev` optionally followed by `.identifier(.identifier)*`
+    /// Grammar: `$prev` optionally followed by a path composed of:
+    /// - dot-separated identifiers: `.field`
+    /// - bracket array indices:     `[N]`
+    ///
+    /// Examples: `$prev`, `$prev.id`, `$prev.items[0].id`, `$prev[0].name`
+    /// (ue-dsl-chain H1: minimal array-index support added).
     fn parse_prev_ref(&mut self) -> Result<ArgValue, DslError> {
         let start = self.pos;
         // Consume `$`
@@ -755,15 +834,61 @@ impl<'a> Parser<'a> {
                 error: format!("expected '$prev', found '${}'", ident),
             });
         }
-        // Optional dot-path
+        // Optional path — dot-segments and/or bracket indices.
         let mut path = String::new();
-        while self.peek() == Some('.') {
-            self.advance(1); // consume '.'
-            let segment = self.parse_identifier()?;
-            if !path.is_empty() {
-                path.push('.');
+        loop {
+            match self.peek() {
+                Some('.') => {
+                    self.advance(1); // consume '.'
+                    let segment = self.parse_identifier()?;
+                    if !path.is_empty() {
+                        path.push('.');
+                    }
+                    path.push_str(&segment);
+                }
+                Some('[') => {
+                    // Array index: `[N]`
+                    self.advance(1); // consume '['
+                    let idx_start = self.pos;
+                    // Read digits
+                    let mut idx_str = String::new();
+                    while let Some(c) = self.peek() {
+                        if c.is_ascii_digit() {
+                            idx_str.push(c);
+                            self.advance(1);
+                        } else {
+                            break;
+                        }
+                    }
+                    if idx_str.is_empty() {
+                        return Err(DslError::InvalidValue {
+                            pos: idx_start,
+                            error: "expected non-negative integer inside '[...]'".into(),
+                        });
+                    }
+                    match self.peek() {
+                        Some(']') => self.advance(1),
+                        Some(c) => {
+                            return Err(DslError::UnexpectedChar {
+                                pos: self.pos,
+                                found: c,
+                                expected: "']'",
+                            });
+                        }
+                        None => {
+                            return Err(DslError::UnexpectedEof { expected: "']'" });
+                        }
+                    }
+                    if !path.is_empty() {
+                        path.push('.');
+                    }
+                    // Encode index as `[N]` so split_path can parse it back.
+                    path.push('[');
+                    path.push_str(&idx_str);
+                    path.push(']');
+                }
+                _ => break,
             }
-            path.push_str(&segment);
         }
         Ok(ArgValue::PrevRef { path })
     }
@@ -781,6 +906,72 @@ impl<'a> Parser<'a> {
             })?;
         self.pos = end;
         Ok(value)
+    }
+
+    /// Check whether a parsed string value is a `$prev` reference written
+    /// inside quotes (CC-3). Returns `Some(PrevRef)` if so, or
+    /// `Some(Value(...))` if the string is an escaped literal, or `None` if
+    /// neither (i.e. an ordinary string the caller should store as-is).
+    ///
+    /// ## Escape semantics (High-2 fix)
+    ///
+    /// A string like `"$prev.id"` deserializes to the Rust string `$prev.id`
+    /// and is promoted to `ArgValue::PrevRef { path: "id" }`.
+    ///
+    /// To pass the **literal** string `$prev.id` as a value, write `"\\$prev.id"`
+    /// in the DSL source. That deserializes to `\$prev.id` (one leading backslash).
+    /// This function strips the leading `\` and returns
+    /// `ArgValue::Value(json!("$prev.id"))` — so the handler receives the clean
+    /// string without the escape marker.
+    ///
+    /// `$prevish.id` does NOT match (prefix boundary is `.` or `[` only).
+    ///
+    /// ## Bracket-index validation (Medium-1 fix)
+    ///
+    /// Quoted `$prev[...]` strings are routed through the same bracket-body
+    /// validator as unquoted refs: only non-negative integers are accepted inside
+    /// `[...]`. Malformed brackets (negative index, non-numeric, unclosed) return
+    /// `None` (treated as a literal, consistent with the caller treating unknown
+    /// forms as values).
+    fn string_as_prev_ref(s: &str) -> Option<ArgValue> {
+        // Escape: `\$prev...` → strip the leading backslash, return literal.
+        if let Some(rest) = s.strip_prefix('\\') {
+            if rest == "$prev" || rest.starts_with("$prev.") || rest.starts_with("$prev[") {
+                return Some(ArgValue::Value(Value::String(rest.to_owned())));
+            }
+        }
+
+        if s == "$prev" {
+            return Some(ArgValue::PrevRef {
+                path: String::new(),
+            });
+        }
+        // "$prev.field..."
+        if let Some(rest) = s.strip_prefix("$prev.") {
+            if !rest.is_empty() {
+                return Some(ArgValue::PrevRef {
+                    path: rest.to_owned(),
+                });
+            }
+        }
+        // "$prev[N]..." — validate bracket body before promoting (Medium-1 fix).
+        if let Some(after_bracket) = s.strip_prefix("$prev[") {
+            // after_bracket is everything after "[", e.g. "0].id" or "-1].id"
+            if let Some(close) = after_bracket.find(']') {
+                let index_str = &after_bracket[..close];
+                // Only non-negative integers are valid.
+                if !index_str.is_empty() && index_str.chars().all(|c| c.is_ascii_digit()) {
+                    let tail = &after_bracket[close + 1..]; // "].id" → ".id" after close
+                                                            // path encodes as "[N]..." (used by split_path)
+                    let path = format!("[{index_str}]{tail}");
+                    return Some(ArgValue::PrevRef { path });
+                }
+            }
+            // Malformed bracket (missing ']', negative, non-numeric) — treat as invalid.
+            // Return None so the caller stores it as a literal Value.
+            return None;
+        }
+        None
     }
 
     /// Walk forward through the input to find the end of a JSON value, respecting
@@ -848,6 +1039,104 @@ impl<'a> Parser<'a> {
             return Err(DslError::UnclosedBracket { kind: '{' });
         }
         Ok(i)
+    }
+}
+
+/// Return `true` if the string value is a `$prev` reference written inside JSON
+/// quotes. Used to detect `"$prev.id"` literals in JSON-form input (ue-dsl-chain C1).
+///
+/// Matches exactly `$prev`, strings starting with `$prev.`, or strings starting
+/// with `$prev[` (bracket-index form). Does NOT match `$prevish.id` — the prefix
+/// boundary is `.` or `[` only.
+fn is_prev_ref_string(s: &str) -> bool {
+    s == "$prev" || s.starts_with("$prev.") || s.starts_with("$prev[")
+}
+
+/// Recursively scan a JSON value for any string that is a `$prev` reference.
+///
+/// This covers nested arrays and objects, so `{"ids": ["$prev.id"]}` and
+/// `{"nested": {"id": "$prev[0].id"}}` are both detected (fix for High-1).
+fn json_value_contains_prev_ref(v: &Value) -> bool {
+    match v {
+        Value::String(s) => is_prev_ref_string(s),
+        Value::Array(arr) => arr.iter().any(json_value_contains_prev_ref),
+        Value::Object(map) => map.values().any(json_value_contains_prev_ref),
+        _ => false,
+    }
+}
+
+/// A single segment in a `$prev` path — either a field name or an array index.
+#[derive(Debug, Clone, PartialEq)]
+enum PathSegment<'a> {
+    Field(&'a str),
+    Index(usize),
+}
+
+/// Split a dotted path that may contain bracket array indices into segments.
+///
+/// `"items[0].id"` → `[Field("items"), Index(0), Field("id")]`
+/// `"[2].name"` → `[Index(2), Field("name")]`
+/// `"plain.path"` → `[Field("plain"), Field("path")]`
+fn split_path(path: &str) -> Vec<PathSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut remaining = path;
+    while !remaining.is_empty() {
+        if let Some(rest) = remaining.strip_prefix('[') {
+            // Array index: `[N]...`
+            if let Some(close) = rest.find(']') {
+                let index_str = &rest[..close];
+                if let Ok(idx) = index_str.parse::<usize>() {
+                    segments.push(PathSegment::Index(idx));
+                    remaining = &rest[close + 1..];
+                    // Strip leading '.' before next segment, if any.
+                    remaining = remaining.strip_prefix('.').unwrap_or(remaining);
+                    continue;
+                }
+            }
+            // Malformed index — treat whole remainder as field (will fail lookup).
+            segments.push(PathSegment::Field(remaining));
+            break;
+        }
+        // Field name — up to next '.' or '['.
+        let end = remaining.find(['.', '[']).unwrap_or(remaining.len());
+        let field = &remaining[..end];
+        if !field.is_empty() {
+            segments.push(PathSegment::Field(field));
+        }
+        remaining = &remaining[end..];
+        // Strip leading '.' separator.
+        remaining = remaining.strip_prefix('.').unwrap_or(remaining);
+    }
+    segments
+}
+
+/// Apply one path segment to a JSON value — field lookup or array index.
+fn apply_path_segment<'a>(cur: &'a Value, seg: PathSegment<'_>) -> Option<&'a Value> {
+    match seg {
+        PathSegment::Field(key) => cur.get(key),
+        PathSegment::Index(idx) => cur.as_array()?.get(idx),
+    }
+}
+
+/// Scan an op's args for any `PrevRef` (or `Array`/`Object` containing one) and
+/// return a representative position (0 — we don't track source positions per-arg
+/// at this stage) if any is found. Used to emit `PrevRefOutsideChain` at parse
+/// time for Single and Parallel modes (adr-dsl-packs H1).
+fn find_prev_ref_pos(op: &ParsedOp) -> Option<usize> {
+    for av in op.args.values() {
+        if arg_value_has_prev_ref(av) {
+            return Some(0);
+        }
+    }
+    None
+}
+
+fn arg_value_has_prev_ref(av: &ArgValue) -> bool {
+    match av {
+        ArgValue::PrevRef { .. } => true,
+        ArgValue::Array(els) => els.iter().any(arg_value_has_prev_ref),
+        ArgValue::Object(pairs) => pairs.iter().any(|(_, v)| arg_value_has_prev_ref(v)),
+        ArgValue::Value(_) => false,
     }
 }
 
@@ -1407,5 +1696,307 @@ mod tests {
             path: "missing".into(),
         }]);
         assert_eq!(arr.resolve_all(&prev), None);
+    }
+
+    // ── CC-3: Quoted "$prev.id" substitutes the same as unquoted $prev.id ─────
+
+    #[test]
+    fn quoted_prev_ref_chain_parses_as_prev_ref() {
+        // CC-3: `get(id="$prev.id")` must produce PrevRef, not Value("$prev.id").
+        let r = req(r#"create(kind="concept", name="A") | get(id="$prev.id")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(r.ops[1].args["id"], ArgValue::PrevRef { path: "id".into() });
+    }
+
+    #[test]
+    fn quoted_bare_prev_ref_parses_as_prev_ref() {
+        // CC-3: `"$prev"` (no path) must also promote.
+        let r = req(r#"next() | update(id="$prev")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(r.ops[1].args["id"], ArgValue::PrevRef { path: "".into() });
+    }
+
+    #[test]
+    fn quoted_prev_ref_deep_path_parses_as_prev_ref() {
+        // CC-3: `"$prev.result.id"` — multi-segment dotted quoted ref.
+        let r = req(r#"create(kind="concept", name="A") | get(id="$prev.result.id")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(
+            r.ops[1].args["id"],
+            ArgValue::PrevRef {
+                path: "result.id".into()
+            }
+        );
+    }
+
+    #[test]
+    fn escaped_dollar_prev_stays_literal() {
+        // CC-3 escape (High-2 fix): `"\\$prev.id"` → the literal string `$prev.id`.
+        // The DSL source `"\\$prev.id"` deserializes to `\$prev.id` (one backslash).
+        // string_as_prev_ref strips the leading `\` and returns Value("$prev.id").
+        let r = req(r#"create(kind="concept", name="A") | get(id="\\$prev.id")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        // After stripping the escape marker the handler sees the clean literal.
+        assert_eq!(r.ops[1].args["id"], ArgValue::Value(json!("$prev.id")));
+    }
+
+    // ── ue-dsl-chain C1: JSON-form with $prev string is rejected clearly ──────
+
+    #[test]
+    fn json_form_with_prev_ref_string_is_rejected() {
+        // ue-dsl-chain C1: JSON form `[{...}, {"args":{"id":"$prev.id"}}]` must
+        // be rejected with PrevRefInJsonForm, not silently passed through.
+        let err = parse_request(
+            r#"[{"tool":"create","args":{"kind":"concept","name":"A"}},{"tool":"get","args":{"id":"$prev.id"}}]"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DslError::PrevRefInJsonForm { ref arg_name } if arg_name == "id"),
+            "expected PrevRefInJsonForm, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn json_form_with_bare_prev_string_is_rejected() {
+        // ue-dsl-chain C1: bare `"$prev"` in JSON form is also rejected.
+        let err = parse_request(r#"[{"tool":"get","args":{"id":"$prev"}}]"#).unwrap_err();
+        assert!(
+            matches!(err, DslError::PrevRefInJsonForm { ref arg_name } if arg_name == "id"),
+            "expected PrevRefInJsonForm, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn json_form_without_prev_ref_still_works() {
+        // ue-dsl-chain C1 guard: make sure normal JSON form is not broken.
+        let r = req(r#"[{"tool":"next","args":{}}, {"tool":"complete","args":{"id":"abc"}}]"#);
+        assert_eq!(r.mode, ExecutionMode::Parallel);
+        assert_eq!(r.ops.len(), 2);
+    }
+
+    // ── adr-dsl-packs H1: PrevRefOutsideChain emitted at parse time ───────────
+
+    #[test]
+    fn prev_ref_in_single_op_is_rejected() {
+        // adr-dsl-packs H1: `get(id=$prev.id)` without chain must be rejected.
+        let err = parse_request(r#"get(id=$prev.id)"#).unwrap_err();
+        assert!(
+            matches!(err, DslError::PrevRefOutsideChain { .. }),
+            "expected PrevRefOutsideChain, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn prev_ref_in_fn_batch_is_rejected() {
+        // adr-dsl-packs H1: PrevRef inside `[create(...), get(id=$prev.id)]` is
+        // parallel (no `|`) — must be rejected at parse time.
+        let err =
+            parse_request(r#"[create(kind="concept", name="A"), get(id=$prev.id)]"#).unwrap_err();
+        assert!(
+            matches!(err, DslError::PrevRefOutsideChain { .. }),
+            "expected PrevRefOutsideChain, got {err:?}"
+        );
+    }
+
+    // ── adr-dsl-packs H2: multi-segment dotted verb → clear error ─────────────
+
+    #[test]
+    fn three_segment_verb_name_rejected() {
+        // adr-dsl-packs H2: `brain.state.debug()` must produce UnsupportedVerbNesting,
+        // not the misleading "expected '|' or end of input, found '.'".
+        let err = parse_request("brain.state.debug()").unwrap_err();
+        assert!(
+            matches!(err, DslError::UnsupportedVerbNesting { .. }),
+            "expected UnsupportedVerbNesting, got {err:?}"
+        );
+    }
+
+    // ── ue-dsl-chain H1: array indexing in $prev paths ────────────────────────
+
+    #[test]
+    fn chain_prev_array_index_at_root() {
+        // `$prev[0].id` — index at the root of a prev result.
+        let r = req(r#"list(kind="concept") | get(id=$prev[0].id)"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(
+            r.ops[1].args["id"],
+            ArgValue::PrevRef {
+                path: "[0].id".into()
+            }
+        );
+    }
+
+    #[test]
+    fn chain_prev_array_index_nested() {
+        // `$prev.items[2].name` — index inside a named field.
+        let r = req(r#"list(kind="concept") | get(id=$prev.items[2].name)"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(
+            r.ops[1].args["id"],
+            ArgValue::PrevRef {
+                path: "items.[2].name".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_prev_array_index_at_root() {
+        let prev = json!([{"id": "first"}, {"id": "second"}]);
+        let r = ArgValue::PrevRef {
+            path: "[0].id".into(),
+        };
+        assert_eq!(r.resolve_prev(&prev), Some(&json!("first")));
+    }
+
+    #[test]
+    fn resolve_prev_array_index_nested() {
+        let prev = json!({"items": [{"name": "alpha"}, {"name": "beta"}]});
+        let r = ArgValue::PrevRef {
+            path: "items.[1].name".into(),
+        };
+        assert_eq!(r.resolve_prev(&prev), Some(&json!("beta")));
+    }
+
+    #[test]
+    fn resolve_prev_array_index_out_of_bounds_returns_none() {
+        let prev = json!([{"id": "only"}]);
+        let r = ArgValue::PrevRef {
+            path: "[5].id".into(),
+        };
+        assert_eq!(r.resolve_prev(&prev), None);
+    }
+
+    // ── CC-3 + H1: quoted prev ref with array index ───────────────────────────
+
+    #[test]
+    fn quoted_prev_ref_with_array_index_parses() {
+        // `"$prev[0].id"` quoted with bracket index should also promote.
+        let r = req(r#"list(kind="concept") | get(id="$prev[0].id")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(
+            r.ops[1].args["id"],
+            ArgValue::PrevRef {
+                path: "[0].id".into()
+            }
+        );
+    }
+
+    // ── High-1 regression: JSON-form recursive $prev detection ───────────────
+
+    #[test]
+    fn json_form_nested_array_with_prev_ref_is_rejected() {
+        // High-1: `{"ids": ["$prev.id"]}` — $prev inside an array arg must be detected.
+        let err = parse_request(
+            r#"[{"tool":"create","args":{"kind":"concept","name":"A"}},{"tool":"search","args":{"ids":["$prev.id"]}}]"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DslError::PrevRefInJsonForm { ref arg_name } if arg_name == "ids"),
+            "expected PrevRefInJsonForm for nested array, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn json_form_nested_object_with_prev_ref_is_rejected() {
+        // High-1: `{"filter": {"id": "$prev.id"}}` — $prev inside an object arg must be detected.
+        let err = parse_request(
+            r#"[{"tool":"create","args":{"kind":"concept","name":"A"}},{"tool":"search","args":{"filter":{"id":"$prev.id"}}}]"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DslError::PrevRefInJsonForm { ref arg_name } if arg_name == "filter"),
+            "expected PrevRefInJsonForm for nested object, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn json_form_bracket_prev_ref_is_rejected() {
+        // High-1: `{"id": "$prev[0].id"}` — bracket-index form must also be detected.
+        let err = parse_request(
+            r#"[{"tool":"create","args":{"kind":"concept","name":"A"}},{"tool":"get","args":{"id":"$prev[0].id"}}]"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DslError::PrevRefInJsonForm { ref arg_name } if arg_name == "id"),
+            "expected PrevRefInJsonForm for $prev[0].id, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn json_form_prevish_id_stays_literal() {
+        // High-1 boundary: `$prevish.id` is NOT a $prev ref and must pass through.
+        let r = req(r#"[{"tool":"get","args":{"id":"$prevish.id"}}]"#);
+        assert_eq!(r.mode, ExecutionMode::Parallel);
+        assert_eq!(r.ops[0].args["id"], ArgValue::Value(json!("$prevish.id")));
+    }
+
+    // ── High-2 regression: escape semantics produce clean literal ────────────
+
+    #[test]
+    fn escaped_dollar_prev_without_path_stays_literal() {
+        // High-2: `"\\$prev"` → literal `$prev` (no path), not a PrevRef.
+        let r = req(r#"create(kind="concept", name="A") | get(id="\\$prev")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(r.ops[1].args["id"], ArgValue::Value(json!("$prev")));
+    }
+
+    #[test]
+    fn escaped_dollar_prev_bracket_stays_literal() {
+        // High-2: `"\\$prev[0].id"` → literal `$prev[0].id`, not a PrevRef.
+        let r = req(r#"create(kind="concept", name="A") | get(id="\\$prev[0].id")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert_eq!(r.ops[1].args["id"], ArgValue::Value(json!("$prev[0].id")));
+    }
+
+    // ── Medium-1 regression: quoted bracket index validation ─────────────────
+
+    #[test]
+    fn quoted_prev_ref_negative_index_treated_as_literal() {
+        // Medium-1: `"$prev[-1].id"` — negative index is invalid in bracket grammar.
+        // string_as_prev_ref returns None → stored as literal Value, not PrevRef.
+        // In a chain, the value is a concrete string (no $prev substitution needed).
+        let r = req(r#"list(kind="concept") | get(id="$prev[-1].id")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        // Should be a Value (literal), NOT a PrevRef.
+        assert!(
+            matches!(r.ops[1].args["id"], ArgValue::Value(_)),
+            "negative index quoted ref must be literal Value, not PrevRef; got {:?}",
+            r.ops[1].args["id"]
+        );
+    }
+
+    #[test]
+    fn quoted_prev_ref_missing_close_bracket_treated_as_literal() {
+        // Medium-1: `"$prev[0.id"` — missing ']' is a malformed bracket.
+        let r = req(r#"list(kind="concept") | get(id="$prev[0.id")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert!(
+            matches!(r.ops[1].args["id"], ArgValue::Value(_)),
+            "unclosed bracket quoted ref must be literal Value, not PrevRef; got {:?}",
+            r.ops[1].args["id"]
+        );
+    }
+
+    #[test]
+    fn quoted_prev_ref_non_numeric_index_treated_as_literal() {
+        // Medium-1: `"$prev[abc].id"` — non-numeric index is invalid.
+        let r = req(r#"list(kind="concept") | get(id="$prev[abc].id")"#);
+        assert_eq!(r.mode, ExecutionMode::Chain);
+        assert!(
+            matches!(r.ops[1].args["id"], ArgValue::Value(_)),
+            "non-numeric bracket index quoted ref must be literal Value; got {:?}",
+            r.ops[1].args["id"]
+        );
+    }
+
+    #[test]
+    fn unquoted_negative_index_rejected_at_parse_time() {
+        // Regression: unquoted `$prev[-1].id` — the `-` is not a digit, so the
+        // digit-reader finds an empty index string and returns InvalidValue.
+        let err = parse_request(r#"list(kind="concept") | get(id=$prev[-1].id)"#).unwrap_err();
+        assert!(
+            matches!(err, DslError::InvalidValue { .. }),
+            "expected InvalidValue for negative index in unquoted ref, got {err:?}"
+        );
     }
 }

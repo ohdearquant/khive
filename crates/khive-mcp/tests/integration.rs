@@ -1463,6 +1463,60 @@ async fn test_ue4_h1_bare_prev_map_produces_clear_substitution_error() -> anyhow
     Ok(())
 }
 
+/// ADR-016 H3 regression: `$prev.nonexistent_field` error must list the
+/// available top-level fields from the prior result.
+///
+/// This test specifically covers the "H3: available fields hint" claim from the
+/// PR — that `$prev.bogus` returns an error message containing
+/// "Available top-level fields" plus at least one known field name.
+/// The existing `test_prev_unresolvable_aborts_chain` only checked that the
+/// path name appears in the error; this test asserts the field-hint clause.
+#[tokio::test]
+async fn test_h3_prev_nonexistent_field_error_lists_available_fields() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create a concept so $prev has known fields (id, full_id, kind, name, …).
+    let ops = r#"create(kind="entity", entity_kind="concept", name="H3Test") | get(id=$prev.nonexistent_field)"#;
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let results = body["results"].as_array().expect("results array");
+
+    assert_eq!(results.len(), 2, "expected 2 ops");
+    assert_eq!(results[0]["ok"], json!(true), "create must succeed");
+
+    // Op 1 (get) must fail because $prev.nonexistent_field doesn't exist.
+    assert_eq!(
+        results[1]["ok"],
+        json!(false),
+        "get with nonexistent field must fail: {}",
+        results[1]
+    );
+
+    // The error message must contain the "Available top-level fields" hint.
+    let err_obj = &results[1]["error"];
+    let err_msg = err_obj
+        .as_str()
+        .unwrap_or_else(|| err_obj["message"].as_str().unwrap_or(""));
+    assert!(
+        err_msg.contains("Available top-level fields"),
+        "H3: error must contain 'Available top-level fields'; got: {err_msg}"
+    );
+    // The hint must list at least one known field from the create result.
+    let mentions_field =
+        err_msg.contains("id") || err_msg.contains("kind") || err_msg.contains("full_id");
+    assert!(
+        mentions_field,
+        "H3: available-fields hint must name at least one known field; got: {err_msg}"
+    );
+
+    Ok(())
+}
+
 // ── help=true schema envelope integration tests ─────────────────────────────
 //
 // These tests confirm that help=true calls through the MCP surface return
