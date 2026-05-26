@@ -1,8 +1,8 @@
 //! Verb handler implementations for the comm pack (ADR-040).
 //!
-//! All four verbs (`send`, `inbox`, `read`, `reply`) store and query `message`
-//! notes in the standard notes table. Message-specific metadata lives in the
-//! `properties` JSON column; `content` is the message body.
+//! All five verbs (`send`, `inbox`, `read`, `reply`, `thread`) store and query
+//! `message` notes in the standard notes table. Message-specific metadata lives
+//! in the `properties` JSON column; `content` is the message body.
 
 use chrono::Utc;
 use serde::Deserialize;
@@ -55,6 +55,141 @@ fn note_to_message_json(note: &Note) -> Value {
     })
 }
 
+/// Write an outbound copy (caller namespace) and an inbound copy (recipient namespace),
+/// rolling back the outbound note if the inbound write fails (atomicity per ADR-040).
+///
+/// `subject`, `thread_id` are optional. `sent_at` is the RFC3339 timestamp for both copies.
+///
+/// Cross-namespace thread root invariant (ADR-040 §108-109): when a root message is sent
+/// (i.e., `thread_id` is `None`), both the outbound and inbound copies must share the
+/// same canonical `thread_id` — the sender's outbound UUID.  This ensures that
+/// `comm.thread(id=outbound_id)` can find replies written in any namespace, because all
+/// replies carry the same canonical thread_id regardless of which copy they were replying
+/// to.
+///
+/// When `thread_id` is already supplied (reply path), it is forwarded unchanged to both
+/// copies.
+///
+/// Returns the outbound `Note` on success.
+#[allow(clippy::too_many_arguments)]
+async fn dual_write_message(
+    runtime: &KhiveRuntime,
+    caller_token: &NamespaceToken,
+    from: &str,
+    to: &str,
+    subject: Option<&str>,
+    content: &str,
+    thread_id: Option<&str>,
+    sent_at: &str,
+) -> Result<Note, RuntimeError> {
+    let is_self_send = from == to.trim();
+
+    let recipient_token: Option<(Namespace, NamespaceToken)> = if is_self_send {
+        None
+    } else {
+        let recipient_ns = Namespace::parse(to.trim()).map_err(|e| {
+            RuntimeError::InvalidInput(format!("send: invalid recipient namespace {to:?}: {e}"))
+        })?;
+        let tok = runtime.authorize(recipient_ns.clone());
+        Some((recipient_ns, tok))
+    };
+
+    let outbound_props = json!({
+        "from": from,
+        "to": to,
+        "direction": "outbound",
+        "subject": subject,
+        "thread_id": thread_id,
+        "read": false,
+        "sent_at": sent_at,
+    });
+
+    let outbound_note = runtime
+        .create_note(
+            caller_token,
+            "message",
+            subject,
+            content,
+            None,
+            Some(outbound_props),
+            Vec::new(),
+        )
+        .await?;
+
+    // Canonical thread_id for both copies:
+    // - If the caller supplied a thread_id (reply path), propagate it as-is.
+    // - If this is a new root message (thread_id is None), use the outbound note's
+    //   UUID so that both copies share the same canonical root across namespaces.
+    let canonical_thread_id: String = match thread_id {
+        Some(tid) => tid.to_string(),
+        None => outbound_note.id.as_hyphenated().to_string(),
+    };
+
+    // Patch the outbound note's thread_id to the canonical value (only needed when
+    // this is a root send; reply path already has the correct thread_id stored).
+    if thread_id.is_none() {
+        let store = runtime
+            .notes(caller_token)
+            .map_err(|e| RuntimeError::Internal(format!("dual_write: get outbound store: {e}")))?;
+        let mut patched = outbound_note.clone();
+        let mut props = patched.properties.clone().unwrap_or_else(|| json!({}));
+        props["thread_id"] = json!(canonical_thread_id);
+        patched.properties = Some(props);
+        patched.updated_at = chrono::Utc::now().timestamp_micros();
+        if let Err(patch_err) = store.upsert_note(patched).await {
+            let _ = runtime
+                .delete_note(caller_token, outbound_note.id, true)
+                .await;
+            return Err(RuntimeError::Internal(format!(
+                "dual_write: patch outbound thread_id: {patch_err}"
+            )));
+        }
+    }
+
+    {
+        let inbound_tok: &NamespaceToken = if is_self_send {
+            caller_token
+        } else {
+            match recipient_token.as_ref() {
+                Some((_, tok)) => tok,
+                None => unreachable!("non-self-send always has recipient_token"),
+            }
+        };
+
+        let inbound_props = json!({
+            "from": from,
+            "to": to,
+            "direction": "inbound",
+            "subject": subject,
+            "thread_id": canonical_thread_id,
+            "read": false,
+            "sent_at": sent_at,
+            "outbound_ref": outbound_note.id,
+        });
+
+        let inbound_result = runtime
+            .create_note(
+                inbound_tok,
+                "message",
+                subject,
+                content,
+                None,
+                Some(inbound_props),
+                Vec::new(),
+            )
+            .await;
+
+        if let Err(inbound_err) = inbound_result {
+            let _ = runtime
+                .delete_note(caller_token, outbound_note.id, true)
+                .await;
+            return Err(inbound_err);
+        }
+    }
+
+    Ok(outbound_note)
+}
+
 // ── param structs ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -86,6 +221,16 @@ pub(crate) struct ReplyParams {
     pub content: String,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct ThreadParams {
+    /// Thread root ID: accepts either an 8-char short prefix or a full UUID.
+    /// Returns all messages whose `properties.thread_id` matches this value,
+    /// plus the originating message itself, in chronological order.
+    pub id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
     serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
@@ -96,9 +241,10 @@ fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeErro
 /// `send` — create a message note in the caller's namespace (outbound) AND the
 /// recipient's namespace (inbound) per ADR-040 §send.
 ///
-/// Two writes are made atomically: if the inbound write fails the outbound note
-/// is deleted before returning the error. When sender and recipient are the same
-/// namespace only one note is written (no duplicate).
+/// Two writes are made atomically via `dual_write_message`: if the inbound write
+/// fails the outbound note is deleted before returning the error. When sender and
+/// recipient are the same namespace both copies are written to the caller's namespace
+/// (one outbound, one inbound) so that `inbox()` surfaces self-sent messages.
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -119,75 +265,17 @@ pub(crate) async fn handle_send(
     let from = token.namespace().as_str().to_string();
     let sent_at = Utc::now().to_rfc3339();
 
-    // Validate the recipient namespace before any write so we never write an
-    // outbound note that we'd immediately have to roll back on parse failure.
-    // When from == to, skip cross-namespace checks (self-send path).
-    let recipient_token: Option<(Namespace, _)> = if from == p.to.trim() {
-        None // self-send: only one note, no inbound write needed
-    } else {
-        let recipient_ns = Namespace::parse(p.to.trim()).map_err(|e| {
-            RuntimeError::InvalidInput(format!("send: invalid recipient namespace {:?}: {e}", p.to))
-        })?;
-        let tok = runtime.authorize(recipient_ns.clone());
-        Some((recipient_ns, tok))
-    };
-
-    // ── Write 1: outbound copy in caller's namespace ──────────────────────────
-    let outbound_props = json!({
-        "from": from,
-        "to": p.to,
-        "direction": "outbound",
-        "subject": p.subject,
-        "thread_id": p.thread_id,
-        "read": false,
-        "sent_at": sent_at,
-    });
-
-    let outbound_note = runtime
-        .create_note(
-            token,
-            "message",
-            p.subject.as_deref(),
-            &p.content,
-            None,
-            Some(outbound_props),
-            Vec::new(),
-        )
-        .await?;
-
-    // ── Write 2: inbound copy in recipient's namespace ────────────────────────
-    // Skipped when from == to (self-send) — only one note for that case.
-    if let Some((_recipient_ns, ref recipient_tok)) = recipient_token {
-        let inbound_props = json!({
-            "from": from,
-            "to": p.to,
-            "direction": "inbound",
-            "subject": p.subject,
-            "thread_id": p.thread_id,
-            "read": false,
-            "sent_at": sent_at,
-            // Cross-reference back to the outbound copy for read-receipt tracking.
-            "outbound_ref": outbound_note.id,
-        });
-
-        let inbound_result = runtime
-            .create_note(
-                recipient_tok,
-                "message",
-                p.subject.as_deref(),
-                &p.content,
-                None,
-                Some(inbound_props),
-                Vec::new(),
-            )
-            .await;
-
-        // Atomicity: roll back outbound on inbound failure.
-        if let Err(inbound_err) = inbound_result {
-            let _ = runtime.delete_note(token, outbound_note.id, true).await;
-            return Err(inbound_err);
-        }
-    }
+    let outbound_note = dual_write_message(
+        runtime,
+        token,
+        &from,
+        &p.to,
+        p.subject.as_deref(),
+        &p.content,
+        p.thread_id.as_deref(),
+        &sent_at,
+    )
+    .await?;
 
     Ok(json!({
         "id": short_id(outbound_note.id),
@@ -200,44 +288,71 @@ pub(crate) async fn handle_send(
 }
 
 /// `inbox` — list inbound messages for the caller namespace (ADR-040 §inbox).
+///
+/// Implements a paginated scan so that matching messages are never lost when
+/// the newest unfiltered page contains no inbound rows. Each page fetches up
+/// to PAGE_SIZE messages; scanning stops when `limit` filtered rows are
+/// collected or the store is exhausted.
 pub(crate) async fn handle_inbox(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
-    let limit = p.limit.unwrap_or(20).clamp(1, 200);
-    let status = p.status.as_deref().unwrap_or("unread");
+    let limit = p.limit.unwrap_or(20).clamp(1, 200) as usize;
 
-    // Pull a broad window and filter in-memory for direction + read status.
-    let notes = runtime
-        .list_notes(token, Some("message"), limit * 4, 0)
-        .await?;
+    let status = match p.status.as_deref().unwrap_or("unread") {
+        s @ ("unread" | "read" | "all") => s,
+        other => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "inbox: invalid status {other:?}; expected one of: unread, read, all"
+            )));
+        }
+    };
 
-    let messages: Vec<Value> = notes
-        .iter()
-        .filter(|n| n.deleted_at.is_none())
-        .filter(|n| {
+    const PAGE_SIZE: u32 = 200;
+    let mut messages: Vec<Value> = Vec::with_capacity(limit);
+    let mut db_offset: u32 = 0;
+
+    loop {
+        let page = runtime
+            .list_notes(token, Some("message"), PAGE_SIZE, db_offset)
+            .await?;
+        let fetched = page.len();
+
+        for n in page {
+            if n.deleted_at.is_some() {
+                continue;
+            }
             let props = n.properties.as_ref();
             let direction = props
                 .and_then(|p| p.get("direction"))
                 .and_then(Value::as_str);
             if direction != Some("inbound") {
-                return false;
+                continue;
             }
             let read = props
                 .and_then(|p| p.get("read"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            match status {
+            let passes = match status {
                 "unread" => !read,
                 "read" => read,
-                _ => true, // "all"
+                _ => true,
+            };
+            if passes {
+                messages.push(note_to_message_json(&n));
+                if messages.len() == limit {
+                    break;
+                }
             }
-        })
-        .take(limit as usize)
-        .map(note_to_message_json)
-        .collect();
+        }
+
+        if messages.len() == limit || (fetched as u32) < PAGE_SIZE {
+            break;
+        }
+        db_offset += PAGE_SIZE;
+    }
 
     let count = messages.len();
     Ok(json!({ "messages": messages, "count": count }))
@@ -268,6 +383,22 @@ pub(crate) async fn handle_read(
         return Err(RuntimeError::InvalidInput(format!(
             "read: note {id} is kind {:?}, expected \"message\"",
             note.kind
+        )));
+    }
+
+    // Reject read() on outbound messages — "read" is a recipient action.
+    // Marking an outbound (sent) message as read corrupts the read/unread
+    // invariant and has no semantic meaning to the sender.
+    let direction = note
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("direction"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if direction == "outbound" {
+        return Err(RuntimeError::InvalidInput(format!(
+            "read: cannot mark outbound message {id} as read (direction=outbound); \
+             read() is a recipient action for inbound messages only"
         )));
     }
 
@@ -375,31 +506,25 @@ pub(crate) async fn handle_reply(
         original_from.clone()
     };
 
-    let properties = json!({
-        "from": from,
-        "to": reply_to,
-        "direction": "outbound",
-        "subject": reply_subject,
-        "thread_id": thread_id,
-        "read": false,
-        "sent_at": sent_at,
-    });
+    let reply_subject_opt = if reply_subject.is_empty() {
+        None
+    } else {
+        Some(reply_subject.as_str())
+    };
 
-    let reply_note = runtime
-        .create_note(
-            token,
-            "message",
-            if reply_subject.is_empty() {
-                None
-            } else {
-                Some(reply_subject.as_str())
-            },
-            &p.content,
-            None,
-            Some(properties),
-            Vec::new(),
-        )
-        .await?;
+    // dual_write_message writes outbound to caller namespace and inbound to
+    // recipient namespace, matching the same delivery semantics as `send`.
+    let reply_note = dual_write_message(
+        runtime,
+        token,
+        &from,
+        &reply_to,
+        reply_subject_opt,
+        &p.content,
+        Some(&thread_id),
+        &sent_at,
+    )
+    .await?;
 
     Ok(json!({
         "id": short_id(reply_note.id),
@@ -409,5 +534,143 @@ pub(crate) async fn handle_reply(
         "to": reply_to,
         "subject": reply_subject,
         "sent_at": sent_at,
+    }))
+}
+
+/// `thread` — retrieve all messages in a conversation thread (ADR-040 §thread).
+///
+/// Returns the originating message (the one whose `id` matches the `thread_id`
+/// root) plus all messages whose `properties.thread_id` equals the root UUID,
+/// ordered by `created_at` ascending (chronological).
+///
+/// Cross-namespace thread resolution: when the resolved note carries a `thread_id`
+/// in its properties that differs from its own UUID, that stored `thread_id` IS the
+/// canonical root (e.g., this is an inbound copy of the root, or a non-root message).
+/// `comm.thread` resolves to that canonical root so that `thread(id=id_A)` and
+/// `thread(id=id_B)` both return the full conversation regardless of which copy UUID
+/// the caller holds.
+///
+/// The root ID is validated: it must exist in the caller namespace and its
+/// `kind` must be `"message"`. A full UUID that does not resolve, belongs to a
+/// different namespace, or has the wrong kind returns an error — the same
+/// behaviour as `read()` and `reply()`.
+pub(crate) async fn handle_thread(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: ThreadParams = deser(params)?;
+    let limit = p.limit.unwrap_or(100).clamp(1, 500) as usize;
+
+    // Resolve and validate the passed ID.
+    let passed_uuid = resolve_id(runtime, token, &p.id, "thread").await?;
+
+    let canonical_thread_id: String = {
+        let store = runtime.notes(token)?;
+        let note = store
+            .get_note(passed_uuid)
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("thread: get_note: {e}")))?
+            .ok_or_else(|| {
+                RuntimeError::NotFound(format!("thread: message {passed_uuid} not found"))
+            })?;
+
+        if note.namespace != token.namespace().as_str() {
+            return Err(RuntimeError::NotFound(format!(
+                "thread: message {passed_uuid} not found"
+            )));
+        }
+        if note.kind != "message" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "thread: note {passed_uuid} is kind {:?}, expected \"message\"",
+                note.kind
+            )));
+        }
+
+        // Cross-namespace root resolution: if the note's properties.thread_id is a
+        // valid full UUID that differs from the note's own UUID, use that as the
+        // canonical thread_id.  This handles the case where the caller holds an
+        // inbound copy UUID (id_B) but the canonical root is the outbound UUID (id_A).
+        // Both copies were written with the same canonical thread_id by dual_write_message.
+        match note
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("thread_id"))
+            .and_then(Value::as_str)
+            .filter(|s| s.len() == 36)
+            .and_then(|s| s.parse::<Uuid>().ok())
+        {
+            Some(stored_root) if stored_root != passed_uuid => {
+                stored_root.as_hyphenated().to_string()
+            }
+            _ => passed_uuid.as_hyphenated().to_string(),
+        }
+    };
+
+    let canonical_short = &canonical_thread_id[..8];
+
+    // Paginated scan: collect up to `limit` matching messages without a fixed
+    // prefetch cap.  Sorting happens after collection because DB ordering is by
+    // `created_at DESC`; we need ascending for thread display.
+    const PAGE_SIZE: u32 = 200;
+    let mut messages: Vec<Value> = Vec::new();
+    let mut db_offset: u32 = 0;
+
+    loop {
+        let page = runtime
+            .list_notes(token, Some("message"), PAGE_SIZE, db_offset)
+            .await?;
+        let fetched = page.len();
+
+        for n in page {
+            if n.deleted_at.is_some() {
+                continue;
+            }
+            let props = n.properties.as_ref();
+
+            // A message belongs to this thread if:
+            // (a) its own UUID equals the canonical thread_id (it IS the root), or
+            // (b) its properties.thread_id equals the canonical thread_id (it is a reply).
+            let matches = {
+                let own_full = n.id.as_hyphenated().to_string();
+                if own_full == canonical_thread_id {
+                    true
+                } else {
+                    match props
+                        .and_then(|p| p.get("thread_id"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(stored_thread) => {
+                            stored_thread == canonical_thread_id
+                                || stored_thread == canonical_short
+                                || (stored_thread.len() >= 8
+                                    && &stored_thread[..8] == canonical_short)
+                        }
+                        None => false,
+                    }
+                }
+            };
+
+            if matches {
+                messages.push(note_to_message_json(&n));
+            }
+        }
+
+        if (fetched as u32) < PAGE_SIZE {
+            break;
+        }
+        db_offset += PAGE_SIZE;
+    }
+
+    // Sort chronologically ascending (earliest first).
+    messages.sort_by_key(|m| m.get("created_at").and_then(Value::as_i64).unwrap_or(0));
+    messages.truncate(limit);
+    let count = messages.len();
+
+    Ok(json!({
+        "thread_id": canonical_thread_id,
+        "count": count,
+        "messages": messages,
     }))
 }

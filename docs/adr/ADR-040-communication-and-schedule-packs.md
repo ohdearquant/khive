@@ -57,12 +57,13 @@ impl Pack for CommPack {
     const NOTE_KINDS:   &'static [&'static str] = &["message"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS:     &'static [HandlerDef]   = &[
-        HandlerDef { name: "comm.send",  description: "Send a message, optionally threaded.",  visibility: Visibility::Verb },
-        HandlerDef { name: "comm.inbox", description: "List inbound messages for the caller.", visibility: Visibility::Verb },
-        HandlerDef { name: "comm.read",  description: "Mark a message as read.",               visibility: Visibility::Verb },
-        HandlerDef { name: "comm.reply", description: "Reply to a message, threading linkage.", visibility: Visibility::Verb },
+        HandlerDef { name: "comm.send",   description: "Send a message, optionally threaded.",                             visibility: Visibility::Verb },
+        HandlerDef { name: "comm.inbox",  description: "List inbound messages for the caller.",                            visibility: Visibility::Verb },
+        HandlerDef { name: "comm.read",   description: "Mark an inbound message as read.",                                 visibility: Visibility::Verb },
+        HandlerDef { name: "comm.reply",  description: "Reply to a message, threading linkage.",                           visibility: Visibility::Verb },
+        HandlerDef { name: "comm.thread", description: "Retrieve all messages in a conversation thread, chronologically.", visibility: Visibility::Verb },
     ];
-    // ADR-023 §4: pack-prefixed verb names — `comm.send` / `comm.inbox` / `comm.read` / `comm.reply`
+    // ADR-023 §4: pack-prefixed verb names — `comm.send` / `comm.inbox` / `comm.read` / `comm.reply` / `comm.thread`
     const EDGE_RULES:   &'static [EdgeEndpointRule] = &[];
     const REQUIRES:     &'static [&'static str] = &["kg"];
 }
@@ -92,14 +93,34 @@ The `content` field on the note is the message body. Subject is optional metadat
 caller's namespace) or `outbound` (message sent by the caller). This is set by `send` and
 `reply` at write time — callers do not supply it.
 
-#### Four verbs
+#### Five verbs
 
-| Verb         | Speech act (ADR-025) | Args                                      | What it does                                                                                                                                                                                                                 |
-| ------------ | -------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `comm.send`  | commissive           | `to`, `subject?`, `content`, `thread_id?` | Create a message note in the recipient's namespace. `from` is set to the caller's identity. `direction=inbound` in recipient's namespace; `direction=outbound` copy created in caller's namespace.                           |
-| `comm.inbox` | assertive            | `limit?`, `status?`                       | List inbound messages (`direction=inbound`) for the caller, ordered by `sent_at` descending. `status` filters on `read`: `unread` (default), `read`, or `all`.                                                               |
-| `comm.read`  | declaration          | `id`                                      | Set `properties.read = true` on the message. Returns the updated message envelope.                                                                                                                                           |
-| `comm.reply` | commissive           | `id`, `content`                           | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the original sender, `subject` prefixed with `"Re: "` if not already. |
+| Verb          | Speech act (ADR-025) | Args                                      | What it does                                                                                                                                                                                                                                                                              |
+| ------------- | -------------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.send`   | commissive           | `to`, `subject?`, `content`, `thread_id?` | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.             |
+| `comm.inbox`  | assertive            | `limit?`, `status?`                       | List inbound messages (`direction=inbound`) for the caller. `status` filters on `read`: `unread` (default), `read`, or `all`. Uses a paginated scan so that inbound messages are never missed behind a deep outbound backlog.                                                             |
+| `comm.read`   | declaration          | `id`                                      | Set `properties.read = true` on an **inbound** message. Returns the updated message envelope. Outbound messages cannot be marked read; the verb returns an error if `direction=outbound`.                                                                                                 |
+| `comm.reply`  | commissive           | `id`, `content`                           | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient.           |
+| `comm.thread` | assertive            | `id`, `limit?`                            | Validate the root message by UUID (must exist, must be `kind=message`), then return the root plus all messages whose `properties.thread_id` equals the root UUID, sorted by `created_at` ascending (chronological). Uses a paginated scan. `id` accepts 8-char short prefix or full UUID. |
+
+#### Message-filter scan cap
+
+`list(kind=message, direction=…)` and similar filtered calls route through the KG pack's
+paginated scan path. The scan reads the note store in 200-row pages (newest-first) and applies
+in-memory filters until `limit` matches are collected. To bound worst-case cost on very large
+stores (e.g. 1 M+ messages), the scan stops after at most **10 000 unfiltered rows**
+(`MAX_SCAN_TOTAL` in `khive-pack-kg/src/handlers.rs`).
+
+Callers with deep mailboxes should prefer the dedicated comm verbs, which are not subject to
+this cap:
+
+- `comm.inbox` — paginates through the store by namespace until `limit` inbound rows are found;
+  no total-scan ceiling.
+- `comm.thread` — indexed by `thread_id`; scans the full store but exits early once every page
+  returns no new matches.
+
+The 10 000-row cap is an implementation detail and may be raised or made configurable in a
+future release.
 
 #### Threading model
 
@@ -344,8 +365,8 @@ KHIVE_PACKS=kg,gtd,comm,schedule kkernel mcp   # full stack
 ```
 
 ADR-016's dynamic verb catalog reflects exactly what is loaded; agents that do not load
-`comm` see no `send`/`inbox`/`read`/`reply` verbs, and agents that do not load `schedule`
-see no `remind`/`schedule`/`agenda`/`cancel` verbs.
+`comm` see no `send`/`inbox`/`read`/`reply`/`thread` verbs, and agents that do not load
+`schedule` see no `remind`/`schedule`/`agenda`/`cancel` verbs.
 
 ## Rationale
 
@@ -386,16 +407,23 @@ graceful shutdown — machinery that belongs in the runtime binary, not a pack. 
 intent storage (pack) from trigger evaluation (runtime/external) keeps the pack composable
 across deployment modes: single-binary local use, daemon mode, cloud cron.
 
-### Why four verbs per pack
+### Why five verbs for comm, four for schedule
 
-The verb count matches the domain's natural CRUD shape. `send`/`reply` are the two creation
-paths for messages (standalone vs. threaded). `inbox` and `read` are the two read-path
-verbs (list and acknowledge). For schedule, `remind`/`schedule` are the two creation paths
-(notification vs. verb dispatch), `agenda` is the query verb, and `cancel` is the
-termination verb.
+The comm pack's natural CRUD shape maps to five verbs: `send`/`reply` are the two creation
+paths (standalone vs. threaded), `inbox` and `read` are the two read-path verbs (list and
+acknowledge), and `thread` is the conversation-reconstruction verb. `thread` was promoted from
+the `list(kind=message, thread_id=X)` workaround path to a first-class verb because (a) it
+validates the root ID before scanning, (b) it uses a paginated scan rather than a bounded
+prefetch window, and (c) it returns chronologically sorted output — semantics that `list` does
+not guarantee.
 
-Each pack adds exactly four disjoint verbs with no overlap with kg, gtd, or memory verb
-names. ADR-017's `VerbRegistry` rejects duplicates at boot.
+The schedule pack retains exactly four verbs: `remind`/`schedule` are the two creation paths
+(notification vs. verb dispatch), `agenda` is the query verb, and `cancel` is the termination
+verb.
+
+Both packs use disjoint verb names with no overlap with kg, gtd, or memory verb names.
+ADR-017's `VerbRegistry` rejects duplicates at boot. The total catalog grows by nine verbs
+across the two packs (five comm + four schedule), not eight.
 
 ### Why no `forget` / `unschedule` — use `cancel` / `delete`
 
@@ -423,9 +451,9 @@ standard `delete(id)` path.
 
 - Two new note kinds (`message`, `scheduled_event`) integrate into the existing notes pipeline
   at zero schema cost. FTS5 search, hybrid recall, and graph linkage work without new plumbing.
-- The verb catalog grows by eight verbs across two packs, each with a distinct and coherent
-  domain. ADR-016's dynamic catalog means agents that don't load these packs see no surface
-  bloat.
+- The verb catalog grows by nine verbs across two packs (five comm: send/inbox/read/reply/thread;
+  four schedule: schedule/remind/agenda/cancel), each with a distinct and coherent domain.
+  ADR-016's dynamic catalog means agents that don't load these packs see no surface bloat.
 - The `annotates` edge mechanism from ADR-002 works for both packs without new edge endpoint
   rules — messages and scheduled events attach to KG entities the same way observations do.
 - Cross-pack scheduling (GTD, Comm) is composition at the payload level — no inter-pack API.

@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Communication pack — inter-agent messaging (send, inbox, read, reply) (ADR-040)"
+description = "Communication pack — inter-agent messaging (send, inbox, read, reply, thread) (ADR-040)"
 
 [dependencies]
 khive-types = { version = "0.2.2", path = "../khive-types", features = ["serde"] }

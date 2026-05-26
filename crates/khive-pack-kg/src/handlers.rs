@@ -224,6 +224,12 @@ struct ListParams {
     min_weight: Option<f64>,
     max_weight: Option<f64>,
     note_kind: Option<String>,
+    // message-specific filters (comm pack — properties JSON column)
+    thread_id: Option<String>,
+    direction: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    read: Option<bool>,
     // event-specific filters
     verb: Option<String>,
     verbs: Option<Vec<String>>,
@@ -1330,18 +1336,154 @@ impl KgPack {
                 )?;
                 let limit = p.limit.unwrap_or(20).min(200);
                 let offset = p.offset.unwrap_or(0);
-                let notes = self
-                    .runtime
-                    .list_notes(token, kind_filter.as_deref(), limit, offset)
-                    .await?;
-                let remapped: Vec<Value> = notes
-                    .iter()
-                    .map(|n| {
-                        to_json(n)
-                            .map(remap_note_status)
-                            .unwrap_or_else(|_| serde_json::json!({}))
-                    })
-                    .collect();
+
+                // Determine whether any message-specific property filters are active.
+                // These are not pushed to SQL (the NoteStore only filters by namespace +
+                // kind); they are applied in-memory after retrieval.
+                let has_msg_filter = p.thread_id.is_some()
+                    || p.direction.is_some()
+                    || p.from.is_some()
+                    || p.to.is_some()
+                    || p.read.is_some();
+
+                // Normalise a thread_id for comparison: accept either the 8-char
+                // short prefix or the full 36-char UUID form.
+                let thread_id_filter = p.thread_id.as_deref();
+                let direction_filter = p.direction.as_deref();
+                let from_filter = p.from.as_deref();
+                let to_filter = p.to.as_deref();
+                let read_filter = p.read;
+
+                // When message filters are active, use a paginated scan so that matching
+                // rows are never lost behind a deep backlog of non-matching messages.
+                // Total scan is capped at MAX_SCAN_TOTAL to avoid pathological performance
+                // on very large note stores (e.g. 1M+ messages).
+                // For deep mailboxes, prefer comm.inbox (no cap) or comm.thread (thread-indexed).
+                // See ADR-040 §"Message-filter scan cap" for rationale and alternatives.
+                const PAGE_SIZE: u32 = 200;
+                const MAX_SCAN_TOTAL: u32 = 10_000;
+
+                let notes: Vec<_> = if has_msg_filter {
+                    let mut collected: Vec<_> = Vec::new();
+                    let mut db_offset: u32 = 0;
+                    let target_after_skip = offset as usize + limit as usize;
+                    loop {
+                        let remaining_scan =
+                            MAX_SCAN_TOTAL.saturating_sub(db_offset).min(PAGE_SIZE);
+                        if remaining_scan == 0 {
+                            break;
+                        }
+                        let page = self
+                            .runtime
+                            .list_notes(token, kind_filter.as_deref(), remaining_scan, db_offset)
+                            .await?;
+                        let fetched = page.len() as u32;
+                        for n in page {
+                            if n.deleted_at.is_some() {
+                                continue;
+                            }
+                            let props = n.properties.as_ref();
+                            let passes = (|| {
+                                if let Some(wanted_thread) = thread_id_filter {
+                                    let stored = match props
+                                        .and_then(|p| p.get("thread_id"))
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        Some(s) => s,
+                                        None => return false,
+                                    };
+                                    let matches = stored == wanted_thread
+                                        || (stored.len() >= 8
+                                            && wanted_thread.len() >= 8
+                                            && stored[..8] == wanted_thread[..8]);
+                                    if !matches {
+                                        return false;
+                                    }
+                                }
+                                if let Some(wanted_dir) = direction_filter {
+                                    let stored = props
+                                        .and_then(|p| p.get("direction"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    if stored != wanted_dir {
+                                        return false;
+                                    }
+                                }
+                                if let Some(wanted_from) = from_filter {
+                                    let stored = props
+                                        .and_then(|p| p.get("from"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    if stored != wanted_from {
+                                        return false;
+                                    }
+                                }
+                                if let Some(wanted_to) = to_filter {
+                                    let stored = props
+                                        .and_then(|p| p.get("to"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    if stored != wanted_to {
+                                        return false;
+                                    }
+                                }
+                                if let Some(wanted_read) = read_filter {
+                                    let stored = props
+                                        .and_then(|p| p.get("read"))
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false);
+                                    if stored != wanted_read {
+                                        return false;
+                                    }
+                                }
+                                true
+                            })();
+                            if passes {
+                                collected.push(n);
+                                if collected.len() >= target_after_skip {
+                                    break;
+                                }
+                            }
+                        }
+                        if collected.len() >= target_after_skip || fetched < PAGE_SIZE {
+                            break;
+                        }
+                        db_offset += fetched;
+                    }
+                    collected
+                } else {
+                    self.runtime
+                        .list_notes(token, kind_filter.as_deref(), limit, offset)
+                        .await?
+                };
+
+                // notes is already the correct filtered+paged slice in both paths:
+                // - has_msg_filter=true:  paginated scan above yielded up to target_after_skip
+                //   matching rows; apply skip+take here to honour offset within those results.
+                // - has_msg_filter=false: list_notes was called with the correct limit/offset.
+                let remapped: Vec<Value> = if has_msg_filter {
+                    notes
+                        .into_iter()
+                        .skip(offset as usize)
+                        .take(limit as usize)
+                        .map(|n| {
+                            to_json(&n)
+                                .map(remap_note_status)
+                                .unwrap_or_else(|_| serde_json::json!({}))
+                        })
+                        .collect()
+                } else {
+                    notes
+                        .iter()
+                        .filter(|n| n.deleted_at.is_none())
+                        .map(|n| {
+                            to_json(n)
+                                .map(remap_note_status)
+                                .unwrap_or_else(|_| serde_json::json!({}))
+                        })
+                        .collect()
+                };
                 to_json(&remapped)
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),

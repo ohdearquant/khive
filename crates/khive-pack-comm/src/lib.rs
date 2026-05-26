@@ -20,7 +20,7 @@ impl Pack for CommPack {
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
-static COMM_HANDLERS: [HandlerDef; 4] = [
+static COMM_HANDLERS: [HandlerDef; 5] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -63,7 +63,7 @@ static COMM_HANDLERS: [HandlerDef; 4] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Max messages to return. Default 20, max 100.",
+                description: "Max messages to return. Default 20, max 200.",
             },
             ParamDef {
                 name: "status",
@@ -75,14 +75,14 @@ static COMM_HANDLERS: [HandlerDef; 4] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Mark a message as read.",
+        description: "Mark an inbound message as read.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[ParamDef {
             name: "id",
             param_type: "string",
             required: true,
-            description: "Short 8-char prefix or full UUID of the message to mark read.",
+            description: "Short 8-char prefix or full UUID of the inbound message to mark read. Outbound messages cannot be marked read.",
         }],
     },
     HandlerDef {
@@ -102,6 +102,26 @@ static COMM_HANDLERS: [HandlerDef; 4] = [
                 param_type: "string",
                 required: true,
                 description: "Reply body. Must not be empty.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.thread",
+        description: "Retrieve all messages in a conversation thread, ordered chronologically.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "string",
+                required: true,
+                description: "Thread root: short 8-char prefix or full UUID of the originating message.",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Max messages to return. Default 100, max 500.",
             },
         ],
     },
@@ -162,6 +182,7 @@ impl PackRuntime for CommPack {
             "comm.inbox" => handlers::handle_inbox(self.runtime(), token, params).await,
             "comm.read" => handlers::handle_read(self.runtime(), token, params).await,
             "comm.reply" => handlers::handle_reply(self.runtime(), token, params).await,
+            "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "comm pack does not handle verb {verb:?}"
             ))),
