@@ -60,19 +60,31 @@ fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeErro
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }
 
-/// Validate that `at` is a valid RFC 3339 timestamp.
+/// Validate that `at` is a valid RFC 3339 timestamp and lies in the future.
 ///
 /// Accepts any RFC 3339 string that `chrono` can parse as a `DateTime<Utc>`
 /// (e.g. "2027-01-01T00:00:00Z" or "2027-01-01T00:00:00+05:30").
-/// Returns an error with the exact invalid value and the expected format so
-/// callers can act on the message without inspecting the type.
-fn validate_at(verb: &str, at: &str) -> Result<(), RuntimeError> {
-    if at.parse::<DateTime<Utc>>().is_err() {
-        return Err(RuntimeError::InvalidInput(format!(
+///
+/// Returns the parsed UTC instant so callers can use it for comparisons
+/// without re-parsing. The original string is preserved by callers who want
+/// to store it as-is (see H5 fix below).
+///
+/// Rejects:
+/// - Unparseable strings (not RFC 3339).
+/// - Timestamps that lie in the past relative to `Utc::now()`.
+fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
+    let parsed = at.parse::<DateTime<Utc>>().map_err(|_| {
+        RuntimeError::InvalidInput(format!(
             "{verb}.at: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), got {at:?}"
+        ))
+    })?;
+    if parsed <= Utc::now() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}.at: cannot schedule in the past (got {at:?}); \
+             use a future timestamp"
         )));
     }
-    Ok(())
+    Ok(parsed)
 }
 
 /// Validate a cron expression (5-field) — only basic structure check in v1.
@@ -91,6 +103,20 @@ fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
             }
         }
     }
+}
+
+/// Validate that `action` is parseable DSL via `khive_request::parse_request`.
+///
+/// This catches garbage like `"x"` or `"bogus-not-a-valid-verb()"` at write
+/// time rather than at trigger time, when nobody is watching.
+fn validate_action(action: &str) -> Result<(), RuntimeError> {
+    khive_request::parse_request(action).map_err(|e| {
+        RuntimeError::InvalidInput(format!(
+            "schedule.action: invalid DSL ({e}); \
+             provide a valid verb call (e.g. \"remind(content=\\\"hello\\\")\")"
+        ))
+    })?;
+    Ok(())
 }
 
 // ── param structs ────────────────────────────────────────────────────────────
@@ -145,13 +171,19 @@ pub(crate) async fn handle_remind(
             "remind: `at` must not be empty".into(),
         ));
     }
-    validate_at("remind", p.at.trim())?;
+    // Validate RFC 3339 and reject past timestamps (C3).
+    // Preserve the caller's original string as `trigger_at` so the
+    // submitted wall time and offset are round-tripped faithfully (H5).
+    // The UTC instant is used only for comparison/ordering.
+    let trigger_at_original = p.at.trim().to_string();
+    let _trigger_utc = validate_at("remind", &trigger_at_original)?;
+
     if let Some(ref r) = p.repeat {
         validate_repeat(r)?;
     }
 
     let properties = json!({
-        "trigger_at": p.at,
+        "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "pending",
         "event_type": "remind",
@@ -176,7 +208,7 @@ pub(crate) async fn handle_remind(
         "id": short_id(note.id),
         "full_id": note.id.as_hyphenated().to_string(),
         "event_type": "remind",
-        "trigger_at": p.at,
+        "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "pending",
     }))
@@ -199,13 +231,23 @@ pub(crate) async fn handle_schedule(
             "schedule: `at` must not be empty".into(),
         ));
     }
-    validate_at("schedule", p.at.trim())?;
+    // Validate DSL parseability at write time (C4). Garbage like "x" or
+    // "bogus-not-a-valid-verb()" is rejected before it enters storage.
+    validate_action(p.action.trim())?;
+
+    // Validate RFC 3339 and reject past timestamps (C3).
+    // Preserve the caller's original string as `trigger_at` so the
+    // submitted wall time and offset are round-tripped faithfully (H5).
+    // The UTC instant is used only for comparison/ordering.
+    let trigger_at_original = p.at.trim().to_string();
+    let _trigger_utc = validate_at("schedule", &trigger_at_original)?;
+
     if let Some(ref r) = p.repeat {
         validate_repeat(r)?;
     }
 
     let properties = json!({
-        "trigger_at": p.at,
+        "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "pending",
         "event_type": "schedule",
@@ -230,7 +272,7 @@ pub(crate) async fn handle_schedule(
         "id": short_id(note.id),
         "full_id": note.id.as_hyphenated().to_string(),
         "event_type": "schedule",
-        "trigger_at": p.at,
+        "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "pending",
     }))
@@ -245,61 +287,111 @@ pub(crate) async fn handle_agenda(
     let p: AgendaParams = deser(params)?;
     let limit = p.limit.unwrap_or(20).clamp(1, 200);
 
-    let notes = runtime
-        .list_notes(token, Some("scheduled_event"), limit * 4, 0)
-        .await?;
+    // Parse from/to bounds as instants so comparison is correct regardless of
+    // timezone offset or DST. Reject non-RFC-3339 filter values (H1).
+    let from_instant: Option<DateTime<Utc>> = match p.from {
+        Some(ref s) => {
+            let ts = s.parse::<DateTime<Utc>>().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "agenda.from: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), \
+                     got {s:?}"
+                ))
+            })?;
+            Some(ts)
+        }
+        None => None,
+    };
+    let to_instant: Option<DateTime<Utc>> = match p.to {
+        Some(ref s) => {
+            let ts = s.parse::<DateTime<Utc>>().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "agenda.to: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), \
+                     got {s:?}"
+                ))
+            })?;
+            Some(ts)
+        }
+        None => None,
+    };
 
-    let mut events: Vec<Value> = notes
-        .iter()
-        .filter(|n| n.deleted_at.is_none())
-        .filter(|n| {
+    // Page through all scheduled_event notes until we have `limit` valid
+    // events or the result set is exhausted (H2 fix). A bounded prefetch
+    // could hide valid events behind many corrupt legacy rows — iterating
+    // until exhaustion guarantees correctness at the cost of extra fetches
+    // on large data sets with corrupt rows at the front (rare in practice).
+    //
+    // Performance follow-up: the schema_plan declares idx_schedule_trigger on
+    // json_extract(properties, '$.trigger_at') (ADR-040), but the current
+    // runtime list_notes path orders by created_at DESC and applies trigger_at
+    // sorting in-memory — the index is provisioned for a future schedule-
+    // specific storage query that filters pending notes and orders/ranges by
+    // trigger_at directly. Tracked as a follow-up issue.
+    const PAGE_SIZE: u32 = 200;
+    let mut offset: u32 = 0;
+    let mut events: Vec<(DateTime<Utc>, Value)> = Vec::new();
+
+    loop {
+        let page = runtime
+            .list_notes(token, Some("scheduled_event"), PAGE_SIZE, offset)
+            .await?;
+        let page_len = page.len() as u32;
+
+        for n in &page {
+            if n.deleted_at.is_some() {
+                continue;
+            }
             let status = n
                 .properties
                 .as_ref()
                 .and_then(|p| p.get("status"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            status == "pending"
-        })
-        .filter(|n| {
-            // Apply from/to window filter when provided.
-            let trigger_at = n
+            if status != "pending" {
+                continue;
+            }
+
+            // Parse trigger_at as an instant. Skip rows with unparseable
+            // trigger_at — these are legacy corrupt rows (H1, H2).
+            let trigger_at_str = n
                 .properties
                 .as_ref()
                 .and_then(|p| p.get("trigger_at"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if let Some(ref from) = p.from {
-                if trigger_at < from.as_str() {
-                    return false;
+            let instant = match trigger_at_str.parse::<DateTime<Utc>>() {
+                Ok(ts) => ts,
+                Err(_) => continue,
+            };
+
+            // Apply from/to window using parsed instants (H1).
+            if let Some(from) = from_instant {
+                if instant < from {
+                    continue;
                 }
             }
-            if let Some(ref to) = p.to {
-                if trigger_at > to.as_str() {
-                    return false;
+            if let Some(to) = to_instant {
+                if instant > to {
+                    continue;
                 }
             }
-            true
-        })
-        .map(note_to_event_json)
+            events.push((instant, note_to_event_json(n)));
+        }
+
+        // Stop when the storage page is exhausted.
+        if page_len < PAGE_SIZE {
+            break;
+        }
+        offset += PAGE_SIZE;
+    }
+
+    // Sort ascending by parsed timestamp — correct regardless of tz format (H1).
+    events.sort_by_key(|(ts, _)| *ts);
+
+    let events: Vec<Value> = events
+        .into_iter()
+        .map(|(_, v)| v)
+        .take(limit as usize)
         .collect();
-
-    // Sort ascending by trigger_at (lexicographic on ISO 8601 strings works correctly).
-    events.sort_by(|a, b| {
-        let ta = a
-            .get("properties")
-            .and_then(|p| p.get("trigger_at"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let tb = b
-            .get("properties")
-            .and_then(|p| p.get("trigger_at"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        ta.cmp(tb)
-    });
-
-    events.truncate(limit as usize);
     let count = events.len();
 
     Ok(json!({ "events": events, "count": count }))

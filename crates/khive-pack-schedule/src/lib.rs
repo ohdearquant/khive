@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
 use khive_types::{HandlerDef, Pack, ParamDef, Visibility};
 
 pub struct SchedulePack {
@@ -19,6 +19,17 @@ impl Pack for SchedulePack {
     const HANDLERS: &'static [HandlerDef] = &SCHEDULE_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
+
+/// ADR-040 §283-291: pack-auxiliary index for agenda() efficiency.
+///
+/// A partial index on `properties.trigger_at` (JSON-extracted) scoped to
+/// `scheduled_event` notes enables efficient range scans in `agenda()`.
+/// The statement is idempotent (`CREATE INDEX IF NOT EXISTS`) and is NOT
+/// part of the core versioned migration chain (ADR-015).
+pub(crate) static SCHEDULE_SCHEMA_PLAN_STMTS: [&str; 1] =
+    ["CREATE INDEX IF NOT EXISTS idx_schedule_trigger \
+        ON notes(json_extract(properties, '$.trigger_at')) \
+        WHERE kind = 'scheduled_event'"];
 
 static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {
@@ -154,6 +165,13 @@ impl PackRuntime for SchedulePack {
     }
     fn requires(&self) -> &'static [&'static str] {
         <SchedulePack as Pack>::REQUIRES
+    }
+
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "schedule",
+            statements: &SCHEDULE_SCHEMA_PLAN_STMTS,
+        }
     }
 
     async fn dispatch(

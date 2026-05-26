@@ -42,7 +42,7 @@ async fn remind_creates_pending_event() {
             "remind",
             serde_json::json!({
                 "content": "check status",
-                "at": "2026-06-01T09:00:00Z"
+                "at": "2099-06-01T09:00:00Z"
             }),
         )
         .await
@@ -61,8 +61,8 @@ async fn schedule_creates_pending_event_with_action() {
         .dispatch(
             "schedule",
             serde_json::json!({
-                "action": "create(kind=entity, name=test)",
-                "at": "2026-06-01T10:00:00Z"
+                "action": "create(kind=\"entity\", name=\"test\")",
+                "at": "2099-06-01T10:00:00Z"
             }),
         )
         .await
@@ -79,7 +79,7 @@ async fn agenda_returns_pending_events() {
     registry
         .dispatch(
             "remind",
-            serde_json::json!({ "content": "hello", "at": "2026-07-01T00:00:00Z" }),
+            serde_json::json!({ "content": "hello", "at": "2099-07-01T00:00:00Z" }),
         )
         .await
         .expect("remind succeeds");
@@ -105,7 +105,7 @@ async fn remind_with_invalid_repeat_is_rejected() {
             "remind",
             serde_json::json!({
                 "content": "hello",
-                "at": "2026-06-01T09:00:00Z",
+                "at": "2099-06-01T09:00:00Z",
                 "repeat": "not-valid-cron"
             }),
         )
@@ -121,7 +121,7 @@ async fn test_full_id_returns_36_char_schedule() {
     let result = registry
         .dispatch(
             "remind",
-            serde_json::json!({ "content": "check status", "at": "2026-06-01T09:00:00Z" }),
+            serde_json::json!({ "content": "check status", "at": "2099-06-01T09:00:00Z" }),
         )
         .await
         .expect("remind succeeds");
@@ -157,8 +157,8 @@ async fn s_c1_schedule_valid_rfc3339_succeeds() {
         .dispatch(
             "schedule",
             serde_json::json!({
-                "action": "create(kind=entity, name=test)",
-                "at": "2027-01-01T00:00:00Z"
+                "action": "remind(content=\"test\")",
+                "at": "2099-01-01T00:00:00Z"
             }),
         )
         .await
@@ -175,7 +175,7 @@ async fn s_c1_schedule_invalid_at_not_a_date() {
         .dispatch(
             "schedule",
             serde_json::json!({
-                "action": "create(kind=entity, name=test)",
+                "action": "remind(content=\"test\")",
                 "at": "not-a-date"
             }),
         )
@@ -197,7 +197,7 @@ async fn s_c1_schedule_invalid_at_natural_language() {
         .dispatch(
             "schedule",
             serde_json::json!({
-                "action": "create(kind=entity, name=test)",
+                "action": "remind(content=\"test\")",
                 "at": "tomorrow at 3pm"
             }),
         )
@@ -218,7 +218,7 @@ async fn s_c1_schedule_invalid_at_out_of_range_date() {
         .dispatch(
             "schedule",
             serde_json::json!({
-                "action": "create(kind=entity, name=test)",
+                "action": "remind(content=\"test\")",
                 "at": "2027-13-99"
             }),
         )
@@ -262,7 +262,7 @@ async fn s_c1_remind_valid_rfc3339_succeeds() {
             "remind",
             serde_json::json!({
                 "content": "morning standup",
-                "at": "2027-06-15T09:00:00+00:00"
+                "at": "2099-06-15T09:00:00+00:00"
             }),
         )
         .await
@@ -280,7 +280,7 @@ async fn s_c1_agenda_only_shows_valid_events() {
     registry
         .dispatch(
             "remind",
-            serde_json::json!({ "content": "valid event", "at": "2027-01-01T10:00:00Z" }),
+            serde_json::json!({ "content": "valid event", "at": "2099-01-01T10:00:00Z" }),
         )
         .await
         .expect("remind with valid at must succeed");
@@ -309,7 +309,7 @@ async fn test_cancel_accepts_short_id() {
     let reminded = registry
         .dispatch(
             "remind",
-            serde_json::json!({ "content": "cancel me by short id", "at": "2026-07-01T12:00:00Z" }),
+            serde_json::json!({ "content": "cancel me by short id", "at": "2099-07-01T12:00:00Z" }),
         )
         .await
         .expect("remind succeeds");
@@ -347,5 +347,507 @@ async fn test_cancel_accepts_short_id() {
     assert!(
         cancel_full_id.starts_with(short),
         "cancel response full_id starts with short prefix"
+    );
+}
+
+// ── C3 regression: past dates rejected ───────────────────────────────────────
+
+#[tokio::test]
+async fn c3_schedule_past_date_rejected() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule",
+            serde_json::json!({
+                "action": "remind(content=\"past\")",
+                "at": "2020-01-01T00:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("past") || msg.contains("future"),
+        "C3: past at must be rejected with past/future hint; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn c3_remind_past_date_rejected() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "remind",
+            serde_json::json!({
+                "content": "stale reminder",
+                "at": "2019-06-01T09:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("past") || msg.contains("future"),
+        "C3: past remind.at must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn c3_agenda_never_shows_past_pending_events() {
+    // Since past dates are rejected at write time, agenda must never contain
+    // pending events with trigger_at in the past.
+    let (registry, _rt) = build_registry();
+
+    // Insert one valid future event.
+    registry
+        .dispatch(
+            "remind",
+            serde_json::json!({ "content": "future check", "at": "2099-12-31T23:59:59Z" }),
+        )
+        .await
+        .expect("future remind must succeed");
+
+    let agenda = registry
+        .dispatch("agenda", serde_json::json!({ "limit": 100 }))
+        .await
+        .expect("agenda must succeed");
+
+    let now = chrono::Utc::now();
+    let events = agenda["events"].as_array().expect("events array");
+    for event in events {
+        let trigger_at = event["properties"]["trigger_at"]
+            .as_str()
+            .expect("trigger_at must be present");
+        let instant = trigger_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("trigger_at must be parseable");
+        assert!(
+            instant > now,
+            "C3: agenda must never contain past-pending events; found {trigger_at}"
+        );
+    }
+}
+
+// ── C4 regression: unparseable DSL action rejected ───────────────────────────
+
+#[tokio::test]
+async fn c4_schedule_bogus_action_rejected() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule",
+            serde_json::json!({
+                "action": "bogus-not-a-valid-verb()",
+                "at": "2099-01-01T00:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("DSL") || msg.contains("action") || msg.contains("invalid"),
+        "C4: bogus action must be rejected with DSL error hint; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn c4_schedule_single_char_action_rejected() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule",
+            serde_json::json!({
+                "action": "x",
+                "at": "2099-01-01T00:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("DSL") || msg.contains("action") || msg.contains("invalid"),
+        "C4: single-char action must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn c4_schedule_valid_action_succeeds() {
+    let (registry, _rt) = build_registry();
+
+    // A well-formed verb call must be accepted.
+    let result = registry
+        .dispatch(
+            "schedule",
+            serde_json::json!({
+                "action": "remind(content=\"hello world\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("schedule with valid DSL action must succeed");
+
+    assert_eq!(result["status"], "pending");
+}
+
+// ── H1 regression: agenda from/to uses parsed timestamps ─────────────────────
+
+#[tokio::test]
+async fn h1_agenda_from_filter_uses_parsed_timestamps() {
+    let (registry, _rt) = build_registry();
+
+    // Insert events at two different future times.
+    registry
+        .dispatch(
+            "remind",
+            serde_json::json!({ "content": "early", "at": "2099-01-01T10:00:00Z" }),
+        )
+        .await
+        .expect("remind 1 succeeds");
+    registry
+        .dispatch(
+            "remind",
+            serde_json::json!({ "content": "late", "at": "2099-12-31T10:00:00Z" }),
+        )
+        .await
+        .expect("remind 2 succeeds");
+
+    // Only events at or after 2099-06-01 should be returned.
+    let agenda = registry
+        .dispatch(
+            "agenda",
+            serde_json::json!({ "from": "2099-06-01T00:00:00Z", "limit": 50 }),
+        )
+        .await
+        .expect("agenda with from filter succeeds");
+
+    let events = agenda["events"].as_array().expect("events array");
+    // The early event (2099-01-01) must not appear.
+    for event in events {
+        let trigger_at = event["properties"]["trigger_at"]
+            .as_str()
+            .expect("trigger_at present");
+        let instant = trigger_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("parseable");
+        let from = "2099-06-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        assert!(
+            instant >= from,
+            "H1: agenda.from filter must exclude events before the bound; found {trigger_at}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn h1_agenda_rejects_invalid_from() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "agenda",
+            serde_json::json!({ "from": "not-a-date", "limit": 10 }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RFC 3339") || msg.contains("timestamp") || msg.contains("not-a-date"),
+        "H1: invalid agenda.from must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn h1_agenda_rejects_invalid_to() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "agenda",
+            serde_json::json!({ "to": "not-a-date", "limit": 10 }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RFC 3339") || msg.contains("timestamp") || msg.contains("not-a-date"),
+        "H1: invalid agenda.to must be rejected; got: {msg}"
+    );
+}
+
+// ── H5 regression: trigger_at preserves caller's original RFC3339 string ─────
+//
+// The fix: callers submit a timestamp with an offset; the pack must return
+// the *original* string (preserving wall time + offset) rather than
+// canonicalising to UTC.  The stored instant must still be correct for
+// comparison purposes (validated separately through agenda ordering tests).
+
+#[tokio::test]
+async fn h5_schedule_at_with_offset_preserves_original_string() {
+    let (registry, _rt) = build_registry();
+
+    // Input has +02:00 offset. The canonical UTC equivalent would be
+    // 2099-01-01T22:00:00Z — but the response must return the ORIGINAL string.
+    let input_at = "2099-01-02T00:00:00+02:00";
+    let result = registry
+        .dispatch(
+            "schedule",
+            serde_json::json!({
+                "action": "remind(content=\"tz-test\")",
+                "at": input_at
+            }),
+        )
+        .await
+        .expect("schedule with +02:00 offset must succeed");
+
+    let trigger_at = result["trigger_at"].as_str().expect("trigger_at present");
+    // Must preserve the caller's original string exactly.
+    assert_eq!(
+        trigger_at, input_at,
+        "H5: trigger_at in response must preserve caller's original RFC3339 string; got {trigger_at}"
+    );
+    // The original string must still be parseable as a valid RFC3339 timestamp.
+    assert!(
+        trigger_at.parse::<chrono::DateTime<chrono::Utc>>().is_ok(),
+        "H5: stored trigger_at must be a valid RFC 3339 timestamp; got {trigger_at}"
+    );
+}
+
+#[tokio::test]
+async fn h5_remind_at_with_offset_preserves_original_string() {
+    let (registry, _rt) = build_registry();
+
+    let input_at = "2099-06-15T09:00:00+05:30";
+    let result = registry
+        .dispatch(
+            "remind",
+            serde_json::json!({
+                "content": "tz-remind",
+                "at": input_at
+            }),
+        )
+        .await
+        .expect("remind with +05:30 offset must succeed");
+
+    let trigger_at = result["trigger_at"].as_str().expect("trigger_at present");
+    // Must preserve the caller's original string exactly.
+    assert_eq!(
+        trigger_at, input_at,
+        "H5: trigger_at in remind response must preserve caller's original RFC3339 string; got {trigger_at}"
+    );
+    // The original string must still be parseable.
+    assert!(
+        trigger_at.parse::<chrono::DateTime<chrono::Utc>>().is_ok(),
+        "H5: stored trigger_at must be a valid RFC 3339 timestamp; got {trigger_at}"
+    );
+}
+
+#[tokio::test]
+async fn h5_utc_input_preserved_as_is() {
+    let (registry, _rt) = build_registry();
+
+    // UTC input (Z suffix) must also be returned as-is.
+    let input_at = "2099-03-10T12:00:00Z";
+    let result = registry
+        .dispatch(
+            "remind",
+            serde_json::json!({ "content": "utc-tz-test", "at": input_at }),
+        )
+        .await
+        .expect("remind with Z suffix must succeed");
+
+    let trigger_at = result["trigger_at"].as_str().expect("trigger_at present");
+    assert_eq!(
+        trigger_at, input_at,
+        "H5: UTC input must be returned unchanged; got {trigger_at}"
+    );
+}
+
+// ── H2 regression: agenda paginates past corrupt legacy rows ─────────────────
+//
+// Inserts a valid pending event FIRST (oldest created_at), then inserts more
+// than one page worth of corrupt legacy rows AFTER it (newer created_at). The
+// runtime list_notes path orders by created_at DESC, so the corrupt rows are
+// returned first — the valid event sits below the first page.
+//
+// Without the paginating loop fix, `agenda()` would only see the first page of
+// corrupt rows and return zero events, never finding the valid one beneath.
+// With the fix, the loop crosses the page boundary and surfaces the valid
+// event.
+
+#[tokio::test]
+async fn h2_agenda_finds_valid_event_past_corrupt_legacy_rows() {
+    use chrono::Utc;
+    use khive_storage::Note;
+    use serde_json::json;
+
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let tok = runtime.authorize(khive_types::Namespace::local());
+    let note_store = runtime.notes(&tok).expect("note store accessible");
+
+    // Step 1: insert the valid event FIRST (oldest created_at).
+    // Using the verb path here would assign Utc::now() as created_at, but we
+    // need to control ordering precisely, so use the storage layer too.
+    let valid_at = "2099-11-11T11:11:11Z";
+    let valid_note = Note {
+        id: uuid::Uuid::new_v4(),
+        namespace: "local".to_string(),
+        kind: "scheduled_event".to_string(),
+        status: "active".to_string(),
+        name: None,
+        content: "valid-event".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({
+            "trigger_at": valid_at,
+            "status": "pending",
+            "event_type": "remind",
+            "payload": null,
+            "fired_at": null,
+            "cancelled_at": null,
+        })),
+        // Anchor created_at well in the past so all corrupt rows have newer ts.
+        created_at: 1_700_000_000_000_000_i64,
+        updated_at: Utc::now().timestamp_micros(),
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(valid_note)
+        .await
+        .expect("valid note inserted");
+
+    // Step 2: insert > PAGE_SIZE (200) corrupt rows AFTER the valid event so
+    // newest-first pagination returns them before the valid row. The handler
+    // const PAGE_SIZE = 200; we use 250 so the valid event is on page 2.
+    let now_micros = Utc::now().timestamp_micros();
+    for i in 0..250u32 {
+        let corrupt = Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "scheduled_event".to_string(),
+            status: "active".to_string(),
+            name: None,
+            content: format!("corrupt-legacy-{i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({
+                "trigger_at": "not-a-date",
+                "status": "pending",
+                "event_type": "remind",
+                "payload": null,
+                "fired_at": null,
+                "cancelled_at": null,
+            })),
+            // Newer than the valid event, increasing so each row is distinct.
+            created_at: now_micros + (i as i64 * 1000),
+            updated_at: now_micros,
+            deleted_at: None,
+        };
+        note_store
+            .upsert_note(corrupt)
+            .await
+            .expect("corrupt note inserted");
+    }
+
+    // agenda() must return the valid event despite corrupt rows preceding it.
+    let agenda = registry
+        .dispatch("agenda", serde_json::json!({ "limit": 10 }))
+        .await
+        .expect("agenda must succeed");
+
+    let events = agenda["events"].as_array().expect("events array");
+    assert!(
+        !events.is_empty(),
+        "H2: agenda must return at least one event; corrupt legacy rows must not hide valid ones"
+    );
+
+    // Every returned event must have a parseable trigger_at.
+    for event in events {
+        let trigger_at = event["properties"]["trigger_at"]
+            .as_str()
+            .expect("trigger_at present");
+        assert!(
+            trigger_at.parse::<chrono::DateTime<chrono::Utc>>().is_ok(),
+            "H2: every agenda event must have a valid RFC 3339 trigger_at; got {trigger_at:?}"
+        );
+    }
+
+    // The valid event must be present.
+    let found = events
+        .iter()
+        .any(|e| e["properties"]["trigger_at"].as_str() == Some(valid_at));
+    assert!(
+        found,
+        "H2: valid-event with trigger_at={valid_at:?} must appear in agenda; got: {events:?}"
+    );
+}
+
+// ── schema_plan regression: SchedulePack declares ADR-040 trigger index ───────
+
+#[tokio::test]
+async fn schedule_pack_exposes_non_empty_schema_plan() {
+    use khive_runtime::PackRuntime;
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = SchedulePack::new(runtime);
+    let plan = pack.schema_plan();
+
+    assert!(
+        !plan.is_empty(),
+        "SchedulePack must return a non-empty SchemaPlan (ADR-040 §283)"
+    );
+    assert_eq!(plan.pack, "schedule", "SchemaPlan.pack must be 'schedule'");
+    assert!(
+        !plan.statements.is_empty(),
+        "schema plan must have at least one DDL statement"
+    );
+
+    let combined = plan.statements.join(" ");
+    assert!(
+        combined.contains("idx_schedule_trigger"),
+        "schema plan must declare idx_schedule_trigger index; got: {combined}"
+    );
+    assert!(
+        combined.contains("CREATE INDEX IF NOT EXISTS"),
+        "schema plan DDL must be idempotent (CREATE INDEX IF NOT EXISTS); got: {combined}"
+    );
+    assert!(
+        combined.contains("scheduled_event"),
+        "schema plan index must be scoped to 'scheduled_event' kind; got: {combined}"
+    );
+}
+
+#[tokio::test]
+async fn verb_registry_aggregates_schedule_schema_plan() {
+    let (registry, _rt) = build_registry();
+    let plans = registry.all_schema_plans();
+    assert!(
+        plans.iter().any(|p| p.pack == "schedule"),
+        "registry must expose schedule schema plan; got packs: {:?}",
+        plans.iter().map(|p| p.pack).collect::<Vec<_>>()
+    );
+    let sched_plan = plans
+        .iter()
+        .find(|p| p.pack == "schedule")
+        .expect("schedule plan present");
+    assert!(
+        !sched_plan.is_empty(),
+        "schedule schema plan must have DDL statements"
     );
 }
