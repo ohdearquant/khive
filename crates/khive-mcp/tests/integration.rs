@@ -1847,7 +1847,10 @@ async fn startup_migrations_applied_to_fresh_file_backed_db() -> anyhow::Result<
             "description": "fix1: run_migrations at startup",
             "changeset": {
                 "kind": "add_entity",
-                "entity": format!(r#"{{"kind":"concept","name":"fix1-{eid}"}}"#)
+                "entity": {
+                    "kind": "concept",
+                    "name": format!("fix1-{eid}")
+                }
             }
         }
     }]))
@@ -2079,6 +2082,211 @@ async fn link_source_and_target_ids_are_short_in_agent_mode() -> anyhow::Result<
         36,
         "link source_id must be 36-char in verbose mode"
     );
+    Ok(())
+}
+
+// ── ADR-046 regression: get(id=proposal_id) returns ProposalCreated payload ──
+
+/// ADR-046:299 — get(id=<proposal_id>) must return the full ProposalCreated
+/// event payload: description, changeset, reviewers, parent_id.
+/// Before the fix, get returned only projection columns and omitted those fields.
+#[tokio::test]
+async fn get_proposal_id_returns_proposal_created_payload() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create a parent entity so we can set parent_id on the proposal.
+    let parent = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="ParentEntity")"#,
+    )
+    .await?;
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    assert_eq!(parent_id.len(), 36, "parent entity id must be full UUID");
+
+    // Propose with all optional fields populated: description, reviewers, parent_id,
+    // and a changeset that carries a named entity.
+    let ops = serde_json::to_string(&json!([{
+        "tool": "propose",
+        "args": {
+            "title": "get-payload regression",
+            "description": "ADR-046:299 regression — description must survive get()",
+            "changeset": {
+                "kind": "add_entity",
+                "entity": {
+                    "kind": "concept",
+                    "name": "PayloadRegressionEntity"
+                }
+            },
+            "reviewers": ["alice", "bob"],
+            "parent_id": parent_id
+        }
+    }]))
+    .unwrap();
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(first["ok"], true, "propose must succeed; got: {first}");
+    let proposal_id = first["result"]["proposal_id"]
+        .as_str()
+        .expect("propose must return proposal_id")
+        .to_string();
+    assert_eq!(
+        proposal_id.len(),
+        36,
+        "proposal_id from propose must be full UUID"
+    );
+
+    // Now get(id=<proposal_id>) — must return the ProposalCreated event payload.
+    let get_result = ok_one(&client, &format!(r#"get(id="{proposal_id}")"#)).await?;
+
+    // ADR-046:299: the four previously-missing fields must be present.
+    assert_eq!(
+        get_result["description"].as_str().unwrap_or(""),
+        "ADR-046:299 regression — description must survive get()",
+        "get(id=proposal_id) must return description from ProposalCreated payload"
+    );
+    let reviewers = get_result["reviewers"]
+        .as_array()
+        .expect("get(id=proposal_id) must return reviewers array");
+    assert_eq!(
+        reviewers.len(),
+        2,
+        "get(id=proposal_id) must return all reviewers; got: {reviewers:?}"
+    );
+    assert!(
+        reviewers.iter().any(|r| r.as_str() == Some("alice")),
+        "reviewers must include alice; got: {reviewers:?}"
+    );
+    assert!(
+        reviewers.iter().any(|r| r.as_str() == Some("bob")),
+        "reviewers must include bob; got: {reviewers:?}"
+    );
+    let changeset = &get_result["changeset"];
+    assert!(
+        !changeset.is_null(),
+        "get(id=proposal_id) must return changeset; got null"
+    );
+    assert_eq!(
+        changeset["kind"].as_str().unwrap_or(""),
+        "add_entity",
+        "changeset kind must be add_entity; got: {changeset}"
+    );
+    // parent_id is stored as Id128 (numeric); check it round-trips to a non-null value.
+    assert!(
+        !get_result["parent_id"].is_null(),
+        "get(id=proposal_id) must return parent_id when set; got: {get_result}"
+    );
+
+    Ok(())
+}
+
+// ── ADR-046 regression: list(kind=proposal) unfiltered returns all rows ───────
+
+/// ADR-046:277-279 — list(kind=proposal) without a status filter must return
+/// ALL rows including applied/withdrawn (audit trail).
+/// Before the fix, no-status defaulted to status IN ('open','changes_requested'),
+/// hiding audit rows.
+#[tokio::test]
+async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create two proposals.
+    let ops = serde_json::to_string(&json!([
+        {
+            "tool": "propose",
+            "args": {
+                "title": "audit-row-A",
+                "description": "first proposal",
+                "changeset": {
+                    "kind": "add_entity",
+                    "entity": {"kind": "concept", "name": "AuditEntityA"}
+                },
+                "reviewers": []
+            }
+        },
+        {
+            "tool": "propose",
+            "args": {
+                "title": "audit-row-B",
+                "description": "second proposal",
+                "changeset": {
+                    "kind": "add_entity",
+                    "entity": {"kind": "concept", "name": "AuditEntityB"}
+                },
+                "reviewers": []
+            }
+        }
+    ]))
+    .unwrap();
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": ops, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    assert_eq!(body["results"][0]["ok"], true, "first propose must succeed");
+    assert_eq!(
+        body["results"][1]["ok"], true,
+        "second propose must succeed"
+    );
+    let pid_a = body["results"][0]["result"]["proposal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Withdraw proposal A so it moves to a terminal status.
+    let ops_withdraw = serde_json::to_string(&json!([{
+        "tool": "withdraw",
+        "args": {
+            "proposal_id": pid_a,
+            "rationale": "test withdrawal for audit list"
+        }
+    }]))
+    .unwrap();
+    let wr = call(
+        &client,
+        "request",
+        json!({"ops": ops_withdraw, "presentation": "verbose"}),
+    )
+    .await?;
+    let wr_body: Value = serde_json::from_str(&first_text(&wr))?;
+    assert_eq!(
+        wr_body["results"][0]["ok"], true,
+        "withdraw must succeed; got: {}",
+        wr_body["results"][0]
+    );
+
+    // list(kind=proposal) without status — must return BOTH rows (open + withdrawn).
+    // The list result is a bare JSON array (same shape as other list verbs).
+    let list_result = ok_one(&client, r#"list(kind="proposal")"#).await?;
+    let items = list_result
+        .as_array()
+        .expect("list(kind=proposal) must return a JSON array");
+    assert!(
+        items.len() >= 2,
+        "list(kind=proposal) without status must include all rows (audit trail); \
+         got {} items — withdrawn proposal must not be hidden",
+        items.len()
+    );
+
+    // list(kind=proposal, status=open) — must return only the open one.
+    let list_open = ok_one(&client, r#"list(kind="proposal", status="open")"#).await?;
+    let open_items = list_open
+        .as_array()
+        .expect("list(kind=proposal, status=open) must return a JSON array");
+    assert!(
+        open_items
+            .iter()
+            .all(|i| i["status"].as_str() == Some("open")),
+        "list(kind=proposal, status=open) must return only open proposals; got: {open_items:?}"
+    );
+
     Ok(())
 }
 

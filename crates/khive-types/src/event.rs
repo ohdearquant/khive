@@ -246,6 +246,7 @@ pub struct AggregateRef {
 pub enum EventPayload {
     Json(String),
     RerankExecuted(RerankExecutedPayload),
+    #[cfg(feature = "serde")]
     ProposalCreated(ProposalCreatedPayload),
     ProposalReviewed(ProposalReviewedPayload),
     ProposalApplied(ProposalAppliedPayload),
@@ -271,8 +272,8 @@ pub struct RerankExecutedPayload {
     pub hook_target_match: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProposalCreatedPayload {
     pub proposal_id: Id128,
     pub proposer: String,
@@ -284,16 +285,105 @@ pub struct ProposalCreatedPayload {
     pub parent_id: Option<Id128>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
+/// Structured draft for adding a new entity via a proposal (ADR-046:100).
+///
+/// Fields mirror the `create(kind=<entity kind>)` verb surface; `kind` is
+/// validated against the closed 8-kind taxonomy (ADR-001) at apply time.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EntityDraft {
+    /// Entity kind — must be one of the 8 closed ADR-001 values.
+    pub kind: String,
+    /// Human-readable name (required).
+    pub name: String,
+    /// Optional long-form description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Arbitrary structured metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Value>,
+    /// Classification tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+/// Structured patch for modifying an existing entity via a proposal (ADR-046:101).
+///
+/// Absent fields mean "leave unchanged". Setting `description` to `null` clears it.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProposalEntityPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `null` clears the description; absent leaves it unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_opt_opt"
+    )]
+    pub description: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Structured draft for adding a new note via a proposal (ADR-046:106).
+///
+/// Fields mirror the `create(kind=<note kind>)` verb surface.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NoteDraft {
+    /// Note kind string (validated by the loaded pack at apply time).
+    pub kind: String,
+    /// Note body / content (required).
+    pub content: String,
+    /// Optional short name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Arbitrary structured metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Value>,
+}
+
+/// Serde helper for `Option<Option<T>>` — distinguishes absent vs. explicit null.
+#[cfg(feature = "serde")]
+mod serde_opt_opt {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T, S>(val: &Option<Option<T>>, s: S) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: Serializer,
+    {
+        match val {
+            None => unreachable!("skip_serializing_if guards the None case"),
+            Some(inner) => inner.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        T: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let opt: Option<T> = Option::deserialize(d)?;
+        Ok(Some(opt))
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProposalChangeset {
+    /// Add a new entity. `entity.kind` validated against ADR-001 at apply time.
     AddEntity {
-        entity: String,
+        entity: EntityDraft,
     },
+    /// Modify an existing entity's properties / tags / description.
     UpdateEntity {
         id: Id128,
-        patch: String,
+        patch: ProposalEntityPatch,
     },
     AddEdge {
         source: Id128,
@@ -301,8 +391,31 @@ pub enum ProposalChangeset {
         relation: crate::EdgeRelation,
         weight: Option<f32>,
     },
+    /// Add a note (entity-annotating or stand-alone).
     AddNote {
-        note: String,
+        note: NoteDraft,
+    },
+    MergeEntities {
+        into: Id128,
+        from: Id128,
+    },
+    SupersedeEntity {
+        old: Id128,
+        new: Id128,
+    },
+    Compound {
+        steps: Vec<ProposalChangeset>,
+    },
+}
+
+#[cfg(not(feature = "serde"))]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalChangeset {
+    AddEdge {
+        source: Id128,
+        target: Id128,
+        relation: crate::EdgeRelation,
+        weight: Option<f32>,
     },
     MergeEntities {
         into: Id128,
@@ -499,5 +612,57 @@ mod tests {
             .payload(payload)
             .build(header());
         assert_eq!(event.kind.name(), "proposal_reviewed");
+    }
+
+    /// C1 regression: all ProposalChangeset variants that carry Id128 fields must
+    /// round-trip through serde_json::Value.  Previously `Id128::deserialize` used
+    /// `<&str>::deserialize` which fails when the deserializer holds owned data
+    /// (the Value-backed path used by the MCP DSL parser).
+    #[cfg(feature = "serde")]
+    #[test]
+    fn proposal_changeset_id_variants_deserialize_from_value() {
+        let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
+        let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
+
+        // UpdateEntity — patch is now a structured ProposalEntityPatch object
+        let v =
+            serde_json::json!({"kind": "update_entity", "id": uuid, "patch": {"name": "NewName"}});
+        let cs: ProposalChangeset =
+            serde_json::from_value(v).expect("UpdateEntity must deserialize from Value");
+        assert!(
+            matches!(cs, ProposalChangeset::UpdateEntity { .. }),
+            "expected UpdateEntity"
+        );
+
+        // AddEdge
+        let v = serde_json::json!({
+            "kind": "add_edge",
+            "source": uuid, "target": uuid2,
+            "relation": "extends", "weight": 1.0
+        });
+        let cs: ProposalChangeset =
+            serde_json::from_value(v).expect("AddEdge must deserialize from Value");
+        assert!(
+            matches!(cs, ProposalChangeset::AddEdge { .. }),
+            "expected AddEdge"
+        );
+
+        // MergeEntities
+        let v = serde_json::json!({"kind": "merge_entities", "into": uuid, "from": uuid2});
+        let cs: ProposalChangeset =
+            serde_json::from_value(v).expect("MergeEntities must deserialize from Value");
+        assert!(
+            matches!(cs, ProposalChangeset::MergeEntities { .. }),
+            "expected MergeEntities"
+        );
+
+        // SupersedeEntity
+        let v = serde_json::json!({"kind": "supersede_entity", "old": uuid, "new": uuid2});
+        let cs: ProposalChangeset =
+            serde_json::from_value(v).expect("SupersedeEntity must deserialize from Value");
+        assert!(
+            matches!(cs, ProposalChangeset::SupersedeEntity { .. }),
+            "expected SupersedeEntity"
+        );
     }
 }

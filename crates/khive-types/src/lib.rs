@@ -32,8 +32,12 @@ pub use entity::{Entity, EntityKind, Link, PropertyValue};
 pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
-    ProposalAppliedPayload, ProposalChangeset, ProposalCreatedPayload, ProposalDecision,
-    ProposalReviewedPayload, ProposalWithdrawnPayload, RerankExecutedPayload,
+    ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload, ProposalWithdrawnPayload,
+    RerankExecutedPayload,
+};
+#[cfg(feature = "serde")]
+pub use event::{
+    EntityDraft, NoteDraft, ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch,
 };
 pub use hash::Hash32;
 pub use header::Header;

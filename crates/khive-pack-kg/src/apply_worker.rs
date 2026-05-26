@@ -29,8 +29,8 @@ use khive_runtime::{
 use khive_storage::types::PageRequest;
 use khive_storage::{EdgeRelation, EventFilter};
 use khive_types::{
-    ApplyResult, EventKind, Id128, ProposalAppliedPayload, ProposalChangeset,
-    ProposalCreatedPayload, Timestamp,
+    ApplyResult, EntityDraft, EntityKind, EventKind, Id128, NoteDraft, ProposalAppliedPayload,
+    ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch, Timestamp,
 };
 
 use crate::projection_worker::ProposalsProjectionWorker;
@@ -181,6 +181,7 @@ impl ProposalApplyWorker {
                     self.apply_update_entity(token, *id, patch).await?;
                     Ok(vec![])
                 }
+
                 ProposalChangeset::AddEdge {
                     source,
                     target,
@@ -213,71 +214,53 @@ impl ProposalApplyWorker {
         })
     }
 
-    /// Apply `AddEntity`: deserialize the entity JSON draft and create it.
+    /// Apply `AddEntity`: create the entity from the structured draft.
     async fn apply_add_entity(
         &self,
         token: &NamespaceToken,
-        entity_json: &str,
+        draft: &EntityDraft,
     ) -> Result<Vec<Uuid>, RuntimeError> {
-        let draft: serde_json::Value = serde_json::from_str(entity_json).map_err(|e| {
-            RuntimeError::InvalidInput(format!("AddEntity: invalid entity JSON: {e}"))
+        let kind = draft.kind.as_str();
+
+        // C2: Validate kind against the closed entity-kind taxonomy (ADR-001).
+        // Direct `create` rejects invalid kinds; the apply worker must enforce the
+        // same invariant so proposals cannot bypass taxonomy validation.
+        EntityKind::from_str(kind).map_err(|_| {
+            let valid: Vec<&str> = EntityKind::ALL.iter().map(|k| k.name()).collect();
+            RuntimeError::InvalidInput(format!(
+                "AddEntity: unknown entity_kind {kind:?}; valid: {}",
+                valid.join(" | ")
+            ))
         })?;
-        let kind = draft
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RuntimeError::InvalidInput("AddEntity: missing 'kind' field".into()))?;
-        let name = draft
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RuntimeError::InvalidInput("AddEntity: missing 'name' field".into()))?;
-        let description = draft.get("description").and_then(|v| v.as_str());
-        let properties = draft.get("properties").cloned();
-        let tags: Vec<String> = draft
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
 
         let entity = self
             .runtime
-            .create_entity(token, kind, None, name, description, properties, tags)
+            .create_entity(
+                token,
+                kind,
+                None,
+                draft.name.as_str(),
+                draft.description.as_deref(),
+                draft.properties.clone(),
+                draft.tags.clone(),
+            )
             .await?;
         Ok(vec![entity.id])
     }
 
-    /// Apply `UpdateEntity`: parse the patch JSON and call `update_entity`.
+    /// Apply `UpdateEntity`: apply the structured patch to the entity.
     async fn apply_update_entity(
         &self,
         token: &NamespaceToken,
         id: Id128,
-        patch_json: &str,
+        proposal_patch: &ProposalEntityPatch,
     ) -> Result<(), RuntimeError> {
         let entity_id = Uuid::from_u128(id.to_u128());
-        let patch_val: serde_json::Value = serde_json::from_str(patch_json).map_err(|e| {
-            RuntimeError::InvalidInput(format!("UpdateEntity: invalid patch JSON: {e}"))
-        })?;
         let patch = EntityPatch {
-            name: patch_val
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            description: patch_val.get("description").map(|v| {
-                if v.is_null() {
-                    None
-                } else {
-                    v.as_str().map(String::from)
-                }
-            }),
-            properties: patch_val.get("properties").cloned(),
-            tags: patch_val.get("tags").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect()
-            }),
+            name: proposal_patch.name.clone(),
+            description: proposal_patch.description.clone(),
+            properties: proposal_patch.properties.clone(),
+            tags: proposal_patch.tags.clone(),
         };
         self.runtime.update_entity(token, entity_id, patch).await?;
         Ok(())
@@ -316,28 +299,23 @@ impl ProposalApplyWorker {
         Ok(edge.id.0)
     }
 
-    /// Apply `AddNote`: deserialize the note JSON draft and create the note.
+    /// Apply `AddNote`: create the note from the structured draft.
     async fn apply_add_note(
         &self,
         token: &NamespaceToken,
-        note_json: &str,
+        draft: &NoteDraft,
     ) -> Result<Vec<Uuid>, RuntimeError> {
-        let draft: serde_json::Value = serde_json::from_str(note_json)
-            .map_err(|e| RuntimeError::InvalidInput(format!("AddNote: invalid note JSON: {e}")))?;
-        let kind = draft
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RuntimeError::InvalidInput("AddNote: missing 'kind' field".into()))?;
-        let content = draft
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RuntimeError::InvalidInput("AddNote: missing 'content' field".into()))?;
-        let name = draft.get("name").and_then(|v| v.as_str());
-        let properties = draft.get("properties").cloned();
-
         let note = self
             .runtime
-            .create_note(token, kind, name, content, None, properties, vec![])
+            .create_note(
+                token,
+                draft.kind.as_str(),
+                draft.name.as_deref(),
+                draft.content.as_str(),
+                None,
+                draft.properties.clone(),
+                vec![],
+            )
             .await?;
         Ok(vec![note.id])
     }
@@ -687,6 +665,69 @@ mod tests {
             applied.items.len(),
             0,
             "no ProposalApplied event should be emitted for a non-approved proposal"
+        );
+    }
+
+    /// C2 regression: apply worker must reject proposals whose AddEntity changeset
+    /// carries an invalid entity kind.  Direct `create(kind="invalidkind")` correctly
+    /// errors; the proposal apply path must enforce the same invariant.
+    #[tokio::test]
+    async fn apply_worker_rejects_invalid_entity_kind() {
+        let (rt, tok) = setup();
+        ensure_schema(&rt).await;
+
+        let proposal_id = Uuid::new_v4();
+        // Changeset references an invalid entity kind that is not in ADR-001.
+        let changeset = ProposalChangeset::AddEntity {
+            entity: EntityDraft {
+                kind: "invalidkind".to_string(),
+                name: "BadEntity".to_string(),
+                description: Some("should fail".to_string()),
+                properties: None,
+                tags: vec![],
+            },
+        };
+
+        seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+        insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+        let worker = ProposalApplyWorker::new(rt.clone());
+        worker
+            .maybe_apply(&tok, proposal_id)
+            .await
+            .expect("maybe_apply itself must succeed (errors emitted as ProposalApplied{Failed})");
+
+        // The apply must have emitted a ProposalApplied{Failed} event, not success.
+        let event_store = rt.events(&tok).expect("event store");
+        let applied_events = event_store
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::ProposalApplied],
+                    payload_proposal_id: Some(proposal_id),
+                    ..Default::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("query events");
+
+        assert_eq!(
+            applied_events.items.len(),
+            1,
+            "ProposalApplied event must be emitted"
+        );
+
+        // Verify no entity with that name was created.
+        let entities = rt
+            .list_entities(&tok, None, None, 100, 0)
+            .await
+            .expect("list_entities");
+        assert!(
+            !entities.iter().any(|e| e.name == "BadEntity"),
+            "entity with invalid kind must not be created in the KG"
         );
     }
 }

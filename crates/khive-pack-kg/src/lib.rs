@@ -404,7 +404,15 @@ static KG_HANDLERS: [HandlerDef; 14] = [
                 name: "changeset",
                 param_type: "object",
                 required: true,
-                description: "Proposed changes as a structured patch object.",
+                description: "Proposed changes. Discriminated by 'kind' field. \
+                    Variants (all fields are structured objects, not JSON strings): \
+                    add_entity — {kind: \"add_entity\", entity: {kind: <entity-kind>, name: <string>, description?: <string>, properties?: <object>, tags?: [<string>]}}; \
+                    update_entity — {kind: \"update_entity\", id: <full UUID>, patch: {name?: <string>, description?: <string|null>, properties?: <object>, tags?: [<string>]}}; \
+                    add_edge — {kind: \"add_edge\", source: <UUID>, target: <UUID>, relation: <EdgeRelation>, weight?: <float>}; \
+                    add_note — {kind: \"add_note\", note: {kind: <note-kind>, content: <string>, name?: <string>, properties?: <object>}}; \
+                    merge_entities — {kind: \"merge_entities\", into: <UUID>, from: <UUID>}; \
+                    supersede_entity — {kind: \"supersede_entity\", old: <UUID>, new: <UUID>}; \
+                    compound — {kind: \"compound\", steps: [<changeset>, ...]}.",
             },
             ParamDef {
                 name: "reviewers",
@@ -437,7 +445,7 @@ static KG_HANDLERS: [HandlerDef; 14] = [
                 name: "proposal_id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the proposal to review.",
+                description: "Full UUID or 8-char short ID of the proposal to review.",
             },
             ParamDef {
                 name: "decision",
@@ -464,7 +472,7 @@ static KG_HANDLERS: [HandlerDef; 14] = [
                 name: "proposal_id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the open proposal to withdraw.",
+                description: "Full UUID or 8-char short ID of the open proposal to withdraw.",
             },
             ParamDef {
                 name: "rationale",

@@ -164,7 +164,9 @@ impl serde::Serialize for Id128 {
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Id128 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = <&str>::deserialize(deserializer)?;
+        // Deserialize into owned String so this works when the deserializer
+        // holds owned data (e.g. serde_json::Value) and cannot lend a &str.
+        let s = alloc::string::String::deserialize(deserializer)?;
         s.parse().map_err(serde::de::Error::custom)
     }
 }
@@ -234,5 +236,19 @@ mod tests {
         let a = Id128::from_u128(1);
         let b = Id128::from_u128(2);
         assert!(a < b);
+    }
+
+    /// C1 regression: Id128 must deserialize from an owned serde_json::Value string,
+    /// not only from a borrowed &str.  Previously used `<&str>::deserialize` which
+    /// fails when the deserializer holds owned data (e.g. Value-backed deserializer).
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialize_from_owned_value() {
+        use alloc::string::ToString;
+        let uuid_str = "abcdef01-2345-6789-abcd-ef0123456789";
+        // serde_json::from_value takes a Value (owned), exercising the owned-string path.
+        let val = serde_json::Value::String(uuid_str.to_string());
+        let id: Id128 = serde_json::from_value(val).expect("Id128 must deserialize from Value");
+        assert_eq!(format!("{id}"), uuid_str);
     }
 }

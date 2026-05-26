@@ -1060,43 +1060,196 @@ impl KgPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params)?;
-        let id = resolve_uuid_async(&p.id, &self.runtime, token).await?;
 
-        if let Ok(entity) = self.runtime.get_entity(token, id).await {
-            return flatten_get_result("entity", to_json(&entity)?);
-        }
+        // ADR-046:299 — `get(id=<proposal_id>)` resolves to the ProposalCreated
+        // event payload, not a projection row.  Try to resolve the id against
+        // proposals_open first (for UUID/prefix disambiguation), then fetch the
+        // ProposalCreated event payload.  Standard substrates win when the same
+        // id matches both (shouldn't happen in practice; proposal IDs are fresh UUIDs).
 
-        if let Some(note) = self
-            .runtime
-            .notes(token)?
-            .get_note(id)
-            .await
-            .map_err(RuntimeError::Storage)?
-        {
-            if note.namespace == token.namespace().as_str() {
-                let note_val = to_json(&note)?;
-                let remapped = remap_note_status(note_val);
-                return flatten_get_result("note", remapped);
+        // Attempt standard UUID resolution for entity/note/edge/event substrates.
+        if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, token).await {
+            if let Ok(entity) = self.runtime.get_entity(token, id).await {
+                return flatten_get_result("entity", to_json(&entity)?);
+            }
+
+            if let Some(note) = self
+                .runtime
+                .notes(token)?
+                .get_note(id)
+                .await
+                .map_err(RuntimeError::Storage)?
+            {
+                if note.namespace == token.namespace().as_str() {
+                    let note_val = to_json(&note)?;
+                    let remapped = remap_note_status(note_val);
+                    return flatten_get_result("note", remapped);
+                }
+            }
+
+            if let Some(edge) = self.runtime.get_edge(token, id).await? {
+                return flatten_get_result("edge", to_json(&edge)?);
+            }
+
+            if let Some(event) = self
+                .runtime
+                .events(token)?
+                .get_event(id)
+                .await
+                .map_err(RuntimeError::Storage)?
+            {
+                if event.namespace == token.namespace().as_str() {
+                    return flatten_get_result("event", to_json(&event)?);
+                }
             }
         }
 
-        if let Some(edge) = self.runtime.get_edge(token, id).await? {
-            return flatten_get_result("edge", to_json(&edge)?);
-        }
-
-        if let Some(event) = self
-            .runtime
-            .events(token)?
-            .get_event(id)
-            .await
-            .map_err(RuntimeError::Storage)?
-        {
-            if event.namespace == token.namespace().as_str() {
-                return flatten_get_result("event", to_json(&event)?);
-            }
+        // Fall back: resolve as a proposal_id.  ADR-046:299 specifies that
+        // get(id=<proposal_id>) resolves to the ProposalCreated event payload.
+        if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
+            return Ok(payload_val);
         }
 
         Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
+    }
+
+    /// Resolve `raw_id` as a proposal ID and return the `ProposalCreated` event payload.
+    ///
+    /// ADR-046:299 — `get(id=<proposal_id>)` resolves to the `ProposalCreated`
+    /// event payload, not a projection row.
+    ///
+    /// Steps:
+    /// 1. Resolve `raw_id` (full UUID or 8-char prefix) against `proposals_open`.
+    /// 2. If found (exactly one match), query the event log for the
+    ///    `ProposalCreated` event with `payload_proposal_id = <full_uuid>`.
+    /// 3. Deserialize the event payload as `ProposalCreatedPayload` and return as JSON.
+    ///
+    /// Returns `Ok(None)` if no proposal matches.  Returns `Err` only on internal
+    /// storage or deserialization failures.
+    async fn try_get_proposal_payload(
+        &self,
+        token: &NamespaceToken,
+        raw_id: &str,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let ns = token.namespace().as_str().to_owned();
+
+        // Step 1: resolve the proposal_id (full UUID or 8-char prefix).
+        let (sql_str, params) = if Uuid::from_str(raw_id).is_ok() {
+            (
+                "SELECT proposal_id FROM proposals_open \
+                 WHERE proposal_id = ?1 AND namespace = ?2 LIMIT 1"
+                    .to_string(),
+                vec![SqlValue::Text(raw_id.to_string()), SqlValue::Text(ns)],
+            )
+        } else if raw_id.len() >= 8 && raw_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            let pattern = format!("{}%", raw_id);
+            (
+                "SELECT proposal_id FROM proposals_open \
+                 WHERE proposal_id LIKE ?1 AND namespace = ?2 LIMIT 2"
+                    .to_string(),
+                vec![SqlValue::Text(pattern), SqlValue::Text(ns)],
+            )
+        } else {
+            return Ok(None);
+        };
+
+        let sql = self.runtime.sql();
+        let rows = {
+            let mut reader = match sql.reader().await {
+                Ok(r) => r,
+                Err(e) => return Err(RuntimeError::Storage(e)),
+            };
+            match reader
+                .query_all(SqlStatement {
+                    sql: sql_str,
+                    params,
+                    label: Some("proposals_open.resolve_for_get".into()),
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if e.to_string().contains("no such table") {
+                        return Ok(None);
+                    }
+                    return Err(RuntimeError::Storage(e));
+                }
+            }
+        };
+
+        // Guard against ambiguous prefix — return None so the caller can propagate NotFound.
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+
+        let full_uuid_str = rows[0]
+            .get("proposal_id")
+            .and_then(|v| {
+                if let SqlValue::Text(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                RuntimeError::Internal("proposal_id column missing from proposals_open row".into())
+            })?;
+
+        let proposal_uuid = Uuid::from_str(&full_uuid_str).map_err(|e| {
+            RuntimeError::Internal(format!("stored proposal_id is not a valid UUID: {e}"))
+        })?;
+
+        // Step 2: fetch the ProposalCreated event from the event log.
+        let event_store = self.runtime.events(token)?;
+        let page = event_store
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::ProposalCreated],
+                    payload_proposal_id: Some(proposal_uuid),
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await
+            .map_err(RuntimeError::Storage)?;
+
+        let event = match page.items.into_iter().next() {
+            Some(e) => e,
+            None => {
+                return Err(RuntimeError::Internal(format!(
+                    "ProposalCreated event not found for proposal_id {proposal_uuid}"
+                )));
+            }
+        };
+
+        // Step 3: deserialize the payload and return as JSON.
+        // Use from_str (not from_value) so Id128::deserialize works with string-backed data.
+        let payload_str = event.payload.to_string();
+        let payload: khive_types::ProposalCreatedPayload = serde_json::from_str(&payload_str)
+            .map_err(|e| {
+                RuntimeError::Internal(format!(
+                    "failed to deserialize ProposalCreated payload: {e}"
+                ))
+            })?;
+
+        let mut result = serde_json::to_value(&payload).map_err(|e| {
+            RuntimeError::Internal(format!(
+                "failed to re-serialize ProposalCreatedPayload: {e}"
+            ))
+        })?;
+
+        // Inject a top-level "kind" discriminant so callers can identify the response type.
+        if let serde_json::Value::Object(ref mut map) = result {
+            map.insert(
+                "kind".to_string(),
+                serde_json::Value::String("proposal".to_string()),
+            );
+        }
+
+        Ok(Some(result))
     }
 
     pub(crate) async fn handle_list(
@@ -1863,6 +2016,69 @@ impl KgPack {
 
     // ---- Proposal verbs (ADR-046) ----
 
+    /// Resolve a proposal_id string (full UUID or 8-char prefix) to a full UUID.
+    ///
+    /// H1: `review` and `withdraw` previously called `Uuid::from_str` directly,
+    /// which rejects 8-char short IDs with "expected length 32 for simple format,
+    /// found 8".  Every other verb accepts short IDs via `resolve_uuid_async`.
+    /// Proposal IDs live in `proposals_open`, not the four tables that
+    /// `resolve_prefix` searches, so we need a dedicated prefix query here.
+    async fn resolve_proposal_uuid(
+        &self,
+        token: &NamespaceToken,
+        raw: &str,
+    ) -> Result<Uuid, RuntimeError> {
+        // Fast path: already a full UUID.
+        if let Ok(uuid) = Uuid::from_str(raw) {
+            return Ok(uuid);
+        }
+        // Prefix resolution: require at least 8 hex chars to avoid ambiguity.
+        if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            let ns = token.namespace().as_str().to_owned();
+            let pattern = format!("{}%", raw);
+            let sql = self.runtime.sql();
+            let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: "SELECT proposal_id FROM proposals_open \
+                          WHERE proposal_id LIKE ?1 AND namespace = ?2 LIMIT 2"
+                        .to_string(),
+                    params: vec![SqlValue::Text(pattern), SqlValue::Text(ns)],
+                    label: Some("proposals_open.resolve_prefix".into()),
+                })
+                .await
+                .map_err(RuntimeError::Storage)?;
+
+            let ids: Vec<String> = rows
+                .into_iter()
+                .filter_map(|row| {
+                    row.get("proposal_id").and_then(|v| {
+                        if let SqlValue::Text(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+
+            return match ids.len() {
+                0 => Err(RuntimeError::NotFound(format!(
+                    "no proposal matches prefix: {raw:?}"
+                ))),
+                1 => Uuid::from_str(&ids[0]).map_err(|e| {
+                    RuntimeError::Internal(format!("stored proposal_id is invalid: {e}"))
+                }),
+                _ => Err(RuntimeError::InvalidInput(format!(
+                    "ambiguous proposal prefix {raw:?}: matches multiple proposals; use full UUID"
+                ))),
+            };
+        }
+        Err(RuntimeError::InvalidInput(format!(
+            "invalid proposal_id {raw:?}: must be a full UUID or 8-char hex prefix"
+        )))
+    }
+
     /// `propose` — commissive verb. Emits a `ProposalCreated` event and inserts
     /// a row into the `proposals_open` projection table.
     pub(crate) async fn handle_propose(
@@ -1953,9 +2169,9 @@ impl KgPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: ReviewParams = deser(params)?;
-        let proposal_id = Uuid::from_str(&p.proposal_id).map_err(|e| {
-            RuntimeError::InvalidInput(format!("invalid proposal_id {:?}: {e}", p.proposal_id))
-        })?;
+        // H1: accept 8-char short IDs (propose returns short IDs; the next natural
+        // step is review; forcing a full-UUID round-trip is unnecessary friction).
+        let proposal_id = self.resolve_proposal_uuid(token, &p.proposal_id).await?;
         // Actor is always the authenticated token identity — client cannot override.
         let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
@@ -2093,9 +2309,8 @@ impl KgPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: WithdrawParams = deser(params)?;
-        let proposal_id = Uuid::from_str(&p.proposal_id).map_err(|e| {
-            RuntimeError::InvalidInput(format!("invalid proposal_id {:?}: {e}", p.proposal_id))
-        })?;
+        // H1: accept 8-char short IDs consistent with all other verbs.
+        let proposal_id = self.resolve_proposal_uuid(token, &p.proposal_id).await?;
         // Actor is always the authenticated token identity — client cannot override.
         let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
@@ -2212,11 +2427,17 @@ impl KgPack {
         let mut sql_params: Vec<SqlValue> = vec![SqlValue::Text(ns)];
         let mut param_idx = 2usize;
 
+        // ADR-046:277-279 — hard-state proposals (approved/rejected/applied/withdrawn)
+        // are retained for audit.  ADR-046:501-504 says list(kind=proposal) supports
+        // standard filters.  When no status is supplied, return ALL rows so callers
+        // can see the complete audit trail.  Pass status="open" (or repeat with
+        // status="changes_requested") to filter to actionable proposals only.
         if let Some(status) = &p.status {
             sql_str.push_str(&format!(" AND status = ?{param_idx}"));
             sql_params.push(SqlValue::Text(status.clone()));
             param_idx += 1;
         }
+
         if let Some(proposer) = &p.proposer {
             sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
             sql_params.push(SqlValue::Text(proposer.clone()));
@@ -2404,7 +2625,7 @@ mod tests {
             "description": "Add RoPE entity to the graph",
             "changeset": {
                 "kind": "add_entity",
-                "entity": "{\"kind\":\"concept\",\"name\":\"RoPE\"}"
+                "entity": {"kind": "concept", "name": "RoPE"}
             },
             "reviewers": ["alice"],
         }))
@@ -2465,7 +2686,7 @@ mod tests {
         let p: ProposeParams = serde_json::from_value(json!({
             "title": "Fix RoPE",
             "description": "Fix RoPE entity",
-            "changeset": {"kind": "add_entity", "entity": "{}"},
+            "changeset": {"kind": "add_entity", "entity": {"kind": "concept", "name": "RoPE"}},
         }))
         .expect("ProposeParams must deserialize without actor");
         assert_eq!(p.title, "Fix RoPE");

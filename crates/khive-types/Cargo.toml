@@ -14,12 +14,13 @@ categories.workspace = true
 # serde is optional — removed from default so `khive-types` is truly no_std-optional.
 # All internal dependents that need serde must declare `features = ["serde"]` explicitly.
 default = ["std"]
-serde = ["dep:serde"]
+serde = ["dep:serde", "dep:serde_json"]
 std = []
 blake3 = ["dep:blake3"]
 
 [dependencies]
 serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 blake3 = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
