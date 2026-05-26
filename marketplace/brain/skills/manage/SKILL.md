@@ -8,9 +8,9 @@ Use `manage` to change a profile's lifecycle state. Lifecycle controls whether t
 
 ## Lifecycle states
 
-| State | Meaning |
-| ----- | ------- |
-| `active` | Live update loop runs. Profile receives posterior updates from every dispatch. |
+| State      | Meaning                                                                          |
+| ---------- | -------------------------------------------------------------------------------- |
+| `active`   | Live update loop runs. Profile receives posterior updates from every dispatch.   |
 | `inactive` | Updates stopped. Posteriors are frozen but retained. Profile can be reactivated. |
 | `archived` | Read-only. Audit-retained. Cannot be reactivated without explicit re-activation. |
 

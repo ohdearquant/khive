@@ -10,13 +10,13 @@ A task is a note with `kind = "task"`. GTD state (`inbox`/`next`/`waiting`/`some
 
 All verbs are dispatched through the single MCP `request` tool ([ADR-020](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-020-request-dsl.md)).
 
-| Verb                                                                                   | What it does                                                      |
-| -------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `gtd.assign(title, priority?, status?, assignee?, due?, start?, end?, depends_on?, tags?, description?)` | Create a task. Defaults to `status=inbox`, priority salience 0.5. |
-| `gtd.next(limit?, assignee?)`                                                              | Actionable gtd.tasks (status in `{next, active}`), priority-sorted.   |
-| `gtd.complete(id, result?)`                                                                | Mark done. Records `completed_at` and validates the transition. `done` is terminal — no further transitions. |
-| `gtd.tasks(status?, assignee?, priority?, limit?, offset?)`                                | Filtered listing.                                                 |
-| `gtd.transition(id, status, note?)`                                                        | Explicit GTD state change with lifecycle validation.              |
+| Verb                                                                                                     | What it does                                                                                                 |
+| -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `gtd.assign(title, priority?, status?, assignee?, due?, start?, end?, depends_on?, tags?, description?)` | Create a task. Defaults to `status=inbox`, priority salience 0.5.                                            |
+| `gtd.next(limit?, assignee?)`                                                                            | Actionable gtd.tasks (status in `{next, active}`), priority-sorted.                                          |
+| `gtd.complete(id, result?)`                                                                              | Mark done. Records `completed_at` and validates the transition. `done` is terminal — no further transitions. |
+| `gtd.tasks(status?, assignee?, priority?, limit?, offset?)`                                              | Filtered listing.                                                                                            |
+| `gtd.transition(id, status, note?)`                                                                      | Explicit GTD state change with lifecycle validation.                                                         |
 
 Statuses accept canonical names _or_ aliases: `in_progress → active`, `todo → inbox`, `blocked → waiting`, `later → someday`, `finished → done`.
 

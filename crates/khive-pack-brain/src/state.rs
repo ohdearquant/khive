@@ -132,8 +132,8 @@ impl EntityPosteriors {
 pub struct BalancedRecallState {
     /// relevance_weight — prior Beta(7,3): warm-starts expecting 70% success
     pub relevance: BetaPosterior,
-    /// importance_weight — prior Beta(2,8)
-    pub importance: BetaPosterior,
+    /// salience_weight — prior Beta(2,8)
+    pub salience: BetaPosterior,
     /// temporal_weight — prior Beta(1,9)
     pub temporal: BetaPosterior,
     /// Per-entity posteriors, bounded LRU (10K default)
@@ -148,7 +148,7 @@ impl BalancedRecallState {
     pub fn new(entity_capacity: usize) -> Self {
         Self {
             relevance: BetaPosterior::new(7.0, 3.0),
-            importance: BetaPosterior::new(2.0, 8.0),
+            salience: BetaPosterior::new(2.0, 8.0),
             temporal: BetaPosterior::new(1.0, 9.0),
             entity_posteriors: EntityPosteriors::new(entity_capacity),
             total_events: 0,
@@ -158,7 +158,7 @@ impl BalancedRecallState {
 
     pub fn reset_posteriors(&mut self) {
         self.relevance = BetaPosterior::new(7.0, 3.0);
-        self.importance = BetaPosterior::new(2.0, 8.0);
+        self.salience = BetaPosterior::new(2.0, 8.0);
         self.temporal = BetaPosterior::new(1.0, 9.0);
         self.entity_posteriors.clear();
         self.exploration_epoch += 1;
@@ -167,7 +167,7 @@ impl BalancedRecallState {
     pub fn to_snapshot(&self) -> BalancedRecallSnapshot {
         BalancedRecallSnapshot {
             relevance: self.relevance.clone(),
-            importance: self.importance.clone(),
+            salience: self.salience.clone(),
             temporal: self.temporal.clone(),
             entity_posteriors: self.entity_posteriors.to_snapshot(),
             total_events: self.total_events,
@@ -178,7 +178,7 @@ impl BalancedRecallState {
     pub fn from_snapshot(snapshot: BalancedRecallSnapshot, entity_capacity: usize) -> Self {
         Self {
             relevance: snapshot.relevance,
-            importance: snapshot.importance,
+            salience: snapshot.salience,
             temporal: snapshot.temporal,
             entity_posteriors: EntityPosteriors::from_snapshot(
                 snapshot.entity_posteriors,
@@ -194,7 +194,7 @@ impl BalancedRecallState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalancedRecallSnapshot {
     pub relevance: BetaPosterior,
-    pub importance: BetaPosterior,
+    pub salience: BetaPosterior,
     pub temporal: BetaPosterior,
     pub entity_posteriors: HashMap<Uuid, BetaPosterior>,
     pub total_events: u64,

@@ -56,10 +56,10 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 description: "Memory content to store.",
             },
             ParamDef {
-                name: "importance",
+                name: "salience",
                 param_type: "number",
                 required: false,
-                description: "Importance weight 0.0–1.0 (default 0.5).",
+                description: "Salience weight 0.0–1.0 (default 0.5).",
             },
             ParamDef {
                 name: "decay_factor",

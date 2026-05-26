@@ -26,7 +26,7 @@ No Neo4j. No SPARQL endpoint to deploy. SQLite on disk, MCP over stdio, `cargo t
 | **Hybrid search**           | FTS5 trigram (CJK-safe) + sqlite-vec embeddings + reciprocal rank fusion                           |
 | **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                             |
 | **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                                  |
-| **Salience-weighted notes** | Notes carry importance scores; search ranks by semantic relevance × salience                       |
+| **Salience-weighted notes** | Notes carry salience scores; search ranks by semantic relevance × salience                         |
 | **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                                  |
 | **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges                         |
 | **Namespace isolation**     | Tenant scoping on every operation — share one DB, isolate many agents                              |

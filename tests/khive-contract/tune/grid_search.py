@@ -112,7 +112,7 @@ def setup_session(
     for i, mem in enumerate(memories):
         args: dict[str, Any] = {
             "content": mem["content"],
-            "importance": mem["importance"],
+            "salience": mem["salience"],
             "decay_factor": mem["decay_factor"],
             "memory_type": mem["memory_type"],
         }
@@ -304,17 +304,17 @@ def generate_grid(quick: bool = False) -> list[dict[str, Any]]:
     Quick grid:     every 20th config (deterministic sort) ≈ 116 configs
 
     v2 adds min_salience variation which DOES discriminate on the v2 corpus:
-    - min_salience=0.0: retrieves all items including low-importance traps
-    - min_salience=0.4: filters out low-importance items (0.28-0.35) from results
+    - min_salience=0.0: retrieves all items including low-salience traps
+    - min_salience=0.4: filters out low-salience items (0.28-0.35) from results
 
-    Weight triples are normalized so relevance+importance+temporal = 1.0.
+    Weight triples are normalized so relevance+salience+temporal = 1.0.
     Weighted fusion uses [text_weight, vector_weight] where alpha=vector_weight.
     In FTS-only mode (no_embed=True) all vector results are empty, so
     weighted configs with high vector alpha will score poorly — this is
     expected and meaningful for the grid.
     """
     weight_triples = [
-        # (relevance_weight, importance_weight, temporal_weight)
+        # (relevance_weight, salience_weight, temporal_weight)
         (0.70, 0.20, 0.10),  # default
         (0.60, 0.30, 0.10),
         (0.60, 0.20, 0.20),
@@ -345,8 +345,8 @@ def generate_grid(quick: bool = False) -> list[dict[str, Any]]:
     half_lives = [14.0, 30.0, 60.0]
 
     # min_salience variation: the key discriminating dimension for v2 corpus.
-    # 0.0 includes all items (even low-importance traps).
-    # 0.40 filters out importance_trap memories (importance 0.26-0.35) from results,
+    # 0.0 includes all items (even low-salience traps).
+    # 0.40 filters out importance_trap memories (salience 0.26-0.35) from results,
     # which FAILS importance_trap queries (those expected items have salience < 0.40).
     # This creates measurable discrimination: configs with min_salience=0.0 find trap
     # items; configs with min_salience=0.40 do not.
@@ -361,7 +361,7 @@ def generate_grid(quick: bool = False) -> list[dict[str, Any]]:
                         for ms in min_salience_values:
                             cfg: dict[str, Any] = {
                                 "relevance_weight": rw,
-                                "importance_weight": iw,
+                                "salience_weight": iw,
                                 "temporal_weight": tw,
                                 "candidate_multiplier": cm,
                                 "fuse_strategy": fuse,
@@ -507,7 +507,7 @@ def write_results(
 
 [recall]
 relevance_weight = {cfg['relevance_weight']}
-importance_weight = {cfg['importance_weight']}
+salience_weight = {cfg['salience_weight']}
 temporal_weight = {cfg['temporal_weight']}
 temporal_half_life_days = {cfg['temporal_half_life_days']}
 decay_model = "{decay_model_str}"
@@ -537,7 +537,7 @@ min_salience = {cfg['min_salience']}
         decay_str = c["decay_model"] if isinstance(c["decay_model"], str) else json.dumps(c["decay_model"])
         ms = c.get("min_salience", 0.0)
         return (
-            f"rel={c['relevance_weight']} imp={c['importance_weight']} "
+            f"rel={c['relevance_weight']} sal={c['salience_weight']} "
             f"tmp={c['temporal_weight']} cand={c['candidate_multiplier']} "
             f"fuse={fuse_str} decay={decay_str} hl={c['temporal_half_life_days']} "
             f"ms={ms}"
@@ -583,7 +583,7 @@ min_salience = {cfg['min_salience']}
 | recall_at_10 | {default_config_metrics['recall_at_10']:.4f} | {winner['recall_at_10']:.4f} | {winner['recall_at_10'] - default_config_metrics['recall_at_10']:+.4f} |
 | mean latency | {default_config_metrics['mean_latency_ms']:.1f}ms | {winner['mean_latency_ms']:.1f}ms | {winner['mean_latency_ms'] - default_config_metrics['mean_latency_ms']:+.1f}ms |
 
-Default config: relevance=0.70 importance=0.20 temporal=0.10 candidate_multiplier=20 fuse=rrf(k=60) decay=exponential half_life=30.0
+Default config: relevance=0.70 salience=0.20 temporal=0.10 candidate_multiplier=20 fuse=rrf(k=60) decay=exponential half_life=30.0
 """
         else:
             default_section = f"""
@@ -595,7 +595,7 @@ Default config: relevance=0.70 importance=0.20 temporal=0.10 candidate_multiplie
 | MRR | {default_config_metrics['mrr']:.4f} | {winner['mrr']:.4f} | {winner['mrr'] - default_config_metrics['mrr']:+.4f} |
 | mean latency | {default_config_metrics['mean_latency_ms']:.1f}ms | {winner['mean_latency_ms']:.1f}ms | {winner['mean_latency_ms'] - default_config_metrics['mean_latency_ms']:+.1f}ms |
 
-Default config: relevance=0.70 importance=0.20 temporal=0.10 candidate_multiplier=20 fuse=rrf(k=60) decay=exponential half_life=30.0
+Default config: relevance=0.70 salience=0.20 temporal=0.10 candidate_multiplier=20 fuse=rrf(k=60) decay=exponential half_life=30.0
 """
 
     if version == "v2":
@@ -671,7 +671,7 @@ Parameters: `{_cfg_summary(winner)}`
 
 _DEFAULT_CONFIG = {
     "relevance_weight": 0.70,
-    "importance_weight": 0.20,
+    "salience_weight": 0.20,
     "temporal_weight": 0.10,
     "candidate_multiplier": 20,
     "fuse_strategy": {"rrf": {"k": 60}},

@@ -69,8 +69,8 @@ pub mod ordering;
 
 pub use khive_score::{cmp_asc_then_id, cmp_desc_then_id, DeterministicScore};
 pub use objective::builtin::{
-    FirstMatchObjective, HasImportance, HasTimestamp, ImportanceObjective, MaxScoreObjective,
-    RecencyObjective, RelevanceObjective, ThresholdObjective,
+    FirstMatchObjective, HasSalience, HasTimestamp, MaxScoreObjective, RecencyObjective,
+    RelevanceObjective, SalienceObjective, ThresholdObjective,
 };
 pub use objective::compose::{
     ConsensusObjective, NegateObjective, PriorityObjective, ScaleObjective, UnionObjective,

@@ -23,11 +23,11 @@ directly when you need other entity kinds, relations, or full parameter control.
 
 All verbs are dispatched through the single MCP `request` tool.
 
-| Verb | What it does |
-| ---- | ------------ |
-| `knowledge.learn(name, description?, domain?, tags?)` | Register a concept entity. `domain` is stored in `properties.domain` and automatically added to `tags` for FTS discoverability. |
-| `knowledge.cite(concept_id, source_id, weight?)` | Create an `introduced_by` edge from a concept to its source document or person. `weight` is clamped to [0.0, 1.0]; defaults to 1.0. |
-| `knowledge.topic(domain?, query?, limit?)` | List or search concept entities, optionally filtered by domain tag. `limit` max is 100; defaults to 20. |
+| Verb                                                  | What it does                                                                                                                        |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `knowledge.learn(name, description?, domain?, tags?)` | Register a concept entity. `domain` is stored in `properties.domain` and automatically added to `tags` for FTS discoverability.     |
+| `knowledge.cite(concept_id, source_id, weight?)`      | Create an `introduced_by` edge from a concept to its source document or person. `weight` is clamped to [0.0, 1.0]; defaults to 1.0. |
+| `knowledge.topic(domain?, query?, limit?)`            | List or search concept entities, optionally filtered by domain tag. `limit` max is 100; defaults to 20.                             |
 
 ## Skills
 

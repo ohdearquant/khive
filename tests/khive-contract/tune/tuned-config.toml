@@ -6,7 +6,7 @@
 
 [recall]
 relevance_weight = 0.7
-importance_weight = 0.2
+salience_weight = 0.2
 temporal_weight = 0.1
 temporal_half_life_days = 14.0
 decay_model = "hyperbolic"

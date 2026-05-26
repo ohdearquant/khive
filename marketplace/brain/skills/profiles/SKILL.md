@@ -8,11 +8,11 @@ The brain pack ships with one built-in profile, `balanced-recall-v1`, which driv
 
 ## Verbs covered
 
-| Verb | What it does |
-| ---- | ------------ |
-| `brain.profiles(lifecycle?)` | List all profiles, optionally filtered by lifecycle. |
-| `brain.profile(id)` | Full profile record with state snapshot. |
-| `brain.resolve(consumer_kind, actor?, namespace?)` | Which profile would serve this caller? |
+| Verb                                               | What it does                                         |
+| -------------------------------------------------- | ---------------------------------------------------- |
+| `brain.profiles(lifecycle?)`                       | List all profiles, optionally filtered by lifecycle. |
+| `brain.profile(id)`                                | Full profile record with state snapshot.             |
+| `brain.resolve(consumer_kind, actor?, namespace?)` | Which profile would serve this caller?               |
 
 ## Workflow
 
@@ -40,7 +40,7 @@ Required arg: `id` (the profile string identifier, not a UUID).
 request(ops="brain.profile(id=\"balanced-recall-v1\")")
 ```
 
-The response adds `state_snapshot` to the fields above. The snapshot contains current posterior values for `relevance_weight`, `importance_weight`, and `temporal_weight`.
+The response adds `state_snapshot` to the fields above. The snapshot contains current posterior values for `relevance_weight`, `salience_weight`, and `temporal_weight`.
 
 A `NotFound` error is returned if no profile with that `id` exists.
 

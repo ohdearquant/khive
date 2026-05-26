@@ -16,12 +16,12 @@ request(ops="knowledge.learn(name=\"LoRA\", domain=\"fine-tuning\", tags=[\"adap
 
 ## Parameters
 
-| Parameter | Type | Required | Description |
-| --------- | ---- | -------- | ----------- |
-| `name` | string | yes | Canonical short name for the concept (e.g. `"LoRA"`, `"FlashAttention"`). |
-| `description` | string | no | Free-text description. Included in FTS index. |
-| `domain` | string | no | Research domain (e.g. `"attention"`, `"fine-tuning"`, `"inference"`). |
-| `tags` | list of strings | no | Additional classification tags. |
+| Parameter     | Type            | Required | Description                                                               |
+| ------------- | --------------- | -------- | ------------------------------------------------------------------------- |
+| `name`        | string          | yes      | Canonical short name for the concept (e.g. `"LoRA"`, `"FlashAttention"`). |
+| `description` | string          | no       | Free-text description. Included in FTS index.                             |
+| `domain`      | string          | no       | Research domain (e.g. `"attention"`, `"fine-tuning"`, `"inference"`).     |
+| `tags`        | list of strings | no       | Additional classification tags.                                           |
 
 ## Response shape
 

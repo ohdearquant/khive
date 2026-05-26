@@ -117,14 +117,14 @@ pub struct SelectorWeights { pub category_weights: BTreeMap<String, f32>,
 
 ### Six built-in objectives (common strategies)
 
-| Objective                               | Behavior                                  |
-| --------------------------------------- | ----------------------------------------- |
-| `MaxScoreObjective`                     | Highest raw score wins                    |
-| `ThresholdObjective`                    | Pass/fail gate at a score threshold       |
-| `FirstMatchObjective`                   | First candidate that passes the predicate |
-| `RecencyObjective<T: HasTimestamp>`     | Temporal weighting                        |
-| `ImportanceObjective<T: HasImportance>` | Importance-weighted                       |
-| `RelevanceObjective`                    | Relevance scoring from context            |
+| Objective                           | Behavior                                  |
+| ----------------------------------- | ----------------------------------------- |
+| `MaxScoreObjective`                 | Highest raw score wins                    |
+| `ThresholdObjective`                | Pass/fail gate at a score threshold       |
+| `FirstMatchObjective`               | First candidate that passes the predicate |
+| `RecencyObjective<T: HasTimestamp>` | Temporal weighting                        |
+| `SalienceObjective<T: HasSalience>` | Salience-weighted                         |
+| `RelevanceObjective`                | Relevance scoring from context            |
 
 ### Six composition combinators (objective algebra)
 

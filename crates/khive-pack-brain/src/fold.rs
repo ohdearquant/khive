@@ -46,14 +46,14 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
             }
         }
 
-        // Fix #355 (MAJ-001): importance posterior — driven by explicit feedback signal.
-        // Useful feedback = positive evidence that importance weighting helped recall.
+        // Fix #355 (MAJ-001): salience posterior — driven by explicit feedback signal.
+        // Useful feedback = positive evidence that salience weighting helped recall.
         // NotUseful / Wrong = negative evidence.
         if let BrainSignal::Feedback { signal: ref fb, .. } = signal {
             match fb {
-                FeedbackSignal::Useful => state.importance.update_success(),
+                FeedbackSignal::Useful => state.salience.update_success(),
                 FeedbackSignal::NotUseful | FeedbackSignal::Wrong => {
-                    state.importance.update_failure()
+                    state.salience.update_failure()
                 }
             }
         }
@@ -126,9 +126,9 @@ mod tests {
         // relevance prior Beta(7,3)
         assert!((state.relevance.alpha - 7.0).abs() < 1e-12);
         assert!((state.relevance.beta - 3.0).abs() < 1e-12);
-        // importance prior Beta(2,8)
-        assert!((state.importance.alpha - 2.0).abs() < 1e-12);
-        assert!((state.importance.beta - 8.0).abs() < 1e-12);
+        // salience prior Beta(2,8)
+        assert!((state.salience.alpha - 2.0).abs() < 1e-12);
+        assert!((state.salience.beta - 8.0).abs() < 1e-12);
         // temporal prior Beta(1,9)
         assert!((state.temporal.alpha - 1.0).abs() < 1e-12);
         assert!((state.temporal.beta - 9.0).abs() < 1e-12);
@@ -242,7 +242,7 @@ mod tests {
 
     // ── Regression tests (issues #355, #356, #357, #295) ──────────────────────
 
-    // #355 (MAJ-001): importance and temporal posteriors must update after dispatch.
+    // #355 (MAJ-001): salience and temporal posteriors must update after dispatch.
     #[test]
     fn test_355_posteriors_update_after_dispatch() {
         let fold = BalancedRecallFold::new(100);
@@ -250,26 +250,26 @@ mod tests {
         let state = fold.init(&ctx);
 
         // Baseline: domain-informed priors.
-        let imp_alpha_prior = state.importance.alpha; // 2.0
-        let imp_beta_prior = state.importance.beta; // 8.0
+        let sal_alpha_prior = state.salience.alpha; // 2.0
+        let sal_beta_prior = state.salience.beta; // 8.0
         let tmp_alpha_prior = state.temporal.alpha; // 1.0
         let tmp_beta_prior = state.temporal.beta; // 9.0
 
-        // Useful feedback → importance success.
+        // Useful feedback → salience success.
         let id = Uuid::new_v4();
         let mut fb_useful = make_event("brain.feedback", EventOutcome::Success, Some(id));
         fb_useful.payload = serde_json::json!({"signal": "useful"});
         let state = fold.reduce(state, &fb_useful, &ctx);
 
         assert!(
-            (state.importance.alpha - (imp_alpha_prior + 1.0)).abs() < 1e-12,
-            "useful feedback must increment importance.alpha: expected {}, got {}",
-            imp_alpha_prior + 1.0,
-            state.importance.alpha
+            (state.salience.alpha - (sal_alpha_prior + 1.0)).abs() < 1e-12,
+            "useful feedback must increment salience.alpha: expected {}, got {}",
+            sal_alpha_prior + 1.0,
+            state.salience.alpha
         );
         assert!(
-            (state.importance.beta - imp_beta_prior).abs() < 1e-12,
-            "useful feedback must not change importance.beta"
+            (state.salience.beta - sal_beta_prior).abs() < 1e-12,
+            "useful feedback must not change salience.beta"
         );
 
         // Fast recall hit → temporal success (latency_us = 0 ≤ 50_000).
@@ -298,14 +298,14 @@ mod tests {
             "slow recall hit must increment temporal.beta"
         );
 
-        // Not-useful feedback → importance failure.
+        // Not-useful feedback → salience failure.
         let mut fb_bad = make_event("brain.feedback", EventOutcome::Success, Some(id));
         fb_bad.payload = serde_json::json!({"signal": "not_useful"});
         let state = fold.reduce(state, &fb_bad, &ctx);
 
         assert!(
-            (state.importance.beta - (imp_beta_prior + 1.0)).abs() < 1e-12,
-            "not_useful feedback must increment importance.beta"
+            (state.salience.beta - (sal_beta_prior + 1.0)).abs() < 1e-12,
+            "not_useful feedback must increment salience.beta"
         );
     }
 }

@@ -31,12 +31,14 @@ VERBS_UNDER_TEST = {
     "memory.remember", "memory.recall",
 }
 
-# The 14 KG substrate verbs that are allowed as bare names (no pack prefix).
+# KG substrate verbs that are allowed as bare names (no pack prefix).
 # Matches the Rust contract test at crates/kkernel/tests/verb_namespace_contract.rs.
+# `verbs` is the substrate-level verb-registry introspection (J-help PR #464).
 KG_SUBSTRATE_BARE: frozenset[str] = frozenset({
     "create", "get", "list", "update", "delete", "merge",
     "search", "link", "neighbors", "traverse", "query",
     "propose", "review", "withdraw",
+    "verbs",
 })
 
 # Pattern for a valid dotted verb: one dot, identifier on each side.

@@ -60,8 +60,8 @@ Resist:
 
 ## When to use other verbs instead
 
-| Situation                                               | Verb                                                                                                                                                               |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Situation                                               | Verb                                                                                                                                                                   |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | "Can I act on this right now?" — actually start working | `gtd.transition(id=..., status="active")`                                                                                                                              |
 | "I know I can't do this yet, blocked by X"              | `gtd.assign(..., status="waiting")` + describe blocker in `description`                                                                                                |
 | "Maybe someday, not now"                                | `gtd.assign(..., status="someday")`                                                                                                                                    |

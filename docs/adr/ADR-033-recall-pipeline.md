@@ -10,7 +10,7 @@ The memory pack ([ADR-021](ADR-021-memory-pack.md)) exposes two verbs: `remember
 ADR-021 §5 specifies the recall verb's scoring formula as a v1 starting value:
 
 ```
-score = rrf_score * 0.70 + effective_importance * 0.20 + temporal * 0.10
+score = rrf_score * 0.70 + effective_salience * 0.20 + temporal * 0.10
 ```
 
 and explicitly defers recall-weight tuning to a separate ADR when research informs it. This
@@ -22,7 +22,7 @@ Changing any weight requires editing Rust source and recompiling.
 
 **2. The pipeline is opaque.** The `recall` verb returns final results. There is no way to
 inspect intermediate states: what did FTS find? What did vector search find? What did RRF
-produce before importance and temporal weighting were applied? Without intermediates,
+produce before salience and temporal weighting were applied? Without intermediates,
 calibration is guesswork.
 
 **3. No fold integration.** The scoring formula is ad-hoc arithmetic, not an Objective
@@ -44,7 +44,7 @@ calibrated empirically without recompilation.
 pub struct RecallConfig {
     // Fusion weights — must be non-negative; sum must be > 0
     pub relevance_weight: f64,       // default 0.70
-    pub importance_weight: f64,      // default 0.20
+    pub salience_weight: f64,         // default 0.20
     pub temporal_weight: f64,        // default 0.10
 
     // Per-reranker weights, keyed by reranker name (ADR-042 §7). v1 built-ins:
@@ -127,12 +127,12 @@ The `memory.recall_score` handler returns a score breakdown per result:
   "score": 0.42,
   "breakdown": {
     "relevance": 0.35,
-    "importance_raw": 0.80,
-    "importance_decayed": 0.62,
+    "salience_raw": 0.80,
+    "salience_decayed": 0.62,
     "temporal": 0.15,
     "weighted": {
       "relevance_contribution": 0.245,
-      "importance_contribution": 0.124,
+      "salience_contribution": 0.124,
       "temporal_contribution": 0.015
     }
   }
@@ -194,7 +194,7 @@ impl MemoryPack {
     ) -> ComposePipeline<NoteCandidate> {
         let mut terms: Vec<(f64, Box<dyn Objective<NoteCandidate>>)> = vec![
             (config.relevance_weight, Box::new(RrfFusionObjective)),
-            (config.importance_weight, Box::new(DecayAwareImportanceObjective {
+            (config.salience_weight, Box::new(DecayAwareSalienceObjective {
                 decay_model: config.decay_model.clone(),
             })),
             (config.temporal_weight, Box::new(TemporalRecencyObjective {
@@ -228,7 +228,7 @@ The three new Objective implementations:
 pub struct RrfFusionObjective;
 
 /// Scores by salience with configurable temporal decay.
-pub struct DecayAwareImportanceObjective {
+pub struct DecayAwareSalienceObjective {
     pub decay_model: DecayModel,
 }
 
@@ -254,7 +254,7 @@ The `recall` verb accepts an optional `config` object. Missing fields use pack d
   "limit": 10,
   "config": {
     "relevance_weight": 0.50,
-    "importance_weight": 0.30,
+    "salience_weight": 0.30,
     "temporal_weight": 0.20,
     "temporal_half_life_days": 7.0,
     "decay_model": "hyperbolic"
@@ -271,11 +271,11 @@ call-level config wins field-by-field over file defaults.
 Per the ADR-024 documentation requirement, every domain-specific fold implementation must
 document its Hoare triple:
 
-| Component         | Recall instantiation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Precondition**  | Query string is non-empty. Namespace contains memory-kind notes. RecallConfig is valid: all weights non-negative, `relevance_weight + importance_weight + temporal_weight > 0`. Embedding model is configured if the vector path is active.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| **Program**       | Stage 1 (`memory.recall_embed`): query → embedding via multi-engine fan-out. Stage 2 (`memory.recall_candidates`): broad recall from FTS5 + vector, `candidate_multiplier × limit` candidates per path. Stage 3 (`memory.recall_fuse`): apply `fusion_strategy` (default RRF) to produce fused hits. Stage 4 (`memory.recall_rerank`): **REPLACE strategy** — if `reranker_weights` is non-empty, build the five rerank features per candidate (`relevance`, `importance`, `temporal`, `text_match`, `vector_match`) and call `weighted_rerank`; the normalized weighted score becomes the final score directly, replacing `compute_score`. If `reranker_weights` is empty (the default), this stage is skipped. Stage 5 (`memory.recall_score`): **only when `reranker_weights` is empty** — apply `compute_score` using the three base weights (`relevance_weight`, `importance_weight`, `temporal_weight`). When Stage 4 ran, Stage 5 is a no-op (final scores are already set). Stage 6 (select): truncate to `limit`; apply `budget` via `GreedySelector` if set. |
-| **Postcondition** | Output is a deterministic list of memory notes ordered by composite score, within `limit`. All returned notes are alive (not soft-deleted) and `kind = memory`. Score breakdown is available on request via `memory.recall_score`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Component         | Recall instantiation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Precondition**  | Query string is non-empty. Namespace contains memory-kind notes. RecallConfig is valid: all weights non-negative, `relevance_weight + salience_weight + temporal_weight > 0`. Embedding model is configured if the vector path is active.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **Program**       | Stage 1 (`memory.recall_embed`): query → embedding via multi-engine fan-out. Stage 2 (`memory.recall_candidates`): broad recall from FTS5 + vector, `candidate_multiplier × limit` candidates per path. Stage 3 (`memory.recall_fuse`): apply `fusion_strategy` (default RRF) to produce fused hits. Stage 4 (`memory.recall_rerank`): **REPLACE strategy** — if `reranker_weights` is non-empty, build the five rerank features per candidate (`relevance`, `salience`, `temporal`, `text_match`, `vector_match`) and call `weighted_rerank`; the normalized weighted score becomes the final score directly, replacing `compute_score`. If `reranker_weights` is empty (the default), this stage is skipped. Stage 5 (`memory.recall_score`): **only when `reranker_weights` is empty** — apply `compute_score` using the three base weights (`relevance_weight`, `salience_weight`, `temporal_weight`). When Stage 4 ran, Stage 5 is a no-op (final scores are already set). Stage 6 (select): truncate to `limit`; apply `budget` via `GreedySelector` if set. |
+| **Postcondition** | Output is a deterministic list of memory notes ordered by composite score, within `limit`. All returned notes are alive (not soft-deleted) and `kind = memory`. Score breakdown is available on request via `memory.recall_score`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ### 6.1 Per-request knobs (ADR-033 §6 addendum)
 
@@ -324,7 +324,7 @@ pre-computed candidate features.
 score replaces the `compute_score` output as the final score. When `reranker_weights` is
 empty (the default), the reranker stage is skipped and `compute_score` runs as before.
 Rationale: the five reranker features cover the same axes as `compute_score` (relevance,
-importance, temporal) plus retrieval-source bonuses. A caller who configures
+salience, temporal) plus retrieval-source bonuses. A caller who configures
 `reranker_weights` is explicitly taking over scoring — blending via a hidden α would
 require a sixth config knob and make the weighting opaque.
 
@@ -333,7 +333,7 @@ require a sixth config knob and make the weighting opaque.
 | Feature name   | Source                                                     | Range  |
 | -------------- | ---------------------------------------------------------- | ------ |
 | `relevance`    | Fused retrieval score (RRF/weighted fusion output)         | [0, 1] |
-| `importance`   | Note salience after applying configured decay model        | [0, 1] |
+| `salience`     | Note salience after applying configured decay model        | [0, 1] |
 | `temporal`     | `exp(-ln2/half_life × age_days)` — recency half-life score | (0, 1] |
 | `text_match`   | 1.0 when candidate appeared in FTS text results, else 0.0  | {0, 1} |
 | `vector_match` | 1.0 when candidate appeared in vector results, else 0.0    | {0, 1} |
@@ -406,7 +406,7 @@ To calibrate recall parameters for a deployment:
 1. **Baseline**: `recall(query="...", limit=20)` — observe default-weight results.
 2. **Inspect**: `memory.recall_score(fused_hits=..., config={...})` — read the per-result breakdown
    to see which component dominates.
-3. **Adjust**: modify `relevance_weight`, `importance_weight`, or `temporal_weight` in the
+3. **Adjust**: modify `relevance_weight`, `salience_weight`, or `temporal_weight` in the
    config.
 4. **Compare**: run the same query with two configs; compare result orderings.
 5. **Evaluate**: are the top results what was expected? If not, identify which breakdown
@@ -441,7 +441,7 @@ When the brain pack is loaded, the `recall` handler resolves a profile at setup 
 (before any stage runs) via `brain.resolve(actor, namespace, consumer_kind="recall")`
 — ADR-032 §10. The resolved profile contributes:
 
-- **Config overrides**: `RecallConfig` fields the profile has tuned (relevance/importance/
+- **Config overrides**: `RecallConfig` fields the profile has tuned (relevance/salience/
   temporal/rerank weights, decay model, half-life). Profile config overrides compose
   field-by-field with the per-call `config` argument; the per-call config wins (operator
   override beats automated tuning).
@@ -502,7 +502,7 @@ stage in ADR-042 does.
 
 ADR-021 explicitly flagged the 0.70 / 0.20 / 0.10 split as starting values, not invariants.
 Different deployment contexts (long-term research archive vs. daily session memory vs.
-episodic log) want different balances between retrieval relevance, importance-weighted
+episodic log) want different balances between retrieval relevance, salience-weighted
 memory, and temporal freshness. No single hardcoded setting is correct for all contexts.
 Compile-time constants block empirical calibration entirely.
 

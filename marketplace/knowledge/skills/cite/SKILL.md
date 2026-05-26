@@ -16,11 +16,11 @@ request(ops="knowledge.cite(concept_id=\"<concept_uuid>\", source_id=\"<document
 
 ## Parameters
 
-| Parameter | Type | Required | Description |
-| --------- | ---- | -------- | ----------- |
-| `concept_id` | string | yes | Full UUID or 8-char prefix of the concept. |
-| `source_id` | string | yes | Full UUID or 8-char prefix of the source (`document` or `person`). |
-| `weight` | float | no | Edge weight in `[0.0, 1.0]`. Default: `1.0` (definitional). |
+| Parameter    | Type   | Required | Description                                                        |
+| ------------ | ------ | -------- | ------------------------------------------------------------------ |
+| `concept_id` | string | yes      | Full UUID or 8-char prefix of the concept.                         |
+| `source_id`  | string | yes      | Full UUID or 8-char prefix of the source (`document` or `person`). |
+| `weight`     | float  | no       | Edge weight in `[0.0, 1.0]`. Default: `1.0` (definitional).        |
 
 ## Response shape
 
@@ -53,4 +53,4 @@ request(ops="knowledge.cite(concept_id=\"<concept_full_id>\", source_id=\"<paper
 - **Citing concept → concept.** `introduced_by` requires the target to be a `document` or
   `person`. Use the kg `link` verb with a different relation (e.g. `extends`) for concept→concept.
 - **Using a note ID as source.** Notes are not valid targets for `introduced_by`. The source must
-  be a `document` or `person` *entity*.
+  be a `document` or `person` _entity_.

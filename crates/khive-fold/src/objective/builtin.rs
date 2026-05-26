@@ -154,10 +154,10 @@ pub trait HasTimestamp {
     fn timestamp(&self) -> chrono::DateTime<chrono::Utc>;
 }
 
-/// Trait for items with importance
-pub trait HasImportance {
-    /// Returns the importance value of this item (0.0 to 1.0)
-    fn importance(&self) -> f64;
+/// Trait for items with salience
+pub trait HasSalience {
+    /// Returns the salience value of this item (0.0 to 1.0)
+    fn salience(&self) -> f64;
 }
 
 /// Scores by recency (newer = higher score).
@@ -204,51 +204,49 @@ impl<T: HasTimestamp + Send + Sync> Objective<T> for RecencyObjective {
     }
 }
 
-/// Scores by importance field.
-pub struct ImportanceObjective {
-    min_importance: f64,
+/// Scores by salience field.
+pub struct SalienceObjective {
+    min_salience: f64,
 }
 
-impl ImportanceObjective {
-    /// Create a new importance objective
+impl SalienceObjective {
+    /// Create a new salience objective
     pub fn new() -> Self {
-        Self {
-            min_importance: 0.0,
-        }
+        Self { min_salience: 0.0 }
     }
 
-    /// Set minimum importance
+    /// Set minimum salience
     pub fn with_min(mut self, min: f64) -> Self {
-        self.min_importance = min;
+        self.min_salience = min;
         self
     }
 }
 
-impl Default for ImportanceObjective {
+impl Default for SalienceObjective {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: HasImportance + Send + Sync> Objective<T> for ImportanceObjective {
+impl<T: HasSalience + Send + Sync> Objective<T> for SalienceObjective {
     fn score(&self, candidate: &T, _context: &ObjectiveContext) -> f64 {
-        let importance = candidate.importance();
-        if importance >= self.min_importance {
-            importance
+        let salience = candidate.salience();
+        if salience >= self.min_salience {
+            salience
         } else {
             0.0
         }
     }
 
     fn name(&self) -> &str {
-        "ImportanceObjective"
+        "SalienceObjective"
     }
 }
 
-/// Combines recency and importance.
+/// Combines recency and salience.
 pub struct RelevanceObjective {
     recency_weight: f64,
-    importance_weight: f64,
+    salience_weight: f64,
     recency: RecencyObjective,
 }
 
@@ -257,18 +255,18 @@ impl RelevanceObjective {
     ///
     /// # Panics
     /// Panics if either weight is negative or non-finite.
-    pub fn new(recency_half_life: f64, recency_weight: f64, importance_weight: f64) -> Self {
+    pub fn new(recency_half_life: f64, recency_weight: f64, salience_weight: f64) -> Self {
         assert!(
             recency_weight.is_finite() && recency_weight >= 0.0,
             "recency_weight must be finite and non-negative, got {recency_weight}"
         );
         assert!(
-            importance_weight.is_finite() && importance_weight >= 0.0,
-            "importance_weight must be finite and non-negative, got {importance_weight}"
+            salience_weight.is_finite() && salience_weight >= 0.0,
+            "salience_weight must be finite and non-negative, got {salience_weight}"
         );
         Self {
             recency_weight,
-            importance_weight,
+            salience_weight,
             recency: RecencyObjective::new(recency_half_life),
         }
     }
@@ -279,7 +277,7 @@ impl RelevanceObjective {
     }
 }
 
-impl<T: HasTimestamp + HasImportance + Send + Sync> Objective<T> for RelevanceObjective {
+impl<T: HasTimestamp + HasSalience + Send + Sync> Objective<T> for RelevanceObjective {
     fn score(&self, candidate: &T, context: &ObjectiveContext) -> f64 {
         // If context carries a named relevance score, use it directly.
         if let Some(v) = context
@@ -291,11 +289,11 @@ impl<T: HasTimestamp + HasImportance + Send + Sync> Objective<T> for RelevanceOb
         }
 
         let recency_score = self.recency.score(candidate, context);
-        let importance_score = candidate.importance();
+        let salience_score = candidate.salience();
 
-        let total_weight = self.recency_weight + self.importance_weight;
+        let total_weight = self.recency_weight + self.salience_weight;
         if total_weight > 0.0 {
-            (self.recency_weight * recency_score + self.importance_weight * importance_score)
+            (self.recency_weight * recency_score + self.salience_weight * salience_score)
                 / total_weight
         } else {
             0.0
@@ -371,7 +369,7 @@ mod tests {
     struct TestItem {
         _value: i32,
         timestamp: chrono::DateTime<chrono::Utc>,
-        importance: f64,
+        salience: f64,
     }
 
     impl HasTimestamp for TestItem {
@@ -380,9 +378,9 @@ mod tests {
         }
     }
 
-    impl HasImportance for TestItem {
-        fn importance(&self) -> f64 {
-            self.importance
+    impl HasSalience for TestItem {
+        fn salience(&self) -> f64 {
+            self.salience
         }
     }
 
@@ -398,12 +396,12 @@ mod tests {
         let new_item = TestItem {
             _value: 1,
             timestamp: now,
-            importance: 0.5,
+            salience: 0.5,
         };
         let old_item = TestItem {
             _value: 2,
             timestamp: old,
-            importance: 0.5,
+            salience: 0.5,
         };
 
         let new_score = objective.score(&new_item, &context);
@@ -423,7 +421,7 @@ mod tests {
         let item = TestItem {
             _value: 1,
             timestamp: now,
-            importance: 0.8,
+            salience: 0.8,
         };
 
         let score = objective.score(&item, &context);
@@ -442,10 +440,10 @@ mod tests {
         let item = TestItem {
             _value: 1,
             timestamp: now,
-            importance: 0.9,
+            salience: 0.9,
         };
 
-        // The context relevance_score should override the recency+importance fusion.
+        // The context relevance_score should override the recency+salience fusion.
         let score = objective.score(&item, &context);
         assert!((score - 0.42).abs() < 1e-9);
     }
@@ -457,8 +455,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "importance_weight must be finite and non-negative")]
-    fn test_relevance_nan_importance_weight_panics() {
+    #[should_panic(expected = "salience_weight must be finite and non-negative")]
+    fn test_relevance_nan_salience_weight_panics() {
         RelevanceObjective::new(3600.0, 0.5, f64::NAN);
     }
 

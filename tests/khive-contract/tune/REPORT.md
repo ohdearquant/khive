@@ -1,3 +1,4 @@
+# Historical report — pre-salience rename (2026-05-25)
 # Param-Tuning Grid Search Report
 
 - **Date**: 2026-05-25

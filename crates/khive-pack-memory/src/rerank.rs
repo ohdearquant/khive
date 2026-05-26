@@ -3,12 +3,12 @@ use std::collections::HashMap;
 /// Input features available per recall candidate for weighted reranking.
 ///
 /// Each field is a normalized scalar in roughly [0, 1] (though `temporal` and
-/// `importance` can technically exceed 1.0 only if salience > 1.0 or age < 0,
+/// `salience` can technically exceed 1.0 only if the raw salience > 1.0 or age < 0,
 /// neither of which the runtime produces in practice).
 ///
 /// Supported feature names (keys in `reranker_weights`):
 /// - `"relevance"` — fused retrieval score (RRF/weighted fusion output)
-/// - `"importance"` — note salience after decay (`salience * exp(-k * age)`)
+/// - `"salience"` — note salience after decay (`salience * exp(-k * age)`)
 /// - `"temporal"` — recency score (`exp(-ln2/half_life * age_days)`)
 /// - `"text_match"` — 1.0 when candidate appeared in FTS text results, else 0.0
 /// - `"vector_match"` — 1.0 when candidate appeared in vector results, else 0.0
@@ -16,8 +16,8 @@ use std::collections::HashMap;
 pub struct RerankFeatures {
     /// Fused retrieval score from RRF or weighted fusion.
     pub relevance: f64,
-    /// Salience after applying the configured decay model.
-    pub importance: f64,
+    /// Decay-adjusted salience value (raw salience × decay factor).
+    pub salience: f64,
     /// Half-life–decay recency score independent of per-note decay_factor.
     pub temporal: f64,
     /// True when candidate appeared in FTS text search results.
@@ -62,7 +62,7 @@ pub fn weighted_rerank(features: &RerankFeatures, weights: &HashMap<String, f64>
         }
         let feature_value = match name.as_str() {
             "relevance" => features.relevance,
-            "importance" => features.importance,
+            "salience" => features.salience,
             "temporal" => features.temporal,
             "text_match" => f64::from(features.text_match),
             "vector_match" => f64::from(features.vector_match),
@@ -89,7 +89,7 @@ mod tests {
     fn features() -> RerankFeatures {
         RerankFeatures {
             relevance: 0.8,
-            importance: 0.6,
+            salience: 0.6,
             temporal: 0.4,
             text_match: true,
             vector_match: false,
@@ -114,26 +114,26 @@ mod tests {
     }
 
     #[test]
-    fn single_importance_weight_produces_expected_score() {
+    fn single_salience_weight_produces_expected_score() {
         // After normalization: (2.0 * 0.6) / 2.0 = 0.6 — the weight magnitude
         // cancels out; only the feature value remains.
-        let weights: HashMap<String, f64> = [("importance".to_string(), 2.0)].into_iter().collect();
+        let weights: HashMap<String, f64> = [("salience".to_string(), 2.0)].into_iter().collect();
         let score = weighted_rerank(&features(), &weights);
         let diff = (score - 0.6).abs();
         assert!(
             diff < 1e-12,
-            "importance weight=2.0 on importance=0.6 should normalize to 0.6, got {score}"
+            "salience weight=2.0 on salience=0.6 should normalize to 0.6, got {score}"
         );
     }
 
     #[test]
     fn multi_feature_weight_produces_expected_combination() {
-        // relevance*0.5 + importance*0.3 + temporal*0.2
+        // relevance*0.5 + salience*0.3 + temporal*0.2
         // = 0.8*0.5 + 0.6*0.3 + 0.4*0.2
         // = 0.40 + 0.18 + 0.08 = 0.66
         let weights: HashMap<String, f64> = [
             ("relevance".to_string(), 0.5),
-            ("importance".to_string(), 0.3),
+            ("salience".to_string(), 0.3),
             ("temporal".to_string(), 0.2),
         ]
         .into_iter()
@@ -186,12 +186,12 @@ mod tests {
     fn zero_weight_entry_is_skipped() {
         let weights: HashMap<String, f64> = [
             ("relevance".to_string(), 0.0),
-            ("importance".to_string(), 1.0),
+            ("salience".to_string(), 1.0),
         ]
         .into_iter()
         .collect();
         let score = weighted_rerank(&features(), &weights);
-        // Only importance contributes: (0.6*1.0) / 1.0 = 0.6
+        // Only salience contributes: (0.6*1.0) / 1.0 = 0.6
         let diff = (score - 0.6).abs();
         assert!(
             diff < 1e-12,
@@ -206,13 +206,13 @@ mod tests {
     fn doubling_all_weights_does_not_change_score() {
         let weights_1x: HashMap<String, f64> = [
             ("relevance".to_string(), 1.0),
-            ("importance".to_string(), 0.3),
+            ("salience".to_string(), 0.3),
         ]
         .into_iter()
         .collect();
         let weights_2x: HashMap<String, f64> = [
             ("relevance".to_string(), 2.0),
-            ("importance".to_string(), 0.6),
+            ("salience".to_string(), 0.6),
         ]
         .into_iter()
         .collect();

@@ -1,7 +1,7 @@
 {
   "_meta": {
     "version": "v2",
-    "description": "Harder eval corpus for recall tuning. Synonym queries, partial matches, distractors, 5+ domains, ground-truth expected_top_k. Includes importance_trap queries to discriminate importance_weight parameter.",
+    "description": "Harder eval corpus for recall tuning. Synonym queries, partial matches, distractors, 5+ domains, ground-truth expected_top_k. Includes importance_trap queries to discriminate salience_weight parameter.",
     "memory_count": 203,
     "query_count": 48,
     "domains": ["ml", "biology", "programming", "history", "geography", "cooking", "medicine", "physics", "economics", "linguistics"],
@@ -10,7 +10,7 @@
     "query_types": {
       "synonym": "queries using synonyms not present verbatim in memory content",
       "partial": "queries where only some terms appear in target memory",
-      "importance_trap": "queries with unique terms matching low-importance memories; discriminates importance_weight parameter"
+      "importance_trap": "queries with unique terms matching low-salience memories; discriminates salience_weight parameter"
     }
   },
   "memories": [
@@ -18,7 +18,7 @@
       "id": "mem_001",
       "content": "Backpropagation computes gradients by applying the chain rule through each layer of a neural network, enabling weight updates via gradient descent",
       "domain": "ml",
-      "importance": 0.90,
+      "salience": 0.90,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["ml", "neural-networks", "optimization"]
@@ -27,7 +27,7 @@
       "id": "mem_002",
       "content": "Stochastic gradient descent updates model parameters using the gradient computed on a random mini-batch rather than the full training dataset",
       "domain": "ml",
-      "importance": 0.88,
+      "salience": 0.88,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["ml", "optimization"]
@@ -36,7 +36,7 @@
       "id": "mem_003",
       "content": "Adam optimizer combines momentum and adaptive learning rates for each parameter, converging faster than vanilla SGD on most deep learning tasks",
       "domain": "ml",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["ml", "optimization"]
@@ -45,7 +45,7 @@
       "id": "mem_004",
       "content": "Attention mechanisms allow neural networks to selectively focus on relevant parts of the input sequence when producing each output token",
       "domain": "ml",
-      "importance": 0.92,
+      "salience": 0.92,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["ml", "transformers", "attention"]
@@ -54,7 +54,7 @@
       "id": "mem_005",
       "content": "The transformer architecture uses multi-head self-attention and feedforward layers to process sequences without recurrence, enabling parallelization",
       "domain": "ml",
-      "importance": 0.95,
+      "salience": 0.95,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["ml", "transformers"]
@@ -63,7 +63,7 @@
       "id": "mem_006",
       "content": "Dropout regularization randomly sets a fraction of activations to zero during training to reduce overfitting in deep neural networks",
       "domain": "ml",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "regularization"]
@@ -72,7 +72,7 @@
       "id": "mem_007",
       "content": "Batch normalization normalizes layer activations to have zero mean and unit variance, stabilizing training and enabling higher learning rates",
       "domain": "ml",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "normalization"]
@@ -81,7 +81,7 @@
       "id": "mem_008",
       "content": "Convolutional neural networks use learnable filters that slide over spatial input to detect local patterns, forming the backbone of computer vision models",
       "domain": "ml",
-      "importance": 0.90,
+      "salience": 0.90,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["ml", "cnn", "computer-vision"]
@@ -90,7 +90,7 @@
       "id": "mem_009",
       "content": "Recurrent neural networks maintain hidden state across time steps to model sequential dependencies in variable-length input sequences",
       "domain": "ml",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "rnn", "sequence"]
@@ -99,7 +99,7 @@
       "id": "mem_010",
       "content": "Long short-term memory networks solve the vanishing gradient problem in RNNs by using gating mechanisms to control information flow over long sequences",
       "domain": "ml",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "lstm", "sequence"]
@@ -108,7 +108,7 @@
       "id": "mem_011",
       "content": "Transfer learning fine-tunes a pretrained model on a new task, leveraging representations learned from a large corpus to achieve better performance with less data",
       "domain": "ml",
-      "importance": 0.88,
+      "salience": 0.88,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["ml", "transfer-learning"]
@@ -117,7 +117,7 @@
       "id": "mem_012",
       "content": "Embedding layers map discrete tokens to dense vectors in a continuous space, capturing semantic relationships between words or categories",
       "domain": "ml",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "embeddings", "nlp"]
@@ -126,7 +126,7 @@
       "id": "mem_013",
       "content": "Reinforcement learning trains agents by rewarding desired behaviors and penalizing undesired ones through interaction with an environment",
       "domain": "ml",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "reinforcement-learning"]
@@ -135,7 +135,7 @@
       "id": "mem_014",
       "content": "Cross-entropy loss measures the divergence between predicted probability distributions and true labels, commonly used for classification tasks",
       "domain": "ml",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "loss-functions"]
@@ -144,7 +144,7 @@
       "id": "mem_015",
       "content": "Hyperparameter tuning searches over learning rate, batch size, and network architecture to find configurations that maximize validation performance",
       "domain": "ml",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "hyperparameters"]
@@ -153,7 +153,7 @@
       "id": "mem_016",
       "content": "Mitochondria are the powerhouse of the cell, generating ATP through oxidative phosphorylation in the electron transport chain",
       "domain": "biology",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "cell", "energy"]
@@ -162,7 +162,7 @@
       "id": "mem_017",
       "content": "Cellular respiration converts glucose and oxygen into carbon dioxide, water, and ATP energy through glycolysis, the Krebs cycle, and oxidative phosphorylation",
       "domain": "biology",
-      "importance": 0.88,
+      "salience": 0.88,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["biology", "metabolism", "energy"]
@@ -171,7 +171,7 @@
       "id": "mem_018",
       "content": "Messenger RNA carries the genetic blueprint from DNA in the nucleus to ribosomes in the cytoplasm where proteins are synthesized",
       "domain": "biology",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["biology", "genetics", "protein-synthesis"]
@@ -180,7 +180,7 @@
       "id": "mem_019",
       "content": "Natural selection favors individuals with heritable traits that increase survival and reproductive success in a given environment",
       "domain": "biology",
-      "importance": 0.88,
+      "salience": 0.88,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["biology", "evolution"]
@@ -189,7 +189,7 @@
       "id": "mem_020",
       "content": "Enzymes are biological catalysts that speed up chemical reactions by lowering activation energy without being consumed in the process",
       "domain": "biology",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "biochemistry", "enzymes"]
@@ -198,7 +198,7 @@
       "id": "mem_021",
       "content": "The immune system distinguishes self from non-self through antigen presentation, T-cell activation, and antibody-mediated humoral immunity",
       "domain": "biology",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "immunology"]
@@ -207,7 +207,7 @@
       "id": "mem_022",
       "content": "Stem cells are undifferentiated cells capable of self-renewal and differentiation into specialized cell types such as neurons, muscle, or blood cells",
       "domain": "biology",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "stem-cells"]
@@ -216,7 +216,7 @@
       "id": "mem_023",
       "content": "The human genome contains approximately 3 billion base pairs encoding roughly 20,000 protein-coding genes distributed across 23 chromosome pairs",
       "domain": "biology",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "genetics", "genome"]
@@ -225,7 +225,7 @@
       "id": "mem_024",
       "content": "Epigenetic modifications such as DNA methylation and histone acetylation regulate gene expression without altering the underlying DNA sequence",
       "domain": "biology",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "epigenetics", "gene-regulation"]
@@ -234,7 +234,7 @@
       "id": "mem_025",
       "content": "Symbiosis describes the close ecological interaction between two species, which can be mutualistic, commensal, or parasitic in nature",
       "domain": "biology",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "ecology"]
@@ -243,7 +243,7 @@
       "id": "mem_026",
       "content": "Memory allocators like jemalloc and tcmalloc manage heap fragmentation and thread-local caches to reduce allocation latency in concurrent programs",
       "domain": "programming",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "systems", "memory"]
@@ -252,7 +252,7 @@
       "id": "mem_027",
       "content": "Async runtimes like Tokio schedule thousands of lightweight tasks onto a thread pool using cooperative multitasking and event-driven IO",
       "domain": "programming",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "async", "rust"]
@@ -261,7 +261,7 @@
       "id": "mem_028",
       "content": "Type inference allows compilers to deduce the types of expressions automatically without requiring explicit annotations from the programmer",
       "domain": "programming",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "type-systems"]
@@ -270,7 +270,7 @@
       "id": "mem_029",
       "content": "Monads in functional programming represent computations as values and allow sequencing effects such as IO, optional values, or error handling",
       "domain": "programming",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "functional", "haskell"]
@@ -279,7 +279,7 @@
       "id": "mem_030",
       "content": "Lock-free data structures use atomic compare-and-swap operations instead of mutexes to allow concurrent access without blocking threads",
       "domain": "programming",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "concurrency", "lock-free"]
@@ -288,7 +288,7 @@
       "id": "mem_031",
       "content": "Garbage collection automatically reclaims unreachable heap memory by tracing live object graphs from root pointers in languages like Java and Go",
       "domain": "programming",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "memory", "gc"]
@@ -297,7 +297,7 @@
       "id": "mem_032",
       "content": "Compiler intermediate representations like LLVM IR abstract over machine architectures, enabling target-independent optimizations like dead code elimination",
       "domain": "programming",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "compilers", "llvm"]
@@ -306,7 +306,7 @@
       "id": "mem_033",
       "content": "Cache coherence protocols like MESI ensure that processor caches remain consistent when multiple cores access shared memory locations",
       "domain": "programming",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "systems", "cpu"]
@@ -315,7 +315,7 @@
       "id": "mem_034",
       "content": "B-tree indexes in relational databases provide O(log n) search, insert, and delete by maintaining sorted order across balanced tree nodes on disk",
       "domain": "programming",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "databases", "indexes"]
@@ -324,7 +324,7 @@
       "id": "mem_035",
       "content": "Consensus algorithms like Raft elect a leader and replicate a log across a cluster to achieve fault-tolerant distributed agreement",
       "domain": "programming",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "distributed-systems"]
@@ -333,7 +333,7 @@
       "id": "mem_036",
       "content": "Event sourcing stores all state changes as an immutable append-only log of events rather than mutable current state in a relational table",
       "domain": "programming",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "architecture", "event-sourcing"]
@@ -342,7 +342,7 @@
       "id": "mem_037",
       "content": "The Peloponnesian War between Athens and Sparta lasted from 431 to 404 BC and ended with Athenian defeat after the Sicilian Expedition disaster",
       "domain": "history",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "greece", "ancient"]
@@ -351,7 +351,7 @@
       "id": "mem_038",
       "content": "The Byzantine Empire survived the fall of Rome for nearly a thousand years, preserving Greek and Roman culture in Constantinople until 1453",
       "domain": "history",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "byzantine", "medieval"]
@@ -360,7 +360,7 @@
       "id": "mem_039",
       "content": "The printing press invented by Gutenberg around 1440 enabled mass reproduction of texts, accelerating the Reformation and the Scientific Revolution",
       "domain": "history",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "technology", "renaissance"]
@@ -369,7 +369,7 @@
       "id": "mem_040",
       "content": "The Treaty of Westphalia in 1648 ended the Thirty Years War and established the modern system of sovereign nation-states in Europe",
       "domain": "history",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "europe", "diplomacy"]
@@ -378,7 +378,7 @@
       "id": "mem_041",
       "content": "The colonization of the Americas by European powers decimated indigenous populations through introduced diseases, conquest, and forced labor systems",
       "domain": "history",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "colonization", "americas"]
@@ -387,7 +387,7 @@
       "id": "mem_042",
       "content": "The Meiji Restoration of 1868 modernized Japan by abolishing the feudal samurai class and rapidly adopting Western technology and institutions",
       "domain": "history",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "japan", "modernization"]
@@ -396,7 +396,7 @@
       "id": "mem_043",
       "content": "The Cold War rivalry between the United States and Soviet Union drove the space race, proxy wars, and nuclear deterrence strategy from 1947 to 1991",
       "domain": "history",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "cold-war", "20th-century"]
@@ -405,7 +405,7 @@
       "id": "mem_044",
       "content": "The Berlin Wall construction in 1961 physically divided East and West Germany, becoming the defining symbol of Iron Curtain division in Europe",
       "domain": "history",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "cold-war", "germany"]
@@ -414,7 +414,7 @@
       "id": "mem_045",
       "content": "The Scramble for Africa between 1881 and 1914 resulted in European powers colonizing nearly the entire African continent for resources and strategic position",
       "domain": "history",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "colonization", "africa"]
@@ -423,7 +423,7 @@
       "id": "mem_046",
       "content": "The Sahara Desert is the world's largest hot desert spanning over 9 million square kilometers across Northern Africa with extreme temperature variation",
       "domain": "geography",
-      "importance": 0.75,
+      "salience": 0.75,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "africa", "desert"]
@@ -432,7 +432,7 @@
       "id": "mem_047",
       "content": "The Amazon River basin contains the largest tropical rainforest on Earth, housing an estimated 10% of all species on the planet",
       "domain": "geography",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "south-america", "ecosystem"]
@@ -441,7 +441,7 @@
       "id": "mem_048",
       "content": "Tectonic plates move at centimeter-per-year rates driven by convection currents in the mantle, causing earthquakes, volcanoes, and mountain formation",
       "domain": "geography",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "geology", "tectonics"]
@@ -450,7 +450,7 @@
       "id": "mem_049",
       "content": "The Himalayan mountain range formed when the Indian subcontinent collided with Eurasia approximately 50 million years ago, creating the world's highest peaks",
       "domain": "geography",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "mountains", "asia"]
@@ -459,7 +459,7 @@
       "id": "mem_050",
       "content": "Ocean currents like the Gulf Stream transport heat across vast distances, moderating coastal climates and influencing global weather patterns",
       "domain": "geography",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "oceanography", "climate"]
@@ -468,7 +468,7 @@
       "id": "mem_051",
       "content": "Permafrost in Arctic and subarctic regions stores vast quantities of frozen organic carbon that may release greenhouse gases as global temperatures rise",
       "domain": "geography",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "climate", "arctic"]
@@ -477,7 +477,7 @@
       "id": "mem_052",
       "content": "River deltas form where sediment carried by a river is deposited as the current slows upon reaching the sea, creating fertile agricultural land",
       "domain": "geography",
-      "importance": 0.75,
+      "salience": 0.75,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "rivers", "geomorphology"]
@@ -486,7 +486,7 @@
       "id": "mem_053",
       "content": "The Mediterranean Sea has a nearly enclosed basin with limited tidal range, making it saltier than the Atlantic due to high evaporation rates",
       "domain": "geography",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "seas", "oceanography"]
@@ -495,7 +495,7 @@
       "id": "mem_054",
       "content": "Maillard reaction between amino acids and reducing sugars at high temperatures produces hundreds of flavor compounds that give browned food its complex taste",
       "domain": "cooking",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "chemistry", "flavor"]
@@ -504,7 +504,7 @@
       "id": "mem_055",
       "content": "Fermentation by bacteria and yeast converts sugars into alcohol, lactic acid, or carbon dioxide, producing bread, beer, wine, yogurt, and kimchi",
       "domain": "cooking",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "fermentation", "microbiology"]
@@ -513,7 +513,7 @@
       "id": "mem_056",
       "content": "Emulsification combines fat and water into a stable mixture using an emulsifier like lecithin or mustard, creating sauces like hollandaise and mayonnaise",
       "domain": "cooking",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "chemistry", "sauces"]
@@ -522,7 +522,7 @@
       "id": "mem_057",
       "content": "Caramelization occurs when sugar is heated above 160 degrees Celsius, breaking down sucrose into simpler compounds with a characteristic amber color and toffee flavor",
       "domain": "cooking",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "chemistry", "sugar"]
@@ -531,7 +531,7 @@
       "id": "mem_058",
       "content": "Umami is the fifth basic taste detected by glutamate receptors, naturally found in aged cheeses, soy sauce, mushrooms, and dried fish",
       "domain": "cooking",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "taste", "flavor"]
@@ -540,7 +540,7 @@
       "id": "mem_059",
       "content": "Braising cooks tough cuts of meat slowly in liquid at low temperature, dissolving collagen into gelatin and creating a rich, tender result",
       "domain": "cooking",
-      "importance": 0.75,
+      "salience": 0.75,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "techniques", "meat"]
@@ -549,7 +549,7 @@
       "id": "mem_060",
       "content": "Gluten forms when wheat flour proteins glutenin and gliadin are hydrated and kneaded, creating an elastic network that traps fermentation gas in bread dough",
       "domain": "cooking",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "baking", "chemistry"]
@@ -558,7 +558,7 @@
       "id": "mem_061",
       "content": "Knife skills like julienne, chiffonade, and brunoise refer to specific cutting shapes and sizes that affect cook times and texture consistency",
       "domain": "cooking",
-      "importance": 0.70,
+      "salience": 0.70,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "techniques", "preparation"]
@@ -567,7 +567,7 @@
       "id": "mem_062",
       "content": "Spices like turmeric, cumin, coriander, and cardamom form the flavor backbone of South Asian cuisine and have documented antimicrobial properties",
       "domain": "cooking",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "spices", "asian-cuisine"]
@@ -576,7 +576,7 @@
       "id": "mem_063",
       "content": "Stock is made by simmering bones, aromatic vegetables, and herbs to extract collagen, gelatin, and mineral flavor into a rich base liquid",
       "domain": "cooking",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "techniques", "sauces"]
@@ -585,7 +585,7 @@
       "id": "mem_064",
       "content": "Insulin secreted by pancreatic beta cells lowers blood glucose by facilitating cellular uptake of glucose and inhibiting hepatic glucose production",
       "domain": "medicine",
-      "importance": 0.88,
+      "salience": 0.88,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["medicine", "endocrinology", "diabetes"]
@@ -594,7 +594,7 @@
       "id": "mem_065",
       "content": "Statins inhibit the HMG-CoA reductase enzyme to reduce hepatic cholesterol synthesis, lowering LDL levels and cardiovascular disease risk",
       "domain": "medicine",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "pharmacology", "cardiology"]
@@ -603,7 +603,7 @@
       "id": "mem_066",
       "content": "Antibiotic resistance arises when bacteria acquire mutations or resistance genes that inactivate drugs, making infections harder to treat",
       "domain": "medicine",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["medicine", "microbiology", "public-health"]
@@ -612,7 +612,7 @@
       "id": "mem_067",
       "content": "Herd immunity protects vulnerable populations when a sufficient proportion of a community is immune, preventing pathogen transmission chains",
       "domain": "medicine",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "epidemiology", "vaccines"]
@@ -621,7 +621,7 @@
       "id": "mem_068",
       "content": "Cognitive behavioral therapy helps patients identify and restructure maladaptive thought patterns and behaviors that maintain depression and anxiety",
       "domain": "medicine",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "psychiatry", "therapy"]
@@ -630,7 +630,7 @@
       "id": "mem_069",
       "content": "Pharmacokinetics describes how drugs are absorbed, distributed, metabolized, and excreted by the body, determining dosing intervals and therapeutic windows",
       "domain": "medicine",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "pharmacology"]
@@ -639,7 +639,7 @@
       "id": "mem_070",
       "content": "Magnetic resonance imaging uses radiofrequency pulses and magnetic fields to excite hydrogen nuclei, creating high-contrast soft tissue images",
       "domain": "medicine",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "imaging", "diagnostics"]
@@ -648,7 +648,7 @@
       "id": "mem_071",
       "content": "Synaptic plasticity—the strengthening and weakening of synaptic connections through long-term potentiation and depression—is the cellular basis of learning",
       "domain": "medicine",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["medicine", "neuroscience", "memory"]
@@ -657,7 +657,7 @@
       "id": "mem_072",
       "content": "Electroencephalography records electrical activity from scalp electrodes to detect seizure patterns, sleep stages, and brain oscillations",
       "domain": "medicine",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "neuroscience", "diagnostics"]
@@ -666,7 +666,7 @@
       "id": "mem_073",
       "content": "Coagulation cascade involves a series of protease activations that convert fibrinogen to fibrin, forming a blood clot to stop bleeding at injury sites",
       "domain": "medicine",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "hematology"]
@@ -675,7 +675,7 @@
       "id": "mem_074",
       "content": "Entropy in thermodynamics measures the number of accessible microstates of a system; the second law states that entropy of an isolated system never decreases",
       "domain": "physics",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["physics", "thermodynamics"]
@@ -684,7 +684,7 @@
       "id": "mem_075",
       "content": "Electromagnetic radiation spans wavelengths from gamma rays through X-rays, ultraviolet, visible light, infrared, and radio waves across the electromagnetic spectrum",
       "domain": "physics",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["physics", "electromagnetism", "optics"]
@@ -693,7 +693,7 @@
       "id": "mem_076",
       "content": "Wave-particle duality holds that quantum objects exhibit wave behavior in interference experiments and particle behavior in detection measurements",
       "domain": "physics",
-      "importance": 0.87,
+      "salience": 0.87,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["physics", "quantum", "wave-particle"]
@@ -702,7 +702,7 @@
       "id": "mem_077",
       "content": "Dark matter is a form of matter that does not emit electromagnetic radiation but exerts gravitational influence, comprising about 27% of the universe's mass-energy",
       "domain": "physics",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["physics", "astrophysics", "cosmology"]
@@ -711,7 +711,7 @@
       "id": "mem_078",
       "content": "Superconductivity occurs in certain materials cooled below a critical temperature, allowing electrical current to flow with zero resistance",
       "domain": "physics",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["physics", "condensed-matter", "superconductivity"]
@@ -720,7 +720,7 @@
       "id": "mem_079",
       "content": "Inflation theory proposes that the universe underwent exponential expansion in the first fraction of a second after the Big Bang, explaining its observed homogeneity",
       "domain": "physics",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["physics", "cosmology", "inflation"]
@@ -729,7 +729,7 @@
       "id": "mem_080",
       "content": "Supply and demand curves intersect at the market equilibrium price where the quantity consumers want to buy equals what producers want to sell",
       "domain": "economics",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "microeconomics", "markets"]
@@ -738,7 +738,7 @@
       "id": "mem_081",
       "content": "Inflation erodes purchasing power when the general price level rises over time, measured by indices like the consumer price index and producer price index",
       "domain": "economics",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "macroeconomics", "inflation"]
@@ -747,7 +747,7 @@
       "id": "mem_082",
       "content": "Comparative advantage explains why nations trade by specializing in goods they produce at lower opportunity cost, even if one nation is more efficient at all goods",
       "domain": "economics",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "trade", "international"]
@@ -756,7 +756,7 @@
       "id": "mem_083",
       "content": "Monetary policy conducted by central banks adjusts interest rates and money supply to influence inflation, employment, and economic growth",
       "domain": "economics",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "macroeconomics", "central-banking"]
@@ -765,7 +765,7 @@
       "id": "mem_084",
       "content": "Market failure occurs when free markets allocate resources inefficiently, as in the case of externalities, public goods, information asymmetry, or market power",
       "domain": "economics",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "microeconomics", "market-failure"]
@@ -774,7 +774,7 @@
       "id": "mem_085",
       "content": "Game theory models strategic interactions where agents choose actions that depend on expected responses from other rational actors",
       "domain": "economics",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "game-theory", "strategy"]
@@ -783,7 +783,7 @@
       "id": "mem_086",
       "content": "Phonemes are the minimal contrastive sound units of a language; changing one phoneme can change the meaning of a word, as in bat versus cat",
       "domain": "linguistics",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["linguistics", "phonology"]
@@ -792,7 +792,7 @@
       "id": "mem_087",
       "content": "Syntactic trees represent the hierarchical constituency structure of sentences, showing how phrases are nested inside larger phrases",
       "domain": "linguistics",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["linguistics", "syntax"]
@@ -801,7 +801,7 @@
       "id": "mem_088",
       "content": "Linguistic relativity, or the Sapir-Whorf hypothesis, proposes that the language one speaks influences how one perceives and categorizes reality",
       "domain": "linguistics",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["linguistics", "semantics", "cognition"]
@@ -810,7 +810,7 @@
       "id": "mem_089",
       "content": "Language acquisition in children proceeds through cooing, babbling, one-word, and multi-word stages, with critical period effects on phonological learning",
       "domain": "linguistics",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["linguistics", "acquisition", "development"]
@@ -819,7 +819,7 @@
       "id": "mem_090",
       "content": "Loanwords enter a language when speakers adopt foreign vocabulary for new concepts, technologies, or cultural practices, often adapting pronunciation to native phonotactics",
       "domain": "linguistics",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["linguistics", "lexicology", "contact"]
@@ -828,7 +828,7 @@
       "id": "mem_091",
       "content": "Morphology studies how words are built from smaller meaningful units called morphemes, including roots, prefixes, and suffixes",
       "domain": "linguistics",
-      "importance": 0.77,
+      "salience": 0.77,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["linguistics", "morphology"]
@@ -837,7 +837,7 @@
       "id": "mem_092",
       "content": "Pragma was an ancient Greek word for action or affair; pragmatics studies how context shapes meaning beyond literal sentence semantics",
       "domain": "linguistics",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.03,
       "memory_type": "semantic",
       "tags": ["linguistics", "pragmatics"]
@@ -846,7 +846,7 @@
       "id": "mem_093",
       "content": "Feature scaling standardizes input variables to a common range before training, preventing features with large numeric values from dominating gradient updates",
       "domain": "ml",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "preprocessing"]
@@ -855,7 +855,7 @@
       "id": "mem_094",
       "content": "Principal component analysis projects high-dimensional data onto orthogonal axes of maximum variance, enabling dimensionality reduction and visualization",
       "domain": "ml",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "dimensionality-reduction"]
@@ -864,7 +864,7 @@
       "id": "mem_095",
       "content": "Support vector machines find the maximum-margin hyperplane separating classes in a high-dimensional feature space, with kernel functions for nonlinear boundaries",
       "domain": "ml",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "classification", "svm"]
@@ -873,7 +873,7 @@
       "id": "mem_096",
       "content": "Random forests aggregate predictions from many decision trees trained on bootstrap samples and random feature subsets to reduce overfitting and variance",
       "domain": "ml",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "ensemble", "decision-trees"]
@@ -882,7 +882,7 @@
       "id": "mem_097",
       "content": "Variational autoencoders learn a compressed latent representation of data by encoding inputs into a probability distribution and reconstructing from samples",
       "domain": "ml",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "generative", "vae"]
@@ -891,7 +891,7 @@
       "id": "mem_098",
       "content": "The citric acid cycle, also called the Krebs cycle, oxidizes acetyl-CoA derived from glucose and fatty acids, producing NADH and FADH2 for ATP synthesis",
       "domain": "biology",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "metabolism", "biochemistry"]
@@ -900,7 +900,7 @@
       "id": "mem_099",
       "content": "Apoptosis is programmed cell death triggered by internal or external signals, removing damaged or unnecessary cells without causing inflammation",
       "domain": "biology",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "cell", "death"]
@@ -909,7 +909,7 @@
       "id": "mem_100",
       "content": "Vesicles transport cargo proteins between organelles in eukaryotic cells, with SNARE proteins mediating membrane fusion at the destination compartment",
       "domain": "biology",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "cell", "transport"]
@@ -918,7 +918,7 @@
       "id": "mem_101",
       "content": "Microservices architecture decomposes an application into small independently deployable services that communicate over APIs or message queues",
       "domain": "programming",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "architecture", "microservices"]
@@ -927,7 +927,7 @@
       "id": "mem_102",
       "content": "Tensor algebra represents multi-dimensional arrays and their operations, forming the computational foundation of modern deep learning frameworks",
       "domain": "ml",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "math", "tensors"]
@@ -936,7 +936,7 @@
       "id": "mem_103",
       "content": "Plate boundaries where two plates converge produce subduction zones, trenches, and arc volcanoes; divergent boundaries produce mid-ocean ridges and rift valleys",
       "domain": "geography",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "geology", "tectonics"]
@@ -945,7 +945,7 @@
       "id": "mem_104",
       "content": "Ancient Mesopotamia between the Tigris and Euphrates rivers developed the earliest writing system—cuneiform—along with the first legal codes and urban civilizations",
       "domain": "history",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "ancient", "mesopotamia"]
@@ -954,7 +954,7 @@
       "id": "mem_105",
       "content": "Sous vide cooking seals food in vacuum bags and cooks it in precisely temperature-controlled water baths, achieving uniform doneness impossible with conventional heat",
       "domain": "cooking",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "techniques", "precision"]
@@ -963,7 +963,7 @@
       "id": "mem_106",
       "content": "Nash equilibrium describes a stable outcome in strategic games where no player can benefit by unilaterally changing their strategy given others' choices",
       "domain": "economics",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "game-theory"]
@@ -972,7 +972,7 @@
       "id": "mem_107",
       "content": "Germ theory of disease, established by Pasteur and Koch, holds that infectious diseases are caused by microorganisms that invade the host",
       "domain": "medicine",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "microbiology", "history"]
@@ -981,7 +981,7 @@
       "id": "mem_108",
       "content": "Photovoltaic cells convert incident photons into electrical current when absorbed photons excite electrons across a semiconductor bandgap",
       "domain": "physics",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["physics", "optics", "solar-energy"]
@@ -990,7 +990,7 @@
       "id": "mem_109",
       "content": "The bond market prices sovereign debt using yield curves that reflect maturity, credit risk, and expected future interest rate movements",
       "domain": "economics",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "finance", "bonds"]
@@ -999,7 +999,7 @@
       "id": "mem_110",
       "content": "Semantic shift is the process by which a word gradually changes meaning over generations, often through metaphor, generalization, or specialization",
       "domain": "linguistics",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["linguistics", "semantics", "change"]
@@ -1008,7 +1008,7 @@
       "id": "mem_111",
       "content": "Bought a new mechanical keyboard today with Cherry MX brown switches; the tactile bump is perfect for long coding sessions without the noise of clicky switches",
       "domain": "distractor",
-      "importance": 0.40,
+      "salience": 0.40,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "hardware"]
@@ -1017,7 +1017,7 @@
       "id": "mem_112",
       "content": "The movie was entertaining but the ending felt rushed; the director should have given the third act at least another twenty minutes to resolve the subplot properly",
       "domain": "distractor",
-      "importance": 0.35,
+      "salience": 0.35,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "entertainment"]
@@ -1026,7 +1026,7 @@
       "id": "mem_113",
       "content": "Checked in for the flight at 5am; the airport coffee was terrible but the lounge had decent wifi so managed to finish the slide deck before boarding",
       "domain": "distractor",
-      "importance": 0.30,
+      "salience": 0.30,
       "decay_factor": 0.06,
       "memory_type": "episodic",
       "tags": ["personal", "travel"]
@@ -1035,7 +1035,7 @@
       "id": "mem_114",
       "content": "The apartment landlord finally fixed the leaking pipe under the kitchen sink after three weeks of follow-up emails and one formal complaint letter",
       "domain": "distractor",
-      "importance": 0.28,
+      "salience": 0.28,
       "decay_factor": 0.06,
       "memory_type": "episodic",
       "tags": ["personal", "home"]
@@ -1044,7 +1044,7 @@
       "id": "mem_115",
       "content": "Tried making sourdough for the first time; the starter is active after four days of feeding and the kitchen smells wonderfully yeasty and sour",
       "domain": "distractor",
-      "importance": 0.38,
+      "salience": 0.38,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "cooking", "hobby"]
@@ -1053,7 +1053,7 @@
       "id": "mem_116",
       "content": "Finished reading a novel about a lighthouse keeper in 1920s Newfoundland; the prose was beautifully sparse and the isolation felt viscerally real",
       "domain": "distractor",
-      "importance": 0.32,
+      "salience": 0.32,
       "decay_factor": 0.06,
       "memory_type": "episodic",
       "tags": ["personal", "reading"]
@@ -1062,7 +1062,7 @@
       "id": "mem_117",
       "content": "The afternoon sun angle through the west window is now different enough from summer that I need to adjust my monitor position again to avoid glare",
       "domain": "distractor",
-      "importance": 0.22,
+      "salience": 0.22,
       "decay_factor": 0.07,
       "memory_type": "episodic",
       "tags": ["personal", "home"]
@@ -1071,7 +1071,7 @@
       "id": "mem_118",
       "content": "Picked up the dry cleaning and noticed the collar on the blue shirt has a faint yellow stain that the cleaner missed; need to bring it back next week",
       "domain": "distractor",
-      "importance": 0.18,
+      "salience": 0.18,
       "decay_factor": 0.08,
       "memory_type": "episodic",
       "tags": ["personal", "errands"]
@@ -1080,7 +1080,7 @@
       "id": "mem_119",
       "content": "The Wi-Fi router needed a firmware update; after flashing it the 5GHz band dropped connection randomly for two hours until a second reboot fixed it",
       "domain": "distractor",
-      "importance": 0.32,
+      "salience": 0.32,
       "decay_factor": 0.06,
       "memory_type": "episodic",
       "tags": ["personal", "hardware", "networking"]
@@ -1089,7 +1089,7 @@
       "id": "mem_120",
       "content": "Saw a heron standing completely still in the creek behind the park for almost twenty minutes before it finally struck at something in the water",
       "domain": "distractor",
-      "importance": 0.25,
+      "salience": 0.25,
       "decay_factor": 0.06,
       "memory_type": "episodic",
       "tags": ["personal", "nature"]
@@ -1098,7 +1098,7 @@
       "id": "mem_121",
       "content": "Tried a new ramen shop downtown; the broth was tonkotsu-style, rich and cloudy with a strong pork bone flavor, and the chashu was melt-in-your-mouth tender",
       "domain": "distractor",
-      "importance": 0.35,
+      "salience": 0.35,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "food", "restaurant"]
@@ -1107,7 +1107,7 @@
       "id": "mem_122",
       "content": "Signed up for a pottery class starting next month; always wanted to learn wheel throwing but never made the time before",
       "domain": "distractor",
-      "importance": 0.28,
+      "salience": 0.28,
       "decay_factor": 0.06,
       "memory_type": "episodic",
       "tags": ["personal", "hobby"]
@@ -1116,7 +1116,7 @@
       "id": "mem_123",
       "content": "The plumber came to replace the water heater; the new one is tankless and should save about thirty percent on the monthly energy bill",
       "domain": "distractor",
-      "importance": 0.25,
+      "salience": 0.25,
       "decay_factor": 0.07,
       "memory_type": "episodic",
       "tags": ["personal", "home", "energy"]
@@ -1125,7 +1125,7 @@
       "id": "mem_124",
       "content": "Ordered replacement brake pads for the bicycle; the organic pads wear faster than sintered but the modulation is much more predictable on wet descents",
       "domain": "distractor",
-      "importance": 0.30,
+      "salience": 0.30,
       "decay_factor": 0.06,
       "memory_type": "episodic",
       "tags": ["personal", "cycling"]
@@ -1134,7 +1134,7 @@
       "id": "mem_125",
       "content": "The orchid on the windowsill bloomed for the third time this year; apparently repotting it into bark medium and reducing watering frequency was the key",
       "domain": "distractor",
-      "importance": 0.22,
+      "salience": 0.22,
       "decay_factor": 0.07,
       "memory_type": "episodic",
       "tags": ["personal", "plants"]
@@ -1143,7 +1143,7 @@
       "id": "mem_126",
       "content": "Watched a documentary about deep-sea hydrothermal vents and the extremophile communities that thrive there without sunlight, driven entirely by chemosynthesis",
       "domain": "distractor",
-      "importance": 0.40,
+      "salience": 0.40,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "science-interest"]
@@ -1152,7 +1152,7 @@
       "id": "mem_127",
       "content": "Had coffee with an old colleague who now works on satellite telemetry; fascinating conversation about the latency tradeoffs in low-earth-orbit constellations",
       "domain": "distractor",
-      "importance": 0.38,
+      "salience": 0.38,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "conversation"]
@@ -1161,7 +1161,7 @@
       "id": "mem_128",
       "content": "The grocery delivery app sent the wrong brand of olive oil again; at least this one is also extra-virgin so the flavor difference is minimal",
       "domain": "distractor",
-      "importance": 0.15,
+      "salience": 0.15,
       "decay_factor": 0.09,
       "memory_type": "episodic",
       "tags": ["personal", "errands", "food"]
@@ -1170,7 +1170,7 @@
       "id": "mem_129",
       "content": "Set up a new aquarium with a planted substrate and CO2 injection; the stem plants are already putting out visible new growth after just five days",
       "domain": "distractor",
-      "importance": 0.28,
+      "salience": 0.28,
       "decay_factor": 0.06,
       "memory_type": "episodic",
       "tags": ["personal", "hobby"]
@@ -1179,7 +1179,7 @@
       "id": "mem_130",
       "content": "Photosynthesis in C4 plants like corn and sugarcane uses a carbon-concentrating mechanism that reduces photorespiration and improves water-use efficiency in hot climates",
       "domain": "biology",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "plants", "photosynthesis"]
@@ -1188,7 +1188,7 @@
       "id": "mem_131",
       "content": "Neural oscillations at gamma frequencies around 40Hz in the prefrontal cortex correlate with working memory maintenance and conscious attention",
       "domain": "medicine",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "neuroscience", "cognition"]
@@ -1197,7 +1197,7 @@
       "id": "mem_132",
       "content": "The Great Barrier Reef is the world's largest coral reef system, spanning 2,300 kilometers along the northeast Australian coast and hosting enormous marine biodiversity",
       "domain": "geography",
-      "importance": 0.75,
+      "salience": 0.75,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "ocean", "australia"]
@@ -1206,7 +1206,7 @@
       "id": "mem_133",
       "content": "Marginal cost is the additional cost incurred by producing one more unit of output; profit-maximizing firms produce until marginal cost equals marginal revenue",
       "domain": "economics",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "microeconomics", "production"]
@@ -1215,7 +1215,7 @@
       "id": "mem_134",
       "content": "Pitch accent systems assign high or low tones to syllables to distinguish word meaning, as in Japanese, Swedish, and some dialects of Serbian",
       "domain": "linguistics",
-      "importance": 0.72,
+      "salience": 0.72,
       "decay_factor": 0.03,
       "memory_type": "semantic",
       "tags": ["linguistics", "phonology", "prosody"]
@@ -1224,7 +1224,7 @@
       "id": "mem_135",
       "content": "The photoelectric effect—that light ejects electrons from metal surfaces only above a threshold frequency—led Einstein to propose the photon model of light",
       "domain": "physics",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["physics", "quantum", "history"]
@@ -1233,7 +1233,7 @@
       "id": "mem_136",
       "content": "Immune checkpoint inhibitors block proteins like PD-1 and CTLA-4 that normally suppress T-cell activation, unleashing anti-tumor immune responses in cancer patients",
       "domain": "medicine",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["medicine", "oncology", "immunotherapy"]
@@ -1242,7 +1242,7 @@
       "id": "mem_137",
       "content": "The Coriolis effect causes moving air and water masses to deflect rightward in the northern hemisphere and leftward in the southern hemisphere due to Earth's rotation",
       "domain": "geography",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "meteorology", "physics"]
@@ -1251,7 +1251,7 @@
       "id": "mem_138",
       "content": "Dependency injection decouples classes from their dependencies by passing required objects through constructor parameters rather than creating them internally",
       "domain": "programming",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "design-patterns", "oop"]
@@ -1260,7 +1260,7 @@
       "id": "mem_139",
       "content": "Protectionism uses tariffs, quotas, and subsidies to shield domestic industries from foreign competition, often reducing allocative efficiency but preserving employment",
       "domain": "economics",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "trade", "policy"]
@@ -1269,7 +1269,7 @@
       "id": "mem_140",
       "content": "Pidgins form as simplified contact languages between speakers of mutually unintelligible tongues; when children acquire a pidgin as their first language it becomes a creole",
       "domain": "linguistics",
-      "importance": 0.75,
+      "salience": 0.75,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["linguistics", "contact", "creolization"]
@@ -1278,7 +1278,7 @@
       "id": "mem_141",
       "content": "Dropped my phone walking to the metro and cracked the screen protector; the display underneath seems fine but I should replace the protector before the cracks spread",
       "domain": "distractor",
-      "importance": 0.20,
+      "salience": 0.20,
       "decay_factor": 0.08,
       "memory_type": "episodic",
       "tags": ["personal", "errands"]
@@ -1287,7 +1287,7 @@
       "id": "mem_142",
       "content": "The quarterly rent increase notice arrived; the landlord is citing rising property taxes and maintenance costs as justification for an eight percent hike",
       "domain": "distractor",
-      "importance": 0.30,
+      "salience": 0.30,
       "decay_factor": 0.06,
       "memory_type": "episodic",
       "tags": ["personal", "housing"]
@@ -1296,7 +1296,7 @@
       "id": "mem_143",
       "content": "Watched a chess tournament stream; the world champion's endgame technique in the king-and-pawn endgame was surgical—every tempo precisely calculated",
       "domain": "distractor",
-      "importance": 0.35,
+      "salience": 0.35,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "chess"]
@@ -1305,7 +1305,7 @@
       "id": "mem_144",
       "content": "The cat knocked over the succulent arrangement on the bookshelf for the second time this week; need to find a higher shelf or a hanging planter",
       "domain": "distractor",
-      "importance": 0.12,
+      "salience": 0.12,
       "decay_factor": 0.10,
       "memory_type": "episodic",
       "tags": ["personal", "home", "pets"]
@@ -1314,7 +1314,7 @@
       "id": "mem_145",
       "content": "Finished the online Spanish course level B1; the subjunctive mood is still tricky but the reading comprehension has improved noticeably over the past three months",
       "domain": "distractor",
-      "importance": 0.35,
+      "salience": 0.35,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "language-learning"]
@@ -1323,7 +1323,7 @@
       "id": "mem_146",
       "content": "The hiking trail was muddy after the rain but the views from the ridge were spectacular; took about four hours round trip including a thirty minute lunch stop",
       "domain": "distractor",
-      "importance": 0.25,
+      "salience": 0.25,
       "decay_factor": 0.07,
       "memory_type": "episodic",
       "tags": ["personal", "outdoor", "hiking"]
@@ -1332,7 +1332,7 @@
       "id": "mem_147",
       "content": "Annealing in metallurgy heats a metal to just below its melting point and then cools it slowly, relieving internal stresses and improving ductility",
       "domain": "physics",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["physics", "materials", "metallurgy"]
@@ -1341,7 +1341,7 @@
       "id": "mem_148",
       "content": "The Silk Road connected Han Dynasty China to the Roman Empire via Central Asian oases, facilitating trade in silk, spices, and glassware across Eurasia",
       "domain": "history",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "trade", "ancient"]
@@ -1350,7 +1350,7 @@
       "id": "mem_149",
       "content": "Osmosis is the movement of water across a semipermeable membrane from a region of lower solute concentration to higher solute concentration",
       "domain": "biology",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "cell", "transport"]
@@ -1359,7 +1359,7 @@
       "id": "mem_150",
       "content": "Terroir refers to the complete natural environment—soil composition, microclimate, topography, and local microflora—that gives wines their distinctive regional character",
       "domain": "cooking",
-      "importance": 0.70,
+      "salience": 0.70,
       "decay_factor": 0.03,
       "memory_type": "semantic",
       "tags": ["cooking", "wine", "geography"]
@@ -1368,7 +1368,7 @@
       "id": "mem_151",
       "content": "The Fourier transform decomposes a time-domain signal into its constituent frequencies, enabling spectral analysis and signal filtering operations",
       "domain": "physics",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["physics", "math", "signal-processing"]
@@ -1377,7 +1377,7 @@
       "id": "mem_152",
       "content": "Stock options give holders the right but not obligation to buy or sell shares at a fixed strike price before expiration, enabling leveraged speculation and hedging",
       "domain": "economics",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "finance", "derivatives"]
@@ -1386,7 +1386,7 @@
       "id": "mem_153",
       "content": "Conlang designers like Tolkien and Okrand create invented languages with consistent phonology, morphology, and syntax for fictional worlds or linguistic experiments",
       "domain": "linguistics",
-      "importance": 0.68,
+      "salience": 0.68,
       "decay_factor": 0.03,
       "memory_type": "semantic",
       "tags": ["linguistics", "conlangs"]
@@ -1395,7 +1395,7 @@
       "id": "mem_154",
       "content": "The human gut microbiome contains trillions of bacteria that influence digestion, immune regulation, and possibly mood through the gut-brain axis",
       "domain": "biology",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "microbiome", "health"]
@@ -1404,7 +1404,7 @@
       "id": "mem_155",
       "content": "Colonoscopy uses a flexible camera to inspect the entire colon, detecting polyps that can be removed to prevent colorectal cancer progression",
       "domain": "medicine",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "oncology", "screening"]
@@ -1413,7 +1413,7 @@
       "id": "mem_156",
       "content": "The Hanging Gardens of Babylon, if they existed, were reportedly an ascending series of terraced gardens irrigated by pumps drawing from the Euphrates River",
       "domain": "distractor",
-      "importance": 0.55,
+      "salience": 0.55,
       "decay_factor": 0.03,
       "memory_type": "semantic",
       "tags": ["history", "ancient", "wonders"]
@@ -1422,7 +1422,7 @@
       "id": "mem_157",
       "content": "Gradient boosting builds an ensemble of weak learners sequentially, with each tree fitting the residuals left by the previous ones to minimize a differentiable loss",
       "domain": "ml",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "ensemble", "boosting"]
@@ -1431,7 +1431,7 @@
       "id": "mem_158",
       "content": "Diffusion models learn to reverse a gradual noise-addition process, generating high-quality images by iteratively denoising from pure Gaussian noise",
       "domain": "ml",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["ml", "generative", "diffusion"]
@@ -1440,7 +1440,7 @@
       "id": "mem_159",
       "content": "Quorum sensing allows bacteria to detect population density by accumulating signaling molecules and trigger coordinated gene expression at threshold concentrations",
       "domain": "biology",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "microbiology", "gene-regulation"]
@@ -1449,7 +1449,7 @@
       "id": "mem_160",
       "content": "Urban heat islands form where concrete and asphalt absorb and retain solar energy, raising city temperatures several degrees above surrounding rural areas",
       "domain": "geography",
-      "importance": 0.75,
+      "salience": 0.75,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "urban", "climate"]
@@ -1458,7 +1458,7 @@
       "id": "mem_161",
       "content": "Bought a new espresso machine with PID temperature control and a pressure profiling kit; dialing in the extraction for the Ethiopian natural process beans took about twenty shots",
       "domain": "distractor",
-      "importance": 0.38,
+      "salience": 0.38,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "coffee", "hobby"]
@@ -1467,7 +1467,7 @@
       "id": "mem_162",
       "content": "The mortgage refinancing closed at a lower rate than expected; the break-even on closing costs works out to about eighteen months of reduced payments",
       "domain": "distractor",
-      "importance": 0.35,
+      "salience": 0.35,
       "decay_factor": 0.05,
       "memory_type": "episodic",
       "tags": ["personal", "finance"]
@@ -1476,7 +1476,7 @@
       "id": "mem_163",
       "content": "Formal verification uses mathematical proof techniques to guarantee that a program or hardware design satisfies specified correctness properties",
       "domain": "programming",
-      "importance": 0.82,
+      "salience": 0.82,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "verification", "formal-methods"]
@@ -1485,7 +1485,7 @@
       "id": "mem_164",
       "content": "Protein folding determines three-dimensional structure from the amino acid sequence; misfolding into beta-sheet aggregates causes diseases like Alzheimer's and Parkinson's",
       "domain": "biology",
-      "importance": 0.85,
+      "salience": 0.85,
       "decay_factor": 0.01,
       "memory_type": "semantic",
       "tags": ["biology", "proteins", "disease"]
@@ -1494,7 +1494,7 @@
       "id": "mem_165",
       "content": "The Paris Agreement commits signatories to limit warming to 1.5 degrees Celsius above pre-industrial levels through nationally determined carbon reduction targets",
       "domain": "geography",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "climate", "policy"]
@@ -1503,7 +1503,7 @@
       "id": "mem_166",
       "content": "Microwave ovens heat food by exciting water molecules with 2.45 GHz electromagnetic radiation, causing rapid internal heating through dielectric absorption",
       "domain": "distractor",
-      "importance": 0.48,
+      "salience": 0.48,
       "decay_factor": 0.04,
       "memory_type": "semantic",
       "tags": ["physics", "cooking", "appliances"]
@@ -1512,7 +1512,7 @@
       "id": "mem_167",
       "content": "Constitutional monarchies retain a hereditary monarch as ceremonial head of state while an elected parliament and prime minister hold actual governing power",
       "domain": "history",
-      "importance": 0.75,
+      "salience": 0.75,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "government", "monarchy"]
@@ -1521,7 +1521,7 @@
       "id": "mem_168",
       "content": "Seismographs detect and record ground motion from earthquakes by measuring relative displacement between a suspended mass and the moving earth frame",
       "domain": "geography",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "geology", "seismology"]
@@ -1530,7 +1530,7 @@
       "id": "mem_169",
       "content": "Central bank quantitative easing purchases government bonds to inject liquidity and suppress long-term interest rates when conventional monetary policy is constrained",
       "domain": "economics",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "macroeconomics", "monetary-policy"]
@@ -1539,7 +1539,7 @@
       "id": "mem_170",
       "content": "The smell of baking bread triggers strong autobiographical memories because the olfactory bulb connects directly to hippocampal memory circuits without thalamic relay",
       "domain": "distractor",
-      "importance": 0.45,
+      "salience": 0.45,
       "decay_factor": 0.04,
       "memory_type": "semantic",
       "tags": ["neuroscience", "memory", "smell"]
@@ -1548,7 +1548,7 @@
       "id": "mem_171",
       "content": "Optogenetics uses genetically encoded light-sensitive proteins to activate or silence specific neurons with millisecond precision in behaving animals",
       "domain": "medicine",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "neuroscience", "tools"]
@@ -1557,7 +1557,7 @@
       "id": "mem_172",
       "content": "Diphthongs are complex vowel sounds where the tongue glides from one position to another within a single syllable, as in the English words bite and boat",
       "domain": "linguistics",
-      "importance": 0.70,
+      "salience": 0.70,
       "decay_factor": 0.03,
       "memory_type": "semantic",
       "tags": ["linguistics", "phonology", "vowels"]
@@ -1566,7 +1566,7 @@
       "id": "mem_173",
       "content": "Arbitrage exploits price differences for the same asset across markets, and in efficient markets arbitrage opportunities are eliminated almost instantly",
       "domain": "economics",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["economics", "finance", "markets"]
@@ -1575,7 +1575,7 @@
       "id": "mem_174",
       "content": "The fermentation of milk by Lactobacillus acidophilus and other bacteria lowers pH through lactic acid production, thickening the milk and preserving it as yogurt",
       "domain": "cooking",
-      "importance": 0.73,
+      "salience": 0.73,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "fermentation", "dairy"]
@@ -1584,7 +1584,7 @@
       "id": "mem_175",
       "content": "Virtual memory allows processes to use more memory than physically installed by mapping pages to disk, with the operating system swapping pages on demand",
       "domain": "programming",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["programming", "systems", "memory"]
@@ -1593,7 +1593,7 @@
       "id": "mem_176",
       "content": "The decolonization movement after World War II led dozens of African and Asian nations to achieve independence from European colonial powers between 1945 and 1975",
       "domain": "history",
-      "importance": 0.80,
+      "salience": 0.80,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["history", "colonization", "20th-century"]
@@ -1602,7 +1602,7 @@
       "id": "mem_177",
       "content": "Sleep is best right now and I am too tired to write anything coherent; this entry is just a placeholder to note that Tuesday was completely uneventful",
       "domain": "distractor",
-      "importance": 0.10,
+      "salience": 0.10,
       "decay_factor": 0.10,
       "memory_type": "episodic",
       "tags": ["personal", "daily"]
@@ -1611,7 +1611,7 @@
       "id": "mem_178",
       "content": "Scoville scale measures capsaicin concentration in peppers by expressing the dilution factor required for a trained panel to detect no heat, ranging from zero for bell peppers to millions for Carolina Reapers",
       "domain": "cooking",
-      "importance": 0.65,
+      "salience": 0.65,
       "decay_factor": 0.03,
       "memory_type": "semantic",
       "tags": ["cooking", "peppers", "measurement"]
@@ -1620,7 +1620,7 @@
       "id": "mem_179",
       "content": "Convolutional feature maps from early layers detect edges and textures while deeper layers respond to object parts and whole objects in computer vision models",
       "domain": "ml",
-      "importance": 0.83,
+      "salience": 0.83,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "cnn", "interpretability"]
@@ -1629,7 +1629,7 @@
       "id": "mem_180",
       "content": "Continental drift was first proposed by Alfred Wegener in 1912 based on the matching coastlines of Africa and South America and similar fossil assemblages on both continents",
       "domain": "geography",
-      "importance": 0.78,
+      "salience": 0.78,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "geology", "history-of-science"]
@@ -1638,7 +1638,7 @@
       "id": "mem_181",
       "content": "Finally got the standing desk assembled; the cable management took longer than the actual desk but the result is much cleaner than the old setup",
       "domain": "distractor",
-      "importance": 0.22,
+      "salience": 0.22,
       "decay_factor": 0.08,
       "memory_type": "episodic",
       "tags": ["personal", "home", "workspace"]
@@ -1647,7 +1647,7 @@
       "id": "mem_182",
       "content": "The team trivia night was won by the table in the back corner; the decisive question about 1980s pop music eliminated the engineering teams early",
       "domain": "distractor",
-      "importance": 0.18,
+      "salience": 0.18,
       "decay_factor": 0.09,
       "memory_type": "episodic",
       "tags": ["personal", "social"]
@@ -1656,7 +1656,7 @@
       "id": "mem_183",
       "content": "Renewed the car registration at the DMV; the whole process took 45 minutes including the wait, which is much faster than last year",
       "domain": "distractor",
-      "importance": 0.12,
+      "salience": 0.12,
       "decay_factor": 0.10,
       "memory_type": "episodic",
       "tags": ["personal", "errands"]
@@ -1665,7 +1665,7 @@
       "id": "mem_184",
       "content": "The neighbor's dog barked at 3am again; need to figure out whether to leave a polite note or just buy better earplugs",
       "domain": "distractor",
-      "importance": 0.10,
+      "salience": 0.10,
       "decay_factor": 0.10,
       "memory_type": "episodic",
       "tags": ["personal", "home"]
@@ -1674,7 +1674,7 @@
       "id": "mem_185",
       "content": "Bought new running shoes; the extra cushioning in the heel is immediately noticeable and the wide toe box should help with the blister problem",
       "domain": "distractor",
-      "importance": 0.25,
+      "salience": 0.25,
       "decay_factor": 0.07,
       "memory_type": "episodic",
       "tags": ["personal", "fitness", "shopping"]
@@ -1683,7 +1683,7 @@
       "id": "mem_186",
       "content": "The ferry crossing was delayed by 90 minutes due to fog; eventually cleared and the sunset views over the water made up for the wait",
       "domain": "distractor",
-      "importance": 0.20,
+      "salience": 0.20,
       "decay_factor": 0.08,
       "memory_type": "episodic",
       "tags": ["personal", "travel"]
@@ -1692,7 +1692,7 @@
       "id": "mem_187",
       "content": "Just discovered that the downstairs bathroom tap drips exactly 47 times per minute; it is oddly hypnotic and very annoying at midnight",
       "domain": "distractor",
-      "importance": 0.08,
+      "salience": 0.08,
       "decay_factor": 0.10,
       "memory_type": "episodic",
       "tags": ["personal", "home"]
@@ -1701,7 +1701,7 @@
       "id": "mem_188",
       "content": "Left the umbrella on the train for the third time this year; the lost property office said to check back in a week if nobody claims it",
       "domain": "distractor",
-      "importance": 0.10,
+      "salience": 0.10,
       "decay_factor": 0.10,
       "memory_type": "episodic",
       "tags": ["personal", "errands"]
@@ -1710,7 +1710,7 @@
       "id": "mem_189",
       "content": "The hardware store was out of the specific screw size needed; ended up ordering online and the shipment arrives Thursday, delaying the shelf project",
       "domain": "distractor",
-      "importance": 0.12,
+      "salience": 0.12,
       "decay_factor": 0.10,
       "memory_type": "episodic",
       "tags": ["personal", "home", "diy"]
@@ -1719,7 +1719,7 @@
       "id": "mem_190",
       "content": "Noticed the pigeon that has been nesting on the air conditioning unit outside is now raising two chicks; they are surprisingly loud for such small birds",
       "domain": "distractor",
-      "importance": 0.18,
+      "salience": 0.18,
       "decay_factor": 0.09,
       "memory_type": "episodic",
       "tags": ["personal", "nature"]
@@ -1728,7 +1728,7 @@
       "id": "mem_191",
       "content": "Switched from manual to electric toothbrush after the dentist's suggestion; the timer feature is useful but the charging dock takes up too much counter space",
       "domain": "distractor",
-      "importance": 0.14,
+      "salience": 0.14,
       "decay_factor": 0.09,
       "memory_type": "episodic",
       "tags": ["personal", "health-routine"]
@@ -1737,7 +1737,7 @@
       "id": "mem_192",
       "content": "Finished assembling the flat-pack bookcase; the instructions included one completely ambiguous diagram that required three restarts to decipher correctly",
       "domain": "distractor",
-      "importance": 0.15,
+      "salience": 0.15,
       "decay_factor": 0.09,
       "memory_type": "episodic",
       "tags": ["personal", "home", "diy"]
@@ -1746,7 +1746,7 @@
       "id": "mem_193",
       "content": "The ice cream shop on the corner finally opened after its winter break; the salted caramel was worth the wait but the queue was 30 minutes long",
       "domain": "distractor",
-      "importance": 0.18,
+      "salience": 0.18,
       "decay_factor": 0.09,
       "memory_type": "episodic",
       "tags": ["personal", "food", "local"]
@@ -1755,7 +1755,7 @@
       "id": "mem_194",
       "content": "Power outage for three hours during the workday; made an unexpected productive afternoon of offline reading and handwritten notes",
       "domain": "distractor",
-      "importance": 0.22,
+      "salience": 0.22,
       "decay_factor": 0.08,
       "memory_type": "episodic",
       "tags": ["personal", "daily"]
@@ -1764,7 +1764,7 @@
       "id": "mem_195",
       "content": "Lent the camping gear to a friend for the weekend; remembered too late that the tent zipper is broken and needs duct tape to stay closed",
       "domain": "distractor",
-      "importance": 0.15,
+      "salience": 0.15,
       "decay_factor": 0.09,
       "memory_type": "episodic",
       "tags": ["personal", "outdoor"]
@@ -1773,17 +1773,17 @@
       "id": "mem_196",
       "content": "Xentherion plastovite crystalline matrix undergoes sublimation cascade when exposed to resonant photonic frequencies in the 450nm band",
       "domain": "ml",
-      "importance": 0.28,
+      "salience": 0.28,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "unique-term-trap"],
-      "_note": "Importance trap: low importance (0.28), unique terms. Queries using 'xentherion plastovite' test whether high importance_weight demotes this relevant but low-importance item."
+      "_note": "Salience trap: low salience (0.28), unique terms. Queries using 'xentherion plastovite' test whether high salience_weight demotes this relevant but low-salience item."
     },
     {
       "id": "mem_197",
       "content": "Velquatrix enzymes catalyze the oxidative phosvelation pathway in mitochondrial cristae during cellular respiration under hypoxic conditions",
       "domain": "biology",
-      "importance": 0.30,
+      "salience": 0.30,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "unique-term-trap"],
@@ -1793,7 +1793,7 @@
       "id": "mem_198",
       "content": "Zyphomatic arc induction triggers cascading resonance in thalamic relay circuits producing synchronized oscillation bursts in prefrontal neurons",
       "domain": "medicine",
-      "importance": 0.32,
+      "salience": 0.32,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "unique-term-trap"],
@@ -1803,7 +1803,7 @@
       "id": "mem_199",
       "content": "Quandric fissile stratification in deltaic sediment layers reveals proglacial varve sequences spanning the Holocene thermal maximum",
       "domain": "geography",
-      "importance": 0.26,
+      "salience": 0.26,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["geography", "unique-term-trap"],
@@ -1813,7 +1813,7 @@
       "id": "mem_200",
       "content": "Melvoric distillation separation removes volitile aldehydes from fermentation broth through fractional condensation at precisely calibrated volvic temperatures",
       "domain": "cooking",
-      "importance": 0.27,
+      "salience": 0.27,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["cooking", "unique-term-trap"],
@@ -1823,31 +1823,31 @@
       "id": "mem_201",
       "content": "Structural equation models fit latent variable networks by minimising the discrepancy between observed and model-implied covariance matrices using maximum likelihood estimation",
       "domain": "ml",
-      "importance": 0.88,
+      "salience": 0.88,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["ml", "statistics", "sem"],
-      "_note": "High-importance anchor for xentherion contrast query: expected_top_k alongside mem_196 — high importance_weight should prefer this over mem_196"
+      "_note": "High-salience anchor for xentherion contrast query: expected_top_k alongside mem_196 — high salience_weight should prefer this over mem_196"
     },
     {
       "id": "mem_202",
       "content": "Tricarboxylic acid oxidation in peroxisome beta-oxidation produces acetyl-CoA that enters the mitochondrial matrix via the carnitine shuttle",
       "domain": "biology",
-      "importance": 0.86,
+      "salience": 0.86,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["biology", "metabolism", "biochemistry"],
-      "_note": "High-importance anchor for velquatrix contrast query"
+      "_note": "High-salience anchor for velquatrix contrast query"
     },
     {
       "id": "mem_203",
       "content": "Thalamic relay neurons gate sensory signals to cortical areas and modulate arousal state through reciprocal thalamocortical loops",
       "domain": "medicine",
-      "importance": 0.84,
+      "salience": 0.84,
       "decay_factor": 0.02,
       "memory_type": "semantic",
       "tags": ["medicine", "neuroscience", "thalamus"],
-      "_note": "High-importance anchor for zyphomatic contrast query"
+      "_note": "High-salience anchor for zyphomatic contrast query"
     }
   ],
   "eval_queries": [
@@ -2177,7 +2177,7 @@
       "expected_top_k": ["mem_196"],
       "expected_excluded": ["mem_111", "mem_112"],
       "query_type": "importance_trap",
-      "notes": "Unique-term query matching only mem_196 (imp=0.28). High importance_weight demotes this low-importance item, hurting MRR. Tests importance_weight discrimination."
+      "notes": "Unique-term query matching only mem_196 (sal=0.28). High salience_weight demotes this low-salience item, hurting MRR. Tests salience_weight discrimination."
     },
     {
       "id": "q_042",
@@ -2185,7 +2185,7 @@
       "expected_top_k": ["mem_197"],
       "expected_excluded": ["mem_016", "mem_020"],
       "query_type": "importance_trap",
-      "notes": "Unique-term query matching only mem_197 (imp=0.30). Tests importance_weight — low importance_weight prefers FTS relevance and finds this; high importance_weight ranks it low."
+      "notes": "Unique-term query matching only mem_197 (sal=0.30). Tests salience_weight — low salience_weight prefers FTS relevance and finds this; high salience_weight ranks it low."
     },
     {
       "id": "q_043",
@@ -2193,7 +2193,7 @@
       "expected_top_k": ["mem_198", "mem_203"],
       "expected_excluded": ["mem_111", "mem_112"],
       "query_type": "importance_trap",
-      "notes": "mem_198 (imp=0.32) and mem_203 (imp=0.84). High importance_weight promotes mem_203 to rank 1 and may push mem_198 below limit. Discriminates importance_weight."
+      "notes": "mem_198 (sal=0.32) and mem_203 (sal=0.84). High salience_weight promotes mem_203 to rank 1 and may push mem_198 below limit. Discriminates salience_weight."
     },
     {
       "id": "q_044",
@@ -2201,7 +2201,7 @@
       "expected_top_k": ["mem_199"],
       "expected_excluded": ["mem_046", "mem_048"],
       "query_type": "importance_trap",
-      "notes": "Unique-term query matching only mem_199 (imp=0.26). Pure importance_weight discrimination."
+      "notes": "Unique-term query matching only mem_199 (sal=0.26). Pure salience_weight discrimination."
     },
     {
       "id": "q_045",
@@ -2209,7 +2209,7 @@
       "expected_top_k": ["mem_200"],
       "expected_excluded": ["mem_054", "mem_055"],
       "query_type": "importance_trap",
-      "notes": "Unique-term query matching only mem_200 (imp=0.27). Tests importance_weight on low-salience cooking memory."
+      "notes": "Unique-term query matching only mem_200 (sal=0.27). Tests salience_weight on low-salience cooking memory."
     },
     {
       "id": "q_046",
@@ -2217,7 +2217,7 @@
       "expected_top_k": ["mem_201"],
       "expected_excluded": ["mem_094", "mem_095"],
       "query_type": "importance_trap",
-      "notes": "High-importance mem_201 (imp=0.88) — unique terms ensure FTS match. Should rank first regardless of importance_weight. Serves as a control query."
+      "notes": "High-salience mem_201 (sal=0.88) — unique terms ensure FTS match. Should rank first regardless of salience_weight. Serves as a control query."
     },
     {
       "id": "q_047",
@@ -2225,7 +2225,7 @@
       "expected_top_k": ["mem_202"],
       "expected_excluded": ["mem_016", "mem_017"],
       "query_type": "importance_trap",
-      "notes": "High-importance mem_202 (imp=0.86) — unique biochemistry terms. Control query: should rank first regardless of importance_weight."
+      "notes": "High-salience mem_202 (sal=0.86) — unique biochemistry terms. Control query: should rank first regardless of salience_weight."
     },
     {
       "id": "q_048",
@@ -2233,7 +2233,7 @@
       "expected_top_k": ["mem_203"],
       "expected_excluded": ["mem_198", "mem_071"],
       "query_type": "importance_trap",
-      "notes": "High-importance mem_203 (imp=0.84) with 'thalamic' shared with mem_198 (imp=0.32). Tests ranking when both match. High importance_weight should strongly prefer mem_203."
+      "notes": "High-salience mem_203 (sal=0.84) with 'thalamic' shared with mem_198 (sal=0.32). Tests ranking when both match. High salience_weight should strongly prefer mem_203."
     }
   ]
 }

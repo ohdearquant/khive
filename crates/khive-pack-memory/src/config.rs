@@ -40,7 +40,7 @@ pub struct RecallConfig {
     /// Weight of RRF/fusion score. Default 0.70.
     pub relevance_weight: f64,
     /// Weight of decay-adjusted salience. Default 0.20.
-    pub importance_weight: f64,
+    pub salience_weight: f64,
     /// Weight of pure recency. Default 0.10.
     pub temporal_weight: f64,
 
@@ -104,7 +104,7 @@ impl Default for RecallConfig {
     fn default() -> Self {
         Self {
             relevance_weight: 0.70,
-            importance_weight: 0.20,
+            salience_weight: 0.20,
             temporal_weight: 0.10,
             reranker_weights: HashMap::new(),
             reranker_params: HashMap::new(),
@@ -142,9 +142,9 @@ impl RecallConfig {
                 "relevance_weight must be non-negative".to_string(),
             ));
         }
-        if self.importance_weight < 0.0 {
+        if self.salience_weight < 0.0 {
             return Err(RuntimeError::InvalidInput(
-                "importance_weight must be non-negative".to_string(),
+                "salience_weight must be non-negative".to_string(),
             ));
         }
         if self.temporal_weight < 0.0 {
@@ -152,10 +152,10 @@ impl RecallConfig {
                 "temporal_weight must be non-negative".to_string(),
             ));
         }
-        let weight_sum = self.relevance_weight + self.importance_weight + self.temporal_weight;
+        let weight_sum = self.relevance_weight + self.salience_weight + self.temporal_weight;
         if weight_sum <= 0.0 {
             return Err(RuntimeError::InvalidInput(
-                "at least one of relevance_weight / importance_weight / temporal_weight must be positive".to_string(),
+                "at least one of relevance_weight / salience_weight / temporal_weight must be positive".to_string(),
             ));
         }
         for (name, &weight) in &self.reranker_weights {
@@ -215,14 +215,14 @@ pub enum DecayModel {
 impl DecayModel {
     /// Apply decay to a salience value.
     ///
-    /// - `salience`    — raw importance in [0, 1]
+    /// - `salience`    — raw salience in [0, 1]
     /// - `age_days`    — age of the note in days
     /// - `decay_factor`— per-note decay rate stored on the note (used by Exponential and Hyperbolic)
     /// - `half_life`   — config half-life, used only by PowerLaw (ignored by Exponential)
     pub fn apply(&self, salience: f64, age_days: f64, decay_factor: f64, _half_life: f64) -> f64 {
         match self {
             DecayModel::Exponential => {
-                // ADR-021 §5: effective_importance = salience * exp(-decay_factor * age_days)
+                // ADR-021 §5: effective_salience = salience * exp(-decay_factor * age_days)
                 // Uses the note's own decay_factor, not a half-life-derived constant.
                 salience * (-decay_factor * age_days).exp()
             }
@@ -242,9 +242,9 @@ pub struct ScoreBreakdown {
     /// Raw RRF fusion score (before weighting).
     pub relevance: f64,
     /// Raw salience from the note (before decay).
-    pub importance_raw: f64,
+    pub salience_raw: f64,
     /// Salience after applying the decay model.
-    pub importance_decayed: f64,
+    pub salience_decayed: f64,
     /// Temporal recency score (half-life decay, independent of note's own decay_factor).
     pub temporal: f64,
     /// Weighted contributions summing to the total score.
@@ -255,7 +255,7 @@ impl ScoreBreakdown {
     /// Total composite score.
     pub fn total(&self) -> f64 {
         self.weighted.relevance_contribution
-            + self.weighted.importance_contribution
+            + self.weighted.salience_contribution
             + self.weighted.temporal_contribution
     }
 }
@@ -264,7 +264,7 @@ impl ScoreBreakdown {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeightedContributions {
     pub relevance_contribution: f64,
-    pub importance_contribution: f64,
+    pub salience_contribution: f64,
     pub temporal_contribution: f64,
 }
 
@@ -385,9 +385,9 @@ mod tests {
     }
 
     #[test]
-    fn negative_importance_weight_fails_validation() {
+    fn negative_salience_weight_fails_validation() {
         let cfg = RecallConfig {
-            importance_weight: -1.0,
+            salience_weight: -1.0,
             ..RecallConfig::default()
         };
         assert!(cfg.validate().is_err());
@@ -406,7 +406,7 @@ mod tests {
     fn all_zero_weights_fails_validation() {
         let cfg = RecallConfig {
             relevance_weight: 0.0,
-            importance_weight: 0.0,
+            salience_weight: 0.0,
             temporal_weight: 0.0,
             ..RecallConfig::default()
         };
@@ -435,7 +435,7 @@ mod tests {
     fn non_uniform_weights_validate() {
         let cfg = RecallConfig {
             relevance_weight: 0.5,
-            importance_weight: 0.3,
+            salience_weight: 0.3,
             temporal_weight: 0.2,
             ..RecallConfig::default()
         };
@@ -497,7 +497,7 @@ mod tests {
         let diff = (cfg.relevance_weight - 0.5).abs();
         assert!(diff < 1e-12);
         // unspecified fields keep defaults
-        let diff2 = (cfg.importance_weight - 0.20).abs();
+        let diff2 = (cfg.salience_weight - 0.20).abs();
         assert!(diff2 < 1e-12);
         assert_eq!(cfg.decay_model, DecayModel::Exponential);
     }
@@ -591,12 +591,12 @@ mod tests {
     fn score_breakdown_total_sums_contributions() {
         let bd = ScoreBreakdown {
             relevance: 0.5,
-            importance_raw: 0.8,
-            importance_decayed: 0.6,
+            salience_raw: 0.8,
+            salience_decayed: 0.6,
             temporal: 0.3,
             weighted: WeightedContributions {
                 relevance_contribution: 0.35,
-                importance_contribution: 0.12,
+                salience_contribution: 0.12,
                 temporal_contribution: 0.03,
             },
         };

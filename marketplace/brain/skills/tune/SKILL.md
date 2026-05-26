@@ -80,7 +80,7 @@ Record the `exploration_epoch`. Then reset:
 request(ops="brain.reset()")
 ```
 
-The epoch increments by 1. Run `brain.profile` again to confirm the posterior means returned to the prior (~0.7 for relevance, ~0.2 for importance, ~0.1 for temporal with the default `balanced-recall-v1` priors).
+The epoch increments by 1. Run `brain.profile` again to confirm the posterior means returned to the prior (~0.7 for relevance, ~0.2 for salience, ~0.1 for temporal with the default `balanced-recall-v1` priors).
 
 ## Anti-patterns
 

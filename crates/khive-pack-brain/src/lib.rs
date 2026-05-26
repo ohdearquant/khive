@@ -68,7 +68,7 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
             name: "parameter",
             param_type: "string",
             required: false,
-            description: "Specific parameter to query: \"recall::relevance_weight\" | \"recall::importance_weight\" | \"recall::temporal_weight\". Omit to return all.",
+            description: "Specific parameter to query: \"recall::relevance_weight\" | \"recall::salience_weight\" | \"recall::temporal_weight\". Omit to return all.",
         }],
     },
     HandlerDef {
@@ -428,7 +428,7 @@ impl BrainPack {
 
         let param_map = [
             ("recall::relevance_weight", &br.relevance),
-            ("recall::importance_weight", &br.importance),
+            ("recall::salience_weight", &br.salience),
             ("recall::temporal_weight", &br.temporal),
         ];
 
@@ -2035,7 +2035,7 @@ mod tests {
             .unwrap();
         let obj = result.as_object().unwrap();
         assert!(obj.contains_key("recall::relevance_weight"));
-        assert!(obj.contains_key("recall::importance_weight"));
+        assert!(obj.contains_key("recall::salience_weight"));
         assert!(obj.contains_key("recall::temporal_weight"));
     }
 
@@ -2239,7 +2239,7 @@ mod tests {
             pack.on_dispatch(&view).await;
         }
 
-        // Step 2: also call handle_feedback directly to move importance away from prior.
+        // Step 2: also call handle_feedback directly to move salience away from prior.
         // C4: create a real entity so target_id validation passes.
         let target = create_test_entity(&rt, &token).await;
         for _ in 0..5 {
@@ -2256,8 +2256,8 @@ mod tests {
         // Verify state before reset: posteriors have moved, total_events > 0.
         let before = pack.snapshot();
         assert!(
-            before.balanced_recall.importance.alpha > 2.0,
-            "importance.alpha must have grown past prior after useful feedback"
+            before.balanced_recall.salience.alpha > 2.0,
+            "salience.alpha must have grown past prior after useful feedback"
         );
         assert!(
             before.balanced_recall.total_events >= 9,
@@ -2302,16 +2302,16 @@ mod tests {
         // Step 4: after reset, posteriors must be domain-informed priors — NOT Beta(1,1).
         let after = pack.snapshot();
 
-        // importance prior = Beta(2,8)
+        // salience prior = Beta(2,8)
         assert!(
-            (after.balanced_recall.importance.alpha - 2.0).abs() < 1e-12,
-            "#295: importance.alpha must be 2.0 after reset, got {}",
-            after.balanced_recall.importance.alpha
+            (after.balanced_recall.salience.alpha - 2.0).abs() < 1e-12,
+            "#295: salience.alpha must be 2.0 after reset, got {}",
+            after.balanced_recall.salience.alpha
         );
         assert!(
-            (after.balanced_recall.importance.beta - 8.0).abs() < 1e-12,
-            "#295: importance.beta must be 8.0 after reset, got {}",
-            after.balanced_recall.importance.beta
+            (after.balanced_recall.salience.beta - 8.0).abs() < 1e-12,
+            "#295: salience.beta must be 8.0 after reset, got {}",
+            after.balanced_recall.salience.beta
         );
 
         // temporal prior = Beta(1,9)
@@ -2363,13 +2363,13 @@ mod tests {
              reset result ({epoch_after})"
         );
 
-        // state_snapshot: importance.alpha must be the prior value.
+        // state_snapshot: salience.alpha must be the prior value.
         let snap = &record["state_snapshot"];
-        let imp_alpha = snap["importance"]["alpha"].as_f64().unwrap();
+        let sal_alpha = snap["salience"]["alpha"].as_f64().unwrap();
         assert!(
-            (imp_alpha - 2.0).abs() < 1e-12,
-            "#295: brain.profile state_snapshot importance.alpha must be 2.0 after reset, \
-             got {imp_alpha}"
+            (sal_alpha - 2.0).abs() < 1e-12,
+            "#295: brain.profile state_snapshot salience.alpha must be 2.0 after reset, \
+             got {sal_alpha}"
         );
     }
 
@@ -3179,8 +3179,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Emit feedback to custom-v1 so its importance posterior diverges from prior.
-        // brain.feedback with signal="useful" → importance.update_success() (fold.rs:54).
+        // Emit feedback to custom-v1 so its salience posterior diverges from prior.
+        // brain.feedback with signal="useful" → salience.update_success() (fold.rs:54).
         pack.dispatch(
             "brain.feedback",
             json!({"target_id": target, "signal": "useful", "served_by_profile_id": "custom-v1"}),
@@ -3190,7 +3190,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Confirm importance.alpha increased above the prior (2.0).
+        // Confirm salience.alpha increased above the prior (2.0).
         let mutated = pack
             .dispatch(
                 "brain.profile",
@@ -3200,12 +3200,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let importance_alpha_before = mutated["state_snapshot"]["importance"]["alpha"]
+        let salience_alpha_before = mutated["state_snapshot"]["salience"]["alpha"]
             .as_f64()
-            .expect("state_snapshot.importance.alpha must be a number");
+            .expect("state_snapshot.salience.alpha must be a number");
         assert!(
-            importance_alpha_before > 2.0,
-            "r3 fix 2: feedback must have moved importance alpha above prior 2.0; got {importance_alpha_before}"
+            salience_alpha_before > 2.0,
+            "r3 fix 2: feedback must have moved salience alpha above prior 2.0; got {salience_alpha_before}"
         );
         let epoch_before = mutated["exploration_epoch"].as_u64().unwrap();
 
@@ -3240,7 +3240,7 @@ mod tests {
 
         // All three posteriors must return exactly to ADR-032 priors:
         //   relevance  = Beta(7, 3)
-        //   importance = Beta(2, 8)
+        //   salience   = Beta(2, 8)
         //   temporal   = Beta(1, 9)
         let snap = &after["state_snapshot"];
         assert!(
@@ -3257,15 +3257,11 @@ mod tests {
             "r3 fix 2: relevance must be Beta(7,3) after reset; got ({rel_alpha},{rel_beta})"
         );
 
-        let imp_alpha = snap["importance"]["alpha"]
-            .as_f64()
-            .expect("importance.alpha");
-        let imp_beta = snap["importance"]["beta"]
-            .as_f64()
-            .expect("importance.beta");
+        let sal_alpha = snap["salience"]["alpha"].as_f64().expect("salience.alpha");
+        let sal_beta = snap["salience"]["beta"].as_f64().expect("salience.beta");
         assert!(
-            (imp_alpha - 2.0).abs() < 1e-9 && (imp_beta - 8.0).abs() < 1e-9,
-            "r3 fix 2: importance must be Beta(2,8) after reset; got ({imp_alpha},{imp_beta})"
+            (sal_alpha - 2.0).abs() < 1e-9 && (sal_beta - 8.0).abs() < 1e-9,
+            "r3 fix 2: salience must be Beta(2,8) after reset; got ({sal_alpha},{sal_beta})"
         );
 
         let tmp_alpha = snap["temporal"]["alpha"].as_f64().expect("temporal.alpha");

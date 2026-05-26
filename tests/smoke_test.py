@@ -493,7 +493,7 @@ def memory_smoke():
         # memory.remember: store a memory note
         mem = call_verb(proc, "memory.remember", {
             "content": "khive uses SQLite with FTS5 and sqlite-vec for hybrid search",
-            "importance": 0.9,
+            "salience": 0.9,
             "memory_type": "semantic",
         })
         assert mem is not None, "memory.remember must return a result"
@@ -504,7 +504,7 @@ def memory_smoke():
         # memory.remember: second memory with different content
         mem2 = call_verb(proc, "memory.remember", {
             "content": "The runtime enforces namespace isolation for every ID-based operation",
-            "importance": 0.7,
+            "salience": 0.7,
             "memory_type": "semantic",
         })
         assert mem2 is not None, "second memory.remember must return a result"

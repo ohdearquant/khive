@@ -1,5 +1,5 @@
 ---
-description: Store durable agent memory with the right type, importance, decay, tags, and optional source link.
+description: Store durable agent memory with the right type, salience, decay, tags, and optional source link.
 ---
 
 # Remember
@@ -31,25 +31,25 @@ Skip memory for:
 
 ### 2. Choose a memory type
 
-| Type | Use when |
-| ---- | -------- |
+| Type       | Use when                                                                         |
+| ---------- | -------------------------------------------------------------------------------- |
 | `episodic` | The memory is tied to an event, session, interaction, or time-bound observation. |
-| `semantic` | The memory is a durable fact, preference, rule, or reusable piece of knowledge. |
+| `semantic` | The memory is a durable fact, preference, rule, or reusable piece of knowledge.  |
 
 When uncertain, use `episodic`. It is safer to preserve the context of when the memory was learned.
 
 ### 3. Store the memory
 
 ```
-request(ops="memory.remember(content=\"<durable memory>\", memory_type=\"episodic\", importance=0.6)")
+request(ops="remember(content=\"<durable memory>\", memory_type=\"episodic\", salience=0.6)")
 ```
 
-Use `importance` from `0.0` to `1.0`. Defaults are acceptable for ordinary memories; use high importance only for context that should reliably outrank routine notes.
+Use `salience` from `0.0` to `1.0`. Defaults are acceptable for ordinary memories; use high salience only for context that should reliably outrank routine notes.
 
 For stable facts:
 
 ```
-request(ops="memory.remember(content=\"The memory pack stores one note kind, memory, and uses memory_type to distinguish episodic from semantic memories.\", memory_type=\"semantic\", importance=0.8, tags=[\"khive\",\"memory-pack\"])")
+request(ops="remember(content=\"The memory pack stores one note kind, memory, and uses memory_type to distinguish episodic from semantic memories.\", memory_type=\"semantic\", salience=0.8, tags=[\"khive\",\"memory-pack\"])")
 ```
 
 ### 4. Link provenance when available
@@ -57,7 +57,7 @@ request(ops="memory.remember(content=\"The memory pack stores one note kind, mem
 If the memory came from a source entity or note, pass its UUID:
 
 ```
-request(ops="memory.remember(content=\"ADR-036 defines recall as memory-scoped retrieval with decay-aware ranking.\", memory_type=\"semantic\", importance=0.8, source_id=\"<source-uuid>\", tags=[\"adr\",\"memory\"])")
+request(ops="remember(content=\"ADR-036 defines recall as memory-scoped retrieval with decay-aware ranking.\", memory_type=\"semantic\", salience=0.8, source_id=\"<source-uuid>\", tags=[\"adr\",\"memory\"])")
 ```
 
 `source_id` creates an `annotates` relationship from the memory note to the source.
@@ -77,21 +77,21 @@ If recall cannot find it, rewrite the memory with clearer keywords or add tags i
 ### Capture a session outcome
 
 ```
-request(ops="memory.remember(content=\"Marketplace sweep found KG agent task queries must use gtd.tasks(...) instead of list(kind=\\\"task\\\", filter=...).\", memory_type=\"episodic\", importance=0.7, tags=[\"marketplace\",\"gtd\",\"kg-agents\"])")
+request(ops="remember(content=\"Marketplace sweep found KG agent task queries must use tasks(...) instead of list(kind=\\\"task\\\", filter=...).\", memory_type=\"episodic\", salience=0.7, tags=[\"marketplace\",\"gtd\",\"kg-agents\"])")
 ```
 
 ### Store a durable preference
 
 ```
-request(ops="memory.remember(content=\"User prefers copy-paste-ready fix specs with exact before and after content.\", memory_type=\"semantic\", importance=0.9, tags=[\"user-preference\",\"specs\"])")
+request(ops="remember(content=\"User prefers copy-paste-ready fix specs with exact before and after content.\", memory_type=\"semantic\", salience=0.9, tags=[\"user-preference\",\"specs\"])")
 ```
 
 ### Store several independent memories
 
 ```
 request(ops="[
-  memory.remember(content=\"Memory pack exposes remember and recall verbs.\", memory_type=\"semantic\", importance=0.7),
-  memory.remember(content=\"Recall should be run before claiming no prior context exists.\", memory_type=\"semantic\", importance=0.8)
+  remember(content=\"Memory pack exposes remember and recall verbs.\", memory_type=\"semantic\", salience=0.7),
+  remember(content=\"Recall should be run before claiming no prior context exists.\", memory_type=\"semantic\", salience=0.8)
 ]")
 ```
 
@@ -99,6 +99,6 @@ request(ops="[
 
 - **Remembering everything.** Memory quality drops if routine scratch work crowds out durable context.
 - **Using vague content.** A future `recall` query depends on specific words.
-- **Inflating importance.** High-importance memories should be rare.
+- **Inflating salience.** High-salience memories should be rare.
 - **Storing tasks as memories.** Use `assign` for commitments and lifecycle tracking.
 - **Storing relationships as prose only.** If the relationship matters structurally, use KG entities and edges.

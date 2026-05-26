@@ -1,5 +1,8 @@
 """Regression tests for memories_corpus_v2.json eval corpus integrity.
 
+ADR: ADR-021
+section: Recall evaluation corpus; salience weighting; query-type coverage
+
 These tests verify:
   1. Schema correctness — every query.expected_top_k references a real memory ID.
   2. Query type coverage — each type appears at least N times.
@@ -18,6 +21,11 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+
+# Manifest contract — declares which verbs the corpus is calibrated against.
+# The corpus drives memory.recall scoring evaluation; these are the verbs that
+# read the salience signal this corpus tests.
+VERBS_UNDER_TEST = {"memory.recall", "memory.remember"}
 
 _HERE = Path(__file__).parent
 _FIXTURES = _HERE.parent / "fixtures"
@@ -103,7 +111,7 @@ def test_memory_ids_have_id_field(memories: list[dict]) -> None:
 
 def test_memory_required_fields(memories: list[dict]) -> None:
     """Every memory must have the required fields."""
-    required = {"id", "content", "importance", "decay_factor", "memory_type"}
+    required = {"id", "content", "salience", "decay_factor", "memory_type"}
     for m in memories:
         missing = required - m.keys()
         assert not missing, f"Memory {m.get('id', '?')} missing fields: {missing}"

@@ -55,21 +55,19 @@ tolerated.
 Two kinds (`episodic` and `semantic`) would force a two-search merge in `recall`,
 complicate per-type retrieval branches, and gain nothing over a queryable property.
 
-### 2. `importance` aliases `salience`; `decay_factor` defaults to mild decay
+### 2. `salience` and `decay_factor`; `decay_factor` defaults to mild decay
 
-The notes substrate already carries `salience` (the importance signal used by retrieval
-rerank, [ADR-012](ADR-012-retrieval-composition.md)) and `decay_factor` (per-note
-exponential decay rate). The memory pack does NOT introduce new columns; it remaps
-user-facing parameter names:
+The notes substrate carries `salience` (the primary signal used by retrieval rerank,
+[ADR-012](ADR-012-retrieval-composition.md)) and `decay_factor` (per-note exponential
+decay rate). The memory pack does NOT introduce new columns; it uses these substrate
+fields directly:
 
 | Wire parameter | Storage column | Default                                |
 | -------------- | -------------- | -------------------------------------- |
-| `importance`   | `salience`     | `0.5`                                  |
+| `salience`     | `salience`     | `0.5`                                  |
 | `decay_factor` | `decay_factor` | `0.01` (mild decay; ~69-day half-life) |
 
-`importance` is the term the memory domain uses; `salience` is the substrate-level
-concept used by other packs. The handler translates between them. There is no duplicate
-column.
+There is no aliasing — the wire parameter and storage column are both `salience`.
 
 The substrate-wide `decay_factor` default is `0.0` (no decay). The memory pack handler
 overrides this default to `0.01` for memory notes, so memory participates in time decay
@@ -99,7 +97,7 @@ Edges are the right substrate for "this came from X" relationships.
 ### 4. `memory.remember` — sugar over `create` + optional `link`
 
 ```
-memory.remember(content, memory_type?, importance?, decay_factor?, source_id?, tags?, namespace?)
+memory.remember(content, memory_type?, salience?, decay_factor?, source_id?, tags?, namespace?)
 ```
 
 Semantically equivalent to:
@@ -108,7 +106,7 @@ Semantically equivalent to:
 1. note_id = create(
      kind = "memory",
      content = content,
-     salience = <importance | 0.5>,
+     salience = <salience | 0.5>,
      decay_factor = <decay_factor | 0.01>,
      properties = { memory_type: <memory_type | "episodic"> },
      tags = <tags | []>,
@@ -120,7 +118,7 @@ Semantically equivalent to:
 ```
 
 The handler validates: (a) `content` non-empty, (b) `memory_type ∈ {episodic, semantic}`
-if provided, (c) `importance ∈ [0, 1]`, (d) `decay_factor >= 0`, (e) `source_id` is a
+if provided, (c) `salience ∈ [0, 1]`, (d) `decay_factor >= 0`, (e) `source_id` is a
 valid UUID present in the namespace.
 
 Agents that prefer explicit CRUD are not blocked:
@@ -144,14 +142,14 @@ distinguish it from generic note search:
    post-filter, the handler implements bounded over-fetch (ceiling `limit * 20` raw
    candidates) until `limit` memory hits are collected.
 2. **Decay-weighted scoring.** Each candidate's `salience` is decayed by age:
-   `effective_importance = salience * exp(-decay_factor * age_days)`, where `age_days`
+   `effective_salience = salience * exp(-decay_factor * age_days)`, where `age_days`
    is `(now - created_at) / seconds_per_day`. Decay is computed per candidate using the
    note's own `decay_factor` (allowing per-memory decay rates).
 3. **Score fusion.** Final score combines the substrate's RRF hybrid score (FTS5 + vector)
-   with the decayed importance and a temporal fresh-first signal:
+   with the decayed salience and a temporal fresh-first signal:
 
    ```
-   score = rrf_score * 0.70 + effective_importance * 0.20 + temporal * 0.10
+   score = rrf_score * 0.70 + effective_salience * 0.20 + temporal * 0.10
    ```
 
    These weights are the v1 defaults. Per-`memory_type` overrides (heavier decay for
@@ -202,7 +200,7 @@ running the candidate-fusion stage:
 ```text
 memory.recall(query, …):
   1. P = brain.resolve(actor, namespace, consumer_kind="recall") on miss → defaults
-  2. weights = P.config_overrides (RRF / importance / temporal weights — §5)
+  2. weights = P.config_overrides (RRF / salience / temporal weights — §5)
   3. candidates = recall_embed → recall_candidates (multi-engine if ADR-031 loaded)
   4. fused = recall_fuse(candidates, weights)
   5. emit RecallExecuted event with payload.served_by_profile_id = Some(P.id)
@@ -266,7 +264,7 @@ pack's semantic ownership of its lifecycle.
 
 The same logic applies here:
 
-- `remember` validates `memory_type`, normalizes `importance` and `decay_factor`
+- `remember` validates `memory_type`, normalizes `salience` and `decay_factor`
   defaults, and creates the `annotates` edge in a single call. Generic `create` + `link`
   requires the agent to know two verbs and the precise edge relation.
 - `recall` enforces the memory-only candidate scoping (preventing leak of `task` or
@@ -305,22 +303,22 @@ Agents that want different decay characteristics override per-memory:
 `memory.remember(content="...", decay_factor=0.05)` for fast-fading episodic content,
 `memory.remember(content="...", decay_factor=0.0)` for permanent semantic facts.
 
-### Why `importance` aliases `salience` (not a new column)
+### Why `salience` (not a separate `importance` column)
 
 The `salience` column already exists on the notes substrate and participates in the
-[ADR-012](ADR-012-retrieval-composition.md) rerank pipeline. Introducing a separate
-`importance` column would either duplicate storage (two columns holding the same value)
-or split storage (importance for memory, salience for everything else) with no
-behavioural benefit.
+[ADR-012](ADR-012-retrieval-composition.md) rerank pipeline. Using `salience` directly
+as both the wire parameter and storage column keeps the interface consistent across all
+packs — the memory pack uses the same vocabulary as the substrate and other packs, with
+no aliasing or translation layer.
 
-The user-facing name lives on the verb argument; the storage column stays at the
-substrate level. The pack handler is the translation point — the same pattern the GTD
-pack uses for `priority` (a wire-level concept that maps to substrate-level fields).
+An earlier draft aliased `importance` → `salience`. That alias was eliminated (2026-05-25)
+to enforce a single consistent term throughout the codebase. The storage column
+`notes.salience` was always canonical; the wire-level alias was the anomaly.
 
 ### Why scoring weights `0.70 / 0.20 / 0.10`
 
 These are v1 starting values, not architectural invariants. The weights say: the
-hybrid retrieval score (FTS5 + vector via RRF) is the primary signal, decayed importance
+hybrid retrieval score (FTS5 + vector via RRF) is the primary signal, decayed salience
 is a secondary signal, and freshness is a tertiary signal. Future research-driven
 recalibration — Beta-Bernoulli posterior over recall hits, adaptive decay adjustment,
 per-`memory_type` weight tables — lands in a separate ADR when the research informing
@@ -336,7 +334,7 @@ handler logic.
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Strip `remember`/`recall`; pack provides kind only                   | Loses domain-specific preconditions; contradicts GTD precedent; memory pack becomes a vocabulary pack with no semantic ownership.                                      |
 | Two memory kinds (`episodic`/`semantic`)                             | Forces two-search merge in `recall`; complicates per-type retrieval policy; mixed-namespace recall correctness is harder.                                              |
-| Separate `importance` column instead of aliasing `salience`          | Duplicates the rerank signal; forces every reader/writer to know which column to consult; no behavioural benefit.                                                      |
+| Separate `importance` column (aliasing `salience`)                   | Duplicate terms cause confusion; the alias was eliminated 2026-05-25 in favour of `salience` throughout.                                                               |
 | Store `source` as a string in `properties`                           | Couples memory to a future actor-identity string format; not traversable via `neighbors`/`traverse`; loses the universal `annotates` edge.                             |
 | Enforce `episodic`/`semantic` distinction with structural validation | Arbitrary; agents disagree on what "time-anchored" means; validation complexity outweighs the gain.                                                                    |
 | `forget` as a pack-owned verb                                        | Duplicates `delete`; no demonstrated use case for distinct semantics; verb pollution.                                                                                  |
@@ -415,8 +413,8 @@ The pack's `StorageProfile` (from [ADR-003](ADR-003-system-architecture.md) /
 
 `remember`:
 
-- Validate inputs (content non-empty, memory_type ∈ {episodic, semantic}, importance ∈ [0,1])
-- Construct `Note` via the storage builder with `salience = importance`, `decay_factor`,
+- Validate inputs (content non-empty, memory_type ∈ {episodic, semantic}, salience ∈ [0,1])
+- Construct `Note` via the storage builder with `salience`, `decay_factor`,
   `properties.memory_type`
 - Persist via `runtime.create_note(...)`
 - If `source_id`: validate it exists in the namespace; create `annotates` edge
@@ -425,7 +423,7 @@ The pack's `StorageProfile` (from [ADR-003](ADR-003-system-architecture.md) /
 
 - Build candidate request with `kind="memory"` as candidate filter (push into FTS5/vector
   candidate retrieval, not just post-filter)
-- For each candidate: compute `effective_importance = salience * exp(-decay_factor * age_days)`,
+- For each candidate: compute `effective_salience = salience * exp(-decay_factor * age_days)`,
   apply score fusion formula
 - Apply optional `memory_type` post-filter
 - Apply `min_score` truncation, then `limit`

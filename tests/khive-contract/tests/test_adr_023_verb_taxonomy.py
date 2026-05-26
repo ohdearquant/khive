@@ -168,7 +168,7 @@ def test_pack_product_verbs_are_reachable_when_loaded(
     # memory.remember
     mem = khive_memory_session.verb("memory.remember", {
         "content": "khive taxonomy coverage test semantic memory",
-        "importance": 0.8,
+        "salience": 0.8,
         "memory_type": "semantic",
         "namespace": ns,
     })

@@ -24,11 +24,11 @@ request(ops="knowledge.topic(query=\"linear attention state space\", domain=\"at
 
 ## Parameters
 
-| Parameter | Type | Required | Description |
-| --------- | ---- | -------- | ----------- |
-| `domain` | string | no | Filter to concepts tagged with this domain. |
-| `query` | string | no | Free-text search query (hybrid FTS + vector). |
-| `limit` | int | no | Maximum results (default: 20, max: 100). |
+| Parameter | Type   | Required | Description                                   |
+| --------- | ------ | -------- | --------------------------------------------- |
+| `domain`  | string | no       | Filter to concepts tagged with this domain.   |
+| `query`   | string | no       | Free-text search query (hybrid FTS + vector). |
+| `limit`   | int    | no       | Maximum results (default: 20, max: 100).      |
 
 ## Response shape
 

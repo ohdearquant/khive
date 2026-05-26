@@ -26,14 +26,14 @@ If the captured title is too vague to act on, do not promote it as-is. Either mo
 
 ### 3. Choose exactly one state
 
-| State | Use when |
-| ----- | -------- |
-| `next` | It is a real commitment and can be acted on without more input. |
-| `active` | You are starting it immediately. |
-| `waiting` | A named person, event, or artifact is blocking it. |
-| `someday` | It is worth keeping but not a current commitment. |
-| `done` | It was captured after the fact and is already complete. |
-| `cancelled` | It is no longer worth tracking. |
+| State       | Use when                                                        |
+| ----------- | --------------------------------------------------------------- |
+| `next`      | It is a real commitment and can be acted on without more input. |
+| `active`    | You are starting it immediately.                                |
+| `waiting`   | A named person, event, or artifact is blocking it.              |
+| `someday`   | It is worth keeping but not a current commitment.               |
+| `done`      | It was captured after the fact and is already complete.         |
+| `cancelled` | It is no longer worth tracking.                                 |
 
 **Transition rules**: `inbox` is a one-way entry point — no state can transition back to it. `waiting` and `someday` cannot reach each other directly (go through `next` or `active`). `done` and `cancelled` report `is_terminal: true` but can only reopen to `next` or `active`.
 

@@ -102,8 +102,8 @@ request(ops="gtd.complete(id=\"<id-from-assign>\")")
 ### Memory pack smoke tests
 
 ```text
-request(ops="memory.remember(content=\"install verification note\", memory_type=\"episodic\", importance=0.1)")
-request(ops="memory.recall(query=\"install verification\", limit=1)")
+request(ops="remember(content=\"install verification note\", memory_type=\"episodic\", salience=0.1)")
+request(ops="recall(query=\"install verification\", limit=1)")
 ```
 
 ### Brain pack smoke tests
@@ -124,12 +124,12 @@ All examples should report `invalid=0`.
 
 ## Troubleshooting
 
-| Symptom | Fix |
-| ------- | --- |
-| `khive-mcp: command not found` | Run `cargo install khive-mcp` or add `~/.cargo/bin` to `PATH` |
+| Symptom                          | Fix                                                           |
+| -------------------------------- | ------------------------------------------------------------- |
+| `khive-mcp: command not found`   | Run `cargo install khive-mcp` or add `~/.cargo/bin` to `PATH` |
 | MCP tool not appearing in Claude | Check `.mcp.json` is in the project root; restart Claude Code |
-| `Unknown verb` error | Confirm `--pack` flag includes the right pack for the verb |
-| `Pack not loaded` error | Verify `khive-mcp --version` matches the plugin version |
+| `Unknown verb` error             | Confirm `--pack` flag includes the right pack for the verb    |
+| `Pack not loaded` error          | Verify `khive-mcp --version` matches the plugin version       |
 
 ## Links
 

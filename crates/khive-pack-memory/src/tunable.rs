@@ -9,7 +9,7 @@ use crate::MemoryPack;
 /// `MemoryPack` implements `PackTunable` so that the brain can adjust the
 /// recall scoring pipeline based on observed usage patterns (Issue #159).
 ///
-/// Parameter names (`memory::relevance_weight`, `memory::importance_weight`,
+/// Parameter names (`memory::relevance_weight`, `memory::salience_weight`,
 /// `memory::temporal_weight`) correspond to the three Beta posteriors in
 /// `BalancedRecallState` (ADR-032 §5a). Posterior means flow directly into
 /// `RecallConfig`.
@@ -30,8 +30,8 @@ impl PackTunable for MemoryPack {
                     bounds: (0.0, 1.0),
                 },
                 ParameterDef {
-                    name: "memory::importance_weight".into(),
-                    // Prior: importance is secondary (2:8).
+                    name: "memory::salience_weight".into(),
+                    // Prior: salience is secondary (2:8).
                     prior_alpha: 2.0,
                     prior_beta: 8.0,
                     bounds: (0.0, 1.0),
@@ -55,12 +55,12 @@ impl PackTunable for MemoryPack {
         let current = self.active_config();
 
         let relevance = state.relevance.mean();
-        let importance = state.importance.mean();
+        let salience = state.salience.mean();
         let temporal = state.temporal.mean();
 
         let projected = RecallConfig {
             relevance_weight: relevance,
-            importance_weight: importance,
+            salience_weight: salience,
             temporal_weight: temporal,
             ..current
         };
@@ -95,7 +95,7 @@ mod tests {
 
     fn balanced_state_with_means(
         relevance_mean: f64,
-        importance_mean: f64,
+        salience_mean: f64,
         temporal_mean: f64,
     ) -> BalancedRecallState {
         // Construct Beta posteriors whose means match the supplied values.
@@ -104,7 +104,7 @@ mod tests {
             |mean: f64| -> BetaPosterior { BetaPosterior::new(mean * 10.0, (1.0 - mean) * 10.0) };
         let mut state = BalancedRecallState::new(100);
         state.relevance = to_posterior(relevance_mean);
-        state.importance = to_posterior(importance_mean);
+        state.salience = to_posterior(salience_mean);
         state.temporal = to_posterior(temporal_mean);
         state
     }
@@ -116,7 +116,7 @@ mod tests {
         assert_eq!(space.parameters.len(), 3);
         let names: Vec<&str> = space.parameters.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"memory::relevance_weight"));
-        assert!(names.contains(&"memory::importance_weight"));
+        assert!(names.contains(&"memory::salience_weight"));
         assert!(names.contains(&"memory::temporal_weight"));
     }
 
@@ -128,7 +128,7 @@ mod tests {
 
         let cfg: RecallConfig = serde_json::from_value(projected).unwrap();
         assert!((cfg.relevance_weight - 0.6).abs() < 1e-10);
-        assert!((cfg.importance_weight - 0.3).abs() < 1e-10);
+        assert!((cfg.salience_weight - 0.3).abs() < 1e-10);
         assert!((cfg.temporal_weight - 0.1).abs() < 1e-10);
     }
 
@@ -141,7 +141,7 @@ mod tests {
 
         let cfg: RecallConfig = serde_json::from_value(projected).unwrap();
         assert!((cfg.relevance_weight - 0.70).abs() < 1e-10);
-        assert!((cfg.importance_weight - 0.20).abs() < 1e-10);
+        assert!((cfg.salience_weight - 0.20).abs() < 1e-10);
         assert!((cfg.temporal_weight - 0.10).abs() < 1e-10);
     }
 
@@ -150,7 +150,7 @@ mod tests {
         let pack = make_pack();
         let new_cfg = RecallConfig {
             relevance_weight: 0.5,
-            importance_weight: 0.3,
+            salience_weight: 0.3,
             temporal_weight: 0.2,
             ..RecallConfig::default()
         };
@@ -160,7 +160,7 @@ mod tests {
 
         let active = pack.active_config();
         assert!((active.relevance_weight - 0.5).abs() < 1e-10);
-        assert!((active.importance_weight - 0.3).abs() < 1e-10);
+        assert!((active.salience_weight - 0.3).abs() < 1e-10);
         assert!((active.temporal_weight - 0.2).abs() < 1e-10);
     }
 
@@ -169,7 +169,7 @@ mod tests {
         let pack = make_pack();
         let bad_cfg = RecallConfig {
             relevance_weight: 0.0,
-            importance_weight: 0.0,
+            salience_weight: 0.0,
             temporal_weight: 0.0,
             ..RecallConfig::default()
         };

@@ -2,7 +2,7 @@
 
 Bayesian adaptive tuning on top of [khive-mcp](https://github.com/ohdearquant/khive).
 
-The brain pack maintains a profile registry. Each profile holds Bayesian posteriors over recall-weight parameters (`relevance_weight`, `importance_weight`, `temporal_weight`). Posteriors update automatically from every successful verb dispatch via a post-dispatch hook, and can be nudged manually with `brain.feedback`. The built-in `balanced-recall-v1` profile is active by default.
+The brain pack maintains a profile registry. Each profile holds Bayesian posteriors over recall-weight parameters (`relevance_weight`, `salience_weight`, `temporal_weight`). Posteriors update automatically from every successful verb dispatch via a post-dispatch hook, and can be nudged manually with `brain.feedback`. The built-in `balanced-recall-v1` profile is active by default.
 
 ## Concepts
 
@@ -24,37 +24,37 @@ khive-mcp --pack brain
 
 ### Read (assertive)
 
-| Verb | What it does |
-| ---- | ------------ |
-| `brain.profiles(lifecycle?)` | List profiles, optionally filtered by lifecycle. |
-| `brain.profile(id)` | Profile metadata, latest snapshot, current state summary. |
-| `brain.resolve(consumer_kind, actor?, namespace?)` | Show which profile would serve a caller context. |
+| Verb                                               | What it does                                              |
+| -------------------------------------------------- | --------------------------------------------------------- |
+| `brain.profiles(lifecycle?)`                       | List profiles, optionally filtered by lifecycle.          |
+| `brain.profile(id)`                                | Profile metadata, latest snapshot, current state summary. |
+| `brain.resolve(consumer_kind, actor?, namespace?)` | Show which profile would serve a caller context.          |
 
 ### Write lifecycle (commissive)
 
-| Verb | What it does |
-| ---- | ------------ |
-| `brain.activate(profile_id)` | Move a profile to Active — starts the live update loop. |
-| `brain.deactivate(profile_id)` | Move a profile to Inactive — stops live updates, retains state. |
-| `brain.archive(profile_id)` | Move a profile to Archived — read-only, audit-retained. |
-| `brain.feedback(target_id, signal, served_by_profile_id?)` | Emit a FeedbackExplicit event and update posteriors. |
+| Verb                                                       | What it does                                                    |
+| ---------------------------------------------------------- | --------------------------------------------------------------- |
+| `brain.activate(profile_id)`                               | Move a profile to Active — starts the live update loop.         |
+| `brain.deactivate(profile_id)`                             | Move a profile to Inactive — stops live updates, retains state. |
+| `brain.archive(profile_id)`                                | Move a profile to Archived — read-only, audit-retained.         |
+| `brain.feedback(target_id, signal, served_by_profile_id?)` | Emit a FeedbackExplicit event and update posteriors.            |
 
 ### Write binding (declaration)
 
-| Verb | What it does |
-| ---- | ------------ |
-| `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)` | Write a row in the profile resolution table. |
-| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)` | Remove rows from the profile resolution table. |
-| `brain.reset()` | Reset posteriors to priors; increments exploration_epoch. |
+| Verb                                                                    | What it does                                              |
+| ----------------------------------------------------------------------- | --------------------------------------------------------- |
+| `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)` | Write a row in the profile resolution table.              |
+| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`         | Remove rows from the profile resolution table.            |
+| `brain.reset()`                                                         | Reset posteriors to priors; increments exploration_epoch. |
 
 ### Internal / operator-only (Subhandler — not exposed on public MCP surface)
 
-| Verb | What it does |
-| ---- | ------------ |
-| `brain.state()` | Return full BrainState snapshot for debugging. |
+| Verb                       | What it does                                        |
+| -------------------------- | --------------------------------------------------- |
+| `brain.state()`            | Return full BrainState snapshot for debugging.      |
 | `brain.config(parameter?)` | Return projected config for a named pack parameter. |
-| `brain.events(limit?)` | List recent brain-relevant events for debugging. |
-| `brain.emit(...)` | Deprecated alias for `brain.feedback`. |
+| `brain.events(limit?)`     | List recent brain-relevant events for debugging.    |
+| `brain.emit(...)`          | Deprecated alias for `brain.feedback`.              |
 
 ## Skills
 

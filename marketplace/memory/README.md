@@ -2,27 +2,27 @@
 
 Persistent agent memory on top of [khive-mcp](https://github.com/ohdearquant/khive).
 
-A memory is a note with `kind = "memory"`. The memory pack adds two focused verbs: `remember` for storing durable context and `recall` for retrieving memory notes with decay-aware ranking. Memories can be tagged, typed as `episodic` or `semantic`, assigned an importance score, and optionally linked to a source entity or note.
+A memory is a note with `kind = "memory"`. The memory pack adds two focused verbs: `remember` for storing durable context and `recall` for retrieving memory notes with decay-aware ranking. Memories can be tagged, typed as `episodic` or `semantic`, assigned a salience score, and optionally linked to a source entity or note.
 
 ## Verbs
 
 All verbs are dispatched through the single MCP `request` tool ([ADR-020](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-020-request-dsl.md)).
 
-| Verb | What it does |
-| ---- | ------------ |
-| `memory.remember(content, memory_type?, importance?/salience?, decay_factor?/decay?, source_id?/source?, namespace?, tags?)` | Store a memory note with salience and decay metadata. |
-| `memory.recall(query, limit?, memory_type?, min_score?, min_salience?, config?, namespace?)` | Search memory notes only, then rank by relevance, importance, and recency. |
+| Verb                                                                                                      | What it does                                                             |
+| --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `remember(content, memory_type?, salience?, decay_factor?/decay?, source_id?/source?, namespace?, tags?)` | Store a memory note with salience and decay metadata.                    |
+| `recall(query, limit?, memory_type?, min_score?, min_salience?, config?, namespace?)`                     | Search memory notes only, then rank by relevance, salience, and recency. |
 
 Memory types:
 
-| Type | Use for |
-| ---- | ------- |
+| Type       | Use for                                                                        |
+| ---------- | ------------------------------------------------------------------------------ |
 | `episodic` | Event-like memories tied to a session, conversation, decision, or observation. |
-| `semantic` | Stable facts, preferences, project context, and reusable knowledge. |
+| `semantic` | Stable facts, preferences, project context, and reusable knowledge.            |
 
 ## Skills
 
-- **remember** - store durable context intentionally, with the right memory type and importance.
+- **remember** - store durable context intentionally, with the right memory type and salience.
 - **recall** - retrieve prior context before acting, planning, or answering from memory.
 
 ## Prerequisites

@@ -17,7 +17,7 @@
 
 khive's retrieval today is bi-encoder + fusion: FTS5 produces text candidates, lattice
 embeddings produce vector candidates, RRF fuses them, the memory pack's scoring
-formula (ADR-033 §1) applies relevance/importance/temporal weights. There is no
+formula (ADR-033 §1) applies relevance/salience/temporal weights. There is no
 cross-encoder rerank — no model that scores each candidate against the query directly.
 
 ADR-011 notes this:
@@ -63,7 +63,7 @@ newly-produced ones). The reranker IS. This ADR specifies that consumer.
   `lattice-tune::train` (lattice ADR-026); brain consumes already-trained adapters
   and tunes them online via `khive-pack-brain::lora::sgd_step` (ADR-032 §5b).
 - Replace the existing scoring formula (ADR-033 §1). Rerank is an _additional_ signal
-  the scoring pipeline can weigh; the existing RRF + importance + temporal terms
+  the scoring pipeline can weigh; the existing RRF + salience + temporal terms
   remain.
 
 ---
@@ -93,7 +93,7 @@ precedence.
   `recall.score` via `RecallConfig.reranker_weights` and available for audit.
 - `final_score: f32` — weighted combination of per-reranker scores computed by the
   rerank stage for ordering purposes. `recall.score` may further blend this with the
-  RRF + importance + temporal terms.
+  RRF + salience + temporal terms.
 
 Both fields are always present after the rerank stage runs. Downstream stages use
 `final_score` for ordering and `rerank_scores` for per-reranker audit/debug.
@@ -387,10 +387,10 @@ into the Reranker trait would dilute it.
 
 ### Why insert rerank between fuse and score (not replace score)
 
-`recall.score` applies the v1 weighted formula over `(rrf_score, importance, temporal)`.
+`recall.score` applies the v1 weighted formula over `(rrf_score, salience, temporal)`.
 Rerank produces an additional signal — `rerank_score` — that the scoring pipeline can
 weight alongside the existing terms. Replacing scoring entirely would discard the
-working importance and temporal logic; inserting rerank as a stage adds signal without
+working salience and temporal logic; inserting rerank as a stage adds signal without
 removing any.
 
 Concretely, ADR-033's `RecallConfig` gains `reranker_weights: HashMap<String, f64>` (default
@@ -399,7 +399,7 @@ enabled, the formula becomes:
 
 ```text
 score = relevance_weight * rrf_score
-      + importance_weight * effective_importance
+      + salience_weight * effective_salience
       + temporal_weight * temporal
       + Σᵢ reranker_weights[i] * reranker_score[i]
 ```

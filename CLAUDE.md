@@ -196,10 +196,10 @@ Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
 
 Load with `KHIVE_PACKS=kg,memory` or `--pack memory`. Adds the `memory` note kind.
 
-| Verb              | Args                                                                    | What it does                                                              |
-| ----------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `memory.remember` | `content`, `importance?`, `decay_factor?`, `memory_type?`, `source_id?` | Create a memory note with salience + decay; optionally annotates a source |
-| `memory.recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`        | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking        |
+| Verb       | Args                                                                  | What it does                                                              |
+| ---------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `remember` | `content`, `salience?`, `decay_factor?`, `memory_type?`, `source_id?` | Create a memory note with salience + decay; optionally annotates a source |
+| `recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`      | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking        |
 
 `get`/`update`/`delete`/`merge` are UUID-only — no `kind` needed, the handler resolves
 the substrate from the UUID. `create`/`list`/`search` require `kind`.

@@ -26,7 +26,7 @@ the profile-orchestration direction defined here)
 
 The predecessor design (legacy ADR-064) framed the brain as a `Fold<Event, BrainState>` whose
 state was a flat map of `pack::parameter_name → BetaPosterior`. Three scalars drove memory
-recall: `recall::relevance_weight`, `recall::importance_weight`, `recall::temporal_weight`.
+recall: `recall::relevance_weight`, `recall::salience_weight`, `recall::temporal_weight`.
 Events updated these posteriors in-place via a single `EventFold::step` implementation. The
 approach was correct in its Bayesian mechanics and in the replay-determinism invariant; it was
 insufficient in two respects:
@@ -320,7 +320,7 @@ impl BetaPosterior {
 
 pub struct BalancedRecallState {
     pub relevance:  BetaPosterior,   // prior Beta(7, 3)
-    pub importance: BetaPosterior,   // prior Beta(2, 8)
+    pub salience:   BetaPosterior,   // prior Beta(2, 8)
     pub temporal:   BetaPosterior,   // prior Beta(1, 9)
     pub entity_posteriors: EntityPosteriors, // bounded LRU, 10K default
     pub total_events: u64,
@@ -1246,7 +1246,7 @@ deployment.
 3. Wire `ruvector-snapshot::SnapshotManager` for `ProfileSnapshot` persistence.
 4. Migrate today's three-scalar Bayesian state into `BalancedRecallProfile` composed of:
    - `Fold` that updates the three Beta posteriors from events via `interpret()`
-   - `Objective` that ranks candidates by weighted combination of relevance, importance,
+   - `Objective` that ranks candidates by weighted combination of relevance, salience,
      temporal decay
    - `Selector` that picks top-k under budget
    - `SnapshotAdapter` for the three Beta pairs plus entity LRU cache

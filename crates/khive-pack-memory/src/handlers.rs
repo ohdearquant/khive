@@ -61,8 +61,7 @@ fn parse_fusion_strategy_str(s: &str) -> Result<RuntimeFusionStrategy, RuntimeEr
 struct RememberParams {
     content: String,
     memory_type: Option<String>,
-    #[serde(alias = "salience")]
-    importance: Option<f64>,
+    salience: Option<f64>,
     #[serde(alias = "decay")]
     decay_factor: Option<f64>,
     #[serde(alias = "source")]
@@ -144,17 +143,17 @@ fn normalize_relevance(raw: f64, strategy: &khive_runtime::FusionStrategy) -> f6
     }
 }
 
-/// Salience amplifier exponent applied to `effective_importance` in `compute_score`.
+/// Salience amplifier exponent applied to `effective_salience` in `compute_score`.
 ///
-/// With the default additive formula, `importance_weight=0.20` gives salience
-/// a narrow linear spread: importance 0.9 vs 0.3 → 3× difference in the
-/// importance term. Raising `effective_importance` to this exponent stretches
-/// the spread — at α=1.5, importance 0.9^1.5 ≈ 0.854 vs 0.3^1.5 ≈ 0.164,
-/// a ~5.2× difference — so high-importance memories rank clearly above
-/// low-importance memories when relevance is similar (UE3-H3, Wave 3).
+/// With the default additive formula, `salience_weight=0.20` gives salience
+/// a narrow linear spread: salience 0.9 vs 0.3 → 3× difference in the
+/// salience term. Raising `effective_salience` to this exponent stretches
+/// the spread — at α=1.5, salience 0.9^1.5 ≈ 0.854 vs 0.3^1.5 ≈ 0.164,
+/// a ~5.2× difference — so high-salience memories rank clearly above
+/// low-salience memories when relevance is similar (UE3-H3, Wave 3).
 ///
-/// Keep α ≤ 2.0. Values above 2 compress near-zero importances toward 0 and
-/// may cause all low-importance memories to fall below `min_score`.
+/// Keep α ≤ 2.0. Values above 2 compress near-zero salience toward 0 and
+/// may cause all low-salience memories to fall below `min_score`.
 const SALIENCE_AMPLIFIER_ALPHA: f64 = 1.5;
 
 fn compute_score(
@@ -165,7 +164,7 @@ fn compute_score(
     age_days: f64,
 ) -> (f64, ScoreBreakdown) {
     let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
-    let effective_importance = cfg.decay_model.apply(
+    let effective_salience = cfg.decay_model.apply(
         salience,
         age_days,
         decay_factor,
@@ -175,16 +174,16 @@ fn compute_score(
         let k = std::f64::consts::LN_2 / cfg.temporal_half_life_days;
         (-k * age_days).exp()
     };
-    let weight_sum = cfg.relevance_weight + cfg.importance_weight + cfg.temporal_weight;
+    let weight_sum = cfg.relevance_weight + cfg.salience_weight + cfg.temporal_weight;
     let norm = if weight_sum > 0.0 { weight_sum } else { 1.0 };
     let r_contrib = cfg.relevance_weight * relevance / norm;
-    // Amplify the importance contribution so that high-salience memories rank
+    // Amplify the salience contribution so that high-salience memories rank
     // clearly above low-salience ones when relevance is similar. Without
     // amplification, the 3× linear spread (0.9 vs 0.3) is too narrow relative
     // to the 70% relevance weight. SALIENCE_AMPLIFIER_ALPHA=1.5 gives ~5.2×
-    // spread (0.854 vs 0.164), making importance a meaningful tiebreaker.
-    let amplified_importance = effective_importance.powf(SALIENCE_AMPLIFIER_ALPHA);
-    let i_contrib = cfg.importance_weight * amplified_importance / norm;
+    // spread (0.854 vs 0.164), making salience a meaningful tiebreaker.
+    let amplified_salience = effective_salience.powf(SALIENCE_AMPLIFIER_ALPHA);
+    let i_contrib = cfg.salience_weight * amplified_salience / norm;
     let t_contrib = cfg.temporal_weight * temporal / norm;
     // Clamp to [0,1]: each component is in [0, weight/norm] and their sum is
     // in [0, 1] by construction when relevance is clamped. The explicit clamp
@@ -192,12 +191,12 @@ fn compute_score(
     let total = (r_contrib + i_contrib + t_contrib).clamp(0.0, 1.0);
     let breakdown = ScoreBreakdown {
         relevance,
-        importance_raw: salience,
-        importance_decayed: effective_importance,
+        salience_raw: salience,
+        salience_decayed: effective_salience,
         temporal,
         weighted: WeightedContributions {
             relevance_contribution: r_contrib,
-            importance_contribution: i_contrib,
+            salience_contribution: i_contrib,
             temporal_contribution: t_contrib,
         },
     };
@@ -622,10 +621,10 @@ impl MemoryPack {
         validate_memory_type(memory_type)?;
 
         // F108: reject out-of-range values instead of clamping
-        let importance = match p.importance {
+        let salience = match p.salience {
             Some(v) if !(0.0..=1.0).contains(&v) => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "importance must be in [0, 1], got {v}"
+                    "salience must be in [0, 1], got {v}"
                 )));
             }
             Some(v) => v,
@@ -690,7 +689,7 @@ impl MemoryPack {
                 "memory",
                 None,
                 &p.content,
-                Some(importance),
+                Some(salience),
                 decay_factor,
                 Some(props),
                 annotates,
@@ -963,7 +962,7 @@ impl MemoryPack {
             let final_score = if !cfg.reranker_weights.is_empty() {
                 let features = RerankFeatures {
                     relevance: norm_relevance as f64,
-                    importance: breakdown.importance_decayed,
+                    salience: breakdown.salience_decayed,
                     temporal: breakdown.temporal,
                     text_match: matches!(source, SearchSource::Text | SearchSource::Both),
                     vector_match: matches!(source, SearchSource::Vector | SearchSource::Both),
@@ -1351,7 +1350,7 @@ impl MemoryPack {
     /// required `note_id`. Supported fields (all optional, default 0.0):
     ///
     /// - `fused_score` — mapped to `relevance` feature
-    /// - `salience` — used with `age_days` to produce `importance`
+    /// - `salience` — used with `age_days` to produce `effective_salience`
     ///   (exponential decay: `salience * exp(-decay_factor * age_days)`)
     /// - `decay_factor` — per-note decay rate; defaults to 0.01 when absent
     /// - `age_days` — note age in days; defaults to 0.0 when absent
@@ -1426,7 +1425,7 @@ impl MemoryPack {
                         let k = std::f64::consts::LN_2 / cfg.temporal_half_life_days;
                         (-k * age_days).exp()
                     });
-                let importance = cfg.decay_model.apply(
+                let effective_salience = cfg.decay_model.apply(
                     salience,
                     age_days,
                     decay_factor,
@@ -1441,7 +1440,7 @@ impl MemoryPack {
 
                 let features = RerankFeatures {
                     relevance: fused_score,
-                    importance,
+                    salience: effective_salience,
                     temporal,
                     text_match,
                     vector_match,
@@ -1456,7 +1455,7 @@ impl MemoryPack {
                     }
                     let fv = match name.as_str() {
                         "relevance" => features.relevance,
-                        "importance" => features.importance,
+                        "salience" => features.salience,
                         "temporal" => features.temporal,
                         "text_match" => f64::from(features.text_match),
                         "vector_match" => f64::from(features.vector_match),
@@ -1544,7 +1543,7 @@ mod tests {
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.relevance_weight - 0.70).abs() < 1e-12);
-        assert!((cfg.importance_weight - 0.20).abs() < 1e-12);
+        assert!((cfg.salience_weight - 0.20).abs() < 1e-12);
         assert!((cfg.temporal_weight - 0.10).abs() < 1e-12);
     }
 
@@ -1767,8 +1766,8 @@ mod tests {
     fn compute_score_weighted_strategy_formula() {
         // Use Weighted strategy (normalization factor = 1.0) to verify the
         // weighted-combination formula with salience amplification.
-        // total = w_r*relevance + w_i*amplified_importance + w_t*temporal
-        // where amplified_importance = effective_importance ^ SALIENCE_AMPLIFIER_ALPHA
+        // total = w_r*relevance + w_s*amplified_salience + w_t*temporal
+        // where amplified_salience = effective_salience ^ SALIENCE_AMPLIFIER_ALPHA
         let cfg = RecallConfig {
             fuse_strategy: khive_runtime::FusionStrategy::Weighted {
                 weights: vec![0.3, 0.7],
@@ -1780,7 +1779,7 @@ mod tests {
         let decay_factor = 0.01;
         let age_days = 0.0;
         let (total, bd) = compute_score(&cfg, relevance, salience, decay_factor, age_days);
-        // At age=0: importance_decayed = salience = 0.8, temporal = 1.0
+        // At age=0: salience_decayed = salience = 0.8, temporal = 1.0
         // amplified = 0.8^1.5 ≈ 0.71554
         // total = 0.70*0.5 + 0.20*0.71554 + 0.10*1.0 ≈ 0.35 + 0.14311 + 0.10 ≈ 0.59311
         let amplified = 0.8_f64.powf(SALIENCE_AMPLIFIER_ALPHA);
@@ -1790,7 +1789,7 @@ mod tests {
             "got {total}, expected {expected}"
         );
         assert!((bd.relevance - 0.5).abs() < 1e-12);
-        assert!((bd.importance_raw - 0.8).abs() < 1e-12);
+        assert!((bd.salience_raw - 0.8).abs() < 1e-12);
     }
 
     #[test]
@@ -1842,8 +1841,8 @@ mod tests {
     #[test]
     fn compute_score_exponential_decay_at_decay_factor_half_life() {
         // Use explicit exponential decay config — not relying on default decay_model.
-        // ADR-021 §5: importance_decayed = salience * exp(-decay_factor * age_days)
-        // At age = ln(2)/0.01 ≈ 69.3 days: importance_decayed ≈ 0.5
+        // ADR-021 §5: salience_decayed = salience * exp(-decay_factor * age_days)
+        // At age = ln(2)/0.01 ≈ 69.3 days: salience_decayed ≈ 0.5
         let cfg = RecallConfig {
             decay_model: DecayModel::Exponential,
             temporal_half_life_days: 30.0,
@@ -1852,9 +1851,9 @@ mod tests {
         let age_days = std::f64::consts::LN_2 / 0.01;
         let (_, bd) = compute_score(&cfg, 0.5, 1.0, 0.01, age_days);
         assert!(
-            (bd.importance_decayed - 0.5).abs() < 1e-10,
-            "importance_decayed = {}",
-            bd.importance_decayed
+            (bd.salience_decayed - 0.5).abs() < 1e-10,
+            "salience_decayed = {}",
+            bd.salience_decayed
         );
         // Temporal at age_days=69.3 with half_life=30: exp(-ln2/30 * 69.3) ≈ exp(-1.6) ≈ 0.2
         // Just verify it's < 0.5 (past the temporal half-life)
@@ -1882,7 +1881,7 @@ mod tests {
         // Use Weighted strategy so relevance passes through unnormalized.
         let cfg = RecallConfig {
             relevance_weight: 1.0,
-            importance_weight: 0.0,
+            salience_weight: 0.0,
             temporal_weight: 0.0,
             fuse_strategy: khive_runtime::FusionStrategy::Weighted {
                 weights: vec![0.5, 0.5],
@@ -1903,37 +1902,37 @@ mod tests {
         assert!(validate_memory_type("episodic").is_ok());
     }
 
-    // ── F108: reject out-of-range importance and decay_factor ─────────────
+    // ── F108: reject out-of-range salience and decay_factor ─────────────
 
     #[test]
-    fn remember_params_importance_below_zero_rejected() {
+    fn remember_params_salience_below_zero_rejected() {
         // Simulate handler validation path directly
-        let importance: f64 = -0.1;
-        let result: Result<f64, RuntimeError> = if !(0.0..=1.0).contains(&importance) {
+        let salience: f64 = -0.1;
+        let result: Result<f64, RuntimeError> = if !(0.0..=1.0).contains(&salience) {
             Err(RuntimeError::InvalidInput(format!(
-                "importance must be in [0, 1], got {importance}"
+                "salience must be in [0, 1], got {salience}"
             )))
         } else {
-            Ok(importance)
+            Ok(salience)
         };
-        assert!(result.is_err(), "expected error for importance < 0");
+        assert!(result.is_err(), "expected error for salience < 0");
     }
 
     #[test]
-    fn remember_params_importance_above_one_rejected() {
-        let importance: f64 = 1.1;
-        let result: Result<f64, RuntimeError> = if !(0.0..=1.0).contains(&importance) {
+    fn remember_params_salience_above_one_rejected() {
+        let salience: f64 = 1.1;
+        let result: Result<f64, RuntimeError> = if !(0.0..=1.0).contains(&salience) {
             Err(RuntimeError::InvalidInput(format!(
-                "importance must be in [0, 1], got {importance}"
+                "salience must be in [0, 1], got {salience}"
             )))
         } else {
-            Ok(importance)
+            Ok(salience)
         };
-        assert!(result.is_err(), "expected error for importance > 1");
+        assert!(result.is_err(), "expected error for salience > 1");
     }
 
     #[test]
-    fn remember_params_importance_boundary_values_accepted() {
+    fn remember_params_salience_boundary_values_accepted() {
         // 0.0 and 1.0 are valid
         for val in [0.0_f64, 0.5, 1.0] {
             let result: Result<(), RuntimeError> = if !(0.0..=1.0).contains(&val) {
@@ -2047,14 +2046,14 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
-    // ── UE3-H3: salience amplification makes high-importance memories rank higher ─
+    // ── UE3-H3: salience amplification makes high-salience memories rank higher ─
 
     #[test]
-    fn high_importance_outranks_low_importance_on_similar_relevance() {
+    fn high_salience_outranks_low_salience_on_similar_relevance() {
         // Regression for UE3-H3: with SALIENCE_AMPLIFIER_ALPHA > 1.0, a memory
-        // with importance=0.9 must score higher than importance=0.3 when both
+        // with salience=0.9 must score higher than salience=0.3 when both
         // have the same relevance and age. Without amplification (alpha=1.0) the
-        // importance contribution difference is only 0.20*(0.9-0.3)=0.12, which
+        // salience contribution difference is only 0.20*(0.9-0.3)=0.12, which
         // is easily swamped when relevance differs even slightly.
         let cfg = RecallConfig {
             fuse_strategy: khive_runtime::FusionStrategy::Weighted {
@@ -2071,24 +2070,21 @@ mod tests {
 
         assert!(
             score_high > score_low,
-            "high importance (score={score_high}) should outrank low importance (score={score_low})"
+            "high salience (score={score_high}) should outrank low salience (score={score_low})"
         );
 
         // Quantitative check: the gap must be > 10% of the score range so the
         // amplification is actually meaningful (not just a rounding difference).
         let gap = score_high - score_low;
-        assert!(
-            gap > 0.05,
-            "importance score gap should be > 0.05, got {gap}"
-        );
+        assert!(gap > 0.05, "salience score gap should be > 0.05, got {gap}");
     }
 
     #[test]
     fn salience_amplifier_discriminates_more_than_linear() {
         // Verify that SALIENCE_AMPLIFIER_ALPHA > 1.0 produces a wider spread
-        // between high and low importance than the linear (alpha=1.0) baseline.
+        // between high and low salience than the linear (alpha=1.0) baseline.
         let cfg = RecallConfig::default();
-        let relevance = 0.0; // zero out relevance to isolate importance contribution
+        let relevance = 0.0; // zero out relevance to isolate salience contribution
         let age_days = 0.0;
 
         let (score_high, _) = compute_score(&cfg, relevance, 0.9, 0.0, age_days);

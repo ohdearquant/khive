@@ -38,7 +38,7 @@ async fn test_remember_recall_smoke() {
             json!({
                 "content": "The attention mechanism in transformers uses Q K V matrices",
                 "memory_type": "semantic",
-                "importance": 0.8,
+                "salience": 0.8,
                 "decay": 0.01
             }),
         )
@@ -77,7 +77,7 @@ async fn test_recall_decay_ranking() {
             "memory.remember",
             json!({
                 "content": shared_content,
-                "importance": 0.7,
+                "salience": 0.7,
                 "decay": 0.01
             }),
         )
@@ -91,7 +91,7 @@ async fn test_recall_decay_ranking() {
             "memory.remember",
             json!({
                 "content": shared_content,
-                "importance": 0.7,
+                "salience": 0.7,
                 "decay": 0.1
             }),
         )
@@ -156,15 +156,15 @@ async fn test_recall_salience_ranking() {
     let registry = make_registry(rt.clone());
 
     // Use non-identical content so MMR penalty does not affect the test.
-    // The rank_score difference between importance=0.9 and importance=0.1 is
-    // ~10% under the archive scoring model (1.18 vs 1.02 importance_boost), which
+    // The rank_score difference between salience=0.9 and salience=0.1 is
+    // ~10% under the archive scoring model (1.18 vs 1.02 salience_boost), which
     // would be eliminated by the MMR penalty (-0.1) on identical content.
     let high = registry
         .dispatch(
             "memory.remember",
             json!({
                 "content": "high-importance concept about knowledge representation theory",
-                "importance": 0.9,
+                "salience": 0.9,
                 "decay": 0.0
             }),
         )
@@ -177,7 +177,7 @@ async fn test_recall_salience_ranking() {
             "memory.remember",
             json!({
                 "content": "low-importance concept about knowledge representation systems",
-                "importance": 0.1,
+                "salience": 0.1,
                 "decay": 0.0
             }),
         )
@@ -230,7 +230,7 @@ async fn test_recall_memory_type_filter() {
             json!({
                 "content": "episodic event about meeting with Alice",
                 "memory_type": "episodic",
-                "importance": 0.7
+                "salience": 0.7
             }),
         )
         .await
@@ -242,7 +242,7 @@ async fn test_recall_memory_type_filter() {
             json!({
                 "content": "semantic fact about meeting protocols",
                 "memory_type": "semantic",
-                "importance": 0.7
+                "salience": 0.7
             }),
         )
         .await
@@ -477,7 +477,7 @@ async fn test_remember_importance_out_of_range_rejected() {
     let neg = registry
         .dispatch(
             "memory.remember",
-            json!({ "content": "test", "importance": -0.1 }),
+            json!({ "content": "test", "salience": -0.1 }),
         )
         .await;
     assert!(neg.is_err(), "negative importance must be rejected");
@@ -487,7 +487,7 @@ async fn test_remember_importance_out_of_range_rejected() {
     let above = registry2
         .dispatch(
             "memory.remember",
-            json!({ "content": "test", "importance": 1.1 }),
+            json!({ "content": "test", "salience": 1.1 }),
         )
         .await;
     assert!(above.is_err(), "importance > 1 must be rejected");
@@ -613,7 +613,7 @@ async fn test_recall_breakdown_is_opt_in() {
     registry
         .dispatch(
             "memory.remember",
-            json!({ "content": "attention score breakdown", "importance": 0.8 }),
+            json!({ "content": "attention score breakdown", "salience": 0.8 }),
         )
         .await
         .expect("memory.remember");
@@ -640,8 +640,8 @@ async fn test_recall_breakdown_is_opt_in() {
     assert!(!hits.is_empty());
     let bd = &hits[0]["breakdown"];
     assert!(bd["relevance"].as_f64().is_some());
-    assert!(bd["importance_raw"].as_f64().is_some());
-    assert!(bd["importance_decayed"].as_f64().is_some());
+    assert!(bd["salience_raw"].as_f64().is_some());
+    assert!(bd["salience_decayed"].as_f64().is_some());
     assert!(bd["temporal"].as_f64().is_some());
     assert!(bd["weighted"]["relevance_contribution"].as_f64().is_some());
 }
@@ -838,7 +838,7 @@ async fn test_recall_breakdown_total_matches_composite_score() {
     registry
         .dispatch(
             "memory.remember",
-            json!({ "content": "arithmetic score check memory", "importance": 0.7 }),
+            json!({ "content": "arithmetic score check memory", "salience": 0.7 }),
         )
         .await
         .expect("memory.remember");
@@ -868,7 +868,7 @@ async fn test_recall_breakdown_total_matches_composite_score() {
     );
     let bd = &hit["breakdown"];
     let rc = bd["weighted"]["relevance_contribution"].as_f64().unwrap();
-    let ic = bd["weighted"]["importance_contribution"].as_f64().unwrap();
+    let ic = bd["weighted"]["salience_contribution"].as_f64().unwrap();
     let tc = bd["weighted"]["temporal_contribution"].as_f64().unwrap();
     let total = rc + ic + tc;
     assert!(
@@ -910,7 +910,7 @@ async fn test_recall_excludes_non_memory_notes() {
             "memory.remember",
             json!({
                 "content": "memory note about attention mechanisms in neural networks",
-                "importance": 0.8
+                "salience": 0.8
             }),
         )
         .await
@@ -920,7 +920,7 @@ async fn test_recall_excludes_non_memory_notes() {
             "memory.remember",
             json!({
                 "content": "another memory note about attention mechanisms",
-                "importance": 0.7
+                "salience": 0.7
             }),
         )
         .await
@@ -993,7 +993,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     // Apply importance-only config to the pack.
     let importance_only = RecallConfig {
         relevance_weight: 0.0,
-        importance_weight: 1.0,
+        salience_weight: 1.0,
         temporal_weight: 0.0,
         ..RecallConfig::default()
     };
@@ -1023,7 +1023,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     let total = result["total"].as_f64().expect("total is a number");
     assert!(
         total.abs() < 1e-9,
-        "under importance_weight=1.0, salience=0 → score=0; got {total}. \
+        "under salience_weight=1.0, salience=0 → score=0; got {total}. \
          If non-zero, MemoryPack::active_config() is not being used by \
          recall.score (#159 regression)."
     );
@@ -1038,7 +1038,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     // unnormalized — RRF strategy would scale it by (k+1) = 61, producing 61.0.
     let relevance_only = RecallConfig {
         relevance_weight: 1.0,
-        importance_weight: 0.0,
+        salience_weight: 0.0,
         temporal_weight: 0.0,
         fuse_strategy: FusionStrategy::Weighted {
             weights: vec![0.5, 0.5],
@@ -1091,7 +1091,7 @@ async fn test_recall_default_identity() {
         registry
             .dispatch(
                 "memory.remember",
-                json!({ "content": content, "importance": 0.8 }),
+                json!({ "content": content, "salience": 0.8 }),
             )
             .await
             .expect("remember succeeds");
@@ -1161,7 +1161,7 @@ async fn test_recall_top_k_override() {
                 "memory.remember",
                 json!({
                     "content": format!("rust ownership memory safety concept {i}"),
-                    "importance": 0.7
+                    "salience": 0.7
                 }),
             )
             .await
@@ -1209,7 +1209,7 @@ async fn test_recall_fusion_strategy_override() {
             "memory.remember",
             json!({
                 "content": "gradient descent optimization machine learning",
-                "importance": 0.8
+                "salience": 0.8
             }),
         )
         .await
@@ -1261,7 +1261,7 @@ async fn test_recall_score_floor() {
             "memory.remember",
             json!({
                 "content": "backpropagation neural network training algorithm",
-                "importance": 0.6
+                "salience": 0.6
             }),
         )
         .await
@@ -1337,7 +1337,7 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
                 "memory.remember",
                 json!({
                     "content": format!("memory about deep learning topic {i}"),
-                    "importance": 0.5 + (i as f64) * 0.1,
+                    "salience": 0.5 + (i as f64) * 0.1,
                     "decay": 0.0
                 }),
             )
@@ -1379,7 +1379,7 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
     );
 }
 
-/// PR #375: reranker_weights with importance=1.0 must promote the highest-salience
+/// PR #375: reranker_weights with salience=1.0 must promote the highest-salience
 /// memory to rank #1, even when it would rank lower under the default compute_score.
 ///
 /// Strengthened: captures baseline ordering first (no reranker) and asserts that
@@ -1387,8 +1387,8 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
 ///
 /// Fixture design: all notes contain the query keyword so all are retrieved.
 /// Low-salience notes have richer keyword density (higher FTS BM25).  Baseline
-/// uses pure relevance scoring (importance_weight=0) so the keyword-dense
-/// low-salience notes rank first.  The importance=1.0 reranker then flips the
+/// uses pure relevance scoring (salience_weight=0) so the keyword-dense
+/// low-salience notes rank first.  The salience=1.0 reranker then flips the
 /// order, placing the high-salience note at rank #1.
 #[tokio::test]
 async fn test_recall_with_reranker_weights_changes_ordering() {
@@ -1403,7 +1403,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
                 "memory.remember",
                 json!({
                     "content": "gradient descent gradient descent gradient descent optimization",
-                    "importance": 0.1,
+                    "salience": 0.1,
                     "decay": 0.0
                 }),
             )
@@ -1418,7 +1418,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
             "memory.remember",
             json!({
                 "content": "gradient descent is a key technique in machine learning",
-                "importance": 0.95,
+                "salience": 0.95,
                 "decay": 0.0
             }),
         )
@@ -1426,7 +1426,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
         .expect("high salience remember");
     let high_id = high_salience["note_id"].as_str().unwrap().to_string();
 
-    // Step 1: baseline recall — pure relevance scoring (importance_weight=0) so
+    // Step 1: baseline recall — pure relevance scoring (salience_weight=0) so
     // BM25-heavy low-salience notes rank first.
     let baseline = registry
         .dispatch(
@@ -1435,7 +1435,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
                 "query": "gradient descent",
                 "config": {
                     "relevance_weight": 1.0,
-                    "importance_weight": 0.0,
+                    "salience_weight": 0.0,
                     "temporal_weight": 0.0
                 }
             }),
@@ -1469,7 +1469,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
             json!({
                 "query": "gradient descent",
                 "config": {
-                    "reranker_weights": { "importance": 1.0 }
+                    "reranker_weights": { "salience": 1.0 }
                 }
             }),
         )
@@ -1486,7 +1486,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
     // Step 3: assert the reranker placed high-salience memory at rank #1.
     assert_eq!(
         top_id, &high_id,
-        "importance=1.0 reranker must rank the highest-salience memory first; got {top_id} not {high_id}"
+        "salience=1.0 reranker must rank the highest-salience memory first; got {top_id} not {high_id}"
     );
 
     // Step 4: assert the ordering actually changed — the reranker is not a no-op.
@@ -1744,7 +1744,7 @@ async fn test_score_floor_portable_across_fusion_strategies() {
                 "memory.remember",
                 json!({
                     "content": content,
-                    "importance": importance,
+                    "salience": importance,
                     "decay_factor": 0.0,
                 }),
             )
@@ -1802,7 +1802,7 @@ async fn test_recall_verbose_presentation_includes_breakdown() {
     registry
         .dispatch(
             "memory.remember",
-            json!({ "content": "transformer positional encoding", "importance": 0.8 }),
+            json!({ "content": "transformer positional encoding", "salience": 0.8 }),
         )
         .await
         .expect("memory.remember");
@@ -1941,7 +1941,7 @@ async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
             "memory.remember",
             json!({
                 "content": "custom embedder fanout regression test content alpha",
-                "importance": 0.8
+                "salience": 0.8
             }),
         )
         .await
@@ -2009,7 +2009,7 @@ async fn test_weighted_fusion_multi_model_text_not_zeroed() {
             "memory.remember",
             json!({
                 "content": "weighted fusion multi model text contribution regression beta",
-                "importance": 0.7
+                "salience": 0.7
             }),
         )
         .await
@@ -2116,7 +2116,7 @@ async fn test_recall_composite_score_bounded_to_unit_interval() {
                 "memory.remember",
                 json!({
                     "content": format!("bounded score test memory number {i}"),
-                    "importance": 0.5 + 0.1 * (i as f64),
+                    "salience": 0.5 + 0.1 * (i as f64),
                     "decay_factor": 0.0,
                 }),
             )

@@ -376,7 +376,7 @@ def test_memory_smoke(
     # remember first memory
     mem = khive_memory_session.verb("memory.remember", {
         "content": "khive uses SQLite with FTS5 and sqlite-vec for hybrid search",
-        "importance": 0.9,
+        "salience": 0.9,
         "memory_type": "semantic",
         "namespace": ns,
     })
@@ -387,7 +387,7 @@ def test_memory_smoke(
     # remember second memory
     mem2 = khive_memory_session.verb("memory.remember", {
         "content": "The runtime enforces namespace isolation for every ID-based operation",
-        "importance": 0.7,
+        "salience": 0.7,
         "memory_type": "semantic",
         "namespace": ns,
     })
