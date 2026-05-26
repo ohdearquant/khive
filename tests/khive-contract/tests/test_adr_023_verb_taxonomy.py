@@ -12,19 +12,19 @@ from khive_contract.client import KhiveMcpSession
 
 # All 18 baseline product verbs
 VERBS_UNDER_TEST = {
-    # KG (11)
+    # KG substrate (11) — bare names; no pack prefix
     "create", "get", "list", "update", "delete", "merge",
     "search", "link", "neighbors", "traverse", "query",
-    # GTD (5)
-    "assign", "next", "complete", "tasks", "transition",
-    # Memory (2)
-    "remember", "recall",
+    # GTD (5) — dotted pack.verb form
+    "gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition",
+    # Memory (2) — dotted pack.verb form
+    "memory.remember", "memory.recall",
 }
 
 KG_VERBS = ("create", "get", "list", "update", "delete", "merge",
             "search", "link", "neighbors", "traverse", "query")
-GTD_VERBS = ("assign", "next", "complete", "tasks", "transition")
-MEMORY_VERBS = ("remember", "recall")
+GTD_VERBS = ("gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition")
+MEMORY_VERBS = ("memory.remember", "memory.recall")
 
 
 @pytest.mark.adr_023
@@ -131,55 +131,55 @@ def test_pack_product_verbs_are_reachable_when_loaded(
     ns = temp_namespace
 
     # ---- GTD verbs ----
-    # assign
-    task = khive_gtd_session.verb("assign", {
+    # gtd.assign
+    task = khive_gtd_session.verb("gtd.assign", {
         "title": "Taxonomy test task",
         "status": "next",
         "priority": "p1",
         "namespace": ns,
     })
-    assert task.get("kind") == "task", f"assign must return kind=task: {task}"
+    assert task.get("kind") == "task", f"gtd.assign must return kind=task: {task}"
     task_id = task.get("full_id") or task.get("id")
-    assert task_id, "assign must return a task id"
+    assert task_id, "gtd.assign must return a task id"
 
-    # next
-    next_tasks = khive_gtd_session.verb("next", {"namespace": ns})
-    assert isinstance(next_tasks, list), "next must return a list"
+    # gtd.next
+    next_tasks = khive_gtd_session.verb("gtd.next", {"namespace": ns})
+    assert isinstance(next_tasks, list), "gtd.next must return a list"
 
-    # tasks
-    task_list = khive_gtd_session.verb("tasks", {"status": "next", "namespace": ns})
-    assert isinstance(task_list, list), "tasks must return a list"
+    # gtd.tasks
+    task_list = khive_gtd_session.verb("gtd.tasks", {"status": "next", "namespace": ns})
+    assert isinstance(task_list, list), "gtd.tasks must return a list"
     full_ids = [t.get("full_id") for t in task_list]
-    assert task_id in full_ids, f"assigned task must appear in tasks(status=next): {full_ids}"
+    assert task_id in full_ids, f"assigned task must appear in gtd.tasks(status=next): {full_ids}"
 
-    # transition
-    trans = khive_gtd_session.verb("transition", {"id": task_id, "status": "waiting",
-                                                    "namespace": ns})
-    assert trans.get("transitioned") is True, f"transition must return transitioned=True: {trans}"
-    assert trans.get("to") == "waiting", f"transition must report to=waiting: {trans}"
+    # gtd.transition
+    trans = khive_gtd_session.verb("gtd.transition", {"id": task_id, "status": "waiting",
+                                                        "namespace": ns})
+    assert trans.get("transitioned") is True, f"gtd.transition must return transitioned=True: {trans}"
+    assert trans.get("to") == "waiting", f"gtd.transition must report to=waiting: {trans}"
 
-    # complete (need a task in actionable status, so transition back to next)
-    khive_gtd_session.verb("transition", {"id": task_id, "status": "next", "namespace": ns})
-    done = khive_gtd_session.verb("complete", {"id": task_id, "result": "taxonomy pass",
-                                                 "namespace": ns})
-    assert done.get("to") == "done", f"complete must return to=done: {done}"
+    # gtd.complete (need a task in actionable status, so transition back to next)
+    khive_gtd_session.verb("gtd.transition", {"id": task_id, "status": "next", "namespace": ns})
+    done = khive_gtd_session.verb("gtd.complete", {"id": task_id, "result": "taxonomy pass",
+                                                     "namespace": ns})
+    assert done.get("to") == "done", f"gtd.complete must return to=done: {done}"
 
     # ---- Memory verbs ----
-    # remember
-    mem = khive_memory_session.verb("remember", {
+    # memory.remember
+    mem = khive_memory_session.verb("memory.remember", {
         "content": "khive taxonomy coverage test semantic memory",
         "importance": 0.8,
         "memory_type": "semantic",
         "namespace": ns,
     })
-    assert mem is not None, "remember must return a result"
+    assert mem is not None, "memory.remember must return a result"
     mem_id = mem.get("id") or mem.get("note_id")
-    assert mem_id, f"remember must return an id: {mem}"
+    assert mem_id, f"memory.remember must return an id: {mem}"
 
-    # recall
-    hits = khive_memory_session.verb("recall", {
+    # memory.recall
+    hits = khive_memory_session.verb("memory.recall", {
         "query": "khive taxonomy coverage",
         "limit": 5,
         "namespace": ns,
     })
-    assert isinstance(hits, list), f"recall must return a list, got: {hits}"
+    assert isinstance(hits, list), f"memory.recall must return a list, got: {hits}"

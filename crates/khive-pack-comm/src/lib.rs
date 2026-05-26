@@ -22,7 +22,7 @@ impl Pack for CommPack {
 
 static COMM_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {
-        name: "send",
+        name: "comm.send",
         description: "Send a message, optionally threaded.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Directive,
@@ -54,7 +54,7 @@ static COMM_HANDLERS: [HandlerDef; 4] = [
         ],
     },
     HandlerDef {
-        name: "inbox",
+        name: "comm.inbox",
         description: "List inbound messages for the caller.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
@@ -74,7 +74,7 @@ static COMM_HANDLERS: [HandlerDef; 4] = [
         ],
     },
     HandlerDef {
-        name: "read",
+        name: "comm.read",
         description: "Mark a message as read.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
@@ -86,7 +86,7 @@ static COMM_HANDLERS: [HandlerDef; 4] = [
         }],
     },
     HandlerDef {
-        name: "reply",
+        name: "comm.reply",
         description: "Reply to a message, threading linkage.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Directive,
@@ -158,10 +158,10 @@ impl PackRuntime for CommPack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "send" => handlers::handle_send(self.runtime(), token, params).await,
-            "inbox" => handlers::handle_inbox(self.runtime(), token, params).await,
-            "read" => handlers::handle_read(self.runtime(), token, params).await,
-            "reply" => handlers::handle_reply(self.runtime(), token, params).await,
+            "comm.send" => handlers::handle_send(self.runtime(), token, params).await,
+            "comm.inbox" => handlers::handle_inbox(self.runtime(), token, params).await,
+            "comm.read" => handlers::handle_read(self.runtime(), token, params).await,
+            "comm.reply" => handlers::handle_reply(self.runtime(), token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "comm pack does not handle verb {verb:?}"
             ))),
@@ -183,7 +183,7 @@ mod help_tests {
 
     #[test]
     fn send_has_required_to_and_content() {
-        let h = find_handler("send");
+        let h = find_handler("comm.send");
         assert!(!h.params.is_empty(), "send must have non-empty params");
         let to = h
             .params
@@ -201,7 +201,7 @@ mod help_tests {
 
     #[test]
     fn send_has_optional_subject_and_thread_id() {
-        let h = find_handler("send");
+        let h = find_handler("comm.send");
         let subject = h
             .params
             .iter()
@@ -218,7 +218,7 @@ mod help_tests {
 
     #[test]
     fn inbox_has_optional_limit_and_status() {
-        let h = find_handler("inbox");
+        let h = find_handler("comm.inbox");
         assert!(!h.params.is_empty(), "inbox must have non-empty params");
         let limit = h
             .params
@@ -236,7 +236,7 @@ mod help_tests {
 
     #[test]
     fn read_has_required_id() {
-        let h = find_handler("read");
+        let h = find_handler("comm.read");
         assert!(!h.params.is_empty(), "read must have non-empty params");
         let id = h
             .params
@@ -248,7 +248,7 @@ mod help_tests {
 
     #[test]
     fn reply_has_required_id_and_content() {
-        let h = find_handler("reply");
+        let h = find_handler("comm.reply");
         assert!(!h.params.is_empty(), "reply must have non-empty params");
         let id = h
             .params

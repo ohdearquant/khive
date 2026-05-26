@@ -782,7 +782,7 @@ impl VerbRegistry {
                     // For recall verbs: extract the first result's note_id as
                     // target_id so the brain temporal posterior can observe
                     // real hit/miss and latency (fix for codex P12 Major).
-                    if verb == "recall" {
+                    if verb == "memory.recall" {
                         let first_note_id = ok_val
                             .as_array()
                             .and_then(|arr| arr.first())

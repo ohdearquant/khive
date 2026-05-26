@@ -34,7 +34,7 @@ async fn test_remember_recall_smoke() {
 
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "The attention mechanism in transformers uses Q K V matrices",
                 "memory_type": "semantic",
@@ -43,18 +43,18 @@ async fn test_remember_recall_smoke() {
             }),
         )
         .await
-        .expect("remember succeeds");
+        .expect("memory.remember succeeds");
 
     let note_id = result["note_id"].as_str().expect("has note_id");
     assert!(!note_id.is_empty());
 
     let recall_result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "attention mechanism transformers" }),
         )
         .await
-        .expect("recall succeeds");
+        .expect("memory.recall succeeds");
 
     let hits = recall_result.as_array().expect("array of hits");
     assert!(!hits.is_empty(), "recall returned at least one result");
@@ -70,7 +70,7 @@ async fn test_recall_decay_ranking() {
     // Create fresh memory with low decay
     let fresh = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "fresh memory about neural networks",
                 "importance": 0.7,
@@ -84,7 +84,7 @@ async fn test_recall_decay_ranking() {
     // Create old memory (simulate 90 days ago) with high decay
     let old = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "old memory about neural networks",
                 "importance": 0.7,
@@ -103,7 +103,7 @@ async fn test_recall_decay_ranking() {
     note_store.upsert_note(old_note).await.unwrap();
 
     let recall_result = registry
-        .dispatch("recall", json!({ "query": "neural networks" }))
+        .dispatch("memory.recall", json!({ "query": "neural networks" }))
         .await
         .expect("recall succeeds");
 
@@ -133,7 +133,7 @@ async fn test_recall_salience_ranking() {
 
     let high = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "concept about knowledge representation",
                 "importance": 0.9,
@@ -146,7 +146,7 @@ async fn test_recall_salience_ranking() {
 
     let low = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "concept about knowledge representation",
                 "importance": 0.1,
@@ -158,7 +158,10 @@ async fn test_recall_salience_ranking() {
     let low_id = low["note_id"].as_str().unwrap().to_string();
 
     let recall_result = registry
-        .dispatch("recall", json!({ "query": "knowledge representation" }))
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "knowledge representation" }),
+        )
         .await
         .expect("recall succeeds");
 
@@ -188,7 +191,7 @@ async fn test_recall_memory_type_filter() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "episodic event about meeting with Alice",
                 "memory_type": "episodic",
@@ -200,7 +203,7 @@ async fn test_recall_memory_type_filter() {
 
     let semantic = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "semantic fact about meeting protocols",
                 "memory_type": "semantic",
@@ -213,7 +216,7 @@ async fn test_recall_memory_type_filter() {
 
     let filtered = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "meeting", "memory_type": "semantic" }),
         )
         .await
@@ -265,7 +268,7 @@ async fn test_remember_source_id_not_in_properties() {
 
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "memory with a source",
                 "source": source_uuid
@@ -308,7 +311,7 @@ async fn test_remember_decay_factor_no_upper_cap() {
     // decay_factor = 5.0 is valid — no upper cap per ADR-021 §4
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "memory with high decay rate",
                 "decay": 5.0
@@ -348,7 +351,7 @@ async fn test_remember_decay_factor_negative_rejected() {
 
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "memory with negative decay",
                 "decay": -0.1
@@ -368,7 +371,7 @@ async fn test_remember_default_memory_type_written_to_properties() {
 
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({ "content": "memory without explicit type" }),
         )
         .await
@@ -416,7 +419,7 @@ async fn test_remember_invalid_source_id_uuid_rejected() {
 
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "memory with bad source_id",
                 "source": "not-a-valid-uuid"
@@ -437,14 +440,20 @@ async fn test_remember_importance_out_of_range_rejected() {
     let registry = make_registry(rt);
 
     let neg = registry
-        .dispatch("remember", json!({ "content": "test", "importance": -0.1 }))
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "test", "importance": -0.1 }),
+        )
         .await;
     assert!(neg.is_err(), "negative importance must be rejected");
 
     let rt2 = make_runtime();
     let registry2 = make_registry(rt2);
     let above = registry2
-        .dispatch("remember", json!({ "content": "test", "importance": 1.1 }))
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "test", "importance": 1.1 }),
+        )
         .await;
     assert!(above.is_err(), "importance > 1 must be rejected");
 }
@@ -461,7 +470,7 @@ async fn test_recall_rerank_passthrough_with_no_active_rerankers() {
     ]);
 
     let result = registry
-        .dispatch("recall.rerank", json!({ "candidates": candidates }))
+        .dispatch("memory.recall_rerank", json!({ "candidates": candidates }))
         .await
         .expect("recall.rerank with no active rerankers");
 
@@ -485,13 +494,13 @@ async fn test_recall_rerank_passthrough_with_no_active_rerankers() {
 #[test]
 fn test_memory_dotted_verbs_registered() {
     let names: Vec<&str> = MemoryPack::HANDLERS.iter().map(|v| v.name).collect();
-    assert!(names.contains(&"recall.candidates"));
-    assert!(names.contains(&"recall.fuse"));
-    assert!(names.contains(&"recall.score"));
-    assert!(names.contains(&"recall.embed"));
+    assert!(names.contains(&"memory.recall_candidates"));
+    assert!(names.contains(&"memory.recall_fuse"));
+    assert!(names.contains(&"memory.recall_score"));
+    assert!(names.contains(&"memory.recall_embed"));
     // F222: recall.rerank must be registered (ADR-033 §2)
     assert!(
-        names.contains(&"recall.rerank"),
+        names.contains(&"memory.recall_rerank"),
         "recall.rerank not found in: {names:?}"
     );
 }
@@ -503,19 +512,19 @@ async fn test_recall_candidates_returns_arrays() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({ "content": "attention recall candidates" }),
         )
         .await
-        .expect("remember");
+        .expect("memory.remember");
 
     let result = registry
         .dispatch(
-            "recall.candidates",
+            "memory.recall_candidates",
             json!({ "query": "attention candidates" }),
         )
         .await
-        .expect("recall.candidates");
+        .expect("memory.recall_candidates");
 
     let text = result["text_candidates"].as_array().expect("text array");
     assert!(!text.is_empty());
@@ -536,16 +545,16 @@ async fn test_recall_fuse_returns_fused_candidates_not_full_recall() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({ "content": "attention fusion diagnostic" }),
         )
         .await
-        .expect("remember");
+        .expect("memory.remember");
 
     let result = registry
-        .dispatch("recall.fuse", json!({ "query": "attention fusion" }))
+        .dispatch("memory.recall_fuse", json!({ "query": "attention fusion" }))
         .await
-        .expect("recall.fuse");
+        .expect("memory.recall_fuse");
 
     let fused = result["fused_candidates"].as_array().expect("fused array");
     assert!(!fused.is_empty());
@@ -568,16 +577,16 @@ async fn test_recall_breakdown_is_opt_in() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({ "content": "attention score breakdown", "importance": 0.8 }),
         )
         .await
-        .expect("remember");
+        .expect("memory.remember");
 
     let plain = registry
-        .dispatch("recall", json!({ "query": "attention breakdown" }))
+        .dispatch("memory.recall", json!({ "query": "attention breakdown" }))
         .await
-        .expect("recall");
+        .expect("memory.recall");
     let hits = plain.as_array().unwrap();
     assert!(!hits.is_empty());
     assert!(
@@ -587,7 +596,7 @@ async fn test_recall_breakdown_is_opt_in() {
 
     let explained = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "attention breakdown", "config": { "include_breakdown": true } }),
         )
         .await
@@ -611,19 +620,19 @@ async fn test_recall_candidates_vector_field_always_present() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({ "content": "text only candidate check" }),
         )
         .await
-        .expect("remember");
+        .expect("memory.remember");
 
     let result = registry
         .dispatch(
-            "recall.candidates",
+            "memory.recall_candidates",
             json!({ "query": "text only candidate" }),
         )
         .await
-        .expect("recall.candidates");
+        .expect("memory.recall_candidates");
 
     // Both arrays must be present even if one is empty.
     assert!(
@@ -643,14 +652,20 @@ async fn test_recall_fuse_source_field_is_plain_string() {
     let registry = make_registry(rt);
 
     registry
-        .dispatch("remember", json!({ "content": "fuse source string check" }))
+        .dispatch(
+            "memory.remember",
+            json!({ "content": "fuse source string check" }),
+        )
         .await
-        .expect("remember");
+        .expect("memory.remember");
 
     let result = registry
-        .dispatch("recall.fuse", json!({ "query": "fuse source string" }))
+        .dispatch(
+            "memory.recall_fuse",
+            json!({ "query": "fuse source string" }),
+        )
         .await
-        .expect("recall.fuse");
+        .expect("memory.recall_fuse");
 
     let fused = result["fused_candidates"].as_array().expect("fused array");
     assert!(!fused.is_empty());
@@ -676,15 +691,15 @@ async fn test_recall_fuse_rrf_k1_uses_retrieval_adapter() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({ "content": "retrieval adapter rrf k1 probe memory" }),
         )
         .await
-        .expect("remember");
+        .expect("memory.remember");
 
     let result = registry
         .dispatch(
-            "recall.fuse",
+            "memory.recall_fuse",
             json!({
                 "query": "retrieval adapter rrf k1 probe",
                 "config": {
@@ -725,19 +740,19 @@ async fn test_recall_fuse_shape_preserved_after_retrieval_wiring() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({ "content": "shape regression check after retrieval wiring" }),
         )
         .await
-        .expect("remember");
+        .expect("memory.remember");
 
     let result = registry
         .dispatch(
-            "recall.fuse",
+            "memory.recall_fuse",
             json!({ "query": "shape regression retrieval wiring" }),
         )
         .await
-        .expect("recall.fuse");
+        .expect("memory.recall_fuse");
 
     // Top-level shape
     assert!(
@@ -787,15 +802,15 @@ async fn test_recall_breakdown_total_matches_composite_score() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({ "content": "arithmetic score check memory", "importance": 0.7 }),
         )
         .await
-        .expect("remember");
+        .expect("memory.remember");
 
     let result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "arithmetic score check", "config": { "include_breakdown": true } }),
         )
         .await
@@ -846,7 +861,7 @@ async fn test_recall_excludes_non_memory_notes() {
     // Create a small number of memory notes with matching content.
     let mem1 = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "memory note about attention mechanisms in neural networks",
                 "importance": 0.8
@@ -856,7 +871,7 @@ async fn test_recall_excludes_non_memory_notes() {
         .expect("remember 1");
     let mem2 = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "another memory note about attention mechanisms",
                 "importance": 0.7
@@ -869,7 +884,7 @@ async fn test_recall_excludes_non_memory_notes() {
 
     let result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "attention mechanisms neural networks", "limit": 5 }),
         )
         .await
@@ -949,7 +964,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     // (the bug), it would be 0.70.
     let result = registry
         .dispatch(
-            "recall.score",
+            "memory.recall_score",
             json!({
                 "rrf": 1.0,
                 "salience": 0.0,
@@ -995,7 +1010,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
 
     let result2 = registry2
         .dispatch(
-            "recall.score",
+            "memory.recall_score",
             json!({
                 "rrf": 1.0,
                 "salience": 0.0,
@@ -1028,14 +1043,17 @@ async fn test_recall_default_identity() {
         "lysosomes digest cellular waste in the cell",
     ] {
         registry
-            .dispatch("remember", json!({ "content": content, "importance": 0.8 }))
+            .dispatch(
+                "memory.remember",
+                json!({ "content": content, "importance": 0.8 }),
+            )
             .await
             .expect("remember succeeds");
     }
 
     // Baseline recall with no knobs
     let base = registry
-        .dispatch("recall", json!({ "query": "cell" }))
+        .dispatch("memory.recall", json!({ "query": "cell" }))
         .await
         .expect("baseline recall succeeds");
     let base_hits = base.as_array().expect("array");
@@ -1048,7 +1066,7 @@ async fn test_recall_default_identity() {
     // Same call with all three knobs explicitly set to null — must be byte-identical
     let knobless = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "cell",
                 "top_k": null,
@@ -1094,7 +1112,7 @@ async fn test_recall_top_k_override() {
     for i in 0..5 {
         registry
             .dispatch(
-                "remember",
+                "memory.remember",
                 json!({
                     "content": format!("rust ownership memory safety concept {i}"),
                     "importance": 0.7
@@ -1107,7 +1125,7 @@ async fn test_recall_top_k_override() {
     // Recall with top_k=2 — must not return more than 2 results
     let result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "rust ownership memory safety", "top_k": 2 }),
         )
         .await
@@ -1122,7 +1140,7 @@ async fn test_recall_top_k_override() {
     // top_k=1 must return at most 1
     let result1 = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "rust ownership memory safety", "top_k": 1 }),
         )
         .await
@@ -1142,7 +1160,7 @@ async fn test_recall_fusion_strategy_override() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "gradient descent optimization machine learning",
                 "importance": 0.8
@@ -1155,7 +1173,7 @@ async fn test_recall_fusion_strategy_override() {
     for strategy in &["rrf", "weighted", "union"] {
         let result = registry
             .dispatch(
-                "recall",
+                "memory.recall",
                 json!({
                     "query": "gradient descent optimization",
                     "fusion_strategy": strategy
@@ -1172,7 +1190,7 @@ async fn test_recall_fusion_strategy_override() {
     // Invalid strategy must return an error
     let err = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "gradient descent optimization",
                 "fusion_strategy": "bogus"
@@ -1194,7 +1212,7 @@ async fn test_recall_score_floor() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "backpropagation neural network training algorithm",
                 "importance": 0.6
@@ -1206,7 +1224,7 @@ async fn test_recall_score_floor() {
     // Baseline: no floor — get result count
     let base = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "backpropagation neural network" }),
         )
         .await
@@ -1216,7 +1234,7 @@ async fn test_recall_score_floor() {
     // score_floor=0.99 must not return MORE results than baseline
     let floored = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "backpropagation neural network",
                 "score_floor": 0.99
@@ -1243,7 +1261,7 @@ async fn test_recall_score_floor() {
     // score_floor=0.0 must behave same as no floor
     let zero_floor = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "backpropagation neural network",
                 "score_floor": 0.0
@@ -1270,7 +1288,7 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
     for i in 0..4 {
         registry
             .dispatch(
-                "remember",
+                "memory.remember",
                 json!({
                     "content": format!("memory about deep learning topic {i}"),
                     "importance": 0.5 + (i as f64) * 0.1,
@@ -1278,11 +1296,11 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
                 }),
             )
             .await
-            .expect("remember");
+            .expect("memory.remember");
     }
 
     let baseline = registry
-        .dispatch("recall", json!({ "query": "deep learning" }))
+        .dispatch("memory.recall", json!({ "query": "deep learning" }))
         .await
         .expect("baseline recall");
     let baseline_ids: Vec<String> = baseline
@@ -1294,7 +1312,7 @@ async fn test_recall_with_empty_reranker_weights_is_passthrough() {
 
     let with_empty_reranker = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "deep learning",
                 "config": { "reranker_weights": {} }
@@ -1336,7 +1354,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
     for _ in 0..3 {
         registry
             .dispatch(
-                "remember",
+                "memory.remember",
                 json!({
                     "content": "gradient descent gradient descent gradient descent optimization",
                     "importance": 0.1,
@@ -1351,7 +1369,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
     // relevance so baseline (pure-relevance) ranks it below the low-salience notes.
     let high_salience = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "gradient descent is a key technique in machine learning",
                 "importance": 0.95,
@@ -1366,7 +1384,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
     // BM25-heavy low-salience notes rank first.
     let baseline = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "gradient descent",
                 "config": {
@@ -1401,7 +1419,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
     // Step 2: reranked recall — importance weight only (REPLACE strategy).
     let reranked = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "gradient descent",
                 "config": {
@@ -1458,7 +1476,7 @@ async fn test_rerank_subhandler_uses_request_weights() {
 
     let result = registry
         .dispatch(
-            "recall.rerank",
+            "memory.recall_rerank",
             json!({
                 "candidates": candidates,
                 "config": {
@@ -1536,7 +1554,7 @@ async fn test_remember_source_id_accepts_short_id() {
     // remember with short id — must NOT return an error (previously did)
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "attention uses Q K V matrices",
                 "source_id": short_id,
@@ -1578,7 +1596,7 @@ fn test_handler_def_recall_params_complete() {
 
     let recall_def = khive_pack_memory::MemoryPack::HANDLERS
         .iter()
-        .find(|h| h.name == "recall")
+        .find(|h| h.name == "memory.recall")
         .expect("recall handler must be registered");
 
     let param_names: Vec<&str> = recall_def.params.iter().map(|p| p.name).collect();
@@ -1611,7 +1629,7 @@ fn test_handler_def_remember_params_complete() {
 
     let remember_def = khive_pack_memory::MemoryPack::HANDLERS
         .iter()
-        .find(|h| h.name == "remember")
+        .find(|h| h.name == "memory.remember")
         .expect("remember handler must be registered");
 
     let param_names: Vec<&str> = remember_def.params.iter().map(|p| p.name).collect();
@@ -1671,7 +1689,7 @@ async fn test_score_floor_portable_across_fusion_strategies() {
         let importance = 0.4 + 0.06 * (i as f64); // 0.40 to 0.94
         registry
             .dispatch(
-                "remember",
+                "memory.remember",
                 json!({
                     "content": content,
                     "importance": importance,
@@ -1679,13 +1697,13 @@ async fn test_score_floor_portable_across_fusion_strategies() {
                 }),
             )
             .await
-            .expect("remember");
+            .expect("memory.remember");
     }
 
     // Query relevant to several memories
     let rrf_result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "attention transformer",
                 "score_floor": 0.3_f64,
@@ -1698,7 +1716,7 @@ async fn test_score_floor_portable_across_fusion_strategies() {
 
     let weighted_result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "attention transformer",
                 "score_floor": 0.3_f64,
@@ -1731,15 +1749,15 @@ async fn test_recall_verbose_presentation_includes_breakdown() {
 
     registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({ "content": "transformer positional encoding", "importance": 0.8 }),
         )
         .await
-        .expect("remember");
+        .expect("memory.remember");
 
     // Default (agent-mode): no breakdown
     let default_result = registry
-        .dispatch("recall", json!({ "query": "transformer" }))
+        .dispatch("memory.recall", json!({ "query": "transformer" }))
         .await
         .expect("recall default");
 
@@ -1753,7 +1771,7 @@ async fn test_recall_verbose_presentation_includes_breakdown() {
     // Verbose: breakdown present
     let verbose_result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "transformer", "presentation": "verbose" }),
         )
         .await
@@ -1868,7 +1886,7 @@ async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
     // remember — must not fail even with no lattice model.
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "custom embedder fanout regression test content alpha",
                 "importance": 0.8
@@ -1884,7 +1902,7 @@ async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
     // should return the note.
     let recall_result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "custom embedder fanout regression" }),
         )
         .await
@@ -1936,7 +1954,7 @@ async fn test_weighted_fusion_multi_model_text_not_zeroed() {
     // Store a memory with distinctive text content.
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "weighted fusion multi model text contribution regression beta",
                 "importance": 0.7
@@ -1950,7 +1968,7 @@ async fn test_weighted_fusion_multi_model_text_not_zeroed() {
     // Recall with explicit Weighted strategy — text must not be zeroed.
     let recall = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "weighted fusion multi model text",
                 "fusion_strategy": "weighted",
@@ -1983,7 +2001,7 @@ async fn test_remember_procedural_memory_type_rejected() {
 
     let result = registry
         .dispatch(
-            "remember",
+            "memory.remember",
             json!({
                 "content": "procedural memory of how to deploy",
                 "memory_type": "procedural"
@@ -2010,7 +2028,7 @@ async fn test_recall_procedural_memory_type_filter_rejected() {
 
     let result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({
                 "query": "deploy procedure",
                 "memory_type": "procedural"
@@ -2043,7 +2061,7 @@ async fn test_recall_composite_score_bounded_to_unit_interval() {
     for i in 0..5 {
         registry
             .dispatch(
-                "remember",
+                "memory.remember",
                 json!({
                     "content": format!("bounded score test memory number {i}"),
                     "importance": 0.5 + 0.1 * (i as f64),
@@ -2051,12 +2069,12 @@ async fn test_recall_composite_score_bounded_to_unit_interval() {
                 }),
             )
             .await
-            .expect("remember");
+            .expect("memory.remember");
     }
 
     let result = registry
         .dispatch(
-            "recall",
+            "memory.recall",
             json!({ "query": "bounded score test memory", "limit": 10 }),
         )
         .await
@@ -2083,7 +2101,7 @@ fn test_handler_def_min_score_description_clarified() {
 
     let recall_def = khive_pack_memory::MemoryPack::HANDLERS
         .iter()
-        .find(|h| h.name == "recall")
+        .find(|h| h.name == "memory.recall")
         .expect("recall handler must be registered");
 
     let min_score_param = recall_def
@@ -2110,7 +2128,7 @@ fn test_handler_def_remember_memory_type_description_lists_valid_values() {
 
     let remember_def = khive_pack_memory::MemoryPack::HANDLERS
         .iter()
-        .find(|h| h.name == "remember")
+        .find(|h| h.name == "memory.remember")
         .expect("remember handler must be registered");
 
     let mt_param = remember_def

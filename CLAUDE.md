@@ -184,22 +184,22 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 
 Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
 
-| Verb         | Args                                                                         | What it does                                                |
-| ------------ | ---------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `assign`     | `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?` | Create a task (defaults: status=inbox, priority=p2)         |
-| `next`       | `limit?`, `assignee?`                                                        | List actionable tasks (status ∈ next/active), priority-sort |
-| `complete`   | `id`, `result?`                                                              | Validate transition → done, record `completed_at`           |
-| `tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                       |
-| `transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation  |
+| Verb             | Args                                                                         | What it does                                                |
+| ---------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `gtd.assign`     | `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?` | Create a task (defaults: status=inbox, priority=p2)         |
+| `gtd.next`       | `limit?`, `assignee?`                                                        | List actionable tasks (status ∈ next/active), priority-sort |
+| `gtd.complete`   | `id`, `result?`                                                              | Validate transition → done, record `completed_at`           |
+| `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                       |
+| `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation  |
 
 ### Memory pack verbs (2 — ADR-021, optional)
 
 Load with `KHIVE_PACKS=kg,memory` or `--pack memory`. Adds the `memory` note kind.
 
-| Verb       | Args                                                                    | What it does                                                              |
-| ---------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `remember` | `content`, `importance?`, `decay_factor?`, `memory_type?`, `source_id?` | Create a memory note with salience + decay; optionally annotates a source |
-| `recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`        | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking        |
+| Verb              | Args                                                                    | What it does                                                              |
+| ----------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `memory.remember` | `content`, `importance?`, `decay_factor?`, `memory_type?`, `source_id?` | Create a memory note with salience + decay; optionally annotates a source |
+| `memory.recall`   | `query`, `limit?`, `min_score?`, `min_salience?`, `memory_type?`        | Hybrid FTS + vector recall with RRF fusion, decay-weighted ranking        |
 
 `get`/`update`/`delete`/`merge` are UUID-only — no `kind` needed, the handler resolves
 the substrate from the UUID. `create`/`list`/`search` require `kind`.

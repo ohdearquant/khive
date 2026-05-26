@@ -15,8 +15,8 @@ from khive_contract.client import KhiveMcpSession, KhiveRpcError
 VERBS_UNDER_TEST = {
     "create", "get", "list", "update", "delete", "merge",
     "search", "link", "neighbors", "traverse", "query",
-    "assign", "next", "complete", "tasks", "transition",
-    "remember", "recall",
+    "gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition",
+    "memory.remember", "memory.recall",
 }
 
 
@@ -288,74 +288,74 @@ def test_gtd_smoke(
     ns = temp_namespace
 
     # assign
-    assigned = khive_gtd_session.verb("assign", {
+    assigned = khive_gtd_session.verb("gtd.assign", {
         "title": "smoke-gtd task",
         "status": "next",
         "priority": "p0",
         "namespace": ns,
     })
-    assert assigned.get("kind") == "task", f"assign must return kind=task: {assigned}"
-    assert assigned.get("status") == "next", f"assign status mismatch: {assigned}"
+    assert assigned.get("kind") == "task", f"gtd.assign must return kind=task: {assigned}"
+    assert assigned.get("status") == "next", f"gtd.assign status mismatch: {assigned}"
     task_full_id = assigned.get("full_id") or assigned.get("id")
-    assert task_full_id, f"assign must return a task id: {assigned}"
+    assert task_full_id, f"gtd.assign must return a task id: {assigned}"
 
     # next
-    ready = khive_gtd_session.verb("next", {"namespace": ns})
-    assert isinstance(ready, list), f"next must return a list: {ready}"
+    ready = khive_gtd_session.verb("gtd.next", {"namespace": ns})
+    assert isinstance(ready, list), f"gtd.next must return a list: {ready}"
     assert any(t.get("full_id") == task_full_id for t in ready), (
-        f"assigned task must appear in next(): {ready}"
+        f"assigned task must appear in gtd.next(): {ready}"
     )
 
     # tasks
-    waiting_task = khive_gtd_session.verb("assign", {
+    waiting_task = khive_gtd_session.verb("gtd.assign", {
         "title": "waiting-task",
         "status": "waiting",
         "priority": "p1",
         "namespace": ns,
     })
-    inbox_task = khive_gtd_session.verb("assign", {
+    inbox_task = khive_gtd_session.verb("gtd.assign", {
         "title": "inbox-task",
         "status": "inbox",
         "priority": "p2",
         "namespace": ns,
     })
-    waiting_tasks = khive_gtd_session.verb("tasks", {"status": "waiting", "namespace": ns})
-    assert isinstance(waiting_tasks, list), f"tasks must return a list: {waiting_tasks}"
+    waiting_tasks = khive_gtd_session.verb("gtd.tasks", {"status": "waiting", "namespace": ns})
+    assert isinstance(waiting_tasks, list), f"gtd.tasks must return a list: {waiting_tasks}"
     waiting_ids = [t.get("full_id") for t in waiting_tasks]
     assert waiting_task.get("full_id") in waiting_ids, (
-        f"waiting task must appear in tasks(status=waiting): {waiting_ids}"
+        f"waiting task must appear in gtd.tasks(status=waiting): {waiting_ids}"
     )
     assert inbox_task.get("full_id") not in waiting_ids, (
-        f"inbox task must NOT appear in tasks(status=waiting): {waiting_ids}"
+        f"inbox task must NOT appear in gtd.tasks(status=waiting): {waiting_ids}"
     )
 
     # transition
-    trans = khive_gtd_session.verb("transition", {
+    trans = khive_gtd_session.verb("gtd.transition", {
         "id": inbox_task.get("full_id"),
         "status": "next",
         "note": "promoted from inbox",
         "namespace": ns,
     })
-    assert trans.get("transitioned") is True, f"transition must set transitioned=True: {trans}"
-    assert trans.get("to") == "next", f"transition must report to=next: {trans}"
+    assert trans.get("transitioned") is True, f"gtd.transition must set transitioned=True: {trans}"
+    assert trans.get("to") == "next", f"gtd.transition must report to=next: {trans}"
 
     # idempotent transition
-    trans_idem = khive_gtd_session.verb("transition", {
+    trans_idem = khive_gtd_session.verb("gtd.transition", {
         "id": inbox_task.get("full_id"),
         "status": "next",
         "namespace": ns,
     })
     assert trans_idem.get("transitioned") is False, (
-        f"idempotent transition must set transitioned=False: {trans_idem}"
+        f"idempotent gtd.transition must set transitioned=False: {trans_idem}"
     )
 
     # complete
-    done = khive_gtd_session.verb("complete", {
+    done = khive_gtd_session.verb("gtd.complete", {
         "id": task_full_id,
         "result": "smoke-test pass",
         "namespace": ns,
     })
-    assert done.get("to") == "done", f"complete must return to=done: {done}"
+    assert done.get("to") == "done", f"gtd.complete must return to=done: {done}"
 
 
 @pytest.mark.adr_027
@@ -374,29 +374,29 @@ def test_memory_smoke(
     ns = temp_namespace
 
     # remember first memory
-    mem = khive_memory_session.verb("remember", {
+    mem = khive_memory_session.verb("memory.remember", {
         "content": "khive uses SQLite with FTS5 and sqlite-vec for hybrid search",
         "importance": 0.9,
         "memory_type": "semantic",
         "namespace": ns,
     })
-    assert mem is not None, "remember must return a result"
+    assert mem is not None, "memory.remember must return a result"
     mem_id = mem.get("id") or mem.get("note_id")
-    assert mem_id, f"remember must return an id: {mem}"
+    assert mem_id, f"memory.remember must return an id: {mem}"
 
     # remember second memory
-    mem2 = khive_memory_session.verb("remember", {
+    mem2 = khive_memory_session.verb("memory.remember", {
         "content": "The runtime enforces namespace isolation for every ID-based operation",
         "importance": 0.7,
         "memory_type": "semantic",
         "namespace": ns,
     })
-    assert mem2 is not None, "second remember must return a result"
+    assert mem2 is not None, "second memory.remember must return a result"
 
     # recall
-    hits = khive_memory_session.verb("recall", {
+    hits = khive_memory_session.verb("memory.recall", {
         "query": "SQLite hybrid search",
         "limit": 5,
         "namespace": ns,
     })
-    assert isinstance(hits, list), f"recall must return a list, got: {hits}"
+    assert isinstance(hits, list), f"memory.recall must return a list, got: {hits}"

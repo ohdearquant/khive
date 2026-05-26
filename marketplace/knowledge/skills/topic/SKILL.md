@@ -13,13 +13,13 @@ hybrid FTS + vector search, then applies the domain filter post-retrieval.
 
 ```
 # All concepts
-request(ops="topic()")
+request(ops="knowledge.topic()")
 
 # By domain
-request(ops="topic(domain=\"attention\", limit=20)")
+request(ops="knowledge.topic(domain=\"attention\", limit=20)")
 
 # Free-text search within a domain
-request(ops="topic(query=\"linear attention state space\", domain=\"attention\")")
+request(ops="knowledge.topic(query=\"linear attention state space\", domain=\"attention\")")
 ```
 
 ## Parameters
@@ -54,7 +54,7 @@ When `query` is provided, each item also carries `score` and `snippet` from the 
 ### Check if a concept already exists before `learn`
 
 ```
-request(ops="topic(query=\"LoRA\", limit=5)")
+request(ops="knowledge.topic(query=\"LoRA\", limit=5)")
 ```
 
 If the result includes a matching item, link it instead of calling `learn` again.
@@ -62,7 +62,7 @@ If the result includes a matching item, link it instead of calling `learn` again
 ### Browse all concepts in a research area
 
 ```
-request(ops="topic(domain=\"inference\", limit=50)")
+request(ops="knowledge.topic(domain=\"inference\", limit=50)")
 ```
 
 ## Anti-patterns

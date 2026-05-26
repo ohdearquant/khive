@@ -139,14 +139,14 @@ Also report to the caller:
 ## Pickup protocol (start of run)
 
 ```
-next(assignee="gap-analyst")
+gtd.next(assignee="gap-analyst")
 ```
 
 Most tasks come from polisher signalling the graph is clean. Read the task's
 `depends_on` chain to verify a recent polish has actually completed.
 
 ```
-transition(id="<task-id>", status="active", note="gap survey starting")
+gtd.transition(id="<task-id>", status="active", note="gap survey starting")
 ```
 
 ## Handoff protocol (end of run)
@@ -154,7 +154,7 @@ transition(id="<task-id>", status="active", note="gap survey starting")
 For each top-N frontier ranking item, assign an `expander` task in priority order:
 
 ```
-assign(title="Expand <concept-name>: mode=<promote|bridge|extend|resolve>",
+gtd.assign(title="Expand <concept-name>: mode=<promote|bridge|extend|resolve>",
        assignee="expander",
        priority="<p1 if rank ≤ 3, p2 if rank ≤ 10, p3 otherwise>",
        tags=["kg:expand:<mode>", "frontier-rank:<N>", "from:gap-analyst", "inventory:<inventory-file-path>"],
@@ -164,7 +164,7 @@ assign(title="Expand <concept-name>: mode=<promote|bridge|extend|resolve>",
 For data-quality flags (status/edge mismatches), assign to polisher:
 
 ```
-assign(title="Fix status/edge mismatch: <N> concepts claim 'implemented' with no implements edge",
+gtd.assign(title="Fix status/edge mismatch: <N> concepts claim 'implemented' with no implements edge",
        assignee="polisher",
        priority="p2",
        tags=["kg:polish", "status-mismatch", "from:gap-analyst"])
@@ -174,14 +174,14 @@ For taxonomy questions (e.g., "this gap needs a relation we don't have"), assign
 `librarian` — these are not autonomously actionable, they need human review:
 
 ```
-assign(title="Taxonomy review: <relation gap description>",
+gtd.assign(title="Taxonomy review: <relation gap description>",
        assignee="librarian",
        priority="p3",
        tags=["kg:meta", "taxonomy"])
 ```
 
 ```
-complete(id="<your-task-id>", result="Found N gaps across 4 categories. Top 20 frontier items queued to expander. Inventory at <path>.")
+gtd.complete(id="<your-task-id>", result="Found N gaps across 4 categories. Top 20 frontier items queued to expander. Inventory at <path>.")
 ```
 
 ## Anti-patterns

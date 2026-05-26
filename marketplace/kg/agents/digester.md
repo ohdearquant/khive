@@ -111,9 +111,9 @@ Report to the caller:
 Before doing anything else, check your GTD queue:
 
 ```
-next(assignee="digester")
+gtd.next(assignee="digester")
 # or
-tasks(assignee="digester", status="next", limit=5)
+gtd.tasks(assignee="digester", status="next", limit=5)
 ```
 
 If tasks exist, work them in priority order. If not, the caller has given you the
@@ -122,7 +122,7 @@ source material directly — proceed with that.
 When you start a task, transition it:
 
 ```
-transition(id="<task-id>", status="active", note="digester starting ingestion of <source>")
+gtd.transition(id="<task-id>", status="active", note="digester starting ingestion of <source>")
 ```
 
 ## Handoff protocol (end of run)
@@ -133,7 +133,7 @@ title + scope so the receiver can act without re-deriving context.
 **To polisher** (always — every digest creates orphans/dupes):
 
 ```
-assign(title="Polish <N> new entities from digest <source>",
+gtd.assign(title="Polish <N> new entities from digest <source>",
        assignee="polisher",
        priority="p2",
        tags=["kg:polish", "from:digester", "batch:<source-id>"],
@@ -144,7 +144,7 @@ assign(title="Polish <N> new entities from digest <source>",
 concept volume — judgment call, but err on the side of running it):
 
 ```
-assign(title="Gap survey: domain=<X> after ingestion of <source>",
+gtd.assign(title="Gap survey: domain=<X> after ingestion of <source>",
        assignee="gap-analyst",
        priority="p3",
        tags=["kg:gap", "from:digester", "domain:<X>"])
@@ -154,7 +154,7 @@ assign(title="Gap survey: domain=<X> after ingestion of <source>",
 Finally, complete your own task:
 
 ```
-complete(id="<your-task-id>", result="Ingested N entities, M edges, K notes. Handed off to polisher + gap-analyst.")
+gtd.complete(id="<your-task-id>", result="Ingested N entities, M edges, K notes. Handed off to polisher + gap-analyst.")
 ```
 
 ## Anti-patterns

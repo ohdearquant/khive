@@ -43,7 +43,7 @@ impl Pack for MemoryPack {
 static MEMORY_HANDLERS: [HandlerDef; 7] = [
     // Commissive: commits a memory to the namespace
     HandlerDef {
-        name: "remember",
+        name: "memory.remember",
         description: "Create a memory note with salience and decay",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
@@ -88,7 +88,7 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
     },
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
-        name: "recall",
+        name: "memory.recall",
         description: "Recall memory notes with decay-aware hybrid ranking",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -156,21 +156,21 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
         ],
     },
     HandlerDef {
-        name: "recall.embed",
+        name: "memory.recall_embed",
         description: "Return the embedding vector used by memory recall",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
         params: &[],
     },
     HandlerDef {
-        name: "recall.candidates",
+        name: "memory.recall_candidates",
         description: "Return raw memory recall candidates by retrieval source",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
         params: &[],
     },
     HandlerDef {
-        name: "recall.fuse",
+        name: "memory.recall_fuse",
         description: "Return fused memory recall candidates before final scoring",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
@@ -178,14 +178,14 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
     },
     // ADR-033 §2, F222: rerank stage between fuse and score
     HandlerDef {
-        name: "recall.rerank",
+        name: "memory.recall_rerank",
         description: "Apply configured rerankers to fused candidates (ADR-033 §2)",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
         params: &[],
     },
     HandlerDef {
-        name: "recall.score",
+        name: "memory.recall_score",
         description: "Score a memory recall candidate and return score breakdown",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
@@ -252,13 +252,13 @@ impl PackRuntime for MemoryPack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "remember" => self.handle_remember(token, params).await,
-            "recall" => self.handle_recall(token, params, registry).await,
-            "recall.embed" => self.handle_recall_embed(params).await,
-            "recall.candidates" => self.handle_recall_candidates(token, params).await,
-            "recall.fuse" => self.handle_recall_fuse(token, params, registry).await,
-            "recall.rerank" => self.handle_recall_rerank(params).await,
-            "recall.score" => self.handle_recall_score(params).await,
+            "memory.remember" => self.handle_remember(token, params).await,
+            "memory.recall" => self.handle_recall(token, params, registry).await,
+            "memory.recall_embed" => self.handle_recall_embed(params).await,
+            "memory.recall_candidates" => self.handle_recall_candidates(token, params).await,
+            "memory.recall_fuse" => self.handle_recall_fuse(token, params, registry).await,
+            "memory.recall_rerank" => self.handle_recall_rerank(params).await,
+            "memory.recall_score" => self.handle_recall_score(params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "memory pack does not handle verb {verb:?}"
             ))),

@@ -13,7 +13,7 @@ Cadence: weekly is the GTD canon. For agent-driven workloads, do it at session s
 ### 1. Process the inbox
 
 ```
-request(ops="tasks(status=\"inbox\", limit=50)")
+request(ops="gtd.tasks(status=\"inbox\", limit=50)")
 ```
 
 For each item, make one decision and move it. The five legal moves from `inbox`:
@@ -31,43 +31,43 @@ Batch the moves once decisions are made — the DSL is built for this:
 
 ```
 request(ops="[
-  transition(id=\"<id1>\", status=\"next\"),
-  transition(id=\"<id2>\", status=\"someday\"),
-  transition(id=\"<id3>\", status=\"cancelled\", note=\"requirement dropped\"),
-  complete(id=\"<id4>\", result=\"already shipped last week\")
+  gtd.transition(id=\"<id1>\", status=\"next\"),
+  gtd.transition(id=\"<id2>\", status=\"someday\"),
+  gtd.transition(id=\"<id3>\", status=\"cancelled\", note=\"requirement dropped\"),
+  gtd.complete(id=\"<id4>\", result=\"already shipped last week\")
 ]")
 ```
 
 ### 2. Refresh `active` work
 
 ```
-request(ops="tasks(status=\"active\", limit=20)")
+request(ops="gtd.tasks(status=\"active\", limit=20)")
 ```
 
 If something's been `active` for more than a few days without progress, it's probably not actually in flight. Either:
 
-- Park it: `transition(id=..., status="waiting", note="<blocker>")`
-- Finish it: `complete(id=..., result="<one line>")`
-- Cancel it: `transition(id=..., status="cancelled", note="<why>")`
+- Park it: `gtd.transition(id=..., status="waiting", note="<blocker>")`
+- Finish it: `gtd.complete(id=..., result="<one line>")`
+- Cancel it: `gtd.transition(id=..., status="cancelled", note="<why>")`
 
 Active should reflect _now_, not aspiration.
 
 ### 3. Unblock `waiting`
 
 ```
-request(ops="tasks(status=\"waiting\", limit=20)")
+request(ops="gtd.tasks(status=\"waiting\", limit=20)")
 ```
 
 For each, read `properties.transition_note` or `properties.description` to remember the blocker. If the blocker is resolved, transition back to `next` or `active`. If the blocker is permanent, `cancelled`.
 
 ```
-request(ops="transition(id=\"<id>\", status=\"next\", note=\"unblocked: Alex approved spec\")")
+request(ops="gtd.transition(id=\"<id>\", status=\"next\", note=\"unblocked: Alex approved spec\")")
 ```
 
 ### 4. Prune `someday`
 
 ```
-request(ops="tasks(status=\"someday\", limit=50)")
+request(ops="gtd.tasks(status=\"someday\", limit=50)")
 ```
 
 The `someday` list will rot if you never look at it. For each, ask: "would I be sad if this never happens?"
@@ -78,7 +78,7 @@ The `someday` list will rot if you never look at it. For each, ask: "would I be 
 ### 5. Review recent `done` for follow-ups
 
 ```
-request(ops="tasks(status=\"done\", limit=20)")
+request(ops="gtd.tasks(status=\"done\", limit=20)")
 ```
 
 Reading recent completions often reveals follow-up work (a `result` line that ends with "...but should also do X"). Capture follow-ups with `assign` while context is fresh.
@@ -89,9 +89,9 @@ Reading recent completions often reveals follow-up work (a `result` line that en
 
 ```
 request(ops="[
-  tasks(status=\"inbox\"),
-  tasks(status=\"active\"),
-  tasks(status=\"waiting\")
+  gtd.tasks(status=\"inbox\"),
+  gtd.tasks(status=\"active\"),
+  gtd.tasks(status=\"waiting\")
 ]")
 ```
 
@@ -111,7 +111,7 @@ Any unfulfilled commitments get added via `assign` in the same session.
 
 If a task has been `next` for multiple reviews without progress, that's a signal — either:
 
-- It's actually not next (downgrade to `someday`).
+- It's actually not gtd.next (downgrade to `someday`).
 - It's blocked (move to `waiting` + describe the blocker).
 - It's the wrong granularity (cancel, then capture smaller, more concrete sub-tasks).
 

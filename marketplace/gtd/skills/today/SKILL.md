@@ -11,7 +11,7 @@ You have a long list of tasks. You don't need to see all of them — you need to
 ### 1. See what's actionable
 
 ```
-request(ops="next(limit=20)")
+request(ops="gtd.next(limit=20)")
 ```
 
 `next` returns only tasks whose status is `next` or `active`, sorted by priority (p0 first), then most-recent. Tasks in `inbox`, `waiting`, or `someday` are intentionally hidden — they aren't ready.
@@ -23,19 +23,19 @@ If the list is empty, you either have no committed work (process the inbox — s
 By assignee (if you collaborate with other agents):
 
 ```
-request(ops="next(assignee=\"lambda:khive\", limit=10)")
+request(ops="gtd.next(assignee=\"lambda:khive\", limit=10)")
 ```
 
 By status — for example, "what's already in progress":
 
 ```
-request(ops="tasks(status=\"active\", limit=10)")
+request(ops="gtd.tasks(status=\"active\", limit=10)")
 ```
 
 By priority + status:
 
 ```
-request(ops="tasks(status=\"next\", priority=\"p0\")")
+request(ops="gtd.tasks(status=\"next\", priority=\"p0\")")
 ```
 
 ### 3. Start one task
@@ -43,7 +43,7 @@ request(ops="tasks(status=\"next\", priority=\"p0\")")
 When you pick one to actually work on, promote it to `active` so the queue reflects reality:
 
 ```
-request(ops="transition(id=\"<short-id-or-full-uuid>\", status=\"active\")")
+request(ops="gtd.transition(id=\"<short-id-or-full-uuid>\", status=\"active\")")
 ```
 
 Both 8-char short IDs (the `id` field) and full UUIDs (`full_id`) are accepted.
@@ -53,13 +53,13 @@ Both 8-char short IDs (the `id` field) and full UUIDs (`full_id`) are accepted.
 A task tagged `next` but you realize you can't move on it right now (waiting on someone, missing input, etc.) should leave the actionable list:
 
 ```
-request(ops="transition(id=\"<id>\", status=\"waiting\", note=\"blocked on review from Alex\")")
+request(ops="gtd.transition(id=\"<id>\", status=\"waiting\", note=\"blocked on review from Alex\")")
 ```
 
 ### 5. Finish what you finished
 
 ```
-request(ops="complete(id=\"<id>\", result=\"shipped in v0.2.1\")")
+request(ops="gtd.complete(id=\"<id>\", result=\"shipped in v0.2.1\")")
 ```
 
 `complete` records `completed_at` automatically and validates the transition. `done` is a **terminal state** — no further transitions are allowed. If the work turns out to be incomplete, cancel the task and create a fresh one instead.
@@ -70,16 +70,16 @@ request(ops="complete(id=\"<id>\", result=\"shipped in v0.2.1\")")
 
 ```
 request(ops="[
-  tasks(status=\"active\"),
-  tasks(status=\"next\"),
-  tasks(status=\"waiting\")
+  gtd.tasks(status=\"active\"),
+  gtd.tasks(status=\"next\"),
+  gtd.tasks(status=\"waiting\")
 ]")
 ```
 
 ### "What's blocking me right now"
 
 ```
-request(ops="tasks(status=\"waiting\", limit=20)")
+request(ops="gtd.tasks(status=\"waiting\", limit=20)")
 ```
 
 For each, read the `properties.transition_note` (set when you parked it) or `properties.description` to remember the blocker.
@@ -88,8 +88,8 @@ For each, read the `properties.transition_note` (set when you parked it) or `pro
 
 ```
 request(ops="[
-  tasks(status=\"next\", priority=\"p0\"),
-  tasks(status=\"next\", priority=\"p1\")
+  gtd.tasks(status=\"next\", priority=\"p0\"),
+  gtd.tasks(status=\"next\", priority=\"p1\")
 ]")
 ```
 
@@ -109,10 +109,10 @@ To narrow to tasks specifically:
 request(ops="search(kind=\"task\", query=\"<short topic phrase>\", limit=5)")
 ```
 
-Past completed tasks (status=done) will surface here too, useful as a "what did I do last time I worked on this".
+Past completed gtd.tasks (status=done) will surface here too, useful as a "what did I do last time I worked on this".
 
 ## Anti-patterns
 
-- **Don't grind `tasks(status=\"inbox\")` looking for what to do.** The inbox is unprocessed — process it via `review`, then `next` will have meaningful candidates.
+- **Don't grind `gtd.tasks(status=\"inbox\")` looking for what to do.** The inbox is unprocessed — process it via `review`, then `next` will have meaningful candidates.
 - **Don't transition to `done` for tasks you didn't actually finish.** Use `cancelled` if you're abandoning, `waiting` if blocked. `done` is a commitment that the work is complete.
 - **Don't batch dozens of transitions in one `request`.** Status changes have ordering semantics in your head; do them one or two at a time so you can react to each result.

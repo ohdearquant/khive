@@ -1,3 +1,4 @@
+# Run via: uv run pytest
 """Request DSL contract tests.
 
 ADR: ADR-016 (file named adr_020 per play specification; ADR drift documented in README)

@@ -397,70 +397,70 @@ def gtd_smoke():
         proc.stdin.write((json.dumps(notify) + "\n").encode())
         proc.stdin.flush()
 
-        # assign → next → complete round-trip
-        assigned = call_verb(proc, "assign", {
+        # gtd.assign → gtd.next → gtd.complete round-trip
+        assigned = call_verb(proc, "gtd.assign", {
             "title": "ship pack-gtd",
             "status": "next",
             "priority": "p0",
         })
         assert assigned["kind"] == "task"
         assert assigned["status"] == "next"
-        print(f"  [gtd] assign — {assigned['title']!r} ({assigned['id']})")
+        print(f"  [gtd] gtd.assign — {assigned['title']!r} ({assigned['id']})")
 
-        ready = call_verb(proc, "next", {})
+        ready = call_verb(proc, "gtd.next", {})
         assert any(t["full_id"] == assigned["full_id"] for t in ready), (
-            f"assigned task not in next(): {ready}"
+            f"assigned task not in gtd.next(): {ready}"
         )
-        print(f"  [gtd] next — {len(ready)} actionable")
+        print(f"  [gtd] gtd.next — {len(ready)} actionable")
 
-        done = call_verb(proc, "complete", {
+        done = call_verb(proc, "gtd.complete", {
             "id": assigned["full_id"],
             "result": "smoke-test pass",
         })
         assert done["to"] == "done"
-        print(f"  [gtd] complete — transitioned to done")
+        print(f"  [gtd] gtd.complete — transitioned to done")
 
-        # tasks: list tasks filtered by status
-        t1 = call_verb(proc, "assign", {
+        # gtd.tasks: list tasks filtered by status
+        t1 = call_verb(proc, "gtd.assign", {
             "title": "waiting task",
             "status": "waiting",
             "priority": "p1",
         })
-        t2 = call_verb(proc, "assign", {
+        t2 = call_verb(proc, "gtd.assign", {
             "title": "inbox task",
             "status": "inbox",
             "priority": "p2",
         })
-        waiting_tasks = call_verb(proc, "tasks", {"status": "waiting"})
-        assert isinstance(waiting_tasks, list), f"tasks must return a list, got: {waiting_tasks}"
+        waiting_tasks = call_verb(proc, "gtd.tasks", {"status": "waiting"})
+        assert isinstance(waiting_tasks, list), f"gtd.tasks must return a list, got: {waiting_tasks}"
         waiting_ids = [t["full_id"] for t in waiting_tasks]
         assert t1["full_id"] in waiting_ids, (
-            f"'waiting task' must appear in tasks(status=waiting): {waiting_ids}"
+            f"'waiting task' must appear in gtd.tasks(status=waiting): {waiting_ids}"
         )
         assert t2["full_id"] not in waiting_ids, (
-            f"'inbox task' must NOT appear in tasks(status=waiting): {waiting_ids}"
+            f"'inbox task' must NOT appear in gtd.tasks(status=waiting): {waiting_ids}"
         )
-        print(f"  [gtd] tasks(status=waiting) — {len(waiting_tasks)} task(s)")
+        print(f"  [gtd] gtd.tasks(status=waiting) — {len(waiting_tasks)} task(s)")
 
-        # transition: explicit lifecycle change with validation
-        trans = call_verb(proc, "transition", {
+        # gtd.transition: explicit lifecycle change with validation
+        trans = call_verb(proc, "gtd.transition", {
             "id": t2["full_id"],
             "status": "next",
             "note": "promoted from inbox",
         })
-        assert trans["transitioned"] is True, f"transition must set transitioned=true: {trans}"
-        assert trans["to"] == "next", f"transition must report to=next: {trans}"
-        print(f"  [gtd] transition inbox→next — ok")
+        assert trans["transitioned"] is True, f"gtd.transition must set transitioned=true: {trans}"
+        assert trans["to"] == "next", f"gtd.transition must report to=next: {trans}"
+        print(f"  [gtd] gtd.transition inbox→next — ok")
 
-        # transition: idempotent (same status) must not error
-        trans_idem = call_verb(proc, "transition", {
+        # gtd.transition: idempotent (same status) must not error
+        trans_idem = call_verb(proc, "gtd.transition", {
             "id": t2["full_id"],
             "status": "next",
         })
         assert trans_idem["transitioned"] is False, (
-            f"idempotent transition must set transitioned=false: {trans_idem}"
+            f"idempotent gtd.transition must set transitioned=false: {trans_idem}"
         )
-        print(f"  [gtd] transition idempotent — ok")
+        print(f"  [gtd] gtd.transition idempotent — ok")
 
         print(f"\n  GTD PACK SMOKE TESTS PASSED")
     finally:
@@ -490,33 +490,33 @@ def memory_smoke():
         proc.stdin.write((json.dumps(notify) + "\n").encode())
         proc.stdin.flush()
 
-        # remember: store a memory note
-        mem = call_verb(proc, "remember", {
+        # memory.remember: store a memory note
+        mem = call_verb(proc, "memory.remember", {
             "content": "khive uses SQLite with FTS5 and sqlite-vec for hybrid search",
             "importance": 0.9,
             "memory_type": "semantic",
         })
-        assert mem is not None, "remember must return a result"
+        assert mem is not None, "memory.remember must return a result"
         mem_id = mem.get("id") or mem.get("note_id")
-        assert mem_id, f"remember must return an id: {mem}"
-        print(f"  [memory] remember — id {str(mem_id)[:8]}...")
+        assert mem_id, f"memory.remember must return an id: {mem}"
+        print(f"  [memory] memory.remember — id {str(mem_id)[:8]}...")
 
-        # remember: second memory with different content
-        mem2 = call_verb(proc, "remember", {
+        # memory.remember: second memory with different content
+        mem2 = call_verb(proc, "memory.remember", {
             "content": "The runtime enforces namespace isolation for every ID-based operation",
             "importance": 0.7,
             "memory_type": "semantic",
         })
-        assert mem2 is not None, "second remember must return a result"
-        print(f"  [memory] remember (second) — ok")
+        assert mem2 is not None, "second memory.remember must return a result"
+        print(f"  [memory] memory.remember (second) — ok")
 
-        # recall: returns a list (possibly empty with --no-embed, FTS still works)
-        hits = call_verb(proc, "recall", {
+        # memory.recall: returns a list (possibly empty with --no-embed, FTS still works)
+        hits = call_verb(proc, "memory.recall", {
             "query": "SQLite hybrid search",
             "limit": 5,
         })
-        assert isinstance(hits, list), f"recall must return a list, got: {hits}"
-        print(f"  [memory] recall — {len(hits)} hit(s)")
+        assert isinstance(hits, list), f"memory.recall must return a list, got: {hits}"
+        print(f"  [memory] memory.recall — {len(hits)} hit(s)")
 
         print(f"\n  MEMORY PACK SMOKE TESTS PASSED")
     finally:

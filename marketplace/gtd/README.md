@@ -12,11 +12,11 @@ All verbs are dispatched through the single MCP `request` tool ([ADR-020](https:
 
 | Verb                                                                                   | What it does                                                      |
 | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `assign(title, priority?, status?, assignee?, due?, start?, end?, depends_on?, tags?, description?)` | Create a task. Defaults to `status=inbox`, priority salience 0.5. |
-| `next(limit?, assignee?)`                                                              | Actionable tasks (status in `{next, active}`), priority-sorted.   |
-| `complete(id, result?)`                                                                | Mark done. Records `completed_at` and validates the transition. `done` is terminal — no further transitions. |
-| `tasks(status?, assignee?, priority?, limit?, offset?)`                                | Filtered listing.                                                 |
-| `transition(id, status, note?)`                                                        | Explicit GTD state change with lifecycle validation.              |
+| `gtd.assign(title, priority?, status?, assignee?, due?, start?, end?, depends_on?, tags?, description?)` | Create a task. Defaults to `status=inbox`, priority salience 0.5. |
+| `gtd.next(limit?, assignee?)`                                                              | Actionable gtd.tasks (status in `{next, active}`), priority-sorted.   |
+| `gtd.complete(id, result?)`                                                                | Mark done. Records `completed_at` and validates the transition. `done` is terminal — no further transitions. |
+| `gtd.tasks(status?, assignee?, priority?, limit?, offset?)`                                | Filtered listing.                                                 |
+| `gtd.transition(id, status, note?)`                                                        | Explicit GTD state change with lifecycle validation.              |
 
 Statuses accept canonical names _or_ aliases: `in_progress → active`, `todo → inbox`, `blocked → waiting`, `later → someday`, `finished → done`.
 

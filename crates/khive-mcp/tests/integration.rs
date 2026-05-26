@@ -294,20 +294,20 @@ async fn assign_then_next_then_complete() -> anyhow::Result<()> {
 
     let assigned = ok_one(
         &client,
-        r#"assign(title="ship release", status="next", priority="p0")"#,
+        r#"gtd.assign(title="ship release", status="next", priority="p0")"#,
     )
     .await?;
     let id = assigned["full_id"].as_str().unwrap().to_string();
     assert_eq!(assigned["kind"], "task");
     assert_eq!(assigned["status"], "next");
 
-    let next_list = ok_one(&client, "next()").await?;
+    let next_list = ok_one(&client, "gtd.next()").await?;
     let arr = next_list.as_array().unwrap();
     assert!(arr.iter().any(|t| t["full_id"] == id));
 
     let completed = ok_one(
         &client,
-        &format!(r#"complete(id="{id}", result="shipped via request")"#),
+        &format!(r#"gtd.complete(id="{id}", result="shipped via request")"#),
     )
     .await?;
     assert_eq!(completed["to"], "done");
@@ -317,16 +317,20 @@ async fn assign_then_next_then_complete() -> anyhow::Result<()> {
 #[tokio::test]
 async fn transition_lifecycle_rejection_is_per_op_not_protocol_error() -> anyhow::Result<()> {
     let client = connect().await?;
-    let assigned = ok_one(&client, r#"assign(title="lifecycle")"#).await?;
+    let assigned = ok_one(&client, r#"gtd.assign(title="lifecycle")"#).await?;
     let id = assigned["full_id"].as_str().unwrap().to_string();
 
     // inbox → done is allowed; done → inbox is NOT.
-    ok_one(&client, &format!(r#"transition(id="{id}", status="done")"#)).await?;
+    ok_one(
+        &client,
+        &format!(r#"gtd.transition(id="{id}", status="done")"#),
+    )
+    .await?;
 
     let result = call(
         &client,
         "request",
-        json!({"ops": format!(r#"transition(id="{id}", status="inbox")"#)}),
+        json!({"ops": format!(r#"gtd.transition(id="{id}", status="inbox")"#)}),
     )
     .await?;
     let body: Value = serde_json::from_str(&first_text(&result))?;
@@ -346,9 +350,9 @@ async fn transition_lifecycle_rejection_is_per_op_not_protocol_error() -> anyhow
 async fn parallel_assign_batch_creates_n_tasks() -> anyhow::Result<()> {
     let client = connect().await?;
     let ops = r#"[
-        assign(title="t1", priority="p0"),
-        assign(title="t2", priority="p1"),
-        assign(title="t3", priority="p2")
+        gtd.assign(title="t1", priority="p0"),
+        gtd.assign(title="t2", priority="p1"),
+        gtd.assign(title="t3", priority="p2")
     ]"#;
     let result = call(&client, "request", json!({"ops": ops})).await?;
     let body: Value = serde_json::from_str(&first_text(&result))?;
@@ -382,7 +386,7 @@ async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
     let instructions = info.instructions.unwrap_or_default();
     assert!(instructions.contains("create"), "kg verb missing");
     assert!(
-        !instructions.contains("\n  assign "),
+        !instructions.contains("gtd.assign"),
         "gtd verb should not be in catalog when only kg is loaded"
     );
 }
@@ -435,7 +439,7 @@ async fn json_form_request_works_identically() -> anyhow::Result<()> {
     let result = call(
         &client,
         "request",
-        json!({"ops": r#"[{"tool":"assign","args":{"title":"json form","priority":"p1"}}]"#}),
+        json!({"ops": r#"[{"tool":"gtd.assign","args":{"title":"json form","priority":"p1"}}]"#}),
     )
     .await?;
     let body: Value = serde_json::from_str(&first_text(&result))?;
@@ -479,7 +483,7 @@ async fn kg_create_note_kind_task_resolves_depends_on_against_task_target() -> a
     // Stand up a task that the new task will depend on. The GTD ADR-031 edge
     // rule allows depends_on between two task notes, so this is the only
     // shape the kg-create-with-task-kind path will accept.
-    let blocker = ok_one(&client, r#"assign(title="write spec")"#).await?;
+    let blocker = ok_one(&client, r#"gtd.assign(title="write spec")"#).await?;
     let blocker_full = blocker["full_id"].as_str().unwrap().to_string();
 
     let task = ok_one(
@@ -555,12 +559,12 @@ async fn kg_create_note_kind_task_rejects_non_task_depends_on_before_write() -> 
 async fn gtd_assign_creates_depends_on_edge_between_two_tasks() -> anyhow::Result<()> {
     let client = connect().await?;
 
-    let blocker = ok_one(&client, r#"assign(title="write spec")"#).await?;
+    let blocker = ok_one(&client, r#"gtd.assign(title="write spec")"#).await?;
     let blocker_full = blocker["full_id"].as_str().unwrap().to_string();
     let dependent = ok_one(
         &client,
         &format!(
-            r#"assign(title="implement feature", depends_on=["{}"])"#,
+            r#"gtd.assign(title="implement feature", depends_on=["{}"])"#,
             blocker_full
         ),
     )
@@ -688,7 +692,7 @@ async fn list_with_granular_entity_kind_filters_results() -> anyhow::Result<()> 
 #[tokio::test]
 async fn list_with_granular_task_kind_lists_only_tasks() -> anyhow::Result<()> {
     let client = connect().await?;
-    ok_one(&client, r#"assign(title="GranularTaskA")"#).await?;
+    ok_one(&client, r#"gtd.assign(title="GranularTaskA")"#).await?;
     ok_one(
         &client,
         r#"create(kind="observation", content="not a task")"#,
@@ -745,7 +749,7 @@ async fn search_with_granular_entity_kind() -> anyhow::Result<()> {
 #[tokio::test]
 async fn search_with_granular_task_kind() -> anyhow::Result<()> {
     let client = connect().await?;
-    ok_one(&client, r#"assign(title="urgent search needle one")"#).await?;
+    ok_one(&client, r#"gtd.assign(title="urgent search needle one")"#).await?;
     ok_one(
         &client,
         r#"create(kind="observation", content="urgent search needle two")"#,
@@ -775,7 +779,7 @@ async fn search_substrate_wide_note_kind_still_works() -> anyhow::Result<()> {
     let client = connect().await?;
     ok_one(
         &client,
-        r#"assign(title="quasiparticle task entry", description="quasiparticle decoherence backlog")"#,
+        r#"gtd.assign(title="quasiparticle task entry", description="quasiparticle decoherence backlog")"#,
     )
     .await?;
     ok_one(
@@ -865,7 +869,7 @@ async fn search_substrate_kind_note_with_legacy_note_kind_sub_filter() -> anyhow
     let client = connect().await?;
     ok_one(
         &client,
-        r#"assign(title="ghyll task entry", description="ghyll mistral foxtrot marker")"#,
+        r#"gtd.assign(title="ghyll task entry", description="ghyll mistral foxtrot marker")"#,
     )
     .await?;
     ok_one(
@@ -1211,7 +1215,7 @@ async fn test_prev_dot_id_resolves() -> anyhow::Result<()> {
         &client,
         "request",
         json!({
-            "ops": r#"assign(title="chain-prev-id-test", status="next") | complete(id=$prev.id)"#,
+            "ops": r#"gtd.assign(title="chain-prev-id-test", status="next") | gtd.complete(id=$prev.id)"#,
             "presentation": "verbose"
         }),
     )
@@ -1223,13 +1227,13 @@ async fn test_prev_dot_id_resolves() -> anyhow::Result<()> {
     assert_eq!(
         results[0]["ok"],
         json!(true),
-        "assign (op 0) must succeed: {}",
+        "gtd.assign (op 0) must succeed: {}",
         results[0]
     );
     assert_eq!(
         results[1]["ok"],
         json!(true),
-        "complete (op 1) must succeed — $prev.id was not resolved: {}",
+        "gtd.complete (op 1) must succeed — $prev.id was not resolved: {}",
         results[1]
     );
     assert_eq!(body["summary"]["succeeded"], json!(2));
@@ -1392,7 +1396,7 @@ async fn test_prev_unresolvable_aborts_chain() -> anyhow::Result<()> {
 /// UE4-H1: Chain bare `$prev` (no dot path) when the prior result is a map
 /// must be rejected with a clear substitution error that lists available fields.
 ///
-/// `assign | complete(id=$prev.id, result=$prev)` — `$prev.id` resolves fine
+/// `gtd.assign | gtd.complete(id=$prev.id, result=$prev)` — `$prev.id` resolves fine
 /// (scalar), but `result=$prev` resolves to the whole assign result map.
 /// The dispatcher must catch the bare map substitution and return a per-op error
 /// with `kind=substitution_error` and a message listing the available fields —
@@ -1406,7 +1410,7 @@ async fn test_ue4_h1_bare_prev_map_produces_clear_substitution_error() -> anyhow
         &client,
         "request",
         json!({
-            "ops": r#"assign(title="bare-prev-test") | complete(id=$prev.id, result=$prev)"#,
+            "ops": r#"gtd.assign(title="bare-prev-test") | gtd.complete(id=$prev.id, result=$prev)"#,
             "presentation": "verbose"
         }),
     )
@@ -1516,7 +1520,7 @@ async fn help_schema(
 #[tokio::test]
 async fn help_recall_params_non_empty_with_query_param() -> anyhow::Result<()> {
     let client = connect_full().await?;
-    let schema = help_schema(&client, "recall").await?;
+    let schema = help_schema(&client, "memory.recall").await?;
     let params = schema["params"]
         .as_array()
         .expect("params must be an array");
@@ -1612,13 +1616,13 @@ async fn connect_comm_schedule(
     Ok(client)
 }
 
-/// `send(help=true)` must return a non-empty params array with required `to` and `content`.
+/// `comm.send(help=true)` must return a non-empty params array with required `to` and `content`.
 #[tokio::test]
 async fn send_help_returns_required_to_and_content() -> anyhow::Result<()> {
     let client = connect_comm_schedule().await?;
-    let result = ok_one(&client, "send(help=true)").await?;
+    let result = ok_one(&client, "comm.send(help=true)").await?;
 
-    assert_eq!(result["verb"], "send");
+    assert_eq!(result["verb"], "comm.send");
     assert_eq!(result["pack"], "comm");
 
     let params = result["params"]
@@ -1641,13 +1645,13 @@ async fn send_help_returns_required_to_and_content() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `inbox(help=true)` must return optional `limit` and `status`.
+/// `comm.inbox(help=true)` must return optional `limit` and `status`.
 #[tokio::test]
 async fn inbox_help_returns_optional_limit_and_status() -> anyhow::Result<()> {
     let client = connect_comm_schedule().await?;
-    let result = ok_one(&client, "inbox(help=true)").await?;
+    let result = ok_one(&client, "comm.inbox(help=true)").await?;
 
-    assert_eq!(result["verb"], "inbox");
+    assert_eq!(result["verb"], "comm.inbox");
     assert_eq!(result["pack"], "comm");
 
     let params = result["params"]
@@ -1670,13 +1674,13 @@ async fn inbox_help_returns_optional_limit_and_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `schedule(help=true)` must return required `action` and `at`.
+/// `schedule.schedule(help=true)` must return required `action` and `at`.
 #[tokio::test]
 async fn schedule_help_returns_required_action_and_at() -> anyhow::Result<()> {
     let client = connect_comm_schedule().await?;
-    let result = ok_one(&client, "schedule(help=true)").await?;
+    let result = ok_one(&client, "schedule.schedule(help=true)").await?;
 
-    assert_eq!(result["verb"], "schedule");
+    assert_eq!(result["verb"], "schedule.schedule");
     assert_eq!(result["pack"], "schedule");
 
     let params = result["params"]
@@ -1702,13 +1706,13 @@ async fn schedule_help_returns_required_action_and_at() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `remind(help=true)` must return required `content` and `at`, optional `repeat`.
+/// `schedule.remind(help=true)` must return required `content` and `at`, optional `repeat`.
 #[tokio::test]
 async fn remind_help_returns_required_content_and_at() -> anyhow::Result<()> {
     let client = connect_comm_schedule().await?;
-    let result = ok_one(&client, "remind(help=true)").await?;
+    let result = ok_one(&client, "schedule.remind(help=true)").await?;
 
-    assert_eq!(result["verb"], "remind");
+    assert_eq!(result["verb"], "schedule.remind");
     assert_eq!(result["pack"], "schedule");
 
     let params = result["params"]

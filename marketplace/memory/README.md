@@ -10,8 +10,8 @@ All verbs are dispatched through the single MCP `request` tool ([ADR-020](https:
 
 | Verb | What it does |
 | ---- | ------------ |
-| `remember(content, memory_type?, importance?/salience?, decay_factor?/decay?, source_id?/source?, namespace?, tags?)` | Store a memory note with salience and decay metadata. |
-| `recall(query, limit?, memory_type?, min_score?, min_salience?, config?, namespace?)` | Search memory notes only, then rank by relevance, importance, and recency. |
+| `memory.remember(content, memory_type?, importance?/salience?, decay_factor?/decay?, source_id?/source?, namespace?, tags?)` | Store a memory note with salience and decay metadata. |
+| `memory.recall(query, limit?, memory_type?, min_score?, min_salience?, config?, namespace?)` | Search memory notes only, then rank by relevance, importance, and recency. |
 
 Memory types:
 

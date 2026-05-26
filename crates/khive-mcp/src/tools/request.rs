@@ -10,11 +10,11 @@ pub struct RequestParams {
     /// One or more operations as a function-call DSL or JSON-form string.
     ///
     /// Examples:
-    /// - `next()`
-    /// - `assign(title="ship", priority="p1")`
+    /// - `gtd.next()`
+    /// - `gtd.assign(title="ship", priority="p1")`
     /// - `create(kind="entity", name="A") | link(source_id=$prev.id, target_id="b", relation="extends")`
     /// - `[create(kind="entity", entity_kind="concept", name="A"), create(kind="entity", entity_kind="concept", name="B")]`
-    /// - `[{"tool":"next","args":{}}, {"tool":"complete","args":{"id":"abc"}}]`
+    /// - `[{"tool":"gtd.next","args":{}}, {"tool":"gtd.complete","args":{"id":"abc"}}]`
     ///
     /// Max 100 operations per batch.
     #[schemars(

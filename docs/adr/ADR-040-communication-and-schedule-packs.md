@@ -57,12 +57,12 @@ impl Pack for CommPack {
     const NOTE_KINDS:   &'static [&'static str] = &["message"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS:     &'static [HandlerDef]   = &[
-        HandlerDef { name: "send",  description: "Send a message, optionally threaded.",  visibility: Visibility::Verb },
-        HandlerDef { name: "inbox", description: "List inbound messages for the caller.", visibility: Visibility::Verb },
-        HandlerDef { name: "read",  description: "Mark a message as read.",               visibility: Visibility::Verb },
-        HandlerDef { name: "reply", description: "Reply to a message, threading linkage.", visibility: Visibility::Verb },
+        HandlerDef { name: "comm.send",  description: "Send a message, optionally threaded.",  visibility: Visibility::Verb },
+        HandlerDef { name: "comm.inbox", description: "List inbound messages for the caller.", visibility: Visibility::Verb },
+        HandlerDef { name: "comm.read",  description: "Mark a message as read.",               visibility: Visibility::Verb },
+        HandlerDef { name: "comm.reply", description: "Reply to a message, threading linkage.", visibility: Visibility::Verb },
     ];
-    // Wire form: comm.send / comm.inbox / comm.read / comm.reply (all Verb)
+    // ADR-023 §4: pack-prefixed verb names — `comm.send` / `comm.inbox` / `comm.read` / `comm.reply`
     const EDGE_RULES:   &'static [EdgeEndpointRule] = &[];
     const REQUIRES:     &'static [&'static str] = &["kg"];
 }
@@ -94,12 +94,12 @@ caller's namespace) or `outbound` (message sent by the caller). This is set by `
 
 #### Four verbs
 
-| Verb    | Speech act (ADR-025) | Args                                      | What it does                                                                                                                                                                                                                 |
-| ------- | -------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `send`  | commissive           | `to`, `subject?`, `content`, `thread_id?` | Create a message note in the recipient's namespace. `from` is set to the caller's identity. `direction=inbound` in recipient's namespace; `direction=outbound` copy created in caller's namespace.                           |
-| `inbox` | assertive            | `limit?`, `status?`                       | List inbound messages (`direction=inbound`) for the caller, ordered by `sent_at` descending. `status` filters on `read`: `unread` (default), `read`, or `all`.                                                               |
-| `read`  | declaration          | `id`                                      | Set `properties.read = true` on the message. Returns the updated message envelope.                                                                                                                                           |
-| `reply` | commissive           | `id`, `content`                           | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the original sender, `subject` prefixed with `"Re: "` if not already. |
+| Verb         | Speech act (ADR-025) | Args                                      | What it does                                                                                                                                                                                                                 |
+| ------------ | -------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.send`  | commissive           | `to`, `subject?`, `content`, `thread_id?` | Create a message note in the recipient's namespace. `from` is set to the caller's identity. `direction=inbound` in recipient's namespace; `direction=outbound` copy created in caller's namespace.                           |
+| `comm.inbox` | assertive            | `limit?`, `status?`                       | List inbound messages (`direction=inbound`) for the caller, ordered by `sent_at` descending. `status` filters on `read`: `unread` (default), `read`, or `all`.                                                               |
+| `comm.read`  | declaration          | `id`                                      | Set `properties.read = true` on the message. Returns the updated message envelope.                                                                                                                                           |
+| `comm.reply` | commissive           | `id`, `content`                           | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the original sender, `subject` prefixed with `"Re: "` if not already. |
 
 #### Threading model
 
@@ -107,7 +107,7 @@ Threading is flat. A `thread_id` is the UUID of the root message in a conversati
 replies carry the same `thread_id`. The pack does not enforce tree structure — callers can
 reconstruct conversation order from `sent_at` on messages sharing a `thread_id`.
 
-`reply(id)` resolves the thread root: if the target message has a `thread_id`, that value
+`comm.reply(id)` resolves the thread root: if the target message has a `thread_id`, that value
 is propagated; otherwise the target message's own UUID becomes the `thread_id` for the new
 message chain.
 
@@ -192,12 +192,12 @@ impl Pack for SchedulePack {
     const NOTE_KINDS:   &'static [&'static str] = &["scheduled_event"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS:     &'static [HandlerDef]   = &[
-        HandlerDef { name: "remind",   description: "Create a time-triggered reminder.",  visibility: Visibility::Verb },
-        HandlerDef { name: "schedule", description: "Schedule a future verb dispatch.",   visibility: Visibility::Verb },
-        HandlerDef { name: "agenda",   description: "List upcoming scheduled events.",    visibility: Visibility::Verb },
-        HandlerDef { name: "cancel",   description: "Cancel a scheduled event.",          visibility: Visibility::Verb },
+        HandlerDef { name: "schedule.remind",   description: "Create a time-triggered reminder.",  visibility: Visibility::Verb },
+        HandlerDef { name: "schedule.schedule", description: "Schedule a future verb dispatch.",   visibility: Visibility::Verb },
+        HandlerDef { name: "schedule.agenda",   description: "List upcoming scheduled events.",    visibility: Visibility::Verb },
+        HandlerDef { name: "schedule.cancel",   description: "Cancel a scheduled event.",          visibility: Visibility::Verb },
     ];
-    // Wire form: schedule.remind / schedule.schedule / schedule.agenda / schedule.cancel
+    // ADR-023 §4: pack-prefixed verb names — `schedule.remind` / `schedule.schedule` / `schedule.agenda` / `schedule.cancel`
     const EDGE_RULES:   &'static [EdgeEndpointRule] = &[];
     const REQUIRES:     &'static [&'static str] = &["kg"];
 }
@@ -225,12 +225,12 @@ reminders and a JSON-encoded verb call string for scheduled dispatch.
 
 #### Four verbs
 
-| Verb       | Speech act (ADR-025) | Args                       | What it does                                                                                                                                                                            |
-| ---------- | -------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `remind`   | commissive           | `content`, `at`, `repeat?` | Create a `scheduled_event` note with `event_type="remind"`. `content` is the reminder body. `at` is ISO 8601. `repeat` is optional recurrence.                                          |
-| `schedule` | commissive           | `action`, `at`, `repeat?`  | Create a `scheduled_event` note with `event_type="schedule"`. `action` is a serialized verb+args payload (a string accepted by the request DSL parser). `at` and `repeat` are as above. |
-| `agenda`   | assertive            | `from?`, `to?`, `limit?`   | List `scheduled_event` notes with `status="pending"`, ordered by `trigger_at` ascending. `from` / `to` are ISO 8601 window bounds. Default `limit=20`.                                  |
-| `cancel`   | declaration          | `id`                       | Set `properties.status = "cancelled"` and record `cancelled_at`. Returns the updated event envelope.                                                                                    |
+| Verb                | Speech act (ADR-025) | Args                       | What it does                                                                                                                                                                            |
+| ------------------- | -------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schedule.remind`   | commissive           | `content`, `at`, `repeat?` | Create a `scheduled_event` note with `event_type="remind"`. `content` is the reminder body. `at` is ISO 8601. `repeat` is optional recurrence.                                          |
+| `schedule.schedule` | commissive           | `action`, `at`, `repeat?`  | Create a `scheduled_event` note with `event_type="schedule"`. `action` is a serialized verb+args payload (a string accepted by the request DSL parser). `at` and `repeat` are as above. |
+| `schedule.agenda`   | assertive            | `from?`, `to?`, `limit?`   | List `scheduled_event` notes with `status="pending"`, ordered by `trigger_at` ascending. `from` / `to` are ISO 8601 window bounds. Default `limit=20`.                                  |
+| `schedule.cancel`   | declaration          | `id`                       | Set `properties.status = "cancelled"` and record `cancelled_at`. Returns the updated event envelope.                                                                                    |
 
 #### Recurrence specification
 
@@ -257,7 +257,7 @@ process**. The pack stores intent. Two supported execution modes:
    to a future implementation ADR.
 2. **External scheduler integration**: An operator configures OS cron or a cloud scheduler
    to call `kkernel exec --pending-events` at an appropriate polling interval (minimum 1
-   minute). The command fetches `agenda()`, dispatches due events, and marks them `fired`.
+   minute). The command fetches `schedule.agenda()`, dispatches due events, and marks them `fired`.
 
 The pack's responsibility ends at intent storage. Agents call `remind` or `schedule`; the
 execution environment decides when and how to evaluate triggers.
@@ -284,7 +284,7 @@ impl PackRuntime for SchedulePack {
         SchemaPlan {
             pack: "schedule",
             statements: &[
-                // Index on trigger_at for agenda() efficiency.
+                // Index on trigger_at for schedule.agenda() efficiency.
                 "CREATE INDEX IF NOT EXISTS idx_schedule_trigger
                     ON notes(json_extract(properties, '$.trigger_at'))
                     WHERE kind = 'scheduled_event'",
@@ -294,7 +294,7 @@ impl PackRuntime for SchedulePack {
 }
 ```
 
-The partial index on `trigger_at` makes `agenda()` scans efficient without a new table.
+The partial index on `trigger_at` makes `schedule.agenda()` scans efficient without a new table.
 Per ADR-015, pack-auxiliary DDL uses idempotent `CREATE ... IF NOT EXISTS`.
 
 ---
@@ -304,13 +304,13 @@ Per ADR-015, pack-auxiliary DDL uses idempotent `CREATE ... IF NOT EXISTS`.
 Both packs compose with the existing pack set:
 
 **Schedule + GTD**: a `scheduled_event` can fire a GTD verb at trigger time. For example:
-`schedule(action="transition(id='abc12345', status='active')", at="2026-06-01T09:00:00Z")`
+`schedule.schedule(action="gtd.transition(id='abc12345', status='active')", at="2026-06-01T09:00:00Z")`
 auto-transitions a task to active at the scheduled time. No coupling at the pack level —
 the interaction is at the `action` payload level.
 
 **Schedule + Comm**: a scheduled message is a `scheduled_event` with
-`action="send(to='agent:ocean', content='weekly status update')"`. At trigger time the
-execution environment dispatches the `send` verb. No coupling at the pack level.
+`action="comm.send(to='agent:ocean', content='weekly status update')"`. At trigger time the
+execution environment dispatches the `comm.send` verb. No coupling at the pack level.
 
 **Comm + KG**: messages attach to KG entities via `link(message_id, entity_id, annotates)`.
 The `annotates` relation from ADR-002 accepts any note → any substrate; no new edge endpoint
@@ -470,7 +470,7 @@ standard `delete(id)` path.
    `cancel` on a recurring event (cancel just the next occurrence vs. all future occurrences)
    is unspecified in v1.
 
-4. **Message namespace write path**: `send(to="agent:khive")` must resolve `agent:khive` to
+4. **Message namespace write path**: `comm.send(to="agent:khive")` must resolve `agent:khive` to
    a namespace and write a note into that namespace. The exact resolution contract (namespace
    registry, alias table, or unresolved string) is deferred to ADR-018's namespace authority.
 

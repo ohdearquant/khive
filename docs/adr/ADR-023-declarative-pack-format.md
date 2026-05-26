@@ -177,6 +177,16 @@ dots:
 
 The single rule: **first dot is always the pack name. There is no second dot.**
 
+**Enforcement**: This rule is enforced at CI time by the contract test at
+`crates/kkernel/tests/verb_namespace_contract.rs`. The test loads every
+`inventory`-registered pack, walks all `HandlerDef` names, and asserts:
+
+- A bare name (no dot) must be in the 14-entry kg-substrate allowlist.
+- A dotted name must carry exactly one dot whose prefix matches `Pack::NAME`.
+- Two or more dots are always a violation.
+
+Any verb name change or new pack registration that violates §4 will fail CI.
+
 The kkernel CLI uses spaces, not dots, to invoke handlers:
 
 ```bash

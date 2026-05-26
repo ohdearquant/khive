@@ -14,8 +14,8 @@ VERBS_UNDER_TEST = {"create"}
 
 KG_VERBS = ("create", "get", "list", "update", "delete", "merge",
             "search", "link", "neighbors", "traverse", "query")
-GTD_VERBS = ("assign", "next", "complete", "tasks", "transition")
-MEMORY_VERBS = ("remember", "recall")
+GTD_VERBS = ("gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition")
+MEMORY_VERBS = ("memory.remember", "memory.recall")
 
 
 @pytest.mark.adr_027
@@ -136,7 +136,7 @@ def test_kg_session_rejects_gtd_verb(
     GTD verbs must not be callable when gtd pack is not loaded.
     """
     envelope = khive_session.request_batch([
-        {"tool": "assign", "args": {
+        {"tool": "gtd.assign", "args": {
             "title": "test task",
             "namespace": temp_namespace,
         }}
@@ -145,7 +145,7 @@ def test_kg_session_rejects_gtd_verb(
     assert results, "Expected results in envelope"
     first = results[0]
     assert not first.get("ok", False), (
-        "KG-only session should not allow GTD 'assign' verb"
+        "KG-only session should not allow GTD 'gtd.assign' verb"
     )
 
 

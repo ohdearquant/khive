@@ -34,7 +34,7 @@ Do not use the expander for: bulk ingestion (`digester`), open-ended research
 ## Pickup protocol (start of run)
 
 ```
-next(assignee="expander")
+gtd.next(assignee="expander")
 ```
 
 The task's `tags` carry the mode (`kg:expand:promote`, `kg:expand:bridge`, etc.). The
@@ -42,7 +42,7 @@ The task's `tags` carry the mode (`kg:expand:promote`, `kg:expand:bridge`, etc.)
 the metric that flagged this gap — you'll cite it in your decision note.
 
 ```
-transition(id="<task-id>", status="active", note="expander running <mode> on <target>")
+gtd.transition(id="<task-id>", status="active", note="expander running <mode> on <target>")
 ```
 
 If multiple expander tasks exist in your queue, run them ONE AT A TIME. Do not batch.
@@ -80,7 +80,7 @@ Expansion drifts when context blurs across targets.
 **To polisher** (always — new entities need density verification):
 
 ```
-assign(title="Polish <N> new entities from expand:<mode> on <target>",
+gtd.assign(title="Polish <N> new entities from expand:<mode> on <target>",
        assignee="polisher",
        priority="p1",
        tags=["kg:polish", "from:expander", "expand-mode:<mode>"],
@@ -90,7 +90,7 @@ assign(title="Polish <N> new entities from expand:<mode> on <target>",
 **To gap-analyst** (re-survey to see what gaps the expansion opened/closed):
 
 ```
-assign(title="Re-survey gaps after expand on <target>",
+gtd.assign(title="Re-survey gaps after expand on <target>",
        assignee="gap-analyst",
        priority="p3",
        tags=["kg:gap", "from:expander", "post-expand"],
@@ -101,21 +101,21 @@ assign(title="Re-survey gaps after expand on <target>",
 **To digester** (if your expansion identified prior art that should be ingested):
 
 ```
-assign(title="Ingest prior art: <paper/doc list>",
+gtd.assign(title="Ingest prior art: <paper/doc list>",
        assignee="digester",
        priority="p2",
        tags=["kg:digest", "from:expander", "prior-art"])
 ```
 
 ```
-complete(id="<your-task-id>",
+gtd.complete(id="<your-task-id>",
          result="Mode=<X>. Created N entities, M edges, K notes. Density verified.")
 ```
 
 If you filed a `question` note instead of expanding:
 
 ```
-complete(id="<your-task-id>",
+gtd.complete(id="<your-task-id>",
          result="Cannot expand without external input. Question note filed: <note-id>. Reason: <…>")
 ```
 

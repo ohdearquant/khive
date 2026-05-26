@@ -33,10 +33,10 @@ fn comm_pack_declares_message_note_kind() {
 fn comm_pack_declares_four_handlers() {
     assert_eq!(CommPack::HANDLERS.len(), 4);
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
-    assert!(names.contains(&"send"));
-    assert!(names.contains(&"inbox"));
-    assert!(names.contains(&"read"));
-    assert!(names.contains(&"reply"));
+    assert!(names.contains(&"comm.send"));
+    assert!(names.contains(&"comm.inbox"));
+    assert!(names.contains(&"comm.read"));
+    assert!(names.contains(&"comm.reply"));
 }
 
 #[test]
@@ -51,7 +51,7 @@ async fn send_and_inbox_roundtrip() {
     // Send a message — creates an outbound message note.
     let result = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "agent:bob", "content": "hello" }),
         )
         .await
@@ -60,7 +60,10 @@ async fn send_and_inbox_roundtrip() {
 
     // Inbox with status=all returns the sent message (outbound notes are not listed by default).
     let inbox = registry
-        .dispatch("inbox", serde_json::json!({ "status": "all", "limit": 10 }))
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
         .await
         .expect("inbox succeeds");
     // We sent an outbound message; inbox only lists inbound by default.
@@ -76,7 +79,7 @@ async fn read_marks_message_as_read() {
     // Send a message and capture the full_id.
     let sent = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "agent:alice", "content": "mark me read" }),
         )
         .await
@@ -88,7 +91,7 @@ async fn read_marks_message_as_read() {
 
     // Call read with the full UUID — must succeed and return read: true.
     let result = registry
-        .dispatch("read", serde_json::json!({ "id": full_id }))
+        .dispatch("comm.read", serde_json::json!({ "id": full_id }))
         .await
         .expect("read succeeds");
     assert_eq!(
@@ -110,7 +113,7 @@ async fn reply_creates_threaded_message() {
     // Send the original message.
     let original = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({
                 "to": "agent:carol",
                 "content": "original message",
@@ -127,7 +130,7 @@ async fn reply_creates_threaded_message() {
     // Reply to the original message.
     let reply = registry
         .dispatch(
-            "reply",
+            "comm.reply",
             serde_json::json!({
                 "id": original_full_id,
                 "content": "this is a reply"
@@ -170,7 +173,7 @@ async fn test_full_id_returns_36_char() {
 
     let sent = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "agent:target", "content": "hello" }),
         )
         .await
@@ -200,7 +203,7 @@ async fn test_read_accepts_short_id() {
 
     let sent = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "agent:alice", "content": "read me by short id" }),
         )
         .await
@@ -209,7 +212,7 @@ async fn test_read_accepts_short_id() {
     let short = sent.get("id").and_then(|v| v.as_str()).expect("id present");
 
     let result = registry
-        .dispatch("read", serde_json::json!({ "id": short }))
+        .dispatch("comm.read", serde_json::json!({ "id": short }))
         .await
         .expect("read with 8-char short id succeeds");
 
@@ -239,7 +242,7 @@ async fn test_reply_accepts_short_id() {
 
     let sent = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({
                 "to": "agent:carol",
                 "content": "original",
@@ -253,7 +256,7 @@ async fn test_reply_accepts_short_id() {
 
     let reply = registry
         .dispatch(
-            "reply",
+            "comm.reply",
             serde_json::json!({ "id": short, "content": "reply via short id" }),
         )
         .await
@@ -340,7 +343,7 @@ async fn test_short_id_collision_errors_clearly() {
     let registry = builder.build().expect("registry");
 
     let err = registry
-        .dispatch("read", serde_json::json!({ "id": base }))
+        .dispatch("comm.read", serde_json::json!({ "id": base }))
         .await
         .unwrap_err();
 
@@ -359,7 +362,7 @@ async fn test_send_writes_outbound_in_caller_ns() {
 
     registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "lambda:leo", "content": "hi" }),
         )
         .await
@@ -405,7 +408,7 @@ async fn test_send_writes_inbound_in_recipient_ns() {
 
     registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "lambda:leo", "content": "meeting at 3pm" }),
         )
         .await
@@ -454,7 +457,7 @@ async fn test_inbox_returns_inbound_for_recipient() {
     let (send_registry, rt) = build_registry_for_ns("lambda:khive");
     send_registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "lambda:leo", "content": "you have mail" }),
         )
         .await
@@ -468,7 +471,7 @@ async fn test_inbox_returns_inbound_for_recipient() {
     let leo_registry = builder.build().expect("leo registry builds");
 
     let inbox = leo_registry
-        .dispatch("inbox", serde_json::json!({ "status": "unread" }))
+        .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
         .await
         .expect("inbox succeeds");
 
@@ -500,7 +503,7 @@ async fn test_send_to_self_writes_single_note() {
 
     registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "self-note" }),
         )
         .await
@@ -532,7 +535,7 @@ async fn test_reply_from_sender_routes_to_recipient() {
     // Send from lambda:khive to lambda:leo.
     let sent = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "lambda:leo", "content": "hello leo" }),
         )
         .await
@@ -546,7 +549,7 @@ async fn test_reply_from_sender_routes_to_recipient() {
     // Sender (lambda:khive) replies to their own outbound message.
     let reply = registry
         .dispatch(
-            "reply",
+            "comm.reply",
             serde_json::json!({ "id": msg_full_id, "content": "follow-up" }),
         )
         .await
@@ -582,7 +585,7 @@ async fn test_reply_from_recipient_routes_to_sender() {
     let (send_registry, rt) = build_registry_for_ns("lambda:khive");
     send_registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "lambda:leo", "content": "meeting at 3pm" }),
         )
         .await
@@ -596,7 +599,7 @@ async fn test_reply_from_recipient_routes_to_sender() {
     let leo_registry = leo_builder.build().expect("leo registry");
 
     let inbox = leo_registry
-        .dispatch("inbox", serde_json::json!({ "status": "unread" }))
+        .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
         .await
         .expect("inbox succeeds");
     let msgs = inbox
@@ -612,7 +615,7 @@ async fn test_reply_from_recipient_routes_to_sender() {
     // Step 3: lambda:leo replies to the inbound message.
     let reply = leo_registry
         .dispatch(
-            "reply",
+            "comm.reply",
             serde_json::json!({ "id": inbound_full_id, "content": "confirmed" }),
         )
         .await
@@ -646,7 +649,7 @@ async fn test_reply_thread_id_is_full_uuid() {
 
     let original = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "agent:target", "content": "root message" }),
         )
         .await
@@ -658,7 +661,7 @@ async fn test_reply_thread_id_is_full_uuid() {
 
     let reply = registry
         .dispatch(
-            "reply",
+            "comm.reply",
             serde_json::json!({ "id": original_full_id, "content": "first reply" }),
         )
         .await
@@ -695,7 +698,7 @@ async fn test_reply_chain_preserves_full_uuid_thread_id() {
 
     let original = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": "agent:other", "content": "start of thread" }),
         )
         .await
@@ -708,7 +711,7 @@ async fn test_reply_chain_preserves_full_uuid_thread_id() {
     // First reply — creates the thread.
     let reply1 = registry
         .dispatch(
-            "reply",
+            "comm.reply",
             serde_json::json!({ "id": original_full_id, "content": "reply 1" }),
         )
         .await
@@ -726,7 +729,7 @@ async fn test_reply_chain_preserves_full_uuid_thread_id() {
         .expect("full_id on reply1");
     let reply2 = registry
         .dispatch(
-            "reply",
+            "comm.reply",
             serde_json::json!({ "id": reply1_full_id, "content": "reply 2" }),
         )
         .await
@@ -756,7 +759,7 @@ async fn test_send_inbound_failure_rolls_back_outbound() {
 
     let result = registry
         .dispatch(
-            "send",
+            "comm.send",
             serde_json::json!({ "to": invalid_recipient, "content": "should rollback" }),
         )
         .await;

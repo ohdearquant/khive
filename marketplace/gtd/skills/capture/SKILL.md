@@ -19,7 +19,7 @@ A task title is what you'd say out loud: short, verb-first, complete enough to r
 ### 2. Assign with the smallest commitment
 
 ```
-request(ops="assign(title=\"<title>\", priority=\"p2\")")
+request(ops="gtd.assign(title=\"<title>\", priority=\"p2\")")
 ```
 
 Default priority is `p2`. Use `p0`/`p1` only if you genuinely want it pushed up in `next` listings. `p3` for "nice to have, no pressure".
@@ -29,13 +29,13 @@ Default priority is `p2`. Use `p0`/`p1` only if you genuinely want it pushed up 
 If you might forget _why_ this matters, add a description:
 
 ```
-request(ops="assign(title=\"<title>\", priority=\"p1\", description=\"<one-sentence why>\")")
+request(ops="gtd.assign(title=\"<title>\", priority=\"p1\", description=\"<one-sentence why>\")")
 ```
 
 If there's a deadline, set it — but only if it's a real deadline, not aspirational:
 
 ```
-request(ops="assign(title=\"prep slides\", priority=\"p0\", due=\"2026-06-01T10:00:00Z\")")
+request(ops="gtd.assign(title=\"prep slides\", priority=\"p0\", due=\"2026-06-01T10:00:00Z\")")
 ```
 
 ### 4. Multiple captures? Batch them.
@@ -44,9 +44,9 @@ The DSL takes a parallel batch:
 
 ```
 request(ops="[
-  assign(title=\"call dentist\", priority=\"p2\"),
-  assign(title=\"renew passport\", priority=\"p1\", due=\"2026-08-01\"),
-  assign(title=\"finish bench script\", priority=\"p1\", tags=[\"work\",\"lattice\"])
+  gtd.assign(title=\"call dentist\", priority=\"p2\"),
+  gtd.assign(title=\"renew passport\", priority=\"p1\", due=\"2026-08-01\"),
+  gtd.assign(title=\"finish bench script\", priority=\"p1\", tags=[\"work\",\"lattice\"])
 ]")
 ```
 
@@ -62,28 +62,28 @@ Resist:
 
 | Situation                                               | Verb                                                                                                                                                               |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| "Can I act on this right now?" — actually start working | `transition(id=..., status="active")`                                                                                                                              |
-| "I know I can't do this yet, blocked by X"              | `assign(..., status="waiting")` + describe blocker in `description`                                                                                                |
-| "Maybe someday, not now"                                | `assign(..., status="someday")`                                                                                                                                    |
-| Need to record several together and link dependencies   | capture the blocker first, then `assign(..., depends_on=[blocker_full_id])` for the dependent task — the property and the `depends_on` graph edge both get written |
+| "Can I act on this right now?" — actually start working | `gtd.transition(id=..., status="active")`                                                                                                                              |
+| "I know I can't do this yet, blocked by X"              | `gtd.assign(..., status="waiting")` + describe blocker in `description`                                                                                                |
+| "Maybe someday, not now"                                | `gtd.assign(..., status="someday")`                                                                                                                                    |
+| Need to record several together and link dependencies   | capture the blocker first, then `gtd.assign(..., depends_on=[blocker_full_id])` for the dependent task — the property and the `depends_on` graph edge both get written |
 
 ## Examples
 
 **Personal**:
 
 ```
-request(ops="assign(title=\"book physical exam\", priority=\"p1\", due=\"2026-06-30\")")
+request(ops="gtd.assign(title=\"book physical exam\", priority=\"p1\", due=\"2026-06-30\")")
 ```
 
 **With dependency** (two-step — the second `assign` needs the first task's `full_id`):
 
 ```
 # Step 1: capture the blocker
-request(ops="assign(title=\"write spec\", priority=\"p1\")")
+request(ops="gtd.assign(title=\"write spec\", priority=\"p1\")")
 # → returns { id: "<short>", full_id: "<spec-uuid>", ... }
 
 # Step 2: capture the dependent task referencing the blocker
-request(ops="assign(title=\"implement feature\", priority=\"p2\", depends_on=[\"<spec-uuid>\"])")
+request(ops="gtd.assign(title=\"implement feature\", priority=\"p2\", depends_on=[\"<spec-uuid>\"])")
 ```
 
 `assign`'s `depends_on` writes both the property (`properties.depends_on`) and a `depends_on`
@@ -94,9 +94,9 @@ will surface the blocker.
 
 ```
 request(ops="[
-  assign(title=\"reply to Mitchell\", priority=\"p1\"),
-  assign(title=\"clean kitchen\", priority=\"p3\"),
-  assign(title=\"file taxes\", priority=\"p0\", due=\"2026-04-15\"),
-  assign(title=\"learn Polars\", priority=\"p3\", status=\"someday\")
+  gtd.assign(title=\"reply to Mitchell\", priority=\"p1\"),
+  gtd.assign(title=\"clean kitchen\", priority=\"p3\"),
+  gtd.assign(title=\"file taxes\", priority=\"p0\", due=\"2026-04-15\"),
+  gtd.assign(title=\"learn Polars\", priority=\"p3\", status=\"someday\")
 ]")
 ```

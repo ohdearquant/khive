@@ -94,16 +94,16 @@ request(ops="delete(kind=\"entity\", id=\"<id-from-create>\")")
 ### GTD pack smoke tests
 
 ```text
-request(ops="assign(title=\"install-test task\", priority=\"p3\")")
-request(ops="next(limit=3)")
-request(ops="complete(id=\"<id-from-assign>\")")
+request(ops="gtd.assign(title=\"install-test task\", priority=\"p3\")")
+request(ops="gtd.next(limit=3)")
+request(ops="gtd.complete(id=\"<id-from-assign>\")")
 ```
 
 ### Memory pack smoke tests
 
 ```text
-request(ops="remember(content=\"install verification note\", memory_type=\"episodic\", importance=0.1)")
-request(ops="recall(query=\"install verification\", limit=1)")
+request(ops="memory.remember(content=\"install verification note\", memory_type=\"episodic\", importance=0.1)")
+request(ops="memory.recall(query=\"install verification\", limit=1)")
 ```
 
 ### Brain pack smoke tests

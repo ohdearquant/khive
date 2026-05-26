@@ -35,7 +35,7 @@ The system must satisfy:
    or be annotated by an `insight` note. The pack-extensible edge endpoint mechanism
    (ADR-017's `EDGE_RULES`) makes `depends_on: task → task` legal without changes
    to ADR-002.
-5. **Two equivalent paths to the same outcome.** `assign(title="x")` and
+5. **Two equivalent paths to the same outcome.** `gtd.assign(title="x")` and
    `create(kind="note", note_kind="task", title="x")` produce the same task record.
    The pack-owned verb is a flavored convenience over the shared CRUD path.
 
@@ -52,14 +52,13 @@ impl Pack for GtdPack {
     const NOTE_KINDS:   &'static [&'static str]  = &["task"];
     const ENTITY_KINDS: &'static [&'static str]  = &[];
     const HANDLERS:     &'static [HandlerDef]    = &[
-        HandlerDef { name: "assign",     description: "Create a task with optional dependencies.",       visibility: Visibility::Verb },
-        HandlerDef { name: "next",       description: "List actionable tasks (status next or active).", visibility: Visibility::Verb },
-        HandlerDef { name: "complete",   description: "Mark a task done with optional result.",         visibility: Visibility::Verb },
-        HandlerDef { name: "tasks",      description: "Filtered task list.",                            visibility: Visibility::Verb },
-        HandlerDef { name: "transition", description: "Explicit GTD status transition.",                visibility: Visibility::Verb },
+        HandlerDef { name: "gtd.assign",     description: "Create a task with optional dependencies.",       visibility: Visibility::Verb },
+        HandlerDef { name: "gtd.next",       description: "List actionable tasks (status next or active).", visibility: Visibility::Verb },
+        HandlerDef { name: "gtd.complete",   description: "Mark a task done with optional result.",         visibility: Visibility::Verb },
+        HandlerDef { name: "gtd.tasks",      description: "Filtered task list.",                            visibility: Visibility::Verb },
+        HandlerDef { name: "gtd.transition", description: "Explicit GTD status transition.",                visibility: Visibility::Verb },
     ];
-    // Wire form: gtd.assign / gtd.next / gtd.complete / gtd.tasks / gtd.transition
-    // The runtime applies the "gtd." prefix at MCP exposure time per ADR-023 §4.
+    // ADR-023 §4: pack-prefixed verb names — `gtd.assign`, `gtd.next`, etc.
     const EDGE_RULES:   &'static [EdgeEndpointRule] = &[
         EdgeEndpointRule {
             relation: EdgeRelation::DependsOn,
@@ -130,13 +129,13 @@ task-specific knowledge in retrieval.
 
 ### Five disjoint verbs
 
-| Verb         | Purpose                                                                                                                                       |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `assign`     | Create a task. Args: `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?`, `description?`. Returns the task envelope. |
-| `next`       | List actionable tasks (`status ∈ {next, active}`), priority-sorted. Args: `limit?`, `assignee?`.                                              |
-| `complete`   | Validate transition to `done`, record `completed_at` and optional `result`. Args: `id`, `result?`.                                            |
-| `tasks`      | Filtered list. Args: `status?`, `assignee?`, `priority?`, `limit?`, `offset?`.                                                                |
-| `transition` | Explicit lifecycle change with full transition validation. Args: `id`, `status`, `note?`.                                                     |
+| Verb             | Purpose                                                                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gtd.assign`     | Create a task. Args: `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?`, `description?`. Returns the task envelope. |
+| `gtd.next`       | List actionable tasks (`status ∈ {next, active}`), priority-sorted. Args: `limit?`, `assignee?`.                                              |
+| `gtd.complete`   | Validate transition to `done`, record `completed_at` and optional `result`. Args: `id`, `result?`.                                            |
+| `gtd.tasks`      | Filtered list. Args: `status?`, `assignee?`, `priority?`, `limit?`, `offset?`.                                                                |
+| `gtd.transition` | Explicit lifecycle change with full transition validation. Args: `id`, `status`, `note?`.                                                     |
 
 No collision with kg pack's shared CRUD. ADR-017's `VerbRegistry` registers all five
 verbs as `gtd`-owned. The kg pack's `create(kind="note", note_kind="task", ...)`
@@ -221,7 +220,7 @@ Both forms produce equivalent task records:
 **GTD-native** (flavored):
 
 ```text
-assign(title="Implement retrieval", priority="p1", depends_on=["abc12345"])
+gtd.assign(title="Implement retrieval", priority="p1", depends_on=["abc12345"])
 ```
 
 **Shared CRUD** (generic):
@@ -242,7 +241,7 @@ substrate operations through the request DSL."
 `complete` and `transition` enforce the GTD state machine. They are not equivalent to
 kg `update` — `update` patches arbitrary fields without lifecycle awareness, while
 `transition` validates against the allowed-set table. A `done → inbox` `update` would
-silently succeed; `transition(id, "inbox")` from `done` returns `InvalidInput`.
+silently succeed; `gtd.transition(id, "inbox")` from `done` returns `InvalidInput`.
 
 `next` and `tasks` are GTD-specific list queries. `tasks` filters by `status`,
 `assignee`, `priority`. `next` is a specialized form of `tasks` returning actionable
@@ -420,7 +419,7 @@ lifecycle table — illegal jumps (`done → inbox`) are rejected. The two verbs
 different intents:
 
 - `update(id, properties={"due": "2026-07-01"})` — patch a field, no lifecycle.
-- `transition(id, status="active")` — change lifecycle state with validation.
+- `gtd.transition(id, status="active")` — change lifecycle state with validation.
 
 A future agent might call `update(id, properties={"status": "done"})` and silently
 bypass the lifecycle validation. The `transition` verb forces the explicit lifecycle
@@ -437,7 +436,7 @@ LLM-generated tool calls.
 
 `next` is the GTD-canonical query: "what should I work on right now?" It's a specific
 filter (`status ∈ {next, active}`) with a specific sort (priority-descending). Could
-be expressed as `tasks(status=["next", "active"], sort="priority desc")`, but `next()`
+be expressed as `gtd.tasks(status=["next", "active"], sort="priority desc")`, but `gtd.next()`
 is one of the most-called verbs in practice and deserves its own name.
 
 ### Why pack-auxiliary `gtd_lifecycle_audit` table?

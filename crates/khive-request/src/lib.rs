@@ -909,17 +909,17 @@ mod tests {
 
     #[test]
     fn single_op_no_args() {
-        let r = req("next()");
+        let r = req("gtd.next()");
         assert_eq!(r.mode, ExecutionMode::Single);
         assert_eq!(r.ops.len(), 1);
-        assert_eq!(r.ops[0].tool, "next");
+        assert_eq!(r.ops[0].tool, "gtd.next");
         assert!(r.ops[0].args.is_empty());
     }
 
     #[test]
     fn single_op_with_string_arg() {
-        let v = ops(r#"assign(title="ship release")"#);
-        assert_eq!(v[0].tool, "assign");
+        let v = ops(r#"gtd.assign(title="ship release")"#);
+        assert_eq!(v[0].tool, "gtd.assign");
         assert_eq!(val(&v[0].args["title"]), &json!("ship release"));
     }
 
@@ -961,20 +961,20 @@ mod tests {
 
     #[test]
     fn nested_array_and_object_values() {
-        let v = ops(r#"assign(title="x", tags=["a","b"], properties={"k":"v","n":1})"#);
+        let v = ops(r#"gtd.assign(title="x", tags=["a","b"], properties={"k":"v","n":1})"#);
         assert_eq!(val(&v[0].args["tags"]), &json!(["a", "b"]));
         assert_eq!(val(&v[0].args["properties"]), &json!({"k": "v", "n": 1}));
     }
 
     #[test]
     fn string_with_comma_and_paren_inside() {
-        let v = ops(r#"assign(title="hello, world (now)")"#);
+        let v = ops(r#"gtd.assign(title="hello, world (now)")"#);
         assert_eq!(val(&v[0].args["title"]), &json!("hello, world (now)"));
     }
 
     #[test]
     fn string_with_escaped_quote() {
-        let v = ops(r#"assign(title="he said \"hi\"")"#);
+        let v = ops(r#"gtd.assign(title="he said \"hi\"")"#);
         assert_eq!(val(&v[0].args["title"]), &json!("he said \"hi\""));
     }
 
@@ -987,10 +987,11 @@ mod tests {
 
     #[test]
     fn json_form_batch_parses() {
-        let r = req(r#"[{"tool":"next","args":{}}, {"tool":"complete","args":{"id":"abc"}}]"#);
+        let r =
+            req(r#"[{"tool":"gtd.next","args":{}}, {"tool":"gtd.complete","args":{"id":"abc"}}]"#);
         assert_eq!(r.mode, ExecutionMode::Parallel);
         assert_eq!(r.ops.len(), 2);
-        assert_eq!(r.ops[1].tool, "complete");
+        assert_eq!(r.ops[1].tool, "gtd.complete");
         assert_eq!(val(&r.ops[1].args["id"]), &json!("abc"));
     }
 
@@ -999,56 +1000,56 @@ mod tests {
         // Pretty-printers commonly emit `[ {...} ]` with spaces or newlines after `[`.
         // The whitespace is legal JSON, so the parser must route this to the JSON
         // path rather than the function-call batch parser.
-        let v = ops(r#"[  {"tool":"next","args":{}} ]"#);
+        let v = ops(r#"[  {"tool":"gtd.next","args":{}} ]"#);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].tool, "next");
+        assert_eq!(v[0].tool, "gtd.next");
 
-        let v = ops("[\n  {\"tool\":\"next\",\"args\":{}},\n  {\"tool\":\"complete\",\"args\":{\"id\":\"x\"}}\n]");
+        let v = ops("[\n  {\"tool\":\"gtd.next\",\"args\":{}},\n  {\"tool\":\"gtd.complete\",\"args\":{\"id\":\"x\"}}\n]");
         assert_eq!(v.len(), 2);
-        assert_eq!(v[1].tool, "complete");
+        assert_eq!(v[1].tool, "gtd.complete");
     }
 
     #[test]
     fn json_form_single_object_is_treated_as_one_op() {
-        let r = req(r#"{"tool":"next","args":{}}"#);
+        let r = req(r#"{"tool":"gtd.next","args":{}}"#);
         assert_eq!(r.mode, ExecutionMode::Single);
         assert_eq!(r.ops.len(), 1);
-        assert_eq!(r.ops[0].tool, "next");
+        assert_eq!(r.ops[0].tool, "gtd.next");
     }
 
     #[test]
     fn duplicate_arg_rejected() {
-        let err = parse_request(r#"assign(title="a", title="b")"#).unwrap_err();
+        let err = parse_request(r#"gtd.assign(title="a", title="b")"#).unwrap_err();
         assert!(matches!(err, DslError::DuplicateArg { ref name } if name == "title"));
     }
 
     #[test]
     fn unknown_token_after_op_rejected() {
-        let err = parse_request(r#"next() garbage"#).unwrap_err();
+        let err = parse_request(r#"gtd.next() garbage"#).unwrap_err();
         assert!(matches!(err, DslError::UnexpectedChar { .. }));
     }
 
     #[test]
     fn unclosed_paren_rejected() {
-        let err = parse_request(r#"assign(title="a""#).unwrap_err();
+        let err = parse_request(r#"gtd.assign(title="a""#).unwrap_err();
         // The string is closed; the args list isn't.
         assert!(matches!(err, DslError::UnexpectedEof { .. }));
     }
 
     #[test]
     fn unterminated_string_rejected() {
-        let err = parse_request(r#"assign(title="oops)"#).unwrap_err();
+        let err = parse_request(r#"gtd.assign(title="oops)"#).unwrap_err();
         assert!(matches!(err, DslError::UnclosedString));
     }
 
     #[test]
     fn too_many_ops_rejected() {
-        let one = r#"next(),"#;
+        let one = r#"gtd.next(),"#;
         let mut s = String::from("[");
         for _ in 0..MAX_OPS + 1 {
             s.push_str(one);
         }
-        s.push_str("next()]");
+        s.push_str("gtd.next()]");
         let err = parse_request(&s).unwrap_err();
         assert!(matches!(err, DslError::TooManyOps { .. }));
     }
@@ -1063,9 +1064,9 @@ mod tests {
 
     #[test]
     fn recall_with_query_arg() {
-        let v = ops(r#"recall(query="test")"#);
+        let v = ops(r#"memory.recall(query="test")"#);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].tool, "recall");
+        assert_eq!(v[0].tool, "memory.recall");
         assert_eq!(val(&v[0].args["query"]), &json!("test"));
     }
 
@@ -1080,12 +1081,12 @@ mod tests {
 
     #[test]
     fn parallel_recall_and_inbox() {
-        let r = req(r#"[recall(query="x"), inbox()]"#);
+        let r = req(r#"[memory.recall(query="x"), comm.inbox()]"#);
         assert_eq!(r.mode, ExecutionMode::Parallel);
         assert_eq!(r.ops.len(), 2);
-        assert_eq!(r.ops[0].tool, "recall");
+        assert_eq!(r.ops[0].tool, "memory.recall");
         assert_eq!(val(&r.ops[0].args["query"]), &json!("x"));
-        assert_eq!(r.ops[1].tool, "inbox");
+        assert_eq!(r.ops[1].tool, "comm.inbox");
         assert!(r.ops[1].args.is_empty());
     }
 
@@ -1093,9 +1094,9 @@ mod tests {
 
     #[test]
     fn json_missing_args_defaults_to_empty_map() {
-        let v = ops(r#"{"tool":"inbox"}"#);
+        let v = ops(r#"{"tool":"comm.inbox"}"#);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].tool, "inbox");
+        assert_eq!(v[0].tool, "comm.inbox");
         assert!(v[0].args.is_empty());
     }
 
@@ -1116,18 +1117,18 @@ mod tests {
 
     #[test]
     fn dotted_tool_with_args() {
-        let v = ops(r#"recall.candidates(query="test", limit=5)"#);
-        assert_eq!(v[0].tool, "recall.candidates");
+        let v = ops(r#"memory.recall_candidates(query="test", limit=5)"#);
+        assert_eq!(v[0].tool, "memory.recall_candidates");
         assert_eq!(val(&v[0].args["query"]), &json!("test"));
         assert_eq!(val(&v[0].args["limit"]), &json!(5));
     }
 
     #[test]
     fn dotted_tool_in_batch() {
-        let v = ops(r#"[brain.state(), recall.fuse(query="x")]"#);
+        let v = ops(r#"[brain.state(), memory.recall_fuse(query="x")]"#);
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].tool, "brain.state");
-        assert_eq!(v[1].tool, "recall.fuse");
+        assert_eq!(v[1].tool, "memory.recall_fuse");
     }
 
     #[test]
@@ -1153,7 +1154,7 @@ mod tests {
 
     #[test]
     fn unicode_string_arg_preserved() {
-        let v = ops(r#"assign(title="café")"#);
+        let v = ops(r#"gtd.assign(title="café")"#);
         assert_eq!(val(&v[0].args["title"]), &json!("café"));
     }
 
@@ -1190,7 +1191,7 @@ mod tests {
     #[test]
     fn chain_prev_no_field_selector() {
         // $prev alone (no dot path) refers to the whole prior result.
-        let r = req(r#"next() | update(id=$prev)"#);
+        let r = req(r#"gtd.next() | update(id=$prev)"#);
         assert_eq!(r.mode, ExecutionMode::Chain);
         assert_eq!(r.ops[1].args["id"], ArgValue::PrevRef { path: "".into() });
     }
@@ -1211,15 +1212,15 @@ mod tests {
 
     #[test]
     fn single_op_mode() {
-        let r = req("next()");
+        let r = req("gtd.next()");
         assert_eq!(r.mode, ExecutionMode::Single);
     }
 
     #[test]
     fn chain_too_many_ops_rejected() {
-        let mut s = String::from("next()");
+        let mut s = String::from("gtd.next()");
         for _ in 0..MAX_OPS {
-            s.push_str(" | next()");
+            s.push_str(" | gtd.next()");
         }
         let err = parse_request(&s).unwrap_err();
         assert!(matches!(err, DslError::TooManyOps { .. }));
@@ -1269,8 +1270,10 @@ mod tests {
 
     #[test]
     fn chain_prev_in_single_element_array() {
-        // `assign(title="root") | assign(title="dep", depends_on=[$prev.full_id])`
-        let r = req(r#"assign(title="root") | assign(title="dep", depends_on=[$prev.full_id])"#);
+        // `gtd.assign(title="root") | gtd.assign(title="dep", depends_on=[$prev.full_id])`
+        let r = req(
+            r#"gtd.assign(title="root") | gtd.assign(title="dep", depends_on=[$prev.full_id])"#,
+        );
         assert_eq!(r.mode, ExecutionMode::Chain);
         assert_eq!(r.ops.len(), 2);
         match &r.ops[1].args["depends_on"] {
@@ -1291,7 +1294,7 @@ mod tests {
     fn chain_prev_in_mixed_array() {
         // `[$prev.id, "literal-uuid"]` — first element is PrevRef, second is literal.
         let r = req(
-            r#"assign(title="root") | assign(title="dep", depends_on=[$prev.id, "literal-uuid"])"#,
+            r#"gtd.assign(title="root") | gtd.assign(title="dep", depends_on=[$prev.id, "literal-uuid"])"#,
         );
         assert_eq!(r.mode, ExecutionMode::Chain);
         match &r.ops[1].args["depends_on"] {
@@ -1308,7 +1311,7 @@ mod tests {
     fn chain_prev_multiple_in_array() {
         // `depends_on=[$prev.field.deep, $prev.other]`
         let r = req(
-            r#"assign(title="root") | assign(title="dep", depends_on=[$prev.field.deep, $prev.other])"#,
+            r#"gtd.assign(title="root") | gtd.assign(title="dep", depends_on=[$prev.field.deep, $prev.other])"#,
         );
         assert_eq!(r.mode, ExecutionMode::Chain);
         match &r.ops[1].args["depends_on"] {
@@ -1334,8 +1337,9 @@ mod tests {
     #[test]
     fn chain_prev_inside_object_inside_array() {
         // `properties={"refs":[$prev.id]}` — nested: object containing array containing PrevRef
-        let r =
-            req(r#"assign(title="root") | assign(title="dep", properties={"refs": [$prev.id]})"#);
+        let r = req(
+            r#"gtd.assign(title="root") | gtd.assign(title="dep", properties={"refs": [$prev.id]})"#,
+        );
         assert_eq!(r.mode, ExecutionMode::Chain);
         match &r.ops[1].args["properties"] {
             ArgValue::Object(pairs) => {
@@ -1356,14 +1360,14 @@ mod tests {
     #[test]
     fn pure_json_array_folds_to_value() {
         // An array with no $prev refs should still produce ArgValue::Value(Array(...))
-        let v = ops(r#"assign(title="x", depends_on=["a", "b"])"#);
+        let v = ops(r#"gtd.assign(title="x", depends_on=["a", "b"])"#);
         assert_eq!(val(&v[0].args["depends_on"]), &json!(["a", "b"]));
     }
 
     #[test]
     fn pure_json_object_folds_to_value() {
         // An object with no $prev refs should still produce ArgValue::Value(Object(...))
-        let v = ops(r#"assign(title="x", properties={"k": "v"})"#);
+        let v = ops(r#"gtd.assign(title="x", properties={"k": "v"})"#);
         assert_eq!(val(&v[0].args["properties"]), &json!({"k": "v"}));
     }
 

@@ -54,7 +54,7 @@ fn pack(rt: KhiveRuntime) -> Fixture {
 }
 
 async fn assign(pack: &Fixture, body: Value) -> Value {
-    pack.dispatch("assign", body).await.expect("assign ok")
+    pack.dispatch("gtd.assign", body).await.expect("assign ok")
 }
 
 #[tokio::test]
@@ -63,11 +63,11 @@ async fn pack_metadata_matches_trait_consts() {
     assert_eq!(pack.name(), "gtd");
     assert!(pack.note_kinds().contains(&"task"));
     let verbs: Vec<&str> = pack.verbs().iter().map(|v| v.name).collect();
-    assert!(verbs.contains(&"assign"));
-    assert!(verbs.contains(&"next"));
-    assert!(verbs.contains(&"complete"));
-    assert!(verbs.contains(&"tasks"));
-    assert!(verbs.contains(&"transition"));
+    assert!(verbs.contains(&"gtd.assign"));
+    assert!(verbs.contains(&"gtd.next"));
+    assert!(verbs.contains(&"gtd.complete"));
+    assert!(verbs.contains(&"gtd.tasks"));
+    assert!(verbs.contains(&"gtd.transition"));
 }
 
 #[tokio::test]
@@ -86,7 +86,7 @@ async fn assign_creates_a_task_with_defaults() {
 async fn assign_rejects_empty_title() {
     let pack = pack(rt());
     let err = pack
-        .dispatch("assign", json!({"title": "  "}))
+        .dispatch("gtd.assign", json!({"title": "  "}))
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -97,13 +97,13 @@ async fn assign_rejects_empty_title() {
 async fn assign_rejects_invalid_status_and_priority() {
     let pack = pack(rt());
     let err = pack
-        .dispatch("assign", json!({"title": "x", "status": "bogus"}))
+        .dispatch("gtd.assign", json!({"title": "x", "status": "bogus"}))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("invalid status"));
 
     let err = pack
-        .dispatch("assign", json!({"title": "x", "priority": "p9"}))
+        .dispatch("gtd.assign", json!({"title": "x", "priority": "p9"}))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("invalid priority"));
@@ -141,7 +141,7 @@ async fn next_returns_only_actionable_in_priority_order() {
     )
     .await;
 
-    let resp = pack.dispatch("next", json!({})).await.unwrap();
+    let resp = pack.dispatch("gtd.next", json!({})).await.unwrap();
     let arr = resp.as_array().unwrap();
     assert_eq!(arr.len(), 3, "only next/active count as actionable");
     let titles: Vec<&str> = arr.iter().map(|t| t["title"].as_str().unwrap()).collect();
@@ -163,7 +163,7 @@ async fn next_supports_assignee_filter() {
     .await;
 
     let resp = pack
-        .dispatch("next", json!({"assignee": "alice"}))
+        .dispatch("gtd.next", json!({"assignee": "alice"}))
         .await
         .unwrap();
     let arr = resp.as_array().unwrap();
@@ -178,12 +178,12 @@ async fn complete_marks_task_done_and_is_idempotent_via_load_check() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     // UE2-H1: must transition to an actionable state before completing.
-    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+    pack.dispatch("gtd.transition", json!({"id": id, "status": "next"}))
         .await
         .expect("transition to next must succeed");
 
     let done = pack
-        .dispatch("complete", json!({"id": id, "result": "shipped"}))
+        .dispatch("gtd.complete", json!({"id": id, "result": "shipped"}))
         .await
         .unwrap();
     assert_eq!(done["completed"], true);
@@ -192,7 +192,7 @@ async fn complete_marks_task_done_and_is_idempotent_via_load_check() {
 
     // Second complete must fail because "done" is a terminal state.
     let err = pack
-        .dispatch("complete", json!({"id": id}))
+        .dispatch("gtd.complete", json!({"id": id}))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("terminal state"));
@@ -207,12 +207,12 @@ async fn complete_via_short_id_resolves_prefix() {
     assert_eq!(short.len(), 8);
 
     // UE2-H1: transition to next first.
-    pack.dispatch("transition", json!({"id": full_id, "status": "next"}))
+    pack.dispatch("gtd.transition", json!({"id": full_id, "status": "next"}))
         .await
         .expect("transition to next must succeed");
 
     let done = pack
-        .dispatch("complete", json!({"id": short}))
+        .dispatch("gtd.complete", json!({"id": short}))
         .await
         .unwrap();
     assert_eq!(done["to"], "done");
@@ -238,7 +238,7 @@ async fn complete_rejects_non_task_notes() {
     let pack = pack(runtime);
     let err = pack
         .dispatch(
-            "complete",
+            "gtd.complete",
             json!({"id": note.id.as_hyphenated().to_string()}),
         )
         .await
@@ -269,14 +269,14 @@ async fn tasks_filters_by_status_and_priority() {
     .await;
 
     let resp = pack
-        .dispatch("tasks", json!({"status": "next"}))
+        .dispatch("gtd.tasks", json!({"status": "next"}))
         .await
         .unwrap();
     let arr = resp.as_array().unwrap();
     assert_eq!(arr.len(), 2);
 
     let resp = pack
-        .dispatch("tasks", json!({"status": "next", "priority": "p0"}))
+        .dispatch("gtd.tasks", json!({"status": "next", "priority": "p0"}))
         .await
         .unwrap();
     let arr = resp.as_array().unwrap();
@@ -292,14 +292,14 @@ async fn transition_enforces_lifecycle_rules() {
 
     // inbox → done is allowed.
     let r = pack
-        .dispatch("transition", json!({"id": id, "status": "active"}))
+        .dispatch("gtd.transition", json!({"id": id, "status": "active"}))
         .await
         .unwrap();
     assert_eq!(r["to"], "active");
 
     // active → inbox is NOT allowed.
     let err = pack
-        .dispatch("transition", json!({"id": id, "status": "inbox"}))
+        .dispatch("gtd.transition", json!({"id": id, "status": "inbox"}))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("cannot transition"));
@@ -312,7 +312,7 @@ async fn transition_to_same_status_is_idempotent_noop() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let r = pack
-        .dispatch("transition", json!({"id": id, "status": "next"}))
+        .dispatch("gtd.transition", json!({"id": id, "status": "next"}))
         .await
         .unwrap();
     assert_eq!(r["transitioned"], false);
@@ -397,7 +397,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
 
     let err = pack
         .dispatch(
-            "assign",
+            "gtd.assign",
             json!({"title": "depends on observation", "depends_on": [other_full]}),
         )
         .await
@@ -563,7 +563,7 @@ async fn transition_writes_lifecycle_audit_record() {
 
     fixture
         .dispatch(
-            "transition",
+            "gtd.transition",
             json!({"id": task_id, "status": "next", "note": "moved to next"}),
         )
         .await
@@ -637,12 +637,12 @@ async fn complete_writes_lifecycle_audit_record() {
 
     // UE2-H1: transition to actionable state first.
     fixture
-        .dispatch("transition", json!({"id": task_id, "status": "next"}))
+        .dispatch("gtd.transition", json!({"id": task_id, "status": "next"}))
         .await
         .expect("transition to next should succeed");
 
     fixture
-        .dispatch("complete", json!({"id": task_id, "result": "done!"}))
+        .dispatch("gtd.complete", json!({"id": task_id, "result": "done!"}))
         .await
         .expect("complete should succeed");
 
@@ -688,14 +688,14 @@ async fn test_transition_from_done_rejected() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     // Move to done.
-    pack.dispatch("transition", json!({"id": id, "status": "done"}))
+    pack.dispatch("gtd.transition", json!({"id": id, "status": "done"}))
         .await
         .expect("transition to done must succeed");
 
     // Any further transition out of done must fail.
     for target in &["next", "active", "inbox", "waiting", "someday", "cancelled"] {
         let err = pack
-            .dispatch("transition", json!({"id": id, "status": target}))
+            .dispatch("gtd.transition", json!({"id": id, "status": target}))
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -718,14 +718,14 @@ async fn test_transition_from_cancelled_rejected() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     // Move to cancelled.
-    pack.dispatch("transition", json!({"id": id, "status": "cancelled"}))
+    pack.dispatch("gtd.transition", json!({"id": id, "status": "cancelled"}))
         .await
         .expect("transition to cancelled must succeed");
 
     // Any further transition out of cancelled must fail.
     for target in &["next", "active", "inbox", "waiting", "someday", "done"] {
         let err = pack
-            .dispatch("transition", json!({"id": id, "status": target}))
+            .dispatch("gtd.transition", json!({"id": id, "status": target}))
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -748,20 +748,20 @@ async fn test_complete_on_already_done_returns_clear_error() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     // UE2-H1: transition to actionable state first.
-    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+    pack.dispatch("gtd.transition", json!({"id": id, "status": "next"}))
         .await
         .expect("transition to next must succeed");
 
     // First complete succeeds.
     let done = pack
-        .dispatch("complete", json!({"id": id, "result": "shipped"}))
+        .dispatch("gtd.complete", json!({"id": id, "result": "shipped"}))
         .await
         .expect("first complete must succeed");
     assert_eq!(done["to"], "done");
 
     // Second complete on an already-done task must fail with a clear error.
     let err = pack
-        .dispatch("complete", json!({"id": id}))
+        .dispatch("gtd.complete", json!({"id": id}))
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -827,7 +827,7 @@ async fn get_task_after_transition_exposes_updated_gtd_status() {
     let resp = assign(&pack, json!({"title": "transition remap test"})).await;
     let full_id = resp["full_id"].as_str().unwrap().to_string();
 
-    pack.dispatch("transition", json!({"id": full_id, "status": "active"}))
+    pack.dispatch("gtd.transition", json!({"id": full_id, "status": "active"}))
         .await
         .expect("transition to active must succeed");
 
@@ -857,11 +857,11 @@ async fn get_task_after_complete_exposes_done_status() {
     let full_id = resp["full_id"].as_str().unwrap().to_string();
 
     // UE2-H1: transition to actionable state first.
-    pack.dispatch("transition", json!({"id": full_id, "status": "next"}))
+    pack.dispatch("gtd.transition", json!({"id": full_id, "status": "next"}))
         .await
         .expect("transition to next must succeed");
 
-    pack.dispatch("complete", json!({"id": full_id, "result": "shipped"}))
+    pack.dispatch("gtd.complete", json!({"id": full_id, "result": "shipped"}))
         .await
         .expect("complete must succeed");
 
@@ -946,13 +946,13 @@ async fn noop_transition_does_not_write_audit_record() {
 
     // Real transition — initializes the audit schema and writes one row.
     fixture
-        .dispatch("transition", json!({"id": task_id, "status": "next"}))
+        .dispatch("gtd.transition", json!({"id": task_id, "status": "next"}))
         .await
         .expect("real transition should succeed");
 
     // Noop transition — must not write a second row.
     let r = fixture
-        .dispatch("transition", json!({"id": task_id, "status": "next"}))
+        .dispatch("gtd.transition", json!({"id": task_id, "status": "next"}))
         .await
         .expect("noop transition should return ok");
     assert_eq!(
@@ -998,7 +998,7 @@ async fn assign_rejects_terminal_status_done() {
     let pack = pack(rt());
     let err = pack
         .dispatch(
-            "assign",
+            "gtd.assign",
             json!({"title": "terminal task", "status": "done"}),
         )
         .await
@@ -1020,7 +1020,7 @@ async fn assign_rejects_terminal_status_cancelled() {
     let pack = pack(rt());
     let err = pack
         .dispatch(
-            "assign",
+            "gtd.assign",
             json!({"title": "terminal task", "status": "cancelled"}),
         )
         .await
@@ -1041,7 +1041,10 @@ async fn assign_rejects_terminal_status_cancelled() {
 async fn assign_accepts_inbox_status() {
     let pack = pack(rt());
     let resp = pack
-        .dispatch("assign", json!({"title": "inbox task", "status": "inbox"}))
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "inbox task", "status": "inbox"}),
+        )
         .await
         .expect("inbox is a valid initial status");
     assert_eq!(resp["status"], "inbox");
@@ -1053,7 +1056,7 @@ async fn assign_due_iso8601_full_accepted() {
     let pack = pack(rt());
     let resp = pack
         .dispatch(
-            "assign",
+            "gtd.assign",
             json!({"title": "iso due", "due": "2026-06-01T00:00:00Z"}),
         )
         .await
@@ -1070,7 +1073,7 @@ async fn assign_due_date_only_accepted() {
     let pack = pack(rt());
     let resp = pack
         .dispatch(
-            "assign",
+            "gtd.assign",
             json!({"title": "date-only due", "due": "2026-06-01"}),
         )
         .await
@@ -1085,7 +1088,10 @@ async fn assign_due_date_only_accepted() {
 async fn assign_due_free_text_rejected() {
     let pack = pack(rt());
     let err = pack
-        .dispatch("assign", json!({"title": "vague due", "due": "tomorrow"}))
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "vague due", "due": "tomorrow"}),
+        )
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -1105,7 +1111,7 @@ async fn assign_due_natural_language_rejected() {
     let pack = pack(rt());
     let err = pack
         .dispatch(
-            "assign",
+            "gtd.assign",
             json!({"title": "vague due", "due": "June 1st 2026"}),
         )
         .await
@@ -1125,12 +1131,12 @@ async fn complete_response_includes_completed_at() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     // UE2-H1: transition to actionable state first.
-    pack.dispatch("transition", json!({"id": id, "status": "active"}))
+    pack.dispatch("gtd.transition", json!({"id": id, "status": "active"}))
         .await
         .expect("transition to active must succeed");
 
     let done = pack
-        .dispatch("complete", json!({"id": id, "result": "shipped"}))
+        .dispatch("gtd.complete", json!({"id": id, "result": "shipped"}))
         .await
         .expect("complete must succeed");
 
@@ -1153,12 +1159,12 @@ async fn complete_sets_properties_status_to_done() {
 
     // UE2-H1: transition to actionable state first.
     fixture
-        .dispatch("transition", json!({"id": id, "status": "next"}))
+        .dispatch("gtd.transition", json!({"id": id, "status": "next"}))
         .await
         .expect("transition to next must succeed");
 
     fixture
-        .dispatch("complete", json!({"id": id}))
+        .dispatch("gtd.complete", json!({"id": id}))
         .await
         .expect("complete must succeed");
 
@@ -1205,7 +1211,7 @@ async fn transition_response_includes_task_fields() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let r = pack
-        .dispatch("transition", json!({"id": id, "status": "next"}))
+        .dispatch("gtd.transition", json!({"id": id, "status": "next"}))
         .await
         .expect("transition must succeed");
 
@@ -1245,7 +1251,7 @@ async fn timestamps_are_rfc3339_across_verbs() {
         .unwrap_or_else(|e| panic!("due not RFC 3339: {due} — {e}"));
 
     // tasks listing: same fields.
-    let tasks = pack.dispatch("tasks", json!({})).await.unwrap();
+    let tasks = pack.dispatch("gtd.tasks", json!({})).await.unwrap();
     let task = tasks
         .as_array()
         .unwrap()
@@ -1260,12 +1266,15 @@ async fn timestamps_are_rfc3339_across_verbs() {
     }
 
     // UE2-H1: transition to actionable state first.
-    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+    pack.dispatch("gtd.transition", json!({"id": id, "status": "next"}))
         .await
         .expect("transition to next must succeed");
 
     // complete response: completed_at must be RFC 3339.
-    let done = pack.dispatch("complete", json!({"id": id})).await.unwrap();
+    let done = pack
+        .dispatch("gtd.complete", json!({"id": id}))
+        .await
+        .unwrap();
     let completed_at = done["completed_at"].as_str().expect("completed_at missing");
     chrono::DateTime::parse_from_rfc3339(completed_at)
         .unwrap_or_else(|e| panic!("completed_at not RFC 3339: {completed_at} — {e}"));
@@ -1281,11 +1290,11 @@ async fn complete_writes_status_column_to_done() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     // UE2-H1: transition to actionable state first.
-    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+    pack.dispatch("gtd.transition", json!({"id": id, "status": "next"}))
         .await
         .expect("transition to next must succeed");
 
-    pack.dispatch("complete", json!({"id": id}))
+    pack.dispatch("gtd.complete", json!({"id": id}))
         .await
         .expect("complete must succeed");
 
@@ -1312,7 +1321,7 @@ async fn transition_writes_status_column() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     // inbox → next
-    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+    pack.dispatch("gtd.transition", json!({"id": id, "status": "next"}))
         .await
         .expect("transition inbox→next must succeed");
 
@@ -1362,16 +1371,16 @@ async fn tasks_priority_filter_excludes_terminal_by_default() {
     // Transition B → done, D → cancelled.
     let b_id = b["full_id"].as_str().unwrap().to_string();
     let d_id = d["full_id"].as_str().unwrap().to_string();
-    pack.dispatch("transition", json!({"id": b_id, "status": "done"}))
+    pack.dispatch("gtd.transition", json!({"id": b_id, "status": "done"}))
         .await
         .expect("B→done");
-    pack.dispatch("transition", json!({"id": d_id, "status": "cancelled"}))
+    pack.dispatch("gtd.transition", json!({"id": d_id, "status": "cancelled"}))
         .await
         .expect("D→cancelled");
 
     // tasks(priority="p0") — no status filter — must return A and C only.
     let resp = pack
-        .dispatch("tasks", json!({"priority": "p0"}))
+        .dispatch("gtd.tasks", json!({"priority": "p0"}))
         .await
         .unwrap();
     let arr = resp.as_array().unwrap();
@@ -1399,7 +1408,7 @@ async fn tasks_priority_filter_excludes_terminal_by_default() {
 
     // tasks(priority="p0", status="done") — explicit status — must return only B.
     let resp_done = pack
-        .dispatch("tasks", json!({"priority": "p0", "status": "done"}))
+        .dispatch("gtd.tasks", json!({"priority": "p0", "status": "done"}))
         .await
         .unwrap();
     let arr_done = resp_done.as_array().unwrap();
@@ -1411,7 +1420,7 @@ async fn tasks_priority_filter_excludes_terminal_by_default() {
     assert_eq!(arr_done[0]["title"], "B");
 
     // tasks() — no filter at all — must not include B or D.
-    let resp_all = pack.dispatch("tasks", json!({})).await.unwrap();
+    let resp_all = pack.dispatch("gtd.tasks", json!({})).await.unwrap();
     let all_titles: Vec<&str> = resp_all
         .as_array()
         .unwrap()
@@ -1441,11 +1450,11 @@ async fn next_excludes_terminal_tasks() {
     let t2 = assign(&pack, json!({"title": "done-task", "status": "inbox"})).await;
     let t2_id = t2["full_id"].as_str().unwrap().to_string();
 
-    pack.dispatch("transition", json!({"id": t2_id, "status": "done"}))
+    pack.dispatch("gtd.transition", json!({"id": t2_id, "status": "done"}))
         .await
         .expect("done transition");
 
-    let resp = pack.dispatch("next", json!({})).await.unwrap();
+    let resp = pack.dispatch("gtd.next", json!({})).await.unwrap();
     let titles: Vec<&str> = resp
         .as_array()
         .unwrap()
@@ -1476,7 +1485,7 @@ async fn complete_from_inbox_is_rejected() {
     assert_eq!(resp["status"], "inbox");
 
     let err = pack
-        .dispatch("complete", json!({"id": id}))
+        .dispatch("gtd.complete", json!({"id": id}))
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -1498,7 +1507,7 @@ async fn complete_from_waiting_is_rejected() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let err = pack
-        .dispatch("complete", json!({"id": id}))
+        .dispatch("gtd.complete", json!({"id": id}))
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -1516,7 +1525,7 @@ async fn complete_from_someday_is_rejected() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let err = pack
-        .dispatch("complete", json!({"id": id}))
+        .dispatch("gtd.complete", json!({"id": id}))
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -1534,7 +1543,7 @@ async fn complete_from_next_succeeds() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let done = pack
-        .dispatch("complete", json!({"id": id}))
+        .dispatch("gtd.complete", json!({"id": id}))
         .await
         .expect("complete from next must succeed");
     assert_eq!(done["from"], "next");
@@ -1549,7 +1558,7 @@ async fn complete_from_active_succeeds() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let done = pack
-        .dispatch("complete", json!({"id": id}))
+        .dispatch("gtd.complete", json!({"id": id}))
         .await
         .expect("complete from active must succeed");
     assert_eq!(done["from"], "active");
@@ -1567,7 +1576,7 @@ async fn cc1_complete_with_status_cancelled_reaches_cancelled() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let result = pack
-        .dispatch("complete", json!({"id": id, "status": "cancelled"}))
+        .dispatch("gtd.complete", json!({"id": id, "status": "cancelled"}))
         .await
         .expect("complete(status=cancelled) must succeed");
 
@@ -1590,7 +1599,7 @@ async fn cc1_complete_with_status_done_still_works() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let result = pack
-        .dispatch("complete", json!({"id": id, "status": "done"}))
+        .dispatch("gtd.complete", json!({"id": id, "status": "done"}))
         .await
         .expect("complete(status=done) must succeed");
 
@@ -1609,7 +1618,7 @@ async fn cc1_complete_default_is_done() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let result = pack
-        .dispatch("complete", json!({"id": id}))
+        .dispatch("gtd.complete", json!({"id": id}))
         .await
         .expect("complete() with no status must default to done");
 
@@ -1624,7 +1633,7 @@ async fn cc1_complete_invalid_status_is_rejected() {
     let id = resp["full_id"].as_str().unwrap().to_string();
 
     let err = pack
-        .dispatch("complete", json!({"id": id, "status": "bogus"}))
+        .dispatch("gtd.complete", json!({"id": id, "status": "bogus"}))
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -1650,7 +1659,10 @@ async fn cc1_complete_cancelled_writes_audit_record() {
     let task_id = resp["full_id"].as_str().unwrap().to_string();
 
     fixture
-        .dispatch("complete", json!({"id": task_id, "status": "cancelled"}))
+        .dispatch(
+            "gtd.complete",
+            json!({"id": task_id, "status": "cancelled"}),
+        )
         .await
         .expect("complete(status=cancelled) must succeed");
 
@@ -1687,14 +1699,14 @@ async fn dsl_parallel_c2_double_complete_second_must_fail() {
 
     // First complete succeeds.
     let first = pack
-        .dispatch("complete", json!({"id": id, "result": "op-A"}))
+        .dispatch("gtd.complete", json!({"id": id, "result": "op-A"}))
         .await
         .expect("first complete must succeed");
     assert_eq!(first["to"], "done");
 
     // Second complete must fail because "done" is terminal.
     let err = pack
-        .dispatch("complete", json!({"id": id, "result": "op-B"}))
+        .dispatch("gtd.complete", json!({"id": id, "result": "op-B"}))
         .await
         .unwrap_err();
     assert!(
@@ -1722,8 +1734,8 @@ async fn dsl_parallel_c2_concurrent_complete_one_wins_one_loses() {
     let pack_b = pack_a.clone();
 
     let (res_a, res_b) = tokio::join!(
-        pack_a.dispatch("complete", json!({"id": id, "result": "op-A"})),
-        pack_b.dispatch("complete", json!({"id": id2, "result": "op-B"})),
+        pack_a.dispatch("gtd.complete", json!({"id": id, "result": "op-A"})),
+        pack_b.dispatch("gtd.complete", json!({"id": id2, "result": "op-B"})),
     );
 
     let successes = [res_a.is_ok(), res_b.is_ok()]
@@ -1768,7 +1780,7 @@ async fn scenario_gtd_c2_next_excludes_tasks_with_incomplete_deps() {
     let dep_id = dependent["full_id"].as_str().unwrap().to_string();
 
     // next() must NOT return the dependent task (its dep is not done).
-    let result = pack.dispatch("next", json!({})).await.unwrap();
+    let result = pack.dispatch("gtd.next", json!({})).await.unwrap();
     let titles: Vec<&str> = result
         .as_array()
         .unwrap()
@@ -1781,12 +1793,15 @@ async fn scenario_gtd_c2_next_excludes_tasks_with_incomplete_deps() {
     );
 
     // Now complete the blocker.
-    pack.dispatch("transition", json!({"id": blocker_id, "status": "done"}))
-        .await
-        .expect("blocker→done");
+    pack.dispatch(
+        "gtd.transition",
+        json!({"id": blocker_id, "status": "done"}),
+    )
+    .await
+    .expect("blocker→done");
 
     // next() must now include the dependent task.
-    let result2 = pack.dispatch("next", json!({})).await.unwrap();
+    let result2 = pack.dispatch("gtd.next", json!({})).await.unwrap();
     let titles2: Vec<&str> = result2
         .as_array()
         .unwrap()
@@ -1811,7 +1826,7 @@ async fn scenario_gtd_c2_next_includes_tasks_with_no_deps() {
     )
     .await;
 
-    let result = pack.dispatch("next", json!({})).await.unwrap();
+    let result = pack.dispatch("gtd.next", json!({})).await.unwrap();
     let titles: Vec<&str> = result
         .as_array()
         .unwrap()
@@ -1835,10 +1850,10 @@ async fn scenario_gtd_c2_next_includes_tasks_with_all_deps_done() {
     let b2_id = b2["full_id"].as_str().unwrap().to_string();
 
     // Complete both blockers.
-    pack.dispatch("transition", json!({"id": b1_id, "status": "done"}))
+    pack.dispatch("gtd.transition", json!({"id": b1_id, "status": "done"}))
         .await
         .unwrap();
-    pack.dispatch("transition", json!({"id": b2_id, "status": "done"}))
+    pack.dispatch("gtd.transition", json!({"id": b2_id, "status": "done"}))
         .await
         .unwrap();
 
@@ -1854,7 +1869,7 @@ async fn scenario_gtd_c2_next_includes_tasks_with_all_deps_done() {
     .await;
     let dep_id = dep["full_id"].as_str().unwrap().to_string();
 
-    let result = pack.dispatch("next", json!({})).await.unwrap();
+    let result = pack.dispatch("gtd.next", json!({})).await.unwrap();
     let titles: Vec<&str> = result
         .as_array()
         .unwrap()
@@ -1952,7 +1967,7 @@ async fn next_resolves_deps_older_than_500_task_window() {
 
     // next() must include the dependent task: its blocker is done even though
     // it is outside the 500-task scan window.
-    let result = fixture.dispatch("next", json!({})).await.unwrap();
+    let result = fixture.dispatch("gtd.next", json!({})).await.unwrap();
     let found = result
         .as_array()
         .unwrap()
@@ -2002,7 +2017,7 @@ async fn concurrent_complete_two_threads_one_wins_one_loses_atomic() {
     tokio::spawn(async move {
         bar_a.wait().await;
         let res = pack_a
-            .dispatch("complete", json!({"id": id_a, "result": "thread-A"}))
+            .dispatch("gtd.complete", json!({"id": id_a, "result": "thread-A"}))
             .await;
         let _ = tx_a.send(res);
     });
@@ -2010,7 +2025,7 @@ async fn concurrent_complete_two_threads_one_wins_one_loses_atomic() {
     tokio::spawn(async move {
         bar_b.wait().await;
         let res = pack_b
-            .dispatch("complete", json!({"id": id_b, "result": "thread-B"}))
+            .dispatch("gtd.complete", json!({"id": id_b, "result": "thread-B"}))
             .await;
         let _ = tx_b.send(res);
     });

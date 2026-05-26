@@ -33,7 +33,7 @@ pub(crate) static SCHEDULE_SCHEMA_PLAN_STMTS: [&str; 1] =
 
 static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {
-        name: "remind",
+        name: "schedule.remind",
         description: "Create a time-triggered reminder.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
@@ -59,7 +59,7 @@ static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
         ],
     },
     HandlerDef {
-        name: "schedule",
+        name: "schedule.schedule",
         description: "Schedule a future verb dispatch.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
@@ -68,7 +68,7 @@ static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 name: "action",
                 param_type: "string",
                 required: true,
-                description: "Verb dispatch payload to execute at the trigger time (e.g. \"remind(content=\\\"hello\\\")\"). Must not be empty.",
+                description: "Verb dispatch payload to execute at the trigger time (e.g. \"schedule.remind(content=\\\"hello\\\")\"). Must not be empty.",
             },
             ParamDef {
                 name: "at",
@@ -85,7 +85,7 @@ static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
         ],
     },
     HandlerDef {
-        name: "agenda",
+        name: "schedule.agenda",
         description: "List upcoming scheduled events.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
@@ -111,7 +111,7 @@ static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
         ],
     },
     HandlerDef {
-        name: "cancel",
+        name: "schedule.cancel",
         description: "Cancel a scheduled event.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
@@ -182,10 +182,10 @@ impl PackRuntime for SchedulePack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "remind" => handlers::handle_remind(self.runtime(), token, params).await,
-            "schedule" => handlers::handle_schedule(self.runtime(), token, params).await,
-            "agenda" => handlers::handle_agenda(self.runtime(), token, params).await,
-            "cancel" => handlers::handle_cancel(self.runtime(), token, params).await,
+            "schedule.remind" => handlers::handle_remind(self.runtime(), token, params).await,
+            "schedule.schedule" => handlers::handle_schedule(self.runtime(), token, params).await,
+            "schedule.agenda" => handlers::handle_agenda(self.runtime(), token, params).await,
+            "schedule.cancel" => handlers::handle_cancel(self.runtime(), token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "schedule pack does not handle verb {verb:?}"
             ))),
@@ -207,7 +207,7 @@ mod help_tests {
 
     #[test]
     fn remind_has_required_content_and_at() {
-        let h = find_handler("remind");
+        let h = find_handler("schedule.remind");
         assert!(!h.params.is_empty(), "remind must have non-empty params");
         let content = h
             .params
@@ -225,7 +225,7 @@ mod help_tests {
 
     #[test]
     fn remind_has_optional_repeat() {
-        let h = find_handler("remind");
+        let h = find_handler("schedule.remind");
         let repeat = h
             .params
             .iter()
@@ -236,7 +236,7 @@ mod help_tests {
 
     #[test]
     fn schedule_has_required_action_and_at() {
-        let h = find_handler("schedule");
+        let h = find_handler("schedule.schedule");
         assert!(!h.params.is_empty(), "schedule must have non-empty params");
         let action = h
             .params
@@ -254,7 +254,7 @@ mod help_tests {
 
     #[test]
     fn schedule_has_optional_repeat() {
-        let h = find_handler("schedule");
+        let h = find_handler("schedule.schedule");
         let repeat = h
             .params
             .iter()
@@ -265,7 +265,7 @@ mod help_tests {
 
     #[test]
     fn agenda_has_optional_from_to_limit() {
-        let h = find_handler("agenda");
+        let h = find_handler("schedule.agenda");
         assert!(!h.params.is_empty(), "agenda must have non-empty params");
         for name in ["from", "to", "limit"] {
             let p = h
@@ -279,7 +279,7 @@ mod help_tests {
 
     #[test]
     fn cancel_has_required_id() {
-        let h = find_handler("cancel");
+        let h = find_handler("schedule.cancel");
         assert!(!h.params.is_empty(), "cancel must have non-empty params");
         let id = h
             .params

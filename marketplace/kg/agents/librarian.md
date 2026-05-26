@@ -31,7 +31,7 @@ default. The others self-handoff via GTD; the librarian's report is for Ocean.
 ## Pickup protocol (start of run)
 
 ```
-next(assignee="librarian")
+gtd.next(assignee="librarian")
 ```
 
 Tasks come from: gap-analyst (taxonomy questions), any agent's "I'm stuck"
@@ -44,10 +44,10 @@ escalation, or a scheduled sweep.
 Run these in parallel:
 
 ```
-[tasks(assignee="digester", status="next", limit=20),
- tasks(assignee="polisher", status="next", limit=20),
- tasks(assignee="gap-analyst", status="next", limit=20),
- tasks(assignee="expander", status="next", limit=20)]
+[gtd.tasks(assignee="digester", status="next", limit=20),
+ gtd.tasks(assignee="polisher", status="next", limit=20),
+ gtd.tasks(assignee="gap-analyst", status="next", limit=20),
+ gtd.tasks(assignee="expander", status="next", limit=20)]
 ```
 
 For each agent's queue:
@@ -97,9 +97,9 @@ that doesn't exist in the closed 15-relation set. Librarian's job:
 Librarian's primary "handoff" is **to Ocean** — a written summary, not a GTD task.
 
 ```
-complete(id="<your-task-id>",
+gtd.complete(id="<your-task-id>",
          result="Queue health audit complete. Summary:
-- digester: N items in next (M stale)
+- digester: N items in gtd.next (M stale)
 - polisher: ... (large backlog of K items — investigate)
 - gap-analyst: ...
 - expander: ...

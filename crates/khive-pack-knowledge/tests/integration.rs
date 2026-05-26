@@ -37,15 +37,15 @@ async fn pack_registers_cleanly_with_verb_registry() {
     let f = pack(rt());
     let verbs: Vec<&str> = f.registry.all_verbs().iter().map(|v| v.name).collect();
     assert!(
-        verbs.contains(&"learn"),
+        verbs.contains(&"knowledge.learn"),
         "expected 'learn' verb, got: {verbs:?}"
     );
     assert!(
-        verbs.contains(&"cite"),
+        verbs.contains(&"knowledge.cite"),
         "expected 'cite' verb, got: {verbs:?}"
     );
     assert!(
-        verbs.contains(&"topic"),
+        verbs.contains(&"knowledge.topic"),
         "expected 'topic' verb, got: {verbs:?}"
     );
     // No note kinds added.
@@ -63,7 +63,7 @@ async fn learn_creates_concept_with_name_and_domain() {
     let f = pack(rt());
     let resp = f
         .dispatch(
-            "learn",
+            "knowledge.learn",
             json!({
                 "name": "LoRA",
                 "description": "Low-Rank Adaptation of large language models",
@@ -99,7 +99,7 @@ async fn learn_creates_concept_with_name_and_domain() {
 async fn learn_creates_concept_without_domain() {
     let f = pack(rt());
     let resp = f
-        .dispatch("learn", json!({ "name": "FlashAttention" }))
+        .dispatch("knowledge.learn", json!({ "name": "FlashAttention" }))
         .await
         .expect("learn ok");
 
@@ -112,7 +112,7 @@ async fn learn_creates_concept_without_domain() {
 async fn learn_rejects_empty_name() {
     let f = pack(rt());
     let err = f
-        .dispatch("learn", json!({ "name": "   " }))
+        .dispatch("knowledge.learn", json!({ "name": "   " }))
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -123,7 +123,7 @@ async fn learn_rejects_empty_name() {
 async fn learn_rejects_missing_name() {
     let f = pack(rt());
     let err = f
-        .dispatch("learn", json!({ "domain": "attention" }))
+        .dispatch("knowledge.learn", json!({ "domain": "attention" }))
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -139,7 +139,10 @@ async fn cite_creates_introduced_by_edge() {
 
     // Create concept via learn.
     let concept = f
-        .dispatch("learn", json!({ "name": "LoRA", "domain": "fine-tuning" }))
+        .dispatch(
+            "knowledge.learn",
+            json!({ "name": "LoRA", "domain": "fine-tuning" }),
+        )
         .await
         .expect("learn concept");
 
@@ -162,7 +165,7 @@ async fn cite_creates_introduced_by_edge() {
 
     let resp = f
         .dispatch(
-            "cite",
+            "knowledge.cite",
             json!({
                 "concept_id": concept_id,
                 "source_id": source_id,
@@ -185,7 +188,7 @@ async fn cite_rejects_unknown_id() {
     let f = pack(rt());
     let err = f
         .dispatch(
-            "cite",
+            "knowledge.cite",
             json!({
                 "concept_id": "00000000-0000-0000-0000-000000000001",
                 "source_id":  "00000000-0000-0000-0000-000000000002"
@@ -202,7 +205,7 @@ async fn cite_rejects_missing_concept_id() {
     let f = pack(rt());
     let err = f
         .dispatch(
-            "cite",
+            "knowledge.cite",
             json!({ "source_id": "00000000-0000-0000-0000-000000000001" }),
         )
         .await
@@ -216,20 +219,29 @@ async fn cite_rejects_missing_concept_id() {
 #[tokio::test]
 async fn topic_lists_all_concepts_without_filter() {
     let f = pack(rt());
-    f.dispatch("learn", json!({ "name": "GQA", "domain": "attention" }))
-        .await
-        .expect("learn 1");
     f.dispatch(
-        "learn",
+        "knowledge.learn",
+        json!({ "name": "GQA", "domain": "attention" }),
+    )
+    .await
+    .expect("learn 1");
+    f.dispatch(
+        "knowledge.learn",
         json!({ "name": "FlashAttention", "domain": "attention" }),
     )
     .await
     .expect("learn 2");
-    f.dispatch("learn", json!({ "name": "LoRA", "domain": "fine-tuning" }))
-        .await
-        .expect("learn 3");
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn 3");
 
-    let resp = f.dispatch("topic", json!({})).await.expect("topic ok");
+    let resp = f
+        .dispatch("knowledge.topic", json!({}))
+        .await
+        .expect("topic ok");
 
     let items = resp["items"].as_array().expect("items array");
     assert_eq!(items.len(), 3, "expected 3 concepts, got: {}", items.len());
@@ -238,21 +250,27 @@ async fn topic_lists_all_concepts_without_filter() {
 #[tokio::test]
 async fn topic_filters_by_domain() {
     let f = pack(rt());
-    f.dispatch("learn", json!({ "name": "GQA", "domain": "attention" }))
-        .await
-        .expect("learn 1");
     f.dispatch(
-        "learn",
+        "knowledge.learn",
+        json!({ "name": "GQA", "domain": "attention" }),
+    )
+    .await
+    .expect("learn 1");
+    f.dispatch(
+        "knowledge.learn",
         json!({ "name": "FlashAttention", "domain": "attention" }),
     )
     .await
     .expect("learn 2");
-    f.dispatch("learn", json!({ "name": "LoRA", "domain": "fine-tuning" }))
-        .await
-        .expect("learn 3");
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn 3");
 
     let resp = f
-        .dispatch("topic", json!({ "domain": "attention" }))
+        .dispatch("knowledge.topic", json!({ "domain": "attention" }))
         .await
         .expect("topic filtered");
 
@@ -275,12 +293,15 @@ async fn topic_filters_by_domain() {
 #[tokio::test]
 async fn topic_returns_empty_for_unknown_domain() {
     let f = pack(rt());
-    f.dispatch("learn", json!({ "name": "LoRA", "domain": "fine-tuning" }))
-        .await
-        .expect("learn");
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn");
 
     let resp = f
-        .dispatch("topic", json!({ "domain": "quantum-computing" }))
+        .dispatch("knowledge.topic", json!({ "domain": "quantum-computing" }))
         .await
         .expect("topic ok");
 
@@ -292,13 +313,13 @@ async fn topic_returns_empty_for_unknown_domain() {
 async fn topic_respects_limit() {
     let f = pack(rt());
     for i in 0..5 {
-        f.dispatch("learn", json!({ "name": format!("Concept{i}") }))
+        f.dispatch("knowledge.learn", json!({ "name": format!("Concept{i}") }))
             .await
             .expect("learn");
     }
 
     let resp = f
-        .dispatch("topic", json!({ "limit": 2 }))
+        .dispatch("knowledge.topic", json!({ "limit": 2 }))
         .await
         .expect("topic ok");
 

@@ -59,8 +59,8 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 
 Default pack: **kg** (11 verbs — `create`, `get`, `list`, `update`, `delete`, `merge`, `search`,
 `link`, `neighbors`, `traverse`, `query`). Load the **gtd** pack alongside for task lifecycle
-(`KHIVE_PACKS=kg,gtd` or `--pack kg --pack gtd`) and get 5 more verbs: `assign`, `next`,
-`complete`, `tasks`, `transition`.
+(`KHIVE_PACKS=kg,gtd` or `--pack kg --pack gtd`) and get 5 more verbs: `gtd.assign`, `gtd.next`,
+`gtd.complete`, `gtd.tasks`, `gtd.transition`.
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only — they auto-detect the record type.

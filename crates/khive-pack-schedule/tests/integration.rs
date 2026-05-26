@@ -22,10 +22,10 @@ fn schedule_pack_declares_scheduled_event_note_kind() {
 fn schedule_pack_declares_four_handlers() {
     assert_eq!(SchedulePack::HANDLERS.len(), 4);
     let names: Vec<&str> = SchedulePack::HANDLERS.iter().map(|h| h.name).collect();
-    assert!(names.contains(&"remind"));
-    assert!(names.contains(&"schedule"));
-    assert!(names.contains(&"agenda"));
-    assert!(names.contains(&"cancel"));
+    assert!(names.contains(&"schedule.remind"));
+    assert!(names.contains(&"schedule.schedule"));
+    assert!(names.contains(&"schedule.agenda"));
+    assert!(names.contains(&"schedule.cancel"));
 }
 
 #[test]
@@ -39,7 +39,7 @@ async fn remind_creates_pending_event() {
 
     let result = registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({
                 "content": "check status",
                 "at": "2099-06-01T09:00:00Z"
@@ -59,7 +59,7 @@ async fn schedule_creates_pending_event_with_action() {
 
     let result = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "create(kind=\"entity\", name=\"test\")",
                 "at": "2099-06-01T10:00:00Z"
@@ -78,14 +78,14 @@ async fn agenda_returns_pending_events() {
 
     registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({ "content": "hello", "at": "2099-07-01T00:00:00Z" }),
         )
         .await
         .expect("remind succeeds");
 
     let agenda = registry
-        .dispatch("agenda", serde_json::json!({ "limit": 10 }))
+        .dispatch("schedule.agenda", serde_json::json!({ "limit": 10 }))
         .await
         .expect("agenda succeeds");
 
@@ -102,7 +102,7 @@ async fn remind_with_invalid_repeat_is_rejected() {
 
     let err = registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({
                 "content": "hello",
                 "at": "2099-06-01T09:00:00Z",
@@ -120,7 +120,7 @@ async fn test_full_id_returns_36_char_schedule() {
 
     let result = registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({ "content": "check status", "at": "2099-06-01T09:00:00Z" }),
         )
         .await
@@ -155,7 +155,7 @@ async fn s_c1_schedule_valid_rfc3339_succeeds() {
 
     let result = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "remind(content=\"test\")",
                 "at": "2099-01-01T00:00:00Z"
@@ -173,7 +173,7 @@ async fn s_c1_schedule_invalid_at_not_a_date() {
 
     let err = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "remind(content=\"test\")",
                 "at": "not-a-date"
@@ -195,7 +195,7 @@ async fn s_c1_schedule_invalid_at_natural_language() {
 
     let err = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "remind(content=\"test\")",
                 "at": "tomorrow at 3pm"
@@ -216,7 +216,7 @@ async fn s_c1_schedule_invalid_at_out_of_range_date() {
 
     let err = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "remind(content=\"test\")",
                 "at": "2027-13-99"
@@ -237,7 +237,7 @@ async fn s_c1_remind_invalid_at_is_rejected() {
 
     let err = registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({
                 "content": "hello",
                 "at": "invalid"
@@ -259,7 +259,7 @@ async fn s_c1_remind_valid_rfc3339_succeeds() {
 
     let result = registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({
                 "content": "morning standup",
                 "at": "2099-06-15T09:00:00+00:00"
@@ -279,14 +279,14 @@ async fn s_c1_agenda_only_shows_valid_events() {
 
     registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({ "content": "valid event", "at": "2099-01-01T10:00:00Z" }),
         )
         .await
         .expect("remind with valid at must succeed");
 
     let agenda = registry
-        .dispatch("agenda", serde_json::json!({ "limit": 50 }))
+        .dispatch("schedule.agenda", serde_json::json!({ "limit": 50 }))
         .await
         .expect("agenda must succeed");
 
@@ -308,7 +308,7 @@ async fn test_cancel_accepts_short_id() {
 
     let reminded = registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({ "content": "cancel me by short id", "at": "2099-07-01T12:00:00Z" }),
         )
         .await
@@ -326,7 +326,7 @@ async fn test_cancel_accepts_short_id() {
 
     // Cancel using only the 8-char short prefix — must succeed.
     let result = registry
-        .dispatch("cancel", serde_json::json!({ "id": short }))
+        .dispatch("schedule.cancel", serde_json::json!({ "id": short }))
         .await
         .expect("cancel with 8-char short id succeeds");
 
@@ -358,7 +358,7 @@ async fn c3_schedule_past_date_rejected() {
 
     let err = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "remind(content=\"past\")",
                 "at": "2020-01-01T00:00:00Z"
@@ -380,7 +380,7 @@ async fn c3_remind_past_date_rejected() {
 
     let err = registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({
                 "content": "stale reminder",
                 "at": "2019-06-01T09:00:00Z"
@@ -405,14 +405,14 @@ async fn c3_agenda_never_shows_past_pending_events() {
     // Insert one valid future event.
     registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({ "content": "future check", "at": "2099-12-31T23:59:59Z" }),
         )
         .await
         .expect("future remind must succeed");
 
     let agenda = registry
-        .dispatch("agenda", serde_json::json!({ "limit": 100 }))
+        .dispatch("schedule.agenda", serde_json::json!({ "limit": 100 }))
         .await
         .expect("agenda must succeed");
 
@@ -440,7 +440,7 @@ async fn c4_schedule_bogus_action_rejected() {
 
     let err = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "bogus-not-a-valid-verb()",
                 "at": "2099-01-01T00:00:00Z"
@@ -462,7 +462,7 @@ async fn c4_schedule_single_char_action_rejected() {
 
     let err = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "x",
                 "at": "2099-01-01T00:00:00Z"
@@ -485,7 +485,7 @@ async fn c4_schedule_valid_action_succeeds() {
     // A well-formed verb call must be accepted.
     let result = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "remind(content=\"hello world\")",
                 "at": "2099-06-01T10:00:00Z"
@@ -506,14 +506,14 @@ async fn h1_agenda_from_filter_uses_parsed_timestamps() {
     // Insert events at two different future times.
     registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({ "content": "early", "at": "2099-01-01T10:00:00Z" }),
         )
         .await
         .expect("remind 1 succeeds");
     registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({ "content": "late", "at": "2099-12-31T10:00:00Z" }),
         )
         .await
@@ -522,7 +522,7 @@ async fn h1_agenda_from_filter_uses_parsed_timestamps() {
     // Only events at or after 2099-06-01 should be returned.
     let agenda = registry
         .dispatch(
-            "agenda",
+            "schedule.agenda",
             serde_json::json!({ "from": "2099-06-01T00:00:00Z", "limit": 50 }),
         )
         .await
@@ -553,7 +553,7 @@ async fn h1_agenda_rejects_invalid_from() {
 
     let err = registry
         .dispatch(
-            "agenda",
+            "schedule.agenda",
             serde_json::json!({ "from": "not-a-date", "limit": 10 }),
         )
         .await
@@ -572,7 +572,7 @@ async fn h1_agenda_rejects_invalid_to() {
 
     let err = registry
         .dispatch(
-            "agenda",
+            "schedule.agenda",
             serde_json::json!({ "to": "not-a-date", "limit": 10 }),
         )
         .await
@@ -601,7 +601,7 @@ async fn h5_schedule_at_with_offset_preserves_original_string() {
     let input_at = "2099-01-02T00:00:00+02:00";
     let result = registry
         .dispatch(
-            "schedule",
+            "schedule.schedule",
             serde_json::json!({
                 "action": "remind(content=\"tz-test\")",
                 "at": input_at
@@ -630,7 +630,7 @@ async fn h5_remind_at_with_offset_preserves_original_string() {
     let input_at = "2099-06-15T09:00:00+05:30";
     let result = registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({
                 "content": "tz-remind",
                 "at": input_at
@@ -660,7 +660,7 @@ async fn h5_utc_input_preserved_as_is() {
     let input_at = "2099-03-10T12:00:00Z";
     let result = registry
         .dispatch(
-            "remind",
+            "schedule.remind",
             serde_json::json!({ "content": "utc-tz-test", "at": input_at }),
         )
         .await
@@ -768,7 +768,7 @@ async fn h2_agenda_finds_valid_event_past_corrupt_legacy_rows() {
 
     // agenda() must return the valid event despite corrupt rows preceding it.
     let agenda = registry
-        .dispatch("agenda", serde_json::json!({ "limit": 10 }))
+        .dispatch("schedule.agenda", serde_json::json!({ "limit": 10 }))
         .await
         .expect("agenda must succeed");
 

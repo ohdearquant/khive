@@ -23,11 +23,11 @@ KG_VERBS = frozenset({
 })
 
 GTD_VERBS = frozenset({
-    "assign", "next", "complete", "tasks", "transition",
+    "gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition",
 })
 
 MEMORY_VERBS = frozenset({
-    "remember", "recall",
+    "memory.remember", "memory.recall",
 })
 
 BRAIN_VERBS = frozenset({
@@ -39,7 +39,19 @@ BRAIN_VERBS = frozenset({
     "brain.state", "brain.config", "brain.events", "brain.emit",
 })
 
-ALL_VERBS = KG_VERBS | GTD_VERBS | MEMORY_VERBS | BRAIN_VERBS
+COMM_VERBS = frozenset({
+    "comm.send", "comm.inbox", "comm.read", "comm.reply",
+})
+
+SCHEDULE_VERBS = frozenset({
+    "schedule.remind", "schedule.schedule", "schedule.agenda", "schedule.cancel",
+})
+
+KNOWLEDGE_VERBS = frozenset({
+    "knowledge.learn", "knowledge.cite", "knowledge.topic",
+})
+
+ALL_VERBS = KG_VERBS | GTD_VERBS | MEMORY_VERBS | BRAIN_VERBS | COMM_VERBS | SCHEDULE_VERBS | KNOWLEDGE_VERBS
 
 # Regex that matches the start of a verb call line (supports dotted names like brain.profiles)
 _VERB_RE = re.compile(
@@ -209,7 +221,7 @@ def _validate_verb_args(verb: str, args_text: str, original: str) -> tuple[bool,
     """Check that the first argument looks like a keyword arg, not positional."""
     args_stripped = args_text.strip().lstrip("(").rstrip(")").strip()
     if not args_stripped:
-        return True, None  # No args — fine for verbs like next()
+        return True, None  # No args — fine for verbs like gtd.next()
     # Skip if placeholder content
     if _PLACEHOLDER_RE.search(args_stripped):
         return True, None

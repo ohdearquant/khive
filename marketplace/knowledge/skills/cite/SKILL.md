@@ -11,7 +11,7 @@ person that first introduced it. This follows the ADR-002 base endpoint contract
 ## Usage
 
 ```
-request(ops="cite(concept_id=\"<concept_uuid>\", source_id=\"<document_uuid>\")")
+request(ops="knowledge.cite(concept_id=\"<concept_uuid>\", source_id=\"<document_uuid>\")")
 ```
 
 ## Parameters
@@ -39,13 +39,13 @@ request(ops="cite(concept_id=\"<concept_uuid>\", source_id=\"<document_uuid>\")"
 
 ```
 # 1. Register the concept
-request(ops="learn(name=\"LoRA\", domain=\"fine-tuning\")")
+request(ops="knowledge.learn(name=\"LoRA\", domain=\"fine-tuning\")")
 
 # 2. Create the paper as a document entity
 request(ops="create(kind=\"document\", name=\"Hu et al. 2021\", description=\"LoRA: Low-Rank Adaptation\")")
 
 # 3. Link them
-request(ops="cite(concept_id=\"<concept_full_id>\", source_id=\"<paper_entity_id>\")")
+request(ops="knowledge.cite(concept_id=\"<concept_full_id>\", source_id=\"<paper_entity_id>\")")
 ```
 
 ## Anti-patterns

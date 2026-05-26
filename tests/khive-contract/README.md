@@ -15,6 +15,10 @@ proper uv-managed Python package with:
 
 ## How to run
 
+**All commands must be run via `uv run pytest`** — plain `pytest` will fail with
+`ModuleNotFoundError` because dependencies (e.g. `jsonschema`) are managed by uv, not the
+system Python. This is the canonical invocation required by CI and code review gates.
+
 ```bash
 cd tests/khive-contract
 

@@ -11,9 +11,9 @@ All verbs are dispatched through the single MCP `request` tool ([ADR-020](https:
 
 | Verb | What it does |
 | ---- | ------------ |
-| `learn(name, description?, domain?, tags?)` | Register a concept entity. Domain is stored as a property and promoted to tags for search. |
-| `cite(concept_id, source_id, weight?)` | Link a concept to the document or person that introduced it (`introduced_by` edge). |
-| `topic(domain?, query?, limit?)` | List or search concept entities, optionally filtered by domain. |
+| `knowledge.learn(name, description?, domain?, tags?)` | Register a concept entity. Domain is stored as a property and promoted to tags for search. |
+| `knowledge.cite(concept_id, source_id, weight?)` | Link a concept to the document or person that introduced it (`introduced_by` edge). |
+| `knowledge.topic(domain?, query?, limit?)` | List or search concept entities, optionally filtered by domain. |
 
 ## Skills
 

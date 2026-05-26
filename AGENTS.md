@@ -16,31 +16,31 @@ If you're working on khive itself (writing code in this repo), see `CLAUDE.md` i
 
 All verbs are dispatched through a single MCP tool, `request`, which accepts a function-call DSL
 or JSON form ([ADR-020](docs/adr/ADR-020-request-dsl.md),
-[ADR-027](docs/adr/ADR-027-single-tool-mcp-surface.md)). Verb semantics are unchanged from
-[ADR-023](docs/adr/ADR-023-verb-consolidated-mcp-surface.md); only the wire shape moved.
+[ADR-027](docs/adr/ADR-027-single-tool-mcp-surface.md)). Verb semantics and namespace contract are
+defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 
-| Verb        | What it does                                                                                                            | When to use                                              |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `create`    | Add an entity or note                                                                                                   | New concept, paper, observation, decision worth tracking |
-| `get`       | Fetch any record by UUID (auto-detects type)                                                                            | When you have a UUID and need the full record            |
-| `search`    | Text + semantic search over entities or notes                                                                           | Finding things by content similarity                     |
-| `list`      | Structured filtering (by kind, tags, etc.)                                                                              | Browsing a category or namespace                         |
-| `update`    | Patch properties, tags, or content (by UUID)                                                                            | Correcting or enriching an existing record               |
-| `delete`    | Soft-delete (or hard-delete) a record (by UUID)                                                                         | Removing stale or incorrect data                         |
-| `link`      | Connect two nodes with a typed relation                                                                                 | When relationships emerge from research                  |
-| `traverse`  | Multi-hop graph walk with depth/relation filters                                                                        | Structural context — lineages, paths, clusters           |
-| `neighbors` | Immediate neighbors of a node                                                                                           | "What connects to this entity?"                          |
-| `query`     | GQL/SPARQL query string → SQL                                                                                           | Complex pattern matching over the graph                  |
-| `merge`     | Deduplicate two entities into one (v0.1)                                                                                | "LoRA" and "Low-Rank Adaptation" are the same concept    |
-| `remember`  | Store a memory (memory pack — [ADR-036](docs/adr/ADR-036-memory-pack-semantics.md))                                     | Cross-session context, agent state, working memory       |
-| `recall`    | Semantic search over memories with decay weighting (memory pack — [ADR-036](docs/adr/ADR-036-memory-pack-semantics.md)) | Retrieve what you stored in prior sessions               |
+| Verb              | What it does                                                                                                  | When to use                                              |
+| ----------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `create`          | Add an entity or note                                                                                         | New concept, paper, observation, decision worth tracking |
+| `get`             | Fetch any record by UUID (auto-detects type)                                                                  | When you have a UUID and need the full record            |
+| `search`          | Text + semantic search over entities or notes                                                                 | Finding things by content similarity                     |
+| `list`            | Structured filtering (by kind, tags, etc.)                                                                    | Browsing a category or namespace                         |
+| `update`          | Patch properties, tags, or content (by UUID)                                                                  | Correcting or enriching an existing record               |
+| `delete`          | Soft-delete (or hard-delete) a record (by UUID)                                                               | Removing stale or incorrect data                         |
+| `link`            | Connect two nodes with a typed relation                                                                       | When relationships emerge from research                  |
+| `traverse`        | Multi-hop graph walk with depth/relation filters                                                              | Structural context — lineages, paths, clusters           |
+| `neighbors`       | Immediate neighbors of a node                                                                                 | "What connects to this entity?"                          |
+| `query`           | GQL/SPARQL query string → SQL                                                                                 | Complex pattern matching over the graph                  |
+| `merge`           | Deduplicate two entities into one (v0.1)                                                                      | "LoRA" and "Low-Rank Adaptation" are the same concept    |
+| `memory.remember` | Store a memory (memory pack — [ADR-021](docs/adr/ADR-021-memory-pack.md))                                     | Cross-session context, agent state, working memory       |
+| `memory.recall`   | Semantic search over memories with decay weighting (memory pack — [ADR-021](docs/adr/ADR-021-memory-pack.md)) | Retrieve what you stored in prior sessions               |
 
-**One MCP tool (`request`), 11 core verbs + 2 memory-pack verbs.** `get`, `update`, `delete` are
-UUID-only — they auto-detect whether the record is an entity, note, or edge. `create`, `list`,
-`search` require `kind=entity|note` (or `kind=edge` for `list`; `kind=event` for audit events per
-[ADR-038](docs/adr/ADR-038-events-surface.md)).
+**One MCP tool (`request`), 11 core KG verbs (bare names) + 2 memory-pack verbs (dotted form).**
+`get`, `update`, `delete` are UUID-only — they auto-detect whether the record is an entity, note,
+or edge. `create`, `list`, `search` require `kind=entity|note` (or `kind=edge` for `list`;
+`kind=event` for audit events per [ADR-038](docs/adr/ADR-038-events-surface.md)).
 
-`remember` and `recall` require the memory pack: `KHIVE_PACKS=kg,memory`.
+`memory.remember` and `memory.recall` require the memory pack: `KHIVE_PACKS=kg,memory`.
 
 ### How to call a verb
 

@@ -133,7 +133,7 @@ pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
 static GTD_HANDLERS: [HandlerDef; 5] = [
     // Directive: directs an actor to perform work
     HandlerDef {
-        name: "assign",
+        name: "gtd.assign",
         description: "Create a GTD task (note with kind=task)",
         visibility: Visibility::Verb,
         category: VerbCategory::Directive,
@@ -184,7 +184,7 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
     },
     // Assertive: retrieves actionable tasks
     HandlerDef {
-        name: "next",
+        name: "gtd.next",
         description: "List actionable tasks (status=next or active) by priority",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -205,7 +205,7 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
     },
     // Declaration: declares a task done or cancelled
     HandlerDef {
-        name: "complete",
+        name: "gtd.complete",
         description: "Mark a task done (or cancelled) with an optional result note",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
@@ -232,7 +232,7 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
     },
     // Assertive: retrieves filtered task listing
     HandlerDef {
-        name: "tasks",
+        name: "gtd.tasks",
         description: "List tasks filtered by status, assignee, priority",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -271,7 +271,7 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
     },
     // Declaration: changes task lifecycle status
     HandlerDef {
-        name: "transition",
+        name: "gtd.transition",
         description: "Explicit GTD status transition with lifecycle validation",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
@@ -380,11 +380,11 @@ impl PackRuntime for GtdPack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "assign" => self.handle_assign(token, params).await,
-            "next" => self.handle_next(token, params).await,
-            "complete" => self.handle_complete(token, params).await,
-            "tasks" => self.handle_tasks(token, params).await,
-            "transition" => self.handle_transition(token, params).await,
+            "gtd.assign" => self.handle_assign(token, params).await,
+            "gtd.next" => self.handle_next(token, params).await,
+            "gtd.complete" => self.handle_complete(token, params).await,
+            "gtd.tasks" => self.handle_tasks(token, params).await,
+            "gtd.transition" => self.handle_transition(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "gtd pack does not handle verb {verb:?}"
             ))),

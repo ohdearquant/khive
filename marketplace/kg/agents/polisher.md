@@ -113,7 +113,7 @@ Report to the caller:
 ## Pickup protocol (start of run)
 
 ```
-next(assignee="polisher")
+gtd.next(assignee="polisher")
 ```
 
 Most polisher tasks come from digester (post-ingest cleanup) or expander (post-create
@@ -121,7 +121,7 @@ verification). Read the task's `depends_on` and `tags` to know which slice/batch
 target.
 
 ```
-transition(id="<task-id>", status="active", note="polisher starting on <slice>")
+gtd.transition(id="<task-id>", status="active", note="polisher starting on <slice>")
 ```
 
 ## Handoff protocol (end of run)
@@ -129,7 +129,7 @@ transition(id="<task-id>", status="active", note="polisher starting on <slice>")
 **To gap-analyst** (after a substantive polish run — domain changed, orphans cleaned):
 
 ```
-assign(title="Gap survey: graph is clean as of <date>",
+gtd.assign(title="Gap survey: graph is clean as of <date>",
        assignee="gap-analyst",
        priority="p2",
        tags=["kg:gap", "from:polisher", "snapshot:<date>"],
@@ -140,7 +140,7 @@ assign(title="Gap survey: graph is clean as of <date>",
 re-ingestion in the correct namespace):
 
 ```
-assign(title="Re-ingest cross-namespace entities: <N> ghosts in <list>",
+gtd.assign(title="Re-ingest cross-namespace entities: <N> ghosts in <list>",
        assignee="digester",
        priority="p3",
        tags=["kg:digest", "from:polisher", "ghost-ns"])
@@ -149,14 +149,14 @@ assign(title="Re-ingest cross-namespace entities: <N> ghosts in <list>",
 **Self-assign** (if you ran out of time on a large slice):
 
 ```
-assign(title="Continue polish slice <X> offset <Y>",
+gtd.assign(title="Continue polish slice <X> offset <Y>",
        assignee="polisher",
        priority="p2",
        tags=["kg:polish", "continuation"])
 ```
 
 ```
-complete(id="<your-task-id>", result="Fixed N orphans, M under-linked, K dupes merged. Density <before>→<after>.")
+gtd.complete(id="<your-task-id>", result="Fixed N orphans, M under-linked, K dupes merged. Density <before>→<after>.")
 ```
 
 ## Anti-patterns

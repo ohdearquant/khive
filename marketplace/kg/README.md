@@ -96,7 +96,7 @@ request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\
 
 The kg agents are designed to collaborate **via the GTD pack's task queue**, not by
 direct orchestration. Each agent on completion `assign`s follow-up tasks to the next
-agent in the pipeline, and at start runs `next(assignee=<self>)` to pull its queue.
+agent in the pipeline, and at start runs `gtd.next(assignee=<self>)` to pull its queue.
 
 Pipeline shape:
 
@@ -123,7 +123,7 @@ MCP server config (both packs):
 
 Each agent file documents its `Pickup protocol` and `Handoff protocol` sections —
 read those to understand which tasks land in your queue and which you assign on
-completion. A scheduled (or hook-triggered) `next(assignee=<agent>)` poll is enough
+completion. A scheduled (or hook-triggered) `gtd.next(assignee=<agent>)` poll is enough
 to keep the swarm moving; no central orchestrator required.
 
 ## Schema

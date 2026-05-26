@@ -35,7 +35,7 @@ impl Pack for KnowledgePack {
 static KNOWLEDGE_HANDLERS: [HandlerDef; 3] = [
     // Commissive: commits a concept entity to the namespace
     HandlerDef {
-        name: "learn",
+        name: "knowledge.learn",
         description: "Register a concept entity with optional domain and tags",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
@@ -68,7 +68,7 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 3] = [
     },
     // Commissive: commits an introduced_by edge between concept and source
     HandlerDef {
-        name: "cite",
+        name: "knowledge.cite",
         description: "Link a concept to the paper or source that introduced it",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
@@ -95,7 +95,7 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 3] = [
     },
     // Assertive: retrieves concepts filtered by domain or free-text query
     HandlerDef {
-        name: "topic",
+        name: "knowledge.topic",
         description: "List concepts filtered by domain or free-text query",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -178,9 +178,9 @@ impl PackRuntime for KnowledgePack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "learn" => self.handle_learn(token, params).await,
-            "cite" => self.handle_cite(token, params).await,
-            "topic" => self.handle_topic(token, params).await,
+            "knowledge.learn" => self.handle_learn(token, params).await,
+            "knowledge.cite" => self.handle_cite(token, params).await,
+            "knowledge.topic" => self.handle_topic(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "knowledge pack does not handle verb {verb:?}"
             ))),

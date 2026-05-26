@@ -200,16 +200,16 @@ mod tests {
             "memory pack must have subhandler entries; got none in {:?}",
             info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
         );
-        // recall.embed must be a subhandler.
+        // memory.recall_embed must be a subhandler.
         let embed = info
             .verbs
             .iter()
-            .find(|v| v.name == "recall.embed")
-            .expect("recall.embed must be in the handler list");
+            .find(|v| v.name == "memory.recall_embed")
+            .expect("memory.recall_embed must be in the handler list");
         assert_eq!(
             embed.visibility,
             VerbVisibility::Subhandler,
-            "recall.embed must have Subhandler visibility (F119)"
+            "memory.recall_embed must have Subhandler visibility (F119)"
         );
     }
 

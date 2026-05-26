@@ -11,7 +11,7 @@ tags, making it discoverable by both `topic` and the kg `search` verb.
 ## Usage
 
 ```
-request(ops="learn(name=\"LoRA\", domain=\"fine-tuning\", tags=[\"adapter\", \"peft\"])")
+request(ops="knowledge.learn(name=\"LoRA\", domain=\"fine-tuning\", tags=[\"adapter\", \"peft\"])")
 ```
 
 ## Parameters
@@ -48,7 +48,7 @@ algorithms and techniques, then `cite` to link them to their introducing paper.
 ### Batch registration
 
 ```
-request(ops="[learn(name=\"GQA\", domain=\"attention\"), learn(name=\"MLA\", domain=\"attention\")]")
+request(ops="[knowledge.learn(name=\"GQA\", domain=\"attention\"), knowledge.learn(name=\"MLA\", domain=\"attention\")]")
 ```
 
 ## Anti-patterns
@@ -56,4 +56,4 @@ request(ops="[learn(name=\"GQA\", domain=\"attention\"), learn(name=\"MLA\", dom
 - **Using `learn` for papers.** Papers are `document` entities. Use `create(kind=\"document\")`.
 - **Leaving domain empty for browseable concepts.** Domain unlocks `topic` filtering.
 - **Duplicate names.** `learn` creates a new entity on every call. Search first with
-  `topic(query=\"<name>\")` or `search(kind=\"concept\", query=\"...\")` before registering.
+  `knowledge.topic(query=\"<name>\")` or `search(kind=\"concept\", query=\"...\")` before registering.

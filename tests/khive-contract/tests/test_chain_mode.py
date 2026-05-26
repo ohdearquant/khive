@@ -1,3 +1,4 @@
+# Run via: uv run pytest
 """Chain-mode integration tests at the MCP boundary.
 
 Issue: #389 — unit tests cover chain parsing + $prev substitution only; this
@@ -18,7 +19,7 @@ import pytest
 from khive_contract.client import KhiveMcpSession, KhiveRpcError
 from khive_contract.schema import assert_envelope
 
-VERBS_UNDER_TEST = {"create", "get", "link", "update", "assign", "complete"}
+VERBS_UNDER_TEST = {"create", "get", "link", "update", "gtd.assign", "gtd.complete"}
 
 # ---------------------------------------------------------------------------
 # Skip entire module when the MCP binary is not present.
@@ -44,7 +45,7 @@ pytestmark = [
 # ---------------------------------------------------------------------------
 # Case 1: GTD chain — assign then complete via $prev.id
 #
-# `assign(title='x') | complete(id=$prev.id)`
+# `gtd.assign(title='x') | gtd.complete(id=$prev.id)`
 # Both ops must succeed; completed task must have status "done".
 # ---------------------------------------------------------------------------
 
@@ -67,8 +68,8 @@ def test_chain_assign_then_complete(
     title = f"ChainAssignComplete_{uuid.uuid4().hex[:6]}"
 
     ops = (
-        f'assign(title="{title}", namespace="{ns}")'
-        f' | complete(id=$prev.id, namespace="{ns}")'
+        f'gtd.assign(title="{title}", namespace="{ns}")'
+        f' | gtd.complete(id=$prev.id, namespace="{ns}")'
     )
     envelope = khive_gtd_session.request(ops)
 

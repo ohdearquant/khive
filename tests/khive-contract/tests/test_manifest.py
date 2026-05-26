@@ -23,13 +23,13 @@ TESTS_DIR = pathlib.Path(__file__).parent
 _THIS_FILE = pathlib.Path(__file__)
 
 ALL_PRODUCT_VERBS: frozenset[str] = frozenset({
-    # KG (11)
+    # KG substrate (11) — bare names; no pack prefix
     "create", "get", "list", "update", "delete", "merge",
     "search", "link", "neighbors", "traverse", "query",
-    # GTD (5)
-    "assign", "next", "complete", "tasks", "transition",
-    # Memory (2)
-    "remember", "recall",
+    # GTD (5) — dotted pack.verb form
+    "gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition",
+    # Memory (2) — dotted pack.verb form
+    "memory.remember", "memory.recall",
 })
 
 PLAY_SPEC_MINIMUM_VERB_COUNT = 15

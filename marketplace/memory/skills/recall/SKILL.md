@@ -13,7 +13,7 @@ Recall retrieves memory notes, not every note in the graph. Use it before answer
 Use the words future memory authors were likely to store:
 
 ```
-request(ops="recall(query=\"marketplace memory plugin remember recall\", limit=5)")
+request(ops="memory.recall(query=\"marketplace memory plugin remember recall\", limit=5)")
 ```
 
 Prefer distinctive nouns over generic prompts. "KG agent task queue syntax" is better than "what happened with agents".
@@ -23,13 +23,13 @@ Prefer distinctive nouns over generic prompts. "KG agent task queue syntax" is b
 Use `semantic` for durable facts and preferences:
 
 ```
-request(ops="recall(query=\"user preference fix specs\", memory_type=\"semantic\", limit=5)")
+request(ops="memory.recall(query=\"user preference fix specs\", memory_type=\"semantic\", limit=5)")
 ```
 
 Use `episodic` for session history and prior outcomes:
 
 ```
-request(ops="recall(query=\"previous marketplace sweep findings\", memory_type=\"episodic\", limit=5)")
+request(ops="memory.recall(query=\"previous marketplace sweep findings\", memory_type=\"episodic\", limit=5)")
 ```
 
 ### 3. Read the result shape
@@ -43,13 +43,13 @@ When a hit matters, carry forward its `note_id` in your notes or response so it 
 Recall scores are decay-aware hybrid scores (combining RRF fusion, salience with decay, and temporal recency — weighted 0.70 / 0.20 / 0.10 by default). Recent notes with normal salience typically score 0.10–0.25; older or low-salience notes may drop to 0.02–0.08. Start without `min_score` and inspect the returned scores before setting a threshold:
 
 ```
-request(ops="recall(query=\"memory pack source_id annotates\", limit=5)")
+request(ops="memory.recall(query=\"memory pack source_id annotates\", limit=5)")
 ```
 
 If the results include low-quality hits, set `min_score` just below the score of the last useful result:
 
 ```
-request(ops="recall(query=\"memory pack source_id annotates\", min_score=0.02, limit=5)")
+request(ops="memory.recall(query=\"memory pack source_id annotates\", min_score=0.02, limit=5)")
 ```
 
 If important memories may be low-salience, keep `min_score` unset and refine the query instead.
@@ -69,7 +69,7 @@ request(ops="search(kind=\"note\", query=\"<topic>\", limit=10)")
 ### Resume a project
 
 ```
-request(ops="recall(query=\"<project name> decisions blockers next steps\", limit=10)")
+request(ops="memory.recall(query=\"<project name> decisions blockers next steps\", limit=10)")
 ```
 
 Read the hits before creating new tasks or making claims about project state.
@@ -77,7 +77,7 @@ Read the hits before creating new tasks or making claims about project state.
 ### Check user preferences
 
 ```
-request(ops="recall(query=\"user prefers\", memory_type=\"semantic\", limit=10)")
+request(ops="memory.recall(query=\"user prefers\", memory_type=\"semantic\", limit=10)")
 ```
 
 Use this before choosing output format, tone, or workflow when the user has previously expressed durable preferences.
@@ -87,7 +87,7 @@ Use this before choosing output format, tone, or workflow when the user has prev
 If memories were tagged with source or domain words, include them:
 
 ```
-request(ops="recall(query=\"ADR-036 memory recall decay ranking\", memory_type=\"semantic\", limit=5)")
+request(ops="memory.recall(query=\"ADR-036 memory recall decay ranking\", memory_type=\"semantic\", limit=5)")
 ```
 
 ## Anti-patterns

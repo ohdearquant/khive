@@ -96,10 +96,10 @@ Storing source as a free string in `properties` would couple the memory pack to 
 actor-identity ADR for the string format, and would not participate in graph traversal.
 Edges are the right substrate for "this came from X" relationships.
 
-### 4. `remember` — sugar over `create` + optional `link`
+### 4. `memory.remember` — sugar over `create` + optional `link`
 
 ```
-remember(content, memory_type?, importance?, decay_factor?, source_id?, tags?, namespace?)
+memory.remember(content, memory_type?, importance?, decay_factor?, source_id?, tags?, namespace?)
 ```
 
 Semantically equivalent to:
@@ -127,10 +127,10 @@ Agents that prefer explicit CRUD are not blocked:
 `create(kind="memory", salience=0.7, decay_factor=0.01, properties={"memory_type":"semantic"}, ...)`
 followed by an optional `link(annotates)` produces an equivalent result.
 
-### 5. `recall` — memory-scoped retrieval with decay weighting
+### 5. `memory.recall` — memory-scoped retrieval with decay weighting
 
 ```
-recall(query, limit?, memory_type?, namespace?, min_score?)
+memory.recall(query, limit?, memory_type?, namespace?, min_score?)
 ```
 
 A memory-scoped variant of `search(kind="note", ...)` with three behaviours that
@@ -200,7 +200,7 @@ alongside this pack, the `recall` handler consults brain's resolved profile befo
 running the candidate-fusion stage:
 
 ```text
-recall(query, …):
+memory.recall(query, …):
   1. P = brain.resolve(actor, namespace, consumer_kind="recall") on miss → defaults
   2. weights = P.config_overrides (RRF / importance / temporal weights — §5)
   3. candidates = recall_embed → recall_candidates (multi-engine if ADR-031 loaded)
@@ -227,9 +227,9 @@ recent/active recall, `memory-cold` for archive). Both instances declare `kind=m
 
 Per [ADR-017](ADR-017-pack-standard.md)'s KindRoute model:
 
-- **`recall(kind="memory")`** fans out across all enabled instances; results fuse via
+- **`memory.recall(kind="memory")`** fans out across all enabled instances; results fuse via
   backend-level RRF.
-- **`remember(kind="memory")`** writes to the operator-declared `primary_write_instance`
+- **`memory.remember(kind="memory")`** writes to the operator-declared `primary_write_instance`
   (config). Explicit `instance="memory-cold"` overrides this (subject to auth).
 - Operators MUST declare `primary_write_instance` when more than one memory instance is
   enabled — registration order is not a valid tiebreaker.
@@ -302,8 +302,8 @@ equal. Defaulting to `0.01` (mild decay, ~69-day half-life) gives sensible behav
 out of the box.
 
 Agents that want different decay characteristics override per-memory:
-`remember(content="...", decay_factor=0.05)` for fast-fading episodic content,
-`remember(content="...", decay_factor=0.0)` for permanent semantic facts.
+`memory.remember(content="...", decay_factor=0.05)` for fast-fading episodic content,
+`memory.remember(content="...", decay_factor=0.0)` for permanent semantic facts.
 
 ### Why `importance` aliases `salience` (not a new column)
 
@@ -395,15 +395,15 @@ impl Pack for MemoryPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const EDGE_RULES: &'static [EdgeEndpointRule] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
-        HandlerDef { name: "remember",          description: "...", visibility: Visibility::Verb },
-        HandlerDef { name: "recall",            description: "...", visibility: Visibility::Verb },
-        HandlerDef { name: "recall_embed",      description: "...", visibility: Visibility::Subhandler },
-        HandlerDef { name: "recall_candidates", description: "...", visibility: Visibility::Subhandler },
-        HandlerDef { name: "recall_fuse",       description: "...", visibility: Visibility::Subhandler },
-        HandlerDef { name: "recall_score",      description: "...", visibility: Visibility::Subhandler },
+        HandlerDef { name: "memory.remember",          description: "...", visibility: Visibility::Verb },
+        HandlerDef { name: "memory.recall",            description: "...", visibility: Visibility::Verb },
+        HandlerDef { name: "memory.recall_embed",      description: "...", visibility: Visibility::Subhandler },
+        HandlerDef { name: "memory.recall_candidates", description: "...", visibility: Visibility::Subhandler },
+        HandlerDef { name: "memory.recall_fuse",       description: "...", visibility: Visibility::Subhandler },
+        HandlerDef { name: "memory.recall_score",      description: "...", visibility: Visibility::Subhandler },
     ];
-    // Wire form: memory.remember / memory.recall (Verb)
-    //            memory.recall_embed / memory.recall_candidates / memory.recall_fuse / memory.recall_score (Subhandler)
+    // ADR-023 §4: pack-prefixed verb names — `memory.remember` / `memory.recall` (Verb)
+    //             `memory.recall_embed` / `memory.recall_candidates` / `memory.recall_fuse` / `memory.recall_score` (Subhandler)
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 ```
@@ -434,9 +434,9 @@ The pack's `StorageProfile` (from [ADR-003](ADR-003-system-architecture.md) /
 
 | Scenario                                               | Assert                                                                      |
 | ------------------------------------------------------ | --------------------------------------------------------------------------- |
-| `remember(content="x")` defaults                       | `memory_type="episodic"`, `salience=0.5`, `decay_factor=0.01`               |
-| `remember(... source_id=P)`                            | `annotates` edge from memory_id to P exists                                 |
-| `recall(query="x")` excludes non-memory notes          | Mixed namespace with observations + tasks; no leak                          |
+| `memory.remember(content="x")` defaults                | `memory_type="episodic"`, `salience=0.5`, `decay_factor=0.01`               |
+| `memory.remember(... source_id=P)`                     | `annotates` edge from memory_id to P exists                                 |
+| `memory.recall(query="x")` excludes non-memory notes   | Mixed namespace with observations + tasks; no leak                          |
 | `recall` with mixed namespace > `limit * 4` non-memory | Candidate scoping pushes filter into retrieval; correct limit hits returned |
 | Decay-weighted ranking                                 | High-decay old memory ranks below low-decay equivalent                      |
 | `memory_type` post-filter                              | Returns only specified type                                                 |
