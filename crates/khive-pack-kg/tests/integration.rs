@@ -44,6 +44,14 @@ fn pack() -> Fixture {
     }
 }
 
+impl Clone for Fixture {
+    fn clone(&self) -> Self {
+        Fixture {
+            registry: self.registry.clone(),
+        }
+    }
+}
+
 fn pack_with_events() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
     let tok = rt.authorize(khive_runtime::Namespace::local());
@@ -3149,5 +3157,479 @@ async fn verbs_dispatch_pack_filter_fake_excludes_subhandler() {
         names,
         vec!["fake.pub"],
         "verbs(pack=fake) must return exactly [fake.pub], not the subhandler"
+    );
+}
+
+// M2 / codex H1 regression: three parallel singleton link() calls for the same
+// (source, target, relation) triple must all return the same edge ID and the
+// database must contain exactly one edge row for that triple.
+//
+// Before the H1 fix, each call generated a fresh UUID before the insert; the
+// losing calls returned their locally-generated IDs even though the database
+// stored a different (winning) row ID.  After the fix, link() reads back the
+// persisted row by natural key so every caller receives the same stored ID.
+#[tokio::test]
+async fn parallel_link_same_triple_returns_identical_ids() {
+    let pack = pack();
+
+    // Create two entities to link.
+    let a = pack
+        .dispatch("create", json!({"kind": "concept", "name": "ParLinkA"}))
+        .await
+        .expect("create A must succeed");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch("create", json!({"kind": "concept", "name": "ParLinkB"}))
+        .await
+        .expect("create B must succeed");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // Fire three concurrent link() calls for the same (A→B, extends) triple.
+    // tokio::join! runs all branches as concurrent tasks on the same executor;
+    // the shared in-memory KhiveRuntime uses a pool writer, so the three upserts
+    // are serialised at the DB level while being logically concurrent at the call
+    // site — exactly the scenario that exposed the phantom-ID bug.
+    let link_args = json!({"source_id": a_id, "target_id": b_id, "relation": "extends"});
+
+    let p1 = pack.clone();
+    let p2 = pack.clone();
+    let p3 = pack.clone();
+    let a1 = link_args.clone();
+    let a2 = link_args.clone();
+    let a3 = link_args.clone();
+
+    let (r1, r2, r3) = tokio::join!(
+        p1.dispatch("link", a1),
+        p2.dispatch("link", a2),
+        p3.dispatch("link", a3),
+    );
+
+    let edge1 = r1.expect("link call 1 must succeed");
+    let edge2 = r2.expect("link call 2 must succeed");
+    let edge3 = r3.expect("link call 3 must succeed");
+
+    let id1 = edge1.get("id").and_then(Value::as_str).unwrap_or("");
+    let id2 = edge2.get("id").and_then(Value::as_str).unwrap_or("");
+    let id3 = edge3.get("id").and_then(Value::as_str).unwrap_or("");
+
+    assert!(
+        !id1.is_empty() && id1 == id2 && id2 == id3,
+        "H1: all three parallel link() calls must return the same edge ID; got: {id1:?}, {id2:?}, {id3:?}"
+    );
+
+    // Exactly one edge row must exist for this triple.
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "edge", "source_id": a_id, "target_id": b_id, "relations": ["extends"]}),
+        )
+        .await
+        .expect("list edges must succeed");
+    let edges = list_result.as_array().expect("list must return array");
+    assert_eq!(
+        edges.len(),
+        1,
+        "H1: exactly one edge row must exist for the triple after three parallel link() calls; got: {edges:?}"
+    );
+}
+
+// R4 / codex H1 round-4 regression: singleton link() must go through runtime.link()
+// upsert even when the triple already exists, so caller-supplied weight and metadata
+// are persisted (ADR-009 §edge-upsert contract).
+//
+// Before the r4 fix the handler pre-read the existing edge and returned it directly,
+// silently dropping any new weight / metadata the caller passed.
+#[tokio::test]
+async fn singleton_link_updates_weight_and_metadata_on_existing_triple() {
+    let pack = pack();
+
+    // Create two entities.
+    let a = pack
+        .dispatch("create", json!({"kind": "concept", "name": "R4LinkA"}))
+        .await
+        .expect("create A must succeed");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch("create", json!({"kind": "concept", "name": "R4LinkB"}))
+        .await
+        .expect("create B must succeed");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // First link: weight=0.3, metadata={"first": "v1"}.
+    let edge1 = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": a_id,
+                "target_id": b_id,
+                "relation": "extends",
+                "weight": 0.3,
+                "metadata": {"first": "v1"}
+            }),
+        )
+        .await
+        .expect("first link must succeed");
+    let id1 = edge1
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("first link must return an id")
+        .to_string();
+
+    // Second link on the same triple: weight=0.8, metadata={"second": "v2"}.
+    let edge2 = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": a_id,
+                "target_id": b_id,
+                "relation": "extends",
+                "weight": 0.8,
+                "metadata": {"second": "v2"}
+            }),
+        )
+        .await
+        .expect("second link must succeed");
+    let id2 = edge2
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("second link must return an id")
+        .to_string();
+
+    // IDs must be the same persisted row.
+    assert_eq!(
+        id1, id2,
+        "R4: singleton link() on existing triple must return the same stable edge ID"
+    );
+
+    // Fetch the row and assert weight and metadata were updated.
+    let fetched = pack
+        .dispatch("get", json!({"id": id1}))
+        .await
+        .expect("get edge by id must succeed");
+
+    let stored_weight = fetched
+        .get("weight")
+        .and_then(Value::as_f64)
+        .expect("fetched edge must have weight");
+    assert!(
+        (stored_weight - 0.8).abs() < 1e-9,
+        "R4: weight must be updated to 0.8 by second link() call; got {stored_weight}"
+    );
+
+    let stored_meta = fetched
+        .get("metadata")
+        .expect("fetched edge must have metadata");
+    assert!(
+        stored_meta.get("second").is_some(),
+        "R4: metadata must contain 'second' key from second link() call; got {stored_meta}"
+    );
+
+    // Exactly one edge row for this triple.
+    let list_result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "edge", "source_id": a_id, "target_id": b_id, "relations": ["extends"]}),
+        )
+        .await
+        .expect("list edges must succeed");
+    let edges = list_result.as_array().expect("list must return array");
+    assert_eq!(
+        edges.len(),
+        1,
+        "R4: exactly one edge row must exist for the triple; got: {edges:?}"
+    );
+}
+
+// ---- Merge symmetric-relation canonicalization regression (ADR-002 §134) ----
+
+/// After merging B into A, B's `competes_with` edge to C is rewired to A→C.
+/// If A already has a `competes_with` edge to C, the rewire is a conflict:
+/// exactly ONE live edge must survive, and its stored endpoints must satisfy
+/// `source_uuid < target_uuid` (canonical form for symmetric relations).
+#[tokio::test]
+async fn merge_rewire_symmetric_relation_canonicalization() {
+    let pack = pack();
+
+    // Create A, B, C.
+    let a_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "MergeSymA"}))
+        .await
+        .expect("create A")
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("A must have id")
+        .to_string();
+
+    let b_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "MergeSymB"}))
+        .await
+        .expect("create B")
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("B must have id")
+        .to_string();
+
+    let c_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "MergeSymC"}))
+        .await
+        .expect("create C")
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("C must have id")
+        .to_string();
+
+    // A competes_with C — canonical form stored by the runtime.
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": c_id, "relation": "competes_with"}),
+    )
+    .await
+    .expect("link A competes_with C");
+
+    // B competes_with C — also stored in canonical form.
+    pack.dispatch(
+        "link",
+        json!({"source_id": b_id, "target_id": c_id, "relation": "competes_with"}),
+    )
+    .await
+    .expect("link B competes_with C");
+
+    // Merge B into A. B's competes_with edge to C should be rewired to A→C,
+    // but A already owns that triple → exactly one live edge must survive.
+    pack.dispatch("merge", json!({"into_id": a_id, "from_id": b_id}))
+        .await
+        .expect("merge B into A must succeed");
+
+    // Assert: neighbors(A, competes_with) returns exactly C (one neighbor).
+    let neighbors = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": a_id, "relations": ["competes_with"]}),
+        )
+        .await
+        .expect("neighbors of A with competes_with must succeed");
+    let items = neighbors.as_array().expect("neighbors must return array");
+    let neighbor_ids: Vec<&str> = items
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        neighbor_ids.len(),
+        1,
+        "merge must leave exactly one competes_with neighbor of A; got: {neighbor_ids:?}"
+    );
+    assert!(
+        neighbor_ids[0] == c_id
+            || c_id.starts_with(neighbor_ids[0])
+            || neighbor_ids[0].starts_with(&c_id[..8]),
+        "the sole competes_with neighbor of A must be C; got: {:?}",
+        neighbor_ids[0]
+    );
+
+    // Bonus: the surviving edge row must have source_uuid < target_uuid (canonical form).
+    // list(kind=edge, relations=[competes_with], source_id=<canonical_src>) where
+    // canonical_src is the lower of the two UUIDs.
+    let (canon_src, canon_tgt) = if a_id < c_id {
+        (a_id.as_str(), c_id.as_str())
+    } else {
+        (c_id.as_str(), a_id.as_str())
+    };
+    let edge_list = pack
+        .dispatch(
+            "list",
+            json!({"kind": "edge", "source_id": canon_src, "target_id": canon_tgt, "relations": ["competes_with"]}),
+        )
+        .await
+        .expect("list edge in canonical order must succeed");
+    let edges = edge_list.as_array().expect("list must return array");
+    assert_eq!(
+        edges.len(),
+        1,
+        "exactly one canonically-ordered edge row must exist; got: {edges:?}"
+    );
+}
+
+// ---- H1 codex round-3: update_edge canonicalizes symmetric relations ----
+
+/// H1-a: updating an edge from a non-symmetric relation to `competes_with`
+/// must store the row with `source_uuid < target_uuid` (canonical form).
+#[tokio::test]
+async fn update_edge_to_symmetric_relation_canonicalizes_endpoints() {
+    let pack = pack();
+
+    let a_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "UpdateSymA"}))
+        .await
+        .expect("create A")
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("A must have id")
+        .to_string();
+
+    let b_id = pack
+        .dispatch("create", json!({"kind": "concept", "name": "UpdateSymB"}))
+        .await
+        .expect("create B")
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("B must have id")
+        .to_string();
+
+    // Determine which UUID is larger so we can link in non-canonical order.
+    // We want the initial link to be stored as the HIGHER uuid → LOWER uuid so that
+    // when we change to competes_with the canonical form requires a swap.
+    let (src_id, tgt_id) = if a_id > b_id {
+        (a_id.as_str(), b_id.as_str())
+    } else {
+        (b_id.as_str(), a_id.as_str())
+    };
+
+    // Link src -[extends]-> tgt (non-symmetric; valid in either direction).
+    let link_resp = pack
+        .dispatch(
+            "link",
+            json!({"source_id": src_id, "target_id": tgt_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link extends must succeed");
+    let edge_id = link_resp
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("link must return edge id")
+        .to_string();
+
+    // Update the relation to competes_with (symmetric).
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({"kind": "edge", "id": edge_id, "relation": "competes_with"}),
+        )
+        .await
+        .expect("update to competes_with must succeed");
+
+    // The returned edge must satisfy canonical order: source_uuid < target_uuid.
+    let ret_src = updated
+        .get("source_id")
+        .and_then(Value::as_str)
+        .expect("returned edge must have source_id")
+        .to_string();
+    let ret_tgt = updated
+        .get("target_id")
+        .and_then(Value::as_str)
+        .expect("returned edge must have target_id")
+        .to_string();
+    assert!(
+        ret_src < ret_tgt,
+        "H1-a: update_edge to symmetric relation must canonicalize source < target; \
+         got source={ret_src}, target={ret_tgt}"
+    );
+
+    // Verify by listing with the canonical triple — exactly one edge must exist.
+    let canon_s = ret_src.as_str();
+    let canon_t = ret_tgt.as_str();
+    let edge_list = pack
+        .dispatch(
+            "list",
+            json!({"kind": "edge", "source_id": canon_s, "target_id": canon_t, "relations": ["competes_with"]}),
+        )
+        .await
+        .expect("list canonical edge must succeed");
+    let listed: &Vec<Value> = edge_list.as_array().expect("list must return array");
+    assert_eq!(
+        listed.len(),
+        1,
+        "H1-a: exactly one canonical competes_with edge must exist; got: {listed:?}"
+    );
+}
+
+/// H1-b: if a canonical `B -[competes_with]-> A` row already exists (B < A),
+/// then updating `A -[extends]-> B` to `competes_with` must not create a
+/// duplicate — the existing canonical row must survive as the sole edge.
+#[tokio::test]
+async fn update_edge_to_symmetric_relation_no_duplicate_when_canonical_exists() {
+    let pack = pack();
+
+    let a_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "UpdateSymDupA"}),
+        )
+        .await
+        .expect("create A")
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("A must have id")
+        .to_string();
+
+    let b_id = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "UpdateSymDupB"}),
+        )
+        .await
+        .expect("create B")
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("B must have id")
+        .to_string();
+
+    // Create the canonical competes_with edge B↔A (runtime stores it in canonical form).
+    pack.dispatch(
+        "link",
+        json!({"source_id": a_id, "target_id": b_id, "relation": "competes_with"}),
+    )
+    .await
+    .expect("pre-create canonical competes_with must succeed");
+
+    // Determine non-canonical direction for extends: higher_uuid → lower_uuid.
+    let (ext_src, ext_tgt) = if a_id > b_id {
+        (a_id.as_str(), b_id.as_str())
+    } else {
+        (b_id.as_str(), a_id.as_str())
+    };
+
+    // Link the non-canonical direction with a non-symmetric relation.
+    let link_resp = pack
+        .dispatch(
+            "link",
+            json!({"source_id": ext_src, "target_id": ext_tgt, "relation": "extends"}),
+        )
+        .await
+        .expect("link extends must succeed");
+    let edge_id = link_resp
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("link must return edge id")
+        .to_string();
+
+    // Update to competes_with. The canonical row already exists → the extends
+    // edge should be absorbed (no duplicate created).
+    pack.dispatch(
+        "update",
+        json!({"kind": "edge", "id": edge_id, "relation": "competes_with"}),
+    )
+    .await
+    .expect("update to competes_with when canonical exists must succeed");
+
+    // List ALL competes_with edges between A and B — must be exactly one.
+    let (canon_s, canon_t) = if a_id < b_id {
+        (a_id.as_str(), b_id.as_str())
+    } else {
+        (b_id.as_str(), a_id.as_str())
+    };
+    let edge_list = pack
+        .dispatch(
+            "list",
+            json!({"kind": "edge", "source_id": canon_s, "target_id": canon_t, "relations": ["competes_with"]}),
+        )
+        .await
+        .expect("list canonical competes_with after update must succeed");
+    let listed: &Vec<Value> = edge_list.as_array().expect("list must return array");
+    assert_eq!(
+        listed.len(),
+        1,
+        "H1-b: exactly one competes_with edge must exist after update (no duplicate); got: {listed:?}"
     );
 }

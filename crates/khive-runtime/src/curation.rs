@@ -14,8 +14,10 @@ use khive_db::SqliteError;
 use khive_storage::types::{EdgeFilter, TextDocument};
 use khive_storage::{EdgeRelation, Entity, SubstrateKind};
 use khive_types::EventKind;
+use rusqlite::OptionalExtension;
 
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::operations::canonical_edge_endpoints;
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 // ---------------------------------------------------------------------------
@@ -260,6 +262,20 @@ impl KhiveRuntime {
             return Err(RuntimeError::InvalidInput(
                 "cannot merge an entity into itself".into(),
             ));
+        }
+        // H2 fix: enforce same-kind constraint at the runtime layer (ADR-014).
+        // The handler also checks this, but any direct runtime caller (CLI, tests,
+        // future SDK) would bypass the handler guard without this check here.
+        {
+            let into_entity = self.get_entity(token, into_id).await?;
+            let from_entity = self.get_entity(token, from_id).await?;
+            if into_entity.kind != from_entity.kind {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cannot merge entities of different kinds: into={} ({}), from={} ({}); \
+                     merge requires both entities to share the same kind",
+                    into_id, into_entity.kind, from_id, from_entity.kind
+                )));
+            }
         }
         let ns = token.namespace().as_str().to_owned();
         let sanitized_ns: String = ns
@@ -749,15 +765,21 @@ fn merge_entity_sql(
     let mut edges_rewired = 0usize;
     if !dry_run {
         for edge in all_edges {
-            let new_src = if edge.source_id == from_id {
+            let raw_src = if edge.source_id == from_id {
                 into_id
             } else {
                 edge.source_id
             };
-            let new_tgt = if edge.target_id == from_id {
+            let raw_tgt = if edge.target_id == from_id {
                 into_id
             } else {
                 edge.target_id
+            };
+            // ADR-002 §134: symmetric relations must be stored with source_uuid < target_uuid.
+            // Apply canonicalization so the conflict check and UPDATE both use the canonical form.
+            let (new_src, new_tgt) = match edge.relation.parse::<EdgeRelation>() {
+                Ok(rel) => canonical_edge_endpoints(rel, raw_src, raw_tgt),
+                Err(_) => (raw_src, raw_tgt),
             };
 
             if new_src == new_tgt {
@@ -769,33 +791,79 @@ fn merge_entity_sql(
             }
 
             let now_ts = chrono::Utc::now().timestamp();
-            conn.execute(
-                "INSERT INTO graph_edges \
-                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-                 ON CONFLICT(namespace, id) DO UPDATE SET \
-                     source_id = excluded.source_id, \
-                     target_id = excluded.target_id, \
-                     relation = excluded.relation, \
-                     weight = excluded.weight, \
-                     updated_at = excluded.updated_at, \
-                     metadata = excluded.metadata \
-                 ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
-                rusqlite::params![
-                    &namespace,
-                    edge.id.to_string(),
-                    new_src.to_string(),
-                    new_tgt.to_string(),
-                    &edge.relation,
-                    edge.weight,
-                    edge.created_at,
-                    now_ts,
-                    edge.deleted_at,
-                    edge.target_backend,
-                    edge.metadata,
-                ],
-            )?;
-            edges_rewired += 1;
+            // H3 fix (ADR-009/ADR-014): preserve the original edge ID by updating
+            // source_id/target_id in-place when no conflict exists.
+            //
+            // Two-step approach to handle all cases while keeping the original ID:
+            //   (a) No conflict (new triple): UPDATE source_id/target_id in-place.
+            //       The edge retains its original UUID — callers can still get() it
+            //       by the ID they received from link().
+            //   (b) Conflict: into_id already has an edge with this (source,target,
+            //       relation). Delete the from-edge (it is superseded) and UPDATE
+            //       the existing into-edge to refresh weight/metadata/deleted_at.
+            //       The surviving edge is the into-entity's original edge (correct).
+            //
+            // Check for a conflict: does into_id already have this natural key?
+            let conflict_id: Option<String> = {
+                let conflict_src = new_src.to_string();
+                let conflict_tgt = new_tgt.to_string();
+                conn.query_row(
+                    "SELECT id FROM graph_edges \
+                     WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
+                     AND relation = ?4 AND id != ?5",
+                    rusqlite::params![
+                        &namespace,
+                        &conflict_src,
+                        &conflict_tgt,
+                        &edge.relation,
+                        edge.id.to_string(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(SqliteError::Rusqlite)?
+            };
+
+            let changed = if let Some(existing_id) = conflict_id {
+                // Case (b): a live or soft-deleted row already owns this natural key.
+                // Delete the from-edge and refresh the existing row.
+                conn.execute(
+                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                    rusqlite::params![&namespace, edge.id.to_string()],
+                )?;
+                conn.execute(
+                    "UPDATE graph_edges SET \
+                     weight = ?1, updated_at = ?2, deleted_at = NULL, \
+                     target_backend = ?3, metadata = ?4 \
+                     WHERE namespace = ?5 AND id = ?6",
+                    rusqlite::params![
+                        edge.weight,
+                        now_ts,
+                        edge.target_backend,
+                        edge.metadata,
+                        &namespace,
+                        &existing_id,
+                    ],
+                )?
+            } else {
+                // Case (a): no conflict — update source_id/target_id in-place,
+                // preserving the original edge ID for callers.
+                conn.execute(
+                    "UPDATE graph_edges SET \
+                     source_id = ?1, target_id = ?2, updated_at = ?3 \
+                     WHERE namespace = ?4 AND id = ?5",
+                    rusqlite::params![
+                        new_src.to_string(),
+                        new_tgt.to_string(),
+                        now_ts,
+                        &namespace,
+                        edge.id.to_string(),
+                    ],
+                )?
+            };
+            if changed > 0 {
+                edges_rewired += 1;
+            }
         }
 
         // --- Upsert merged entity ---
@@ -1163,15 +1231,20 @@ fn merge_note_sql(
     if !dry_run {
         // Rewire and upsert.
         for edge in all_edges {
-            let new_src = if edge.source_id == from_id {
+            let raw_src = if edge.source_id == from_id {
                 into_id
             } else {
                 edge.source_id
             };
-            let new_tgt = if edge.target_id == from_id {
+            let raw_tgt = if edge.target_id == from_id {
                 into_id
             } else {
                 edge.target_id
+            };
+            // ADR-002 §134: canonicalize symmetric relations before conflict check + UPDATE.
+            let (new_src, new_tgt) = match edge.relation.parse::<EdgeRelation>() {
+                Ok(rel) => canonical_edge_endpoints(rel, raw_src, raw_tgt),
+                Err(_) => (raw_src, raw_tgt),
             };
             if new_src == new_tgt {
                 conn.execute(
@@ -1181,33 +1254,64 @@ fn merge_note_sql(
                 continue;
             }
             let now_ts = chrono::Utc::now().timestamp();
-            conn.execute(
-                "INSERT INTO graph_edges \
-                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, target_backend, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-                 ON CONFLICT(namespace, id) DO UPDATE SET \
-                     source_id = excluded.source_id, \
-                     target_id = excluded.target_id, \
-                     relation = excluded.relation, \
-                     weight = excluded.weight, \
-                     updated_at = excluded.updated_at, \
-                     metadata = excluded.metadata \
-                 ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING",
-                rusqlite::params![
-                    &namespace,
-                    edge.id.to_string(),
-                    new_src.to_string(),
-                    new_tgt.to_string(),
-                    &edge.relation,
-                    edge.weight,
-                    edge.created_at,
-                    now_ts,
-                    edge.deleted_at,
-                    edge.target_backend,
-                    edge.metadata,
-                ],
-            )?;
-            edges_rewired += 1;
+            // Same two-step approach as entity merge rewire: preserve original edge ID
+            // when no conflict, merge into existing row when conflict exists.
+            let conflict_id: Option<String> = {
+                let conflict_src = new_src.to_string();
+                let conflict_tgt = new_tgt.to_string();
+                conn.query_row(
+                    "SELECT id FROM graph_edges \
+                     WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
+                     AND relation = ?4 AND id != ?5",
+                    rusqlite::params![
+                        &namespace,
+                        &conflict_src,
+                        &conflict_tgt,
+                        &edge.relation,
+                        edge.id.to_string(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(SqliteError::Rusqlite)?
+            };
+
+            let changed = if let Some(existing_id) = conflict_id {
+                conn.execute(
+                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                    rusqlite::params![&namespace, edge.id.to_string()],
+                )?;
+                conn.execute(
+                    "UPDATE graph_edges SET \
+                     weight = ?1, updated_at = ?2, deleted_at = NULL, \
+                     target_backend = ?3, metadata = ?4 \
+                     WHERE namespace = ?5 AND id = ?6",
+                    rusqlite::params![
+                        edge.weight,
+                        now_ts,
+                        edge.target_backend,
+                        edge.metadata,
+                        &namespace,
+                        &existing_id,
+                    ],
+                )?
+            } else {
+                conn.execute(
+                    "UPDATE graph_edges SET \
+                     source_id = ?1, target_id = ?2, updated_at = ?3 \
+                     WHERE namespace = ?4 AND id = ?5",
+                    rusqlite::params![
+                        new_src.to_string(),
+                        new_tgt.to_string(),
+                        now_ts,
+                        &namespace,
+                        edge.id.to_string(),
+                    ],
+                )?
+            };
+            if changed > 0 {
+                edges_rewired += 1;
+            }
         }
 
         // Upsert merged into-note.
@@ -2202,5 +2306,169 @@ mod tests {
 
         assert_eq!(updated.metadata.as_ref().unwrap()["source"], "manual");
         assert!((updated.weight - 0.5).abs() < 0.001, "weight unchanged");
+    }
+
+    // scenario-kg-maintenance C1 regression: merge must not crash when both
+    // entities share a common third-party edge (duplicate triple after rewire).
+    // Before the fix, the double-ON-CONFLICT INSERT raised a UNIQUE constraint
+    // error at the SQLite layer and the merge aborted mid-transaction.
+    #[tokio::test]
+    async fn merge_entity_survives_shared_edge_to_third_party() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        // Create three entities: A and B will be merged; shared is the common target.
+        // Use `extends` (concept→concept) which is in the ADR-002 base allowlist.
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Both A and B extend the same shared concept — this creates a duplicate
+        // triple (A/B → shared, extends) that triggers the crash on rewire.
+        rt.link(&tok, a.id, shared.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        rt.link(&tok, b.id, shared.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // Before the fix this would return Err with "UNIQUE constraint failed".
+        let summary = rt
+            .merge_entity(
+                &tok,
+                a.id,
+                b.id,
+                crate::EntityDedupMergePolicy::PreferInto,
+                false,
+            )
+            .await
+            .expect(
+                "C1: merge must succeed even when both entities share an edge to a third party",
+            );
+
+        assert_eq!(summary.kept_id, a.id);
+        assert_eq!(summary.removed_id, b.id);
+        // A already had the Extends edge to shared; when B→shared is rewired to
+        // A→shared, the ON CONFLICT DO UPDATE refreshes the existing row (clears
+        // deleted_at, updates weight). rusqlite reports this as 1 change, so
+        // edges_rewired will be >= 0. The important invariant is that the merge
+        // did NOT crash and exactly one live edge A→shared remains.
+
+        // One live edge A→shared must exist after merge.
+        let a_edges = rt
+            .list_edges(
+                &tok,
+                crate::EdgeListFilter {
+                    source_id: Some(a.id),
+                    target_id: Some(shared.id),
+                    relations: vec![EdgeRelation::Extends],
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            a_edges.len(),
+            1,
+            "C1: exactly one live A→shared Extends edge must exist after merge; got: {a_edges:?}"
+        );
+
+        // Tombstone check: B must be soft-deleted after successful merge (C3).
+        // get_entity filters deleted_at IS NULL, so a tombstoned entity returns None.
+        let b_after = rt.entities(&tok).unwrap().get_entity(b.id).await.unwrap();
+        assert!(
+            b_after.is_none(),
+            "C3: from_entity must be tombstoned (get_entity returns None for deleted) after merge; got: {b_after:?}"
+        );
+    }
+
+    // H2 regression: merge_entity at the runtime level must reject cross-kind merges.
+    // Before the H2 fix, only the pack handler had this guard; a direct runtime caller
+    // could still merge concept+project, silently tombstoning the source entity.
+    #[tokio::test]
+    async fn merge_entity_cross_kind_rejected_at_runtime() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let concept = rt
+            .create_entity(&tok, "concept", None, "H2Concept", None, None, vec![])
+            .await
+            .unwrap();
+        let project = rt
+            .create_entity(&tok, "project", None, "H2Project", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Cross-kind merge must return InvalidInput at the runtime level.
+        let err = rt
+            .merge_entity(
+                &tok,
+                concept.id,
+                project.id,
+                crate::EntityDedupMergePolicy::PreferInto,
+                false,
+            )
+            .await
+            .expect_err("H2: cross-kind merge must be rejected by runtime");
+        assert!(
+            matches!(err, crate::RuntimeError::InvalidInput(_)),
+            "H2: expected InvalidInput, got: {err:?}"
+        );
+
+        // Both entities must survive the failed merge attempt with no tombstone.
+        let concept_after = rt.get_entity(&tok, concept.id).await;
+        let project_after = rt.get_entity(&tok, project.id).await;
+        assert!(
+            concept_after.is_ok(),
+            "H2: concept must remain live after rejected merge; got: {concept_after:?}"
+        );
+        assert!(
+            project_after.is_ok(),
+            "H2: project must remain live after rejected merge; got: {project_after:?}"
+        );
+    }
+
+    // scenario-kg-maintenance C2 regression: same-kind merge must succeed.
+    #[tokio::test]
+    async fn merge_entity_same_kind_succeeds() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let c1 = rt
+            .create_entity(&tok, "concept", None, "Concept1", None, None, vec![])
+            .await
+            .unwrap();
+        let c2 = rt
+            .create_entity(&tok, "concept", None, "Concept2", None, None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                c1.id,
+                c2.id,
+                crate::EntityDedupMergePolicy::PreferInto,
+                false,
+            )
+            .await
+            .expect("same-kind merge must succeed");
+        assert_eq!(summary.kept_id, c1.id);
+        assert_eq!(summary.removed_id, c2.id);
+
+        // c2 must be tombstoned.
+        let c2_after = rt.entities(&tok).unwrap().get_entity(c2.id).await.unwrap();
+        assert!(c2_after.is_none(), "from_entity must be tombstoned");
     }
 }

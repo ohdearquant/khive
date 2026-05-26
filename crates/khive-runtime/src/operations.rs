@@ -16,6 +16,9 @@ use khive_storage::types::{
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 
+use khive_db::SqliteError;
+use rusqlite::OptionalExtension;
+
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -207,7 +210,7 @@ fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &st
 /// For `competes_with` and `composed_with`, normalises direction so that
 /// `source_uuid < target_uuid` (lexicographic on the UUID bytes). This
 /// collapses A→B and B→A into a single canonical row, preventing duplicates.
-fn canonical_edge_endpoints(
+pub(crate) fn canonical_edge_endpoints(
     relation: EdgeRelation,
     source_id: Uuid,
     target_id: Uuid,
@@ -764,8 +767,33 @@ impl KhiveRuntime {
             metadata,
             target_backend: None,
         };
-        self.graph(token)?.upsert_edge(edge.clone()).await?;
-        Ok(edge)
+        self.graph(token)?.upsert_edge(edge).await?;
+
+        // H1 fix: read back the persisted row by natural key so the returned
+        // edge ID is always the one stored in the database, not the locally
+        // generated UUID that was displaced by an ON CONFLICT DO UPDATE.
+        // Under parallel calls for the same triple, every caller now returns
+        // the same persisted edge ID — the winner's insert or the updated row.
+        let persisted = self
+            .list_edges(
+                token,
+                crate::curation::EdgeListFilter {
+                    source_id: Some(source_id),
+                    target_id: Some(target_id),
+                    relations: vec![relation],
+                    ..Default::default()
+                },
+                1,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                crate::RuntimeError::Internal(format!(
+                    "upsert_edge succeeded but natural-key lookup for ({source_id}, {target_id}, {relation}) returned nothing"
+                ))
+            })?;
+        Ok(persisted)
     }
 
     /// Returns `true` if `id` resolves to a live substrate record in `namespace`.
@@ -1838,6 +1866,12 @@ impl KhiveRuntime {
     /// are legal for `new_rel` before persisting. Weight-only updates (`relation = None`)
     /// skip validation. Returns `InvalidInput` if the new relation would violate the
     /// ADR-002/ADR-019/ADR-024 three-case contract; the edge is NOT mutated on error.
+    ///
+    /// ADR-002 §134: when the resulting relation is symmetric (`competes_with`,
+    /// `composed_with`), endpoint order is canonicalised to `source_uuid < target_uuid`
+    /// after validation. If a canonical row already exists at the target triple, the
+    /// non-canonical edge is deleted and the existing canonical row is refreshed
+    /// (DELETE + UPDATE pattern, mirroring `merge_entity_sql`).
     pub async fn update_edge(
         &self,
         token: &NamespaceToken,
@@ -1866,7 +1900,138 @@ impl KhiveRuntime {
             edge.metadata = Some(props);
         }
 
-        graph.upsert_edge(edge.clone()).await?;
+        // ADR-002 §134: for symmetric relations, canonicalise endpoint order and check
+        // for natural-key conflicts regardless of whether endpoints were flipped.
+        //
+        // The raw-SQL path is used for ALL symmetric relations because `upsert_edge`
+        // resolves ON CONFLICT(namespace,id) first and cannot detect a duplicate at
+        // the natural key (namespace, source_id, target_id, relation) with a different
+        // id. Bug-fix: this path must also run when endpoints are already canonical
+        // (endpoints_flipped=false) to catch conflicts arising from a relation change
+        // that collides with an existing canonical row.
+        let (canon_src, canon_tgt) =
+            canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+
+        if edge.relation.is_symmetric() {
+            // Raw-SQL path (mirrors merge_entity_sql).
+            let ns = token.namespace().as_str().to_string();
+            let edge_id_str = edge_id.to_string();
+            let relation_str = edge.relation.to_string();
+            let canon_src_str = canon_src.to_string();
+            let canon_tgt_str = canon_tgt.to_string();
+            let weight = edge.weight;
+            let metadata = edge
+                .metadata
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_default());
+            let target_backend = edge.target_backend.clone();
+
+            let pool = self.backend().pool_arc();
+
+            // spawn_blocking returns Some(surviving_id) when a canonical conflict was
+            // absorbed (the requested edge was deleted, existing canonical row refreshed),
+            // or None when the requested edge was updated in-place.
+            let surviving_id: Option<String> = tokio::task::spawn_blocking(move || {
+                let guard = pool.writer()?;
+                guard.transaction(|conn| {
+                    let now_ts = chrono::Utc::now().timestamp();
+
+                    // Check for a conflicting canonical row (same namespace + natural key,
+                    // different id). This catches conflicts whether or not endpoints were
+                    // flipped — Bug 2 fix.
+                    let conflict_id: Option<String> = conn
+                        .query_row(
+                            "SELECT id FROM graph_edges \
+                             WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
+                             AND relation = ?4 AND id != ?5",
+                            rusqlite::params![
+                                &ns,
+                                &canon_src_str,
+                                &canon_tgt_str,
+                                &relation_str,
+                                &edge_id_str,
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(SqliteError::Rusqlite)?;
+
+                    if let Some(existing_id) = conflict_id {
+                        // Case (b): canonical row already exists — delete the non-canonical
+                        // edge and refresh the existing canonical row. Return the surviving
+                        // id so the caller can re-fetch it (Bug 1 fix: do not return the
+                        // deleted edge's id).
+                        conn.execute(
+                            "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                            rusqlite::params![&ns, &edge_id_str],
+                        )
+                        .map_err(SqliteError::Rusqlite)?;
+                        conn.execute(
+                            "UPDATE graph_edges SET \
+                             weight = ?1, updated_at = ?2, deleted_at = NULL, \
+                             target_backend = ?3, metadata = ?4 \
+                             WHERE namespace = ?5 AND id = ?6",
+                            rusqlite::params![
+                                weight,
+                                now_ts,
+                                target_backend,
+                                metadata,
+                                &ns,
+                                &existing_id,
+                            ],
+                        )
+                        .map_err(SqliteError::Rusqlite)?;
+                        Ok(Some(existing_id))
+                    } else {
+                        // Case (a): no conflict — update source_id/target_id in-place,
+                        // preserving the original edge UUID.
+                        conn.execute(
+                            "UPDATE graph_edges SET \
+                             source_id = ?1, target_id = ?2, relation = ?3, \
+                             weight = ?4, updated_at = ?5, metadata = ?6 \
+                             WHERE namespace = ?7 AND id = ?8",
+                            rusqlite::params![
+                                &canon_src_str,
+                                &canon_tgt_str,
+                                &relation_str,
+                                weight,
+                                now_ts,
+                                metadata,
+                                &ns,
+                                &edge_id_str,
+                            ],
+                        )
+                        .map_err(SqliteError::Rusqlite)?;
+                        Ok(None)
+                    }
+                })
+            })
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("update_edge: spawn_blocking join: {e}")))?
+            .map_err(RuntimeError::Sqlite)?;
+
+            if let Some(sid) = surviving_id {
+                // A conflict was absorbed: re-fetch the surviving canonical row so the
+                // caller receives its real id (Bug 1 fix).
+                let surviving_uuid = Uuid::parse_str(&sid).map_err(|e| {
+                    RuntimeError::Internal(format!("update_edge: surviving id parse failed: {e}"))
+                })?;
+                edge = self
+                    .get_edge(token, surviving_uuid)
+                    .await?
+                    .ok_or_else(|| {
+                        RuntimeError::Internal(format!(
+                            "update_edge: surviving canonical row {surviving_uuid} vanished after update"
+                        ))
+                    })?;
+            } else {
+                // Reflect canonical endpoints in the returned edge (no conflict absorbed).
+                edge.source_id = canon_src;
+                edge.target_id = canon_tgt;
+            }
+        } else {
+            graph.upsert_edge(edge.clone()).await?;
+        }
 
         let event_store = self.events(token)?;
         let ns = token.namespace().as_str().to_string();
@@ -2031,6 +2196,13 @@ impl KhiveRuntime {
     /// (no writes occur). On success, all edges are persisted in a single
     /// atomic transaction via `upsert_edges`.
     ///
+    /// After the bulk upsert, each edge is read back by its natural key
+    /// (namespace, source_id, target_id, relation) so that the returned IDs
+    /// are always the persisted row IDs, not the locally-generated UUIDs that
+    /// may have been displaced by an ON CONFLICT DO UPDATE. This mirrors the
+    /// H1 fix applied to singleton `link()` and prevents phantom-ID exposure
+    /// when callers upsert overlapping triples with `verbose=true`.
+    ///
     /// All specs must share the same namespace; the namespace is taken from
     /// `token` (or validated against it if `spec.namespace` is set).
     pub async fn link_many(
@@ -2046,7 +2218,34 @@ impl KhiveRuntime {
             edges.push(self.build_edge(token, spec).await?);
         }
         self.graph(token)?.upsert_edges(edges.clone()).await?;
-        Ok(edges)
+
+        // H1-bulk fix: read back each persisted edge by natural key so callers
+        // always receive the stored row ID, not the pre-upsert generated UUID.
+        let mut persisted = Vec::with_capacity(edges.len());
+        for edge in &edges {
+            let row = self
+                .list_edges(
+                    token,
+                    crate::curation::EdgeListFilter {
+                        source_id: Some(edge.source_id),
+                        target_id: Some(edge.target_id),
+                        relations: vec![edge.relation],
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    crate::RuntimeError::Internal(format!(
+                        "upsert_edges succeeded but natural-key lookup for ({}, {}, {}) returned nothing",
+                        edge.source_id, edge.target_id, edge.relation.as_str()
+                    ))
+                })?;
+            persisted.push(row);
+        }
+        Ok(persisted)
     }
 }
 
@@ -5321,5 +5520,59 @@ mod tests {
             still_there.is_some(),
             "note must survive cross-ns delete attempt"
         );
+    }
+
+    // H1-bulk regression: parallel link_many calls with overlapping triples must
+    // return the identical persisted edge ID, not locally-generated phantom IDs.
+    //
+    // Sequence:
+    //   1. First link_many creates the A→B Extends edge (persisted with ID₁).
+    //   2. Second link_many upserts the same triple (ON CONFLICT DO UPDATE keeps ID₁).
+    //   3. Both callers must see ID₁ in their returned Vec<Edge>.
+    #[tokio::test]
+    async fn link_many_overlapping_triple_returns_persisted_ids() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let spec = || LinkSpec {
+            namespace: None,
+            source_id: a.id,
+            target_id: b.id,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+            metadata: None,
+        };
+
+        // First call — creates the edge.
+        let first = rt.link_many(&tok, vec![spec()]).await.unwrap();
+        assert_eq!(first.len(), 1);
+        let persisted_id: Uuid = first[0].id.into();
+
+        // Second call — same natural-key triple; ON CONFLICT updates, preserving the
+        // existing row ID. link_many must read back the row and return that same ID.
+        let second = rt.link_many(&tok, vec![spec()]).await.unwrap();
+        assert_eq!(second.len(), 1);
+        let second_id: Uuid = second[0].id.into();
+
+        assert_eq!(
+            persisted_id, second_id,
+            "link_many with an existing triple must return the persisted row ID ({persisted_id}), \
+             not a new phantom ID ({second_id})"
+        );
+
+        // Confirm only one edge row exists in the graph store.
+        let count = rt
+            .count_edges(&tok, crate::curation::EdgeListFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "upsert must not duplicate the edge row");
     }
 }

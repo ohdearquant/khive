@@ -218,6 +218,8 @@ struct ListParams {
     offset: Option<u32>,
     entity_kind: Option<String>,
     entity_type: Option<String>,
+    // CC-2 fix: tags filter for list(kind=entity)
+    tags: Option<Vec<String>>,
     source_id: Option<String>,
     target_id: Option<String>,
     relations: Option<Vec<String>>,
@@ -261,6 +263,10 @@ struct UpdateParams {
     tags: Option<Vec<String>>,
     relation: Option<String>,
     weight: Option<f64>,
+    /// ue-kg-deep C3 fix: entity_kind is immutable after creation. Accepting
+    /// this field (even though we reject it) prevents silent discard — callers
+    /// get an explicit error instead of a silent no-op.
+    entity_kind: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -293,6 +299,11 @@ struct SearchParams {
     note_kind: Option<String>,
     include_superseded: Option<bool>,
     properties: Option<Value>,
+    /// ue-kg-deep C4 fix: minimum score floor — results below this threshold
+    /// are discarded. No default applied server-side; callers pass e.g. 0.01
+    /// to suppress pure-noise hits. RRF rank-1 scores ≈ 0.016, so a floor
+    /// like 0.02 reliably drops near-zero noise without hiding real matches.
+    min_score: Option<f64>,
 }
 
 /// One entry in a bulk-link request (F205 / ADR-038).
@@ -1281,6 +1292,12 @@ impl KgPack {
         let spec = resolve_kind_spec(&p.kind, registry)?;
         match spec {
             KindSpec::Entity { specific } => {
+                // CC-2 fix: reject contradicting note_kind when listing entities
+                if p.note_kind.as_deref().is_some_and(|s| !s.is_empty()) {
+                    return Err(RuntimeError::InvalidInput(
+                        "note_kind filter is not valid when kind=entity; use kind=note to list notes".into(),
+                    ));
+                }
                 let kind_filter = reconcile_specific(
                     specific,
                     p.entity_kind.as_deref(),
@@ -1289,16 +1306,62 @@ impl KgPack {
                 )?;
                 let limit = p.limit.unwrap_or(50).min(500);
                 let offset = p.offset.unwrap_or(0);
-                let entities = self
-                    .runtime
-                    .list_entities(
-                        token,
-                        kind_filter.as_deref(),
-                        p.entity_type.as_deref(),
-                        limit,
-                        offset,
-                    )
-                    .await?;
+                // CC-2 fix: pass tags_any through EntityFilter so that
+                // list(kind="entity", tags=[X]) actually filters by tag.
+                // When tags are present we call query_entities directly; otherwise
+                // we keep the original list_entities path (no tags: empty filter).
+                let entities = if let Some(ref tag_list) = p.tags {
+                    if tag_list.is_empty() {
+                        self.runtime
+                            .list_entities(
+                                token,
+                                kind_filter.as_deref(),
+                                p.entity_type.as_deref(),
+                                limit,
+                                offset,
+                            )
+                            .await?
+                    } else {
+                        use khive_storage::types::PageRequest;
+                        let filter = EntityFilter {
+                            kinds: kind_filter
+                                .as_deref()
+                                .map(|k| vec![k.to_string()])
+                                .unwrap_or_default(),
+                            entity_types: p
+                                .entity_type
+                                .as_deref()
+                                .map(|t| vec![t.to_string()])
+                                .unwrap_or_default(),
+                            tags_any: tag_list.clone(),
+                            ..Default::default()
+                        };
+                        let page = self
+                            .runtime
+                            .entities(token)?
+                            .query_entities(
+                                token.namespace().as_str(),
+                                filter,
+                                PageRequest {
+                                    offset: offset.into(),
+                                    limit,
+                                },
+                            )
+                            .await
+                            .map_err(RuntimeError::Storage)?;
+                        page.items
+                    }
+                } else {
+                    self.runtime
+                        .list_entities(
+                            token,
+                            kind_filter.as_deref(),
+                            p.entity_type.as_deref(),
+                            limit,
+                            offset,
+                        )
+                        .await?
+                };
                 to_json(&entities)
             }
             KindSpec::Edge => {
@@ -1566,6 +1629,13 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: UpdateParams = deser(params)?;
+        // ue-kg-deep C3 fix: entity_kind is immutable after creation. Silently
+        // discarding this field was the bug — now we surface an explicit error.
+        if p.entity_kind.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "entity_kind is immutable; to change kind, delete then re-create the entity, or use merge() if this is a deduplication correction".into(),
+            ));
+        }
         // Resolve `kind` with registry BEFORE the first .await so that the
         // registry borrow is provably dead at all yield points (mirrors the
         // pattern used in handle_create / handle_list).  ADR-014: when `kind`
@@ -1727,6 +1797,18 @@ impl KgPack {
             KindSpec::Entity { specific } => {
                 ensure_entity_kind(&self.runtime, token, into_id, specific.as_deref()).await?;
                 ensure_entity_kind(&self.runtime, token, from_id, specific.as_deref()).await?;
+                // C2 fix: reject cross-kind merge (concept+project, etc.) before
+                // any writes. Fetching both entities here is cheap — merge_entity_sql
+                // will fetch them again inside the transaction, but the early guard
+                // gives a clear error message before any SQL side-effects occur.
+                let into_entity = self.runtime.get_entity(token, into_id).await?;
+                let from_entity = self.runtime.get_entity(token, from_id).await?;
+                if into_entity.kind != from_entity.kind {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "cannot merge entities of different kinds: into={} ({}), from={} ({})",
+                        into_id, into_entity.kind, from_id, from_entity.kind
+                    )));
+                }
                 self.runtime
                     .merge_entity(token, into_id, from_id, policy, dry_run)
                     .await?
@@ -1842,8 +1924,14 @@ impl KgPack {
                     hits
                 };
 
+                // C4 fix: apply min_score floor when the caller specifies one.
+                // No server-side default — RRF rank-1 scores ≈ 0.016 so any
+                // non-trivial default would silently hide valid matches. Callers
+                // who want to suppress noise should pass min_score explicitly.
+                let score_floor = p.min_score.unwrap_or(0.0).max(0.0);
                 let result: Vec<Value> = filtered_hits
                     .iter()
+                    .filter(|h| h.score.to_f64() >= score_floor)
                     .map(|h| {
                         // #160: include entity_kind so agents can distinguish hit
                         // kinds without an extra get() call.
@@ -1893,8 +1981,11 @@ impl KgPack {
                     map
                 };
 
+                // C4 fix: apply min_score floor when the caller specifies one.
+                let score_floor = p.min_score.unwrap_or(0.0).max(0.0);
                 let result: Vec<Value> = hits
                     .iter()
+                    .filter(|h| h.score.to_f64() >= score_floor)
                     .map(|h| {
                         serde_json::json!({
                             "id": h.note_id.to_string(),
@@ -2062,6 +2153,7 @@ impl KgPack {
         let weight = p.weight.unwrap_or(1.0).clamp(0.0, 1.0);
         let relation = parse_relation(&relation_str)?;
         let metadata = merge_entry_metadata(p.metadata, p.dependency_kind)?;
+
         let edge = self
             .runtime
             .link(token, source, target, relation, weight, metadata)
@@ -2853,5 +2945,94 @@ mod tests {
             "withdraw must be in KG_HANDLERS"
         );
         assert!(names.contains(&"verbs"), "verbs must be in KG_HANDLERS");
+    }
+
+    // ---- Wave 4 regression tests ----
+
+    // CC-2 regression: ListParams must accept a `tags` field.
+    // Before the fix, tags was absent from the struct so passing tags=["rust"]
+    // silently discarded the filter.
+    #[test]
+    fn list_params_accepts_tags() {
+        use super::ListParams;
+        let p: ListParams = serde_json::from_value(json!({
+            "kind": "entity",
+            "tags": ["rust", "systems"],
+        }))
+        .expect("ListParams must accept tags");
+        assert_eq!(
+            p.tags,
+            Some(vec!["rust".to_string(), "systems".to_string()])
+        );
+    }
+
+    // CC-2 regression: ListParams with no tags field produces None (not empty vec).
+    #[test]
+    fn list_params_no_tags_is_none() {
+        use super::ListParams;
+        let p: ListParams = serde_json::from_value(json!({"kind": "entity"})).unwrap();
+        assert!(
+            p.tags.is_none(),
+            "absent tags must be None so the entity filter is not applied"
+        );
+    }
+
+    // ue-kg-deep C3 regression: UpdateParams must capture entity_kind so the
+    // handler can return an explicit error instead of silently discarding it.
+    #[test]
+    fn update_params_captures_entity_kind() {
+        use super::UpdateParams;
+        let p: UpdateParams = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "entity_kind": "dataset",
+        }))
+        .expect("UpdateParams must deserialize with entity_kind present");
+        assert!(
+            p.entity_kind.is_some(),
+            "entity_kind field must be captured (not silently discarded)"
+        );
+    }
+
+    // ue-kg-deep C3 regression: absent entity_kind → None (preserves normal update flow).
+    #[test]
+    fn update_params_entity_kind_absent_is_none() {
+        use super::UpdateParams;
+        let p: UpdateParams = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "NewName",
+        }))
+        .unwrap();
+        assert!(
+            p.entity_kind.is_none(),
+            "absent entity_kind must be None so normal updates are not rejected"
+        );
+    }
+
+    // ue-kg-deep C4 regression: SearchParams must accept a `min_score` field.
+    #[test]
+    fn search_params_accepts_min_score() {
+        use super::SearchParams;
+        let p: SearchParams = serde_json::from_value(json!({
+            "kind": "entity",
+            "query": "transformer",
+            "min_score": 0.1,
+        }))
+        .expect("SearchParams must accept min_score");
+        assert_eq!(p.min_score, Some(0.1));
+    }
+
+    // ue-kg-deep C4 regression: absent min_score → None (no floor applied, returns all hits).
+    #[test]
+    fn search_params_min_score_absent_is_none() {
+        use super::SearchParams;
+        let p: SearchParams = serde_json::from_value(json!({
+            "kind": "entity",
+            "query": "transformer",
+        }))
+        .unwrap();
+        assert!(
+            p.min_score.is_none(),
+            "absent min_score must be None; no floor applied by default"
+        );
     }
 }

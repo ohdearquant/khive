@@ -691,6 +691,196 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
 }
 
 // =============================================================================
+// update_edge conflict handling regression tests (codex round-3 H1)
+// =============================================================================
+
+/// Regression for Bug 1: when update_edge absorbs a conflict (the requested edge
+/// is deleted and the existing canonical row is refreshed), the returned edge must
+/// carry the SURVIVING canonical row's id — not the id of the deleted edge.
+///
+/// Setup: pre-create canonical A→B competes_with (E1), create A→B extends (E2).
+/// Update E2's relation to competes_with. The returned id must be E1, not E2.
+/// A subsequent get(returned_id) must succeed.
+#[tokio::test]
+async fn update_edge_returns_surviving_canonical_id_on_conflict() {
+    use khive_runtime::EdgePatch;
+
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local());
+
+    let a = rt
+        .create_entity(&tok, "concept", None, "SurvA", None, None, vec![])
+        .await
+        .unwrap();
+    let b = rt
+        .create_entity(&tok, "concept", None, "SurvB", None, None, vec![])
+        .await
+        .unwrap();
+
+    // E1: canonical competes_with between A and B (runtime canonicalises order).
+    let e1 = rt
+        .link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 1.0, None)
+        .await
+        .unwrap();
+
+    // E2: non-symmetric extends edge, using the higher-uuid as source so that
+    // updating to competes_with will trigger a flip (endpoints_flipped=true path).
+    let (src, tgt) = if a.id > b.id {
+        (a.id, b.id)
+    } else {
+        (b.id, a.id)
+    };
+    let e2 = rt
+        .link(&tok, src, tgt, EdgeRelation::Extends, 0.5, None)
+        .await
+        .unwrap();
+
+    // E1 and E2 must be different edges.
+    assert_ne!(
+        e1.id, e2.id,
+        "pre-condition: E1 and E2 must be distinct edges"
+    );
+
+    // Update E2 to competes_with → conflict with E1 must be absorbed.
+    let returned = rt
+        .update_edge(
+            &tok,
+            e2.id.into(),
+            EdgePatch {
+                relation: Some(EdgeRelation::CompetesWith),
+                weight: Some(0.9),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update_edge must succeed even when conflict is absorbed");
+
+    // Bug 1 assertion: returned id must be E1 (surviving canonical row), not E2 (deleted).
+    assert_eq!(
+        returned.id, e1.id,
+        "Bug 1: update_edge must return the SURVIVING canonical row id (E1={:?}), \
+         got E2={:?}",
+        e1.id, returned.id
+    );
+
+    // get(returned.id) must succeed — it must not 404.
+    let fetched = rt
+        .get_edge(&tok, returned.id.into())
+        .await
+        .expect("get_edge on returned id must not error")
+        .expect("get_edge on returned id must find a row (not 404)");
+    assert_eq!(
+        fetched.id, e1.id,
+        "fetched row id must match E1 (surviving canonical)"
+    );
+
+    // E2 must no longer exist.
+    let e2_lookup = rt
+        .get_edge(&tok, e2.id.into())
+        .await
+        .expect("get_edge on deleted id must not error");
+    assert!(
+        e2_lookup.is_none(),
+        "Bug 1: deleted edge E2 must not be findable after conflict absorption"
+    );
+}
+
+/// Regression for Bug 2: when an edge's relation is updated to a symmetric relation
+/// and the endpoints are ALREADY in canonical order (endpoints_flipped=false),
+/// a pre-existing canonical row with the same natural key must still be detected and
+/// absorbed — no UNIQUE-constraint error, no duplicate row.
+///
+/// Setup: ensure A < B (canonical order). Pre-create canonical A→B competes_with (E1).
+/// Create A→B extends (E2, already canonical since A < B and extends is non-symmetric).
+/// Update E2's relation to competes_with (endpoints_flipped=false because A < B).
+/// Assert: exactly one live competes_with edge remains between A and B.
+#[tokio::test]
+async fn update_edge_canonical_orientation_conflict() {
+    use khive_runtime::EdgePatch;
+
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local());
+
+    let a = rt
+        .create_entity(&tok, "concept", None, "CanOrA", None, None, vec![])
+        .await
+        .unwrap();
+    let b = rt
+        .create_entity(&tok, "concept", None, "CanOrB", None, None, vec![])
+        .await
+        .unwrap();
+
+    // Determine canonical order: canon_lo < canon_hi.
+    let (canon_lo, canon_hi) = if a.id < b.id {
+        (a.id, b.id)
+    } else {
+        (b.id, a.id)
+    };
+
+    // E1: canonical competes_with (lower → higher, which is canonical).
+    let e1 = rt
+        .link(
+            &tok,
+            canon_lo,
+            canon_hi,
+            EdgeRelation::CompetesWith,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // E2: extends in the same canonical direction (lower → higher).
+    // endpoints_flipped will be false when we update to competes_with.
+    let e2 = rt
+        .link(&tok, canon_lo, canon_hi, EdgeRelation::Extends, 0.5, None)
+        .await
+        .unwrap();
+
+    assert_ne!(
+        e1.id, e2.id,
+        "pre-condition: E1 and E2 must be distinct edges"
+    );
+
+    // Update E2's relation to competes_with — must not produce UNIQUE-constraint error.
+    // Bug 2: the non-flipped path used to call upsert_edge which only checked ON CONFLICT(id),
+    // missing the natural-key duplicate with a different id.
+    rt.update_edge(
+        &tok,
+        e2.id.into(),
+        EdgePatch {
+            relation: Some(EdgeRelation::CompetesWith),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Bug 2: update_edge on canonical-orientation conflict must not error");
+
+    // Verify exactly one live competes_with edge exists between canon_lo and canon_hi.
+    let edges = rt
+        .list_edges(
+            &tok,
+            khive_runtime::EdgeListFilter {
+                source_id: Some(canon_lo),
+                target_id: Some(canon_hi),
+                relations: vec![EdgeRelation::CompetesWith],
+                ..Default::default()
+            },
+            100,
+        )
+        .await
+        .expect("list_edges must succeed");
+
+    assert_eq!(
+        edges.len(),
+        1,
+        "Bug 2: exactly one competes_with edge must exist after non-flipped conflict absorption; \
+         found {} edges: {edges:?}",
+        edges.len()
+    );
+}
+
+// =============================================================================
 // EmbedderRegistry integration tests (#397)
 // =============================================================================
 

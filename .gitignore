@@ -82,3 +82,6 @@ docs/adr/_review/
 npm/bin/khive-*
 # Exception: npm/bin/khive-mcp is the Node shim for the MCP binary, not a compiled binary.
 !npm/bin/khive-mcp
+
+# Codex review artifacts (local working notes, not part of the codebase)
+codex_review_*.md

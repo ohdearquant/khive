@@ -312,6 +312,12 @@ static KG_HANDLERS: [HandlerDef; 15] = [
                 required: false,
                 description: "Maximum results to return (default 10).",
             },
+            ParamDef {
+                name: "min_score",
+                param_type: "number",
+                required: false,
+                description: "Optional caller-supplied score floor (0.0–1.0). Results below this threshold are discarded. No server default is applied; RRF rank-1 scores are typically 0.013–0.033 on small corpora. Pass e.g. 0.02 to suppress near-zero noise hits.",
+            },
         ],
     },
     // Commissive: commits a typed edge to the graph
