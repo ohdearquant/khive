@@ -258,7 +258,7 @@ impl KhiveMcpServer {
                         }),
                     )
                 })?;
-                arg_val.resolve_all(prev).ok_or_else(|| {
+                let resolved_val = arg_val.resolve_all(prev).ok_or_else(|| {
                     (
                         tool.clone(),
                         json!({
@@ -268,7 +268,44 @@ impl KhiveMcpServer {
                             ),
                         }),
                     )
-                })?
+                })?;
+                // UE4-H1: bare `$prev` (no path) resolving to a map or array
+                // will cause a confusing downstream type error. Detect it here and
+                // surface a clear substitution error with available field names.
+                if matches!(&arg_val, ArgValue::PrevRef { path } if path.is_empty()) {
+                    match &resolved_val {
+                        Value::Object(map) => {
+                            let fields: Vec<&str> = map.keys().map(String::as_str).collect();
+                            return Err((
+                                tool.clone(),
+                                json!({
+                                    "kind": "substitution_error",
+                                    "message": format!(
+                                        "argument {name:?}: $prev requires a dotted path \
+                                         (e.g. $prev.id) when the prior result is a map. \
+                                         Available top-level fields: [{}]",
+                                        fields.join(", ")
+                                    ),
+                                }),
+                            ));
+                        }
+                        Value::Array(_) => {
+                            return Err((
+                                tool.clone(),
+                                json!({
+                                    "kind": "substitution_error",
+                                    "message": format!(
+                                        "argument {name:?}: $prev requires a dotted path \
+                                         (e.g. $prev.0) when the prior result is an array. \
+                                         Use $prev.N to select a specific element."
+                                    ),
+                                }),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                resolved_val
             } else {
                 match arg_val {
                     ArgValue::Value(v) => v,

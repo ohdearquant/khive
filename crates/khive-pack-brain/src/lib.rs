@@ -481,12 +481,21 @@ impl BrainPack {
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         let state = self.state.lock().unwrap();
+        // UE5-H1: only expose the three public-facing lifecycle states.
+        // `defined` and `registered` are internal implementation states that
+        // callers cannot filter on; listing them in the error would confuse users.
         let filter_lc: Option<ProfileLifecycle> = p
             .lifecycle
             .as_deref()
-            .map(|s| serde_json::from_value(Value::String(s.to_owned())))
-            .transpose()
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid lifecycle: {e}")))?;
+            .map(|s| match s {
+                "active" => Ok(ProfileLifecycle::Active),
+                "inactive" => Ok(ProfileLifecycle::Inactive),
+                "archived" => Ok(ProfileLifecycle::Archived),
+                other => Err(RuntimeError::InvalidInput(format!(
+                    "invalid lifecycle {other:?}; expected one of 'active', 'inactive', 'archived'"
+                ))),
+            })
+            .transpose()?;
 
         let profiles: Vec<&ProfileRecord> = state
             .profiles
@@ -1308,6 +1317,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["unbound"], json!(1u64));
+    }
+
+    // ── UE5-H1: brain.profiles lifecycle filter public API ───────────────────
+    //
+    // The public lifecycle filter must only accept 'active', 'inactive', 'archived'.
+    // Internal states 'defined' and 'registered' must not appear in the error message.
+
+    #[tokio::test]
+    async fn ue5_h1_invalid_lifecycle_error_lists_only_public_states() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let err = pack
+            .dispatch(
+                "brain.profiles",
+                json!({"lifecycle": "deleted"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            // Must mention valid states
+            assert!(
+                msg.contains("active"),
+                "UE5-H1: error must list 'active'; got: {msg}"
+            );
+            assert!(
+                msg.contains("inactive"),
+                "UE5-H1: error must list 'inactive'; got: {msg}"
+            );
+            assert!(
+                msg.contains("archived"),
+                "UE5-H1: error must list 'archived'; got: {msg}"
+            );
+            // Must NOT leak internal states
+            assert!(
+                !msg.contains("defined"),
+                "UE5-H1: error must NOT expose internal 'defined' state; got: {msg}"
+            );
+            assert!(
+                !msg.contains("registered"),
+                "UE5-H1: error must NOT expose internal 'registered' state; got: {msg}"
+            );
+        } else {
+            panic!("UE5-H1: expected InvalidInput, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ue5_h1_internal_lifecycle_values_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        for internal_state in ["defined", "registered"] {
+            let err = pack
+                .dispatch(
+                    "brain.profiles",
+                    json!({"lifecycle": internal_state}),
+                    &registry,
+                    &token,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RuntimeError::InvalidInput(_)),
+                "UE5-H1: internal lifecycle '{internal_state}' must be rejected, got {err:?}"
+            );
+        }
     }
 
     // ── B-C1 regression: lifecycle terminal-state enforcement ─────────────────

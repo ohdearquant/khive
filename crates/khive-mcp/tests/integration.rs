@@ -242,6 +242,33 @@ async fn invalid_kind_failure_does_not_abort_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// UE4-H2: empty batch `ops="[]"` must return an RPC-level `-32602 invalid_params`
+/// error, not a `{results: [], summary: {total: 0}}` 200-style response.
+#[tokio::test]
+async fn empty_batch_returns_invalid_params() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let err = call(&client, "request", json!({"ops": "[]"})).await.err();
+    let svc = err.as_ref().and_then(|e| e.downcast_ref::<ServiceError>());
+    assert!(
+        matches!(
+            svc,
+            Some(ServiceError::McpError(e)) if e.code == ErrorCode::INVALID_PARAMS
+        ),
+        "UE4-H2: empty batch must return INVALID_PARAMS, got {err:?}"
+    );
+    // Also check JSON-form empty array.
+    let err2 = call(&client, "request", json!({"ops": "[]"})).await.err();
+    let svc2 = err2.as_ref().and_then(|e| e.downcast_ref::<ServiceError>());
+    assert!(
+        matches!(
+            svc2,
+            Some(ServiceError::McpError(e)) if e.code == ErrorCode::INVALID_PARAMS
+        ),
+        "UE4-H2: empty JSON batch must return INVALID_PARAMS, got {err2:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn malformed_dsl_returns_invalid_params() -> anyhow::Result<()> {
     let client = connect().await?;
@@ -1362,14 +1389,17 @@ async fn test_prev_unresolvable_aborts_chain() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Chain: $prev bare (no dot path) substitutes the entire prior op's result object.
+/// UE4-H1: Chain bare `$prev` (no dot path) when the prior result is a map
+/// must be rejected with a clear substitution error that lists available fields.
 ///
-/// We use `assign | complete(id=$prev.id, result=$prev)` — the `result` arg
-/// receives the entire assign result JSON object.  The substitution itself must
-/// succeed (no "unresolved $prev" error).  Even if `complete` rejects the object
-/// value for `result`, the failure must not be a substitution error.
+/// `assign | complete(id=$prev.id, result=$prev)` — `$prev.id` resolves fine
+/// (scalar), but `result=$prev` resolves to the whole assign result map.
+/// The dispatcher must catch the bare map substitution and return a per-op error
+/// with `kind=substitution_error` and a message listing the available fields —
+/// instead of silently passing the map downstream where the handler emits a
+/// confusing "invalid type: map, expected a string".
 #[tokio::test]
-async fn test_prev_bare_resolves_full_result() -> anyhow::Result<()> {
+async fn test_ue4_h1_bare_prev_map_produces_clear_substitution_error() -> anyhow::Result<()> {
     let client = connect().await?;
 
     let result = call(
@@ -1392,19 +1422,40 @@ async fn test_prev_bare_resolves_full_result() -> anyhow::Result<()> {
         results[0]
     );
 
-    // Op 1 uses $prev.id (resolves to ID string) and $prev (resolves to the
-    // whole assign result object).  Whether or not complete succeeds, the
-    // failure must NOT be a substitution error mentioning "$prev".
-    let op1_err = {
-        let e = &results[1]["error"];
-        e.as_str()
-            .unwrap_or_else(|| e["message"].as_str().unwrap_or(""))
-            .to_string()
-    };
-    assert!(
-        !op1_err.contains("$prev"),
-        "op 1 error must not mention '$prev' — bare substitution must have succeeded; got: {op1_err}"
+    // Op 1: result=$prev resolves to the whole assign result map.
+    // UE4-H1: the dispatcher must detect this and return a substitution_error
+    // rather than passing the map through to the handler.
+    assert_eq!(
+        results[1]["ok"],
+        json!(false),
+        "bare $prev -> map must cause op 1 to fail: {}",
+        results[1]
     );
+    let error = &results[1]["error"];
+    let err_msg = error["message"]
+        .as_str()
+        .unwrap_or_else(|| error.as_str().unwrap_or(""));
+    assert!(
+        err_msg.contains("dotted path") || err_msg.contains("$prev"),
+        "UE4-H1: error must mention dotted path or $prev; got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("result") || error["kind"].as_str() == Some("substitution_error"),
+        "UE4-H1: error must reference the offending arg or be a substitution_error; got: {error}"
+    );
+    // The error must list at least one available field from the prior result.
+    // assign result includes fields like id/full_id/title/kind.
+    let mentions_field = err_msg.contains("id")
+        || err_msg.contains("title")
+        || err_msg.contains("kind")
+        || err_msg.contains("full_id");
+    assert!(
+        mentions_field,
+        "UE4-H1: error must list available top-level fields from prior result; got: {err_msg}"
+    );
+
+    // Chain is aborted: op 1 fails, no op 2 here (only 2 ops total).
+    assert_eq!(body["summary"]["failed"], json!(1));
     Ok(())
 }
 

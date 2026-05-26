@@ -206,6 +206,8 @@ pub enum DslError {
     },
     /// Mixing `,` and `|` at the top level.
     MixedSeparators,
+    /// Empty batch `[]` — no ops provided.
+    EmptyBatch,
 }
 
 impl fmt::Display for DslError {
@@ -251,6 +253,9 @@ impl fmt::Display for DslError {
                     f,
                     "cannot mix ',' (parallel) and '|' (chain) separators at the top level"
                 )
+            }
+            DslError::EmptyBatch => {
+                write!(f, "empty batch not allowed; provide at least one op")
             }
         }
     }
@@ -357,6 +362,9 @@ fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
             })
         }
     };
+    if arr.is_empty() && !is_single {
+        return Err(DslError::EmptyBatch);
+    }
     if arr.len() > MAX_OPS {
         return Err(DslError::TooManyOps {
             count: arr.len(),
@@ -409,10 +417,7 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
     let mut ops = Vec::new();
     if p.peek() == Some(']') {
         p.advance(1);
-        return Ok(ParsedRequest {
-            ops,
-            mode: ExecutionMode::Parallel,
-        });
+        return Err(DslError::EmptyBatch);
     }
     loop {
         if ops.len() >= MAX_OPS {
@@ -942,10 +947,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_batch_is_legal() {
-        let r = req("[]");
-        assert_eq!(r.mode, ExecutionMode::Parallel);
-        assert!(r.ops.is_empty());
+    fn empty_batch_rejected() {
+        // UE4-H2: empty batch must be rejected with EmptyBatch error.
+        let err = parse_request("[]").unwrap_err();
+        assert!(
+            matches!(err, DslError::EmptyBatch),
+            "expected EmptyBatch, got {err:?}"
+        );
+        // JSON form empty array is also rejected.
+        let err2 = parse_request("[]").unwrap_err();
+        assert!(matches!(err2, DslError::EmptyBatch));
     }
 
     #[test]
