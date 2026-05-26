@@ -1,6 +1,6 @@
 //! pack-kg — Knowledge Graph verb pack for khive.
 //!
-//! Provides 14 verbs for managing entities, notes, edges, graph queries, and
+//! Provides 15 verbs for managing entities, notes, edges, graph queries, and
 //! event-sourced proposals (ADR-046) in a research knowledge graph. This is
 //! the first-party pack shipped with the khive binary.
 //!
@@ -57,7 +57,8 @@ impl Pack for KgPack {
 //   Declaration — changes institutional status by fiat
 //
 // Verbs 12-14 (propose, review, withdraw) added per ADR-046 (cluster-22).
-static KG_HANDLERS: [HandlerDef; 14] = [
+// Verb 15 (verbs) added for top-level verb discovery (ue-help-introspection H5).
+static KG_HANDLERS: [HandlerDef; 15] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -164,7 +165,9 @@ static KG_HANDLERS: [HandlerDef; 14] = [
     // Declaration: changes entity or edge state by fiat
     HandlerDef {
         name: "update",
-        description: "Patch entity or edge fields",
+        description: "Patch entity, note, or edge fields. Accepted fields depend on substrate: \
+                       entities accept name/description/properties/tags; notes accept \
+                       name/content/salience/decay_factor/properties; edges accept relation/weight/properties.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
@@ -172,7 +175,7 @@ static KG_HANDLERS: [HandlerDef; 14] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the entity or edge to patch.",
+                description: "UUID of the entity, note, or edge to patch.",
             },
             ParamDef {
                 name: "kind",
@@ -184,13 +187,43 @@ static KG_HANDLERS: [HandlerDef; 14] = [
                 name: "name",
                 param_type: "string",
                 required: false,
-                description: "New name (entities only).",
+                description: "New name (entities and notes).",
             },
             ParamDef {
                 name: "description",
                 param_type: "string",
                 required: false,
-                description: "New description (entities only).",
+                description: "New description (entities only; notes use 'content' for body text).",
+            },
+            ParamDef {
+                name: "content",
+                param_type: "string",
+                required: false,
+                description: "New body text (notes only).",
+            },
+            ParamDef {
+                name: "salience",
+                param_type: "number",
+                required: false,
+                description: "Importance score 0.0–1.0 (notes only; affects recall ranking).",
+            },
+            ParamDef {
+                name: "decay_factor",
+                param_type: "number",
+                required: false,
+                description: "Decay rate >= 0 (notes only; higher = faster decay).",
+            },
+            ParamDef {
+                name: "relation",
+                param_type: "string",
+                required: false,
+                description: "New edge relation (edges only; any of the 15 canonical relations).",
+            },
+            ParamDef {
+                name: "weight",
+                param_type: "number",
+                required: false,
+                description: "New edge weight 0.0–1.0 (edges only; 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible).",
             },
             ParamDef {
                 name: "properties",
@@ -482,7 +515,80 @@ static KG_HANDLERS: [HandlerDef; 14] = [
             },
         ],
     },
+    // Assertive: verb discovery (ue-help-introspection H5)
+    HandlerDef {
+        name: "verbs",
+        description: "List all MCP-callable verbs registered on this server. \
+                       Internal subhandlers are excluded. \
+                       Pass category=<name> to filter by illocutionary category \
+                       (Assertive | Commissive | Declaration | Directive). \
+                       Pass pack=<name> to filter by pack.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "category",
+                param_type: "string",
+                required: false,
+                description: "Filter by illocutionary category: Assertive | Commissive | Declaration | Directive.",
+            },
+            ParamDef {
+                name: "pack",
+                param_type: "string",
+                required: false,
+                description: "Filter by pack name (e.g. \"kg\", \"gtd\", \"memory\", \"brain\", \"comm\", \"schedule\").",
+            },
+        ],
+    },
 ];
+
+/// Handle the `verbs` introspection verb (ue-help-introspection H5).
+///
+/// Returns all MCP-callable verbs registered on this server — identical to the
+/// list the `request` tool's description advertises. Internal subhandlers
+/// (`Visibility::Subhandler`) are excluded.
+///
+/// Supports optional `category` and `pack` filters so agents can enumerate a
+/// subset of the verb surface without parsing the prose description.
+fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Value, RuntimeError> {
+    #[derive(serde::Deserialize, Default)]
+    struct VerbsParams {
+        category: Option<String>,
+        pack: Option<String>,
+    }
+    let p: VerbsParams =
+        serde_json::from_value(params).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+    let verbs: Vec<Value> = registry
+        .all_verbs_with_names()
+        .into_iter()
+        .filter(|(pack_name, handler)| {
+            let cat_ok = p
+                .category
+                .as_deref()
+                .is_none_or(|c| format!("{:?}", handler.category).eq_ignore_ascii_case(c));
+            let pack_ok = p
+                .pack
+                .as_deref()
+                .is_none_or(|pk| pack_name.eq_ignore_ascii_case(pk));
+            cat_ok && pack_ok
+        })
+        .map(|(pack_name, handler)| {
+            serde_json::json!({
+                "verb": handler.name,
+                "pack": pack_name,
+                "description": handler.description,
+                "category": format!("{:?}", handler.category),
+            })
+        })
+        .collect();
+
+    let total = verbs.len();
+    Ok(serde_json::json!({
+        "verbs": verbs,
+        "total": total,
+    }))
+}
 
 impl KgPack {
     pub fn new(runtime: KhiveRuntime) -> Self {
@@ -546,6 +652,7 @@ impl PackRuntime for KgPack {
             "propose" => self.handle_propose(token, params).await,
             "review" => self.handle_review(token, params).await,
             "withdraw" => self.handle_withdraw(token, params).await,
+            "verbs" => handle_verbs(params, registry),
             _ => Err(RuntimeError::InvalidInput(format!(
                 "kg pack does not handle verb {verb:?}"
             ))),
@@ -640,6 +747,117 @@ mod help_tests {
                 .iter()
                 .any(|p| p.name == "rationale" && !p.required),
             "withdraw must document optional rationale param"
+        );
+    }
+
+    // ── ue-help-introspection C2 regressions ─────────────────────────────────
+
+    /// update.help must document `content` for notes (C2 / H4).
+    #[test]
+    fn update_params_documents_content_for_notes() {
+        let h = find_handler("update");
+        assert!(
+            h.params.iter().any(|p| p.name == "content"),
+            "update must document 'content' param (notes only)"
+        );
+        let content = h.params.iter().find(|p| p.name == "content").unwrap();
+        assert!(
+            content.description.contains("note"),
+            "update.content description must mention 'note'"
+        );
+    }
+
+    /// update.name must NOT say "entities only" (C2).
+    #[test]
+    fn update_params_name_not_entities_only() {
+        let h = find_handler("update");
+        let name_param = h.params.iter().find(|p| p.name == "name").unwrap();
+        assert!(
+            !name_param.description.contains("entities only"),
+            "update.name must not claim 'entities only' — notes also have names"
+        );
+    }
+
+    /// update.help must document `salience` for notes (H4).
+    #[test]
+    fn update_params_documents_salience_for_notes() {
+        let h = find_handler("update");
+        assert!(
+            h.params.iter().any(|p| p.name == "salience"),
+            "update must document 'salience' param (notes only)"
+        );
+    }
+
+    /// update.help must document `decay_factor` for notes (H4).
+    #[test]
+    fn update_params_documents_decay_factor_for_notes() {
+        let h = find_handler("update");
+        assert!(
+            h.params.iter().any(|p| p.name == "decay_factor"),
+            "update must document 'decay_factor' param (notes only)"
+        );
+    }
+
+    /// update.help must document `relation` for edges (codex High).
+    #[test]
+    fn update_params_documents_relation_for_edges() {
+        let h = find_handler("update");
+        assert!(
+            h.params.iter().any(|p| p.name == "relation"),
+            "update must document 'relation' param (edges only)"
+        );
+        let rel = h.params.iter().find(|p| p.name == "relation").unwrap();
+        assert!(
+            rel.description.contains("edge"),
+            "update.relation description must mention 'edge'"
+        );
+    }
+
+    /// update.help must document `weight` for edges (codex High).
+    #[test]
+    fn update_params_documents_weight_for_edges() {
+        let h = find_handler("update");
+        assert!(
+            h.params.iter().any(|p| p.name == "weight"),
+            "update must document 'weight' param (edges only)"
+        );
+        let w = h.params.iter().find(|p| p.name == "weight").unwrap();
+        assert!(
+            w.description.contains("edge"),
+            "update.weight description must mention 'edge'"
+        );
+    }
+
+    // ── ue-help-introspection C3 regression ──────────────────────────────────
+
+    /// No handler named "thread" should exist in the KG pack.
+    /// This guards against accidentally adding a `thread` Verb-visibility
+    /// handler without a corresponding dispatch arm (C3).
+    #[test]
+    fn no_thread_verb_in_kg_handlers() {
+        assert!(
+            KG_HANDLERS.iter().all(|h| h.name != "thread"),
+            "KG_HANDLERS must not contain a 'thread' handler — see C3"
+        );
+    }
+
+    // ── ue-help-introspection H5 regression ──────────────────────────────────
+
+    /// The `verbs` introspection handler must be present and have params.
+    #[test]
+    fn verbs_handler_is_present_and_has_params() {
+        let h = find_handler("verbs");
+        assert!(
+            !h.params.is_empty(),
+            "verbs must have documented params (category, pack)"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "category"),
+            "verbs must document 'category' filter param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "pack"),
+            "verbs must document 'pack' filter param"
         );
     }
 }

@@ -588,6 +588,11 @@ impl VerbRegistry {
     /// }
     /// ```
     ///
+    /// For `Visibility::Subhandler` handlers the envelope carries
+    /// `"visibility": "internal"` and `"callable_via_mcp": false` so that
+    /// callers who discover the schema via `help=true` see the same
+    /// non-callable status that dispatch would enforce (ue-help-introspection C1).
+    ///
     /// Returns `Err(RuntimeError::InvalidInput(...))` when the verb is unknown
     /// to all loaded packs — identical to the error the normal dispatch path
     /// would emit (so callers get consistent feedback for unknown verbs).
@@ -608,6 +613,24 @@ impl VerbRegistry {
                             })
                         })
                         .collect();
+                    // ue-help-introspection C1: subhandlers are not callable via
+                    // the MCP request surface.  The help payload must match the
+                    // behaviour the dispatch path enforces so that agents who
+                    // read `help=true` before probing see accurate availability.
+                    if matches!(handler.visibility, Visibility::Subhandler) {
+                        return Ok(serde_json::json!({
+                            "verb": verb,
+                            "pack": pack.name(),
+                            "description": handler.description,
+                            "category": category,
+                            "params": params_arr,
+                            "visibility": "internal",
+                            "callable_via_mcp": false,
+                            "note": "This is an internal subhandler. Calling it via the MCP \
+                                     request surface returns permission denied. It can only be \
+                                     invoked by internal runtime callers.",
+                        }));
+                    }
                     return Ok(serde_json::json!({
                         "verb": verb,
                         "pack": pack.name(),
@@ -618,10 +641,14 @@ impl VerbRegistry {
                 }
             }
         }
+        // Only list Verb-visibility handlers so internal subhandlers are not
+        // advertised in the unknown-verb error (ue-help-introspection C1 / codex High).
         let available: Vec<&str> = self
             .packs
             .iter()
-            .flat_map(|p| p.handlers().iter().map(|v| v.name))
+            .flat_map(|p| p.handlers().iter())
+            .filter(|h| matches!(h.visibility, Visibility::Verb))
+            .map(|h| h.name)
             .collect();
         Err(RuntimeError::InvalidInput(format!(
             "unknown verb {verb:?}; available: {}",
@@ -807,10 +834,14 @@ impl VerbRegistry {
                 return result;
             }
         }
+        // Only list Verb-visibility handlers so internal subhandlers are not
+        // advertised in the unknown-verb error (ue-help-introspection C1 / codex High).
         let available: Vec<&str> = self
             .packs
             .iter()
-            .flat_map(|p| p.handlers().iter().map(|v| v.name))
+            .flat_map(|p| p.handlers().iter())
+            .filter(|h| matches!(h.visibility, Visibility::Verb))
+            .map(|h| h.name)
             .collect();
         Err(RuntimeError::InvalidInput(format!(
             "unknown verb {verb:?}; available: {}",
@@ -3313,6 +3344,10 @@ mod help_tests {
         },
     ];
 
+    // A subhandler with no params — mirrors recall.embed / brain.emit / etc.
+    // Used to test that help=true on a Subhandler returns callable_via_mcp: false.
+    static EMBED_PARAMS: [ParamDef; 0] = [];
+
     struct HelpPack {
         invocations: Arc<AtomicUsize>,
     }
@@ -3335,6 +3370,15 @@ mod help_tests {
                 visibility: Visibility::Verb,
                 category: VerbCategory::Assertive,
                 params: &RECALL_PARAMS,
+            },
+            // ue-help-introspection C1: a Subhandler used to test that
+            // help=true returns callable_via_mcp: false for internal verbs.
+            HandlerDef {
+                name: "recall.embed",
+                description: "Return the embedding vector used by memory recall",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Assertive,
+                params: &EMBED_PARAMS,
             },
         ];
     }
@@ -3485,6 +3529,163 @@ mod help_tests {
             invocations.load(Ordering::SeqCst),
             1,
             "pack dispatch must fire exactly once for a normal call"
+        );
+    }
+
+    // ── ue-help-introspection C1 regressions ─────────────────────────────────
+    //
+    // Subhandler verbs must return `callable_via_mcp: false` in their help
+    // schema so agents who read help=true before probing see accurate
+    // availability — not a "looks callable" schema followed by permission denied.
+
+    /// help=true on a `Visibility::Subhandler` verb returns `callable_via_mcp: false`
+    /// and `visibility: "internal"` rather than a plain callable-looking envelope.
+    #[tokio::test]
+    async fn help_true_on_subhandler_returns_callable_via_mcp_false() {
+        let reg = build_help_registry(Arc::new(AtomicUsize::new(0)));
+
+        let result = reg
+            .dispatch("recall.embed", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true on subhandler must succeed (no permission check on help path)");
+
+        assert_eq!(
+            result["callable_via_mcp"],
+            serde_json::json!(false),
+            "subhandler help must carry callable_via_mcp: false"
+        );
+        assert_eq!(
+            result["visibility"], "internal",
+            "subhandler help must carry visibility: internal"
+        );
+        // The verb and pack fields must still be present so the caller knows
+        // what the schema belongs to.
+        assert_eq!(result["verb"], "recall.embed");
+        assert_eq!(result["pack"], "helptest");
+    }
+
+    /// Public Verb-visibility handlers must NOT have `callable_via_mcp: false`.
+    #[tokio::test]
+    async fn help_true_on_public_verb_does_not_have_callable_via_mcp_false() {
+        let reg = build_help_registry(Arc::new(AtomicUsize::new(0)));
+
+        let result = reg
+            .dispatch("create", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true on public verb must succeed");
+
+        // callable_via_mcp must be absent or true for public verbs.
+        assert_ne!(
+            result.get("callable_via_mcp"),
+            Some(&serde_json::json!(false)),
+            "public verb help must NOT carry callable_via_mcp: false"
+        );
+        // visibility must be absent or 'public' (never 'internal') for public verbs.
+        assert_ne!(
+            result.get("visibility"),
+            Some(&serde_json::json!("internal")),
+            "public verb help must NOT carry visibility: internal"
+        );
+    }
+
+    /// help=true on an unknown verb returns an error (same behavior as normal dispatch).
+    #[tokio::test]
+    async fn help_true_on_unknown_verb_returns_error() {
+        let reg = build_help_registry(Arc::new(AtomicUsize::new(0)));
+
+        let err = reg
+            .dispatch("nonexistent_verb", serde_json::json!({ "help": true }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "help=true on unknown verb must return InvalidInput, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonexistent_verb"),
+            "error must name the unknown verb: {msg}"
+        );
+    }
+
+    /// Subhandler help must include params: [] even when the verb has no params.
+    #[tokio::test]
+    async fn help_true_on_subhandler_includes_params_field() {
+        let reg = build_help_registry(Arc::new(AtomicUsize::new(0)));
+
+        let result = reg
+            .dispatch("recall.embed", serde_json::json!({ "help": true }))
+            .await
+            .expect("help=true on subhandler must succeed");
+
+        // params must always be present (H1: consistent shape).
+        let params = result
+            .get("params")
+            .expect("subhandler help must include 'params' field");
+        assert!(
+            params.is_array(),
+            "subhandler help params must be a JSON array"
+        );
+    }
+
+    // ── codex High: unknown-verb error must not leak subhandler names ─────────
+
+    /// `describe_verb` on an unknown verb must list only Verb-visibility names
+    /// in the "available" list — never subhandler names like `recall.embed`
+    /// (codex High — ue-help-introspection C1 / unknown-verb path).
+    #[tokio::test]
+    async fn help_true_unknown_verb_available_list_excludes_subhandlers() {
+        let reg = build_help_registry(Arc::new(AtomicUsize::new(0)));
+
+        let err = reg
+            .dispatch("not_a_verb", serde_json::json!({ "help": true }))
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        // `recall.embed` is a Subhandler in HelpPack — must NOT appear in the
+        // "available" list of an unknown-verb error.
+        assert!(
+            !msg.contains("recall.embed"),
+            "unknown-verb help error must not advertise subhandler recall.embed: {msg}"
+        );
+        // Public verbs must still appear so the agent knows what to call.
+        assert!(
+            msg.contains("create"),
+            "unknown-verb help error must still list public verb 'create': {msg}"
+        );
+        assert!(
+            msg.contains("recall"),
+            "unknown-verb help error must still list public verb 'recall': {msg}"
+        );
+    }
+
+    /// Normal dispatch on an unknown verb must also not leak subhandler names.
+    #[tokio::test]
+    async fn dispatch_unknown_verb_available_list_excludes_subhandlers() {
+        let reg = build_help_registry(Arc::new(AtomicUsize::new(0)));
+
+        let err = reg
+            .dispatch("not_a_verb", serde_json::json!({}))
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        // `recall.embed` is a Subhandler in HelpPack — must NOT appear in the
+        // "available" list of an unknown-verb dispatch error.
+        assert!(
+            !msg.contains("recall.embed"),
+            "dispatch unknown-verb error must not advertise subhandler recall.embed: {msg}"
+        );
+        // Public verbs must still appear so the agent knows what to call.
+        assert!(
+            msg.contains("create"),
+            "dispatch unknown-verb error must still list public verb 'create': {msg}"
+        );
+        assert!(
+            msg.contains("recall"),
+            "dispatch unknown-verb error must still list public verb 'recall': {msg}"
         );
     }
 }

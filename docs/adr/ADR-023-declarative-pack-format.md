@@ -136,7 +136,7 @@ config can only shrink the MCP surface, never expand it.
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
-bare verb names (14 verbs total):
+bare verb names (15 verbs total):
 
 | Verb        | Speech act  | Description                                                                      |
 | ----------- | ----------- | -------------------------------------------------------------------------------- |
@@ -154,6 +154,12 @@ bare verb names (14 verbs total):
 | `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                      |
 | `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`. |
 | `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.             |
+| `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.        |
+
+`verbs` was added in Wave 4 (ue-help-introspection H5) to provide a machine-readable discovery
+endpoint. It is a pure read operation with no side effects. It excludes internal subhandlers
+(`Visibility::Subhandler`) from its output — the returned list is identical to what the
+`request` tool's MCP description advertises.
 
 Every other pack prefixes its verbs with the pack name and a single dot:
 

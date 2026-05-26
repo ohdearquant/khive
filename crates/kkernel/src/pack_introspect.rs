@@ -163,11 +163,12 @@ mod tests {
             "kg pack must expose verbs; got {:?}",
             info.verbs
         );
-        // ADR-024 requires 11 KG verbs; ADR-046 adds propose/review/withdraw → 14 total
+        // ADR-024 requires 11 KG verbs; ADR-046 adds propose/review/withdraw → 14 total;
+        // Wave 4 J-fix adds `verbs` discovery endpoint → 15 total
         assert_eq!(
             info.verbs.len(),
-            14,
-            "kg pack must expose 14 verbs (ADR-024 + ADR-046); got {}: {:?}",
+            15,
+            "kg pack must expose 15 verbs (ADR-024 + ADR-046 + verbs discovery); got {}: {:?}",
             info.verbs.len(),
             info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
         );

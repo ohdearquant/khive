@@ -131,8 +131,8 @@ The taxonomy is **only** for the verb-addition decision and for documentation/in
 ### Why formalize at all
 
 "N verbs, closed" without an extension criterion is just "we have not needed to add one
-yet." (The product surface has grown: the kg pack now carries 14 verbs including `propose`,
-`review`, `withdraw` from ADR-046; the full classified surface is in the table above.) The first verb-addition pressure (e.g., for a future audit/compliance pack) will
+yet." (The product surface has grown: the kg pack now carries 15 verbs including `propose`,
+`review`, `withdraw` from ADR-046 and `verbs` discovery from Wave 4; the full classified surface is in the table above.) The first verb-addition pressure (e.g., for a future audit/compliance pack) will
 re-open the debate from scratch. A principled taxonomy gives the debate a frame: "is this
 a new illocutionary force, or a synonym?" The answer is usually decisive.
 

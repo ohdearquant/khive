@@ -7,7 +7,10 @@
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
-use khive_runtime::{KhiveRuntime, RuntimeError, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    KhiveRuntime, NamespaceToken, ParamDef, RuntimeError, VerbCategory, VerbRegistry,
+    VerbRegistryBuilder, Visibility,
+};
 use khive_types::Pack;
 use serde_json::{json, Value};
 
@@ -67,14 +70,14 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 // ---- PackRuntime trait: verbs() and unknown-verb dispatch ----
 
 // ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
-// handler count from 11 to 14.
+// handler count from 11 to 14, then 15 with verbs introspection.
 #[test]
-fn pack_verbs_returns_fourteen() {
+fn pack_verbs_returns_fifteen() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        14,
-        "KgPack must expose exactly 14 verbs (11 original + propose/review/withdraw)"
+        15,
+        "KgPack must expose exactly 15 verbs (14 original + verbs introspection)"
     );
 }
 
@@ -97,6 +100,7 @@ fn pack_verbs_names_are_correct() {
         "propose",
         "review",
         "withdraw",
+        "verbs",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -2910,4 +2914,240 @@ async fn neighbors_direction_filter_incoming_outgoing() {
             "K-C2: neighbors(B, {dir_spelling}) must NOT return A; got: {node_ids:?}"
         );
     }
+}
+
+// ── verbs() dispatch-level tests (codex review Medium: H5 not covered) ────────
+//
+// A fake pack with one public verb and one subhandler so we can verify that
+// `verbs()` excludes subhandlers and that category/pack filters work correctly.
+
+static FAKE_SUBHANDLER_HANDLERS: [HandlerDef; 2] = [
+    HandlerDef {
+        name: "fake.pub",
+        description: "Public verb on fake pack",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    },
+    HandlerDef {
+        name: "fake.internal",
+        description: "Internal subhandler on fake pack",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "input",
+            param_type: "string",
+            required: false,
+            description: "Internal embedding input.",
+        }],
+    },
+];
+
+/// A minimal pack that exposes one public verb and one internal subhandler.
+/// Used to verify that `verbs()` excludes subhandlers across pack boundaries.
+struct FakeSubhandlerPack;
+
+impl Pack for FakeSubhandlerPack {
+    const NAME: &'static str = "fake";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &FAKE_SUBHANDLER_HANDLERS;
+    const REQUIRES: &'static [&'static str] = &["kg"];
+}
+
+#[async_trait]
+impl PackRuntime for FakeSubhandlerPack {
+    fn name(&self) -> &str {
+        FakeSubhandlerPack::NAME
+    }
+
+    fn note_kinds(&self) -> &'static [&'static str] {
+        FakeSubhandlerPack::NOTE_KINDS
+    }
+
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        FakeSubhandlerPack::ENTITY_KINDS
+    }
+
+    fn handlers(&self) -> &'static [HandlerDef] {
+        FakeSubhandlerPack::HANDLERS
+    }
+
+    fn requires(&self) -> &'static [&'static str] {
+        FakeSubhandlerPack::REQUIRES
+    }
+
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::InvalidInput(format!(
+            "FakeSubhandlerPack does not handle verb {verb:?}"
+        )))
+    }
+}
+
+fn pack_with_subhandler_pack() -> Fixture {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    builder.register(FakeSubhandlerPack);
+    Fixture {
+        registry: builder.build().expect("registry builds"),
+    }
+}
+
+/// `verbs()` with no filters returns all public verbs (unfiltered output).
+#[tokio::test]
+async fn verbs_dispatch_unfiltered_returns_public_verbs() {
+    let pack = pack();
+    let result = pack
+        .dispatch("verbs", json!({}))
+        .await
+        .expect("verbs() must succeed");
+
+    let verbs_arr = result["verbs"].as_array().expect("verbs must be an array");
+    assert!(
+        !verbs_arr.is_empty(),
+        "verbs() must return at least one verb; got empty array"
+    );
+    // `verbs` itself must appear in the list.
+    let names: Vec<&str> = verbs_arr
+        .iter()
+        .filter_map(|v| v["verb"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"verbs"),
+        "verbs() output must include 'verbs' itself; got: {names:?}"
+    );
+    // `create` (an Assertive kg verb) must appear.
+    assert!(
+        names.contains(&"create"),
+        "verbs() output must include 'create'; got: {names:?}"
+    );
+    // `total` must equal the array length.
+    let total = result["total"].as_u64().expect("total must be an integer");
+    assert_eq!(
+        total as usize,
+        verbs_arr.len(),
+        "verbs.total must match verbs array length"
+    );
+}
+
+/// `verbs(category="Assertive")` returns only Assertive verbs and no others.
+#[tokio::test]
+async fn verbs_dispatch_category_filter_assertive() {
+    let pack = pack();
+    let result = pack
+        .dispatch("verbs", json!({"category": "Assertive"}))
+        .await
+        .expect("verbs(category=Assertive) must succeed");
+
+    let verbs_arr = result["verbs"].as_array().expect("verbs must be an array");
+    assert!(
+        !verbs_arr.is_empty(),
+        "category=Assertive must match at least one verb"
+    );
+    // Every returned verb must be Assertive.
+    for entry in verbs_arr {
+        let cat = entry["category"].as_str().unwrap_or("");
+        assert_eq!(
+            cat, "Assertive",
+            "verbs(category=Assertive) must only return Assertive verbs; got: {entry}"
+        );
+    }
+    // `search` is Assertive — must appear.
+    let names: Vec<&str> = verbs_arr
+        .iter()
+        .filter_map(|v| v["verb"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"search"),
+        "verbs(category=Assertive) must include 'search'; got: {names:?}"
+    );
+}
+
+/// `verbs(pack="kg")` returns only kg-owned verbs and no verbs from other packs.
+#[tokio::test]
+async fn verbs_dispatch_pack_filter_kg() {
+    let pack = pack_with_subhandler_pack();
+    let result = pack
+        .dispatch("verbs", json!({"pack": "kg"}))
+        .await
+        .expect("verbs(pack=kg) must succeed");
+
+    let verbs_arr = result["verbs"].as_array().expect("verbs must be an array");
+    assert!(
+        !verbs_arr.is_empty(),
+        "pack=kg must match at least one verb"
+    );
+    // Every returned entry must belong to "kg".
+    for entry in verbs_arr {
+        let p = entry["pack"].as_str().unwrap_or("");
+        assert_eq!(
+            p, "kg",
+            "verbs(pack=kg) must only return kg verbs; got: {entry}"
+        );
+    }
+    // The `fake.pub` verb from FakeSubhandlerPack must NOT appear.
+    let names: Vec<&str> = verbs_arr
+        .iter()
+        .filter_map(|v| v["verb"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"fake.pub"),
+        "verbs(pack=kg) must not include fake.pub; got: {names:?}"
+    );
+}
+
+/// `verbs()` must exclude subhandlers even when a second pack has them.
+#[tokio::test]
+async fn verbs_dispatch_excludes_subhandlers_across_packs() {
+    let pack = pack_with_subhandler_pack();
+    let result = pack
+        .dispatch("verbs", json!({}))
+        .await
+        .expect("verbs() with fake+kg packs must succeed");
+
+    let verbs_arr = result["verbs"].as_array().expect("verbs must be an array");
+    let names: Vec<&str> = verbs_arr
+        .iter()
+        .filter_map(|v| v["verb"].as_str())
+        .collect();
+
+    // `fake.pub` is Verb-visibility — must appear.
+    assert!(
+        names.contains(&"fake.pub"),
+        "verbs() must include public verb fake.pub; got: {names:?}"
+    );
+    // `fake.internal` is Subhandler-visibility — must NOT appear.
+    assert!(
+        !names.contains(&"fake.internal"),
+        "verbs() must NOT include subhandler fake.internal; got: {names:?}"
+    );
+}
+
+/// `verbs(pack="fake")` returns the one public fake verb and excludes the subhandler.
+#[tokio::test]
+async fn verbs_dispatch_pack_filter_fake_excludes_subhandler() {
+    let pack = pack_with_subhandler_pack();
+    let result = pack
+        .dispatch("verbs", json!({"pack": "fake"}))
+        .await
+        .expect("verbs(pack=fake) must succeed");
+
+    let verbs_arr = result["verbs"].as_array().expect("verbs must be an array");
+    let names: Vec<&str> = verbs_arr
+        .iter()
+        .filter_map(|v| v["verb"].as_str())
+        .collect();
+
+    assert_eq!(
+        names,
+        vec!["fake.pub"],
+        "verbs(pack=fake) must return exactly [fake.pub], not the subhandler"
+    );
 }

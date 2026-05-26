@@ -148,7 +148,9 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "status",
                 param_type: "string",
                 required: false,
-                description: "Initial status: inbox | next | waiting | someday | active (default inbox).",
+                description: "Initial status: inbox | next | waiting | someday | active (default inbox). \
+                               Canonical values also accepted as aliases: todo=inbox, in_progress=active, \
+                               blocked=waiting, later=someday, finished=done.",
             },
             ParamDef {
                 name: "priority",
@@ -241,7 +243,9 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "status",
                 param_type: "string",
                 required: false,
-                description: "Filter by status: inbox | next | waiting | someday | active | done | cancelled.",
+                description: "Filter by status: inbox | next | waiting | someday | active | done | cancelled. \
+                               Aliases also accepted: todo=inbox, in_progress=active, blocked=waiting, \
+                               later=someday, finished=done.",
             },
             ParamDef {
                 name: "assignee",
@@ -286,7 +290,9 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "status",
                 param_type: "string",
                 required: true,
-                description: "Target status: inbox | next | waiting | someday | active | done | cancelled.",
+                description: "Target status: inbox | next | waiting | someday | active | done | cancelled. \
+                               Aliases also accepted: todo=inbox, in_progress=active, blocked=waiting, \
+                               later=someday, finished=done.",
             },
             ParamDef {
                 name: "note",
