@@ -606,7 +606,7 @@ import run rather than once per addition.
 Phases 1 and 2 cover the primary research audience. Phases 3–5 are independent and may ship
 in either order based on demand signals.
 
-## Format-v2 migration UX (deferred to ADR-047)
+## Format-v2 migration UX (deferred to ADR-048)
 
 The current export format (NDJSON, ADR-020 §canonical) is format-v1. A future
 format-v2 will [TBD: rationale]. Migration UX for users with format-v1 archives:
@@ -619,8 +619,9 @@ format-v2 will [TBD: rationale]. Migration UX for users with format-v1 archives:
 - No `migrate` subcommand is needed; round-trip import-then-export effectively
   upgrades archives.
 
-Resolution: deferred to ADR-047 (Format-v2 Migration UX). For v1, only format-v1
-is supported on both import and export sides.
+Resolution: deferred to ADR-048 (Format-v2 Migration UX). ADR-047 was claimed by
+the Knowledge Pack (knowledge pack verb surface). For v1, only format-v1 is
+supported on both import and export sides.
 
 ## Open Questions
 

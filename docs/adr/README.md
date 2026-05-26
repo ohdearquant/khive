@@ -79,6 +79,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-044](ADR-044-vector-store-extensions.md)            | Vector Store Extensions — Capabilities, Metadata Filter, Batched Search, Update, Orphan Sweep |
 | [ADR-045](ADR-045-verb-response-presentation.md)         | Verb Response Presentation Modes                                                              |
 | [ADR-046](ADR-046-event-sourced-proposals.md)            | Event-Sourced Agent KG Proposals                                                              |
+| [ADR-047](ADR-047-knowledge-pack.md)                     | Knowledge Pack — Concept Registration, Citation, and Topic Search                             |
 
 ## Closed Taxonomies — Quick Reference
 

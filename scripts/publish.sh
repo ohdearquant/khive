@@ -58,6 +58,7 @@ CRATES=(
     khive-pack-memory
     khive-pack-comm
     khive-pack-schedule
+    khive-pack-knowledge
     khive-pack-template
     khive-vcs
     # khive-merge — forward-deployed (ADR-043), not yet compilable against
