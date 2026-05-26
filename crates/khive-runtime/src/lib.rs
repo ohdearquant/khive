@@ -58,8 +58,9 @@ pub use objectives::{
 pub use operations::{LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{
     DispatchHook, HandlerDef, KindHook, NoteKindSpec, NoteLifecycleSpec, PackFactory,
-    PackRegistration, PackRegistry, PackRuntime, PackSchemaPlan, ParamDef, SchemaPlan,
-    VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, Visibility,
+    PackLoadError, PackRegistration, PackRegistry, PackRuntime, PackSchemaPlan, ParamDef,
+    SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
+    Visibility,
 };
 pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{present, PresentationMode};

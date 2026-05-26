@@ -1129,6 +1129,35 @@ pub struct PackRegistration(pub &'static dyn PackFactory);
 
 inventory::collect!(PackRegistration);
 
+/// Error returned by [`PackRegistry::register_packs`] when boot validation fails.
+#[derive(Debug)]
+pub enum PackLoadError {
+    /// The requested pack name was not found in the inventory.
+    UnknownPack(String),
+    /// A pack was requested but a declared dependency is absent from the list.
+    MissingDependency {
+        /// The pack that declared the dependency.
+        pack: String,
+        /// The dependency that is missing from the requested pack list.
+        dep: String,
+    },
+}
+
+impl std::fmt::Display for PackLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PackLoadError::UnknownPack(name) => write!(f, "unknown pack {name:?}"),
+            PackLoadError::MissingDependency { pack, dep } => write!(
+                f,
+                "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
+                 add --pack {dep} before --pack {pack}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PackLoadError {}
+
 /// Registry of pack factories discovered via `inventory` at link time (ADR-027).
 ///
 /// No instance is needed — all methods are associated functions that walk the
@@ -1148,20 +1177,19 @@ impl PackRegistry {
     ///
     /// Validates the explicit pack list against `PackFactory::requires()` —
     /// if any requested pack declares a dependency that is absent from `names`,
-    /// registration fails with `Err(missing_name)` (ADR-027: missing dependency
-    /// is a boot error, not silently auto-added). Callers must include all
-    /// required packs explicitly.
+    /// registration fails (ADR-027: missing dependency is a boot error, not
+    /// silently auto-added). Callers must include all required packs explicitly.
     ///
     /// The [`VerbRegistryBuilder::build`] topo-sort enforces correct load order.
     ///
     /// Returns `Ok(())` when all names are recognised and all declared
-    /// dependencies are satisfied; returns `Err(name)` for the first
-    /// unrecognised or unsatisfied pack name.
+    /// dependencies are satisfied; returns `Err(PackLoadError)` with a
+    /// distinct variant for unknown pack vs missing dependency.
     pub fn register_packs(
         names: &[String],
         runtime: KhiveRuntime,
         builder: &mut VerbRegistryBuilder,
-    ) -> Result<(), String> {
+    ) -> Result<(), PackLoadError> {
         // Build a name→factory index once.
         let all: Vec<&'static dyn PackFactory> = inventory::iter::<PackRegistration>
             .into_iter()
@@ -1174,7 +1202,7 @@ impl PackRegistry {
         // Validate that every requested name is a known factory.
         let requested: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
         for name in names {
-            factory_for(name.as_str()).ok_or_else(|| name.clone())?;
+            factory_for(name.as_str()).ok_or_else(|| PackLoadError::UnknownPack(name.clone()))?;
         }
 
         // Validate that all requires() dependencies are explicitly present in
@@ -1183,7 +1211,10 @@ impl PackRegistry {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
             for &dep in factory.requires() {
                 if !requested.contains(dep) {
-                    return Err(dep.to_string());
+                    return Err(PackLoadError::MissingDependency {
+                        pack: name.clone(),
+                        dep: dep.to_string(),
+                    });
                 }
             }
         }

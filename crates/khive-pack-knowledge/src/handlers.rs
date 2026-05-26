@@ -110,18 +110,21 @@ impl KnowledgePack {
             ));
         }
 
-        // Build properties: include domain if provided.
-        let properties = match &p.domain {
-            Some(domain) if !domain.trim().is_empty() => Some(json!({ "domain": domain.trim() })),
-            _ => None,
-        };
+        // Normalise the domain once (trim + lowercase) and use the same value
+        // for properties.domain, the promoted tag, and the response — ADR-047 §91
+        // requires case-insensitive domain matching, so the three surfaces must agree.
+        let domain_norm: Option<String> = p
+            .domain
+            .as_ref()
+            .map(|d| d.trim().to_lowercase())
+            .filter(|d| !d.is_empty());
+
+        let properties = domain_norm.as_ref().map(|d| json!({ "domain": d }));
 
         let mut tags = p.tags.unwrap_or_default();
-        // Promote domain to a tag for FTS discoverability.
-        if let Some(d) = &p.domain {
-            let d = d.trim().to_string();
-            if !d.is_empty() && !tags.contains(&d) {
-                tags.push(d);
+        if let Some(d) = &domain_norm {
+            if !tags.contains(d) {
+                tags.push(d.clone());
             }
         }
 
@@ -144,7 +147,7 @@ impl KnowledgePack {
             "kind": "concept",
             "name": entity.name,
             "description": entity.description,
-            "domain": p.domain,
+            "domain": domain_norm,
             "tags": entity.tags,
             "namespace": entity.namespace,
         }))
@@ -190,6 +193,20 @@ impl KnowledgePack {
     /// When `query` is provided, a hybrid search is run and results are
     /// domain-filtered post-retrieval.  Without `query`, all concepts in the
     /// namespace are listed (up to `limit`).
+    ///
+    /// Both paths emit the same base item shape:
+    ///   `{id, full_id, name, description, tags}`
+    /// The search path additionally includes `score` and `snippet` when present.
+    ///
+    /// ## `total` semantics
+    ///
+    /// **Listing path** (`query` absent): `total` is the true pre-limit count of
+    /// all matching entities in the namespace, usable as a pagination signal.
+    ///
+    /// **Search path** (`query` present): `total` is the post-filter count of the
+    /// candidate window fetched from the search index (`limit * 4` candidates).
+    /// It is bounded by that window and does NOT reflect the full corpus count.
+    /// Use it as a relevance indicator, not a pagination total.
     pub(crate) async fn handle_topic(
         &self,
         token: &NamespaceToken,
@@ -197,78 +214,91 @@ impl KnowledgePack {
     ) -> Result<Value, RuntimeError> {
         let p: TopicParams = deser(params)?;
         let limit = p.limit.unwrap_or(20).min(100);
+        // Normalise domain filter to lowercase (ADR-047 §91: case-insensitive match).
         let domain_filter = p
             .domain
             .as_deref()
-            .map(|d| d.trim().to_string())
+            .map(|d| d.trim().to_lowercase())
             .filter(|d| !d.is_empty());
 
         if let Some(ref query) = p.query {
-            // Hybrid search path.
+            // Search path: hybrid FTS+vector search, then optional domain post-filter.
+            // We fetch limit*4 candidates to give the domain filter enough to work with.
+            // `total` = post-filter count of the candidate window (bounded by limit*4),
+            // NOT a true corpus count — see doc comment above.
             let hits = self
                 .runtime
                 .hybrid_search(token, query, None, limit * 4, Some("concept"), None)
                 .await?;
 
-            // Collect hit IDs for optional domain post-filter.
+            // Always fetch entity records for the search hits so we can emit a
+            // unified item shape (K-2) and apply the domain filter reliably.
             let hit_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
+            let entity_map: std::collections::HashMap<Uuid, _> = if !hit_ids.is_empty() {
+                self.runtime
+                    .get_entities_by_ids(token, &hit_ids)
+                    .await?
+                    .into_iter()
+                    .map(|e| (e.id, e))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
 
-            // When a domain filter is active, fetch entity records to check tags.
-            let entity_tags: std::collections::HashMap<Uuid, Vec<String>> =
-                if domain_filter.is_some() && !hit_ids.is_empty() {
-                    let entities = self
-                        .runtime
-                        .list_entities(token, Some("concept"), None, hit_ids.len() as u32, 0)
-                        .await?;
-                    entities
-                        .into_iter()
-                        .filter(|e| hit_ids.contains(&e.id))
-                        .map(|e| (e.id, e.tags))
-                        .collect()
-                } else {
-                    std::collections::HashMap::new()
-                };
-
-            let results: Vec<Value> = hits
+            // Filter by domain (case-insensitive tag match), then collect up to
+            // `limit` items.  Hits whose entity record is missing are dropped.
+            let filtered: Vec<_> = hits
                 .into_iter()
                 .filter(|h| {
+                    let Some(entity) = entity_map.get(&h.entity_id) else {
+                        return false;
+                    };
                     if let Some(ref d) = domain_filter {
-                        entity_tags
-                            .get(&h.entity_id)
-                            .map(|tags| tags.iter().any(|t| t.eq_ignore_ascii_case(d)))
-                            .unwrap_or(false)
+                        entity.tags.iter().any(|t| t.eq_ignore_ascii_case(d))
                     } else {
                         true
                     }
                 })
+                .collect();
+
+            let total = filtered.len();
+            let results: Vec<Value> = filtered
+                .into_iter()
                 .take(limit as usize)
                 .map(|h| {
-                    json!({
-                        "id": h.entity_id.as_hyphenated().to_string(),
-                        "title": h.title,
-                        "snippet": h.snippet,
+                    let entity = entity_map.get(&h.entity_id).unwrap();
+                    let mut item = json!({
+                        "id": short_id(entity.id),
+                        "full_id": entity.id.as_hyphenated().to_string(),
+                        "name": entity.name,
+                        "description": entity.description,
+                        "tags": entity.tags,
                         "score": h.score.to_f64(),
-                    })
+                    });
+                    if let Some(snippet) = h.snippet {
+                        item["snippet"] = serde_json::Value::String(snippet);
+                    }
+                    item
                 })
                 .collect();
 
-            Ok(json!({ "items": results, "total": results.len() }))
+            Ok(json!({ "items": results, "total": total }))
         } else {
-            // Listing path.
+            // Listing path: DB-level domain filter via tags_any avoids silent
+            // truncation (K-3).  `count_entities_tagged` gives the pre-limit
+            // match count for `total` (K-6).
+            let total = self
+                .runtime
+                .count_entities_tagged(token, Some("concept"), domain_filter.as_deref())
+                .await?;
+
             let entities = self
                 .runtime
-                .list_entities(token, Some("concept"), None, limit, 0)
+                .list_entities_tagged(token, Some("concept"), domain_filter.as_deref(), limit, 0)
                 .await?;
 
             let results: Vec<Value> = entities
                 .into_iter()
-                .filter(|e| {
-                    if let Some(ref d) = domain_filter {
-                        e.tags.iter().any(|t| t.eq_ignore_ascii_case(d))
-                    } else {
-                        true
-                    }
-                })
                 .map(|e| {
                     json!({
                         "id": short_id(e.id),
@@ -280,7 +310,7 @@ impl KnowledgePack {
                 })
                 .collect();
 
-            Ok(json!({ "items": results, "total": results.len() }))
+            Ok(json!({ "items": results, "total": total }))
         }
     }
 }

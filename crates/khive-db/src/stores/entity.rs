@@ -233,12 +233,14 @@ fn build_entity_where(
             .tags_any
             .iter()
             .map(|t| {
-                params.push(Box::new(t.clone()));
+                // Normalise to lowercase so the comparison is case-insensitive
+                // (ADR-047 §91: domain filter must be case-insensitive).
+                params.push(Box::new(t.to_lowercase()));
                 format!("?{}", params.len())
             })
             .collect();
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value IN ({}))",
+            "EXISTS (SELECT 1 FROM json_each(tags) WHERE LOWER(json_each.value) IN ({}))",
             placeholders.join(", ")
         ));
     }

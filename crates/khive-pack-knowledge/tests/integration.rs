@@ -326,3 +326,95 @@ async fn topic_respects_limit() {
     let items = resp["items"].as_array().expect("items array");
     assert!(items.len() <= 2, "expected ≤ 2 items, got: {}", items.len());
 }
+
+// ── H1 regression: case-insensitive domain filter (ADR-047 §91) ──────────────
+
+#[tokio::test]
+async fn topic_domain_filter_is_case_insensitive_listing_path() {
+    let f = pack(rt());
+
+    // Store concept with uppercase domain "Attention".
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "FlashAttention", "domain": "Attention" }),
+    )
+    .await
+    .expect("learn with Attention");
+
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn with fine-tuning");
+
+    // Query with lowercase "attention" — must find the concept stored as "Attention".
+    let resp = f
+        .dispatch("knowledge.topic", json!({ "domain": "attention" }))
+        .await
+        .expect("topic ok");
+
+    let items = resp["items"].as_array().expect("items array");
+    let names: Vec<&str> = items.iter().filter_map(|v| v["name"].as_str()).collect();
+    assert_eq!(items.len(), 1, "expected 1 match, got: {names:?}");
+    assert!(
+        names.contains(&"FlashAttention"),
+        "expected FlashAttention in results: {names:?}"
+    );
+    assert_eq!(
+        resp["total"].as_u64().unwrap_or(0),
+        1,
+        "total should be 1 on listing path"
+    );
+}
+
+// ── H2 regression: search-path `total` semantics ─────────────────────────────
+
+#[tokio::test]
+async fn topic_search_path_total_is_bounded_by_candidate_window() {
+    let f = pack(rt());
+
+    // Learn 10 concepts — more than a small limit, so we can observe truncation.
+    for i in 0..10 {
+        f.dispatch(
+            "knowledge.learn",
+            json!({ "name": format!("Attention{i}"), "domain": "attention" }),
+        )
+        .await
+        .expect("learn");
+    }
+    f.dispatch(
+        "knowledge.learn",
+        json!({ "name": "LoRA", "domain": "fine-tuning" }),
+    )
+    .await
+    .expect("learn unrelated");
+
+    // Search path with limit=3.  total must be <= limit*4 (12) and >= returned items.
+    let resp = f
+        .dispatch(
+            "knowledge.topic",
+            json!({ "query": "attention", "limit": 3 }),
+        )
+        .await
+        .expect("topic search ok");
+
+    let items = resp["items"].as_array().expect("items array");
+    let total = resp["total"].as_u64().expect("total field present");
+
+    assert!(
+        items.len() <= 3,
+        "items must respect limit: got {}",
+        items.len()
+    );
+    // total is the candidate-window count, bounded by limit*4 = 12.
+    assert!(
+        total <= 12,
+        "search-path total must be bounded by limit*4 (12), got {total}"
+    );
+    assert!(
+        total >= items.len() as u64,
+        "total must be >= returned items: total={total}, items={}",
+        items.len()
+    );
+}

@@ -365,6 +365,35 @@ impl KhiveRuntime {
         Ok(entity)
     }
 
+    /// Fetch multiple entities by ID, returning only those that exist in the
+    /// caller's namespace.  Missing or namespace-mismatched IDs are silently
+    /// omitted so that batch lookups don't abort on a single stale reference.
+    pub async fn get_entities_by_ids(
+        &self,
+        token: &NamespaceToken,
+        ids: &[Uuid],
+    ) -> RuntimeResult<Vec<Entity>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let filter = EntityFilter {
+            ids: ids.to_vec(),
+            ..Default::default()
+        };
+        let page = self
+            .entities(token)?
+            .query_entities(
+                token.namespace().as_str(),
+                filter,
+                PageRequest {
+                    offset: 0,
+                    limit: ids.len() as u32,
+                },
+            )
+            .await?;
+        Ok(page.items)
+    }
+
     /// Enforce that `actual` matches the token's namespace.
     ///
     /// Returns `Err(NamespaceMismatch { id })` when they differ, preserving ADR-007
@@ -413,6 +442,71 @@ impl KhiveRuntime {
             )
             .await?;
         Ok(page.items)
+    }
+
+    /// List entities filtered by kind, optional domain tag, limit, and offset.
+    ///
+    /// When `domain_tag` is Some, the query is restricted at the storage layer via
+    /// `EntityFilter::tags_any` so the page result already reflects the domain
+    /// constraint.  This avoids the silent truncation that occurs when filtering
+    /// post-page (K-3).
+    pub async fn list_entities_tagged(
+        &self,
+        token: &NamespaceToken,
+        kind: Option<&str>,
+        domain_tag: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> RuntimeResult<Vec<Entity>> {
+        let filter = EntityFilter {
+            kinds: match kind {
+                Some(k) => vec![k.to_string()],
+                None => vec![],
+            },
+            tags_any: match domain_tag {
+                Some(t) if !t.is_empty() => vec![t.to_string()],
+                _ => vec![],
+            },
+            ..Default::default()
+        };
+        let page = self
+            .entities(token)?
+            .query_entities(
+                token.namespace().as_str(),
+                filter,
+                PageRequest {
+                    offset: offset.into(),
+                    limit,
+                },
+            )
+            .await?;
+        Ok(page.items)
+    }
+
+    /// Count entities filtered by kind and optional domain tag.
+    ///
+    /// Used to report a meaningful `total` alongside a paginated listing (K-6).
+    pub async fn count_entities_tagged(
+        &self,
+        token: &NamespaceToken,
+        kind: Option<&str>,
+        domain_tag: Option<&str>,
+    ) -> RuntimeResult<u64> {
+        let filter = EntityFilter {
+            kinds: match kind {
+                Some(k) => vec![k.to_string()],
+                None => vec![],
+            },
+            tags_any: match domain_tag {
+                Some(t) if !t.is_empty() => vec![t.to_string()],
+                _ => vec![],
+            },
+            ..Default::default()
+        };
+        Ok(self
+            .entities(token)?
+            .count_entities(token.namespace().as_str(), filter)
+            .await?)
     }
 
     /// List events in the namespace proven by the caller token.

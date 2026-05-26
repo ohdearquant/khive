@@ -83,7 +83,7 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 3] = [
                 name: "source_id",
                 param_type: "uuid",
                 required: true,
-                description: "Source document entity ID (must be kind=document)",
+                description: "Source entity ID; must be kind=document or kind=person (ADR-002 §introduced_by)",
             },
             ParamDef {
                 name: "weight",
@@ -116,7 +116,7 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 3] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Max results; defaults to 50",
+                description: "Max results; defaults to 20, capped at 100",
             },
         ],
     },

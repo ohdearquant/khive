@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp};
 use khive_runtime::{
-    present, KhiveRuntime, PackRegistry, PresentationMode, RuntimeError, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder,
+    present, KhiveRuntime, PackLoadError, PackRegistry, PresentationMode, RuntimeError,
+    VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
 };
 
 use crate::tools::request::RequestParams;
@@ -86,6 +86,7 @@ pub struct KhiveMcpServer {
 /// Failure reason inside a [`PackRegError`].
 pub enum PackRegFailure {
     UnknownPack(String),
+    MissingDependency { pack: String, dep: String },
     Registry(khive_runtime::RuntimeError),
 }
 
@@ -101,6 +102,9 @@ impl std::fmt::Debug for PackRegError {
         let mut dbg = f.debug_struct("PackRegError");
         match &self.failure {
             PackRegFailure::UnknownPack(unknown) => dbg.field("unknown", unknown),
+            PackRegFailure::MissingDependency { pack, dep } => {
+                dbg.field("pack", pack).field("missing_dep", dep)
+            }
             PackRegFailure::Registry(source) => dbg.field("source", source),
         }
         .finish_non_exhaustive()
@@ -115,6 +119,11 @@ impl std::fmt::Display for PackRegError {
                 "unknown pack name {:?} — built-in packs: {}",
                 unknown,
                 builtin_pack_names().join(", ")
+            ),
+            PackRegFailure::MissingDependency { pack, dep } => write!(
+                f,
+                "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
+                 add --pack {dep} before --pack {pack}"
             ),
             PackRegFailure::Registry(source) => write!(f, "pack registry build failed: {source}"),
         }
@@ -173,11 +182,14 @@ impl KhiveMcpServer {
         {
             builder.with_event_store(event_store);
         }
-        if let Err(unknown) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
-            return Err(PackRegError {
-                failure: PackRegFailure::UnknownPack(unknown),
-                runtime,
-            });
+        if let Err(load_err) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
+            let failure = match load_err {
+                PackLoadError::UnknownPack(name) => PackRegFailure::UnknownPack(name),
+                PackLoadError::MissingDependency { pack, dep } => {
+                    PackRegFailure::MissingDependency { pack, dep }
+                }
+            };
+            return Err(PackRegError { failure, runtime });
         }
         let registry = builder.build().map_err(|source| PackRegError {
             failure: PackRegFailure::Registry(source),
