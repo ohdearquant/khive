@@ -539,10 +539,13 @@ impl GtdPack {
                 short_id(note.id)
             )));
         }
-        if !can_transition(&current, "done") {
-            let allowed = allowed_transitions(&current).join(", ");
+        // UE2-H1: complete() is restricted to actionable states (next, active) only.
+        // Tasks in inbox/waiting/someday must be explicitly transitioned to an
+        // actionable state first. Use transition(status=done) to bypass this check.
+        if !is_actionable(&current) {
             return Err(RuntimeError::InvalidInput(format!(
-                "cannot transition from {current:?} to \"done\" — allowed: {allowed}"
+                "complete: task in {current:?}; transition to 'next' or 'active' first, \
+                 or use transition(status=done) explicitly"
             )));
         }
 

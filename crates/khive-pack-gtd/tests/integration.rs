@@ -177,12 +177,17 @@ async fn complete_marks_task_done_and_is_idempotent_via_load_check() {
     let resp = assign(&pack, json!({"title": "do thing"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
 
+    // UE2-H1: must transition to an actionable state before completing.
+    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+        .await
+        .expect("transition to next must succeed");
+
     let done = pack
         .dispatch("complete", json!({"id": id, "result": "shipped"}))
         .await
         .unwrap();
     assert_eq!(done["completed"], true);
-    assert_eq!(done["from"], "inbox");
+    assert_eq!(done["from"], "next");
     assert_eq!(done["to"], "done");
 
     // Second complete must fail because "done" is a terminal state.
@@ -197,8 +202,14 @@ async fn complete_marks_task_done_and_is_idempotent_via_load_check() {
 async fn complete_via_short_id_resolves_prefix() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "via short id"})).await;
+    let full_id = resp["full_id"].as_str().unwrap().to_string();
     let short = resp["id"].as_str().unwrap().to_string();
     assert_eq!(short.len(), 8);
+
+    // UE2-H1: transition to next first.
+    pack.dispatch("transition", json!({"id": full_id, "status": "next"}))
+        .await
+        .expect("transition to next must succeed");
 
     let done = pack
         .dispatch("complete", json!({"id": short}))
@@ -624,6 +635,12 @@ async fn complete_writes_lifecycle_audit_record() {
     let resp = assign(&fixture, json!({"title": "audit complete test"})).await;
     let task_id = resp["full_id"].as_str().unwrap().to_string();
 
+    // UE2-H1: transition to actionable state first.
+    fixture
+        .dispatch("transition", json!({"id": task_id, "status": "next"}))
+        .await
+        .expect("transition to next should succeed");
+
     fixture
         .dispatch("complete", json!({"id": task_id, "result": "done!"}))
         .await
@@ -633,7 +650,9 @@ async fn complete_writes_lifecycle_audit_record() {
     let mut reader = sql.reader().await.expect("sql reader");
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT from_state, to_state FROM gtd_lifecycle_audit WHERE note_id = ?1".into(),
+            sql: "SELECT from_state, to_state FROM gtd_lifecycle_audit \
+                  WHERE note_id = ?1 AND to_state = 'done'"
+                .into(),
             params: vec![SqlValue::Text(task_id.clone())],
             label: None,
         })
@@ -643,7 +662,7 @@ async fn complete_writes_lifecycle_audit_record() {
     assert_eq!(
         rows.len(),
         1,
-        "F101: complete must write one audit row; got {rows:?}"
+        "F101: complete must write exactly one audit row with to_state='done'; got {rows:?}"
     );
     let row = &rows[0];
     assert_eq!(
@@ -727,6 +746,11 @@ async fn test_complete_on_already_done_returns_clear_error() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "double complete test"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // UE2-H1: transition to actionable state first.
+    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+        .await
+        .expect("transition to next must succeed");
 
     // First complete succeeds.
     let done = pack
@@ -831,6 +855,11 @@ async fn get_task_after_complete_exposes_done_status() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "complete remap test"})).await;
     let full_id = resp["full_id"].as_str().unwrap().to_string();
+
+    // UE2-H1: transition to actionable state first.
+    pack.dispatch("transition", json!({"id": full_id, "status": "next"}))
+        .await
+        .expect("transition to next must succeed");
 
     pack.dispatch("complete", json!({"id": full_id, "result": "shipped"}))
         .await
@@ -1095,6 +1124,11 @@ async fn complete_response_includes_completed_at() {
     let resp = assign(&pack, json!({"title": "track completion time"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
 
+    // UE2-H1: transition to actionable state first.
+    pack.dispatch("transition", json!({"id": id, "status": "active"}))
+        .await
+        .expect("transition to active must succeed");
+
     let done = pack
         .dispatch("complete", json!({"id": id, "result": "shipped"}))
         .await
@@ -1116,6 +1150,12 @@ async fn complete_sets_properties_status_to_done() {
     let resp = assign(&fixture, json!({"title": "check status after complete"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
     let uuid = uuid::Uuid::parse_str(&id).unwrap();
+
+    // UE2-H1: transition to actionable state first.
+    fixture
+        .dispatch("transition", json!({"id": id, "status": "next"}))
+        .await
+        .expect("transition to next must succeed");
 
     fixture
         .dispatch("complete", json!({"id": id}))
@@ -1219,6 +1259,11 @@ async fn timestamps_are_rfc3339_across_verbs() {
             .unwrap_or_else(|e| panic!("tasks.{field} not RFC 3339: {ts} — {e}"));
     }
 
+    // UE2-H1: transition to actionable state first.
+    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+        .await
+        .expect("transition to next must succeed");
+
     // complete response: completed_at must be RFC 3339.
     let done = pack.dispatch("complete", json!({"id": id})).await.unwrap();
     let completed_at = done["completed_at"].as_str().expect("completed_at missing");
@@ -1234,6 +1279,11 @@ async fn complete_writes_status_column_to_done() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "Write notes.status on complete"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // UE2-H1: transition to actionable state first.
+    pack.dispatch("transition", json!({"id": id, "status": "next"}))
+        .await
+        .expect("transition to next must succeed");
 
     pack.dispatch("complete", json!({"id": id}))
         .await
@@ -1413,4 +1463,95 @@ async fn next_excludes_terminal_tasks() {
     );
 
     let _ = t1["full_id"].as_str();
+}
+
+// ── UE2-H1: complete() state machine enforcement ─────────────────────────────
+
+/// complete() from inbox must be rejected — task must be in next or active first.
+#[tokio::test]
+async fn complete_from_inbox_is_rejected() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "inbox task"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+    assert_eq!(resp["status"], "inbox");
+
+    let err = pack
+        .dispatch("complete", json!({"id": id}))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("inbox"),
+        "error must mention current state 'inbox'; got: {msg}"
+    );
+    assert!(
+        msg.contains("transition to 'next' or 'active'"),
+        "error must guide caller to transition first; got: {msg}"
+    );
+}
+
+/// complete() from waiting must be rejected.
+#[tokio::test]
+async fn complete_from_waiting_is_rejected() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "waiting task", "status": "waiting"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let err = pack
+        .dispatch("complete", json!({"id": id}))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("waiting"),
+        "error must mention current state 'waiting'; got: {msg}"
+    );
+}
+
+/// complete() from someday must be rejected.
+#[tokio::test]
+async fn complete_from_someday_is_rejected() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "someday task", "status": "someday"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let err = pack
+        .dispatch("complete", json!({"id": id}))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("someday"),
+        "error must mention current state 'someday'; got: {msg}"
+    );
+}
+
+/// complete() from next must succeed.
+#[tokio::test]
+async fn complete_from_next_succeeds() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "next task", "status": "next"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let done = pack
+        .dispatch("complete", json!({"id": id}))
+        .await
+        .expect("complete from next must succeed");
+    assert_eq!(done["from"], "next");
+    assert_eq!(done["to"], "done");
+}
+
+/// complete() from active must succeed.
+#[tokio::test]
+async fn complete_from_active_succeeds() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "active task", "status": "active"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let done = pack
+        .dispatch("complete", json!({"id": id}))
+        .await
+        .expect("complete from active must succeed");
+    assert_eq!(done["from"], "active");
+    assert_eq!(done["to"], "done");
 }

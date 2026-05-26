@@ -326,15 +326,24 @@ pub(crate) async fn handle_reply(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // Thread root: use the original's thread_id if set, else the original's own UUID.
+    // UE6-H2: thread_id must always be a full 36-char hyphenated UUID.
+    // If the stored thread_id is a valid full UUID, use it; otherwise fall
+    // back to the original message's own full UUID as the thread root.
     let thread_id = orig_props
         .get("thread_id")
         .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| id.to_string());
+        .and_then(|s| s.parse::<Uuid>().ok())
+        .map(|u| u.as_hyphenated().to_string())
+        .unwrap_or_else(|| original.id.as_hyphenated().to_string());
 
-    let original_sender = orig_props
+    let original_from = orig_props
         .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let original_to = orig_props
+        .get("to")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
@@ -354,9 +363,21 @@ pub(crate) async fn handle_reply(
     let from = token.namespace().as_str().to_string();
     let sent_at = Utc::now().to_rfc3339();
 
+    // UE6-H1: route reply to the "other party" — not always to the original sender.
+    // If the reply caller is the original sender (from), route to the original
+    // recipient (to). If the reply caller is the original recipient, route back
+    // to the original sender. This ensures both A→B and B→A reply correctly.
+    let reply_to = if from == original_from {
+        // Caller was the sender of the original; reply goes to the original recipient.
+        original_to.clone()
+    } else {
+        // Caller was the recipient (or a third party); reply goes to the original sender.
+        original_from.clone()
+    };
+
     let properties = json!({
         "from": from,
-        "to": original_sender,
+        "to": reply_to,
         "direction": "outbound",
         "subject": reply_subject,
         "thread_id": thread_id,
@@ -385,7 +406,7 @@ pub(crate) async fn handle_reply(
         "full_id": reply_note.id.as_hyphenated().to_string(),
         "thread_id": thread_id,
         "from": from,
-        "to": original_sender,
+        "to": reply_to,
         "subject": reply_subject,
         "sent_at": sent_at,
     }))

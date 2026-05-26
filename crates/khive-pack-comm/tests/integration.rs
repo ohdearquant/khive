@@ -519,6 +519,229 @@ async fn test_send_to_self_writes_single_note() {
     );
 }
 
+// ── UE6-H1: reply routes to the "other party", not always back to sender ────
+
+/// Sender replies to their own outbound message → reply routes to original recipient.
+///
+/// A sends to B. A then replies to that message. The reply must go to B, not A.
+#[tokio::test]
+async fn test_reply_from_sender_routes_to_recipient() {
+    // Registry scoped to lambda:khive (the sender).
+    let (registry, _rt) = build_registry_for_ns("lambda:khive");
+
+    // Send from lambda:khive to lambda:leo.
+    let sent = registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": "lambda:leo", "content": "hello leo" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let msg_full_id = sent
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("send returns full_id");
+
+    // Sender (lambda:khive) replies to their own outbound message.
+    let reply = registry
+        .dispatch(
+            "reply",
+            serde_json::json!({ "id": msg_full_id, "content": "follow-up" }),
+        )
+        .await
+        .expect("reply succeeds");
+
+    // Reply must route to lambda:leo (original recipient), not back to lambda:khive.
+    let reply_to = reply
+        .get("to")
+        .and_then(|v| v.as_str())
+        .expect("reply returns to");
+    assert_eq!(
+        reply_to, "lambda:leo",
+        "UE6-H1: sender replying to own message must route to original recipient; got {reply_to}"
+    );
+    let reply_from = reply
+        .get("from")
+        .and_then(|v| v.as_str())
+        .expect("reply returns from");
+    assert_eq!(
+        reply_from, "lambda:khive",
+        "reply from must be the caller namespace"
+    );
+}
+
+/// Recipient replies to an inbound message → reply routes back to original sender.
+///
+/// A sends to B. B replies. The reply must go to A, not B.
+#[tokio::test]
+async fn test_reply_from_recipient_routes_to_sender() {
+    use khive_runtime::VerbRegistryBuilder;
+
+    // Step 1: send from lambda:khive to lambda:leo.
+    let (send_registry, rt) = build_registry_for_ns("lambda:khive");
+    send_registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": "lambda:leo", "content": "meeting at 3pm" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    // Step 2: lambda:leo reads their inbox to get the inbound message id.
+    let mut leo_builder = VerbRegistryBuilder::new();
+    leo_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    leo_builder.register(CommPack::new(rt.clone()));
+    leo_builder.with_default_namespace("lambda:leo");
+    let leo_registry = leo_builder.build().expect("leo registry");
+
+    let inbox = leo_registry
+        .dispatch("inbox", serde_json::json!({ "status": "unread" }))
+        .await
+        .expect("inbox succeeds");
+    let msgs = inbox
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+    assert_eq!(msgs.len(), 1, "leo must have 1 inbound message");
+    let inbound_full_id = msgs[0]
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id on inbound message");
+
+    // Step 3: lambda:leo replies to the inbound message.
+    let reply = leo_registry
+        .dispatch(
+            "reply",
+            serde_json::json!({ "id": inbound_full_id, "content": "confirmed" }),
+        )
+        .await
+        .expect("reply succeeds");
+
+    // Reply must route to lambda:khive (original sender), not back to lambda:leo.
+    let reply_to = reply
+        .get("to")
+        .and_then(|v| v.as_str())
+        .expect("reply returns to");
+    assert_eq!(
+        reply_to, "lambda:khive",
+        "UE6-H1: recipient replying must route to original sender; got {reply_to}"
+    );
+    let reply_from = reply
+        .get("from")
+        .and_then(|v| v.as_str())
+        .expect("reply returns from");
+    assert_eq!(
+        reply_from, "lambda:leo",
+        "reply from must be the caller (lambda:leo)"
+    );
+}
+
+// ── UE6-H2: reply thread_id must be full 36-char UUID ───────────────────────
+
+/// reply thread_id must be the full 36-char hyphenated UUID of the root message.
+#[tokio::test]
+async fn test_reply_thread_id_is_full_uuid() {
+    let (registry, _rt) = build_registry();
+
+    let original = registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": "agent:target", "content": "root message" }),
+        )
+        .await
+        .expect("send succeeds");
+    let original_full_id = original
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id on original");
+
+    let reply = registry
+        .dispatch(
+            "reply",
+            serde_json::json!({ "id": original_full_id, "content": "first reply" }),
+        )
+        .await
+        .expect("reply succeeds");
+
+    let thread_id = reply
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .expect("thread_id in reply");
+
+    assert_eq!(
+        thread_id.len(),
+        36,
+        "UE6-H2: thread_id must be 36-char hyphenated UUID; got {thread_id:?}"
+    );
+    assert!(
+        thread_id.contains('-'),
+        "thread_id must be hyphenated UUID format; got {thread_id:?}"
+    );
+    assert_eq!(
+        thread_id, original_full_id,
+        "thread_id must equal the original message's full UUID"
+    );
+    // Parse as UUID to confirm it's valid.
+    thread_id
+        .parse::<uuid::Uuid>()
+        .unwrap_or_else(|e| panic!("thread_id must be a valid UUID: {thread_id} — {e}"));
+}
+
+/// Reply chain preserves full UUID thread_id across multiple replies.
+#[tokio::test]
+async fn test_reply_chain_preserves_full_uuid_thread_id() {
+    let (registry, _rt) = build_registry();
+
+    let original = registry
+        .dispatch(
+            "send",
+            serde_json::json!({ "to": "agent:other", "content": "start of thread" }),
+        )
+        .await
+        .expect("send succeeds");
+    let original_full_id = original
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id");
+
+    // First reply — creates the thread.
+    let reply1 = registry
+        .dispatch(
+            "reply",
+            serde_json::json!({ "id": original_full_id, "content": "reply 1" }),
+        )
+        .await
+        .expect("reply 1 succeeds");
+    let thread_id_1 = reply1
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .expect("thread_id on reply1");
+    assert_eq!(thread_id_1.len(), 36, "reply1 thread_id must be 36-char");
+
+    // Second reply to the first reply — must carry the same root thread_id.
+    let reply1_full_id = reply1
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id on reply1");
+    let reply2 = registry
+        .dispatch(
+            "reply",
+            serde_json::json!({ "id": reply1_full_id, "content": "reply 2" }),
+        )
+        .await
+        .expect("reply 2 succeeds");
+    let thread_id_2 = reply2
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .expect("thread_id on reply2");
+    assert_eq!(thread_id_2.len(), 36, "reply2 thread_id must be 36-char");
+    assert_eq!(
+        thread_id_1, thread_id_2,
+        "all replies in a chain must share the same thread_id"
+    );
+}
+
 /// inbound write failure rolls back the outbound note (atomicity).
 ///
 /// We simulate inbound failure by passing an invalid recipient namespace string
