@@ -52,7 +52,10 @@ pub(crate) async fn resolve_uuid(
 
 // ── param structs ─────────────────────────────────────────────────────────────
 
+// ue-errors C1 (cross-pack): deny_unknown_fields so typo kwargs are rejected
+// at deserialization rather than silently dropped.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LearnParams {
     /// Name of the concept.
     name: String,
@@ -68,6 +71,7 @@ struct LearnParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CiteParams {
     /// UUID or 8-char prefix of the concept being introduced.
     concept_id: String,
@@ -79,6 +83,7 @@ struct CiteParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TopicParams {
     /// Domain to filter by (matches `properties.domain`).
     #[serde(default)]

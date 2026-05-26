@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 use khive_fold::{Fold, FoldContext};
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    DispatchHook, EventView, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
+    micros_to_iso, DispatchHook, EventView, KhiveRuntime, NamespaceToken, RuntimeError,
+    VerbRegistry,
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
@@ -178,8 +179,8 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         params: &[ParamDef {
             name: "profile_id",
             param_type: "string",
-            required: true,
-            description: "Profile ID to reset (must exist and be active). Use brain.profiles() to list profiles.",
+            required: false,
+            description: "Profile ID to reset (must exist and be active). Defaults to \"balanced-recall-v1\". Use brain.profiles() to list profiles.",
         }],
     },
     HandlerDef {
@@ -417,6 +418,7 @@ impl BrainPack {
 
     async fn handle_config(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct ConfigParams {
             parameter: Option<String>,
         }
@@ -484,6 +486,7 @@ impl BrainPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct EventsParams {
             limit: Option<u32>,
         }
@@ -521,7 +524,7 @@ impl BrainPack {
                     "outcome": e.outcome,
                     "target_id": e.target_id.map(|t| t.to_string()),
                     "duration_us": e.duration_us,
-                    "created_at": e.created_at,
+                    "created_at": micros_to_iso(e.created_at),
                     "payload": e.payload,
                 })
             })
@@ -537,6 +540,7 @@ impl BrainPack {
 
     async fn handle_profiles(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct ProfilesParams {
             lifecycle: Option<String>,
         }
@@ -590,6 +594,7 @@ impl BrainPack {
     async fn handle_profile(&self, params: Value) -> Result<Value, RuntimeError> {
         // H4: accept both `profile_id` (canonical) and `id` (legacy alias).
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct ProfileParams {
             profile_id: Option<String>,
             id: Option<String>,
@@ -624,6 +629,7 @@ impl BrainPack {
 
     async fn handle_resolve(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct ResolveParams {
             actor: Option<String>,
             namespace: Option<String>,
@@ -670,6 +676,7 @@ impl BrainPack {
         lifecycle: ProfileLifecycle,
     ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct LifecycleParams {
             profile_id: String,
         }
@@ -719,21 +726,24 @@ impl BrainPack {
     // ── brain.reset ───────────────────────────────────────────────────────
 
     async fn handle_reset(&self, params: Value) -> Result<Value, RuntimeError> {
-        // C1: profile_id is required; validate existence and reject archived.
+        // profile_id is optional; defaults to "balanced-recall-v1".
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct ResetParams {
-            profile_id: String,
+            profile_id: Option<String>,
         }
         let p: ResetParams = serde_json::from_value(params)
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-
+            .map_err(|e| RuntimeError::InvalidInput(format!("brain.reset: {e}")))?;
+        let profile_id = p
+            .profile_id
+            .unwrap_or_else(|| "balanced-recall-v1".to_string());
         let mut state = self.state.lock().unwrap();
 
         // Validate profile exists.
         let lifecycle = state
             .profiles
-            .get(&p.profile_id)
-            .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", p.profile_id)))?
+            .get(&profile_id)
+            .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?
             .lifecycle
             .clone();
 
@@ -741,35 +751,35 @@ impl BrainPack {
         if lifecycle == ProfileLifecycle::Archived {
             return Err(RuntimeError::InvalidInput(format!(
                 "profile {:?} is archived; archive is terminal and reset is not permitted",
-                p.profile_id
+                profile_id
             )));
         }
 
-        if p.profile_id == "balanced-recall-v1" {
+        if profile_id == "balanced-recall-v1" {
             state.reset_posteriors();
             // Fix #295: sync profile record after reset so brain.profile reflects
             // the restored domain-informed priors, not stale pre-reset values.
             sync_balanced_recall_record(&mut state);
-        } else if state.profile_states.contains_key(&p.profile_id) {
+        } else if state.profile_states.contains_key(&profile_id) {
             // User-created Bayesian profile — reset its own posteriors.
-            state.reset_profile_posteriors(&p.profile_id);
+            state.reset_profile_posteriors(&profile_id);
         } else {
             // Profile exists in registry but has no live state (e.g. non-Bayesian).
             // Increment exploration_epoch on the record to mark the reset event.
-            if let Some(record) = state.profiles.get_mut(&p.profile_id) {
+            if let Some(record) = state.profiles.get_mut(&profile_id) {
                 record.exploration_epoch += 1;
             }
         }
 
-        let epoch = if p.profile_id == "balanced-recall-v1" {
+        let epoch = if profile_id == "balanced-recall-v1" {
             state.balanced_recall.exploration_epoch
         } else {
-            state.profiles[&p.profile_id].exploration_epoch
+            state.profiles[&profile_id].exploration_epoch
         };
 
         Ok(json!({
             "reset": true,
-            "profile_id": p.profile_id,
+            "profile_id": profile_id,
             "exploration_epoch": epoch,
         }))
     }
@@ -782,6 +792,7 @@ impl BrainPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct FeedbackParams {
             target_id: String,
             signal: String,
@@ -937,6 +948,7 @@ impl BrainPack {
 
     async fn handle_bind(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct BindParams {
             profile_id: String,
             actor: Option<String>,
@@ -1010,6 +1022,7 @@ impl BrainPack {
 
     async fn handle_unbind(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct UnbindParams {
             profile_id: Option<String>,
             actor: Option<String>,
@@ -1364,10 +1377,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_reset_no_args_returns_invalid_input() {
+    async fn dispatch_reset_no_args_resets_default_profile() {
+        // profile_id is optional; omitting it resets balanced-recall-v1 by default.
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let err = pack
+        let result = pack
             .dispatch(
                 "brain.reset",
                 json!({}),
@@ -1375,11 +1389,9 @@ mod tests {
                 &rt.authorize(Namespace::local()),
             )
             .await
-            .unwrap_err();
-        assert!(
-            matches!(err, RuntimeError::InvalidInput(_)),
-            "reset with no args must return InvalidInput, got {err:?}"
-        );
+            .expect("reset with no args must succeed (defaults to balanced-recall-v1)");
+        assert_eq!(result["reset"], json!(true));
+        assert_eq!(result["profile_id"], json!("balanced-recall-v1"));
     }
 
     #[tokio::test]
@@ -2371,6 +2383,46 @@ mod tests {
             "#295: brain.profile state_snapshot salience.alpha must be 2.0 after reset, \
              got {sal_alpha}"
         );
+    }
+
+    // Round-4 fix: brain.reset must reject unknown kwargs (deny_unknown_fields).
+    #[tokio::test]
+    async fn brain_reset_rejects_unknown_kwargs() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+        let err = pack
+            .dispatch(
+                "brain.reset",
+                json!({"unknownkw": "oops"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "brain.reset with unknown kwargs must return InvalidInput, got: {err:?}"
+        );
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("brain.reset"),
+                "error message must mention brain.reset, got: {msg}"
+            );
+        }
+    }
+
+    // brain.reset with an empty params object must still succeed.
+    #[tokio::test]
+    async fn brain_reset_accepts_empty_params() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+        let result = pack
+            .dispatch("brain.reset", json!({}), &registry, &token)
+            .await
+            .expect("brain.reset() must succeed with empty params");
+        assert_eq!(result["reset"], json!(true));
     }
 
     // #355 (regression — real dispatch path): temporal posterior must update
@@ -3694,14 +3746,14 @@ mod help_tests {
     }
 
     #[test]
-    fn brain_reset_params_has_required_profile_id() {
+    fn brain_reset_params_has_optional_profile_id() {
         let h = find_handler("brain.reset");
         assert!(!h.params.is_empty(), "brain.reset must have params");
         assert!(
             h.params
                 .iter()
-                .any(|p| p.name == "profile_id" && p.required),
-            "brain.reset must have required profile_id param (C1 fix)"
+                .any(|p| p.name == "profile_id" && !p.required),
+            "brain.reset profile_id must be optional (defaults to balanced-recall-v1)"
         );
     }
 
@@ -3783,6 +3835,185 @@ mod help_tests {
                 .iter()
                 .any(|p| p.name == "consumer_kind" && !p.required),
             "brain.create_profile consumer_kind must be optional"
+        );
+    }
+
+    // ── Regression: schema-aware namespace strip (codex round-2 H1) ──────────
+    //
+    // brain.bind / brain.resolve / brain.unbind / brain.bindings declare
+    // `namespace` as a *business* parameter in their HandlerDef.params.  The
+    // VerbRegistry dispatch path must NOT strip `namespace` from those verbs
+    // even though it strips it as a transport routing key from all other verbs.
+    //
+    // These tests go through VerbRegistry::dispatch (not pack.dispatch) to
+    // exercise the actual strip logic in pack.rs.
+
+    /// Build a VerbRegistry with kg + brain packs, returning the registry and
+    /// an owned BrainPack snapshot handle.  We need a reference to the brain
+    /// state after dispatch — the registry owns the pack, so we verify via a
+    /// second dispatch (brain.bindings) rather than peeking at internal state.
+    fn make_brain_registry() -> (VerbRegistry, KhiveRuntime) {
+        use khive_pack_kg::KgPack;
+        use khive_runtime::VerbRegistryBuilder;
+        let rt = KhiveRuntime::memory().expect("in-memory runtime for brain registry");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain registry builds");
+        (registry, rt)
+    }
+
+    /// brain.bind via VerbRegistry must store the caller-supplied namespace,
+    /// not default to "*".  Regression for the blanket-strip bug (codex H1).
+    #[tokio::test]
+    async fn r2_h1_bind_via_registry_preserves_namespace() {
+        let (registry, _rt) = make_brain_registry();
+
+        // Bind with a specific namespace.
+        let result = registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "alice",
+                    "namespace": "team-a",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("brain.bind must succeed");
+        assert_eq!(
+            result["namespace"],
+            json!("team-a"),
+            "brain.bind response must echo the caller-supplied namespace"
+        );
+
+        // Verify via brain.bindings: the stored row must have namespace=team-a.
+        let bindings = registry
+            .dispatch(
+                "brain.bindings",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "namespace": "team-a",
+                }),
+            )
+            .await
+            .expect("brain.bindings must succeed");
+        assert_eq!(
+            bindings["count"],
+            json!(1u64),
+            "must find exactly one binding for namespace=team-a"
+        );
+        assert_eq!(
+            bindings["bindings"][0]["namespace"],
+            json!("team-a"),
+            "stored binding namespace must be team-a, not wildcard"
+        );
+    }
+
+    /// brain.resolve via VerbRegistry must use the caller-supplied namespace to
+    /// match the binding stored by brain.bind.  Regression for codex H1.
+    #[tokio::test]
+    async fn r2_h1_resolve_via_registry_uses_namespace() {
+        let (registry, _rt) = make_brain_registry();
+
+        // Store a binding scoped to team-a.
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "alice",
+                    "namespace": "team-a",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("brain.bind team-a");
+
+        // Resolve for alice / team-a / recall — must find balanced-recall-v1.
+        let resolved = registry
+            .dispatch(
+                "brain.resolve",
+                json!({
+                    "actor": "alice",
+                    "namespace": "team-a",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("brain.resolve must succeed for team-a");
+        assert_eq!(
+            resolved["resolved_profile_id"],
+            json!("balanced-recall-v1"),
+            "resolve must return the profile bound for team-a"
+        );
+    }
+
+    /// brain.unbind via VerbRegistry must use the caller-supplied namespace to
+    /// remove only the matching binding.  Regression for codex H1.
+    #[tokio::test]
+    async fn r2_h1_unbind_via_registry_uses_namespace() {
+        let (registry, _rt) = make_brain_registry();
+
+        // Two bindings: team-a and team-b.
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "alice",
+                    "namespace": "team-a",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind team-a");
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": "alice",
+                    "namespace": "team-b",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind team-b");
+
+        // Unbind only team-a.
+        let unbound = registry
+            .dispatch(
+                "brain.unbind",
+                json!({
+                    "actor": "alice",
+                    "namespace": "team-a",
+                }),
+            )
+            .await
+            .expect("unbind team-a");
+        assert_eq!(
+            unbound["unbound"],
+            json!(1u64),
+            "must remove exactly one binding (team-a)"
+        );
+
+        // team-b must survive.
+        let remaining = registry
+            .dispatch(
+                "brain.bindings",
+                json!({
+                    "actor": "alice",
+                    "namespace": "team-b",
+                }),
+            )
+            .await
+            .expect("bindings after unbind");
+        assert_eq!(
+            remaining["count"],
+            json!(1u64),
+            "team-b binding must survive the team-a unbind"
         );
     }
 }

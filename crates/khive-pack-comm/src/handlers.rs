@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::note::Note;
 
 fn short_id(uuid: Uuid) -> String {
@@ -50,8 +50,8 @@ fn note_to_message_json(note: &Note) -> Value {
         "content": note.content,
         "namespace": note.namespace,
         "properties": note.properties,
-        "created_at": note.created_at,
-        "updated_at": note.updated_at,
+        "created_at": micros_to_iso(note.created_at),
+        "updated_at": micros_to_iso(note.updated_at),
     })
 }
 
@@ -192,7 +192,10 @@ async fn dual_write_message(
 
 // ── param structs ────────────────────────────────────────────────────────────
 
+// ue-errors C1 (cross-pack): deny_unknown_fields so typo kwargs are rejected
+// at deserialization rather than silently dropped.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SendParams {
     pub to: String,
     pub content: String,
@@ -203,6 +206,7 @@ pub(crate) struct SendParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InboxParams {
     #[serde(default)]
     pub limit: Option<u32>,
@@ -211,11 +215,13 @@ pub(crate) struct InboxParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadParams {
     pub id: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReplyParams {
     pub id: String,
     pub content: String,

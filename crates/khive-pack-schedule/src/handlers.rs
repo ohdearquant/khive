@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::Note;
 
 fn short_id(uuid: Uuid) -> String {
@@ -50,8 +50,8 @@ fn note_to_event_json(note: &Note) -> Value {
         "content": note.content,
         "namespace": note.namespace,
         "properties": note.properties,
-        "created_at": note.created_at,
-        "updated_at": note.updated_at,
+        "created_at": micros_to_iso(note.created_at),
+        "updated_at": micros_to_iso(note.updated_at),
     })
 }
 
@@ -121,7 +121,10 @@ fn validate_action(action: &str) -> Result<(), RuntimeError> {
 
 // ── param structs ────────────────────────────────────────────────────────────
 
+// ue-errors C1 (cross-pack): deny_unknown_fields so typo kwargs are rejected
+// at deserialization rather than silently dropped.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RemindParams {
     pub content: String,
     pub at: String,
@@ -130,6 +133,7 @@ pub(crate) struct RemindParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ScheduleParams {
     pub action: String,
     pub at: String,
@@ -138,6 +142,7 @@ pub(crate) struct ScheduleParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgendaParams {
     #[serde(default)]
     pub from: Option<String>,
@@ -148,6 +153,7 @@ pub(crate) struct AgendaParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CancelParams {
     pub id: String,
 }

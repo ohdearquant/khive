@@ -38,6 +38,7 @@ khive-types = { version = "0.2.2", path = "../khive-types" }
 async-trait = { workspace = true }
 tempfile = "3"
 serial_test = "3"
+khive-pack-knowledge = { version = "0.2.2", path = "../khive-pack-knowledge" }
 
 [[bin]]
 name = "khive-mcp"

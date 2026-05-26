@@ -11,6 +11,7 @@ use khive_runtime::{
     KhiveRuntime, NamespaceToken, ParamDef, RuntimeError, VerbCategory, VerbRegistry,
     VerbRegistryBuilder, Visibility,
 };
+use khive_storage::Note;
 use khive_types::Pack;
 use serde_json::{json, Value};
 
@@ -1558,6 +1559,91 @@ async fn get_event_uuid_returns_event_wrapper() {
         get_result.get("outcome").and_then(Value::as_str),
         Some("success"),
         "outcome must be success"
+    );
+}
+
+// ADR-045 §5: event `created_at` must be an ISO-8601 string at the MCP boundary,
+// not a raw microsecond integer (round-4 blocker fix).
+
+#[tokio::test]
+async fn list_event_created_at_is_iso8601_string() {
+    let pack = pack_with_events();
+    pack.dispatch("create", json!({"kind": "concept", "name": "IsoEventList"}))
+        .await
+        .expect("create must succeed");
+
+    let result = pack
+        .dispatch("list", json!({"kind": "event", "limit": 5}))
+        .await
+        .expect("list(kind=event) must succeed");
+
+    let arr = result.as_array().expect("list must return a JSON array");
+    assert!(!arr.is_empty(), "must have at least one event");
+
+    for event in arr {
+        let created_at = event
+            .get("created_at")
+            .expect("event must have created_at field");
+        let s = created_at
+            .as_str()
+            .expect("created_at must be a string, not an integer");
+        // ISO-8601 datetime: starts with YYYY-MM-DDTHH:
+        assert!(
+            s.len() >= 16
+                && s.as_bytes()[4] == b'-'
+                && s.as_bytes()[7] == b'-'
+                && s.as_bytes()[10] == b'T'
+                && s.as_bytes()[13] == b':',
+            "created_at must be ISO-8601, got: {s}"
+        );
+        assert!(
+            s.starts_with("20"),
+            "created_at must look like a year-2000+ timestamp, got: {s}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_event_created_at_is_iso8601_string() {
+    let pack = pack_with_events();
+    pack.dispatch("create", json!({"kind": "concept", "name": "IsoEventGet"}))
+        .await
+        .expect("create must succeed");
+
+    let list_result = pack
+        .dispatch("list", json!({"kind": "event", "limit": 1}))
+        .await
+        .expect("list must succeed");
+    let events = list_result.as_array().expect("list must be array");
+    assert!(!events.is_empty(), "must have at least one event");
+    let event_id = events[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("event must have id field")
+        .to_string();
+
+    let get_result = pack
+        .dispatch("get", json!({"id": event_id}))
+        .await
+        .expect("get(id=event_uuid) must succeed");
+
+    let created_at = get_result
+        .get("created_at")
+        .expect("event must have created_at field");
+    let s = created_at
+        .as_str()
+        .expect("created_at must be a string, not an integer");
+    assert!(
+        s.len() >= 16
+            && s.as_bytes()[4] == b'-'
+            && s.as_bytes()[7] == b'-'
+            && s.as_bytes()[10] == b'T'
+            && s.as_bytes()[13] == b':',
+        "created_at must be ISO-8601, got: {s}"
+    );
+    assert!(
+        s.starts_with("20"),
+        "created_at must look like a year-2000+ timestamp, got: {s}"
     );
 }
 
@@ -3631,5 +3717,424 @@ async fn update_edge_to_symmetric_relation_no_duplicate_when_canonical_exists() 
         listed.len(),
         1,
         "H1-b: exactly one competes_with edge must exist after update (no duplicate); got: {listed:?}"
+    );
+}
+
+// ADR-045 §5 round-5 blocker: payload-level Timestamp fields must be ISO-8601
+// strings at the MCP boundary, not raw integer microseconds.
+//
+// khive_types::Timestamp derives serde as a transparent u64, so
+// ProposalCreatedPayload.expiry and ProposalAppliedPayload.applied_at
+// serialize as integers unless normalize_event_timestamps recurses into
+// the payload object.
+
+/// propose with expiry → list(kind="event", event_kind="proposal_created") →
+/// assert payload.expiry is a JSON string starting with "20" (ISO year prefix),
+/// NOT a bare integer.
+#[tokio::test]
+async fn proposal_created_event_expiry_is_iso8601_string() {
+    let pack = pack_with_events();
+
+    // Use a concrete far-future microsecond timestamp as expiry.
+    // 2026-04-25 in microseconds (approx): 1745539200000000
+    let expiry_micros: i64 = 1_745_539_200_000_000;
+
+    let propose_result = pack
+        .dispatch(
+            "propose",
+            json!({
+                "title": "ExpiryTimestampTest",
+                "description": "round-5 regression: expiry must be ISO string",
+                "changeset": {"kind": "add_note", "note": {"kind": "observation", "content": "test note"}},
+                "expiry": expiry_micros
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    assert!(
+        propose_result.get("proposal_id").is_some(),
+        "propose must return proposal_id; got {propose_result}"
+    );
+
+    // List proposal_created events.
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "proposal_created", "limit": 10}),
+        )
+        .await
+        .expect("list proposal_created events must succeed");
+    let arr = events.as_array().expect("list must return array");
+    assert!(
+        !arr.is_empty(),
+        "at least one proposal_created event must exist"
+    );
+
+    // Find the event for our proposal (match on payload.title via the changeset).
+    let event = &arr[arr.len() - 1]; // most recent is ours
+    let payload = event.get("payload").expect("event must have payload field");
+
+    // expiry must be a string, not a number.
+    let expiry_val = payload.get("expiry").expect("payload must contain expiry");
+    assert!(
+        expiry_val.is_string(),
+        "payload.expiry must be an ISO-8601 string, not a number; got: {expiry_val}"
+    );
+    let expiry_str = expiry_val.as_str().unwrap();
+    assert!(
+        expiry_str.starts_with("20"),
+        "payload.expiry must look like a year-2000+ ISO timestamp; got: {expiry_str}"
+    );
+    // Basic ISO-8601 structure check: YYYY-MM-DDTHH:
+    assert!(
+        expiry_str.len() >= 16
+            && expiry_str.as_bytes()[4] == b'-'
+            && expiry_str.as_bytes()[7] == b'-'
+            && expiry_str.as_bytes()[10] == b'T'
+            && expiry_str.as_bytes()[13] == b':',
+        "payload.expiry must be ISO-8601, got: {expiry_str}"
+    );
+}
+
+// ---- Round-6: recursive event payload timestamp normalization ----
+//
+// The r6 fix walks the entire event Value recursively (no depth limit) so that
+// Timestamp integers at any nesting level — nested objects, array elements — are
+// converted to ISO-8601 strings before reaching the MCP boundary.
+
+/// Round-6 regression: verifies the recursive walker is wired into the live
+/// propose→approve→applied dispatch path and processes `payload.applied_at`.
+///
+/// The name reflects what this test actually asserts: a direct payload child
+/// (`applied_at`) on a `ProposalApplied` event is returned as an ISO-8601
+/// string by the full handler path.  Genuine nested-object recursion
+/// (e.g. `payload.result.applied_at`) is proven by the unit tests at
+/// `handlers.rs:2713` and `handlers.rs:2729` — injecting such a shape through
+/// the live event store would require bypassing the typed payload structs.
+#[tokio::test]
+async fn proposal_applied_event_payload_applied_at_via_live_dispatch() {
+    // We exercise the recursive walker through the live propose→approve→applied
+    // dispatch path. The ProposalAppliedPayload has applied_at at the payload
+    // top level; the recursive walker must handle it regardless of depth.
+    // This test also guards that the wiring of walk_timestamps into
+    // normalize_event_timestamps is actually live.
+    let pack = pack_with_events();
+
+    let propose_result = pack
+        .dispatch(
+            "propose",
+            json!({
+                "title": "NestedTimestampTest",
+                "description": "round-6: recursive walker must handle any depth",
+                "changeset": {"kind": "add_note", "note": {"kind": "observation", "content": "nested-ts test"}}
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let proposal_id = propose_result["proposal_id"]
+        .as_str()
+        .expect("must have proposal_id")
+        .to_string();
+
+    pack.dispatch(
+        "review",
+        json!({"proposal_id": proposal_id, "decision": "approve"}),
+    )
+    .await
+    .expect("approve must succeed");
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "proposal_applied", "limit": 10}),
+        )
+        .await
+        .expect("list proposal_applied must succeed");
+    let arr = events.as_array().expect("must be array");
+    assert!(
+        !arr.is_empty(),
+        "must have at least one proposal_applied event"
+    );
+
+    for event in arr {
+        let payload = event.get("payload").expect("event must have payload");
+        // applied_at is a direct payload child stored as Timestamp (u64 serde).
+        // The recursive walker must convert it regardless of where it appears.
+        if let Some(applied_at_val) = payload.get("applied_at") {
+            assert!(
+                applied_at_val.is_string(),
+                "payload.applied_at must be ISO-8601 string (recursive walker); got: {applied_at_val}"
+            );
+            let s = applied_at_val.as_str().unwrap();
+            assert!(
+                s.starts_with("20") && s.contains('T'),
+                "payload.applied_at must look like ISO-8601; got: {s}"
+            );
+        }
+    }
+}
+
+/// Round-6 regression: verifies that all events returned by `list(kind="event")`
+/// have ISO-8601 `created_at` strings — confirming the array branch of
+/// `normalize_event_timestamps_array` is live in the dispatch path.
+///
+/// The name reflects what this test actually asserts: top-level `event.created_at`
+/// on listed events.  Array-element recursion (e.g. `payload.steps[].updated_at`)
+/// is proven by the unit test at `handlers.rs:2752` — injecting a synthetic
+/// array-shaped payload through the live event store requires bypassing the typed
+/// payload structs.
+#[tokio::test]
+async fn event_list_created_at_normalized_via_live_dispatch() {
+    // All created_at values on events from list(kind="event") must be ISO strings.
+    // This confirms the array path of walk_timestamps is wired into normalize_event_timestamps_array.
+    let pack = pack_with_events();
+    pack.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "ArrayWalkerGuard"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let events = pack
+        .dispatch("list", json!({"kind": "event", "limit": 10}))
+        .await
+        .expect("list must succeed");
+    let arr = events.as_array().expect("must be array");
+    assert!(!arr.is_empty(), "must have at least one event");
+
+    // All created_at values must be ISO strings (the array walker normalizes each
+    // element — this confirms the array branch of walk_timestamps is live).
+    for event in arr {
+        let created_at = event.get("created_at").expect("event must have created_at");
+        assert!(
+            created_at.is_string(),
+            "event.created_at must be ISO-8601 string after array walk; got: {created_at}"
+        );
+        let s = created_at.as_str().unwrap();
+        assert!(
+            s.starts_with("20") && s.contains('T'),
+            "event.created_at must be ISO-8601; got: {s}"
+        );
+    }
+}
+
+/// Round-6 regression: verifies that `payload.expiry` on a `ProposalCreated`
+/// event is returned as an ISO-8601 string by the full dispatch path.
+///
+/// The name reflects what this test actually asserts: `payload.expiry` (a direct
+/// payload child stored as `Option<Timestamp>` / u64 serde) on a listed event.
+/// The actual signed i64 branch of `walk_timestamps` is proven by the unit test
+/// at `handlers.rs:2713` — the live event store does not expose a raw i64 field
+/// that bypasses the typed payload structs.
+#[tokio::test]
+async fn proposal_created_event_expiry_normalized_via_live_dispatch() {
+    let pack = pack_with_events();
+
+    // Use a concrete far-past microsecond timestamp that fits in i64.
+    // 1970-01-02T00:00:00Z = 86400 * 1_000_000 microseconds
+    let expiry_micros: i64 = 86_400_000_000i64;
+
+    pack.dispatch(
+        "propose",
+        json!({
+            "title": "LegacyI64TimestampTest",
+            "description": "round-6: i64 timestamps in payload must normalize",
+            "changeset": {"kind": "add_note", "note": {"kind": "observation", "content": "i64-ts test"}},
+            "expiry": expiry_micros
+        }),
+    )
+    .await
+    .expect("propose must succeed");
+
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "proposal_created", "limit": 10}),
+        )
+        .await
+        .expect("list proposal_created must succeed");
+    let arr = events.as_array().expect("must be array");
+    assert!(
+        !arr.is_empty(),
+        "must have at least one proposal_created event"
+    );
+
+    let event = &arr[arr.len() - 1]; // most recent is ours
+    let payload = event.get("payload").expect("event must have payload");
+    let expiry_val = payload.get("expiry").expect("payload must contain expiry");
+    assert!(
+        expiry_val.is_string(),
+        "payload.expiry must be ISO-8601 string (i64 branch); got: {expiry_val}"
+    );
+    let s = expiry_val.as_str().unwrap();
+    // 1970-01-02 would start with "1970-"
+    assert!(
+        s.contains('T') && s.contains('-'),
+        "payload.expiry must be ISO-8601; got: {s}"
+    );
+}
+
+/// propose → review(decision=approve) → apply triggers ProposalApplied →
+/// list(kind="event", event_kind="proposal_applied") →
+/// assert payload.applied_at is a JSON string starting with "20", NOT an integer.
+#[tokio::test]
+async fn proposal_applied_event_applied_at_is_iso8601_string() {
+    let pack = pack_with_events();
+
+    let propose_result = pack
+        .dispatch(
+            "propose",
+            json!({
+                "title": "AppliedAtTimestampTest",
+                "description": "round-5 regression: applied_at must be ISO string",
+                "changeset": {"kind": "add_note", "note": {"kind": "observation", "content": "applied-at-test note"}}
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let proposal_id = propose_result
+        .get("proposal_id")
+        .and_then(Value::as_str)
+        .expect("propose must return proposal_id")
+        .to_string();
+
+    // Approve the proposal — actor is "local" so self-approval is allowed.
+    pack.dispatch(
+        "review",
+        json!({"proposal_id": proposal_id, "decision": "approve"}),
+    )
+    .await
+    .expect("review(approve) must succeed");
+
+    // List proposal_applied events.
+    let events = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "event_kind": "proposal_applied", "limit": 10}),
+        )
+        .await
+        .expect("list proposal_applied events must succeed");
+    let arr = events.as_array().expect("list must return array");
+    assert!(
+        !arr.is_empty(),
+        "at least one proposal_applied event must exist after approval"
+    );
+
+    let event = &arr[arr.len() - 1]; // most recent is ours
+    let payload = event.get("payload").expect("event must have payload field");
+
+    // applied_at must be a string, not a number.
+    let applied_at_val = payload
+        .get("applied_at")
+        .expect("payload must contain applied_at");
+    assert!(
+        applied_at_val.is_string(),
+        "payload.applied_at must be an ISO-8601 string, not a number; got: {applied_at_val}"
+    );
+    let applied_at_str = applied_at_val.as_str().unwrap();
+    assert!(
+        applied_at_str.starts_with("20"),
+        "payload.applied_at must look like a year-2000+ ISO timestamp; got: {applied_at_str}"
+    );
+    assert!(
+        applied_at_str.len() >= 16
+            && applied_at_str.as_bytes()[4] == b'-'
+            && applied_at_str.as_bytes()[7] == b'-'
+            && applied_at_str.as_bytes()[10] == b'T'
+            && applied_at_str.as_bytes()[13] == b':',
+        "payload.applied_at must be ISO-8601, got: {applied_at_str}"
+    );
+}
+
+// ---- Round-7: note expires_at normalization ----
+//
+// The r7 fix adds `expires_at` to the `normalize_entity_timestamps` key set.
+// Any note row with a non-null `expires_at` (stored as i64 microseconds) must
+// cross the MCP boundary as an ISO-8601 string, not a raw integer.
+
+/// Round-7 regression: `get(id=<note>)` and `list(kind="note")` must return
+/// `expires_at` as an ISO-8601 string when the field is non-null.
+///
+/// We insert a note with `expires_at` set directly via the `NoteStore` (the
+/// handler's `create` verb does not currently expose `expires_at` as a param),
+/// then verify both the `get` and `list` response paths normalize the field.
+#[tokio::test]
+async fn note_expires_at_is_normalized_to_iso8601() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let tok = rt.authorize(khive_runtime::Namespace::local());
+
+    // Insert a note with expires_at set to a concrete microsecond value.
+    // 2025-01-01T00:00:00Z = 1735689600 seconds → 1_735_689_600_000_000 µs
+    let expires_micros: i64 = 1_735_689_600_000_000;
+    let mut note = Note::new(
+        tok.namespace().as_str(),
+        "observation",
+        "r7 expires_at test",
+    );
+    note.expires_at = Some(expires_micros);
+    let note_id = note.id;
+
+    let note_store = rt.notes(&tok).expect("note store must be available");
+    note_store
+        .upsert_note(note)
+        .await
+        .expect("upsert must succeed");
+
+    // Build the registry (same pack() pattern) so dispatch goes through the
+    // full handler path.
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("registry must build");
+
+    // ---- get path ----
+    let get_result = registry
+        .dispatch("get", json!({"id": note_id.to_string()}))
+        .await
+        .expect("get must succeed");
+    let record = get_result.get("record").unwrap_or(&get_result);
+    let expires_val = record
+        .get("expires_at")
+        .expect("get response must contain expires_at");
+    assert!(
+        expires_val.is_string(),
+        "get: expires_at must be an ISO-8601 string, not an integer; got: {expires_val}"
+    );
+    let s = expires_val.as_str().unwrap();
+    assert!(
+        s.starts_with("2025") && s.contains('T'),
+        "get: expires_at must be ISO-8601 for 2025-01-01; got: {s}"
+    );
+
+    // ---- list path ----
+    let list_result = registry
+        .dispatch("list", json!({"kind": "note", "limit": 100}))
+        .await
+        .expect("list must succeed");
+    let items = list_result.as_array().expect("list must return an array");
+    let found = items
+        .iter()
+        .find(|v| v.get("id").and_then(Value::as_str) == Some(&note_id.to_string()))
+        .or_else(|| {
+            // id may be short-form — match on full_id too
+            items
+                .iter()
+                .find(|v| v.get("full_id").and_then(Value::as_str) == Some(&note_id.to_string()))
+        });
+    // The note must appear in the list.  If it doesn't, the test infrastructure
+    // rather than the normalization logic is at fault — we still assert on all
+    // items to catch any integer leaks in the batch path.
+    for item in items {
+        if let Some(ea) = item.get("expires_at") {
+            if !ea.is_null() {
+                assert!(
+                    ea.is_string(),
+                    "list: expires_at must be ISO-8601 string, not integer; got: {ea} in {item}"
+                );
+            }
+        }
+    }
+    assert!(
+        found.is_some(),
+        "list must include the note we inserted (id={note_id}); got {items:?}"
     );
 }

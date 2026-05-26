@@ -17,8 +17,28 @@
 //! | `null` (lifecycle `*_at`, relationship markers) | included | preserved |
 //! | Score fields        | `0.1234567890`                | `0.123` (3 sig figs)  |
 //!
-//! `Verbose` mode passes through canonically. `Human` mode is delegated to the
-//! CLI layer and is not transformed here (returned as-is from this crate).
+//! ## `Human` mode design decision (ADR-045 C3)
+//!
+//! `Human` mode (`presentation=human`) is intentionally a **no-op at the MCP
+//! runtime layer** — it returns the same canonical JSON as `Verbose`. The full
+//! terminal formatting described in ADR-045 §3 (relative timestamps, glyph
+//! substitution, table layout, UUID dimming) is the responsibility of the
+//! **CLI layer** (`khive-cli::format::pretty`), not the MCP response pipeline.
+//!
+//! Rationale: MCP responses are consumed by callers over a JSON transport.
+//! Injecting ANSI escape codes or table-layout whitespace into JSON would corrupt
+//! the response for non-terminal consumers. The CLI receives verbose JSON and
+//! applies the terminal transform before printing. Implementing terminal
+//! formatting inside `present()` would couple the runtime to a display concern
+//! that belongs at the output layer.
+//!
+//! Consequence: agents that call `presentation=human` receive verbose JSON. This
+//! is documented behavior, not a bug. If the CLI is the caller it applies its own
+//! second-pass formatting — it should not use `presentation=human` over MCP
+//! precisely because the MCP boundary is not a terminal.
+//!
+//! `Verbose` mode passes through canonically. `Human` mode is identical to
+//! `Verbose` at this layer by design.
 //!
 //! **Chain invariant:** `present_response` MUST NOT be called on intermediate
 //! chain results — only on the final response envelope after all `$prev`
@@ -28,6 +48,19 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+/// Convert a microsecond epoch `i64` to an RFC 3339 / ISO-8601 string.
+///
+/// ADR-045 §5 handler invariant: "Use full ISO-8601 timestamps."
+/// Entity and Note storage uses `i64` microseconds internally; this is the
+/// single conversion point before any field reaches the MCP boundary.
+///
+/// Format: `YYYY-MM-DDTHH:MM:SS.ffffffZ` (SecondsFormat::Micros, UTC `Z`).
+pub fn micros_to_iso(micros: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
 
 /// How the response envelope is presented to the caller (ADR-045).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -46,8 +79,12 @@ pub enum PresentationMode {
     Verbose,
     /// Pretty-printed terminal output. Default for `khive` CLI.
     ///
-    /// Formatting is delegated to the CLI layer; this crate returns the value
-    /// unchanged (same as Verbose at the runtime level).
+    /// **At the MCP runtime level this is identical to `Verbose`** — the
+    /// canonical JSON is returned unchanged. Terminal formatting (relative
+    /// timestamps, glyph substitution, table layout) is applied by the CLI
+    /// layer (`khive-cli::format::pretty`), not the MCP response pipeline.
+    ///
+    /// See module-level doc for full rationale (ADR-045 C3 design decision).
     Human,
 }
 

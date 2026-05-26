@@ -63,7 +63,7 @@ pub use pack::{
     Visibility,
 };
 pub use portability::{ImportSummary, KgArchive};
-pub use presentation::{present, PresentationMode};
+pub use presentation::{micros_to_iso, present, PresentationMode};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{

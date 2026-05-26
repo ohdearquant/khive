@@ -112,7 +112,11 @@ pub enum VerbPresentationPolicy {
     Standard,
     /// Always use `Verbose` output regardless of the caller's mode.
     ///
-    /// Declared verbs: `get`, `query`, `traverse`, `neighbors`.
+    /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`.
+    ///
+    /// `link` is included because the returned edge ID is the only handle for
+    /// follow-up `neighbors`/`traverse` calls; short-form IDs risk prefix
+    /// collision at scale (ADR-045 §6 "Edge IDs needed for follow-up").
     AlwaysVerbose,
 }
 
@@ -126,13 +130,16 @@ impl HandlerDef {
     /// The set is derived from ADR-045 §6.  New verbs that need this override
     /// must be added here; omission from the list means `Standard` applies.
     pub fn presentation_policy(&self) -> VerbPresentationPolicy {
-        // `link` was previously listed here but it is NOT AlwaysVerbose (P-H1):
-        // source_id/target_id in the edge response should be short-form in Agent
-        // mode just like every other UUID field. Callers that need the full UUID
-        // to chain operations should use `get` (which is AlwaysVerbose) or pass
-        // `presentation=verbose` explicitly.
+        // ADR-045 §6 — AlwaysVerbose verbs bypass agent-mode transforms entirely.
+        //
+        // `link` is AlwaysVerbose because the edge ID returned is the only handle
+        // for follow-up `neighbors`/`traverse` calls. At scale, two edges can share
+        // the same 8-char prefix (birthday collision ~65K edges), so shortening the
+        // edge ID in agent mode violates ADR-045 §6 "Edge IDs needed for follow-up."
         match self.name {
-            "get" | "query" | "traverse" | "neighbors" => VerbPresentationPolicy::AlwaysVerbose,
+            "get" | "link" | "query" | "traverse" | "neighbors" => {
+                VerbPresentationPolicy::AlwaysVerbose
+            }
             _ => VerbPresentationPolicy::Standard,
         }
     }
@@ -352,5 +359,64 @@ mod tests {
     #[test]
     fn pack_validation_rules_default_empty() {
         assert!(TestPack::VALIDATION_RULES.is_empty());
+    }
+
+    // ADR-045 §6 C2: `link` must be AlwaysVerbose so edge IDs are not shortened.
+    #[test]
+    fn link_handler_is_always_verbose() {
+        let link_def = HandlerDef {
+            name: "link",
+            description: "Create a typed directed edge",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[],
+        };
+        assert_eq!(
+            link_def.presentation_policy(),
+            VerbPresentationPolicy::AlwaysVerbose,
+            "link must be AlwaysVerbose (ADR-045 §6 C2)"
+        );
+    }
+
+    // AlwaysVerbose set regression: ensure get/query/traverse/neighbors remain.
+    #[test]
+    fn always_verbose_set_contains_expected_verbs() {
+        let always_verbose = ["get", "link", "query", "traverse", "neighbors"];
+        for name in always_verbose {
+            let h = HandlerDef {
+                name,
+                description: "",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            };
+            assert_eq!(
+                h.presentation_policy(),
+                VerbPresentationPolicy::AlwaysVerbose,
+                "{name:?} must be AlwaysVerbose"
+            );
+        }
+    }
+
+    // Standard policy for all other verbs.
+    #[test]
+    fn non_verbose_verbs_are_standard_policy() {
+        let standard = [
+            "create", "list", "update", "delete", "search", "recall", "remember",
+        ];
+        for name in standard {
+            let h = HandlerDef {
+                name,
+                description: "",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            };
+            assert_eq!(
+                h.presentation_policy(),
+                VerbPresentationPolicy::Standard,
+                "{name:?} must be Standard (not AlwaysVerbose)"
+            );
+        }
     }
 }

@@ -98,7 +98,10 @@ async fn write_audit_record(
 
 // ── param structs ────────────────────────────────────────────────────────────
 
+// ue-errors C1 (cross-pack): deny_unknown_fields so typo kwargs are rejected
+// at deserialization rather than silently dropped.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AssignParams {
     title: String,
     #[serde(default)]
@@ -122,6 +125,7 @@ struct AssignParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NextParams {
     #[serde(default)]
     limit: Option<u32>,
@@ -130,6 +134,7 @@ struct NextParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompleteParams {
     id: String,
     #[serde(default)]
@@ -155,6 +160,7 @@ fn complete_target_status(status: Option<&str>) -> Result<&'static str, RuntimeE
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TasksParams {
     #[serde(default)]
     status: Option<String>,
@@ -169,6 +175,7 @@ struct TasksParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransitionParams {
     id: String,
     status: String,

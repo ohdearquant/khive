@@ -10,8 +10,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
-    KhiveRuntime, LinkSpec, MergeSummary, NamespaceToken, NotePatch, RuntimeError, VerbRegistry,
+    micros_to_iso, ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy,
+    EntityPatch, KhiveRuntime, LinkSpec, MergeSummary, NamespaceToken, NotePatch, RuntimeError,
+    VerbRegistry,
 };
 use khive_storage::types::{
     Direction, NeighborQuery, PageRequest, TraversalOptions, TraversalRequest,
@@ -206,12 +207,21 @@ struct CreateParams {
     tags: Option<Vec<String>>,
 }
 
+// ue-errors C1: deny_unknown_fields on param structs that are deserialized
+// directly from user input (no hook preprocessing) so typo kwargs are
+// rejected at deserialization rather than silently dropped.
+// CreateParams is EXCLUDED here: `prepare_create` hooks inject fields
+// (namespace, entity_kind, note_kind, title, priority, …) into the params
+// Value before deserialization, so unknown-field rejection must be done
+// at a higher layer for that verb.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GetParams {
     id: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListParams {
     kind: String,
     limit: Option<u32>,
@@ -247,7 +257,11 @@ struct ListParams {
     selected: Option<Vec<String>>,
 }
 
+// ue-errors C1: deny_unknown_fields rejects typos like `nonexistent_field="x"`
+// at deserialization.  All cross-substrate fields (entity, note, edge paths)
+// remain valid because they are declared on the struct.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateParams {
     id: String,
     /// Optional — resolved from UUID when absent (ADR-014: UUID-only ops).
@@ -270,6 +284,7 @@ struct UpdateParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeleteParams {
     id: String,
     /// Optional — resolved from UUID when absent (ADR-014: UUID-only ops).
@@ -278,6 +293,7 @@ struct DeleteParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MergeParams {
     into_id: String,
     from_id: String,
@@ -290,6 +306,7 @@ struct MergeParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchParams {
     kind: String,
     query: String,
@@ -308,6 +325,7 @@ struct SearchParams {
 
 /// One entry in a bulk-link request (F205 / ADR-038).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BulkLinkEntry {
     source_id: String,
     target_id: String,
@@ -318,6 +336,7 @@ struct BulkLinkEntry {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LinkParams {
     // Singleton fields (required unless `links` is provided).
     source_id: Option<String>,
@@ -341,6 +360,7 @@ struct LinkParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NeighborsParams {
     /// Accepts either `id` (canonical, ADR-148 normalized) or `node_id` (legacy).
     #[serde(alias = "node_id")]
@@ -352,6 +372,7 @@ struct NeighborsParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TraverseParams {
     /// Accepts either `roots` (legacy) or `ids` (normalized). Each entry may
     /// be a full UUID or an 8-char prefix; resolved via `resolve_uuid_async`.
@@ -366,6 +387,7 @@ struct TraverseParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueryParams {
     query: String,
 }
@@ -373,6 +395,7 @@ struct QueryParams {
 // ---- Proposal param structs (ADR-046) ----
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProposeParams {
     title: String,
     description: String,
@@ -384,6 +407,7 @@ struct ProposeParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReviewParams {
     proposal_id: String,
     decision: String,
@@ -391,12 +415,14 @@ struct ReviewParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WithdrawParams {
     proposal_id: String,
     rationale: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListProposalsParams {
     status: Option<String>,
     proposer: Option<String>,
@@ -751,6 +777,117 @@ fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeErro
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }
 
+/// Post-process an entity or note JSON value to replace `i64` microsecond epoch
+/// timestamps with ISO-8601 strings (ADR-045 §5 handler invariant — C1 fix).
+///
+/// Applies to the fields `created_at`, `updated_at`, `deleted_at`, and
+/// `expires_at` when they are JSON integer values.  `expires_at` is defined on
+/// the note substrate (`crates/khive-storage/src/note.rs`) and must be
+/// normalized before any note response crosses the MCP boundary.  String values
+/// (already converted) and `null` values are left unchanged.  Other fields are
+/// unaffected.  Adding `expires_at` here is harmless for entity responses
+/// because the helper only rewrites keys that are actually present.
+fn normalize_entity_timestamps(mut v: Value) -> Value {
+    if let Some(obj) = v.as_object_mut() {
+        for field in &["created_at", "updated_at", "deleted_at", "expires_at"] {
+            if let Some(val) = obj.get_mut(*field) {
+                if let Some(micros) = val.as_i64() {
+                    *val = Value::String(micros_to_iso(micros));
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Apply `normalize_entity_timestamps` to every element of a JSON array,
+/// or to the value itself if it is already an object.
+fn normalize_entity_timestamps_array(v: Value) -> Value {
+    match v {
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(normalize_entity_timestamps).collect())
+        }
+        other => normalize_entity_timestamps(other),
+    }
+}
+
+/// Timestamp key names that must be converted to ISO-8601 strings at the MCP
+/// boundary. This set covers all `Timestamp` and `i64` microsecond fields that
+/// appear anywhere in event/entity/note/payload JSON — including nested objects
+/// and array elements (round-6 recursive fix, ADR-045 §5).
+const TIMESTAMP_KEYS: &[&str] = &[
+    "created_at",
+    "updated_at",
+    "deleted_at",
+    "expiry",
+    "applied_at",
+    "withdrawn_at",
+    "reviewed_at",
+    "completed_at",
+    "scheduled_at",
+    "expires_at",
+    "due",
+    "remind_at",
+];
+
+/// Recursively walk a `Value` and convert any integer value whose key appears
+/// in `TIMESTAMP_KEYS` to an ISO-8601 string.
+///
+/// - `Value::Object` → for each (key, val): if key is a timestamp key and val
+///   is a number, convert it. Then recurse into every value regardless.
+/// - `Value::Array` → recurse into every element.
+/// - All other variants → no-op.
+///
+/// Accepts both `u64` (serde repr of `khive_types::Timestamp`) and `i64`
+/// (stored epoch microseconds on storage-layer structs). String values and
+/// `null` are left unchanged — they are already converted or absent.
+fn walk_timestamps(v: &mut Value) {
+    match v {
+        Value::Object(obj) => {
+            for (key, val) in obj.iter_mut() {
+                if TIMESTAMP_KEYS.contains(&key.as_str()) {
+                    let micros_opt = val.as_u64().map(|n| n as i64).or_else(|| val.as_i64());
+                    if let Some(micros) = micros_opt {
+                        *val = Value::String(micros_to_iso(micros));
+                        // Already a scalar now — no need to recurse into it.
+                        continue;
+                    }
+                }
+                walk_timestamps(val);
+            }
+        }
+        Value::Array(arr) => {
+            for elem in arr.iter_mut() {
+                walk_timestamps(elem);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Normalize the `created_at` field on an event JSON object from raw
+/// microsecond integer to an ISO-8601 string (ADR-045 §5 handler invariant).
+///
+/// Round-6: uses `walk_timestamps` to recurse into the entire event value,
+/// including arbitrarily-nested payload objects and arrays. This subsumes the
+/// round-4 (top-level `created_at`) and round-5 (direct payload children) fixes
+/// with a single principled algorithm that applies at any depth.
+fn normalize_event_timestamps(mut v: Value) -> Value {
+    walk_timestamps(&mut v);
+    v
+}
+
+/// Apply `normalize_event_timestamps` to every element of a JSON array,
+/// or to the value itself if it is already an object.
+fn normalize_event_timestamps_array(v: Value) -> Value {
+    match v {
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(normalize_event_timestamps).collect())
+        }
+        other => normalize_event_timestamps(other),
+    }
+}
+
 /// Returns true if `entity_props` contains all key=value pairs from `filter`.
 ///
 /// Both the filter object and the entity's `properties` field must be JSON
@@ -912,6 +1049,48 @@ impl KgPack {
             .ok_or_else(|| RuntimeError::InvalidInput("create requires 'kind'".into()))?
             .to_string();
 
+        // ue-errors C1 (create): validate user-supplied keys against the
+        // declared allowlist BEFORE hook mutation. Hooks inject internal
+        // fields (namespace, entity_kind, note_kind, …) AFTER this gate,
+        // so unknown user kwargs are caught before any mutation occurs.
+        //
+        // Allowlist = CreateParams fields + legacy subkind aliases the handler
+        // normalises + pack-declared user params (GTD: title, priority, status,
+        // assignee, due, start, end, depends_on — consumed by prepare_create).
+        const CREATE_USER_KEYS: &[&str] = &[
+            // Base KG create fields
+            "kind",
+            "name",
+            "entity_kind",
+            "note_kind",
+            "entity_type",
+            "content",
+            "description",
+            "tags",
+            "properties",
+            "salience",
+            "annotates",
+            // GTD pack user params (create(kind="task", ...))
+            "title",
+            "priority",
+            "status",
+            "assignee",
+            "due",
+            "start",
+            "end",
+            "depends_on",
+        ];
+        if let Some(obj) = params.as_object() {
+            for key in obj.keys() {
+                if !CREATE_USER_KEYS.contains(&key.as_str()) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "create: unknown field `{key}`; allowed: {}",
+                        CREATE_USER_KEYS.join(", ")
+                    )));
+                }
+            }
+        }
+
         // Resolve the granular form (`kind="concept"`, `kind="task"`, …) or the
         // legacy substrate-level form (`kind="entity"` + `entity_kind=…`).
         let spec = resolve_kind_spec(&raw_kind, registry)?;
@@ -1022,7 +1201,7 @@ impl KgPack {
                     )
                     .await?;
                 let id = entity.id;
-                (to_json(&entity)?, id)
+                (normalize_entity_timestamps(to_json(&entity)?), id)
             }
             "note" => {
                 let canonical = sub_kind
@@ -1048,7 +1227,13 @@ impl KgPack {
                     )
                     .await?;
                 let id = note.id;
-                (remap_note_status(to_json(&note)?), id)
+                // Normalize microsecond epoch → ISO-8601 before the response
+                // reaches the presentation layer (ADR-045 §5 handler invariant,
+                // Blocker C1: note create was missing normalization).
+                (
+                    remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
+                    id,
+                )
             }
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -1087,7 +1272,10 @@ impl KgPack {
         // Attempt standard UUID resolution for entity/note/edge/event substrates.
         if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, token).await {
             if let Ok(entity) = self.runtime.get_entity(token, id).await {
-                return flatten_get_result("entity", to_json(&entity)?);
+                return flatten_get_result(
+                    "entity",
+                    normalize_entity_timestamps(to_json(&entity)?),
+                );
             }
 
             if let Some(note) = self
@@ -1098,7 +1286,7 @@ impl KgPack {
                 .map_err(RuntimeError::Storage)?
             {
                 if note.namespace == token.namespace().as_str() {
-                    let note_val = to_json(&note)?;
+                    let note_val = normalize_entity_timestamps(to_json(&note)?);
                     let remapped = remap_note_status(note_val);
                     return flatten_get_result("note", remapped);
                 }
@@ -1116,7 +1304,10 @@ impl KgPack {
                 .map_err(RuntimeError::Storage)?
             {
                 if event.namespace == token.namespace().as_str() {
-                    return flatten_get_result("event", to_json(&event)?);
+                    return flatten_get_result(
+                        "event",
+                        normalize_event_timestamps(to_json(&event)?),
+                    );
                 }
             }
         }
@@ -1362,7 +1553,9 @@ impl KgPack {
                         )
                         .await?
                 };
-                to_json(&entities)
+                // Normalize i64 microsecond timestamps to ISO-8601 strings
+                // (ADR-045 §5 handler invariant — C1 fix).
+                Ok(normalize_entity_timestamps_array(to_json(&entities)?))
             }
             KindSpec::Edge => {
                 let source_id = match p.source_id.as_deref() {
@@ -1532,6 +1725,7 @@ impl KgPack {
                         .take(limit as usize)
                         .map(|n| {
                             to_json(&n)
+                                .map(normalize_entity_timestamps)
                                 .map(remap_note_status)
                                 .unwrap_or_else(|_| serde_json::json!({}))
                         })
@@ -1542,6 +1736,7 @@ impl KgPack {
                         .filter(|n| n.deleted_at.is_none())
                         .map(|n| {
                             to_json(n)
+                                .map(normalize_entity_timestamps)
                                 .map(remap_note_status)
                                 .unwrap_or_else(|_| serde_json::json!({}))
                         })
@@ -1603,7 +1798,7 @@ impl KgPack {
                             break;
                         }
                     }
-                    to_json(&items)
+                    Ok(normalize_event_timestamps_array(to_json(&items)?))
                 } else {
                     let page = self
                         .runtime
@@ -1616,7 +1811,7 @@ impl KgPack {
                             },
                         )
                         .await?;
-                    to_json(&page.items)
+                    Ok(normalize_event_timestamps_array(to_json(&page.items)?))
                 }
             }
         }
@@ -1664,7 +1859,9 @@ impl KgPack {
                     properties: p.properties,
                     tags: p.tags,
                 };
-                to_json(&self.runtime.update_entity(token, id, patch).await?)
+                Ok(normalize_entity_timestamps(to_json(
+                    &self.runtime.update_entity(token, id, patch).await?,
+                )?))
             }
             KindSpec::Edge => {
                 let relation = p.relation.as_deref().map(parse_relation).transpose()?;
@@ -1695,7 +1892,9 @@ impl KgPack {
                     p.decay_factor,
                     p.properties,
                 );
-                to_json(&self.runtime.update_note(token, id, patch).await?)
+                Ok(normalize_entity_timestamps(to_json(
+                    &self.runtime.update_note(token, id, patch).await?,
+                )?))
             }
             KindSpec::Event => Err(immutable_event_error()),
             KindSpec::Proposal => Err(RuntimeError::InvalidInput(
@@ -2644,8 +2843,13 @@ impl KgPack {
     pub(crate) async fn handle_list_proposals(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
     ) -> Result<Value, RuntimeError> {
+        // Strip the `kind` discriminator — ListProposalsParams uses
+        // deny_unknown_fields and `kind` is the routing field, not a filter.
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("kind");
+        }
         let p: ListProposalsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))?;
         let ns = token.namespace().as_str().to_owned();
@@ -2719,14 +2923,22 @@ impl KgPack {
                         }
                     })
                 };
+                // ADR-045 §5: convert microsecond epoch integers to ISO-8601
+                // strings before the MCP boundary (proposal listing fix).
+                let ts_or_null = |name: &str| -> Value {
+                    match get_int(name) {
+                        Some(micros) => Value::String(micros_to_iso(micros)),
+                        None => Value::Null,
+                    }
+                };
                 serde_json::json!({
                     "proposal_id": get_text("proposal_id"),
                     "proposer": get_text("proposer"),
                     "title": get_text("title"),
                     "status": get_text("status"),
-                    "created_at": get_int("created_at"),
-                    "updated_at": get_int("updated_at"),
-                    "expiry": get_int("expiry"),
+                    "created_at": ts_or_null("created_at"),
+                    "updated_at": ts_or_null("updated_at"),
+                    "expiry": ts_or_null("expiry"),
                     "last_decision": get_text("last_decision"),
                     "review_count": get_int("review_count").unwrap_or(0),
                     "approve_count": get_int("approve_count").unwrap_or(0),
@@ -3034,5 +3246,173 @@ mod tests {
             p.min_score.is_none(),
             "absent min_score must be None; no floor applied by default"
         );
+    }
+
+    // ADR-045 §5 C1: entity timestamps must be ISO-8601 strings at the handler
+    // boundary. Entity.created_at / updated_at are stored as i64 microseconds;
+    // normalize_entity_timestamps converts them before MCP serialization.
+
+    // ---- Round-6: recursive walk_timestamps unit tests ----
+
+    #[test]
+    fn walk_timestamps_converts_top_level_created_at() {
+        use super::walk_timestamps;
+        let micros = 1779757074693195i64;
+        let mut v = json!({ "created_at": micros, "name": "test" });
+        walk_timestamps(&mut v);
+        let s = v["created_at"].as_str().expect("must be string");
+        assert!(s.len() >= 20 && s.contains('T'), "must be ISO-8601: {s}");
+        assert_eq!(v["name"], json!("test"), "name must be unchanged");
+    }
+
+    #[test]
+    fn walk_timestamps_converts_nested_object_timestamp() {
+        use super::walk_timestamps;
+        let micros = 1_779_757_074_693_195u64;
+        let mut v = json!({
+            "payload": {
+                "result": { "applied_at": micros }
+            }
+        });
+        walk_timestamps(&mut v);
+        let s = v["payload"]["result"]["applied_at"]
+            .as_str()
+            .expect("payload.result.applied_at must be string");
+        assert!(s.len() >= 20 && s.contains('T'), "must be ISO-8601: {s}");
+    }
+
+    #[test]
+    fn walk_timestamps_converts_array_element_timestamps() {
+        use super::walk_timestamps;
+        let micros1 = 1_779_757_074_000_000u64;
+        let micros2 = 1_779_757_075_000_000u64;
+        let mut v = json!({
+            "payload": {
+                "steps": [
+                    { "updated_at": micros1 },
+                    { "updated_at": micros2 }
+                ]
+            }
+        });
+        walk_timestamps(&mut v);
+        let steps = v["payload"]["steps"].as_array().unwrap();
+        for step in steps {
+            let s = step["updated_at"]
+                .as_str()
+                .expect("array element updated_at must be string");
+            assert!(s.len() >= 20 && s.contains('T'), "must be ISO-8601: {s}");
+        }
+    }
+
+    #[test]
+    fn walk_timestamps_handles_i64_branch() {
+        use super::walk_timestamps;
+        // i64 — covers legacy fields and the as_i64() branch of the conversion.
+        let micros: i64 = 1_234_567_890_000_000;
+        let mut v = json!({ "applied_at": micros });
+        walk_timestamps(&mut v);
+        let s = v["applied_at"].as_str().expect("must be string");
+        assert!(s.contains('T'), "must be ISO-8601: {s}");
+    }
+
+    #[test]
+    fn walk_timestamps_leaves_strings_unchanged() {
+        use super::walk_timestamps;
+        let iso = "2026-05-26T00:00:00+00:00";
+        let mut v = json!({ "created_at": iso });
+        walk_timestamps(&mut v);
+        assert_eq!(v["created_at"].as_str().unwrap(), iso);
+    }
+
+    #[test]
+    fn walk_timestamps_leaves_null_unchanged() {
+        use super::walk_timestamps;
+        let mut v = json!({ "deleted_at": null, "created_at": 1779757074693195i64 });
+        walk_timestamps(&mut v);
+        assert_eq!(v["deleted_at"], json!(null));
+        assert!(
+            v["created_at"].as_str().is_some(),
+            "created_at must be converted"
+        );
+    }
+
+    #[test]
+    fn walk_timestamps_non_timestamp_number_untouched() {
+        use super::walk_timestamps;
+        // A key that is NOT in TIMESTAMP_KEYS — must not be touched.
+        let mut v = json!({ "count": 42, "created_at": 1779757074693195i64 });
+        walk_timestamps(&mut v);
+        assert_eq!(
+            v["count"],
+            json!(42),
+            "non-timestamp number must be unchanged"
+        );
+        assert!(v["created_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn normalize_entity_timestamps_converts_i64_to_iso() {
+        use super::normalize_entity_timestamps;
+        // 2026-05-26T00:57:54.693195Z → micros since epoch
+        let micros = 1779757074693195i64;
+        let v = json!({ "created_at": micros, "updated_at": micros, "name": "test" });
+        let out = normalize_entity_timestamps(v);
+        let created = out["created_at"]
+            .as_str()
+            .expect("created_at must be a string");
+        let updated = out["updated_at"]
+            .as_str()
+            .expect("updated_at must be a string");
+        // Both must look like ISO-8601 (start with 4-digit year, contain 'T').
+        assert!(
+            created.len() >= 20 && created.contains('T'),
+            "created_at must be ISO-8601, got: {created:?}"
+        );
+        assert!(
+            updated.len() >= 20 && updated.contains('T'),
+            "updated_at must be ISO-8601, got: {updated:?}"
+        );
+        // name must be unchanged.
+        assert_eq!(out["name"], json!("test"));
+    }
+
+    #[test]
+    fn normalize_entity_timestamps_leaves_string_unchanged() {
+        use super::normalize_entity_timestamps;
+        let iso = "2026-05-26T00:57:54.693195+00:00";
+        let v = json!({ "created_at": iso, "updated_at": iso });
+        let out = normalize_entity_timestamps(v);
+        // Already a string — must not be double-converted.
+        assert_eq!(out["created_at"].as_str().unwrap(), iso);
+    }
+
+    #[test]
+    fn normalize_entity_timestamps_leaves_null_unchanged() {
+        use super::normalize_entity_timestamps;
+        let v = json!({ "created_at": 1779757074693195i64, "deleted_at": null });
+        let out = normalize_entity_timestamps(v);
+        assert!(
+            out["created_at"].as_str().is_some(),
+            "created_at must be converted"
+        );
+        assert_eq!(out["deleted_at"], json!(null), "null must remain null");
+    }
+
+    #[test]
+    fn normalize_entity_timestamps_array_converts_each_element() {
+        use super::normalize_entity_timestamps_array;
+        let micros = 1779757074693195i64;
+        let v = json!([
+            { "created_at": micros, "name": "a" },
+            { "created_at": micros, "name": "b" },
+        ]);
+        let out = normalize_entity_timestamps_array(v);
+        let arr = out.as_array().unwrap();
+        for item in arr {
+            assert!(
+                item["created_at"].as_str().is_some(),
+                "each element's created_at must be ISO string"
+            );
+        }
     }
 }

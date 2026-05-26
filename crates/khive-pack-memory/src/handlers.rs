@@ -8,8 +8,8 @@ use khive_retrieval::{
     fuse_search_results, FusionStrategy as RetrievalFusionStrategy, HybridConfig,
 };
 use khive_runtime::{
-    FusionStrategy as RuntimeFusionStrategy, NamespaceToken, RuntimeError, SearchHit, SearchSource,
-    VerbRegistry,
+    micros_to_iso, FusionStrategy as RuntimeFusionStrategy, NamespaceToken, RuntimeError,
+    SearchHit, SearchSource, VerbRegistry,
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{
@@ -57,7 +57,11 @@ fn parse_fusion_strategy_str(s: &str) -> Result<RuntimeFusionStrategy, RuntimeEr
     }
 }
 
+// ue-errors C1: deny_unknown_fields rejects typos like `garbage_arg="x"` at
+// deserialization, before any business logic runs.  Aliases (`salience`,
+// `decay`, `source`) are still accepted by serde even with this attribute.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RememberParams {
     content: String,
     memory_type: Option<String>,
@@ -71,7 +75,10 @@ struct RememberParams {
     embedding_model: Option<String>,
 }
 
+// ue-errors C1: deny_unknown_fields so typo kwargs (e.g. `min_scroe`)
+// are rejected at deserialization rather than silently dropped.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecallParams {
     query: String,
     limit: Option<u32>,
@@ -703,7 +710,7 @@ impl MemoryPack {
             "salience": note.salience,
             "decay_factor": note.decay_factor,
             "memory_type": memory_type,
-            "created_at": note.created_at,
+            "created_at": micros_to_iso(note.created_at),
         }))
     }
 
@@ -1140,8 +1147,7 @@ impl MemoryPack {
                     "salience": sn.note.salience,
                     "decay_factor": sn.note.decay_factor,
                     "memory_type": memory_type,
-                    "created_at": sn.note.created_at,
-                });
+                    "created_at": micros_to_iso(sn.note.created_at),                });
                 if is_verbose {
                     result["breakdown"] = json!(sn.breakdown);
                 }

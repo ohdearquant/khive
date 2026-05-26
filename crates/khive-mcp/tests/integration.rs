@@ -2,6 +2,10 @@
 //!
 //! Validates the single-tool composition: every verb is reached via `request(ops="…")`.
 
+// Force the knowledge pack to be linked (inventory::submit! requires the crate
+// to be linked into the test binary for its PackRegistration to self-register).
+use khive_pack_knowledge as _;
+
 use async_trait::async_trait;
 use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{
@@ -2000,22 +2004,25 @@ async fn get_returns_flat_shape_with_full_uuid_in_default_agent_mode() -> anyhow
     Ok(())
 }
 
-/// P-H1: `link` is Standard policy — source_id/target_id are truncated to
-/// 8 chars in Agent mode, matching every other UUID field in the system.
-/// Previously `link` was AlwaysVerbose which was inconsistent.
+/// ADR-045 §6 C2: `link` is `AlwaysVerbose` — edge IDs needed for follow-up.
+///
+/// At scale, two edges can share the same 8-char prefix (birthday collision ~65K
+/// edges), so shortening the returned edge ID in agent mode violates ADR-045 §6
+/// "Edge IDs needed for follow-up." `link` must return full 36-char UUIDs in
+/// all modes including agent.
 #[tokio::test]
-async fn link_source_and_target_ids_are_short_in_agent_mode() -> anyhow::Result<()> {
+async fn link_is_always_verbose_returns_full_uuids_in_agent_mode() -> anyhow::Result<()> {
     let client = connect().await?;
 
     // Create two entities via ok_one (verbose) to get full UUIDs for linking.
     let a = ok_one(
         &client,
-        r#"create(kind="entity", entity_kind="concept", name="LinkNodeA")"#,
+        r#"create(kind="entity", entity_kind="concept", name="LinkVerboseA")"#,
     )
     .await?;
     let b = ok_one(
         &client,
-        r#"create(kind="entity", entity_kind="concept", name="LinkNodeB")"#,
+        r#"create(kind="entity", entity_kind="concept", name="LinkVerboseB")"#,
     )
     .await?;
     let a_id = a["id"].as_str().unwrap().to_string();
@@ -2024,7 +2031,8 @@ async fn link_source_and_target_ids_are_short_in_agent_mode() -> anyhow::Result<
     assert_eq!(b_id.len(), 36);
 
     // Call `link` in default Agent mode (no presentation key).
-    // Standard policy: source_id/target_id should be 8-char short form.
+    // AlwaysVerbose policy: source_id/target_id must be full 36-char UUIDs
+    // even in agent mode (ADR-045 §6 C2 fix).
     let result = call(
         &client,
         "request",
@@ -2032,7 +2040,7 @@ async fn link_source_and_target_ids_are_short_in_agent_mode() -> anyhow::Result<
             "ops": format!(
                 r#"link(source_id="{a_id}", target_id="{b_id}", relation="extends")"#
             )
-            // No `presentation` key — defaults to Agent.
+            // No `presentation` key — defaults to Agent, but AlwaysVerbose overrides.
         }),
     )
     .await?;
@@ -2045,23 +2053,25 @@ async fn link_source_and_target_ids_are_short_in_agent_mode() -> anyhow::Result<
     let tgt = edge["target_id"].as_str().unwrap_or("");
     assert_eq!(
         src.len(),
-        8,
-        "link source_id must be 8-char short form in Agent mode (P-H1); got {src:?}"
+        36,
+        "link source_id must be full 36-char UUID in Agent mode (AlwaysVerbose); got {src:?}"
     );
     assert_eq!(
         tgt.len(),
-        8,
-        "link target_id must be 8-char short form in Agent mode (P-H1); got {tgt:?}"
+        36,
+        "link target_id must be full 36-char UUID in Agent mode (AlwaysVerbose); got {tgt:?}"
     );
-    // The edge's own id should also be short in agent mode.
+    // The edge's own id must also be full UUID in agent mode.
     let edge_id = edge["id"].as_str().unwrap_or("");
     assert_eq!(
         edge_id.len(),
-        8,
-        "link edge id must be 8-char in Agent mode; got {edge_id:?}"
+        // Edge IDs are LinkId which may serialize as full UUID; accept 36-char.
+        // The AlwaysVerbose policy ensures no shortening occurs.
+        36,
+        "link edge id must be full UUID in Agent mode (AlwaysVerbose); got {edge_id:?}"
     );
 
-    // Verify: with presentation=verbose, full 36-char UUIDs are returned.
+    // Verify: explicit presentation=verbose also returns full 36-char UUIDs.
     let result_verbose = call(
         &client,
         "request",
@@ -2655,4 +2665,709 @@ fn cli_args_khive_actor_env_is_explicit_and_wins() {
         Namespace::parse("lambda:actor-env").unwrap(),
         "KHIVE_ACTOR env must win over KHIVE_NAMESPACE"
     );
+}
+
+// ── ue-errors C1: unknown-kwarg rejection ────────────────────────────────────
+
+/// `update(id=<uuid>, nonexistent_field="x")` must return `ok: false`, not
+/// silently succeed (ue-errors C1).  The caller must be able to trust that
+/// `ok: true` means the intended update was actually applied.
+#[tokio::test]
+async fn update_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Create an entity to update.
+    let entity = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="UpdateUnknownKwargTest")"#,
+    )
+    .await?;
+    let id = entity["id"].as_str().unwrap();
+
+    // Attempt update with an unknown kwarg.
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": format!(r#"update(id="{id}", nonexistent_field="x")"#) }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "update with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("nonexistent_field") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
+}
+
+/// `remember(content="x", garbage_arg="y")` must return `ok: false` (ue-errors C1).
+#[tokio::test]
+async fn remember_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"memory.remember(content="test memory", garbage_arg="xyz")"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "remember with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("garbage_arg") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
+}
+
+/// Known `remember` aliases (`salience`, `decay`, `source`) must still work
+/// after deny_unknown_fields is applied (ue-errors C1 regression guard).
+#[tokio::test]
+async fn remember_aliases_still_accepted() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"memory.remember(content="alias test", salience=0.8, decay=0.005)"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(true),
+        "remember with aliases salience/decay must succeed; got: {first}"
+    );
+    Ok(())
+}
+
+// ── ADR-045 §5 handler invariant: ISO-8601 timestamps at MCP boundary ────────
+
+/// Entity `create` must return ISO-8601 timestamps (not raw microsecond i64s).
+///
+/// This is the Blocker C1 regression guard: the note create path was missing
+/// normalize_entity_timestamps, causing `created_at`/`updated_at` to arrive
+/// as integer microseconds. Fixed by wrapping the note create response with
+/// normalize_entity_timestamps before remap_note_status.
+#[tokio::test]
+async fn entity_create_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let result = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="TimestampTest-Entity")"#,
+    )
+    .await?;
+
+    let created_at = result["created_at"].as_str().unwrap_or("");
+    let updated_at = result["updated_at"].as_str().unwrap_or("");
+    assert!(
+        !created_at.is_empty(),
+        "entity create created_at must be a string, got: {:?}",
+        result["created_at"]
+    );
+    // ISO-8601 strings start with 4-digit year
+    assert!(
+        created_at.starts_with("20"),
+        "entity create created_at must be ISO-8601, got: {created_at:?}"
+    );
+    assert!(
+        updated_at.starts_with("20"),
+        "entity create updated_at must be ISO-8601, got: {updated_at:?}"
+    );
+    Ok(())
+}
+
+/// Note `create` must return ISO-8601 timestamps (Blocker C1 fix: note path was missing
+/// normalize_entity_timestamps before the MCP response).
+#[tokio::test]
+async fn note_create_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let result = ok_one(
+        &client,
+        r#"create(kind="note", content="timestamp test note")"#,
+    )
+    .await?;
+
+    let created_at = result["created_at"].as_str().unwrap_or("");
+    let updated_at = result["updated_at"].as_str().unwrap_or("");
+    assert!(
+        created_at.starts_with("20"),
+        "note create created_at must be ISO-8601, got: {created_at:?}"
+    );
+    assert!(
+        updated_at.starts_with("20"),
+        "note create updated_at must be ISO-8601, got: {updated_at:?}"
+    );
+    Ok(())
+}
+
+/// Entity `get` (AlwaysVerbose) must return ISO-8601 timestamps.
+#[tokio::test]
+async fn entity_get_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let created = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="TimestampGet-Entity")"#,
+    )
+    .await?;
+    let id = created["id"].as_str().unwrap();
+
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": format!(r#"get(id="{id}")"#)}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(first["ok"], true, "get must succeed: {first}");
+    let entity = &first["result"];
+    let created_at = entity["created_at"].as_str().unwrap_or("");
+    assert!(
+        created_at.starts_with("20"),
+        "entity get created_at must be ISO-8601, got: {created_at:?}"
+    );
+    Ok(())
+}
+
+/// Entity `list` must return ISO-8601 timestamps across all items.
+#[tokio::test]
+async fn entity_list_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    // Ensure at least one entity exists.
+    ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="TimestampList-Entity")"#,
+    )
+    .await?;
+
+    let result = ok_one(&client, r#"list(kind="entity", limit=3)"#).await?;
+    let items = result
+        .as_array()
+        .expect("list(kind=entity) returns array of entities");
+    assert!(!items.is_empty(), "list must return at least one entity");
+
+    for item in items {
+        let created_at = item["created_at"].as_str().unwrap_or("");
+        assert!(
+            created_at.starts_with("20"),
+            "entity list created_at must be ISO-8601, got: {created_at:?} in {item}"
+        );
+    }
+    Ok(())
+}
+
+/// Entity `update` must return ISO-8601 timestamps (the update response goes
+/// through normalize_entity_timestamps before the presentation layer).
+#[tokio::test]
+async fn entity_update_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let created = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="TimestampUpdate-Entity")"#,
+    )
+    .await?;
+    let id = created["id"].as_str().unwrap();
+
+    let result = ok_one(
+        &client,
+        &format!(r#"update(id="{id}", description="updated")"#),
+    )
+    .await?;
+
+    let updated_at = result["updated_at"].as_str().unwrap_or("");
+    assert!(
+        updated_at.starts_with("20"),
+        "entity update updated_at must be ISO-8601, got: {updated_at:?}"
+    );
+    Ok(())
+}
+
+// ── ue-errors C1 extension: unknown-kwarg rejection on additional verbs ───────
+
+/// `recall(query="x", typo_kwarg="y")` must return `ok: false` (ue-errors C1).
+#[tokio::test]
+async fn recall_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"memory.recall(query="test", typo_kwarg="oops")"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "recall with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("typo_kwarg") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
+}
+
+/// `list(kind="entity", typo_kwarg="y")` must return `ok: false` (ue-errors C1).
+#[tokio::test]
+async fn list_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"list(kind="entity", typo_kwarg="oops")"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "list with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("typo_kwarg") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
+}
+
+// ── Round 3: MCP-wide ISO-8601 timestamps (Blocker fix) ──────────────────────
+
+/// `remember` must return ISO-8601 `created_at` (not a raw microsecond i64).
+#[tokio::test]
+async fn remember_returns_iso8601_timestamp() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+
+    let result = ok_one(
+        &client,
+        r#"memory.remember(content="r3 timestamp test", salience=0.7)"#,
+    )
+    .await?;
+
+    let created_at = result["created_at"].as_str().unwrap_or("");
+    assert!(
+        created_at.starts_with("20"),
+        "remember created_at must be ISO-8601 string, got: {:?}",
+        result["created_at"]
+    );
+    Ok(())
+}
+
+/// `recall` must return ISO-8601 `created_at` on each hit (not raw i64).
+#[tokio::test]
+async fn recall_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+
+    // Seed a memory first.
+    ok_one(
+        &client,
+        r#"memory.remember(content="r3 recall timestamp seed")"#,
+    )
+    .await?;
+
+    let result = ok_one(
+        &client,
+        r#"memory.recall(query="r3 recall timestamp seed", limit=1)"#,
+    )
+    .await?;
+
+    let hits = result.as_array().expect("recall returns array");
+    assert!(!hits.is_empty(), "recall must return at least one hit");
+    let created_at = hits[0]["created_at"].as_str().unwrap_or("");
+    assert!(
+        created_at.starts_with("20"),
+        "recall hit created_at must be ISO-8601 string, got: {:?}",
+        hits[0]["created_at"]
+    );
+    Ok(())
+}
+
+fn make_comm_server_only() -> KhiveMcpServer {
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("commtest").unwrap(),
+        embedding_model: None,
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("kg+comm runtime");
+    KhiveMcpServer::new(runtime).expect("server builds with kg+comm")
+}
+
+async fn connect_comm_only(
+) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = make_comm_server_only();
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    Ok(client)
+}
+
+/// `inbox` returns message notes; `created_at` and `updated_at` must be ISO-8601
+/// strings (not raw microsecond i64s) — validates note_to_message_json fix.
+#[tokio::test]
+async fn send_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect_comm_only().await?;
+
+    // Self-send produces one outbound note visible to inbox.
+    ok_one(
+        &client,
+        r#"comm.send(to="commtest", content="r3 timestamp test message")"#,
+    )
+    .await?;
+
+    // inbox lists inbound; self-send is the same note — use the listing path
+    // that calls note_to_message_json which we fixed.
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": r#"list(kind="note", limit=1)"#, "presentation": "verbose"}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(true),
+        "list(kind=note) must succeed: {first}"
+    );
+    let items = first["result"].as_array().expect("list returns array");
+    assert!(!items.is_empty(), "must have at least one message note");
+    let created_at = items[0]["created_at"].as_str().unwrap_or("");
+    assert!(
+        created_at.starts_with("20"),
+        "message note created_at must be ISO-8601 string, got: {:?}",
+        items[0]["created_at"]
+    );
+    Ok(())
+}
+
+fn make_schedule_server_only() -> KhiveMcpServer {
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("schedtest").unwrap(),
+        embedding_model: None,
+        packs: vec!["kg".to_string(), "schedule".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("kg+schedule runtime");
+    KhiveMcpServer::new(runtime).expect("server builds with kg+schedule")
+}
+
+async fn connect_schedule_only(
+) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = make_schedule_server_only();
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    Ok(client)
+}
+
+/// `remind` creates a scheduled_event note; `agenda` returns ISO-8601 timestamps.
+#[tokio::test]
+async fn agenda_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect_schedule_only().await?;
+
+    ok_one(
+        &client,
+        r#"schedule.remind(content="r3 agenda ts test", at="2099-01-01T00:00:00Z")"#,
+    )
+    .await?;
+
+    let result = ok_one(&client, r#"schedule.agenda()"#).await?;
+    // agenda returns { events: [...], count: N }
+    let items = result["events"]
+        .as_array()
+        .expect("agenda returns events array");
+    assert!(!items.is_empty(), "agenda must return at least one event");
+    let created_at = items[0]["created_at"].as_str().unwrap_or("");
+    assert!(
+        created_at.starts_with("20"),
+        "agenda event created_at must be ISO-8601 string, got: {:?}",
+        items[0]["created_at"]
+    );
+    Ok(())
+}
+
+async fn connect_brain_only(
+) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("braintest2").unwrap(),
+        embedding_model: None,
+        packs: vec!["kg".to_string(), "brain".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("kg+brain runtime");
+    let server = KhiveMcpServer::new(runtime).expect("server builds");
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    Ok(client)
+}
+
+/// `brain.profiles` must return ISO-8601 `created_at` on profile records.
+#[tokio::test]
+async fn brain_profiles_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect_brain_only().await?;
+
+    let result = ok_one(&client, r#"brain.profiles()"#).await?;
+    let profiles = result["profiles"]
+        .as_array()
+        .expect("brain.profiles returns profiles array");
+    assert!(
+        !profiles.is_empty(),
+        "brain.profiles must return at least one profile"
+    );
+    let created_at = profiles[0]["created_at"].as_str().unwrap_or("");
+    assert!(
+        created_at.starts_with("20"),
+        "brain.profiles created_at must be ISO-8601 string, got: {:?}",
+        profiles[0]["created_at"]
+    );
+    Ok(())
+}
+
+/// `propose` + `list(kind="proposal")` must return ISO-8601 timestamps on proposal rows.
+#[tokio::test]
+async fn proposal_list_returns_iso8601_timestamps() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    ok_one(
+        &client,
+        r#"propose(title="r3 ts test proposal", description="r3 timestamp regression test", changeset={"kind": "add_entity", "entity": {"kind": "concept", "name": "R3TsEntity"}})"#,
+    )
+    .await?;
+
+    let result = ok_one(&client, r#"list(kind="proposal")"#).await?;
+    let proposals = result
+        .as_array()
+        .expect("list(kind=proposal) returns array");
+    assert!(!proposals.is_empty(), "must have at least one proposal");
+    let created_at = proposals[0]["created_at"].as_str().unwrap_or("");
+    assert!(
+        created_at.starts_with("20"),
+        "proposal list created_at must be ISO-8601 string, got: {:?}",
+        proposals[0]["created_at"]
+    );
+    Ok(())
+}
+
+// ── Round 3: cross-pack deny_unknown_fields (High fix) ───────────────────────
+
+/// `create(kind="concept", unknownkw="x")` must return `ok: false`.
+#[tokio::test]
+async fn create_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"create(kind="concept", name="X", unknownkw="oops")"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "create with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("unknownkw") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
+}
+
+/// `assign(title="T", unknownkw="x")` (GTD) must return `ok: false`.
+#[tokio::test]
+async fn assign_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"gtd.assign(title="GTD unknown kwarg test", unknownkw="oops")"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "assign with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("unknownkw") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
+}
+
+/// `send(to="x", content="y", unknownkw="z")` (comm) must return `ok: false`.
+#[tokio::test]
+async fn send_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect_comm_only().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"comm.send(to="alice", content="test", unknownkw="oops")"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "send with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("unknownkw") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
+}
+
+/// `agenda(unknownkw="x")` (schedule) must return `ok: false`.
+#[tokio::test]
+async fn agenda_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect_schedule_only().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"schedule.agenda(unknownkw="oops")"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "agenda with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("unknownkw") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
+}
+
+/// `brain.profile(id="balanced-recall-v1", unknownkw="x")` must return `ok: false`.
+#[tokio::test]
+async fn brain_profile_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect_brain_only().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"brain.profile(id="balanced-recall-v1", unknownkw="oops")"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "brain.profile with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("unknownkw") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
+}
+
+fn make_knowledge_server() -> KhiveMcpServer {
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("knowtest").unwrap(),
+        embedding_model: None,
+        packs: vec!["kg".to_string(), "knowledge".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("kg+knowledge runtime");
+    KhiveMcpServer::new(runtime).expect("server builds with kg+knowledge")
+}
+
+async fn connect_knowledge(
+) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = make_knowledge_server();
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    Ok(client)
+}
+
+/// `topic(unknownkw="x")` (knowledge) must return `ok: false`.
+#[tokio::test]
+async fn topic_rejects_unknown_kwarg() -> anyhow::Result<()> {
+    let client = connect_knowledge().await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({ "ops": r#"knowledge.topic(unknownkw="oops")"# }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(false),
+        "topic with unknown kwarg must fail; got: {first}"
+    );
+    let err = first["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("unknownkw") || err.contains("unknown field"),
+        "error must mention the unknown field; got: {err}"
+    );
+    Ok(())
 }

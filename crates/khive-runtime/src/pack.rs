@@ -789,7 +789,28 @@ impl VerbRegistry {
         );
 
         for pack in self.packs.iter() {
-            if pack.handlers().iter().any(|v| v.name == verb) {
+            if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
+                // Strip `namespace` from params before forwarding to packs (ADR-007).
+                // The registry has already consumed it to mint the NamespaceToken.
+                //
+                // Exception: if the handler's own `params` schema declares
+                // `"namespace"` as a valid field (e.g. brain.bind, brain.unbind,
+                // brain.bindings, brain.resolve), the field is a *business* argument
+                // — not a transport routing key — and must be passed through
+                // unchanged. Stripping it would silently default the binding to the
+                // "*" wildcard, broadening profile scope across namespaces.
+                let handler_accepts_namespace =
+                    handler_def.params.iter().any(|p| p.name == "namespace");
+                let params = if !handler_accepts_namespace {
+                    if let Value::Object(mut map) = params {
+                        map.remove("namespace");
+                        Value::Object(map)
+                    } else {
+                        params
+                    }
+                } else {
+                    params
+                };
                 let dispatch_start = Instant::now();
                 let result = pack.dispatch(verb, params, self, &token).await;
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;

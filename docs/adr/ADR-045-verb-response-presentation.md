@@ -149,7 +149,27 @@ shape that round-trips through CI / scripted callers without surprises.
 
 #### `Human` mode (pretty-printed terminal)
 
-| Field type   | Human form                                                           |
+**MCP/runtime boundary: `Human` is a no-op at this layer.**
+
+When `presentation=human` is sent over the MCP wire or `kkernel call`, the
+runtime returns canonical (verbose) JSON — identical to `Verbose`. No
+transformation is applied inside `khive-runtime::presentation`. This is a
+deliberate design decision, not an omission:
+
+1. MCP responses are consumed over a JSON transport. Injecting ANSI escape
+   codes, table-layout whitespace, or terminal glyphs into JSON would corrupt
+   the response for every non-terminal consumer.
+2. The `khive` CLI applies its own second-pass formatting after receiving
+   verbose JSON from the runtime. The CLI does NOT pass `presentation=human`
+   over MCP; it uses `presentation=verbose` (or the default agent mode) and
+   applies the terminal transform in `khive-cli::format::pretty` before printing.
+
+**Consequence for callers**: agents or scripts that pass `presentation=human`
+receive verbose JSON. This is documented behavior. The table below describes
+what the CLI layer produces for human-facing output after its own formatting
+pass, but that transform lives at the CLI level — not in the runtime.
+
+| Field type   | CLI Human form (post-MCP, CLI layer)                                 |
 | ------------ | -------------------------------------------------------------------- |
 | UUID         | First-segment short form, dimmed in terminal color                   |
 | Timestamp    | Relative ("3 minutes ago") for recent, absolute date for old         |
@@ -158,7 +178,7 @@ shape that round-trips through CI / scripted callers without surprises.
 | Score        | Bar visualization or rounded number                                  |
 | Long strings | Truncated to terminal width with ellipsis; full text via `--verbose` |
 
-Human mode is delegated to a separate `khive-cli::format::pretty` module —
+Human mode terminal formatting is delegated to `khive-cli::format::pretty` —
 this ADR specifies its existence but not the exact formatting rules (those
 evolve with the CLI UX).
 
