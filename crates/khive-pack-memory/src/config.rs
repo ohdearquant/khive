@@ -4,6 +4,33 @@ use serde::{Deserialize, Serialize};
 
 use khive_runtime::{FusionStrategy, RuntimeError};
 
+/// Error returned when `min_score` is outside the accepted dual-scale range.
+#[derive(Debug, Clone)]
+pub enum MinScoreError {
+    /// Value was NaN or Inf.
+    NotFinite,
+    /// Value was finite but outside `[0.0, 100.0]` (or negative).
+    OutOfRange(f64),
+}
+
+impl std::fmt::Display for MinScoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFinite => write!(f, "min_score must be finite"),
+            Self::OutOfRange(v) => write!(
+                f,
+                "min_score {v} out of range: must be 0.0–1.0 (fraction) or 0–100 (percent)"
+            ),
+        }
+    }
+}
+
+impl From<MinScoreError> for RuntimeError {
+    fn from(e: MinScoreError) -> Self {
+        RuntimeError::InvalidInput(e.to_string())
+    }
+}
+
 /// Configuration for the recall scoring pipeline.
 /// All fields have sensible defaults matching current behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +76,15 @@ pub struct RecallConfig {
     /// When true and no active embedding model is configured, fall back to FTS5-only
     /// candidate retrieval rather than failing. Default true.
     pub fallback_during_migration: bool,
+
+    // --- Archive scoring pipeline override ---
+    /// Optional full archive scoring config override. When provided, `handle_recall`
+    /// uses `calculate_score` + all archive pipeline features (MMR, supersedes
+    /// suppression, CJK routing, entity boost) instead of the legacy additive formula.
+    ///
+    /// `ScoringConfig::default()` is used when this is `None` and the caller provides
+    /// entity_names or sets `use_archive_scoring = true`.
+    pub scoring: Option<crate::scoring::ScoringConfig>,
 }
 
 // Tuning artifact: tests/khive-contract/tune/ swept 116 configs but the synthetic corpus
@@ -56,6 +92,14 @@ pub struct RecallConfig {
 // cannot empirically distinguish these parameters. Defaults below stay at the prior values
 // until a harder corpus (embed-enabled, synonym queries, partial matches) provides signal.
 // See tests/khive-contract/tune/REPORT.md for the analysis.
+//
+// CC-6: Default strategy changed from RRF to Weighted [0.7, 0.3].
+//
+// Under RRF with the default weights (relevance 70%, importance 20%, temporal 10%), a
+// salience=0.3 memory can rank above a salience=0.9 memory when its text/vector rank is
+// marginally better. The Weighted strategy gives full-resolution score values to both
+// retrieval paths, making the importance contribution a meaningful tiebreaker.
+// The RRF strategy remains available via `fusion_strategy="rrf"`.
 impl Default for RecallConfig {
     fn default() -> Self {
         Self {
@@ -68,11 +112,19 @@ impl Default for RecallConfig {
             decay_model: DecayModel::default(),
             candidate_multiplier: 20,
             candidate_limit: None,
-            fuse_strategy: FusionStrategy::default(),
+            // CC-6: Weighted fusion respects score magnitude, allowing the salience
+            // amplifier to meaningfully differentiate high- vs low-importance memories.
+            // Weights [vector=0.7, text=0.3] match the prior RRF intent: vector
+            // results are weighted higher because embedding search captures semantic
+            // similarity; text results supplement with keyword precision.
+            fuse_strategy: FusionStrategy::Weighted {
+                weights: vec![0.7, 0.3],
+            },
             min_score: 0.0,
             min_salience: 0.0,
             include_breakdown: false,
             fallback_during_migration: true,
+            scoring: None,
         }
     }
 }
@@ -456,7 +508,15 @@ mod tests {
     fn new_fields_have_correct_defaults() {
         let cfg = RecallConfig::default();
         assert_eq!(cfg.candidate_limit, None);
-        assert_eq!(cfg.fuse_strategy, FusionStrategy::Rrf { k: 60 });
+        // CC-6: default changed to Weighted [0.7, 0.3] so salience can influence ranking
+        assert!(
+            matches!(
+                cfg.fuse_strategy,
+                FusionStrategy::Weighted { ref weights } if weights == &vec![0.7_f64, 0.3_f64]
+            ),
+            "default fuse_strategy should be Weighted [0.7, 0.3], got {:?}",
+            cfg.fuse_strategy
+        );
         assert!(!cfg.include_breakdown);
     }
 
@@ -517,7 +577,11 @@ mod tests {
         let json = r#"{"temporal_weight": 0.15}"#;
         let cfg: RecallConfig = serde_json::from_str(json).expect("deserialize partial");
         assert_eq!(cfg.candidate_limit, None);
-        assert_eq!(cfg.fuse_strategy, FusionStrategy::Rrf { k: 60 });
+        // CC-6: default changed to Weighted [0.7, 0.3]
+        assert!(
+            matches!(cfg.fuse_strategy, FusionStrategy::Weighted { .. }),
+            "partial config must deserialize fuse_strategy to Weighted default"
+        );
         assert!(!cfg.include_breakdown);
     }
 

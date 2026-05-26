@@ -1,6 +1,7 @@
 pub mod config;
 pub mod handlers;
 pub mod rerank;
+pub mod scoring;
 pub mod tunable;
 
 use std::sync::Mutex;
@@ -115,13 +116,13 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum composite score; range depends on fusion strategy. RRF: 0–1 after rank normalization (normalized by (k+1) so rank-1 = 1.0). Weighted: 0–1 after weight normalization. The default strategy is RRF — see ADR-033. Typical production floor: 0.3–0.7.",
+                description: "Minimum composite score to include (default 0.0). Composite scores are always in [0,1]: relevance is normalized to [0,1] per strategy (RRF rank-1 → 1.0; Weighted scores are [0,1] natively), and all three weighted contributions sum to at most 1.0. Typical production floor: 0.3–0.7.",
             },
             ParamDef {
                 name: "score_floor",
                 param_type: "number",
                 required: false,
-                description: "Filter out hits below this composite score. Portable across fusion strategies (scores normalized to [0,1]).",
+                description: "Alias for min_score. Filter out hits below this composite score. Scores are always in [0,1] regardless of fusion strategy.",
             },
             ParamDef {
                 name: "min_salience",
@@ -152,6 +153,18 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 param_type: "string",
                 required: false,
                 description: "Set to \"verbose\" to include per-component score breakdowns in results.",
+            },
+            ParamDef {
+                name: "entity_names",
+                param_type: "array",
+                required: false,
+                description: "Entity names to boost in scoring. Memories mentioning these entities receive a 1.3× score multiplier.",
+            },
+            ParamDef {
+                name: "full_content",
+                param_type: "boolean",
+                required: false,
+                description: "When false, content is truncated to 200 chars in results. Default true.",
             },
         ],
     },

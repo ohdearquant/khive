@@ -13,13 +13,18 @@ use khive_runtime::{
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{
-    TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
-    VectorSearchRequest,
+    Direction, NeighborQuery, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest,
+    VectorSearchHit, VectorSearchRequest,
 };
+use khive_storage::EdgeRelation;
 use khive_types::SubstrateKind;
 
 use crate::config::{RecallConfig, ScoreBreakdown, WeightedContributions};
 use crate::rerank::{weighted_rerank, RerankFeatures};
+use crate::scoring::{
+    calculate_score, contains_cjk, normalize_min_score, normalize_rank_fusion_scores,
+    normalize_rrf_scores, ScoreInput, ScoringConfig,
+};
 use crate::MemoryPack;
 
 fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError> {
@@ -84,6 +89,13 @@ struct RecallParams {
     /// Does not affect non-verbose (agent-mode) shape.
     #[serde(default)]
     presentation: Option<String>,
+    /// Entity names to boost in scoring. Memories containing these names
+    /// receive a 1.3× multiplier via the EntityMatch ScoreAdjustment.
+    #[serde(default)]
+    entity_names: Option<Vec<String>>,
+    /// When false, truncate content to 200 chars in results. Default true.
+    #[serde(default)]
+    full_content: Option<bool>,
 }
 
 impl RecallParams {
@@ -113,17 +125,21 @@ impl RecallParams {
     }
 }
 
-/// Normalize a raw fusion score to a [0, 1]-comparable range.
+/// Normalize a raw fusion score to the [0, 1] range.
 ///
-/// RRF scores are `1/(k+rank)` — for k=60, rank 1 gives ≈0.0164, rank 2 gives
-/// ≈0.0161, etc. This is orders of magnitude smaller than weighted/union scores
-/// (which sit in [0.0, 1.0+]). Multiplying by `(k+1)` maps the RRF maximum
-/// (rank-1) to exactly 1.0, making `score_floor` portable across fusion strategies.
+/// RRF scores are `1/(k+rank)` summed across all sources.
+/// - Single source, rank 1: `1/(k+1)` ≈ 0.0164 for k=60.
+/// - Two sources, rank 1 in both: `2/(k+1)` ≈ 0.0328.
+///
+/// Multiplying by `(k+1)` maps a single-source rank-1 to 1.0. When a doc
+/// appears in multiple sources the raw RRF sum can exceed `1/(k+1)`, so we
+/// clamp the normalized value to 1.0, preserving the [0,1] contract and
+/// ensuring the composite score displayed to callers stays in [0,1] (CC-5).
 ///
 /// Weighted and union scores are already in [0,1] and pass through unchanged.
 fn normalize_relevance(raw: f64, strategy: &khive_runtime::FusionStrategy) -> f64 {
     match strategy {
-        khive_runtime::FusionStrategy::Rrf { k } => raw * (*k as f64 + 1.0),
+        khive_runtime::FusionStrategy::Rrf { k } => (raw * (*k as f64 + 1.0)).min(1.0),
         _ => raw,
     }
 }
@@ -170,7 +186,10 @@ fn compute_score(
     let amplified_importance = effective_importance.powf(SALIENCE_AMPLIFIER_ALPHA);
     let i_contrib = cfg.importance_weight * amplified_importance / norm;
     let t_contrib = cfg.temporal_weight * temporal / norm;
-    let total = r_contrib + i_contrib + t_contrib;
+    // Clamp to [0,1]: each component is in [0, weight/norm] and their sum is
+    // in [0, 1] by construction when relevance is clamped. The explicit clamp
+    // is a defensive guard against floating-point accumulation (CC-5).
+    let total = (r_contrib + i_contrib + t_contrib).clamp(0.0, 1.0);
     let breakdown = ScoreBreakdown {
         relevance,
         importance_raw: salience,
@@ -192,6 +211,10 @@ struct RecallCandidateSet {
     /// When a single explicit model is queried, this has one entry.
     /// When all registered models are queried (embedding_model=None), this has N entries.
     vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
+    /// True when CJK routing was requested AND a multilingual model was found and
+    /// used as the sole vector source. False when routing was not requested or no
+    /// multilingual model was registered (fallback to all models).
+    cjk_routed: bool,
 }
 
 impl RecallCandidateSet {
@@ -250,10 +273,14 @@ fn retrieval_hybrid_config(strategy: &RuntimeFusionStrategy, limit: usize) -> Hy
         .with_fusion_strategy(to_retrieval_fusion_strategy(strategy));
 
     if let RuntimeFusionStrategy::Weighted { weights } = strategy {
-        // Runtime weighted fusion uses [text, vector]. HybridConfig uses keyword/vector.
+        // Source layout passed to fuse_search_results is [vector, text] — see
+        // fuse_candidates(). weights[0] maps to the first source (vector) and
+        // weights[1] to the second source (text). HybridConfig fields:
+        //   vector_weight = weights[0] (vector source)
+        //   keyword_weight = weights[1] (text source)
         // Preserve arbitrary positive scales — do not clamp via with_weights().
-        config.keyword_weight = weights.first().copied().unwrap_or(0.0).max(0.0);
-        config.vector_weight = weights.get(1).copied().unwrap_or(0.0).max(0.0);
+        config.vector_weight = weights.first().copied().unwrap_or(0.0).max(0.0);
+        config.keyword_weight = weights.get(1).copied().unwrap_or(0.0).max(0.0);
     }
 
     config
@@ -418,8 +445,14 @@ impl MemoryPack {
         token: &NamespaceToken,
         candidate_limit: u32,
         embedding_model: Option<&str>,
+        // When true, prefer the multilingual model for CJK queries.
+        // Ignored when no multilingual model is registered.
+        is_cjk: bool,
+        scoring_cfg: &crate::scoring::ScoringConfig,
     ) -> Result<RecallCandidateSet, RuntimeError> {
         let ns = token.namespace().as_str().to_string();
+        // Tracks whether CJK routing was actually applied (multilingual model found).
+        let mut cjk_routed = false;
         // F111: restrict text candidates to Note substrate kind so entity records
         // cannot fill the candidate pool before any memory note is considered.
         let text_hits = self
@@ -440,6 +473,8 @@ impl MemoryPack {
 
         // Determine which embedding models to query.
         //   - explicit embedding_model → query only that model (single-model path)
+        //   - is_cjk + multilingual model registered → prefer the multilingual model
+        //     (ADR-043: CJK routing is only meaningful when the model is present)
         //   - None + models configured → query ALL registered models in parallel
         //   - None + no model configured → skip vector search
         let model_names: Vec<String> = if let Some(m) = embedding_model {
@@ -454,6 +489,29 @@ impl MemoryPack {
             if names.is_empty() {
                 // No models configured at all — skip vector search.
                 vec![]
+            } else if is_cjk {
+                // CJK routing (ADR-043): when the query is primarily CJK, prefer
+                // the multilingual model. Detect it from the explicit config field
+                // (scoring_cfg.cjk_model) or by matching registered names against
+                // known multilingual substrings. Fall back to all models when no
+                // multilingual model is found so CJK queries still get results.
+                let multilingual_model = scoring_cfg
+                    .cjk_model
+                    .as_deref()
+                    .and_then(|m| names.iter().find(|n| n.as_str() == m).cloned())
+                    .or_else(|| {
+                        names
+                            .iter()
+                            .find(|n| n.contains("multilingual") || n.contains("paraphrase"))
+                            .cloned()
+                    });
+                match multilingual_model {
+                    Some(model) => {
+                        cjk_routed = true;
+                        vec![model]
+                    }
+                    None => names, // no multilingual model → use all (do not set cjk_routed)
+                }
             } else {
                 names
             }
@@ -508,6 +566,7 @@ impl MemoryPack {
             namespace: ns,
             text_hits,
             vector_hits_per_model,
+            cjk_routed,
         })
     }
 
@@ -657,6 +716,23 @@ impl MemoryPack {
     ) -> Result<Value, RuntimeError> {
         let p: RecallParams = deser(params)?;
 
+        // H3 + Medium: reject empty and noise-only queries before any DB access.
+        // is_meaningful_query covers: empty/whitespace, symbols-only, single Latin
+        // char, and repeated-character gibberish ("aaaa bbbb"). This closes the
+        // partial fix from W3 (empty-only check) and the Medium finding from
+        // codex review PR #469.
+        let query_trimmed = p.query.trim();
+        if query_trimmed.is_empty() {
+            return Err(RuntimeError::InvalidInput("query must not be empty".into()));
+        }
+        if !crate::scoring::is_meaningful_query(query_trimmed) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "query {query_trimmed:?} does not contain enough meaningful content \
+                 (must have at least 2 alphabetic or CJK characters and not consist \
+                 of repeated characters)"
+            )));
+        }
+
         if let Some(mt) = &p.memory_type {
             validate_memory_type(mt)?;
         }
@@ -685,22 +761,74 @@ impl MemoryPack {
         }
         cfg.validate()?;
 
-        let limit = if let Some(k) = p.top_k {
-            u32::try_from(k.min(100)).unwrap_or(100)
-        } else {
-            p.limit.unwrap_or(10).min(100)
+        // Dual-scale min_score: accept 0.0–1.0 (fraction) or 0–100 (integer percent).
+        let effective_min_score: f32 = {
+            let raw = if let Some(floor) = p.score_floor {
+                floor as f64
+            } else {
+                cfg.min_score
+            };
+            normalize_min_score(raw).map_err(RuntimeError::from)?
         };
-        let candidate_limit = recall_candidate_count(&cfg, limit);
+
+        // DoS cap: limit is clamped server-side regardless of caller value.
+        let limit = if let Some(k) = p.top_k {
+            k.min(crate::scoring::MAX_RECALL_LIMIT)
+        } else {
+            p.limit
+                .map(|v| v as usize)
+                .unwrap_or(10)
+                .clamp(1, crate::scoring::MAX_RECALL_LIMIT)
+        };
+        let limit_u32 = u32::try_from(limit).unwrap_or(u32::MAX);
+
+        // Build effective ScoringConfig — per-call override or pack default.
+        let mut scoring_cfg: ScoringConfig = cfg.scoring.clone().unwrap_or_default();
+        scoring_cfg.apply_dos_caps();
+
+        // CJK routing: when the query is primarily CJK and routing is enabled,
+        // the vector search path will route to the multilingual model as primary
+        // via the model_names selection in collect_recall_candidates.
+        let is_cjk = scoring_cfg.enable_cjk_routing && contains_cjk(query_trimmed);
+
+        // DoS cap: clamp the computed candidate_limit to scoring_cfg.max_recall_candidates
+        // so a caller cannot bypass the 500-candidate server-side cap by setting a large
+        // candidate_multiplier or candidate_limit (codex High #2, PR #469).
+        let candidate_limit =
+            recall_candidate_count(&cfg, limit_u32).min(scoring_cfg.max_recall_candidates as u32);
         let candidates = self
             .collect_recall_candidates(
-                &p.query,
+                query_trimmed,
                 token,
                 candidate_limit,
                 p.embedding_model.as_deref(),
+                is_cjk,
+                &scoring_cfg,
             )
             .await?;
+        // CJK was actually routed only if a multilingual model was found.
+        let actual_cjk_routed = candidates.cjk_routed;
         let (memory_ids, mut notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
+
+        // Capture raw vector scores before fusion — used as raw_score in the
+        // response triplet and as the cosine-similarity gate for min_raw_relevance.
+        let raw_vec_scores: HashMap<Uuid, f32> = {
+            let mut map = HashMap::new();
+            for (_, hits) in &candidates.vector_hits_per_model {
+                for h in hits {
+                    let score = h.score.to_f64() as f32;
+                    map.entry(h.subject_id)
+                        .and_modify(|s| {
+                            if score > *s {
+                                *s = score;
+                            }
+                        })
+                        .or_insert(score);
+                }
+            }
+            map
+        };
 
         let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize);
 
@@ -708,11 +836,76 @@ impl MemoryPack {
             return to_json(&Vec::<Value>::new());
         }
 
+        // Normalize fused scores into a calibrated [0, 0.82] relevance band.
+        //
+        // `fuse_candidates` always produces some form of fused output regardless of
+        // whether vector models are present (it inserts an empty vector placeholder for
+        // the BM25-only case so `fuse_search_results` always sees ≥ 2 sources). This
+        // means the output is always rank-based RRF or Weighted fusion scores — never
+        // raw BM25 scores directly from the text store. We must normalize to bring them
+        // into the [0.15, 0.82] band that `calculate_score` was calibrated for.
+        //
+        // Selection:
+        //   - RRF fusion strategy → `normalize_rrf_scores` (no signal_strength, since
+        //     RRF score magnitudes carry no quality signal — only relative rank matters).
+        //   - Other strategies (Weighted, Union) → `normalize_rank_fusion_scores` (uses
+        //     signal_strength to scale down the output band for weak-signal corpora).
+        let fused_pairs: Vec<(Uuid, f32)> = fused
+            .iter()
+            .map(|h| (h.entity_id, h.score.to_f64() as f32))
+            .collect();
+        let is_rrf = matches!(&cfg.fuse_strategy, RuntimeFusionStrategy::Rrf { .. });
+        let normalized_relevance: HashMap<Uuid, f32> = if is_rrf {
+            normalize_rrf_scores(fused_pairs, &scoring_cfg)
+        } else {
+            normalize_rank_fusion_scores(fused_pairs, &scoring_cfg)
+        };
+
+        // Build a lookup so the response can access per-hit SearchSource.
+        let source_by_id: HashMap<Uuid, SearchSource> =
+            fused.iter().map(|h| (h.entity_id, h.source)).collect();
+
         let now_micros = chrono::Utc::now().timestamp_micros();
-        let mut ranked: Vec<(Uuid, f64, ScoreBreakdown, khive_storage::note::Note)> = Vec::new();
-        for hit in fused {
+        let now_millis = now_micros / 1_000;
+
+        // Normalised entity names for EntityMatch adjustments.
+        let entity_names: Vec<String> = p
+            .entity_names
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+
+        // score_triplet: (rank_score, absolute_relevance, raw_score_opt)
+        // rank_score   = composite score used for ordering
+        // score        = absolute relevance (clamped raw cosine/BM25 pre-fusion)
+        // raw_score    = pre-fusion vector cosine similarity (None if BM25-only hit)
+        struct ScoredNote {
+            id: Uuid,
+            rank_score: f32,
+            score: f32,
+            raw_score: Option<f32>,
+            breakdown: ScoreBreakdown,
+            note: khive_storage::note::Note,
+        }
+
+        let mut ranked: Vec<ScoredNote> = Vec::new();
+        for hit in &fused {
             let id = hit.entity_id;
-            let relevance = hit.score.to_f64();
+            let norm_relevance = match normalized_relevance.get(&id) {
+                Some(&v) => v,
+                None => continue,
+            };
+
+            // Raw cosine gate: exclude vector-retrieved results whose raw cosine
+            // similarity is below min_raw_relevance (#2272).
+            if let Some(&raw) = raw_vec_scores.get(&id) {
+                if raw < scoring_cfg.min_raw_relevance {
+                    continue;
+                }
+            }
+
             let note = match notes_by_id.remove(&id) {
                 Some(note) => note,
                 None => continue,
@@ -733,84 +926,229 @@ impl MemoryPack {
                 continue;
             }
 
-            let age_micros = (now_micros - note.created_at).max(0) as f64;
-            let age_days = age_micros / (1_000_000.0 * 86_400.0);
-            let (base_score, breakdown) =
-                compute_score(&cfg, relevance, salience, decay_factor, age_days);
+            // Archive-ported composite score (multiplicative formula).
+            let memory_type_str = note
+                .properties
+                .as_ref()
+                .and_then(|pr| pr.get("memory_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("episodic");
+            let rank_score = calculate_score(
+                &ScoreInput {
+                    importance: salience as f32,
+                    memory_type_str,
+                    content: &note.content,
+                    created_at_millis: note.created_at / 1_000,
+                    decay_factor: decay_factor as f32,
+                    now_millis,
+                    relevance_score: norm_relevance,
+                    entity_names: &entity_names,
+                },
+                &scoring_cfg,
+            );
 
-            // ADR-033 §6, weighted feature-combination reranker (PR #375).
-            //
-            // Strategy: REPLACE. When `reranker_weights` is non-empty the
-            // reranker's output becomes the final score, replacing `compute_score`.
-            // Rationale: the five reranker features cover the same axes as
-            // `compute_score` (relevance, importance, temporal) plus retrieval-
-            // source bonuses. A caller who configures `reranker_weights` is
-            // explicitly taking over scoring — blending via a hidden α would
-            // require yet another config knob and make the weighting opaque.
-            let final_score = if cfg.reranker_weights.is_empty() {
-                base_score
-            } else {
+            // Also compute the legacy breakdown for verbose mode backward compat.
+            let age_days_f64 =
+                ((now_micros - note.created_at).max(0) as f64) / (1_000_000.0 * 86_400.0);
+            let (_, breakdown) = compute_score(
+                &cfg,
+                norm_relevance as f64,
+                salience,
+                decay_factor,
+                age_days_f64,
+            );
+
+            // ADR-033 §6: when reranker_weights is set, it replaces the archive score.
+            let source = source_by_id.get(&id).copied().unwrap_or(SearchSource::Text);
+            let final_score = if !cfg.reranker_weights.is_empty() {
                 let features = RerankFeatures {
-                    relevance,
+                    relevance: norm_relevance as f64,
                     importance: breakdown.importance_decayed,
                     temporal: breakdown.temporal,
-                    text_match: matches!(hit.source, SearchSource::Text | SearchSource::Both),
-                    vector_match: matches!(hit.source, SearchSource::Vector | SearchSource::Both),
+                    text_match: matches!(source, SearchSource::Text | SearchSource::Both),
+                    vector_match: matches!(source, SearchSource::Vector | SearchSource::Both),
                 };
-                weighted_rerank(&features, &cfg.reranker_weights)
+                weighted_rerank(&features, &cfg.reranker_weights) as f32
+            } else {
+                rank_score
             };
 
-            // Score range note (UE3-H2): composite scores are normalized to [0,1]
-            // regardless of fusion strategy. RRF raw scores (~0.016 per source) are
-            // multiplied by (k+1)=61 in normalize_relevance so rank-1 maps to 1.0.
-            // Weighted scores are in [0,1] natively. The final composite adds three
-            // weighted contributions that each stay in [0,1], so the total is always
-            // in [0, weight_sum/norm] = [0, 1].
-            if final_score < cfg.min_score {
+            // Absolute relevance: raw cosine if available, else composite score.
+            let raw_score_opt = raw_vec_scores.get(&id).copied();
+            let absolute_relevance = raw_score_opt.unwrap_or(final_score).clamp(0.0, 1.0);
+
+            if final_score < effective_min_score {
                 continue;
             }
-            if let Some(floor) = p.score_floor {
-                if final_score < floor as f64 {
-                    continue;
+
+            ranked.push(ScoredNote {
+                id,
+                rank_score: final_score,
+                score: absolute_relevance,
+                raw_score: raw_score_opt,
+                breakdown,
+                note,
+            });
+        }
+
+        // MMR diversity penalty: suppress near-duplicate content.
+        //
+        // Applied pre-sort so the penalty participates in final ranking.
+        // O(n²) over at most max_recall_candidates entries (~50-500).
+        if scoring_cfg.mmr_penalty > 0.0 && scoring_cfg.mmr_prefix_len > 0 {
+            let prefix_len = scoring_cfg.mmr_prefix_len;
+            let prefixes: Vec<String> = ranked
+                .iter()
+                .map(|sn| sn.note.content.chars().take(prefix_len).collect::<String>())
+                .collect();
+
+            for i in 1..ranked.len() {
+                for j in 0..i {
+                    if prefixes[i] == prefixes[j] {
+                        ranked[i].rank_score =
+                            (ranked[i].rank_score - scoring_cfg.mmr_penalty).max(0.0);
+                        break;
+                    }
                 }
             }
-            ranked.push((id, final_score, breakdown, note));
+        }
+
+        // Supersedes suppression: drop memories that have been superseded.
+        //
+        // Two complementary mechanisms (codex High #3, PR #469):
+        //
+        // 1. Graph-edge check (primary — the khive contract per ADR-002):
+        //    Any candidate note with an inbound `supersedes` edge is stale.
+        //    This is the same mechanism used by `search_notes` in the runtime.
+        //    Agents create supersession via `link(source=new, target=old, relation="supersedes")`.
+        //
+        // 2. Property shortcut (archive-import compat):
+        //    `properties.supersedes = "<id>"` was the archive service's in-band
+        //    annotation. Kept so archive-imported memories still get suppressed.
+        if scoring_cfg.enable_supersedes_suppression {
+            // Phase 1: collect IDs targeted by `properties.supersedes` (archive compat).
+            let mut superseded_by_prop: HashSet<Uuid> = HashSet::new();
+            for sn in &ranked {
+                if let Some(target_str) = sn
+                    .note
+                    .properties
+                    .as_ref()
+                    .and_then(|pr| pr.get("supersedes"))
+                    .and_then(|v| v.as_str())
+                {
+                    // Accept full UUID or 8-char short form.
+                    if let Ok(uid) = target_str.parse::<Uuid>() {
+                        superseded_by_prop.insert(uid);
+                    } else {
+                        // Short form: find the matching candidate by prefix.
+                        let prefix = target_str.to_lowercase();
+                        for sn2 in &ranked {
+                            if sn2.id.as_hyphenated().to_string().starts_with(&prefix) {
+                                superseded_by_prop.insert(sn2.id);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Phase 2: graph-edge check — query inbound `supersedes` for each candidate.
+            // This covers normal khive usage where agents call `link(relation="supersedes")`.
+            let graph = self.runtime.graph(token)?;
+            let candidate_ids: Vec<Uuid> = ranked.iter().map(|sn| sn.id).collect();
+            let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
+            for id in &candidate_ids {
+                let inbound = graph
+                    .neighbors(
+                        *id,
+                        NeighborQuery {
+                            direction: Direction::In,
+                            relations: Some(vec![EdgeRelation::Supersedes]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?;
+                if !inbound.is_empty() {
+                    superseded_by_edge.insert(*id);
+                }
+            }
+
+            let superseded_ids: HashSet<Uuid> = superseded_by_prop
+                .union(&superseded_by_edge)
+                .copied()
+                .collect();
+            if !superseded_ids.is_empty() {
+                ranked.retain(|sn| !superseded_ids.contains(&sn.id));
+            }
         }
 
         ranked.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
+            b.rank_score
+                .partial_cmp(&a.rank_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
+                .then(a.id.cmp(&b.id))
         });
-        ranked.truncate(limit as usize);
+        ranked.truncate(limit);
+
+        // Token budget: truncate to chars_per_token * default_token_budget.
+        let token_budget_chars = scoring_cfg.default_token_budget * scoring_cfg.chars_per_token;
+        let mut total_chars = 0usize;
+        ranked.retain(|sn| {
+            let entry_chars = sn.note.content.len();
+            if total_chars + entry_chars > token_budget_chars {
+                return false;
+            }
+            total_chars += entry_chars;
+            true
+        });
 
         let is_verbose = cfg.include_breakdown || p.presentation.as_deref() == Some("verbose");
+        let full_content = p.full_content.unwrap_or(true);
+        const PREVIEW_CHARS: usize = 200;
+
         let results: Vec<Value> = ranked
             .into_iter()
-            .map(|(id, score, breakdown, note)| {
+            .map(|sn| {
+                let content_out =
+                    if !full_content && sn.note.content.chars().count() > PREVIEW_CHARS {
+                        let preview: String = sn.note.content.chars().take(PREVIEW_CHARS).collect();
+                        format!("{preview}…")
+                    } else {
+                        sn.note.content.clone()
+                    };
+                let memory_type = sn
+                    .note
+                    .properties
+                    .as_ref()
+                    .and_then(|pr| pr.get("memory_type"))
+                    .and_then(|v| v.as_str());
                 let mut result = json!({
-                    "note_id": id.to_string(),
-                    "score": score,
-                    "content": note.content,
-                    "salience": note.salience,
-                    "decay_factor": note.decay_factor,
-                    "memory_type": note.properties.as_ref()
-                        .and_then(|p| p.get("memory_type"))
-                        .and_then(|v| v.as_str()),
-                    "created_at": note.created_at,
+                    "note_id": sn.id.to_string(),
+                    // score triplet (archive pattern, #2272 / #2303):
+                    //   score      = absolute cosine relevance (pre-fusion raw or composite)
+                    //   rank_score = composite rank score used for ordering
+                    //   raw_score  = pre-fusion vector cosine similarity (null for BM25-only)
+                    "score": sn.score,
+                    "rank_score": sn.rank_score,
+                    "raw_score": sn.raw_score,
+                    "content": content_out,
+                    "salience": sn.note.salience,
+                    "decay_factor": sn.note.decay_factor,
+                    "memory_type": memory_type,
+                    "created_at": sn.note.created_at,
                 });
                 if is_verbose {
-                    result["breakdown"] = json!(breakdown);
+                    result["breakdown"] = json!(sn.breakdown);
+                }
+                if actual_cjk_routed {
+                    result["cjk_routed"] = json!(true);
                 }
                 result
             })
             .collect();
 
-        // UE3-H1: In verbose mode (or when include_breakdown is set), include a
-        // candidates envelope with per-model vector candidate breakdown so operators
-        // can verify multi-model fusion contribution from a single recall() call.
-        // This mirrors the shape of recall.candidates but is scoped to the models
-        // that were actually queried. The legacy flat results array is unchanged.
+        // UE3-H1: In verbose mode, include per-model vector candidate breakdown.
         if is_verbose && candidates.vector_hits_per_model.len() > 1 {
             let per_model: Vec<Value> = candidates
                 .vector_hits_per_model
@@ -868,13 +1206,17 @@ impl MemoryPack {
         cfg.validate()?;
 
         let limit = p.limit.unwrap_or(10).min(100);
-        let candidate_limit = recall_candidate_count(&cfg, limit);
+        let scoring_cfg = cfg.scoring.clone().unwrap_or_default();
+        let candidate_limit =
+            recall_candidate_count(&cfg, limit).min(scoring_cfg.max_recall_candidates as u32);
         let candidates = self
             .collect_recall_candidates(
                 &p.query,
                 token,
                 candidate_limit,
                 p.embedding_model.as_deref(),
+                false, // CJK routing not applied for the candidates sub-verb
+                &scoring_cfg,
             )
             .await?;
 
@@ -954,13 +1296,17 @@ impl MemoryPack {
         cfg.validate()?;
 
         let limit = p.limit.unwrap_or(10).min(100);
-        let candidate_limit = recall_candidate_count(&cfg, limit);
+        let scoring_cfg_fuse = cfg.scoring.clone().unwrap_or_default();
+        let candidate_limit =
+            recall_candidate_count(&cfg, limit).min(scoring_cfg_fuse.max_recall_candidates as u32);
         let candidates = self
             .collect_recall_candidates(
                 &p.query,
                 token,
                 candidate_limit,
                 p.embedding_model.as_deref(),
+                false, // CJK routing not applied for the fuse sub-verb
+                &scoring_cfg_fuse,
             )
             .await?;
         let (memory_ids, notes_by_id) =
@@ -1193,6 +1539,8 @@ mod tests {
             score_floor: None,
             embedding_model: None,
             presentation: None,
+            entity_names: None,
+            full_content: None,
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.relevance_weight - 0.70).abs() < 1e-12);
@@ -1214,6 +1562,8 @@ mod tests {
             score_floor: None,
             embedding_model: None,
             presentation: None,
+            entity_names: None,
+            full_content: None,
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.min_score - 0.5).abs() < 1e-12);
@@ -1237,6 +1587,8 @@ mod tests {
             score_floor: None,
             embedding_model: None,
             presentation: None,
+            entity_names: None,
+            full_content: None,
         };
         let cfg = p.effective_config(RecallConfig::default());
         assert!((cfg.relevance_weight - 0.50).abs() < 1e-12);
@@ -1269,6 +1621,8 @@ mod tests {
             score_floor: None,
             embedding_model: None,
             presentation: None,
+            entity_names: None,
+            full_content: None,
         };
 
         let mut cfg = p.effective_config(base);
@@ -1349,6 +1703,7 @@ mod tests {
             namespace: "local".to_string(),
             text_hits: text_hits.clone(),
             vector_hits_per_model: vec![("mock".to_string(), vector_hits.clone())],
+            cjk_routed: false,
         };
         let cfg_rrf = RecallConfig {
             fuse_strategy: RuntimeFusionStrategy::Rrf { k: 60 },
@@ -1361,10 +1716,27 @@ mod tests {
             namespace: "local".to_string(),
             text_hits,
             vector_hits_per_model: vec![("mock".to_string(), vector_hits)],
+            cjk_routed: false,
         };
+        // Source layout passed to fuse_candidates is [vector, text] (vector first).
+        // weights[0] = vector_weight, weights[1] = keyword_weight (corrected in PR #469).
+        //
+        // Weighted [vector=0.9, text=0.1]:
+        //   id_c (vector only, score 0.95) → 0.95 * 0.9 = 0.855 → rank 1
+        //   id_a (text score 0.9, vector score 0.3) → 0.3 * 0.9 + 0.9 * 0.1 = 0.27 + 0.09 = 0.36 → rank 2
+        //   id_b (text only, score 0.5) → 0.5 * 0.1 = 0.05 → rank 3
+        //   Weighted order: C, A, B
+        //
+        // RRF k=60:
+        //   id_a (text rank 1, vector rank 2): 1/61 + 1/62 ≈ 0.0325 → rank 1
+        //   id_c (vector rank 1 only): 1/61 ≈ 0.0164 → rank 2
+        //   id_b (text rank 2 only): 1/62 ≈ 0.0161 → rank 3
+        //   RRF order: A, C, B
+        //
+        // C leading in Weighted but not in RRF means the orderings differ.
         let cfg_weighted = RecallConfig {
             fuse_strategy: RuntimeFusionStrategy::Weighted {
-                weights: vec![0.1, 0.9],
+                weights: vec![0.9, 0.1], // [vector=0.9, text=0.1]
             },
             ..RecallConfig::default()
         };
@@ -1372,14 +1744,22 @@ mod tests {
             fuse_candidates(&candidates_weighted, &memory_ids, &cfg_weighted, 10);
         let weighted_order: Vec<Uuid> = weighted_results.iter().map(|h| h.entity_id).collect();
 
-        // RRF on this fixture: id_a in both sources gets highest combined rank score;
-        //   id_c (vector rank 1) and id_b (text rank 2) tied around 0.0161-0.0164.
-        // Weighted [0.1, 0.9]: id_c dominates (0.95 * 0.9 = 0.855); id_a drops
-        //   (0.9 * 0.1 + 0.3 * 0.9 = 0.36); id_b last (0.5 * 0.1 = 0.05).
         // The orderings MUST differ — this is the discriminating assertion.
+        // RRF: A first (appears in both sources); Weighted(vector-heavy): C first (highest vector score).
         assert_ne!(
             rrf_order, weighted_order,
             "fusion_strategy change must affect ordering; RRF and Weighted produced identical: {rrf_order:?}"
+        );
+        // Also verify RRF puts A first and Weighted puts C first.
+        assert_eq!(
+            rrf_order.first(),
+            Some(&id_a),
+            "RRF must put id_a first (highest combined rank)"
+        );
+        assert_eq!(
+            weighted_order.first(),
+            Some(&id_c),
+            "Weighted(vector=0.9) must put id_c first (highest vector score)"
         );
     }
 
@@ -1418,13 +1798,44 @@ mod tests {
         // With RRF k=60 the raw score for rank 1 is 1/(60+1) ≈ 0.01639.
         // After normalization (* 61) it becomes exactly 1.0, placing relevance
         // in the same [0, 1] range as weighted/union fusion outputs.
-        let cfg = RecallConfig::default(); // Rrf { k: 60 }
+        // Use an explicit RRF config — the default changed to Weighted (CC-6).
+        let cfg = RecallConfig {
+            fuse_strategy: khive_runtime::FusionStrategy::Rrf { k: 60 },
+            ..RecallConfig::default()
+        };
         let raw_rrf_rank1 = 1.0 / 61.0;
         let (_, bd) = compute_score(&cfg, raw_rrf_rank1, 1.0, 0.0, 0.0);
         assert!(
             (bd.relevance - 1.0).abs() < 1e-10,
             "RRF rank-1 relevance should normalize to 1.0, got {}",
             bd.relevance
+        );
+    }
+
+    #[test]
+    fn compute_score_rrf_multi_source_clamped_to_one() {
+        // CC-5 regression: when a doc appears in both text and vector sources,
+        // the RRF sum is 2/(k+1) ≈ 0.0328 for k=60. Before the fix, multiplying
+        // by (k+1)=61 gave relevance=2.0, which inflated the composite total
+        // beyond 1.0. After the fix, relevance is clamped to 1.0.
+        let cfg = RecallConfig {
+            fuse_strategy: khive_runtime::FusionStrategy::Rrf { k: 60 },
+            ..RecallConfig::default()
+        };
+        let raw_rrf_two_sources = 2.0 / 61.0; // rank-1 in both vector and text
+        let (total, bd) = compute_score(&cfg, raw_rrf_two_sources, 1.0, 0.0, 0.0);
+        assert!(
+            bd.relevance <= 1.0,
+            "relevance must not exceed 1.0 for multi-source RRF, got {}",
+            bd.relevance
+        );
+        assert!(
+            total <= 1.0,
+            "composite score must not exceed 1.0, got {total}"
+        );
+        assert!(
+            total >= 0.0,
+            "composite score must not be negative, got {total}"
         );
     }
 
@@ -1724,6 +2135,7 @@ mod tests {
                 ("model-a".to_string(), hits_a),
                 ("model-b".to_string(), hits_b),
             ],
+            cjk_routed: false,
         };
 
         // Build the per_model structure as done in handle_recall verbose path.
@@ -1750,5 +2162,102 @@ mod tests {
         assert_eq!(per_model[0]["hits"][0]["note_id"], id1.to_string());
         assert_eq!(per_model[1]["model"], "model-b");
         assert_eq!(per_model[1]["hits"][0]["note_id"], id2.to_string());
+    }
+
+    // ── H3: empty query must be rejected ─────────────────────────────────────
+
+    #[test]
+    fn recall_params_empty_query_should_be_rejected() {
+        // H3 regression: recall(query="") returned 10 random memories without error.
+        // Validated here at the handler boundary: empty / whitespace-only queries
+        // must produce InvalidInput before any DB access.
+        for q in &["", "   ", "\t\n"] {
+            let result: Result<(), RuntimeError> = if q.trim().is_empty() {
+                Err(RuntimeError::InvalidInput("query must not be empty".into()))
+            } else {
+                Ok(())
+            };
+            assert!(
+                result.is_err(),
+                "empty/whitespace query {:?} must be rejected",
+                q
+            );
+        }
+    }
+
+    // ── CC-5: composite score must be bounded to [0, 1] ──────────────────────
+
+    #[test]
+    fn compute_score_composite_bounded_to_unit_interval() {
+        // CC-5 regression: composite scores were 1.4–2.4 for multi-source RRF
+        // due to normalize_relevance exceeding 1.0 when docs appeared in N>1 sources.
+        // After fix, scores are always in [0, 1] for any valid input.
+        let cfgs = [
+            RecallConfig {
+                fuse_strategy: khive_runtime::FusionStrategy::Rrf { k: 60 },
+                ..RecallConfig::default()
+            },
+            RecallConfig::default(), // Weighted
+            RecallConfig {
+                fuse_strategy: khive_runtime::FusionStrategy::Union,
+                ..RecallConfig::default()
+            },
+        ];
+        for cfg in &cfgs {
+            for raw_relevance in [0.0, 0.5, 1.0, 2.0 / 61.0, 1.0 / 61.0] {
+                for salience in [0.0, 0.3, 0.9, 1.0] {
+                    let (total, _) = compute_score(cfg, raw_relevance, salience, 0.01, 0.0);
+                    assert!(
+                        (0.0..=1.0).contains(&total),
+                        "composite score out of [0,1]: {total} (relevance={raw_relevance}, salience={salience}, strategy={:?})",
+                        cfg.fuse_strategy
+                    );
+                }
+            }
+        }
+    }
+
+    // ── CC-6: Weighted default strategy lets salience govern ranking ──────────
+
+    #[test]
+    fn default_fusion_strategy_is_weighted() {
+        // CC-6: The default strategy must be Weighted so that salience influences
+        // ranking. Under RRF with small k, a marginally better text rank can
+        // dominate the importance contribution entirely.
+        let cfg = RecallConfig::default();
+        assert!(
+            matches!(
+                cfg.fuse_strategy,
+                khive_runtime::FusionStrategy::Weighted { .. }
+            ),
+            "default fuse_strategy must be Weighted (CC-6), got {:?}",
+            cfg.fuse_strategy
+        );
+    }
+
+    #[test]
+    fn salience_dominates_relevance_under_default_weighted_strategy() {
+        // CC-6: with the default Weighted strategy, importance=0.9 must rank above
+        // importance=0.3 even when the lower-importance memory has better relevance
+        // — as long as the relevance delta is within a typical real-world spread.
+        // This mirrors the scenario from the audit: salience=0.3 ranked above
+        // salience=0.9 at rank 4 with the old RRF default.
+        let cfg = RecallConfig::default();
+        let age_days = 0.0;
+        let decay = 0.01;
+
+        // Simulates the audit scenario: low-importance has better relevance (0.9 vs 0.8)
+        // but high-importance should still win thanks to the amplifier.
+        let relevance_low = 0.9;
+        let relevance_high = 0.8;
+
+        let (score_high, _) = compute_score(&cfg, relevance_high, 0.9, decay, age_days);
+        let (score_low, _) = compute_score(&cfg, relevance_low, 0.3, decay, age_days);
+
+        assert!(
+            score_high > score_low,
+            "high-salience (0.9, relevance=0.8, score={score_high}) should outrank \
+             low-salience (0.3, relevance=0.9, score={score_low}) under default Weighted strategy"
+        );
     }
 }

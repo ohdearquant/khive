@@ -228,23 +228,38 @@ fn micros_to_dt(micros: i64) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-/// Escape an FTS5 query string to prevent injection.
+/// Sanitize an FTS5 query string to prevent driver errors from special chars.
 ///
-/// FTS5 special characters (`*`, `"`, `(`, `)`, `+`, `-`, `:`, `^`) and `.`
-/// are stripped. `.` is not an FTS5 operator but causes "syntax error near '.'"
-/// when it appears between digits (e.g. `0.9`) because the FTS5 tokenizer does
-/// not treat it as part of a word token. For Phrase mode, the caller wraps the
-/// result in double quotes.
+/// Two-pass approach:
+/// 1. **Replace** grouping/separator chars with spaces so adjacent tokens are
+///    not merged. This prevents `NEAR(smile,5)` from becoming `NEARsmile5`.
+///    Chars replaced with space: `(`, `)`, `,`
+/// 2. **Remove** remaining FTS5 operator characters (H1: `~`, `!` added):
+///    `*`, `"`, `+`, `-`, `:`, `^`, `.`, `~`, `!`, `\0`, control characters
+///
+/// After character processing, split on whitespace and remove FTS5 keyword
+/// tokens: AND, OR, NOT, NEAR.
+///
+/// For Phrase mode, the caller wraps the result in double quotes.
 fn sanitize_fts5_query(query: &str) -> String {
-    let sanitized: String = query
+    // Pass 1: replace grouping/separator chars with spaces to isolate tokens.
+    let spaced: String = query
+        .chars()
+        .map(|c| if matches!(c, '(' | ')' | ',') { ' ' } else { c })
+        .collect();
+
+    // Pass 2: remove remaining FTS5 special chars and control characters.
+    let sanitized: String = spaced
         .chars()
         .filter(|c| {
             !matches!(
                 c,
-                '*' | '"' | '(' | ')' | '+' | '-' | ':' | '^' | '.' | '\0'
+                '*' | '"' | '+' | '-' | ':' | '^' | '.' | '~' | '!' | '\0'
             ) && !c.is_control()
         })
         .collect();
+
+    // Pass 3: filter FTS5 operator keywords.
     sanitized
         .split_whitespace()
         .filter(|t| {
@@ -1209,6 +1224,63 @@ mod tests {
             "salience 09 vs 03"
         );
         assert_eq!(sanitize_fts5_query("version 1.2.3"), "version 123");
+        // H1: tilde and comma must be stripped to prevent FTS5 syntax errors
+        assert_eq!(sanitize_fts5_query("~hello"), "hello");
+        assert_eq!(sanitize_fts5_query("\"+_~!\""), "_");
+        assert_eq!(sanitize_fts5_query("NEAR(smile, 5)"), "smile 5");
+        assert_eq!(sanitize_fts5_query("a,b,c"), "a b c");
+    }
+
+    /// H1 regression: queries with tilde (~) must not produce "fts5: syntax error near '~'".
+    #[tokio::test]
+    async fn test_search_with_tilde_does_not_crash() {
+        let store = setup_memory_store("tilde_query");
+
+        store
+            .upsert_document(make_document(Uuid::new_v4(), "smile", "smiling face"))
+            .await
+            .unwrap();
+
+        let result = store
+            .search(TextSearchRequest {
+                query: "~smile".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "tilde query must not crash FTS5, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// H1 regression: NEAR() queries must not produce "fts5: syntax error near ','".
+    #[tokio::test]
+    async fn test_search_with_near_operator_does_not_crash() {
+        let store = setup_memory_store("near_query");
+
+        store
+            .upsert_document(make_document(Uuid::new_v4(), "smile", "quokka smile happy"))
+            .await
+            .unwrap();
+
+        let result = store
+            .search(TextSearchRequest {
+                query: "quokka NEAR(smile, 5)".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "NEAR() query must not crash FTS5, got: {:?}",
+            result.err()
+        );
     }
 
     /// M-C4 regression: searching with decimal numbers must succeed (not crash FTS5).
