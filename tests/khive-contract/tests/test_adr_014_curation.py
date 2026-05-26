@@ -43,12 +43,12 @@ def test_update_entity_fields(
     })
     assert updated is not None, "update returned None"
 
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     fetched = khive_session.verb("get", {"id": entity_id, "namespace": temp_namespace})
-    data = fetched["data"]
-    assert data.get("description") == "updated description", (
-        f"description not updated: {data.get('description')!r}"
+    assert fetched.get("description") == "updated description", (
+        f"description not updated: {fetched.get('description')!r}"
     )
-    tags = set(data.get("tags", []))
+    tags = set(fetched.get("tags", []))
     assert "new" in tags and "fresh" in tags, f"tags not updated: {tags}"
     assert "old" not in tags, f"old tag should be replaced: {tags}"
 
@@ -76,9 +76,10 @@ def test_update_edge_weight(
     khive_session.verb("update", {"id": edge_id, "kind": "edge", "namespace": temp_namespace,
                                    "weight": 0.9})
 
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     fetched = khive_session.verb("get", {"id": edge_id, "namespace": temp_namespace})
-    updated_weight = fetched["data"].get("weight")
-    assert updated_weight is not None, f"weight not in edge data: {fetched['data']}"
+    updated_weight = fetched.get("weight")
+    assert updated_weight is not None, f"weight not in edge response: {fetched}"
     assert abs(updated_weight - 0.9) < 0.01, (
         f"edge weight not updated: {updated_weight!r}"
     )
@@ -106,10 +107,10 @@ def test_update_note_content_and_salience(
     khive_session.verb("update", {"id": note_id, "kind": "note", "namespace": temp_namespace,
                                    "content": "updated content", "salience": 0.8})
 
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     fetched = khive_session.verb("get", {"id": note_id, "namespace": temp_namespace})
-    data = fetched["data"]
-    assert data.get("content") == "updated content", f"content not updated: {data}"
-    assert abs(data.get("salience", 0) - 0.8) < 0.01, f"salience not updated: {data}"
+    assert fetched.get("content") == "updated content", f"content not updated: {fetched}"
+    assert abs(fetched.get("salience", 0) - 0.8) < 0.01, f"salience not updated: {fetched}"
 
 
 @pytest.mark.adr_014
@@ -217,22 +218,22 @@ def test_merge_entity_rewires_edges_unions_tags_drops_self_loops(
         f"Expected not-found for merged-away entity: {first_gone.get('error')!r}"
     )
 
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     # Inbound edge must be rewired to kept_id
     rewired = khive_session.verb("get", {"id": e_inbound_id, "namespace": temp_namespace})
     assert rewired.get("kind") == "edge", f"rewired edge not found: {rewired}"
-    edge_data = rewired["data"]
-    assert edge_data.get("target_id") == kept["id"], (
+    assert rewired.get("target_id") == kept["id"], (
         f"Inbound edge target should be rewired to kept_id={kept['id']}, "
-        f"got target_id={edge_data.get('target_id')}"
+        f"got target_id={rewired.get('target_id')}"
     )
-    assert edge_data.get("source_id") == third["id"], (
-        f"Source should still be third={third['id']}, got {edge_data.get('source_id')}"
+    assert rewired.get("source_id") == third["id"], (
+        f"Source should still be third={third['id']}, got {rewired.get('source_id')}"
     )
 
     # Tags must be unioned on kept entity
     kept_after = khive_session.verb("get", {"id": kept["id"], "namespace": temp_namespace})
-    assert kept_after.get("kind") == "entity"
-    tags_after = set(kept_after["data"].get("tags", []))
+    assert kept_after.get("kind") == "concept"
+    tags_after = set(kept_after.get("tags", []))
     assert "alpha" in tags_after, f"Tag 'alpha' missing after merge: {tags_after}"
     assert "beta" in tags_after, f"Tag 'beta' missing after merge: {tags_after}"
     assert "gamma" in tags_after, f"Tag 'gamma' missing after merge: {tags_after}"

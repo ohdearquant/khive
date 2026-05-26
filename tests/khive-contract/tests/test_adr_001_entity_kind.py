@@ -54,18 +54,17 @@ def test_create_list_get_each_entity_kind(
         f"got {ids}"
     )
 
-    # get must return kind=="entity" wrapper with correct data
+    # Per P-H2 (ADR-045): get returns a flat object with granular kind at top —
+    # no {data: ...} wrapper, same shape as create/list.
     fetched = khive_session.verb("get", {"id": entity_id, "namespace": temp_namespace})
     assert fetched is not None, f"get({entity_id}) returned None"
-    assert fetched.get("kind") == "entity", (
-        f"get wrapper kind should be 'entity', got {fetched.get('kind')!r}"
+    assert "data" not in fetched, (
+        f"get must NOT wrap in {{data: ...}} (P-H2); got: {fetched}"
     )
-    data = fetched.get("data", {})
-    # data.kind holds the entity_kind value
-    assert data.get("kind") == entity_kind, (
-        f"get data kind mismatch: {data.get('kind')!r} != {entity_kind!r}"
+    assert fetched.get("kind") == entity_kind, (
+        f"get kind should be granular {entity_kind!r}, got {fetched.get('kind')!r}"
     )
-    assert data.get("name") == f"e_{entity_kind}", f"get data name mismatch: {data}"
+    assert fetched.get("name") == f"e_{entity_kind}", f"get name mismatch: {fetched}"
 
 
 @pytest.mark.adr_001
@@ -126,10 +125,12 @@ def test_create_entity_stores_description_and_tags(
     result = khive_session.verb("create", args)
     entity_id = result["id"]
 
+    # Per P-H2 (ADR-045): get returns flat object, no data wrapper.
     fetched = khive_session.verb("get", {"id": entity_id, "namespace": temp_namespace})
-    data = fetched["data"]
-    assert data.get("description") == "a test description", f"description not stored: {data}"
-    tags = set(data.get("tags", []))
+    assert fetched.get("description") == "a test description", (
+        f"description not stored: {fetched}"
+    )
+    tags = set(fetched.get("tags", []))
     assert "alpha" in tags and "beta" in tags, f"tags not stored correctly: {tags}"
 
 

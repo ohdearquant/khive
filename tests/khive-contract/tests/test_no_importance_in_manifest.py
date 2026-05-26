@@ -91,6 +91,10 @@ def test_memory_request_description_contains_no_importance_param(
     )
 
 
+# TODO: This test currently fails because `crates/khive-pack-memory/src/scoring.rs`
+# still contains residual `importance` identifiers (the salience rename is incomplete).
+# Fix: complete the rename in scoring.rs and update any related test fixtures that
+# still reference the old identifier. Do NOT fix this test — it is the guard.
 @pytest.mark.adr_021
 def test_no_importance_identifiers_in_repo() -> None:
     """Full repository sweep: no non-allowed 'importance' identifier exists.

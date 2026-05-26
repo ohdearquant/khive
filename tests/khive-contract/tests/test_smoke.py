@@ -68,10 +68,11 @@ def test_kg_smoke(
     })
     paper_id = paper["id"]
 
+    # Per P-H2 (ADR-045): get returns flat object with granular kind — no {data: ...} wrapper.
     # get entity
     fetched = khive_session.verb("get", {"id": lora_id, "namespace": ns})
-    assert fetched.get("kind") == "entity", f"get must return kind=entity: {fetched}"
-    assert fetched["data"]["name"] == "SmokeLoRA", f"get data name mismatch: {fetched}"
+    assert fetched.get("kind") == "concept", f"get must return granular kind 'concept': {fetched}"
+    assert fetched.get("name") == "SmokeLoRA", f"get name mismatch: {fetched}"
 
     # list entities
     concepts = khive_session.verb("list", {"kind": "entity", "entity_kind": "concept",

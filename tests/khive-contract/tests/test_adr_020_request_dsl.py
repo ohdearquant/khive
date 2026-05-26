@@ -44,10 +44,10 @@ def test_function_call_single_operation_form(
     entity_id = results[0]["result"]["id"]
     assert entity_id, "Expected entity id in result"
 
-    # The created entity must be gettable
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     fetched = khive_session.verb("get", {"id": entity_id, "namespace": temp_namespace})
-    assert fetched.get("kind") == "entity"
-    assert fetched["data"]["name"] == name
+    assert fetched.get("kind") == "concept"
+    assert fetched.get("name") == name
 
 
 @pytest.mark.adr_016
@@ -107,10 +107,11 @@ def test_short_uuid_prefix_resolution_rules(
     prefix7 = full_id[:7]
     prefix_bad = "ZZZZZZZZ"
 
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     # 8-char prefix must resolve
     fetched = khive_session.verb("get", {"id": prefix8, "namespace": temp_namespace})
-    assert fetched.get("kind") == "entity"
-    assert fetched["data"]["name"] == "PrefixTarget", (
+    assert fetched.get("kind") == "concept"
+    assert fetched.get("name") == "PrefixTarget", (
         f"8-char prefix did not resolve to PrefixTarget: {fetched}"
     )
 

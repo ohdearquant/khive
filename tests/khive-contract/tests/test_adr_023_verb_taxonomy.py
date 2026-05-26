@@ -54,9 +54,10 @@ def test_kg_bare_product_verbs_are_reachable(
     assert entity_a.get("id"), "create entity must return id"
     assert note.get("id"), "create note must return id"
 
+    # Per P-H2 (ADR-045): get returns flat object with granular kind — no "entity" wrapper.
     # get
     fetched = khive_session.verb("get", {"id": entity_a["id"], "namespace": ns})
-    assert fetched.get("kind") == "entity", f"get must return entity wrapper: {fetched}"
+    assert fetched.get("kind") == "concept", f"get must return granular kind 'concept': {fetched}"
 
     # list
     entities = khive_session.verb("list", {"kind": "entity", "entity_kind": "concept",

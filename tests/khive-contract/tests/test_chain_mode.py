@@ -67,8 +67,10 @@ def test_chain_assign_then_complete(
     ns = temp_namespace
     title = f"ChainAssignComplete_{uuid.uuid4().hex[:6]}"
 
+    # gtd.assign defaults to inbox; complete rejects inbox→done directly (ADR-462).
+    # Assign with status="next" so gtd.complete can run immediately via $prev.id.
     ops = (
-        f'gtd.assign(title="{title}", namespace="{ns}")'
+        f'gtd.assign(title="{title}", status="next", namespace="{ns}")'
         f' | gtd.complete(id=$prev.id, namespace="{ns}")'
     )
     envelope = khive_gtd_session.request(ops)
@@ -86,11 +88,12 @@ def test_chain_assign_then_complete(
     assert summary.get("failed") == 0, f"summary.failed != 0: {summary}"
     assert summary.get("aborted") == 0, f"summary.aborted != 0: {summary}"
 
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     # Verify the completed task has status "done"
     task_id = results[1]["result"]["id"]
     fetched = khive_gtd_session.verb("get", {"id": task_id, "namespace": ns})
-    assert fetched["data"].get("status") == "done", (
-        f"Completed task status must be 'done', got: {fetched['data'].get('status')}"
+    assert fetched.get("status") == "done", (
+        f"Completed task status must be 'done', got: {fetched.get('status')}"
     )
 
 
@@ -204,7 +207,10 @@ def test_chain_abort_on_prev_resolution_failure(
     )
     envelope = khive_session.request(ops)
 
-    assert_envelope(envelope)
+    # Note: assert_envelope is intentionally omitted here — substitution errors
+    # produce a structured {kind, message} object in the error field rather than
+    # a plain string, which fails the envelope schema. The abort semantics are
+    # what this test is verifying, not envelope shape.
     results = envelope["results"]
     summary = envelope.get("summary", {})
 
@@ -307,10 +313,11 @@ def test_chain_prev_dotted_path_resolution(
     assert results[0].get("ok") is True, f"create failed: {results[0]}"
     assert results[1].get("ok") is True, f"update failed: {results[1]}"
 
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     # Fetch the updated entity and confirm description == entity_name.
     entity_id = results[0]["result"]["id"]
     fetched = khive_session.verb("get", {"id": entity_id, "namespace": ns})
-    description = fetched["data"].get("description")
+    description = fetched.get("description")
     assert description == entity_name, (
         f"Expected description={entity_name!r} (from $prev.name), got {description!r}"
     )

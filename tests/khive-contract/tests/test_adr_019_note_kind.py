@@ -60,19 +60,18 @@ def test_create_list_get_each_base_note_kind(
         f"list(note_kind={note_kind}) omitted id={note_id}; got {ids}"
     )
 
-    # get must return kind=="note" wrapper
+    # Per P-H2 (ADR-045): get returns flat object with granular kind at top —
+    # no {data: ...} wrapper, same shape as create/list.
     fetched = khive_session.verb("get", {"id": note_id, "namespace": temp_namespace})
     assert fetched is not None
-    assert fetched.get("kind") == "note", (
-        f"get wrapper kind should be 'note', got {fetched.get('kind')!r}"
+    assert "data" not in fetched, (
+        f"get must NOT wrap in {{data: ...}} (P-H2); got: {fetched}"
     )
-    data = fetched.get("data", {})
-    # data.kind holds the note_kind value
-    assert data.get("kind") == note_kind, (
-        f"get data kind mismatch: {data.get('kind')!r} != {note_kind!r}"
+    assert fetched.get("kind") == note_kind, (
+        f"get kind should be granular {note_kind!r}, got {fetched.get('kind')!r}"
     )
-    assert data.get("content") == f"content for {note_kind} note", (
-        f"get data content mismatch: {data}"
+    assert fetched.get("content") == f"content for {note_kind} note", (
+        f"get content mismatch: {fetched}"
     )
 
 
@@ -166,16 +165,17 @@ def test_note_supersession_search_excludes_old_but_get_keeps_both(
         f"New note (new_id={new_id}) must appear in search results; hits: {hit_ids}"
     )
 
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     # get(old_id) must still succeed — superseded is not deleted
     fetched_old = khive_session.verb("get", {"id": old_id, "namespace": temp_namespace})
-    assert fetched_old.get("kind") == "note", (
+    assert fetched_old.get("kind") == "observation", (
         f"Superseded note must still be gettable via get(), got: {fetched_old}"
     )
-    assert fetched_old["data"].get("content") == "SupersededContent unique_token_abc_ns"
+    assert fetched_old.get("content") == "SupersededContent unique_token_abc_ns"
 
     # get(new_id) must also succeed
     fetched_new = khive_session.verb("get", {"id": new_id, "namespace": temp_namespace})
-    assert fetched_new.get("kind") == "note"
+    assert fetched_new.get("kind") == "insight"
 
 
 @pytest.mark.adr_013
@@ -194,8 +194,8 @@ def test_note_salience_stored_and_retrievable(
     result = khive_session.verb("create", args)
     note_id = result["id"]
 
+    # Per P-H2 (ADR-045): get returns flat object — no {data: ...} wrapper.
     fetched = khive_session.verb("get", {"id": note_id, "namespace": temp_namespace})
-    data = fetched["data"]
-    salience = data.get("salience")
-    assert salience is not None, f"salience not stored: {data}"
+    salience = fetched.get("salience")
+    assert salience is not None, f"salience not stored: {fetched}"
     assert abs(salience - 0.75) < 0.01, f"salience value mismatch: {salience}"

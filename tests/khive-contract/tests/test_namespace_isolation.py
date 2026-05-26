@@ -77,13 +77,14 @@ def test_read_isolation_between_namespaces(
         f"AlphaEntity appeared in beta namespace search: {hit_ids_beta}"
     )
 
+    # Per P-H2 (ADR-045): get returns flat object with granular kind — no {data: ...} wrapper.
     # get from alpha must succeed
     fetched = khive_session.verb("get", {"id": full_id, "namespace": ns_alpha})
-    assert fetched.get("kind") == "entity", (
-        f"get from alpha must return kind=entity, got: {fetched}"
+    assert fetched.get("kind") == "concept", (
+        f"get from alpha must return kind=concept, got: {fetched}"
     )
-    assert fetched["data"]["name"] == "AlphaEntity", (
-        f"Entity name mismatch: {fetched['data']}"
+    assert fetched.get("name") == "AlphaEntity", (
+        f"Entity name mismatch: {fetched}"
     )
 
     # 8-char prefix from beta must not resolve to the alpha entity
