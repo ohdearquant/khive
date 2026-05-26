@@ -101,10 +101,10 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[ParamDef {
-            name: "id",
+            name: "profile_id",
             param_type: "string",
             required: true,
-            description: "Profile ID string (e.g. \"balanced-recall-v1\"). NOT a UUID — use the string identifier.",
+            description: "Profile ID string (e.g. \"balanced-recall-v1\"). NOT a UUID — use the string identifier. Alias: id.",
         }],
     },
     HandlerDef {
@@ -175,7 +175,12 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
         description: "Reset posteriors to priors (preserves event history)",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
-        params: &[],
+        params: &[ParamDef {
+            name: "profile_id",
+            param_type: "string",
+            required: true,
+            description: "Profile ID to reset (must exist and be active). Use brain.profiles() to list profiles.",
+        }],
     },
     HandlerDef {
         name: "brain.feedback",
@@ -244,7 +249,7 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.unbind",
-        description: "Remove rows from the profile resolution table",
+        description: "Remove rows from the profile resolution table. At least one filter (profile_id, actor, namespace, or consumer_kind) is required.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
@@ -252,7 +257,7 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "profile_id",
                 param_type: "string",
                 required: false,
-                description: "Remove bindings for this profile ID. All filters use AND semantics.",
+                description: "Remove bindings for this profile ID. All filters use AND semantics. At least one filter is required.",
             },
             ParamDef {
                 name: "actor",
@@ -271,6 +276,64 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Remove bindings for this consumer_kind.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "brain.bindings",
+        description: "List rows in the profile resolution table, optionally filtered",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "profile_id",
+                param_type: "string",
+                required: false,
+                description: "Filter bindings by profile ID.",
+            },
+            ParamDef {
+                name: "actor",
+                param_type: "string",
+                required: false,
+                description: "Filter bindings by actor.",
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Filter bindings by namespace.",
+            },
+            ParamDef {
+                name: "consumer_kind",
+                param_type: "string",
+                required: false,
+                description: "Filter bindings by consumer_kind.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "brain.create_profile",
+        description: "Create a new brain profile with given name and optional seed priors",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "name",
+                param_type: "string",
+                required: true,
+                description: "Profile ID / name (alphanumeric, hyphens allowed, e.g. \"my-profile-v1\"). Must be unique.",
+            },
+            ParamDef {
+                name: "description",
+                param_type: "string",
+                required: false,
+                description: "Human-readable description for this profile.",
+            },
+            ParamDef {
+                name: "consumer_kind",
+                param_type: "string",
+                required: false,
+                description: "Operation kind this profile targets (e.g. \"recall\"). Default \"recall\".",
             },
         ],
     },
@@ -525,18 +588,24 @@ impl BrainPack {
     // ── brain.profile ─────────────────────────────────────────────────────
 
     async fn handle_profile(&self, params: Value) -> Result<Value, RuntimeError> {
+        // H4: accept both `profile_id` (canonical) and `id` (legacy alias).
         #[derive(Deserialize)]
         struct ProfileParams {
-            id: String,
+            profile_id: Option<String>,
+            id: Option<String>,
         }
         let p: ProfileParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        let profile_id = p
+            .profile_id
+            .or(p.id)
+            .ok_or_else(|| RuntimeError::InvalidInput("missing field `profile_id`".into()))?;
 
         let state = self.state.lock().unwrap();
         let record = state
             .profiles
-            .get(&p.id)
-            .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", p.id)))?;
+            .get(&profile_id)
+            .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?;
 
         Ok(json!({
             "id": record.id,
@@ -564,11 +633,15 @@ impl BrainPack {
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         let state = self.state.lock().unwrap();
-        match state.resolve(p.actor.as_deref(), p.namespace.as_deref(), &p.consumer_kind) {
-            Some(record) => Ok(json!({
+        // H3: return requested_consumer_kind + matched_consumer_kind separately so
+        // callers can distinguish a wildcard-binding match ("*") from an exact match.
+        match state.resolve_with_match(p.actor.as_deref(), p.namespace.as_deref(), &p.consumer_kind)
+        {
+            Some((record, matched_kind)) => Ok(json!({
                 "resolved_profile_id": record.id,
                 "lifecycle": record.lifecycle,
-                "consumer_kind": record.consumer_kind,
+                "requested_consumer_kind": p.consumer_kind,
+                "matched_consumer_kind": matched_kind,
             })),
             None => Err(RuntimeError::NotFound(format!(
                 "no profile resolved for consumer_kind={:?}",
@@ -645,15 +718,59 @@ impl BrainPack {
 
     // ── brain.reset ───────────────────────────────────────────────────────
 
-    async fn handle_reset(&self, _params: Value) -> Result<Value, RuntimeError> {
+    async fn handle_reset(&self, params: Value) -> Result<Value, RuntimeError> {
+        // C1: profile_id is required; validate existence and reject archived.
+        #[derive(Deserialize)]
+        struct ResetParams {
+            profile_id: String,
+        }
+        let p: ResetParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
         let mut state = self.state.lock().unwrap();
-        state.reset_posteriors();
-        // Fix #295: sync profile record after reset so brain.profile reflects
-        // the restored domain-informed priors, not stale pre-reset values.
-        sync_balanced_recall_record(&mut state);
+
+        // Validate profile exists.
+        let lifecycle = state
+            .profiles
+            .get(&p.profile_id)
+            .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", p.profile_id)))?
+            .lifecycle
+            .clone();
+
+        // Reject archived profiles — archive is terminal and read-only.
+        if lifecycle == ProfileLifecycle::Archived {
+            return Err(RuntimeError::InvalidInput(format!(
+                "profile {:?} is archived; archive is terminal and reset is not permitted",
+                p.profile_id
+            )));
+        }
+
+        if p.profile_id == "balanced-recall-v1" {
+            state.reset_posteriors();
+            // Fix #295: sync profile record after reset so brain.profile reflects
+            // the restored domain-informed priors, not stale pre-reset values.
+            sync_balanced_recall_record(&mut state);
+        } else if state.profile_states.contains_key(&p.profile_id) {
+            // User-created Bayesian profile — reset its own posteriors.
+            state.reset_profile_posteriors(&p.profile_id);
+        } else {
+            // Profile exists in registry but has no live state (e.g. non-Bayesian).
+            // Increment exploration_epoch on the record to mark the reset event.
+            if let Some(record) = state.profiles.get_mut(&p.profile_id) {
+                record.exploration_epoch += 1;
+            }
+        }
+
+        let epoch = if p.profile_id == "balanced-recall-v1" {
+            state.balanced_recall.exploration_epoch
+        } else {
+            state.profiles[&p.profile_id].exploration_epoch
+        };
+
         Ok(json!({
             "reset": true,
-            "exploration_epoch": state.balanced_recall.exploration_epoch,
+            "profile_id": p.profile_id,
+            "exploration_epoch": epoch,
         }))
     }
 
@@ -689,6 +806,45 @@ impl BrainPack {
             }
         };
 
+        // C4: validate target_id resolves to an existing record in this namespace.
+        let resolved = self
+            .runtime
+            .resolve(token, target)
+            .await
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        if resolved.is_none() {
+            return Err(RuntimeError::NotFound(format!(
+                "target_id {:?} not found in namespace {:?}",
+                target,
+                token.namespace().as_str()
+            )));
+        }
+
+        // C4: compute the effective serving profile (explicit or default), then validate
+        // that it exists in the registry and is not Archived (ADR-032 §1106).
+        let effective_profile = p
+            .served_by_profile_id
+            .as_deref()
+            .unwrap_or("balanced-recall-v1");
+        {
+            let state = self.state.lock().unwrap();
+            match state.profiles.get(effective_profile) {
+                None => {
+                    return Err(RuntimeError::NotFound(format!(
+                        "serving profile {:?} not found in profile registry",
+                        effective_profile
+                    )));
+                }
+                Some(rec) if rec.lifecycle == crate::state::ProfileLifecycle::Archived => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "serving profile {:?} is archived; feedback cannot credit archived profiles",
+                        effective_profile
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+
         let mut data = json!({"signal": signal});
         if let Some(ref profile_id) = p.served_by_profile_id {
             data["served_by_profile_id"] = json!(profile_id);
@@ -710,18 +866,51 @@ impl BrainPack {
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        // Update balanced-recall profile state from this event
         let ctx = FoldContext::new();
         let mut state = self.state.lock().unwrap();
-        let current_recall = std::mem::replace(
-            &mut state.balanced_recall,
-            crate::state::BalancedRecallState::new(0),
-        );
-        let updated = self.fold.reduce(current_recall, &event, &ctx);
-        state.balanced_recall = updated;
 
-        // Fix #356 (MAJ-003): sync profile record metadata via shared helper.
-        sync_balanced_recall_record(&mut state);
+        // Route feedback to the served profile's state, or to the built-in default.
+        let serving_profile = p
+            .served_by_profile_id
+            .as_deref()
+            .unwrap_or("balanced-recall-v1");
+
+        if serving_profile == "balanced-recall-v1" {
+            // Update the built-in balanced-recall state.
+            let current_recall = std::mem::replace(
+                &mut state.balanced_recall,
+                crate::state::BalancedRecallState::new(0),
+            );
+            let updated = self.fold.reduce(current_recall, &event, &ctx);
+            state.balanced_recall = updated;
+            // Fix #356 (MAJ-003): sync profile record metadata via shared helper.
+            sync_balanced_recall_record(&mut state);
+        } else if state.profile_states.contains_key(serving_profile) {
+            // Update the user-created profile's own state.
+            let current = state
+                .profile_states
+                .remove(serving_profile)
+                .expect("key checked above");
+            let updated = self.fold.reduce(current, &event, &ctx);
+            let snap = serde_json::to_value(updated.to_snapshot()).ok();
+            let total = updated.total_events;
+            state
+                .profile_states
+                .insert(serving_profile.to_string(), updated);
+            if let Some(record) = state.profiles.get_mut(serving_profile) {
+                record.total_events = total;
+                record.state_snapshot = snap;
+            }
+        } else {
+            // Profile exists in registry but has no live state — fall back to built-in.
+            let current_recall = std::mem::replace(
+                &mut state.balanced_recall,
+                crate::state::BalancedRecallState::new(0),
+            );
+            let updated = self.fold.reduce(current_recall, &event, &ctx);
+            state.balanced_recall = updated;
+            sync_balanced_recall_record(&mut state);
+        }
 
         Ok(json!({
             "emitted": true,
@@ -760,12 +949,21 @@ impl BrainPack {
 
         let mut state = self.state.lock().unwrap();
 
-        // Verify the profile exists
-        if !state.profiles.contains_key(&p.profile_id) {
-            return Err(RuntimeError::NotFound(format!(
-                "profile {:?}",
-                p.profile_id
-            )));
+        // Verify the profile exists and is not archived (C3: archived = terminal, no new bindings).
+        match state.profiles.get(&p.profile_id) {
+            None => {
+                return Err(RuntimeError::NotFound(format!(
+                    "profile {:?}",
+                    p.profile_id
+                )));
+            }
+            Some(record) if record.lifecycle == ProfileLifecycle::Archived => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "profile {:?} is archived; bindings to archived profiles are not permitted",
+                    p.profile_id
+                )));
+            }
+            Some(_) => {}
         }
 
         let actor = p.actor.unwrap_or_else(|| "*".into());
@@ -821,6 +1019,17 @@ impl BrainPack {
         let p: UnbindParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
+        // C2: require at least one non-null filter to prevent accidental bulk-delete.
+        if p.profile_id.is_none()
+            && p.actor.is_none()
+            && p.namespace.is_none()
+            && p.consumer_kind.is_none()
+        {
+            return Err(RuntimeError::InvalidInput(
+                "unbind requires at least one filter; pass profile_id, actor, namespace, or consumer_kind".into(),
+            ));
+        }
+
         let mut state = self.state.lock().unwrap();
         let before = state.bindings.len();
 
@@ -840,6 +1049,132 @@ impl BrainPack {
 
         let removed = before - state.bindings.len();
         Ok(json!({ "unbound": removed }))
+    }
+
+    // ── brain.bindings ────────────────────────────────────────────────────
+
+    async fn handle_bindings(&self, params: Value) -> Result<Value, RuntimeError> {
+        // H2: inspection verb — list binding rows, optionally filtered.
+        #[derive(Deserialize)]
+        struct BindingsParams {
+            profile_id: Option<String>,
+            actor: Option<String>,
+            namespace: Option<String>,
+            consumer_kind: Option<String>,
+        }
+        let p: BindingsParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        let state = self.state.lock().unwrap();
+        let rows: Vec<Value> = state
+            .bindings
+            .iter()
+            .filter(|b| {
+                p.profile_id.as_ref().is_none_or(|id| &b.profile_id == id)
+                    && p.actor.as_ref().is_none_or(|a| &b.actor == a)
+                    && p.namespace.as_ref().is_none_or(|n| &b.namespace == n)
+                    && p.consumer_kind
+                        .as_ref()
+                        .is_none_or(|k| &b.consumer_kind == k)
+            })
+            .map(|b| {
+                json!({
+                    "profile_id": b.profile_id,
+                    "actor": b.actor,
+                    "namespace": b.namespace,
+                    "consumer_kind": b.consumer_kind,
+                    "priority": b.priority,
+                    "created_at": b.created_at,
+                })
+            })
+            .collect();
+
+        Ok(json!({ "count": rows.len(), "bindings": rows }))
+    }
+
+    // ── brain.create_profile ──────────────────────────────────────────────
+
+    async fn handle_create_profile(&self, params: Value) -> Result<Value, RuntimeError> {
+        // H1: allow external agents to create new profiles via MCP.
+        #[derive(Deserialize)]
+        struct CreateProfileParams {
+            name: String,
+            description: Option<String>,
+            consumer_kind: Option<String>,
+        }
+        let p: CreateProfileParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        // Validate profile-id grammar: trim, reject empty, enforce ASCII alphanumeric + hyphen.
+        let name = p.name.trim().to_string();
+        if name.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "name must not be empty or whitespace-only".into(),
+            ));
+        }
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(RuntimeError::InvalidInput(format!(
+                "name {:?} is invalid; profile IDs must match [a-zA-Z0-9-]+ (alphanumeric and hyphens only)",
+                name
+            )));
+        }
+        let p_name = name;
+
+        // High: validate consumer_kind — reject empty/whitespace and wildcard sentinel.
+        let consumer_kind = p.consumer_kind.unwrap_or_else(|| "recall".into());
+        let ck_trimmed = consumer_kind.trim();
+        if ck_trimmed.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "consumer_kind must not be empty or whitespace".into(),
+            ));
+        }
+        if ck_trimmed == "*" {
+            return Err(RuntimeError::InvalidInput(
+                "consumer_kind '*' is the wildcard sentinel and is not permitted for profile creation; provide a specific operation kind (e.g. \"recall\", \"search\")"
+                    .into(),
+            ));
+        }
+
+        let description = p
+            .description
+            .unwrap_or_else(|| format!("User-created profile: {}", p_name));
+
+        let mut state = self.state.lock().unwrap();
+
+        if state.profiles.contains_key(&p_name) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "profile {:?} already exists",
+                p_name
+            )));
+        }
+
+        // Initialize live BalancedRecallState for this profile so that reset and
+        // feedback can route to its actual posteriors rather than a metadata-only record.
+        let ps = crate::state::BalancedRecallState::new(ENTITY_CACHE_CAPACITY);
+        let snap = serde_json::to_value(ps.to_snapshot()).ok();
+
+        let record = ProfileRecord {
+            id: p_name.clone(),
+            description: description.clone(),
+            consumer_kind: consumer_kind.clone(),
+            state_class: "Bayesian".into(),
+            lifecycle: ProfileLifecycle::Inactive,
+            created_at: Utc::now(),
+            state_snapshot: snap,
+            total_events: 0,
+            exploration_epoch: 0,
+        };
+
+        state.profiles.insert(p_name.clone(), record);
+        state.profile_states.insert(p_name.clone(), ps);
+
+        Ok(json!({
+            "created": true,
+            "profile_id": p_name,
+            "consumer_kind": consumer_kind,
+            "lifecycle": "inactive",
+            "description": description,
+        }))
     }
 }
 
@@ -902,6 +1237,7 @@ impl PackRuntime for BrainPack {
             "brain.profiles" => self.handle_profiles(params).await,
             "brain.profile" => self.handle_profile(params).await,
             "brain.resolve" => self.handle_resolve(params).await,
+            "brain.bindings" => self.handle_bindings(params).await,
             // Commissive
             "brain.activate" => self.handle_activate(params).await,
             "brain.deactivate" => self.handle_deactivate(params).await,
@@ -911,6 +1247,7 @@ impl PackRuntime for BrainPack {
             // Declaration
             "brain.bind" => self.handle_bind(params).await,
             "brain.unbind" => self.handle_unbind(params).await,
+            "brain.create_profile" => self.handle_create_profile(params).await,
             // Legacy
             "brain.emit" => self.handle_emit(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
@@ -975,6 +1312,16 @@ mod tests {
             .expect("empty registry builds successfully")
     }
 
+    /// Create a real entity in the runtime and return its UUID string.
+    /// Used by feedback tests that need a valid target_id (C4 validation).
+    async fn create_test_entity(rt: &KhiveRuntime, token: &NamespaceToken) -> String {
+        let entity = rt
+            .create_entity(token, "concept", None, "test-target", None, None, vec![])
+            .await
+            .expect("create test entity");
+        entity.id.to_string()
+    }
+
     #[tokio::test]
     async fn dispatch_unknown_verb_returns_invalid_input() {
         let (pack, rt) = make_pack();
@@ -1005,7 +1352,7 @@ mod tests {
         let result = pack
             .dispatch(
                 "brain.reset",
-                json!({}),
+                json!({"profile_id": "balanced-recall-v1"}),
                 &registry,
                 &rt.authorize(Namespace::local()),
             )
@@ -1013,6 +1360,88 @@ mod tests {
             .unwrap();
         assert_eq!(result["reset"], json!(true));
         assert_eq!(result["exploration_epoch"], json!(1u64));
+        assert_eq!(result["profile_id"], json!("balanced-recall-v1"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_reset_no_args_returns_invalid_input() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let err = pack
+            .dispatch(
+                "brain.reset",
+                json!({}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "reset with no args must return InvalidInput, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_reset_nonexistent_profile_returns_not_found() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let err = pack
+            .dispatch(
+                "brain.reset",
+                json!({"profile_id": "ghost-profile"}),
+                &registry,
+                &rt.authorize(Namespace::local()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NotFound(_)),
+            "reset on nonexistent profile must return NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_reset_archived_profile_returns_invalid_input() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Archive the profile via the lifecycle DAG
+        pack.dispatch(
+            "brain.deactivate",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.archive",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let err = pack
+            .dispatch(
+                "brain.reset",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("archived") || msg.contains("terminal"),
+                "reset on archived profile must mention 'archived' or 'terminal'; got: {msg}"
+            );
+        } else {
+            panic!("reset on archived profile must return InvalidInput, got {err:?}");
+        }
     }
 
     #[tokio::test]
@@ -1646,7 +2075,7 @@ mod tests {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
         let token = rt.authorize(Namespace::local());
-        let target = "00000000-0000-0000-0000-000000000001";
+        let target = create_test_entity(&rt, &token).await;
 
         // Part A: handle_feedback path.
         for _ in 0..3 {
@@ -1740,13 +2169,14 @@ mod tests {
         let brain = std::sync::Arc::new(BrainPack::new(rt.clone()));
         let token = rt.authorize(Namespace::local());
 
+        // Create a real entity so C4 target_id validation passes.
+        let target = create_test_entity(&rt, &token).await;
+
         // Build a registry WITH the hook so we can trigger the double-count path.
         let mut builder = VerbRegistryBuilder::new();
         let hook: std::sync::Arc<dyn DispatchHook> = brain.clone();
         builder.with_dispatch_hook(hook);
         let registry = builder.build().expect("registry builds");
-
-        let target = "00000000-0000-0000-0000-000000000002";
 
         // Dispatch brain.feedback through the registry (hook is registered).
         brain
@@ -1810,7 +2240,8 @@ mod tests {
         }
 
         // Step 2: also call handle_feedback directly to move importance away from prior.
-        let target = "00000000-0000-0000-0000-000000000003";
+        // C4: create a real entity so target_id validation passes.
+        let target = create_test_entity(&rt, &token).await;
         for _ in 0..5 {
             pack.dispatch(
                 "brain.feedback",
@@ -1851,7 +2282,12 @@ mod tests {
 
         // Step 3: call handle_reset via the production path (dispatch → handle_reset).
         let reset_result = pack
-            .dispatch("brain.reset", json!({}), &registry, &token)
+            .dispatch(
+                "brain.reset",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
             .await
             .unwrap();
         assert_eq!(reset_result["reset"], json!(true));
@@ -2043,6 +2479,1090 @@ mod tests {
             after_miss.balanced_recall.temporal.beta
         );
     }
+
+    // ── Wave-4 Critical regressions (C1-C4) ──────────────────────────────────
+
+    // C2: brain.unbind with zero filters must be rejected.
+    #[tokio::test]
+    async fn w4_c2_unbind_no_filter_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Add a binding so there is something to accidentally wipe.
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "balanced-recall-v1", "actor": "agent-z", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let err = pack
+            .dispatch("brain.unbind", json!({}), &registry, &token)
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("filter") || msg.contains("profile_id") || msg.contains("actor"),
+                "C2: zero-filter unbind must mention required filter; got: {msg}"
+            );
+        } else {
+            panic!("C2: zero-filter unbind must return InvalidInput, got {err:?}");
+        }
+
+        // Binding must still be intact.
+        let state = pack.state.lock().unwrap();
+        assert!(
+            !state.bindings.is_empty(),
+            "C2: binding must survive the rejected unbind"
+        );
+    }
+
+    // C3: brain.bind must reject archived profiles.
+    #[tokio::test]
+    async fn w4_c3_bind_archived_profile_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Archive the only profile.
+        pack.dispatch(
+            "brain.deactivate",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.archive",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let err = pack
+            .dispatch(
+                "brain.bind",
+                json!({"profile_id": "balanced-recall-v1", "consumer_kind": "recall"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("archived"),
+                "C3: bind to archived profile must mention 'archived'; got: {msg}"
+            );
+        } else {
+            panic!("C3: bind to archived profile must return InvalidInput, got {err:?}");
+        }
+    }
+
+    // C3: brain.resolve must skip bindings pointing at archived profiles.
+    #[tokio::test]
+    async fn w4_c3_resolve_skips_archived_binding() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Force a binding directly into state (bypassing handle_bind guard) to simulate
+        // a pre-existing binding that was created before the profile was archived.
+        {
+            let mut state = pack.state.lock().unwrap();
+            state.bindings.push(crate::state::ProfileBinding {
+                actor: "*".into(),
+                namespace: "*".into(),
+                consumer_kind: "recall".into(),
+                profile_id: "balanced-recall-v1".into(),
+                priority: 100,
+                created_at: chrono::Utc::now(),
+            });
+            // Archive the profile in-state.
+            state
+                .profiles
+                .get_mut("balanced-recall-v1")
+                .unwrap()
+                .lifecycle = ProfileLifecycle::Archived;
+        }
+
+        // Resolve must NOT return the archived profile.
+        let err = pack
+            .dispatch(
+                "brain.resolve",
+                json!({"consumer_kind": "recall"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NotFound(_)),
+            "C3: resolve with only archived binding must return NotFound, got {err:?}"
+        );
+    }
+
+    // C4: brain.feedback must reject nonexistent target_id.
+    #[tokio::test]
+    async fn w4_c4_feedback_rejects_nonexistent_target() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({"target_id": "00000000-0000-0000-0000-000000000000", "signal": "useful"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NotFound(_)),
+            "C4: feedback with nonexistent target_id must return NotFound, got {err:?}"
+        );
+    }
+
+    // C4: brain.feedback must reject nonexistent served_by_profile_id.
+    #[tokio::test]
+    async fn w4_c4_feedback_rejects_nonexistent_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Create a real entity for the valid target_id.
+        let target = create_test_entity(&rt, &token).await;
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "useful", "served_by_profile_id": "fake-profile-xyz"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NotFound(_)),
+            "C4: feedback with nonexistent served_by_profile_id must return NotFound, got {err:?}"
+        );
+    }
+
+    // C4: brain.feedback with valid target and known profile must succeed.
+    #[tokio::test]
+    async fn w4_c4_feedback_accepts_valid_target_and_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let target = create_test_entity(&rt, &token).await;
+
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "useful", "served_by_profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["emitted"], json!(true));
+        assert_eq!(result["signal"], json!("useful"));
+    }
+
+    // H1: brain.create_profile creates a new inactive profile.
+    #[tokio::test]
+    async fn w4_h1_create_profile_creates_new_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let result = pack
+            .dispatch(
+                "brain.create_profile",
+                json!({"name": "my-profile-v1", "consumer_kind": "search", "description": "Custom search profile"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["created"], json!(true));
+        assert_eq!(result["profile_id"], json!("my-profile-v1"));
+        assert_eq!(result["lifecycle"], json!("inactive"));
+        assert_eq!(result["consumer_kind"], json!("search"));
+
+        // Verify it appears in brain.profiles.
+        let profiles = pack
+            .dispatch("brain.profiles", json!({}), &registry, &token)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = profiles["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"my-profile-v1"),
+            "new profile must appear in brain.profiles"
+        );
+    }
+
+    // H1: duplicate name is rejected.
+    #[tokio::test]
+    async fn w4_h1_create_profile_duplicate_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let err = pack
+            .dispatch(
+                "brain.create_profile",
+                json!({"name": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "H1: duplicate profile name must return InvalidInput, got {err:?}"
+        );
+    }
+
+    // H2: brain.bindings lists binding rows.
+    #[tokio::test]
+    async fn w4_h2_bindings_lists_rows() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Initially empty.
+        let result = pack
+            .dispatch("brain.bindings", json!({}), &registry, &token)
+            .await
+            .unwrap();
+        assert_eq!(result["count"], json!(0u64));
+        assert_eq!(result["bindings"], json!([]));
+
+        // Add a binding.
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "balanced-recall-v1", "actor": "agent-a", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let result2 = pack
+            .dispatch("brain.bindings", json!({}), &registry, &token)
+            .await
+            .unwrap();
+        assert_eq!(result2["count"], json!(1u64));
+        let rows = result2["bindings"].as_array().unwrap();
+        assert_eq!(rows[0]["actor"], json!("agent-a"));
+        assert_eq!(rows[0]["profile_id"], json!("balanced-recall-v1"));
+    }
+
+    // H2: brain.bindings supports filtering.
+    #[tokio::test]
+    async fn w4_h2_bindings_filtered() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        pack.dispatch("brain.bind", json!({"profile_id": "balanced-recall-v1", "actor": "agent-1", "consumer_kind": "recall"}), &registry, &token).await.unwrap();
+        pack.dispatch("brain.bind", json!({"profile_id": "balanced-recall-v1", "actor": "agent-2", "consumer_kind": "search"}), &registry, &token).await.unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.bindings",
+                json!({"actor": "agent-1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["count"], json!(1u64));
+        assert_eq!(result["bindings"][0]["actor"], json!("agent-1"));
+    }
+
+    // H3: brain.resolve response includes both requested and matched consumer_kind.
+    #[tokio::test]
+    async fn w4_h3_resolve_returns_both_requested_and_matched_kind() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Install a wildcard binding (consumer_kind = "*").
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "balanced-recall-v1", "consumer_kind": "*", "priority": 1}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Query for a different consumer_kind — wildcard binding matches.
+        let result = pack
+            .dispatch(
+                "brain.resolve",
+                json!({"consumer_kind": "search"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["requested_consumer_kind"],
+            json!("search"),
+            "H3: requested_consumer_kind must equal the query"
+        );
+        assert_eq!(
+            result["matched_consumer_kind"],
+            json!("*"),
+            "H3: matched_consumer_kind must show the wildcard binding"
+        );
+        assert_eq!(result["resolved_profile_id"], json!("balanced-recall-v1"));
+    }
+
+    // H3: exact match returns matching kind in matched_consumer_kind.
+    #[tokio::test]
+    async fn w4_h3_resolve_exact_match_returns_exact_kind() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Default fallback (no binding) uses profile's consumer_kind.
+        let result = pack
+            .dispatch(
+                "brain.resolve",
+                json!({"consumer_kind": "recall"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["requested_consumer_kind"], json!("recall"));
+        assert_eq!(result["matched_consumer_kind"], json!("recall"));
+    }
+
+    // Round-2 fix 3: archived high-priority binding + live lower-priority wildcard → live wins.
+    #[tokio::test]
+    async fn r2_archived_exact_binding_defers_to_live_wildcard() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Create a second live profile.
+        pack.dispatch(
+            "brain.create_profile",
+            json!({"name": "search-v1", "consumer_kind": "search"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.activate",
+            json!({"profile_id": "search-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Insert a high-priority exact binding pointing at the default profile.
+        {
+            let mut state = pack.state.lock().unwrap();
+            state.bindings.push(crate::state::ProfileBinding {
+                actor: "*".into(),
+                namespace: "*".into(),
+                consumer_kind: "search".into(),
+                profile_id: "balanced-recall-v1".into(),
+                priority: 100,
+                created_at: chrono::Utc::now(),
+            });
+            // Archive balanced-recall-v1 in-state to simulate it being retired.
+            state
+                .profiles
+                .get_mut("balanced-recall-v1")
+                .unwrap()
+                .lifecycle = crate::state::ProfileLifecycle::Archived;
+        }
+
+        // Add a lower-priority wildcard binding pointing at the live profile.
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "search-v1", "consumer_kind": "*", "priority": 1}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Resolve must return the live lower-priority profile, NOT fall to default.
+        let result = pack
+            .dispatch(
+                "brain.resolve",
+                json!({"consumer_kind": "search"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result["resolved_profile_id"],
+            json!("search-v1"),
+            "r2 fix 3: archived high-priority binding must not suppress the live wildcard binding"
+        );
+    }
+
+    // Round-2 fix 4: brain.feedback rejects archived served_by_profile_id.
+    #[tokio::test]
+    async fn r2_feedback_rejects_archived_served_by_profile() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let target = create_test_entity(&rt, &token).await;
+
+        // Archive the only profile.
+        pack.dispatch(
+            "brain.deactivate",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.archive",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "useful",
+                    "served_by_profile_id": "balanced-recall-v1"
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("archived"),
+                "r2 fix 4: feedback to archived profile must mention 'archived'; got: {msg}"
+            );
+        } else {
+            panic!("r2 fix 4: feedback to archived served_by_profile_id must return InvalidInput, got {err:?}");
+        }
+    }
+
+    // Round-2 fix 5: brain.create_profile rejects empty and wildcard consumer_kind.
+    #[tokio::test]
+    async fn r2_create_profile_rejects_empty_consumer_kind() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let err = pack
+            .dispatch(
+                "brain.create_profile",
+                json!({"name": "bad-profile", "consumer_kind": ""}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "r2 fix 5: empty consumer_kind must return InvalidInput, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn r2_create_profile_rejects_wildcard_consumer_kind() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let err = pack
+            .dispatch(
+                "brain.create_profile",
+                json!({"name": "wildcard-profile", "consumer_kind": "*"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        if let RuntimeError::InvalidInput(msg) = &err {
+            assert!(
+                msg.contains("wildcard") || msg.contains("sentinel") || msg.contains("*"),
+                "r2 fix 5: wildcard consumer_kind rejection must explain the issue; got: {msg}"
+            );
+        } else {
+            panic!("r2 fix 5: wildcard consumer_kind must return InvalidInput, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn r2_create_profile_rejects_whitespace_consumer_kind() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let err = pack
+            .dispatch(
+                "brain.create_profile",
+                json!({"name": "ws-profile", "consumer_kind": "   "}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "r2 fix 5: whitespace consumer_kind must return InvalidInput, got {err:?}"
+        );
+    }
+
+    // Round-2 fix 6: brain.bindings AND-semantics pinned with ≥3 bindings and combined filters.
+    #[tokio::test]
+    async fn r2_bindings_and_semantics_multi_filter() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Create two extra profiles for variety.
+        for name in ["alpha-v1", "beta-v1"] {
+            pack.dispatch(
+                "brain.create_profile",
+                json!({"name": name, "consumer_kind": "recall"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+            pack.dispatch(
+                "brain.activate",
+                json!({"profile_id": name}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Three bindings with distinct (actor, namespace, consumer_kind) combos.
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "balanced-recall-v1", "actor": "agent-A", "namespace": "ns-1", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "alpha-v1", "actor": "agent-A", "namespace": "ns-2", "consumer_kind": "search"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.bind",
+            json!({"profile_id": "beta-v1", "actor": "agent-B", "namespace": "ns-1", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Filter by profile_id + namespace: should return exactly 1 row.
+        let r1 = pack
+            .dispatch(
+                "brain.bindings",
+                json!({"profile_id": "balanced-recall-v1", "namespace": "ns-1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r1["count"],
+            json!(1u64),
+            "AND filter profile_id+namespace must return 1 row"
+        );
+        assert_eq!(r1["bindings"][0]["profile_id"], json!("balanced-recall-v1"));
+        assert_eq!(r1["bindings"][0]["namespace"], json!("ns-1"));
+
+        // Filter by actor + consumer_kind: agent-A+search → only alpha-v1 row.
+        let r2 = pack
+            .dispatch(
+                "brain.bindings",
+                json!({"actor": "agent-A", "consumer_kind": "search"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r2["count"],
+            json!(1u64),
+            "AND filter actor+consumer_kind must return 1 row"
+        );
+        assert_eq!(r2["bindings"][0]["profile_id"], json!("alpha-v1"));
+
+        // Zero-row combination: agent-B + consumer_kind=search (no such binding).
+        let r3 = pack
+            .dispatch(
+                "brain.bindings",
+                json!({"actor": "agent-B", "consumer_kind": "search"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r3["count"],
+            json!(0u64),
+            "AND filter with no matches must return count=0"
+        );
+        assert_eq!(r3["bindings"], json!([]));
+    }
+
+    // Round-2 fix 2: user-created profile has real posterior state that reset mutates.
+    // Round-3 strengthening: emit feedback first to move posteriors, then assert all three
+    // posterior alpha/beta values return to their ADR-032 priors after reset.
+    #[tokio::test]
+    async fn r2_user_profile_reset_mutates_posteriors() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let target = create_test_entity(&rt, &token).await;
+
+        pack.dispatch(
+            "brain.create_profile",
+            json!({"name": "custom-v1", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.activate",
+            json!({"profile_id": "custom-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Emit feedback to custom-v1 so its importance posterior diverges from prior.
+        // brain.feedback with signal="useful" → importance.update_success() (fold.rs:54).
+        pack.dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": "useful", "served_by_profile_id": "custom-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Confirm importance.alpha increased above the prior (2.0).
+        let mutated = pack
+            .dispatch(
+                "brain.profile",
+                json!({"profile_id": "custom-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        let importance_alpha_before = mutated["state_snapshot"]["importance"]["alpha"]
+            .as_f64()
+            .expect("state_snapshot.importance.alpha must be a number");
+        assert!(
+            importance_alpha_before > 2.0,
+            "r3 fix 2: feedback must have moved importance alpha above prior 2.0; got {importance_alpha_before}"
+        );
+        let epoch_before = mutated["exploration_epoch"].as_u64().unwrap();
+
+        // Reset custom profile.
+        let reset_result = pack
+            .dispatch(
+                "brain.reset",
+                json!({"profile_id": "custom-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reset_result["reset"], json!(true));
+        assert_eq!(reset_result["profile_id"], json!("custom-v1"));
+
+        // Epoch must increment.
+        let after = pack
+            .dispatch(
+                "brain.profile",
+                json!({"profile_id": "custom-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        let epoch_after = after["exploration_epoch"].as_u64().unwrap();
+        assert!(
+            epoch_after > epoch_before,
+            "r3 fix 2: reset must increment exploration_epoch on user-created profile; before={epoch_before} after={epoch_after}"
+        );
+
+        // All three posteriors must return exactly to ADR-032 priors:
+        //   relevance  = Beta(7, 3)
+        //   importance = Beta(2, 8)
+        //   temporal   = Beta(1, 9)
+        let snap = &after["state_snapshot"];
+        assert!(
+            !snap.is_null(),
+            "r3 fix 2: state_snapshot must be non-null after reset"
+        );
+
+        let rel_alpha = snap["relevance"]["alpha"]
+            .as_f64()
+            .expect("relevance.alpha");
+        let rel_beta = snap["relevance"]["beta"].as_f64().expect("relevance.beta");
+        assert!(
+            (rel_alpha - 7.0).abs() < 1e-9 && (rel_beta - 3.0).abs() < 1e-9,
+            "r3 fix 2: relevance must be Beta(7,3) after reset; got ({rel_alpha},{rel_beta})"
+        );
+
+        let imp_alpha = snap["importance"]["alpha"]
+            .as_f64()
+            .expect("importance.alpha");
+        let imp_beta = snap["importance"]["beta"]
+            .as_f64()
+            .expect("importance.beta");
+        assert!(
+            (imp_alpha - 2.0).abs() < 1e-9 && (imp_beta - 8.0).abs() < 1e-9,
+            "r3 fix 2: importance must be Beta(2,8) after reset; got ({imp_alpha},{imp_beta})"
+        );
+
+        let tmp_alpha = snap["temporal"]["alpha"].as_f64().expect("temporal.alpha");
+        let tmp_beta = snap["temporal"]["beta"].as_f64().expect("temporal.beta");
+        assert!(
+            (tmp_alpha - 1.0).abs() < 1e-9 && (tmp_beta - 9.0).abs() < 1e-9,
+            "r3 fix 2: temporal must be Beta(1,9) after reset; got ({tmp_alpha},{tmp_beta})"
+        );
+    }
+
+    // Round-2 fix 2: feedback routes to the user-created profile's own state.
+    #[tokio::test]
+    async fn r2_user_profile_feedback_routes_to_profile_state() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let target = create_test_entity(&rt, &token).await;
+
+        pack.dispatch(
+            "brain.create_profile",
+            json!({"name": "custom-v1", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+        pack.dispatch(
+            "brain.activate",
+            json!({"profile_id": "custom-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let before = pack
+            .dispatch(
+                "brain.profile",
+                json!({"profile_id": "custom-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        let events_before = before["total_events"].as_u64().unwrap();
+
+        pack.dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": "useful", "served_by_profile_id": "custom-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let after = pack
+            .dispatch(
+                "brain.profile",
+                json!({"profile_id": "custom-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        let events_after = after["total_events"].as_u64().unwrap();
+        assert!(
+            events_after > events_before,
+            "r2 fix 2: feedback routed to custom profile must increment its total_events; before={events_before} after={events_after}"
+        );
+    }
+
+    // H4: brain.profile accepts profile_id (canonical) and id (alias).
+    #[tokio::test]
+    async fn w4_h4_profile_accepts_profile_id_and_id_alias() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Canonical arg.
+        let r1 = pack
+            .dispatch(
+                "brain.profile",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1["id"], json!("balanced-recall-v1"));
+
+        // Legacy alias.
+        let r2 = pack
+            .dispatch(
+                "brain.profile",
+                json!({"id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2["id"], json!("balanced-recall-v1"));
+    }
+
+    // ── Round-3 regression tests ──────────────────────────────────────────────
+
+    // R3-1: archiving balanced-recall-v1 then calling brain.feedback without
+    // served_by_profile_id must return InvalidInput and must NOT append an event.
+    #[tokio::test]
+    async fn r3_feedback_default_profile_archived_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        let target = create_test_entity(&rt, &token).await;
+
+        // balanced-recall-v1 starts Active; must deactivate before archiving (lifecycle rule).
+        pack.dispatch(
+            "brain.deactivate",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Archive the default profile.
+        pack.dispatch(
+            "brain.archive",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        // Baseline: total_events on default profile before the attempted feedback.
+        // Also capture brain.events count so we catch any FeedbackExplicit row that
+        // sneaks past the lifecycle check via a reordered append → fold sequence.
+        let snap_before = pack
+            .dispatch(
+                "brain.profile",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        let events_before = snap_before["total_events"].as_u64().unwrap_or(0);
+
+        let log_before = pack
+            .dispatch("brain.events", json!({"limit": 1000}), &registry, &token)
+            .await
+            .unwrap();
+        let log_count_before = log_before["events"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        // feedback without served_by_profile_id must be rejected.
+        let err = pack
+            .dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "useful"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        match &err {
+            RuntimeError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("archived"),
+                    "r3-1: error must mention 'archived'; got: {msg}"
+                );
+            }
+            other => panic!("r3-1: expected InvalidInput(archived), got {other:?}"),
+        }
+
+        // No state mutation: total_events must be unchanged.
+        let snap_after = pack
+            .dispatch(
+                "brain.profile",
+                json!({"profile_id": "balanced-recall-v1"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        let events_after = snap_after["total_events"].as_u64().unwrap_or(0);
+        assert_eq!(
+            events_after, events_before,
+            "r3-1: archived default profile must not have events appended; before={events_before} after={events_after}"
+        );
+
+        // Defense-in-depth: also verify nothing landed in the event log itself.
+        // A future reorder that appends FeedbackExplicit before the lifecycle check
+        // but skips the fold would leave total_events unchanged but still write to
+        // the log. This assertion catches that class.
+        let log_after = pack
+            .dispatch("brain.events", json!({"limit": 1000}), &registry, &token)
+            .await
+            .unwrap();
+        let log_count_after = log_after["events"].as_array().map(|a| a.len()).unwrap_or(0);
+        assert_eq!(
+            log_count_after, log_count_before,
+            "r3-1: rejected feedback must not append a FeedbackExplicit event; before={log_count_before} after={log_count_after}"
+        );
+    }
+
+    // R3-3: brain.create_profile profile-id grammar enforcement.
+    #[tokio::test]
+    async fn r3_create_profile_id_grammar_enforced() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+
+        // Whitespace-only name must be rejected.
+        let err = pack
+            .dispatch(
+                "brain.create_profile",
+                json!({"name": "   ", "consumer_kind": "recall"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "r3-3: whitespace-only name must return InvalidInput; got {err:?}"
+        );
+
+        // Leading/trailing space: trimmed name "my-profile" must be accepted.
+        pack.dispatch(
+            "brain.create_profile",
+            json!({"name": "  my-profile  ", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("r3-3: name with leading/trailing spaces should be accepted after trim");
+
+        // Dot in name must be rejected.
+        let err = pack
+            .dispatch(
+                "brain.create_profile",
+                json!({"name": "bad.profile", "consumer_kind": "recall"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "r3-3: dot in name must return InvalidInput; got {err:?}"
+        );
+
+        // Underscore in name must be rejected.
+        let err = pack
+            .dispatch(
+                "brain.create_profile",
+                json!({"name": "bad_profile", "consumer_kind": "recall"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "r3-3: underscore in name must return InvalidInput; got {err:?}"
+        );
+
+        // Asterisk in name must be rejected.
+        let err = pack
+            .dispatch(
+                "brain.create_profile",
+                json!({"name": "*", "consumer_kind": "recall"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "r3-3: asterisk name must return InvalidInput; got {err:?}"
+        );
+
+        // Valid alphanumeric-hyphen name must succeed.
+        pack.dispatch(
+            "brain.create_profile",
+            json!({"name": "valid-profile-123", "consumer_kind": "recall"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("r3-3: valid alphanumeric-hyphen name must succeed");
+    }
 }
 
 #[cfg(test)]
@@ -2075,12 +3595,15 @@ mod help_tests {
     }
 
     #[test]
-    fn brain_profile_params_has_required_id() {
+    fn brain_profile_params_has_required_profile_id() {
         let h = find_handler("brain.profile");
         assert!(!h.params.is_empty(), "brain.profile must have params");
+        // H4: canonical param is now profile_id; id is accepted as a runtime alias.
         assert!(
-            h.params.iter().any(|p| p.name == "id" && p.required),
-            "brain.profile must have required id param (not name)"
+            h.params
+                .iter()
+                .any(|p| p.name == "profile_id" && p.required),
+            "brain.profile must have required profile_id param (H4 fix)"
         );
     }
 
@@ -2175,11 +3698,14 @@ mod help_tests {
     }
 
     #[test]
-    fn brain_reset_params_empty() {
+    fn brain_reset_params_has_required_profile_id() {
         let h = find_handler("brain.reset");
+        assert!(!h.params.is_empty(), "brain.reset must have params");
         assert!(
-            h.params.is_empty(),
-            "brain.reset takes no params — params slice must be empty"
+            h.params
+                .iter()
+                .any(|p| p.name == "profile_id" && p.required),
+            "brain.reset must have required profile_id param (C1 fix)"
         );
     }
 
@@ -2225,6 +3751,42 @@ mod help_tests {
         assert!(
             h.params.iter().any(|p| p.name == "signal" && p.required),
             "brain.emit must have required signal"
+        );
+    }
+
+    #[test]
+    fn brain_bindings_params_all_optional() {
+        let h = find_handler("brain.bindings");
+        assert!(
+            h.params.iter().all(|p| !p.required),
+            "brain.bindings: all params must be optional filter args"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "profile_id"),
+            "brain.bindings must document profile_id filter"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "consumer_kind"),
+            "brain.bindings must document consumer_kind filter"
+        );
+    }
+
+    #[test]
+    fn brain_create_profile_params_has_required_name() {
+        let h = find_handler("brain.create_profile");
+        assert!(
+            !h.params.is_empty(),
+            "brain.create_profile must have params"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "name" && p.required),
+            "brain.create_profile must have required name param"
+        );
+        assert!(
+            h.params
+                .iter()
+                .any(|p| p.name == "consumer_kind" && !p.required),
+            "brain.create_profile consumer_kind must be optional"
         );
     }
 }

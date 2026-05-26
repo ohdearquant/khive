@@ -276,11 +276,19 @@ pub struct ProfileBinding {
 ///
 /// ADR-032 §1: BrainState holds profile registry and lifecycle metadata.
 /// Posteriors live inside each profile's own state, opaque to brain.
+///
+/// Per-profile state: `balanced_recall` holds the live state for the built-in
+/// `balanced-recall-v1` profile. `profile_states` holds live `BalancedRecallState`
+/// for every user-created Bayesian profile. Both maps are initialised at profile
+/// creation and cleared on hard-delete; they are never absent for a living profile
+/// whose `state_class == "Bayesian"`.
 pub struct BrainState {
     /// Registered profiles indexed by profile_id.
     pub profiles: HashMap<String, ProfileRecord>,
-    /// In-memory BalancedRecallState for the active default profile.
+    /// In-memory BalancedRecallState for the built-in `balanced-recall-v1` profile.
     pub balanced_recall: BalancedRecallState,
+    /// Per-profile live state for user-created Bayesian profiles.
+    pub profile_states: HashMap<String, BalancedRecallState>,
     /// Profile binding table — maps (actor, namespace, consumer_kind) → profile_id.
     pub bindings: Vec<ProfileBinding>,
 }
@@ -293,25 +301,38 @@ impl BrainState {
         Self {
             profiles,
             balanced_recall: BalancedRecallState::new(entity_capacity),
+            profile_states: HashMap::new(),
             bindings: Vec::new(),
         }
     }
 
     pub fn to_snapshot(&self) -> BrainStateSnapshot {
+        let extra: HashMap<String, BalancedRecallSnapshot> = self
+            .profile_states
+            .iter()
+            .map(|(id, s)| (id.clone(), s.to_snapshot()))
+            .collect();
         BrainStateSnapshot {
             profiles: self.profiles.clone(),
             balanced_recall: self.balanced_recall.to_snapshot(),
+            profile_states: extra,
             bindings: self.bindings.clone(),
         }
     }
 
     pub fn from_snapshot(snapshot: BrainStateSnapshot, entity_capacity: usize) -> Self {
+        let extra: HashMap<String, BalancedRecallState> = snapshot
+            .profile_states
+            .into_iter()
+            .map(|(id, s)| (id, BalancedRecallState::from_snapshot(s, entity_capacity)))
+            .collect();
         Self {
             profiles: snapshot.profiles,
             balanced_recall: BalancedRecallState::from_snapshot(
                 snapshot.balanced_recall,
                 entity_capacity,
             ),
+            profile_states: extra,
             bindings: snapshot.bindings,
         }
     }
@@ -325,20 +346,54 @@ impl BrainState {
         }
     }
 
+    /// Reset posteriors for a user-created Bayesian profile.
+    pub fn reset_profile_posteriors(&mut self, profile_id: &str) {
+        if let Some(ps) = self.profile_states.get_mut(profile_id) {
+            ps.reset_posteriors();
+            let snap = serde_json::to_value(ps.to_snapshot()).ok();
+            let epoch = ps.exploration_epoch;
+            if let Some(record) = self.profiles.get_mut(profile_id) {
+                record.exploration_epoch = epoch;
+                record.state_snapshot = snap;
+            }
+        }
+    }
+
     /// Resolve a profile_id for the given caller context (ADR-032 §10).
     ///
     /// Longest-match wins: actor + namespace + consumer_kind beats actor + consumer_kind
     /// beats namespace + consumer_kind beats consumer_kind alone. Returns the
     /// `balanced-recall-v1` default when no explicit binding matches.
+    ///
+    /// Archived profiles are never returned, whether reached via binding or fallback.
     pub fn resolve(
         &self,
         actor: Option<&str>,
         namespace: Option<&str>,
         consumer_kind: &str,
     ) -> Option<&ProfileRecord> {
+        self.resolve_with_match(actor, namespace, consumer_kind)
+            .map(|(record, _)| record)
+    }
+
+    /// Like `resolve`, but also returns the `consumer_kind` field from the matched
+    /// binding row (H3: lets the caller distinguish a wildcard match from an exact match).
+    ///
+    /// Returns `(profile_record, matched_binding_consumer_kind)`.
+    /// For the implicit default fallback the matched kind equals the profile's own
+    /// `consumer_kind`.
+    pub fn resolve_with_match(
+        &self,
+        actor: Option<&str>,
+        namespace: Option<&str>,
+        consumer_kind: &str,
+    ) -> Option<(&ProfileRecord, String)> {
         let actor_val = actor.unwrap_or("*");
         let namespace_val = namespace.unwrap_or("*");
 
+        // Pre-filter: exclude bindings whose target profile is archived or missing.
+        // This ensures archived profiles are excluded from candidate selection entirely,
+        // so a lower-priority live binding can win over a higher-priority archived one.
         let best = self
             .bindings
             .iter()
@@ -346,6 +401,10 @@ impl BrainState {
                 (b.actor == "*" || b.actor == actor_val)
                     && (b.namespace == "*" || b.namespace == namespace_val)
                     && (b.consumer_kind == "*" || b.consumer_kind == consumer_kind)
+                    && self
+                        .profiles
+                        .get(&b.profile_id)
+                        .is_some_and(|p| p.lifecycle != ProfileLifecycle::Archived)
             })
             .max_by_key(|b| {
                 let actor_score = if b.actor != "*" { 4 } else { 0 };
@@ -359,11 +418,14 @@ impl BrainState {
             });
 
         if let Some(binding) = best {
-            return self.profiles.get(&binding.profile_id);
+            if let Some(record) = self.profiles.get(&binding.profile_id) {
+                return Some((record, binding.consumer_kind.clone()));
+            }
+            // Profile disappeared between filter and get (very unlikely) — fall through.
         }
 
-        // No explicit binding — return the named default profile if it exists and is
-        // usable, otherwise fall through to any active profile for the consumer_kind.
+        // No explicit binding (or all matched bindings point at archived profiles) —
+        // return the named default profile if it exists and is usable.
         // ADR-032 §10: "balanced-recall-v1" is the v1 system-default for recall.
         if let Some(default) = self.profiles.get("balanced-recall-v1") {
             if default.lifecycle == ProfileLifecycle::Active
@@ -371,14 +433,18 @@ impl BrainState {
                     || consumer_kind == "*"
                     || default.consumer_kind == "*")
             {
-                return Some(default);
+                return Some((default, default.consumer_kind.clone()));
             }
         }
 
         // Generic fallback: first active profile matching consumer_kind.
-        self.profiles
-            .values()
-            .find(|p| p.consumer_kind == consumer_kind && p.lifecycle == ProfileLifecycle::Active)
+        self.profiles.values().find_map(|p| {
+            if p.consumer_kind == consumer_kind && p.lifecycle == ProfileLifecycle::Active {
+                Some((p, p.consumer_kind.clone()))
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -387,6 +453,9 @@ impl BrainState {
 pub struct BrainStateSnapshot {
     pub profiles: HashMap<String, ProfileRecord>,
     pub balanced_recall: BalancedRecallSnapshot,
+    /// Snapshots for user-created Bayesian profiles.
+    #[serde(default)]
+    pub profile_states: HashMap<String, BalancedRecallSnapshot>,
     pub bindings: Vec<ProfileBinding>,
 }
 
