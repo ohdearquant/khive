@@ -2,7 +2,7 @@
 //!
 //! Provides a fully-tunable scoring pipeline:
 //!   1. `ScoringConfig`  — all knobs, all `pub`, all serde-friendly for agent sweeps.
-//!   2. `calculate_score` — multiplicative formula: `w_rel × relevance × (1 + w_temp × recency) × (1 + w_imp × importance)`.
+//!   2. `calculate_score` — multiplicative formula: `w_rel × relevance × (1 + w_temp × recency) × (1 + w_imp × salience)`.
 //!   3. `ScoreAdjustment` — declarative conditional rules applied after the base formula.
 //!   4. `normalize_rrf_scores` / `normalize_rank_fusion_scores` — RRF and raw-cosine normalization.
 //!   5. `normalize_min_score` — dual-scale input (0.0–1.0 fraction or 0–100 integer).
@@ -29,8 +29,8 @@ pub enum AdjustmentCondition {
         #[serde(default)]
         max_days: Option<f32>,
     },
-    /// Match by importance score. Both bounds are optional.
-    ImportanceRange {
+    /// Match by salience score. Both bounds are optional.
+    SalienceRange {
         #[serde(default)]
         min: Option<f32>,
         #[serde(default)]
@@ -69,7 +69,7 @@ pub struct ScoreAdjustment {
 pub struct CandidateContext<'a> {
     pub memory_type: &'a str,
     pub age_days: f32,
-    pub importance: f32,
+    pub salience: f32,
     pub content: &'a str,
     pub entity_names: &'a [String],
 }
@@ -91,14 +91,14 @@ impl AdjustmentCondition {
                 }
                 true
             }
-            Self::ImportanceRange { min, max } => {
+            Self::SalienceRange { min, max } => {
                 if let Some(lo) = min {
-                    if ctx.importance < *lo {
+                    if ctx.salience < *lo {
                         return false;
                     }
                 }
                 if let Some(hi) = max {
-                    if ctx.importance > *hi {
+                    if ctx.salience > *hi {
                         return false;
                     }
                 }
@@ -161,7 +161,7 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
             },
             operation: AdjustmentOp::Add { value: 0.05 },
         },
-        // Semantic age penalty: old high-importance semantic memories get penalized
+        // Semantic age penalty: old high-salience semantic memories get penalized
         // to prevent reference docs from crowding out episodic content.
         ScoreAdjustment {
             condition: AdjustmentCondition::All {
@@ -173,7 +173,7 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
                         min_days: Some(30.0),
                         max_days: None,
                     },
-                    AdjustmentCondition::ImportanceRange {
+                    AdjustmentCondition::SalienceRange {
                         min: Some(0.85),
                         max: None,
                     },
@@ -194,13 +194,13 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
 /// Weights for the combined memory score (multiplicative model).
 ///
 /// Semantic relevance is a **gate** (multiplicative base). Temporal recency
-/// and importance are **boosters** applied on top: `score = w_rel × relevance
-/// × (1 + w_temp × recency) × (1 + w_imp × importance)`.
+/// and salience are **boosters** applied on top: `score = w_rel × relevance
+/// × (1 + w_temp × recency) × (1 + w_imp × salience)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScoringWeights {
-    /// Multiplicative boost from importance in `(1 + w_imp × importance)`. Default: 0.2.
-    pub importance: f32,
+    /// Multiplicative boost from salience in `(1 + w_imp × salience)`. Default: 0.2.
+    pub salience: f32,
     /// Multiplicative boost from recency in `(1 + w_temp × recency)`. Default: 0.1.
     pub temporal: f32,
     /// Base multiplier applied to relevance. Default: 0.7.
@@ -210,7 +210,7 @@ pub struct ScoringWeights {
 impl Default for ScoringWeights {
     fn default() -> Self {
         Self {
-            importance: 0.2,
+            salience: 0.2,
             temporal: 0.1,
             relevance: 0.7,
         }
@@ -430,7 +430,7 @@ pub fn is_meaningful_query(query: &str) -> bool {
 /// Calibrated relevance ceiling for normalized scores.
 ///
 /// Prevents the best candidate from entering the 1.0 saturation zone before
-/// temporal, importance, and entity adjustments are applied.
+/// temporal, salience, and entity adjustments are applied.
 const NORMALIZED_RELEVANCE_CEILING: f32 = 0.82;
 
 /// RRF score threshold above which the best result is considered a genuine
@@ -545,7 +545,7 @@ pub fn normalize_rrf_scores(
 /// Input data for `calculate_score` — groups per-candidate fields to stay
 /// within clippy's 7-argument limit.
 pub struct ScoreInput<'a> {
-    pub importance: f32,
+    pub salience: f32,
     pub memory_type_str: &'a str,
     pub content: &'a str,
     pub created_at_millis: i64,
@@ -558,7 +558,7 @@ pub struct ScoreInput<'a> {
 /// Composite score for a single memory candidate.
 ///
 /// Formula (semantic-gate model, multiplicative):
-///   `score = w_rel × relevance × (1 + w_temp × recency) × (1 + w_imp × importance)`
+///   `score = w_rel × relevance × (1 + w_temp × recency) × (1 + w_imp × salience)`
 ///
 /// Then each `ScoreAdjustment` in `config.adjustments` is evaluated and applied in order.
 /// Result is clamped to `[0, 1]`.
@@ -574,14 +574,14 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     let temporal_recency = (-capped_decay * time_diff_days).exp();
 
     let temporal_boost = 1.0 + w.temporal * temporal_recency;
-    let importance_boost = 1.0 + w.importance * input.importance;
+    let salience_boost = 1.0 + w.salience * input.salience;
 
-    let mut score = semantic_base * temporal_boost * importance_boost;
+    let mut score = semantic_base * temporal_boost * salience_boost;
 
     let ctx = CandidateContext {
         memory_type: input.memory_type_str,
         age_days: time_diff_days,
-        importance: input.importance,
+        salience: input.salience,
         content: input.content,
         entity_names: input.entity_names,
     };
@@ -669,7 +669,7 @@ mod tests {
         let config = ScoringConfig::default();
         let score = calculate_score(
             &ScoreInput {
-                importance: 0.9,
+                salience: 0.9,
                 memory_type_str: "episodic",
                 content: "test content",
                 created_at_millis: 0,
@@ -684,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn calculate_score_high_importance_ranks_higher() {
+    fn calculate_score_high_salience_ranks_higher() {
         let config = ScoringConfig {
             adjustments: vec![],
             ..ScoringConfig::default()
@@ -692,7 +692,7 @@ mod tests {
         let now_ms = 1_000_000i64;
         let score_high = calculate_score(
             &ScoreInput {
-                importance: 0.9,
+                salience: 0.9,
                 memory_type_str: "episodic",
                 content: "content",
                 created_at_millis: 0,
@@ -705,7 +705,7 @@ mod tests {
         );
         let score_low = calculate_score(
             &ScoreInput {
-                importance: 0.1,
+                salience: 0.1,
                 memory_type_str: "episodic",
                 content: "content",
                 created_at_millis: 0,
@@ -716,7 +716,7 @@ mod tests {
             },
             &config,
         );
-        assert!(score_high > score_low, "high importance should rank higher");
+        assert!(score_high > score_low, "high salience should rank higher");
     }
 
     #[test]

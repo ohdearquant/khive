@@ -934,7 +934,7 @@ impl MemoryPack {
                 .unwrap_or("episodic");
             let rank_score = calculate_score(
                 &ScoreInput {
-                    importance: salience as f32,
+                    salience: salience as f32,
                     memory_type_str,
                     content: &note.content,
                     created_at_millis: note.created_at / 1_000,
@@ -975,6 +975,11 @@ impl MemoryPack {
             // Absolute relevance: raw cosine if available, else composite score.
             let raw_score_opt = raw_vec_scores.get(&id).copied();
             let absolute_relevance = raw_score_opt.unwrap_or(final_score).clamp(0.0, 1.0);
+            // ADR-021 §5 / ADR-033: score field must be in [0, 1].
+            debug_assert!(
+                absolute_relevance <= 1.0,
+                "score violates [0,1] contract: {absolute_relevance}"
+            );
 
             if final_score < effective_min_score {
                 continue;
@@ -2219,7 +2224,7 @@ mod tests {
     fn default_fusion_strategy_is_weighted() {
         // CC-6: The default strategy must be Weighted so that salience influences
         // ranking. Under RRF with small k, a marginally better text rank can
-        // dominate the importance contribution entirely.
+        // dominate the salience contribution entirely.
         let cfg = RecallConfig::default();
         assert!(
             matches!(
@@ -2233,8 +2238,8 @@ mod tests {
 
     #[test]
     fn salience_dominates_relevance_under_default_weighted_strategy() {
-        // CC-6: with the default Weighted strategy, importance=0.9 must rank above
-        // importance=0.3 even when the lower-importance memory has better relevance
+        // CC-6: with the default Weighted strategy, salience=0.9 must rank above
+        // salience=0.3 even when the lower-salience memory has better relevance
         // — as long as the relevance delta is within a typical real-world spread.
         // This mirrors the scenario from the audit: salience=0.3 ranked above
         // salience=0.9 at rank 4 with the old RRF default.
@@ -2242,8 +2247,8 @@ mod tests {
         let age_days = 0.0;
         let decay = 0.01;
 
-        // Simulates the audit scenario: low-importance has better relevance (0.9 vs 0.8)
-        // but high-importance should still win thanks to the amplifier.
+        // Simulates the audit scenario: low-salience has better relevance (0.9 vs 0.8)
+        // but high-salience should still win thanks to the amplifier.
         let relevance_low = 0.9;
         let relevance_high = 0.8;
 

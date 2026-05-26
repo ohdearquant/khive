@@ -95,10 +95,10 @@ pub struct RecallConfig {
 //
 // CC-6: Default strategy changed from RRF to Weighted [0.7, 0.3].
 //
-// Under RRF with the default weights (relevance 70%, importance 20%, temporal 10%), a
+// Under RRF with the default weights (relevance 70%, salience 20%, temporal 10%), a
 // salience=0.3 memory can rank above a salience=0.9 memory when its text/vector rank is
 // marginally better. The Weighted strategy gives full-resolution score values to both
-// retrieval paths, making the importance contribution a meaningful tiebreaker.
+// retrieval paths, making the salience contribution a meaningful tiebreaker.
 // The RRF strategy remains available via `fusion_strategy="rrf"`.
 impl Default for RecallConfig {
     fn default() -> Self {
@@ -113,7 +113,7 @@ impl Default for RecallConfig {
             candidate_multiplier: 20,
             candidate_limit: None,
             // CC-6: Weighted fusion respects score magnitude, allowing the salience
-            // amplifier to meaningfully differentiate high- vs low-importance memories.
+            // amplifier to meaningfully differentiate high- vs low-salience memories.
             // Weights [vector=0.7, text=0.3] match the prior RRF intent: vector
             // results are weighted higher because embedding search captures semantic
             // similarity; text results supplement with keyword precision.

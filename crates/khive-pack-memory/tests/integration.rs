@@ -163,7 +163,7 @@ async fn test_recall_salience_ranking() {
         .dispatch(
             "memory.remember",
             json!({
-                "content": "high-importance concept about knowledge representation theory",
+                "content": "high-salience concept about knowledge representation theory",
                 "salience": 0.9,
                 "decay": 0.0
             }),
@@ -176,7 +176,7 @@ async fn test_recall_salience_ranking() {
         .dispatch(
             "memory.remember",
             json!({
-                "content": "low-importance concept about knowledge representation systems",
+                "content": "low-salience concept about knowledge representation systems",
                 "salience": 0.1,
                 "decay": 0.0
             }),
@@ -468,9 +468,9 @@ async fn test_remember_invalid_source_id_uuid_rejected() {
     );
 }
 
-/// ADR-021 §4 (F108): importance outside [0, 1] is rejected.
+/// ADR-021 §4 (F108): salience outside [0, 1] is rejected.
 #[tokio::test]
-async fn test_remember_importance_out_of_range_rejected() {
+async fn test_remember_salience_out_of_range_rejected() {
     let rt = make_runtime();
     let registry = make_registry(rt);
 
@@ -480,7 +480,7 @@ async fn test_remember_importance_out_of_range_rejected() {
             json!({ "content": "test", "salience": -0.1 }),
         )
         .await;
-    assert!(neg.is_err(), "negative importance must be rejected");
+    assert!(neg.is_err(), "negative salience must be rejected");
 
     let rt2 = make_runtime();
     let registry2 = make_registry(rt2);
@@ -490,7 +490,7 @@ async fn test_remember_importance_out_of_range_rejected() {
             json!({ "content": "test", "salience": 1.1 }),
         )
         .await;
-    assert!(above.is_err(), "importance > 1 must be rejected");
+    assert!(above.is_err(), "salience > 1 must be rejected");
 }
 
 /// ADR-033 §2 (F222): recall.rerank is callable and returns expected shape.
@@ -986,19 +986,19 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
 
     // Sanity: with default config (0.70/0.20/0.10), the score for
     //   rrf=1.0, salience=1.0, decay=0.0, age=0 → 0.70+0.20+0.10 = 1.0
-    // With importance_only (0.0/1.0/0.0), the score for
+    // With salience_only (0.0/1.0/0.0), the score for
     //   rrf=1.0, salience=0.0, decay=0.0, age=0 → 0.0
     // The difference is large enough to prove the weights flow through.
 
-    // Apply importance-only config to the pack.
-    let importance_only = RecallConfig {
+    // Apply salience-only config to the pack.
+    let salience_only = RecallConfig {
         relevance_weight: 0.0,
         salience_weight: 1.0,
         temporal_weight: 0.0,
         ..RecallConfig::default()
     };
-    pack.apply_config(serde_json::to_value(&importance_only).unwrap())
-        .expect("apply_config (importance-only) succeeds");
+    pack.apply_config(serde_json::to_value(&salience_only).unwrap())
+        .expect("apply_config (salience-only) succeeds");
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
@@ -1006,7 +1006,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     let registry = builder.build().expect("registry builds");
 
     // Call recall.score with high relevance but ZERO salience — under
-    // importance-only weights, score MUST be 0.0. Under default weights
+    // salience-only weights, score MUST be 0.0. Under default weights
     // (the bug), it would be 0.70.
     let result = registry
         .dispatch(
@@ -1462,7 +1462,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
          reranker change cannot be demonstrated. baseline={baseline_ids:?}"
     );
 
-    // Step 2: reranked recall — importance weight only (REPLACE strategy).
+    // Step 2: reranked recall — salience weight only (REPLACE strategy).
     let reranked = registry
         .dispatch(
             "memory.recall",
@@ -1474,7 +1474,7 @@ async fn test_recall_with_reranker_weights_changes_ordering() {
             }),
         )
         .await
-        .expect("recall with importance reranker");
+        .expect("recall with salience reranker");
     let reranked_hits = reranked.as_array().expect("reranked array");
     assert!(!reranked_hits.is_empty(), "must get results");
     let reranked_ids: Vec<String> = reranked_hits
@@ -1717,8 +1717,8 @@ async fn test_score_floor_portable_across_fusion_strategies() {
 
     // Create 10 memories ALL containing both query terms "attention" and "transformer"
     // so FTS5 returns 10 results and the score span is non-zero. With span > 0 the
-    // normalizer maps scores to [0.15, 0.82], so high-importance memories score above
-    // 0.3 and low-importance ones score below — the exact split the test verifies.
+    // normalizer maps scores to [0.15, 0.82], so high-salience memories score above
+    // 0.3 and low-salience ones score below — the exact split the test verifies.
     // (With only some memories matching both words, FTS5 returns ≤ 1 hit whose span=0;
     // normalize_rank_fusion_scores then clamps to 0.3 * signal_strength, and
     // calculate_score with w_rel=0.7 and the episodic bonus still barely misses 0.3
@@ -1738,13 +1738,13 @@ async fn test_score_floor_portable_across_fusion_strategies() {
     .iter()
     .enumerate()
     {
-        let importance = 0.4 + 0.06 * (i as f64); // 0.40 to 0.94
+        let salience = 0.4 + 0.06 * (i as f64); // 0.40 to 0.94
         registry
             .dispatch(
                 "memory.remember",
                 json!({
                     "content": content,
-                    "salience": importance,
+                    "salience": salience,
                     "decay_factor": 0.0,
                 }),
             )
