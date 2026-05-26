@@ -648,8 +648,33 @@ pub fn runtime_config_from_khive_config(
     khive_cfg: &crate::engine_config::KhiveConfig,
     base: RuntimeConfig,
 ) -> RuntimeConfig {
+    // Apply actor.id as default_namespace when present and valid.
+    // KhiveConfig::validate() guarantees that actor.id, when present, is a
+    // structurally valid Namespace — so the Err arm here is unreachable for
+    // any config that passed load(). A panic here signals a caller contract
+    // violation (passing an unvalidated config).
+    let default_namespace = match khive_cfg.actor.id.as_deref() {
+        Some(id) if !id.is_empty() => match Namespace::parse(id) {
+            Ok(ns) => {
+                tracing::debug!(actor_id = id, "actor.id from config sets default_namespace");
+                ns
+            }
+            Err(e) => {
+                panic!(
+                    "actor.id {id:?} passed validation but Namespace::parse failed: {e}; \
+                     this is a bug — KhiveConfig must be validated before calling \
+                     runtime_config_from_khive_config"
+                );
+            }
+        },
+        _ => base.default_namespace.clone(),
+    };
+
     if khive_cfg.engines.is_empty() {
-        return base;
+        return RuntimeConfig {
+            default_namespace,
+            ..base
+        };
     }
 
     let mut embedding_model: Option<EmbeddingModel> = None;
@@ -677,6 +702,7 @@ pub fn runtime_config_from_khive_config(
     RuntimeConfig {
         embedding_model,
         additional_embedding_models: additional,
+        default_namespace,
         ..base
     }
 }
@@ -859,5 +885,110 @@ mod tests {
                 std::env::set_var("KHIVE_EMBEDDING_MODEL", v);
             }
         }
+    }
+
+    // ---- Actor config tests ----
+
+    use crate::engine_config::{ActorConfig, KhiveConfig};
+
+    fn khive_cfg_with_actor(id: &str) -> KhiveConfig {
+        KhiveConfig {
+            engines: vec![],
+            actor: ActorConfig {
+                id: Some(id.to_string()),
+                display_name: None,
+            },
+        }
+    }
+
+    #[test]
+    fn runtime_config_from_khive_config_applies_actor_id_as_default_namespace() {
+        let base = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+        };
+        let cfg = khive_cfg_with_actor("lambda:khive");
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(result.default_namespace.as_str(), "lambda:khive");
+    }
+
+    #[test]
+    fn runtime_config_from_khive_config_empty_actor_id_keeps_base_namespace() {
+        let base = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("lambda:base").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+        };
+        let cfg = KhiveConfig {
+            engines: vec![],
+            actor: ActorConfig {
+                id: Some(String::new()),
+                display_name: None,
+            },
+        };
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(
+            result.default_namespace.as_str(),
+            "lambda:base",
+            "empty actor.id must not override base namespace"
+        );
+    }
+
+    #[test]
+    fn runtime_config_from_khive_config_absent_actor_id_keeps_base_namespace() {
+        let base = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("lambda:base").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+        };
+        let cfg = KhiveConfig::default(); // no actor.id
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(
+            result.default_namespace.as_str(),
+            "lambda:base",
+            "absent actor.id must not override base namespace"
+        );
+    }
+
+    #[test]
+    fn runtime_config_from_khive_config_actor_id_with_engines() {
+        let base = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+        };
+        let cfg = KhiveConfig {
+            engines: vec![crate::engine_config::EngineConfig {
+                name: "default".to_string(),
+                model: "all-minilm-l6-v2".to_string(),
+                default: true,
+                fusion_weight: None,
+                dims: None,
+            }],
+            actor: ActorConfig {
+                id: Some("lambda:test".to_string()),
+                display_name: None,
+            },
+        };
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(result.default_namespace.as_str(), "lambda:test");
+        assert!(result.embedding_model.is_some());
     }
 }

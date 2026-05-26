@@ -361,3 +361,90 @@ guesses or observes a UUID from another namespace can read that record.
   naming convention.
 - Runtime methods: all namespace-scoped operations take `&NamespaceToken`. Read-by-ID
   methods verify `record.namespace == token.namespace()` after fetch.
+
+---
+
+## Amendment: OSS vs Cloud Namespace Models (2026-05-25)
+
+**Authors**: lambda:khive (Wave 4 — k-actor-config)
+
+### Two products, two models
+
+The original ADR describes the complete enforcement model that will apply in cloud (hosted,
+multi-tenant) deployments. OSS single-binary deployments use a deliberately lighter model.
+These are different products and the distinction is intentional.
+
+```text
+OSS model:   config-default actor + per-op override + no enforcement
+Cloud model: NamespaceToken from authenticated session + full enforcement
+```
+
+OSS never enforces namespace isolation — it is a single-user local tool. The namespace
+field exists to give agents logical grouping and to prevent accidental cross-session
+contamination, not to provide security.
+
+### OSS namespace resolution (priority order)
+
+When `khive-mcp` starts, it resolves the default namespace for the session in the
+following priority order (highest wins):
+
+1. `--actor <id>` CLI flag (or `KHIVE_ACTOR` env var)
+2. `--namespace <id>` CLI flag (or `KHIVE_NAMESPACE` env var) — legacy alias for `--actor`
+3. `[actor] id` in the config file (`--config` / `KHIVE_CONFIG` / `khive.toml` /
+   `.khive/config.toml` / `~/.khive/config.toml`)
+4. Hard default: `"local"`
+
+Every verb that does not supply an explicit `namespace` argument inherits the session
+default. Verbs that supply `namespace` explicitly use that value unconditionally — the gate
+is still consulted (as required by ADR-018), but the OSS default `AllowAllGate` allows all
+requests, so there is no denying enforcement. Cloud deployments swap in `TenantGate`, which
+rejects namespace requests that do not match the authenticated session JWT.
+
+### TOML config format
+
+```toml
+[actor]
+id = "lambda:myproject"           # sets default_namespace for this session
+display_name = "My Project Agent" # optional, advisory only
+```
+
+`display_name` is stored in the config struct and available for display/logging; it has no
+effect on namespace routing or enforcement.
+
+### Why no enforcement in OSS
+
+1. **Single-user deployment.** There is no second principal to protect against. The user
+   who sets `--actor lambda:foo` is the same user who could set `--actor lambda:bar`. An
+   enforcement layer would only add friction with zero security benefit.
+2. **AllowAllGate.** The OSS binary uses `AllowAllGate` — every verb dispatch succeeds
+   authorization. `NamespaceToken` is still minted (structural validation still fires), but
+   the gate never rejects. Cloud swaps in `TenantGate` which verifies the session JWT and
+   enforces that the requested namespace matches the authenticated tenant.
+3. **Contamination prevention, not isolation.** The main value of `--actor` in OSS is
+   preventing accidental cross-session contamination: two agents sharing a single `khive-mcp`
+   instance with the same `"local"` default will interleave their tasks. Giving each agent
+   its own actor ID (`lambda:agent-a`, `lambda:agent-b`) keeps their records separate without
+   any security boundary.
+
+### Cloud enforcement (future)
+
+Cloud deployments replace the `AllowAllGate` with a real gate that:
+
+- Receives the session JWT from the incoming connection context
+- Extracts the tenant namespace from the token claims
+- Rejects any verb that requests a namespace not permitted by the JWT
+
+The `NamespaceToken` minting in `VerbRegistry::dispatch` is unchanged — only the gate
+implementation differs. OSS and cloud share the same type system; enforcement is a
+deployment-time configuration, not a code change.
+
+### Consequences of this amendment
+
+- `RuntimeConfig::default_namespace` is the single place where the OSS actor default
+  is stored. All config-loading code sets it; the runtime never reads `[actor]` directly.
+- `khive-runtime/src/engine_config.rs` gains `ActorConfig { id, display_name }` as a
+  `[actor]` section in `KhiveConfig`.
+- `runtime_config_from_khive_config` applies `actor.id` to `default_namespace` when present.
+- `khive-mcp` binary gains `--actor` / `KHIVE_ACTOR` as the preferred namespace override,
+  with `--namespace` retained as a legacy alias.
+- `KhiveConfig::load_with_home_fallback` implements the 4-tier config search path.

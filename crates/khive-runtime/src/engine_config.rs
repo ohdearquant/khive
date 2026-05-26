@@ -29,6 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
+use khive_types::namespace::Namespace;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -60,6 +61,9 @@ pub enum ConfigError {
 
     #[error("engine {name:?}: fusion_weight must be > 0, got {value}")]
     InvalidFusionWeight { name: String, value: f64 },
+
+    #[error("actor.id {id:?} is not a valid namespace: {reason}")]
+    InvalidActorId { id: String, reason: String },
 }
 
 // ---- Config structs ----
@@ -100,28 +104,68 @@ pub struct EngineConfig {
     pub dims: Option<u32>,
 }
 
+/// Actor configuration — the default namespace / identity for this khive instance.
+///
+/// Corresponds to the `[actor]` TOML section. In OSS mode the runtime uses
+/// `id` as the `default_namespace` stamped on every write operation. Cloud
+/// deployments derive the namespace from an authenticated `NamespaceToken`
+/// instead; the `[actor]` section is ignored there.
+///
+/// ```toml
+/// [actor]
+/// id = "lambda:khive"          # default namespace (required)
+/// display_name = "Ocean's khive lambda"  # human label (optional)
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ActorConfig {
+    /// Namespace identifier used as the default actor for all operations.
+    ///
+    /// Must be a valid `Namespace` string (e.g. `"local"`, `"lambda:khive"`).
+    /// Defaults to `"local"` when absent — backward-compatible with pre-actor
+    /// deployments.
+    #[serde(default)]
+    pub id: Option<String>,
+
+    /// Optional human-readable label for this actor. Not used by the runtime;
+    /// surfaced in introspection and log output only.
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
 ///
-/// Only the `[[engines]]` array is consumed today. Future sections (packs,
-/// gate, namespace) can be added as named struct fields; unknown keys are
-/// silently ignored by serde.
+/// Sections consumed today:
+/// - `[[engines]]`: embedding engine declarations (ADR-031 §D3)
+/// - `[actor]`: default namespace / identity (OSS actor model)
+///
+/// Unknown keys are silently ignored by serde — forward-compatible.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
     /// Embedding engine declarations (ADR-031 §D3).
     #[serde(default)]
     pub engines: Vec<EngineConfig>,
+
+    /// Default actor (namespace) for this khive instance.
+    ///
+    /// When present, `actor.id` becomes the `default_namespace` used by the
+    /// runtime when no per-operation `namespace` argument is supplied. OSS
+    /// model: no enforcement — any operation may still pass `namespace=` to
+    /// use a different namespace. Cloud model derives namespace from an
+    /// authenticated token and ignores this field.
+    #[serde(default)]
+    pub actor: ActorConfig,
 }
 
 impl KhiveConfig {
-    /// Load and validate a `KhiveConfig`.
+    /// Load and validate a `KhiveConfig` from an explicit path.
     ///
     /// Search order:
     /// 1. `path` argument (explicit override — e.g. from `--config` / `KHIVE_CONFIG`)
     /// 2. `./.khive/config.toml` (project-local config, relative to the MCP server cwd)
     ///
     /// The project-local default collocates config with the `khive-test.db` that already
-    /// lives under `.khive/` in each project directory. `~/.khive/config.toml` is
-    /// reserved for personal/global settings and is NOT searched automatically.
+    /// lives under `.khive/` in each project directory. `~/.khive/config.toml` is searched
+    /// by [`KhiveConfig::load_with_home_fallback`] when the project-local file is absent.
     ///
     /// If the resolved file does **not exist**, returns `Ok(None)`.
     /// A missing config is not an error — callers fall back to the env-var path.
@@ -147,6 +191,61 @@ impl KhiveConfig {
         Ok(Some(cfg))
     }
 
+    /// Load config with the full resolution order:
+    ///
+    /// 1. Explicit `path` (from `--config` / `KHIVE_CONFIG`)
+    /// 2. `./khive.toml` (project-local, project root)
+    /// 3. `./.khive/config.toml` (project-local, hidden dir)
+    /// 4. `~/.khive/config.toml` (user-global)
+    ///
+    /// Returns the first file found, or `Ok(None)` when none exist.
+    /// Parse errors are propagated immediately — a malformed config is always
+    /// an error regardless of which tier it came from.
+    pub fn load_with_home_fallback(path: Option<&Path>) -> Result<Option<Self>, ConfigError> {
+        // Tier 1: explicit path (highest priority).
+        if let Some(p) = path {
+            return Self::load(Some(p));
+        }
+
+        // Tiers 2-4: search project root, hidden dir, user-global.
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home_root = std::env::var_os("HOME").map(PathBuf::from);
+        Self::load_with_roots(&project_root, home_root.as_deref())
+    }
+
+    /// Testable inner search: tiers 2-4, given explicit roots instead of
+    /// reading `cwd` and `HOME` from process state.
+    ///
+    /// - Tier 2: `<project_root>/khive.toml`
+    /// - Tier 3: `<project_root>/.khive/config.toml`
+    /// - Tier 4: `<home_root>/.khive/config.toml` (skipped when `None`)
+    pub(crate) fn load_with_roots(
+        project_root: &Path,
+        home_root: Option<&Path>,
+    ) -> Result<Option<Self>, ConfigError> {
+        // Tier 2: project root khive.toml.
+        let tier2 = project_root.join("khive.toml");
+        if tier2.exists() {
+            return Self::load(Some(&tier2));
+        }
+
+        // Tier 3: project-local hidden dir.
+        let tier3 = project_root.join(".khive/config.toml");
+        if tier3.exists() {
+            return Self::load(Some(&tier3));
+        }
+
+        // Tier 4: user-global ~/.khive/config.toml.
+        if let Some(home) = home_root {
+            let tier4 = home.join(".khive/config.toml");
+            if tier4.exists() {
+                return Self::load(Some(&tier4));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Validate the parsed config for logical consistency.
     ///
     /// Checks:
@@ -157,6 +256,22 @@ impl KhiveConfig {
     /// Model name validity is checked lazily at runtime (the config loader does
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // Validate actor.id when present — an invalid namespace is a startup error,
+        // not a silent fallback (ADR-007 §NamespaceToken minting).
+        if let Some(id) = self.actor.id.as_deref() {
+            if id.is_empty() {
+                return Err(ConfigError::InvalidActorId {
+                    id: id.to_string(),
+                    reason: "actor.id must not be empty; remove the key or provide a value"
+                        .to_string(),
+                });
+            }
+            Namespace::parse(id).map_err(|e| ConfigError::InvalidActorId {
+                id: id.to_string(),
+                reason: e.to_string(),
+            })?;
+        }
+
         if self.engines.is_empty() {
             return Ok(());
         }
@@ -257,7 +372,10 @@ pub fn config_from_env() -> KhiveConfig {
         engines[0].default = true;
     }
 
-    KhiveConfig { engines }
+    KhiveConfig {
+        engines,
+        actor: ActorConfig::default(),
+    }
 }
 
 // ---- Tests ----
@@ -410,7 +528,10 @@ fusion_weight = 0.0
                 dims: None,
             });
         }
-        let cfg = KhiveConfig { engines };
+        let cfg = KhiveConfig {
+            engines,
+            actor: ActorConfig::default(),
+        };
         cfg.validate().expect("env-derived config should be valid");
         assert_eq!(cfg.engines.len(), 2);
         assert!(cfg.default_engine().is_some());
@@ -502,5 +623,319 @@ fusion_weight = 0.3
         assert_eq!(cfg.engines.len(), 2);
         assert_eq!(cfg.engines[0].fusion_weight, Some(0.7));
         assert_eq!(cfg.engines[1].fusion_weight, Some(0.3));
+    }
+
+    // 10. [actor] section with id -> parsed correctly.
+    #[test]
+    fn test_actor_id_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[actor]
+id = "lambda:khive"
+display_name = "Ocean's khive lambda"
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("load should succeed")
+            .expect("file should be found");
+        assert_eq!(cfg.actor.id.as_deref(), Some("lambda:khive"));
+        assert_eq!(
+            cfg.actor.display_name.as_deref(),
+            Some("Ocean's khive lambda")
+        );
+        assert!(cfg.engines.is_empty());
+    }
+
+    // 11. [actor] section with engines -> both parsed.
+    #[test]
+    fn test_actor_and_engines_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[actor]
+id = "lambda:test"
+
+[[engines]]
+name = "default"
+model = "all-minilm-l6-v2"
+default = true
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("load should succeed")
+            .expect("file should be found");
+        assert_eq!(cfg.actor.id.as_deref(), Some("lambda:test"));
+        assert_eq!(cfg.engines.len(), 1);
+    }
+
+    // 12. Missing [actor] section -> defaults to None id (backward compat).
+    #[test]
+    fn test_actor_absent_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[engines]]
+name = "x"
+model = "all-minilm-l6-v2"
+default = true
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("load should succeed")
+            .expect("file should be found");
+        assert!(
+            cfg.actor.id.is_none(),
+            "actor.id must be None when [actor] section is absent"
+        );
+    }
+
+    // 13. load_with_roots returns None when no files exist in the given roots.
+    #[test]
+    fn test_load_with_home_fallback_no_files() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let result = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()));
+        assert!(
+            result.expect("no error expected").is_none(),
+            "should return None when no config files exist in the given roots"
+        );
+    }
+
+    // 14. load_with_home_fallback explicit path overrides search.
+    #[test]
+    fn test_load_with_home_fallback_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[actor]
+id = "lambda:explicit"
+"#,
+        );
+        let cfg = KhiveConfig::load_with_home_fallback(Some(&path))
+            .expect("no error expected")
+            .expect("file found");
+        assert_eq!(cfg.actor.id.as_deref(), Some("lambda:explicit"));
+    }
+
+    // 15. actor.id with an invalid namespace string -> ConfigError::InvalidActorId at load time.
+    #[test]
+    fn test_invalid_actor_id_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[actor]
+id = "bad namespace"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("should fail with invalid actor.id");
+        assert!(
+            matches!(err, ConfigError::InvalidActorId { .. }),
+            "expected InvalidActorId, got {err:?}"
+        );
+    }
+
+    // 16. actor.id = "" (empty string) -> ConfigError::InvalidActorId.
+    #[test]
+    fn test_empty_actor_id_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[actor]
+id = ""
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("empty actor.id should be rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidActorId { .. }),
+            "expected InvalidActorId for empty string, got {err:?}"
+        );
+    }
+
+    // 17. actor.id = "lambda:" (structurally invalid — no slug) -> ConfigError::InvalidActorId.
+    #[test]
+    fn test_malformed_actor_id_lambda_colon_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[actor]
+id = "lambda:"
+"#,
+        );
+        let err =
+            KhiveConfig::load(Some(&path)).expect_err("lambda: with no slug should be rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidActorId { .. }),
+            "expected InvalidActorId for 'lambda:', got {err:?}"
+        );
+    }
+
+    // 18. runtime_config_from_khive_config applies valid actor.id to default_namespace.
+    #[test]
+    fn test_runtime_config_actor_id_applied() {
+        use crate::runtime::runtime_config_from_khive_config;
+        use crate::RuntimeConfig;
+        use khive_types::namespace::Namespace;
+
+        let cfg = KhiveConfig {
+            engines: vec![],
+            actor: ActorConfig {
+                id: Some("lambda:test-actor".to_string()),
+                display_name: None,
+            },
+        };
+        cfg.validate().expect("valid config");
+
+        let base = RuntimeConfig::default();
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(
+            result.default_namespace,
+            Namespace::parse("lambda:test-actor").unwrap(),
+            "actor.id must become default_namespace"
+        );
+    }
+
+    // 19. runtime_config_from_khive_config with no actor preserves base namespace.
+    #[test]
+    fn test_runtime_config_no_actor_preserves_base() {
+        use crate::runtime::runtime_config_from_khive_config;
+        use crate::RuntimeConfig;
+        use khive_types::namespace::Namespace;
+
+        let cfg = KhiveConfig {
+            engines: vec![],
+            actor: ActorConfig {
+                id: None,
+                display_name: None,
+            },
+        };
+        cfg.validate().expect("valid config");
+
+        let base_ns = Namespace::parse("lambda:base").unwrap();
+        let base = RuntimeConfig {
+            default_namespace: base_ns.clone(),
+            ..RuntimeConfig::default()
+        };
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(
+            result.default_namespace, base_ns,
+            "no actor.id must leave base namespace unchanged"
+        );
+    }
+
+    // 20. load_with_roots: khive.toml (tier 2) wins over .khive/config.toml (tier 3).
+    #[test]
+    fn test_load_with_home_fallback_project_root_over_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write .khive/config.toml (tier 3).
+        std::fs::create_dir_all(dir.path().join(".khive")).unwrap();
+        std::fs::write(
+            dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:hidden\"\n",
+        )
+        .unwrap();
+
+        // Write khive.toml (tier 2) — should win.
+        std::fs::write(
+            dir.path().join("khive.toml"),
+            "[actor]\nid = \"lambda:project-root\"\n",
+        )
+        .unwrap();
+
+        let cfg = KhiveConfig::load_with_roots(dir.path(), None)
+            .expect("no error expected")
+            .expect("file should be found");
+        assert_eq!(
+            cfg.actor.id.as_deref(),
+            Some("lambda:project-root"),
+            "khive.toml (tier 2) must win over .khive/config.toml (tier 3)"
+        );
+    }
+
+    // 21. load_with_roots: .khive/config.toml (tier 3) wins when khive.toml absent.
+    #[test]
+    fn test_load_with_home_fallback_hidden_over_absent_root() {
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir_all(dir.path().join(".khive")).unwrap();
+        std::fs::write(
+            dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:hidden-config\"\n",
+        )
+        .unwrap();
+        // No khive.toml.
+
+        let cfg = KhiveConfig::load_with_roots(dir.path(), None)
+            .expect("no error expected")
+            .expect("file should be found");
+        assert_eq!(
+            cfg.actor.id.as_deref(),
+            Some("lambda:hidden-config"),
+            ".khive/config.toml (tier 3) must be found when khive.toml is absent"
+        );
+    }
+
+    // 22. load_with_roots: ~/.khive/config.toml (tier 4) found when project files absent.
+    #[test]
+    fn test_load_with_roots_home_tier_found() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
+        std::fs::write(
+            home_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:user-global\"\n",
+        )
+        .unwrap();
+        // No project-level files.
+
+        let cfg = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()))
+            .expect("no error expected")
+            .expect("file should be found");
+        assert_eq!(
+            cfg.actor.id.as_deref(),
+            Some("lambda:user-global"),
+            "~/.khive/config.toml (tier 4) must be found when project files absent"
+        );
+    }
+
+    // 23. load_with_roots: project tier wins over home tier.
+    #[test]
+    fn test_load_with_roots_project_wins_over_home() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+
+        // Home has a config.
+        std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
+        std::fs::write(
+            home_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:user-global\"\n",
+        )
+        .unwrap();
+
+        // Project also has a config — should win.
+        std::fs::create_dir_all(project_dir.path().join(".khive")).unwrap();
+        std::fs::write(
+            project_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:project-wins\"\n",
+        )
+        .unwrap();
+
+        let cfg = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()))
+            .expect("no error expected")
+            .expect("file should be found");
+        assert_eq!(
+            cfg.actor.id.as_deref(),
+            Some("lambda:project-wins"),
+            "project .khive/config.toml (tier 3) must win over ~/.khive/config.toml (tier 4)"
+        );
     }
 }

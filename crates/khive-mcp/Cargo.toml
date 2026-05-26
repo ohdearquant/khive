@@ -36,6 +36,7 @@ rmcp = { version = "1.7", features = ["server", "transport-io", "client"] }
 khive-types = { version = "0.2.2", path = "../khive-types" }
 async-trait = { workspace = true }
 tempfile = "3"
+serial_test = "3"
 
 [[bin]]
 name = "khive-mcp"
