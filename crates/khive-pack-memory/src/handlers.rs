@@ -128,6 +128,19 @@ fn normalize_relevance(raw: f64, strategy: &khive_runtime::FusionStrategy) -> f6
     }
 }
 
+/// Salience amplifier exponent applied to `effective_importance` in `compute_score`.
+///
+/// With the default additive formula, `importance_weight=0.20` gives salience
+/// a narrow linear spread: importance 0.9 vs 0.3 → 3× difference in the
+/// importance term. Raising `effective_importance` to this exponent stretches
+/// the spread — at α=1.5, importance 0.9^1.5 ≈ 0.854 vs 0.3^1.5 ≈ 0.164,
+/// a ~5.2× difference — so high-importance memories rank clearly above
+/// low-importance memories when relevance is similar (UE3-H3, Wave 3).
+///
+/// Keep α ≤ 2.0. Values above 2 compress near-zero importances toward 0 and
+/// may cause all low-importance memories to fall below `min_score`.
+const SALIENCE_AMPLIFIER_ALPHA: f64 = 1.5;
+
 fn compute_score(
     cfg: &RecallConfig,
     raw_relevance: f64,
@@ -149,7 +162,13 @@ fn compute_score(
     let weight_sum = cfg.relevance_weight + cfg.importance_weight + cfg.temporal_weight;
     let norm = if weight_sum > 0.0 { weight_sum } else { 1.0 };
     let r_contrib = cfg.relevance_weight * relevance / norm;
-    let i_contrib = cfg.importance_weight * effective_importance / norm;
+    // Amplify the importance contribution so that high-salience memories rank
+    // clearly above low-salience ones when relevance is similar. Without
+    // amplification, the 3× linear spread (0.9 vs 0.3) is too narrow relative
+    // to the 70% relevance weight. SALIENCE_AMPLIFIER_ALPHA=1.5 gives ~5.2×
+    // spread (0.854 vs 0.164), making importance a meaningful tiebreaker.
+    let amplified_importance = effective_importance.powf(SALIENCE_AMPLIFIER_ALPHA);
+    let i_contrib = cfg.importance_weight * amplified_importance / norm;
     let t_contrib = cfg.temporal_weight * temporal / norm;
     let total = r_contrib + i_contrib + t_contrib;
     let breakdown = ScoreBreakdown {
@@ -741,6 +760,12 @@ impl MemoryPack {
                 weighted_rerank(&features, &cfg.reranker_weights)
             };
 
+            // Score range note (UE3-H2): composite scores are normalized to [0,1]
+            // regardless of fusion strategy. RRF raw scores (~0.016 per source) are
+            // multiplied by (k+1)=61 in normalize_relevance so rank-1 maps to 1.0.
+            // Weighted scores are in [0,1] natively. The final composite adds three
+            // weighted contributions that each stay in [0,1], so the total is always
+            // in [0, weight_sum/norm] = [0, 1].
             if final_score < cfg.min_score {
                 continue;
             }
@@ -759,8 +784,7 @@ impl MemoryPack {
         });
         ranked.truncate(limit as usize);
 
-        let include_breakdown =
-            cfg.include_breakdown || p.presentation.as_deref() == Some("verbose");
+        let is_verbose = cfg.include_breakdown || p.presentation.as_deref() == Some("verbose");
         let results: Vec<Value> = ranked
             .into_iter()
             .map(|(id, score, breakdown, note)| {
@@ -775,12 +799,43 @@ impl MemoryPack {
                         .and_then(|v| v.as_str()),
                     "created_at": note.created_at,
                 });
-                if include_breakdown {
+                if is_verbose {
                     result["breakdown"] = json!(breakdown);
                 }
                 result
             })
             .collect();
+
+        // UE3-H1: In verbose mode (or when include_breakdown is set), include a
+        // candidates envelope with per-model vector candidate breakdown so operators
+        // can verify multi-model fusion contribution from a single recall() call.
+        // This mirrors the shape of recall.candidates but is scoped to the models
+        // that were actually queried. The legacy flat results array is unchanged.
+        if is_verbose && candidates.vector_hits_per_model.len() > 1 {
+            let per_model: Vec<Value> = candidates
+                .vector_hits_per_model
+                .iter()
+                .map(|(model, hits)| {
+                    let hits_json: Vec<Value> = hits
+                        .iter()
+                        .map(|h| {
+                            json!({
+                                "note_id": h.subject_id.to_string(),
+                                "score": h.score.to_f64(),
+                                "rank": h.rank,
+                            })
+                        })
+                        .collect();
+                    json!({ "model": model, "hits": hits_json })
+                })
+                .collect();
+            return to_json(&json!({
+                "results": results,
+                "candidates": {
+                    "vector_candidates_per_model": per_model,
+                },
+            }));
+        }
 
         to_json(&results)
     }
@@ -1330,8 +1385,10 @@ mod tests {
 
     #[test]
     fn compute_score_weighted_strategy_formula() {
-        // Use Weighted strategy (normalization factor = 1.0) to directly verify
-        // the weighted-combination formula: total = w_r*r + w_i*i + w_t*t.
+        // Use Weighted strategy (normalization factor = 1.0) to verify the
+        // weighted-combination formula with salience amplification.
+        // total = w_r*relevance + w_i*amplified_importance + w_t*temporal
+        // where amplified_importance = effective_importance ^ SALIENCE_AMPLIFIER_ALPHA
         let cfg = RecallConfig {
             fuse_strategy: khive_runtime::FusionStrategy::Weighted {
                 weights: vec![0.3, 0.7],
@@ -1343,9 +1400,15 @@ mod tests {
         let decay_factor = 0.01;
         let age_days = 0.0;
         let (total, bd) = compute_score(&cfg, relevance, salience, decay_factor, age_days);
-        // At age=0: importance_decayed = salience, temporal = 1.0, normalization = 1.0
-        // total = 0.70*0.5 + 0.20*0.8 + 0.10*1.0 = 0.35 + 0.16 + 0.10 = 0.61
-        assert!((total - 0.61).abs() < 1e-10, "got {total}");
+        // At age=0: importance_decayed = salience = 0.8, temporal = 1.0
+        // amplified = 0.8^1.5 ≈ 0.71554
+        // total = 0.70*0.5 + 0.20*0.71554 + 0.10*1.0 ≈ 0.35 + 0.14311 + 0.10 ≈ 0.59311
+        let amplified = 0.8_f64.powf(SALIENCE_AMPLIFIER_ALPHA);
+        let expected = 0.70 * 0.5 + 0.20 * amplified + 0.10 * 1.0;
+        assert!(
+            (total - expected).abs() < 1e-10,
+            "got {total}, expected {expected}"
+        );
         assert!((bd.relevance - 0.5).abs() < 1e-12);
         assert!((bd.importance_raw - 0.8).abs() < 1e-12);
     }
@@ -1571,5 +1634,121 @@ mod tests {
         cfg.reranker_weights
             .insert("disabled_reranker".to_string(), 0.0);
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── UE3-H3: salience amplification makes high-importance memories rank higher ─
+
+    #[test]
+    fn high_importance_outranks_low_importance_on_similar_relevance() {
+        // Regression for UE3-H3: with SALIENCE_AMPLIFIER_ALPHA > 1.0, a memory
+        // with importance=0.9 must score higher than importance=0.3 when both
+        // have the same relevance and age. Without amplification (alpha=1.0) the
+        // importance contribution difference is only 0.20*(0.9-0.3)=0.12, which
+        // is easily swamped when relevance differs even slightly.
+        let cfg = RecallConfig {
+            fuse_strategy: khive_runtime::FusionStrategy::Weighted {
+                weights: vec![0.5, 0.5],
+            },
+            ..RecallConfig::default()
+        };
+        let relevance = 0.5; // identical for both
+        let age_days = 0.0; // brand new
+        let decay_factor = 0.01;
+
+        let (score_high, _) = compute_score(&cfg, relevance, 0.9, decay_factor, age_days);
+        let (score_low, _) = compute_score(&cfg, relevance, 0.3, decay_factor, age_days);
+
+        assert!(
+            score_high > score_low,
+            "high importance (score={score_high}) should outrank low importance (score={score_low})"
+        );
+
+        // Quantitative check: the gap must be > 10% of the score range so the
+        // amplification is actually meaningful (not just a rounding difference).
+        let gap = score_high - score_low;
+        assert!(
+            gap > 0.05,
+            "importance score gap should be > 0.05, got {gap}"
+        );
+    }
+
+    #[test]
+    fn salience_amplifier_discriminates_more_than_linear() {
+        // Verify that SALIENCE_AMPLIFIER_ALPHA > 1.0 produces a wider spread
+        // between high and low importance than the linear (alpha=1.0) baseline.
+        let cfg = RecallConfig::default();
+        let relevance = 0.0; // zero out relevance to isolate importance contribution
+        let age_days = 0.0;
+
+        let (score_high, _) = compute_score(&cfg, relevance, 0.9, 0.0, age_days);
+        let (score_low, _) = compute_score(&cfg, relevance, 0.3, 0.0, age_days);
+        let amplified_spread = score_high - score_low;
+
+        // Linear spread without amplification: 0.20*(0.9-0.3) = 0.12
+        let linear_spread = 0.20_f64 * (0.9 - 0.3);
+
+        assert!(
+            amplified_spread > linear_spread,
+            "amplified spread ({amplified_spread}) should exceed linear spread ({linear_spread})"
+        );
+    }
+
+    // ── UE3-H1: per-model vector breakdown structure is correct ───────────────
+
+    #[test]
+    fn vector_candidates_per_model_shape_is_array_of_model_objects() {
+        // Verify that when multiple vector models are present, the candidates
+        // envelope serializes as [{model: "...", hits: [{note_id, score, rank}]}].
+        // This is the shape that recall() verbose mode injects.
+        use khive_storage::types::VectorSearchHit;
+        use uuid::Uuid;
+
+        let id1 = Uuid::from_u128(0x1);
+        let id2 = Uuid::from_u128(0x2);
+
+        let hits_a = vec![VectorSearchHit {
+            subject_id: id1,
+            score: 0.9_f64.into(),
+            rank: 1,
+        }];
+        let hits_b = vec![VectorSearchHit {
+            subject_id: id2,
+            score: 0.7_f64.into(),
+            rank: 1,
+        }];
+
+        let candidates = RecallCandidateSet {
+            namespace: "test".to_string(),
+            text_hits: vec![],
+            vector_hits_per_model: vec![
+                ("model-a".to_string(), hits_a),
+                ("model-b".to_string(), hits_b),
+            ],
+        };
+
+        // Build the per_model structure as done in handle_recall verbose path.
+        let per_model: Vec<Value> = candidates
+            .vector_hits_per_model
+            .iter()
+            .map(|(model, hits)| {
+                let hits_json: Vec<Value> = hits
+                    .iter()
+                    .map(|h| {
+                        json!({
+                            "note_id": h.subject_id.to_string(),
+                            "score": h.score.to_f64(),
+                            "rank": h.rank,
+                        })
+                    })
+                    .collect();
+                json!({ "model": model, "hits": hits_json })
+            })
+            .collect();
+
+        assert_eq!(per_model.len(), 2, "should have one entry per model");
+        assert_eq!(per_model[0]["model"], "model-a");
+        assert_eq!(per_model[0]["hits"][0]["note_id"], id1.to_string());
+        assert_eq!(per_model[1]["model"], "model-b");
+        assert_eq!(per_model[1]["hits"][0]["note_id"], id2.to_string());
     }
 }

@@ -115,7 +115,7 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum composite score. Composite is always in [0,1] after weighted fusion and temporal decay (default none; 0.3–0.7 typical for production).",
+                description: "Minimum composite score; range depends on fusion strategy. RRF: 0–1 after rank normalization (normalized by (k+1) so rank-1 = 1.0). Weighted: 0–1 after weight normalization. The default strategy is RRF — see ADR-033. Typical production floor: 0.3–0.7.",
             },
             ParamDef {
                 name: "score_floor",
