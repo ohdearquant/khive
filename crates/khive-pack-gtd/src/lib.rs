@@ -203,10 +203,10 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
             },
         ],
     },
-    // Declaration: declares a task done
+    // Declaration: declares a task done or cancelled
     HandlerDef {
         name: "complete",
-        description: "Mark a task done with an optional result note",
+        description: "Mark a task done (or cancelled) with an optional result note",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
@@ -221,6 +221,12 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
                 param_type: "string",
                 required: false,
                 description: "Optional result or completion note.",
+            },
+            ParamDef {
+                name: "status",
+                param_type: "string",
+                required: false,
+                description: "Terminal status: \"done\" (default) or \"cancelled\".",
             },
         ],
     },

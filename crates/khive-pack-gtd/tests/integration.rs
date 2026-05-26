@@ -1555,3 +1555,497 @@ async fn complete_from_active_succeeds() {
     assert_eq!(done["from"], "active");
     assert_eq!(done["to"], "done");
 }
+
+// ── Wave 4 regression tests (CC-1, ue-dsl-parallel C2, scenario-gtd C2) ───────
+
+/// CC-1: complete(id, status="cancelled") must honour the status arg and
+/// transition to "cancelled", NOT silently force "done".
+#[tokio::test]
+async fn cc1_complete_with_status_cancelled_reaches_cancelled() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "cc1-cancel-test", "status": "next"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let result = pack
+        .dispatch("complete", json!({"id": id, "status": "cancelled"}))
+        .await
+        .expect("complete(status=cancelled) must succeed");
+
+    assert_eq!(
+        result["to"], "cancelled",
+        "CC-1: complete(status=cancelled) must transition to 'cancelled', not 'done'; got: {result}"
+    );
+    assert_eq!(result["completed"], true);
+    assert!(
+        result["is_terminal"].as_bool().unwrap_or(false),
+        "CC-1: cancelled must be a terminal state; got: {result}"
+    );
+}
+
+/// CC-1: complete(id, status="done") must work as before.
+#[tokio::test]
+async fn cc1_complete_with_status_done_still_works() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "cc1-done-test", "status": "next"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let result = pack
+        .dispatch("complete", json!({"id": id, "status": "done"}))
+        .await
+        .expect("complete(status=done) must succeed");
+
+    assert_eq!(result["to"], "done", "CC-1: explicit status=done must work");
+}
+
+/// CC-1: complete(id) with no status still defaults to "done".
+#[tokio::test]
+async fn cc1_complete_default_is_done() {
+    let pack = pack(rt());
+    let resp = assign(
+        &pack,
+        json!({"title": "cc1-default-test", "status": "next"}),
+    )
+    .await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let result = pack
+        .dispatch("complete", json!({"id": id}))
+        .await
+        .expect("complete() with no status must default to done");
+
+    assert_eq!(result["to"], "done", "CC-1: default status must be 'done'");
+}
+
+/// CC-1: complete(id, status="bogus") must be rejected, not silently force "done".
+#[tokio::test]
+async fn cc1_complete_invalid_status_is_rejected() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "cc1-bogus-test", "status": "next"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    let err = pack
+        .dispatch("complete", json!({"id": id, "status": "bogus"}))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("\"done\" or \"cancelled\""),
+        "CC-1: invalid status must be rejected with helpful message; got: {msg}"
+    );
+}
+
+/// CC-1: complete(status="cancelled") must also write the audit record with to="cancelled".
+#[tokio::test]
+async fn cc1_complete_cancelled_writes_audit_record() {
+    use khive_storage::{SqlStatement, SqlValue};
+
+    let rt = rt();
+    let fixture = pack(rt.clone());
+
+    let resp = assign(
+        &fixture,
+        json!({"title": "cc1-audit-cancel", "status": "next"}),
+    )
+    .await;
+    let task_id = resp["full_id"].as_str().unwrap().to_string();
+
+    fixture
+        .dispatch("complete", json!({"id": task_id, "status": "cancelled"}))
+        .await
+        .expect("complete(status=cancelled) must succeed");
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("sql reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT from_state, to_state FROM gtd_lifecycle_audit \
+                  WHERE note_id = ?1 AND to_state = 'cancelled'"
+                .into(),
+            params: vec![SqlValue::Text(task_id.clone())],
+            label: None,
+        })
+        .await
+        .expect("audit query");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "CC-1: complete(status=cancelled) must write audit row with to_state='cancelled'"
+    );
+}
+
+/// ue-dsl-parallel C2 / CC-race: simulating parallel complete() via sequential
+/// calls. After the first complete() succeeds, the second must return an error
+/// because the task is in terminal state — it must NOT return a false success.
+/// (True concurrent race requires tokio::join!, but the atomic SQL ensures the
+/// second loses even in that case; this test covers the serial leg first.)
+#[tokio::test]
+async fn dsl_parallel_c2_double_complete_second_must_fail() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "race-test", "status": "next"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // First complete succeeds.
+    let first = pack
+        .dispatch("complete", json!({"id": id, "result": "op-A"}))
+        .await
+        .expect("first complete must succeed");
+    assert_eq!(first["to"], "done");
+
+    // Second complete must fail because "done" is terminal.
+    let err = pack
+        .dispatch("complete", json!({"id": id, "result": "op-B"}))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("terminal state"),
+        "dsl-parallel C2: second complete must fail with terminal-state error; got: {err}"
+    );
+}
+
+/// ue-dsl-parallel C2: true concurrent complete() race using tokio::join!.
+/// Both tasks run concurrently; exactly ONE must succeed and ONE must fail.
+#[tokio::test]
+async fn dsl_parallel_c2_concurrent_complete_one_wins_one_loses() {
+    let rt = rt();
+    let fixture = pack(rt.clone());
+
+    let resp = assign(
+        &fixture,
+        json!({"title": "concurrent-race", "status": "next"}),
+    )
+    .await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+    let id2 = id.clone();
+
+    let pack_a = std::sync::Arc::new(fixture);
+    let pack_b = pack_a.clone();
+
+    let (res_a, res_b) = tokio::join!(
+        pack_a.dispatch("complete", json!({"id": id, "result": "op-A"})),
+        pack_b.dispatch("complete", json!({"id": id2, "result": "op-B"})),
+    );
+
+    let successes = [res_a.is_ok(), res_b.is_ok()]
+        .iter()
+        .filter(|&&ok| ok)
+        .count();
+    let failures = [res_a.is_err(), res_b.is_err()]
+        .iter()
+        .filter(|&&e| e)
+        .count();
+
+    assert_eq!(
+        successes, 1,
+        "dsl-parallel C2: exactly one concurrent complete() must succeed; got {successes} successes"
+    );
+    assert_eq!(
+        failures, 1,
+        "dsl-parallel C2: exactly one concurrent complete() must fail; got {failures} failures"
+    );
+}
+
+/// scenario-gtd C2: `next()` must not return tasks whose `depends_on` includes
+/// tasks that are NOT in `done` status.
+#[tokio::test]
+async fn scenario_gtd_c2_next_excludes_tasks_with_incomplete_deps() {
+    let pack = pack(rt());
+
+    // Blocker task: starts inbox (not done).
+    let blocker = assign(&pack, json!({"title": "blocker", "status": "inbox"})).await;
+    let blocker_id = blocker["full_id"].as_str().unwrap().to_string();
+
+    // Dependent task: depends on the blocker, status=next.
+    let dependent = assign(
+        &pack,
+        json!({
+            "title": "dependent-task",
+            "status": "next",
+            "depends_on": [blocker_id]
+        }),
+    )
+    .await;
+    let dep_id = dependent["full_id"].as_str().unwrap().to_string();
+
+    // next() must NOT return the dependent task (its dep is not done).
+    let result = pack.dispatch("next", json!({})).await.unwrap();
+    let titles: Vec<&str> = result
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["title"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(
+        !titles.contains(&"dependent-task"),
+        "scenario-gtd C2: next() must not return tasks with incomplete deps; got: {titles:?}"
+    );
+
+    // Now complete the blocker.
+    pack.dispatch("transition", json!({"id": blocker_id, "status": "done"}))
+        .await
+        .expect("blocker→done");
+
+    // next() must now include the dependent task.
+    let result2 = pack.dispatch("next", json!({})).await.unwrap();
+    let titles2: Vec<&str> = result2
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["title"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(
+        titles2.contains(&"dependent-task"),
+        "scenario-gtd C2: after blocker is done, next() must include dependent task; got: {titles2:?}"
+    );
+
+    let _ = dep_id; // suppress unused warning
+}
+
+/// scenario-gtd C2: a task with NO depends_on must always appear in next().
+#[tokio::test]
+async fn scenario_gtd_c2_next_includes_tasks_with_no_deps() {
+    let pack = pack(rt());
+    assign(
+        &pack,
+        json!({"title": "no-deps-task", "status": "next", "priority": "p1"}),
+    )
+    .await;
+
+    let result = pack.dispatch("next", json!({})).await.unwrap();
+    let titles: Vec<&str> = result
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["title"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(
+        titles.contains(&"no-deps-task"),
+        "scenario-gtd C2: task with no deps must appear in next(); got: {titles:?}"
+    );
+}
+
+/// scenario-gtd C2: a task whose ALL deps are done must appear in next().
+#[tokio::test]
+async fn scenario_gtd_c2_next_includes_tasks_with_all_deps_done() {
+    let pack = pack(rt());
+
+    let b1 = assign(&pack, json!({"title": "dep-done-1", "status": "inbox"})).await;
+    let b1_id = b1["full_id"].as_str().unwrap().to_string();
+    let b2 = assign(&pack, json!({"title": "dep-done-2", "status": "inbox"})).await;
+    let b2_id = b2["full_id"].as_str().unwrap().to_string();
+
+    // Complete both blockers.
+    pack.dispatch("transition", json!({"id": b1_id, "status": "done"}))
+        .await
+        .unwrap();
+    pack.dispatch("transition", json!({"id": b2_id, "status": "done"}))
+        .await
+        .unwrap();
+
+    // Dependent task with two done deps.
+    let dep = assign(
+        &pack,
+        json!({
+            "title": "all-deps-done",
+            "status": "next",
+            "depends_on": [b1_id, b2_id]
+        }),
+    )
+    .await;
+    let dep_id = dep["full_id"].as_str().unwrap().to_string();
+
+    let result = pack.dispatch("next", json!({})).await.unwrap();
+    let titles: Vec<&str> = result
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["title"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(
+        titles.contains(&"all-deps-done"),
+        "scenario-gtd C2: task with all deps done must appear in next(); got: {titles:?}"
+    );
+
+    let _ = dep_id;
+}
+
+/// Regression: `next()` must surface a task whose completed blocker lives
+/// outside the 500-task scan window (older than the 500 newest task rows).
+///
+/// This exercises the batch-fetch path added to `handle_next` that resolves
+/// dependency statuses for UUIDs absent from the initial list_notes page.
+#[tokio::test]
+async fn next_resolves_deps_older_than_500_task_window() {
+    use khive_storage::note::Note;
+    use khive_storage::types::PageRequest;
+    use serde_json::json;
+
+    let runtime = rt();
+    let token = runtime.authorize(khive_runtime::Namespace::local());
+    let note_store = runtime.notes(&token).expect("note store");
+
+    // Create a blocker task with `done` status directly in storage, timestamped
+    // old enough that list_notes (newest-500) will never include it once we
+    // pad the database with 500 newer tasks.
+    let blocker_id = uuid::Uuid::new_v4();
+    let old_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000; // ~11 days ago
+    let blocker = Note {
+        id: blocker_id,
+        namespace: "local".to_string(),
+        kind: "task".to_string(),
+        status: "active".to_string(),
+        name: Some("ancient-blocker".to_string()),
+        content: "ancient blocker task".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({"status": "done"})),
+        created_at: old_ts,
+        updated_at: old_ts,
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(blocker)
+        .await
+        .expect("insert blocker");
+
+    // Pad the database with 500 filler tasks (all inbox, not the blocker).
+    // These are newer than the blocker so they dominate the list_notes window.
+    let now = chrono::Utc::now().timestamp_micros();
+    let fillers: Vec<Note> = (0..500_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("filler-{i}")),
+            content: format!("filler task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "inbox"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(fillers)
+        .await
+        .expect("insert fillers");
+
+    // Build pack AFTER storage is populated (same runtime).
+    let fixture = pack(runtime);
+
+    // Create the dependent task pointing to the ancient-done blocker.
+    let blocker_full = blocker_id.as_hyphenated().to_string();
+    let dep = assign(
+        &fixture,
+        json!({
+            "title": "unblocked-by-ancient",
+            "status": "next",
+            "depends_on": [blocker_full]
+        }),
+    )
+    .await;
+    let dep_id = dep["full_id"].as_str().unwrap().to_string();
+
+    // next() must include the dependent task: its blocker is done even though
+    // it is outside the 500-task scan window.
+    let result = fixture.dispatch("next", json!({})).await.unwrap();
+    let found = result
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["title"].as_str() == Some("unblocked-by-ancient"));
+    assert!(
+        found,
+        "next() must surface task whose done blocker is older than 500-task window; \
+         result: {result:?}"
+    );
+
+    let _ = dep_id;
+    let _ = PageRequest {
+        offset: 0,
+        limit: 1,
+    }; // suppress unused import warning
+}
+
+/// Medium: Race regression — concurrent `complete()` from two OS threads.
+///
+/// Two tasks contend to complete the same task.  Exactly one must win and
+/// exactly one must lose.  The loser must fail with the expected terminal-state
+/// or rows-affected-0 conflict error, NOT a generic SQL / lock error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_complete_two_threads_one_wins_one_loses_atomic() {
+    use std::sync::Arc;
+
+    let runtime = rt();
+    let fixture = Arc::new(pack(runtime));
+
+    let resp = assign(&fixture, json!({"title": "mt-race-task", "status": "next"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    // Barrier ensures both spawned tasks attempt complete() simultaneously.
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let (tx_a, rx_a) = tokio::sync::oneshot::channel::<Result<Value, RuntimeError>>();
+    let (tx_b, rx_b) = tokio::sync::oneshot::channel::<Result<Value, RuntimeError>>();
+
+    let pack_a = fixture.clone();
+    let pack_b = fixture.clone();
+    let bar_a = barrier.clone();
+    let bar_b = barrier.clone();
+    let id_a = id.clone();
+    let id_b = id.clone();
+
+    tokio::spawn(async move {
+        bar_a.wait().await;
+        let res = pack_a
+            .dispatch("complete", json!({"id": id_a, "result": "thread-A"}))
+            .await;
+        let _ = tx_a.send(res);
+    });
+
+    tokio::spawn(async move {
+        bar_b.wait().await;
+        let res = pack_b
+            .dispatch("complete", json!({"id": id_b, "result": "thread-B"}))
+            .await;
+        let _ = tx_b.send(res);
+    });
+
+    let res_a = rx_a.await.expect("thread A result");
+    let res_b = rx_b.await.expect("thread B result");
+
+    let successes = [res_a.is_ok(), res_b.is_ok()]
+        .iter()
+        .filter(|&&ok| ok)
+        .count();
+    let failures = [res_a.is_err(), res_b.is_err()]
+        .iter()
+        .filter(|&&e| e)
+        .count();
+
+    assert_eq!(
+        successes, 1,
+        "exactly one complete() must succeed in concurrent race; got {successes} successes"
+    );
+    assert_eq!(
+        failures, 1,
+        "exactly one complete() must fail in concurrent race; got {failures} failures"
+    );
+
+    // The loser must fail with the expected conflict error — terminal-state
+    // rejection or rows_affected==0 guard — NOT a generic storage/lock error.
+    let loser_err = match (res_a, res_b) {
+        (Err(e), _) => e,
+        (_, Err(e)) => e,
+        _ => panic!("expected exactly one failure; both succeeded"),
+    };
+    let msg = loser_err.to_string();
+    assert!(
+        msg.contains("terminal state") || msg.contains("rows_affected"),
+        "losing complete() must fail with terminal-state or rows_affected conflict; got: {msg}"
+    );
+}

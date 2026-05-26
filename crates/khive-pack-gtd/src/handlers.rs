@@ -134,6 +134,24 @@ struct CompleteParams {
     id: String,
     #[serde(default)]
     result: Option<String>,
+    /// CC-1: honor `status` param — accepts "done" (default) or "cancelled".
+    /// Silently ignoring an explicit status arg is the worst outcome for callers
+    /// who follow the MCP server hint "complete() defaults to 'done'; pass
+    /// status='cancelled' for cancellation."
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// CC-1 helper: validate the target terminal status for `complete()`.
+/// Returns the canonical target (`"done"` or `"cancelled"`) or an error.
+fn complete_target_status(status: Option<&str>) -> Result<&'static str, RuntimeError> {
+    match status {
+        None | Some("done") => Ok("done"),
+        Some("cancelled") => Ok("cancelled"),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "complete: status must be \"done\" or \"cancelled\"; got {other:?}"
+        ))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -319,6 +337,68 @@ async fn load_task(
     Ok((note, current))
 }
 
+// ── atomic GTD transition (ue-dsl-parallel C2) ──────────────────────────────
+
+/// Perform an atomic conditional UPDATE on a task's properties, transitioning it
+/// from `expected_current` to `target` status.
+///
+/// Relies on SQLite's atomic single-statement UPDATE plus a conditional WHERE
+/// predicate (`json_extract(properties,'$.status') = ?`) so that concurrent
+/// `complete()` or `transition()` calls on the same task in a parallel batch do
+/// NOT both report success. Only one write wins; the other gets 0 rows affected
+/// and must report an error.
+///
+/// Returns the number of rows updated (1 = success, 0 = lost race / already moved).
+async fn atomic_gtd_transition(
+    runtime: &KhiveRuntime,
+    note_id: Uuid,
+    expected_current: &str,
+    target: &str,
+    new_props: &serde_json::Value,
+    updated_at: i64,
+) -> Result<u64, RuntimeError> {
+    let props_str = serde_json::to_string(new_props)
+        .map_err(|e| RuntimeError::Internal(format!("serialize props: {e}")))?;
+    let id_str = note_id.as_hyphenated().to_string();
+    let target_owned = target.to_string();
+    let current_owned = expected_current.to_string();
+
+    // The conditional UPDATE runs as a single SQLite statement, which is atomic
+    // on its own — no explicit transaction is needed because we never split the
+    // read-check from the write. The WHERE predicate goes through json_extract
+    // on the properties column to check the GTD status rather than the
+    // row-visibility `status` column (which is always "active").
+    //
+    // Concurrency: if another writer has already written `target` (or any other
+    // terminal state) by the time the WHERE predicate is evaluated, the predicate
+    // fails and rows_affected = 0. Caller distinguishes the rows-affected-0 loser
+    // path from the pre-load terminal-state error returned by `load_task`.
+    let sql = runtime.sql();
+    let mut writer = sql
+        .writer()
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("sql writer: {e}")))?;
+    let affected = writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
+                  WHERE id = ?3 \
+                  AND json_extract(properties, '$.status') = ?4 \
+                  AND deleted_at IS NULL"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(props_str),
+                SqlValue::Integer(updated_at),
+                SqlValue::Text(id_str),
+                SqlValue::Text(current_owned),
+            ],
+            label: Some(format!("gtd_atomic_transition_{target_owned}")),
+        })
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("atomic transition update: {e}")))?;
+
+    Ok(affected)
+}
+
 // ── handlers ─────────────────────────────────────────────────────────────────
 
 impl GtdPack {
@@ -497,7 +577,18 @@ impl GtdPack {
             .list_notes(token, Some("task"), 500, 0)
             .await?;
 
-        let mut actionable: Vec<&khive_storage::note::Note> = notes
+        // Build a quick lookup map of task UUID → GTD status so dependency
+        // filtering (scenario-gtd C2) can check blocker states in O(1).
+        use std::collections::HashMap;
+        let mut status_by_id: HashMap<uuid::Uuid, String> = notes
+            .iter()
+            .filter(|n| n.deleted_at.is_none())
+            .map(|n| (n.id, task_status(n.properties.as_ref())))
+            .collect();
+
+        // Collect actionable candidates (before dependency check) so we can
+        // determine which blocker UUIDs are outside the 500-task window.
+        let candidates: Vec<&khive_storage::note::Note> = notes
             .iter()
             .filter(|n| n.deleted_at.is_none())
             .filter(|n| is_actionable(&task_status(n.properties.as_ref())))
@@ -509,6 +600,71 @@ impl GtdPack {
                         .and_then(|v| v.get("assignee"))
                         .and_then(|v| v.as_str())
                         == Some(want)
+                }
+            })
+            .collect();
+
+        // Gather all dependency UUIDs referenced by candidates that are not
+        // already in status_by_id — these are blockers older than the 500-task
+        // scan window.  Fetch them in one batch so the dependency filter below
+        // can evaluate their status correctly regardless of window position.
+        let missing_dep_ids: Vec<uuid::Uuid> = candidates
+            .iter()
+            .flat_map(|n| {
+                n.properties
+                    .as_ref()
+                    .and_then(|p| p.get("depends_on"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| uuid::Uuid::parse_str(v.as_str().unwrap_or("")).ok())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .filter(|id| !status_by_id.contains_key(id))
+            .collect();
+
+        if !missing_dep_ids.is_empty() {
+            let ns = token.namespace().as_str();
+            let fetched = self
+                .runtime()
+                .notes(token)?
+                .get_notes_batch(&missing_dep_ids)
+                .await
+                .map_err(|e| RuntimeError::Internal(format!("get_notes_batch: {e}")))?;
+            for n in fetched {
+                // Enforce namespace isolation: ignore notes from other tenants.
+                if n.namespace == ns {
+                    status_by_id.insert(n.id, task_status(n.properties.as_ref()));
+                }
+            }
+        }
+
+        // scenario-gtd C2: exclude tasks whose `depends_on` contains any
+        // blocker that is NOT in the `done` terminal state.
+        // Dangling UUIDs (not found in status_by_id even after batch fetch)
+        // are treated as incomplete (blocker unknown = not done → keep blocked).
+        let mut actionable: Vec<&khive_storage::note::Note> = candidates
+            .into_iter()
+            .filter(|n| {
+                let deps = n
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.get("depends_on"))
+                    .and_then(|v| v.as_array());
+                match deps {
+                    None => true, // no dependencies → not blocked
+                    Some(arr) if arr.is_empty() => true,
+                    Some(arr) => arr.iter().all(|dep| {
+                        let dep_str = dep.as_str().unwrap_or("");
+                        let dep_uuid = uuid::Uuid::parse_str(dep_str).ok();
+                        match dep_uuid.and_then(|id| status_by_id.get(&id)) {
+                            Some(s) => s == "done",
+                            // Dep not found or non-UUID → treat as blocked.
+                            None => false,
+                        }
+                    }),
                 }
             })
             .collect();
@@ -531,6 +687,11 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: CompleteParams = deser(params)?;
+
+        // CC-1: validate the target terminal status before any DB work.
+        // Accepts "done" (default) or "cancelled"; rejects anything else.
+        let target = complete_target_status(p.status.as_deref())?;
+
         let (mut note, current) = load_task(self.runtime(), token, &p.id).await?;
 
         if is_terminal(&current) {
@@ -552,7 +713,8 @@ impl GtdPack {
         let completed_at = Utc::now().to_rfc3339();
         let mut props = note.properties.take().unwrap_or(json!({}));
         if let Some(obj) = props.as_object_mut() {
-            obj.insert("status".into(), json!("done"));
+            // CC-1: write the caller-supplied target (done or cancelled).
+            obj.insert("status".into(), json!(target));
             obj.insert("completed_at".into(), json!(completed_at));
             if let Some(ref result) = p.result {
                 obj.insert("result".into(), json!(result));
@@ -564,24 +726,41 @@ impl GtdPack {
         // at data.status in the response.
         note.updated_at = Utc::now().timestamp_micros();
 
-        self.runtime()
-            .notes(token)?
-            .upsert_note(note.clone())
-            .await
-            .map_err(|e| RuntimeError::Internal(format!("upsert_note: {e}")))?;
+        // ue-dsl-parallel C2: atomic transition — use a conditional SQL UPDATE
+        // so that a concurrent complete() on the same task loses the race
+        // cleanly rather than both reporting success.
+        let rows_affected = atomic_gtd_transition(
+            self.runtime(),
+            note.id,
+            &current,
+            target,
+            note.properties.as_ref().unwrap(),
+            note.updated_at,
+        )
+        .await?;
+
+        if rows_affected == 0 {
+            // Another concurrent op already transitioned this task away from `current`.
+            // Re-read the actual current state to give a precise error.
+            let (_, actual_now) = load_task(self.runtime(), token, &p.id).await?;
+            return Err(RuntimeError::InvalidInput(format!(
+                "task {} is in terminal state {actual_now:?}; no further transitions allowed",
+                short_id(note.id)
+            )));
+        }
 
         // ADR-019: write lifecycle audit record (best-effort).
         ensure_audit_schema(self.runtime()).await;
-        write_audit_record(self.runtime(), note.id, &current, "done", None).await;
+        write_audit_record(self.runtime(), note.id, &current, target, None).await;
 
         Ok(json!({
             "completed": true,
             "id": short_id(note.id),
             "full_id": note.id.as_hyphenated().to_string(),
             "from": current,
-            "to": "done",
+            "to": target,
             "completed_at": completed_at,
-            "is_terminal": is_terminal("done"),
+            "is_terminal": is_terminal(target),
         }))
     }
 
@@ -720,11 +899,25 @@ impl GtdPack {
         // at data.status in the response.
         note.updated_at = Utc::now().timestamp_micros();
 
-        self.runtime()
-            .notes(token)?
-            .upsert_note(note.clone())
-            .await
-            .map_err(|e| RuntimeError::Internal(format!("upsert_note: {e}")))?;
+        // ue-dsl-parallel C2: atomic transition — conditional SQL UPDATE so
+        // concurrent transitions in the same parallel batch only one wins.
+        let rows_affected = atomic_gtd_transition(
+            self.runtime(),
+            note.id,
+            &current,
+            target,
+            note.properties.as_ref().unwrap(),
+            note.updated_at,
+        )
+        .await?;
+
+        if rows_affected == 0 {
+            let (_, actual_now) = load_task(self.runtime(), token, &p.id).await?;
+            return Err(RuntimeError::InvalidInput(format!(
+                "task {} is in terminal state {actual_now:?}; no further transitions allowed",
+                short_id(note.id)
+            )));
+        }
 
         // ADR-019 + ADR-101: write lifecycle audit record (best-effort).
         ensure_audit_schema(self.runtime()).await;
