@@ -102,7 +102,9 @@ async fn test_recall_decay_ranking() {
 
     // Manually backdate the old note to simulate age
     let old_uuid: uuid::Uuid = old_id.parse().unwrap();
-    let note_store = rt.notes(&rt.authorize(Namespace::local())).unwrap();
+    let note_store = rt
+        .notes(&rt.authorize(Namespace::local()).unwrap())
+        .unwrap();
     let mut old_note = note_store.get_note(old_uuid).await.unwrap().unwrap();
     old_note.created_at -= 90 * 86_400_000_000i64; // 90 days in microseconds
     note_store.upsert_note(old_note).await.unwrap();
@@ -320,7 +322,7 @@ async fn test_remember_source_id_not_in_properties() {
         .expect("valid uuid");
 
     let note_store = rt
-        .notes(&rt.authorize(Namespace::local()))
+        .notes(&rt.authorize(Namespace::local()).unwrap())
         .expect("note store");
     let note = note_store
         .get_note(note_id)
@@ -363,7 +365,7 @@ async fn test_remember_decay_factor_no_upper_cap() {
         .expect("valid uuid");
 
     let note_store = rt
-        .notes(&rt.authorize(Namespace::local()))
+        .notes(&rt.authorize(Namespace::local()).unwrap())
         .expect("note store");
     let note = note_store
         .get_note(note_id)
@@ -427,7 +429,7 @@ async fn test_remember_default_memory_type_written_to_properties() {
     );
 
     let note_store = rt
-        .notes(&rt.authorize(Namespace::local()))
+        .notes(&rt.authorize(Namespace::local()).unwrap())
         .expect("note store");
     let note = note_store
         .get_note(note_id)
@@ -890,7 +892,7 @@ async fn test_recall_excludes_non_memory_notes() {
 
     // Create 50 observation notes whose content matches the recall query — enough to
     // dominate a `limit=5` candidate pool at `limit * 4 = 20` without pre-filtering.
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
     for i in 0..50 {
         rt.create_note(
             &tok,
