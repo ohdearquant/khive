@@ -356,8 +356,8 @@ impl KhiveRuntime {
 
     /// Retrieve an entity by ID, enforcing namespace isolation (ADR-007).
     ///
-    /// Returns `Err(NotFound)` if the entity does not exist in storage,
-    /// or `Err(NamespaceMismatch)` if it exists in a different namespace.
+    /// Returns `Err(NotFound)` if the entity does not exist or belongs to a
+    /// different namespace (indistinguishable — no cross-namespace existence oracle).
     pub async fn get_entity(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<Entity> {
         let entity = self
             .entities(token)?
@@ -399,18 +399,20 @@ impl KhiveRuntime {
 
     /// Enforce that `actual` matches the token's namespace.
     ///
-    /// Returns `Err(NamespaceMismatch { id })` when they differ, preserving ADR-007
-    /// timing-oracle mitigation (the external message is "not found in this namespace").
+    /// Returns `Err(NotFound)` when they differ — ADR-007 requires wrong-namespace
+    /// and absent UUIDs to be indistinguishable externally (no existence oracle).
     pub(crate) fn ensure_namespace(
         &self,
         actual: &str,
         token: &NamespaceToken,
-        id: Uuid,
+        _id: Uuid,
     ) -> RuntimeResult<()> {
         if actual == token.namespace().as_str() {
             return Ok(());
         }
-        Err(RuntimeError::NamespaceMismatch { id })
+        Err(RuntimeError::NotFound(
+            "not found in this namespace".into(),
+        ))
     }
 
     /// List entities in a namespace, optionally filtered by kind and entity_type.
@@ -1584,8 +1586,8 @@ impl KhiveRuntime {
     /// references for `annotates` edges that target this note (ADR-002, ADR-024).
     /// Soft delete also cleans FTS and vector indexes; edges are left in place.
     ///
-    /// Returns `Ok(false)` if the note does not exist, or `Err(NamespaceMismatch)`
-    /// if it belongs to a different namespace (ADR-007 namespace isolation).
+    /// Returns `Ok(false)` if the note does not exist or belongs to a different
+    /// namespace (ADR-007 — wrong-namespace is indistinguishable from absent).
     pub async fn delete_note(
         &self,
         token: &NamespaceToken,
@@ -1599,7 +1601,7 @@ impl KhiveRuntime {
             None => return Ok(false),
         };
         if note.namespace != ns {
-            return Err(RuntimeError::NamespaceMismatch { id });
+            return Ok(false);
         }
         let mode = if hard {
             DeleteMode::Hard
@@ -1742,8 +1744,8 @@ impl KhiveRuntime {
     /// outbound) to prevent dangling references. Soft delete also cleans FTS
     /// and vector indexes; edges are left in place.
     ///
-    /// Returns `Err(NamespaceMismatch)` if the entity exists but belongs to a
-    /// different namespace (ADR-007 namespace isolation).
+    /// Returns `Err(NotFound)` if the entity does not exist or belongs to a
+    /// different namespace (ADR-007 — indistinguishable, no existence oracle).
     pub async fn delete_entity(
         &self,
         token: &NamespaceToken,
@@ -2857,16 +2859,15 @@ mod tests {
         let found = rt.get_entity(&ns_a, entity.id).await;
         assert!(found.is_ok(), "should be visible in its own namespace");
 
-        // Different namespace: NamespaceMismatch error (ADR-007).
+        // Different namespace: NotFound error (ADR-007 — no cross-namespace existence oracle).
         let not_found = rt.get_entity(&ns_b, entity.id).await;
         assert!(
             not_found.is_err(),
             "should not be visible across namespaces"
         );
-        // Must be the specific NamespaceMismatch variant, not generic NotFound.
         assert!(
-            matches!(not_found.unwrap_err(), crate::RuntimeError::NamespaceMismatch { id } if id == entity.id),
-            "cross-namespace get must return NamespaceMismatch with the entity id"
+            matches!(not_found.unwrap_err(), crate::RuntimeError::NotFound(_)),
+            "cross-namespace get must return NotFound, not NamespaceMismatch"
         );
     }
 
@@ -2904,15 +2905,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete from wrong namespace: NamespaceMismatch error (ADR-007 — no information leak).
+        // Delete from wrong namespace: NotFound (ADR-007 — no existence oracle).
         let cross_ns_result = rt.delete_entity(&ns_b, entity.id, true).await;
         assert!(
             cross_ns_result.is_err(),
             "cross-namespace delete must error"
         );
         assert!(
-            matches!(cross_ns_result.unwrap_err(), crate::RuntimeError::NamespaceMismatch { id } if id == entity.id),
-            "cross-namespace delete must return NamespaceMismatch, not a generic error"
+            matches!(cross_ns_result.unwrap_err(), crate::RuntimeError::NotFound(_)),
+            "cross-namespace delete must return NotFound, not NamespaceMismatch"
         );
 
         // Entity still present in its own namespace.
@@ -5506,11 +5507,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Attempt to delete from a different namespace must return NamespaceMismatch.
+        // Attempt to delete from a different namespace must return Ok(false) —
+        // indistinguishable from absent (ADR-007, no existence oracle).
         let result = rt.delete_note(&ns_b, note.id, true).await;
         assert!(
-            matches!(result.unwrap_err(), crate::RuntimeError::NamespaceMismatch { id } if id == note.id),
-            "cross-namespace delete_note must return NamespaceMismatch with the note id"
+            !result.unwrap(),
+            "cross-namespace delete_note must return Ok(false), not NamespaceMismatch"
         );
 
         // Note must still exist in ns-a after the failed cross-ns delete.

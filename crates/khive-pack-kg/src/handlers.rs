@@ -52,7 +52,7 @@ fn canonical_entity_kind(raw: &str, registry: &VerbRegistry) -> Result<String, R
     )))
 }
 
-fn canonical_note_kind(raw: &str, registry: &VerbRegistry) -> Result<String, RuntimeError> {
+pub(crate) fn canonical_note_kind(raw: &str, registry: &VerbRegistry) -> Result<String, RuntimeError> {
     if let Ok(k) = NoteKind::from_str(raw) {
         return Ok(k.name().to_string());
     }
@@ -2630,6 +2630,7 @@ impl KgPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: ReviewParams = deser(params)?;
         // H1: accept 8-char short IDs (propose returns short IDs; the next natural
@@ -2775,7 +2776,7 @@ impl KgPack {
         // ADR-046 §5: apply worker fires on approval — idempotent on status check.
         if decision == ProposalDecision::Approve {
             crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
-                .maybe_apply(token, proposal_id)
+                .maybe_apply(token, proposal_id, registry)
                 .await?;
         }
 

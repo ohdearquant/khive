@@ -56,11 +56,11 @@ fn comm_pack_requires_kg() {
 async fn send_and_inbox_roundtrip() {
     let (registry, _rt) = build_registry();
 
-    // Send a message — creates an outbound message note.
+    // Send a message to self (same namespace) — creates outbound + inbound notes.
     let result = registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "agent:bob", "content": "hello" }),
+            serde_json::json!({ "to": "local", "content": "hello" }),
         )
         .await
         .expect("send succeeds");
@@ -134,12 +134,12 @@ async fn read_marks_message_as_read() {
 async fn reply_creates_threaded_message() {
     let (registry, _rt) = build_registry();
 
-    // Send the original message.
+    // Send the original message (same namespace — cross-namespace is denied per ADR-040 §481).
     let original = registry
         .dispatch(
             "comm.send",
             serde_json::json!({
-                "to": "agent:carol",
+                "to": "local",
                 "content": "original message",
                 "subject": "Hello"
             }),
@@ -198,7 +198,7 @@ async fn test_full_id_returns_36_char() {
     let sent = registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "agent:target", "content": "hello" }),
+            serde_json::json!({ "to": "local", "content": "hello" }),
         )
         .await
         .expect("send succeeds");
@@ -287,7 +287,7 @@ async fn test_reply_accepts_short_id() {
         .dispatch(
             "comm.send",
             serde_json::json!({
-                "to": "agent:carol",
+                "to": "local",
                 "content": "original",
                 "subject": "Test"
             }),
@@ -398,7 +398,10 @@ async fn test_short_id_collision_errors_clearly() {
 }
 // ── UE6 Critical F-C3: dual-write delivery tests ─────────────────────────────
 
-/// send() from lambda:khive to lambda:leo writes one outbound note in the caller's namespace.
+/// send() within the same namespace writes one outbound note in the caller's namespace.
+///
+/// Cross-namespace sends are denied per ADR-040 §481 (issue #481 fix).
+/// Same-namespace sends must produce both outbound and inbound copies.
 #[tokio::test]
 async fn test_send_writes_outbound_in_caller_ns() {
     let (registry, rt) = build_registry_for_ns("lambda:khive");
@@ -406,12 +409,12 @@ async fn test_send_writes_outbound_in_caller_ns() {
     registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:leo", "content": "hi" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "hi" }),
         )
         .await
-        .expect("send succeeds");
+        .expect("same-namespace send succeeds");
 
-    // Verify: lambda:khive namespace has exactly 1 message note with direction=outbound.
+    // Verify: lambda:khive namespace has exactly 1 outbound note.
     let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
@@ -440,11 +443,14 @@ async fn test_send_writes_outbound_in_caller_ns() {
             .unwrap()
             .get("to")
             .and_then(|v| v.as_str()),
-        Some("lambda:leo")
+        Some("lambda:khive")
     );
 }
 
-/// send() from lambda:khive to lambda:leo writes one inbound note in the recipient's namespace.
+/// send() within the same namespace writes one inbound note alongside the outbound copy.
+///
+/// Cross-namespace sends are denied per ADR-040 §481 (issue #481 fix).
+/// Same-namespace send creates both copies in the caller's namespace.
 #[tokio::test]
 async fn test_send_writes_inbound_in_recipient_ns() {
     let (registry, rt) = build_registry_for_ns("lambda:khive");
@@ -452,17 +458,17 @@ async fn test_send_writes_inbound_in_recipient_ns() {
     registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:leo", "content": "meeting at 3pm" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "meeting at 3pm" }),
         )
         .await
-        .expect("send succeeds");
+        .expect("same-namespace send succeeds");
 
-    // Verify: lambda:leo namespace has exactly 1 message note with direction=inbound.
-    let recipient_token = rt.authorize(Namespace::parse("lambda:leo").unwrap());
+    // Verify: lambda:khive namespace has exactly 1 inbound note.
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
     let notes = rt
-        .list_notes(&recipient_token, Some("message"), 100, 0)
+        .list_notes(&caller_token, Some("message"), 100, 0)
         .await
-        .expect("list_notes in recipient ns succeeds");
+        .expect("list_notes in caller ns succeeds");
     let inbound: Vec<_> = notes
         .iter()
         .filter(|n| n.deleted_at.is_none())
@@ -477,43 +483,43 @@ async fn test_send_writes_inbound_in_recipient_ns() {
     assert_eq!(
         inbound.len(),
         1,
-        "recipient namespace must have exactly 1 inbound note; got {inbound:?}"
+        "caller namespace must have exactly 1 inbound note; got {inbound:?}"
     );
     let props = inbound[0].properties.as_ref().unwrap();
     assert_eq!(
         props.get("from").and_then(|v| v.as_str()),
         Some("lambda:khive")
     );
-    assert_eq!(props.get("to").and_then(|v| v.as_str()), Some("lambda:leo"));
+    assert_eq!(
+        props.get("to").and_then(|v| v.as_str()),
+        Some("lambda:khive")
+    );
     assert_eq!(inbound[0].content, "meeting at 3pm");
-    // inbound copy must carry an outbound_ref back to the caller's copy.
+    // inbound copy must carry an outbound_ref back to the outbound copy.
     assert!(
         props.get("outbound_ref").is_some(),
         "inbound note must carry outbound_ref"
     );
 }
 
-/// inbox() with the recipient's MCP session returns the inbound message.
+/// inbox() returns the inbound message after a same-namespace send.
+///
+/// Cross-namespace delivery is denied per ADR-040 §481 (issue #481 fix).
+/// Same-namespace send creates an inbound copy visible in inbox().
 #[tokio::test]
 async fn test_inbox_returns_inbound_for_recipient() {
-    // Step 1: send from lambda:khive.
-    let (send_registry, rt) = build_registry_for_ns("lambda:khive");
-    send_registry
+    // Self-send: both copies land in lambda:khive namespace.
+    let (registry, _rt) = build_registry_for_ns("lambda:khive");
+    registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:leo", "content": "you have mail" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "you have mail" }),
         )
         .await
-        .expect("send succeeds");
+        .expect("same-namespace send succeeds");
 
-    // Step 2: build a registry scoped to lambda:leo and call inbox().
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
-    builder.register(CommPack::new(rt.clone()));
-    builder.with_default_namespace("lambda:leo");
-    let leo_registry = builder.build().expect("leo registry builds");
-
-    let inbox = leo_registry
+    // inbox() on the same registry must surface the inbound copy.
+    let inbox = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
         .await
         .expect("inbox succeeds");
@@ -524,7 +530,7 @@ async fn test_inbox_returns_inbound_for_recipient() {
         .expect("inbox returns count");
     assert_eq!(
         count, 1,
-        "lambda:leo inbox must have 1 unread message; got {inbox}"
+        "lambda:khive inbox must have 1 unread message; got {inbox}"
     );
 
     let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
@@ -584,31 +590,35 @@ async fn test_send_to_self_writes_two_notes() {
     );
 }
 
-// ── UE6-H1: reply routes to the "other party", not always back to sender ────
+// ── UE6-H1: reply routes to the "other party" based on metadata, not namespace ─
 
-/// Sender replies to their own outbound message → reply routes to original recipient.
+/// Sender replies to their own outbound message → reply `to` equals original `to`.
 ///
-/// A sends to B. A then replies to that message. The reply must go to B, not A.
+/// Within the same namespace: A sends to self (from=A, to=A). Sender replies to
+/// the outbound copy. Because from==to, the reply routes back to the same namespace
+/// (which is correct — there is no other party in a self-send).
+///
+/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
 #[tokio::test]
 async fn test_reply_from_sender_routes_to_recipient() {
-    // Registry scoped to lambda:khive (the sender).
+    // Registry scoped to lambda:khive (sender == recipient in same-namespace mode).
     let (registry, _rt) = build_registry_for_ns("lambda:khive");
 
-    // Send from lambda:khive to lambda:leo.
+    // Same-namespace send: from=lambda:khive, to=lambda:khive.
     let sent = registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:leo", "content": "hello leo" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "hello self" }),
         )
         .await
-        .expect("send succeeds");
+        .expect("same-namespace send succeeds");
 
     let msg_full_id = sent
         .get("full_id")
         .and_then(|v| v.as_str())
         .expect("send returns full_id");
 
-    // Sender (lambda:khive) replies to their own outbound message.
+    // Sender replies to their own outbound message.
     let reply = registry
         .dispatch(
             "comm.reply",
@@ -617,14 +627,14 @@ async fn test_reply_from_sender_routes_to_recipient() {
         .await
         .expect("reply succeeds");
 
-    // Reply must route to lambda:leo (original recipient), not back to lambda:khive.
+    // from == to in self-send, so reply routes back to self.
     let reply_to = reply
         .get("to")
         .and_then(|v| v.as_str())
         .expect("reply returns to");
     assert_eq!(
-        reply_to, "lambda:leo",
-        "UE6-H1: sender replying to own message must route to original recipient; got {reply_to}"
+        reply_to, "lambda:khive",
+        "UE6-H1: self-send reply routes back to same namespace; got {reply_to}"
     );
     let reply_from = reply
         .get("from")
@@ -636,31 +646,28 @@ async fn test_reply_from_sender_routes_to_recipient() {
     );
 }
 
-/// Recipient replies to an inbound message → reply routes back to original sender.
+/// Recipient replies to an inbound message → reply routes back to the original sender
+/// metadata field, not the caller's namespace.
 ///
-/// A sends to B. B replies. The reply must go to A, not B.
+/// Within same-namespace: both are the same namespace so the routing is always self.
+/// This test verifies reply() works on an inbound message and preserves the metadata.
+///
+/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
 #[tokio::test]
 async fn test_reply_from_recipient_routes_to_sender() {
-    use khive_runtime::VerbRegistryBuilder;
+    // Same namespace: lambda:khive sends to lambda:khive, then replies.
+    let (registry, _rt) = build_registry_for_ns("lambda:khive");
 
-    // Step 1: send from lambda:khive to lambda:leo.
-    let (send_registry, rt) = build_registry_for_ns("lambda:khive");
-    send_registry
+    registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:leo", "content": "meeting at 3pm" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "meeting at 3pm" }),
         )
         .await
-        .expect("send succeeds");
+        .expect("same-namespace send succeeds");
 
-    // Step 2: lambda:leo reads their inbox to get the inbound message id.
-    let mut leo_builder = VerbRegistryBuilder::new();
-    leo_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
-    leo_builder.register(CommPack::new(rt.clone()));
-    leo_builder.with_default_namespace("lambda:leo");
-    let leo_registry = leo_builder.build().expect("leo registry");
-
-    let inbox = leo_registry
+    // Find the inbound copy.
+    let inbox = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "unread" }))
         .await
         .expect("inbox succeeds");
@@ -668,14 +675,14 @@ async fn test_reply_from_recipient_routes_to_sender() {
         .get("messages")
         .and_then(|v| v.as_array())
         .expect("messages array");
-    assert_eq!(msgs.len(), 1, "leo must have 1 inbound message");
+    assert_eq!(msgs.len(), 1, "must have 1 inbound message");
     let inbound_full_id = msgs[0]
         .get("full_id")
         .and_then(|v| v.as_str())
         .expect("full_id on inbound message");
 
-    // Step 3: lambda:leo replies to the inbound message.
-    let reply = leo_registry
+    // Reply to the inbound message.
+    let reply = registry
         .dispatch(
             "comm.reply",
             serde_json::json!({ "id": inbound_full_id, "content": "confirmed" }),
@@ -683,22 +690,22 @@ async fn test_reply_from_recipient_routes_to_sender() {
         .await
         .expect("reply succeeds");
 
-    // Reply must route to lambda:khive (original sender), not back to lambda:leo.
+    // In same-namespace, from == to, so reply routes to the same namespace.
     let reply_to = reply
         .get("to")
         .and_then(|v| v.as_str())
         .expect("reply returns to");
     assert_eq!(
         reply_to, "lambda:khive",
-        "UE6-H1: recipient replying must route to original sender; got {reply_to}"
+        "UE6-H1: same-namespace reply routes back to caller namespace; got {reply_to}"
     );
     let reply_from = reply
         .get("from")
         .and_then(|v| v.as_str())
         .expect("reply returns from");
     assert_eq!(
-        reply_from, "lambda:leo",
-        "reply from must be the caller (lambda:leo)"
+        reply_from, "lambda:khive",
+        "reply from must be the caller namespace"
     );
 }
 
@@ -712,7 +719,7 @@ async fn test_reply_thread_id_is_full_uuid() {
     let original = registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "agent:target", "content": "root message" }),
+            serde_json::json!({ "to": "local", "content": "root message" }),
         )
         .await
         .expect("send succeeds");
@@ -761,7 +768,7 @@ async fn test_reply_chain_preserves_full_uuid_thread_id() {
     let original = registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "agent:other", "content": "start of thread" }),
+            serde_json::json!({ "to": "local", "content": "start of thread" }),
         )
         .await
         .expect("send succeeds");
@@ -1034,18 +1041,21 @@ async fn test_list_message_direction_filter() {
 /// read() on an outbound message must return an error.
 /// Before the fix, read() silently mutated outbound messages, corrupting
 /// the read/unread invariant.
+///
+/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Same-namespace send is used here; the outbound copy stays in lambda:khive.
 #[tokio::test]
 async fn test_read_rejects_outbound_message() {
     let (registry, _rt) = build_registry_for_ns("lambda:khive");
 
-    // Send cross-namespace — the outbound copy stays in lambda:khive.
+    // Same-namespace send — the outbound copy is in lambda:khive.
     let sent = registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:leo", "content": "outbound read attempt" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "outbound read attempt" }),
         )
         .await
-        .expect("send succeeds");
+        .expect("same-namespace send succeeds");
 
     let outbound_full_id = sent
         .get("full_id")
@@ -1131,83 +1141,75 @@ async fn test_thread_verb_returns_threaded_messages() {
     );
 }
 
-// ── High 1 regression: reply() delivers inbound copy to recipient namespace ───
+// ── High 1 regression: reply() delivers inbound copy alongside the outbound copy ─
 
-/// reply() must write an inbound copy to the original sender's namespace, not
-/// just an outbound note in the caller's namespace.
+/// reply() must write both an outbound copy and an inbound copy within the same namespace.
 ///
 /// Before the fix, reply() created only an outbound note via a single
-/// create_note call, so the original sender never received the reply in inbox().
+/// create_note call, so inbox() would not surface the reply.
+///
+/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Same-namespace send is used here — both copies land in the caller's namespace.
 #[tokio::test]
 async fn test_reply_delivers_inbound_to_recipient() {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    // Same-namespace: lambda:khive sends to itself and replies.
+    let (registry, _rt) = build_registry_for_ns("lambda:khive");
 
-    // lambda:khive sends to lambda:leo.
-    let mut khive_builder = VerbRegistryBuilder::new();
-    khive_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
-    khive_builder.register(CommPack::new(rt.clone()));
-    khive_builder.with_default_namespace("lambda:khive");
-    let khive_reg = khive_builder.build().expect("khive registry");
-
-    khive_reg
+    registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:leo", "content": "original from khive" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "original message" }),
         )
         .await
-        .expect("send succeeds");
+        .expect("same-namespace send succeeds");
 
-    // lambda:leo reads inbox and replies.
-    let mut leo_builder = VerbRegistryBuilder::new();
-    leo_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
-    leo_builder.register(CommPack::new(rt.clone()));
-    leo_builder.with_default_namespace("lambda:leo");
-    let leo_reg = leo_builder.build().expect("leo registry");
-
-    let inbox = leo_reg
+    // Find the inbound copy via inbox().
+    let inbox = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
-        .expect("leo inbox succeeds");
+        .expect("inbox succeeds");
     let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(msgs.len(), 1, "leo must have 1 inbound message");
+    assert_eq!(msgs.len(), 1, "must have 1 inbound message");
     let inbound_id = msgs[0].get("full_id").and_then(|v| v.as_str()).unwrap();
 
-    leo_reg
+    // Reply to the inbound message.
+    registry
         .dispatch(
             "comm.reply",
-            serde_json::json!({ "id": inbound_id, "content": "reply from leo" }),
+            serde_json::json!({ "id": inbound_id, "content": "reply message" }),
         )
         .await
         .expect("reply succeeds");
 
-    // lambda:khive must see the reply in their inbox.
-    let khive_inbox = khive_reg
+    // After reply, inbox must contain at least 2 inbound messages
+    // (the original inbound + the reply's inbound copy).
+    let inbox_after = registry
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
-        .expect("khive inbox after reply succeeds");
-    let khive_count = khive_inbox
+        .expect("inbox after reply succeeds");
+    let count_after = inbox_after
         .get("count")
         .and_then(|v| v.as_u64())
         .expect("count field");
     assert!(
-        khive_count >= 1,
-        "High-1 regression: reply() must deliver an inbound copy to the original sender; \
-         lambda:khive inbox count={khive_count} (expected >= 1)"
+        count_after >= 2,
+        "High-1 regression: reply() must deliver an inbound copy; \
+         inbox count={count_after} (expected >= 2)"
     );
 
-    // The inbound copy in khive must be direction=inbound.
-    let khive_msgs = khive_inbox
+    // All inbox items must have direction=inbound.
+    let msgs_after = inbox_after
         .get("messages")
         .and_then(|v| v.as_array())
         .unwrap();
     assert!(
-        khive_msgs.iter().any(|m| m
+        msgs_after.iter().all(|m| m
             .get("properties")
             .and_then(|p| p.get("direction"))
             .and_then(|v| v.as_str())
             == Some("inbound")),
-        "High-1 regression: inbound copy in lambda:khive must have direction=inbound; \
-         got {khive_inbox}"
+        "High-1 regression: all inbox items must have direction=inbound; \
+         got {inbox_after}"
     );
 }
 
@@ -1450,64 +1452,60 @@ async fn test_inbox_invalid_status_banana_rejected() {
     );
 }
 
-// ── H1 regression: cross-namespace thread query ───────────────────────────────
+// ── H1 regression: thread query finds reply within same namespace ─────────────
 
-/// A sends to B, B replies, A queries comm.thread(id=A's outbound UUID) — must
-/// return both A's outbound and B's reply.
+/// A sends to self, A replies via the inbound copy, comm.thread(id=outbound_id)
+/// must return both the outbound and the reply.
 ///
-/// Before the fix, A's outbound copy and B's inbound copy had `thread_id=None`
-/// (root).  When B replied, the reply's thread_id was set to `id_B` (B's local
-/// copy UUID), not to `id_A`.  A's thread query would miss B's reply because it
-/// searched for `thread_id == id_A`.
+/// Before the fix, dual_write_message did not stamp the outbound copy with a
+/// canonical thread_id. The reply's thread_id was then set to the inbound copy
+/// UUID, causing thread(id=outbound_id) to miss the reply.
 ///
-/// After the fix, dual_write_message stamps BOTH copies with the same canonical
-/// thread_id (the outbound UUID `id_A`), so all replies from any namespace carry
-/// `thread_id = id_A` and A's thread query finds them.
+/// After the fix, both copies share the same canonical thread_id (outbound UUID),
+/// and all replies carry that thread_id so the thread query finds them.
+///
+/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Same-namespace send is used to test the canonical thread_id invariant.
 #[tokio::test]
 async fn test_cross_namespace_thread_query_finds_reply() {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let (registry, rt) = build_registry_for_ns("lambda:khive");
 
-    // lambda:khive sends to lambda:leo.
-    let mut khive_builder = VerbRegistryBuilder::new();
-    khive_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
-    khive_builder.register(CommPack::new(rt.clone()));
-    khive_builder.with_default_namespace("lambda:khive");
-    let khive_reg = khive_builder.build().expect("khive registry");
-
-    let sent = khive_reg
+    let sent = registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:leo", "content": "hello from khive" }),
+            serde_json::json!({ "to": "lambda:khive", "content": "hello" }),
         )
         .await
-        .expect("send succeeds");
+        .expect("same-namespace send succeeds");
 
     let outbound_full_id = sent
         .get("full_id")
         .and_then(|v| v.as_str())
         .expect("send returns full_id");
 
-    // lambda:leo reads inbox and gets the inbound copy UUID (id_B).
-    let mut leo_builder = VerbRegistryBuilder::new();
-    leo_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
-    leo_builder.register(CommPack::new(rt.clone()));
-    leo_builder.with_default_namespace("lambda:leo");
-    let leo_reg = leo_builder.build().expect("leo registry");
-
-    let inbox = leo_reg
-        .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
+    // Find the inbound copy — it has a different UUID from the outbound copy.
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let notes = rt
+        .list_notes(&caller_token, Some("message"), 100, 0)
         .await
-        .expect("leo inbox succeeds");
-    let msgs = inbox.get("messages").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(msgs.len(), 1, "leo must have 1 inbound message");
-    let inbound_full_id = msgs[0]
-        .get("full_id")
-        .and_then(|v| v.as_str())
-        .expect("inbound full_id");
+        .expect("list_notes");
+    let inbound_note = notes
+        .iter()
+        .find(|n| {
+            n.deleted_at.is_none()
+                && n.properties
+                    .as_ref()
+                    .and_then(|p| p.get("direction"))
+                    .and_then(|v| v.as_str())
+                    == Some("inbound")
+        })
+        .expect("inbound copy must exist after self-send");
+    let inbound_full_id = inbound_note.id.as_hyphenated().to_string();
 
-    // Both copies must share the same canonical thread_id (id_A = outbound_full_id).
-    let inbound_thread_id = msgs[0]
-        .get("properties")
+    // Both copies must share the same canonical thread_id (= outbound UUID).
+    let inbound_thread_id = inbound_note
+        .properties
+        .as_ref()
         .and_then(|p| p.get("thread_id"))
         .and_then(|v| v.as_str())
         .expect("inbound copy must have thread_id");
@@ -1518,21 +1516,20 @@ async fn test_cross_namespace_thread_query_finds_reply() {
          inbound_thread_id={inbound_thread_id}"
     );
 
-    // lambda:leo replies to the inbound copy (id_B).
-    leo_reg
+    // Reply to the inbound copy.
+    registry
         .dispatch(
             "comm.reply",
-            serde_json::json!({ "id": inbound_full_id, "content": "reply from leo" }),
+            serde_json::json!({ "id": inbound_full_id, "content": "reply" }),
         )
         .await
         .expect("reply succeeds");
 
-    // lambda:khive queries comm.thread(id=outbound_full_id=id_A).
-    // Must return at least: A's outbound + B's reply inbound (delivered to lambda:khive).
-    let thread_result = khive_reg
+    // comm.thread(id=outbound_full_id) must find the reply.
+    let thread_result = registry
         .dispatch("comm.thread", serde_json::json!({ "id": outbound_full_id }))
         .await
-        .expect("H1: thread query from A's namespace must succeed");
+        .expect("H1: thread query must succeed");
 
     let count = thread_result
         .get("count")
@@ -1540,8 +1537,8 @@ async fn test_cross_namespace_thread_query_finds_reply() {
         .expect("thread returns count");
     assert!(
         count >= 2,
-        "H1 regression: comm.thread(id=outbound_id) must return at least 2 messages \
-         (A's outbound + B's reply); got count={count}, result={thread_result}"
+        "H1 regression: comm.thread(id=outbound_id) must find the reply; \
+         got count={count}, result={thread_result}"
     );
 }
 
@@ -1731,5 +1728,91 @@ async fn test_list_message_finds_match_beyond_1000_backlog() {
     assert_eq!(
         returned_id, target_id,
         "M1: returned item id={returned_id} must match the target id={target_id}"
+    );
+}
+
+// ── #481 regression: cross-namespace send is denied (ACL gate) ────────────────
+
+/// comm.send to a different namespace must return CrossNamespaceWrite.
+///
+/// Before the fix, send() called runtime.authorize(recipient_ns) which always
+/// succeeded locally, writing an inbound message note into any syntactically valid
+/// recipient namespace without checking a recipient authorization gate (issue #481).
+///
+/// After the fix, any send where `to != caller_namespace` is rejected with an error
+/// that mentions the denied namespace (per ADR-040 §cross-namespace-messaging and
+/// ADR-018: until ACL policy is specified, cross-namespace delivery is DENIED).
+#[tokio::test]
+async fn test_cross_namespace_send_denied_issue_481() {
+    let (registry, rt) = build_registry_for_ns("lambda:khive");
+
+    // Attempt to send to a different namespace.
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:leo", "content": "should be denied" }),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "#481 regression: cross-namespace send must be denied; got ok: {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("cross-namespace") || err.contains("lambda:leo"),
+        "#481 regression: error must mention the denied namespace or 'cross-namespace'; got {err:?}"
+    );
+
+    // Security: the recipient namespace must remain empty — no inbound note was written.
+    let recipient_token = rt.authorize(khive_runtime::Namespace::parse("lambda:leo").unwrap());
+    let notes = rt
+        .list_notes(&recipient_token, Some("message"), 100, 0)
+        .await
+        .expect("list_notes in recipient ns");
+    assert_eq!(
+        notes.len(),
+        0,
+        "#481 regression: no note must be written to the recipient namespace on denial; \
+         got {notes:?}"
+    );
+
+    // Security: the sender namespace must also be empty — no outbound note was written.
+    let sender_token = rt.authorize(khive_runtime::Namespace::parse("lambda:khive").unwrap());
+    let sender_notes = rt
+        .list_notes(&sender_token, Some("message"), 100, 0)
+        .await
+        .expect("list_notes in sender ns");
+    assert_eq!(
+        sender_notes.len(),
+        0,
+        "#481 regression: no outbound note must be written to sender namespace on denial; \
+         got {sender_notes:?}"
+    );
+}
+
+/// comm.send within the same namespace must succeed (ADR-040 §within-namespace).
+///
+/// Same-namespace send is the only permitted form in v0.2.x until ADR-018 specifies
+/// cross-namespace ACL policy.
+#[tokio::test]
+async fn test_same_namespace_send_succeeds_issue_481() {
+    let (registry, _rt) = build_registry_for_ns("lambda:khive");
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "self-send is allowed" }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "#481 regression: same-namespace send must succeed; got err: {result:?}"
+    );
+    let id = result.unwrap();
+    assert!(
+        id.get("id").is_some(),
+        "#481 regression: same-namespace send must return an id; got {id:?}"
     );
 }
