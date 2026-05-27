@@ -54,7 +54,7 @@ request(ops="[
 
 Resist:
 
-- Setting `status=\"active\"` because "I'll do it now" — start the task with `transition`, not on creation.
+- Setting `status=\"active\"` because "I'll do it now" — start the task with `gtd.transition`, not on creation.
 - Adding `depends_on` for soft preferences — only encode hard prerequisites (the dep must actually be done first).
 - Writing the full description up front — capture the _task_, save the _plan_ for later.
 

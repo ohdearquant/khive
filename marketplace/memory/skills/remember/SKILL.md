@@ -41,7 +41,7 @@ When uncertain, use `episodic`. It is safer to preserve the context of when the 
 ### 3. Store the memory
 
 ```
-request(ops="remember(content=\"<durable memory>\", memory_type=\"episodic\", salience=0.6)")
+request(ops="memory.remember(content=\"<durable memory>\", memory_type=\"episodic\", salience=0.6)")
 ```
 
 Use `salience` from `0.0` to `1.0`. Defaults are acceptable for ordinary memories; use high salience only for context that should reliably outrank routine notes.
@@ -49,7 +49,7 @@ Use `salience` from `0.0` to `1.0`. Defaults are acceptable for ordinary memorie
 For stable facts:
 
 ```
-request(ops="remember(content=\"The memory pack stores one note kind, memory, and uses memory_type to distinguish episodic from semantic memories.\", memory_type=\"semantic\", salience=0.8, tags=[\"khive\",\"memory-pack\"])")
+request(ops="memory.remember(content=\"The memory pack stores one note kind, memory, and uses memory_type to distinguish episodic from semantic memories.\", memory_type=\"semantic\", salience=0.8, tags=[\"khive\",\"memory-pack\"])")
 ```
 
 ### 4. Link provenance when available
@@ -57,7 +57,7 @@ request(ops="remember(content=\"The memory pack stores one note kind, memory, an
 If the memory came from a source entity or note, pass its UUID:
 
 ```
-request(ops="remember(content=\"ADR-036 defines recall as memory-scoped retrieval with decay-aware ranking.\", memory_type=\"semantic\", salience=0.8, source_id=\"<source-uuid>\", tags=[\"adr\",\"memory\"])")
+request(ops="memory.remember(content=\"ADR-036 defines recall as memory-scoped retrieval with decay-aware ranking.\", memory_type=\"semantic\", salience=0.8, source_id=\"<source-uuid>\", tags=[\"adr\",\"memory\"])")
 ```
 
 `source_id` creates an `annotates` relationship from the memory note to the source.
@@ -77,21 +77,21 @@ If recall cannot find it, rewrite the memory with clearer keywords or add tags i
 ### Capture a session outcome
 
 ```
-request(ops="remember(content=\"Marketplace sweep found KG agent task queries must use tasks(...) instead of list(kind=\\\"task\\\", filter=...).\", memory_type=\"episodic\", salience=0.7, tags=[\"marketplace\",\"gtd\",\"kg-agents\"])")
+request(ops="memory.remember(content=\"Marketplace sweep found KG agent task queries must use tasks(...) instead of list(kind=\\\"task\\\", filter=...).\", memory_type=\"episodic\", salience=0.7, tags=[\"marketplace\",\"gtd\",\"kg-agents\"])")
 ```
 
 ### Store a durable preference
 
 ```
-request(ops="remember(content=\"User prefers copy-paste-ready fix specs with exact before and after content.\", memory_type=\"semantic\", salience=0.9, tags=[\"user-preference\",\"specs\"])")
+request(ops="memory.remember(content=\"User prefers copy-paste-ready fix specs with exact before and after content.\", memory_type=\"semantic\", salience=0.9, tags=[\"user-preference\",\"specs\"])")
 ```
 
 ### Store several independent memories
 
 ```
 request(ops="[
-  remember(content=\"Memory pack exposes remember and recall verbs.\", memory_type=\"semantic\", salience=0.7),
-  remember(content=\"Recall should be run before claiming no prior context exists.\", memory_type=\"semantic\", salience=0.8)
+  memory.remember(content=\"Memory pack exposes memory.remember and memory.recall verbs.\", memory_type=\"semantic\", salience=0.7),
+  memory.remember(content=\"Recall should be run before claiming no prior context exists.\", memory_type=\"semantic\", salience=0.8)
 ]")
 ```
 

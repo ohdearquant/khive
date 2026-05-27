@@ -34,9 +34,22 @@ request(ops="memory.recall(query=\"previous marketplace sweep findings\", memory
 
 ### 3. Read the result shape
 
-Recall results include memory content plus scoring metadata such as salience, decay, and final score. Treat higher-ranked hits as more relevant, not automatically true.
+Each recall result includes:
 
-When a hit matters, carry forward its `note_id` in your notes or response so it can be inspected later.
+- `score` — absolute relevance (`[0.0, 1.0]`); raw cosine similarity when a vector model is
+  active, otherwise composite score.
+- `rank_score` — composite ordering score (`[0.0, 1.0]`) used to sort results; combines
+  relevance, decayed salience, and temporal recency.
+- `raw_score` — pre-fusion vector cosine similarity (`[0.0, 1.0]`), or `null` for text-only
+  hits.
+- `salience`, `decay_factor`, `memory_type`, `created_at`, `content`.
+
+All three score fields are bounded to `[0.0, 1.0]`. Pass `presentation="verbose"` to include a
+per-component `breakdown` field (relevance, salience contributions, temporal). `presentation`
+defaults to `"agent"` when omitted.
+
+Treat higher-ranked hits as more relevant, not automatically true. When a hit matters, carry
+forward its `note_id` in your notes or response so it can be inspected later.
 
 ### 4. Adjust thresholds only after the first pass
 

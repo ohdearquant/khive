@@ -34,13 +34,13 @@ BRAIN_VERBS = frozenset({
     "brain.profiles", "brain.profile", "brain.resolve",
     "brain.activate", "brain.deactivate", "brain.archive",
     "brain.feedback", "brain.reset",
-    "brain.bind", "brain.unbind",
+    "brain.bind", "brain.unbind", "brain.bindings", "brain.create_profile",
     # internal/subhandler — callable by operators
     "brain.state", "brain.config", "brain.events", "brain.emit",
 })
 
 COMM_VERBS = frozenset({
-    "comm.send", "comm.inbox", "comm.read", "comm.reply",
+    "comm.send", "comm.inbox", "comm.read", "comm.reply", "comm.thread",
 })
 
 SCHEDULE_VERBS = frozenset({

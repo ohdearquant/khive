@@ -8,11 +8,13 @@ The brain pack ships with one built-in profile, `balanced-recall-v1`, which driv
 
 ## Verbs covered
 
-| Verb                                               | What it does                                         |
-| -------------------------------------------------- | ---------------------------------------------------- |
-| `brain.profiles(lifecycle?)`                       | List all profiles, optionally filtered by lifecycle. |
-| `brain.profile(id)`                                | Full profile record with state snapshot.             |
-| `brain.resolve(consumer_kind, actor?, namespace?)` | Which profile would serve this caller?               |
+| Verb                                                              | What it does                                         |
+| ----------------------------------------------------------------- | ---------------------------------------------------- |
+| `brain.profiles(lifecycle?)`                                      | List all profiles, optionally filtered by lifecycle. |
+| `brain.profile(profile_id)`                                       | Full profile record with state snapshot.             |
+| `brain.resolve(consumer_kind, actor?, namespace?)`                | Which profile would serve this caller?               |
+| `brain.bindings(profile_id?, actor?, namespace?, consumer_kind?)` | List binding rows, optionally filtered.              |
+| `brain.create_profile(name, description?, consumer_kind?)`        | Create a new Bayesian profile (starts Inactive).     |
 
 ## Workflow
 
@@ -34,10 +36,10 @@ Fields returned per profile: `id`, `description`, `consumer_kind`, `state_class`
 
 ### brain.profile — read one profile
 
-Required arg: `id` (the profile string identifier, not a UUID).
+Required arg: `profile_id` (the profile string identifier, not a UUID). The legacy `id` alias is also accepted.
 
 ```
-request(ops="brain.profile(id=\"balanced-recall-v1\")")
+request(ops="brain.profile(profile_id=\"balanced-recall-v1\")")
 ```
 
 The response adds `state_snapshot` to the fields above. The snapshot contains current posterior values for `relevance_weight`, `salience_weight`, and `temporal_weight`.
@@ -63,6 +65,34 @@ request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"researcher\", names
 ```
 
 Resolution priority: exact (actor+namespace+consumer_kind) > namespace wildcard > actor wildcard > global wildcard. If no binding matches, `NotFound` is returned — use the `bind` skill to add a binding.
+
+### brain.bindings — inspect the binding table
+
+List all bindings:
+
+```
+request(ops="brain.bindings()")
+```
+
+Filter by profile or consumer kind:
+
+```
+request(ops="brain.bindings(consumer_kind=\"recall\")")
+```
+
+Returns `{ "count": N, "bindings": [...] }`. Use this to confirm which bindings are active before calling `brain.resolve`.
+
+### brain.create_profile — create a new profile
+
+Required arg: `name` (alphanumeric and hyphens, e.g. `"my-profile-v1"`). Optional: `description`, `consumer_kind` (default `"recall"`).
+
+```
+request(ops="brain.create_profile(name=\"my-profile-v1\", consumer_kind=\"recall\")")
+```
+
+New profiles start in `Inactive` state with Bayesian priors (Beta(7,3) / Beta(2,8) / Beta(1,9)). Call `brain.activate` before use. `consumer_kind` must be a non-empty, non-wildcard value.
+
+Response: `{ "created": true, "profile_id": "...", "lifecycle": "inactive", "consumer_kind": "..." }`.
 
 ## Stop condition
 

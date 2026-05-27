@@ -12,7 +12,7 @@ Use `manage` to change a profile's lifecycle state. Lifecycle controls whether t
 | ---------- | -------------------------------------------------------------------------------- |
 | `active`   | Live update loop runs. Profile receives posterior updates from every dispatch.   |
 | `inactive` | Updates stopped. Posteriors are frozen but retained. Profile can be reactivated. |
-| `archived` | Read-only. Audit-retained. Cannot be reactivated without explicit re-activation. |
+| `archived` | Read-only. Audit-retained. Terminal — no transition out is permitted.            |
 
 ## Workflow
 
@@ -40,11 +40,14 @@ Posteriors are frozen in their current state. Use this before performing a `brai
 
 ### brain.archive — retire a profile
 
+Active profiles **must be deactivated first** — the runtime rejects an `Active → Archived`
+transition directly. Call `brain.deactivate` before `brain.archive`:
+
 ```
-request(ops="brain.archive(profile_id=\"balanced-recall-v1\")")
+request(ops="brain.deactivate(profile_id=\"balanced-recall-v1\") | brain.archive(profile_id=$prev.profile_id)")
 ```
 
-Response: `{ "profile_id": "...", "lifecycle": "archived" }`.
+Response of the archive call: `{ "profile_id": "...", "lifecycle": "archived" }`.
 
 Archived profiles are retained for audit purposes. They no longer receive updates. Archive when a profile is superseded by a replacement; do not delete profiles that have accumulated event history.
 
@@ -70,8 +73,11 @@ request(ops="brain.activate(profile_id=\"balanced-recall-v1\")")
 
 ### Check lifecycle after transition
 
+Active profiles must be deactivated before archiving. Use two sequential requests or the chain
+form:
+
 ```
-request(ops="[brain.archive(profile_id=\"balanced-recall-v1\"), brain.profile(id=\"balanced-recall-v1\")]")
+request(ops="brain.deactivate(profile_id=\"balanced-recall-v1\") | brain.archive(profile_id=$prev.profile_id) | brain.profile(profile_id=$prev.profile_id)")
 ```
 
 Verify the `lifecycle` field in the second result equals `archived`.

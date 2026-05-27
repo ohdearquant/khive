@@ -81,7 +81,7 @@ The `someday` list will rot if you never look at it. For each, ask: "would I be 
 request(ops="gtd.tasks(status=\"done\", limit=20)")
 ```
 
-Reading recent completions often reveals follow-up work (a `result` line that ends with "...but should also do X"). Capture follow-ups with `assign` while context is fresh.
+Reading recent completions often reveals follow-up work (a `result` line that ends with "...but should also do X"). Capture follow-ups with `gtd.assign` while context is fresh. `done` is terminal — create a new task rather than reopening.
 
 ## Patterns
 
@@ -105,7 +105,7 @@ If the `kg` pack is loaded, search the past week's recorded insights before revi
 request(ops="search(kind=\"note\", query=\"commitment OR promise OR todo\", limit=10)")
 ```
 
-Any unfulfilled commitments get added via `assign` in the same session.
+Any unfulfilled commitments get added via `gtd.assign` in the same session.
 
 ### Carrying a task forward
 
@@ -121,5 +121,5 @@ Don't let zombies linger in `next`. They erode trust in the actionable list.
 
 - **Reviewing without making decisions.** If you read the inbox without transitioning, the next review will be longer. Make a call on every item.
 - **Hoarding `someday`.** A list of 200 maybe-projects is no different from no list. Cull aggressively — anything you wouldn't actively pull onto `next` in the next three months is `cancelled`.
-- **Never reopening `done`.** GTD's lifecycle allows `done → next` / `done → active` for a reason: if a task came back, it isn't a new task, it's the same one re-opening.
+- **Trying to reopen `done` tasks.** `done` and `cancelled` are terminal. If work comes back, capture a new task — don't attempt a transition out of a terminal state.
 - **Batch transitioning without notes.** When deferring, killing, or unblocking, take three seconds to add a `note` — future you (and future agents searching task content) need the context.

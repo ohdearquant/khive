@@ -102,8 +102,8 @@ request(ops="gtd.complete(id=\"<id-from-assign>\")")
 ### Memory pack smoke tests
 
 ```text
-request(ops="remember(content=\"install verification note\", memory_type=\"episodic\", salience=0.1)")
-request(ops="recall(query=\"install verification\", limit=1)")
+request(ops="memory.remember(content=\"install verification note\", memory_type=\"episodic\", salience=0.1)")
+request(ops="memory.recall(query=\"install verification\", limit=1)")
 ```
 
 ### Brain pack smoke tests
@@ -134,5 +134,5 @@ All examples should report `invalid=0`.
 ## Links
 
 - Repository: <https://github.com/ohdearquant/khive>
-- ADR-020 (request DSL): <https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-020-request-dsl.md>
+- ADR-016 (request DSL): <https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md>
 - Releases: <https://github.com/ohdearquant/khive/releases>

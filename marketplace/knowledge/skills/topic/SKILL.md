@@ -47,7 +47,21 @@ request(ops="knowledge.topic(query=\"linear attention state space\", domain=\"at
 }
 ```
 
-When `query` is provided, each item also carries `score` and `snippet` from the search result.
+When `query` is provided, each item also carries `score` and optionally `snippet` from the
+search result.
+
+### `total` semantics
+
+The meaning of `total` differs between the two execution paths:
+
+- **Listing path** (`query` absent): `total` is the true pre-limit count of all matching
+  entities in the namespace. Use it as a pagination signal — if `total > items.length`, there
+  are more results.
+- **Search path** (`query` present): `total` is the post-filter count of the candidate window
+  fetched from the search index (`limit * 4` candidates). It is bounded by that window and
+  **does not** reflect the full corpus count. Use it as a relevance indicator, not a pagination
+  total. When `domain` narrows results heavily, `total` may be much smaller than the actual
+  number of matching concepts in the corpus.
 
 ## Patterns
 

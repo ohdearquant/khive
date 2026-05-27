@@ -73,6 +73,12 @@ Or add to `.mcp.json`:
 /plugin install knowledge
 ```
 
+## Presentation modes (ADR-045)
+
+The `request` tool accepts an optional `presentation` field per op: `agent` (default,
+token-efficient), `verbose` (canonical full JSON), or `human` (same as `verbose` over MCP).
+Agents should use the default `agent` mode.
+
 ## License
 
 Apache-2.0

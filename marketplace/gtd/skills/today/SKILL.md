@@ -62,7 +62,7 @@ request(ops="gtd.transition(id=\"<id>\", status=\"waiting\", note=\"blocked on r
 request(ops="gtd.complete(id=\"<id>\", result=\"shipped in v0.2.1\")")
 ```
 
-`complete` records `completed_at` automatically and validates the transition. `done` is a **terminal state** — no further transitions are allowed. If the work turns out to be incomplete, cancel the task and create a fresh one instead.
+`gtd.complete` records `completed_at` automatically and validates the transition. Pass `status="cancelled"` to mark cancelled instead of done. Both `done` and `cancelled` are **terminal** — no further transitions accepted. If the work turns out to be incomplete, create a fresh task.
 
 ## Patterns
 

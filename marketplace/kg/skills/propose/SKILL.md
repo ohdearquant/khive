@@ -32,15 +32,17 @@ request(ops="propose(title=\"Add LoRA extends Attention edge\", description=\"Lo
 Pass `reviewers` as a list of agent names or identities who should assess the proposal. If omitted, any agent with access may review.
 
 ```text
-request(ops="propose(title=\"Merge duplicate FlashAttention entities\", description=\"Two entities represent the same concept: ids <a> and <b>. Keeping <a> — it has higher edge count and more complete properties.\", changeset={\"kind\":\"merge_entities\",\"into_id\":\"<a>\",\"from_id\":\"<b>\"}, reviewers=[\"polisher\", \"researcher\"])")
+request(ops="propose(title=\"Merge duplicate FlashAttention entities\", description=\"Two entities represent the same concept: ids <a> and <b>. Keeping <a> — it has higher edge count and more complete properties.\", changeset={\"kind\":\"merge_entities\",\"into\":\"<a>\",\"from\":\"<b>\"}, reviewers=[\"polisher\", \"researcher\"])")
 ```
 
 ### 3. Check proposal status
 
-After submission, retrieve the proposal with `get`:
+`propose` returns a `proposal_id` field. Use it in subsequent calls — not `id`:
 
 ```text
-request(ops="get(id=\"<proposal-id>\")")
+# propose returns: {"proposal_id": "<uuid>", "status": "open", "proposer": "...", "title": "..."}
+request(ops="get(id=\"<proposal_id-from-response>\")")
+request(ops="review(proposal_id=\"<proposal_id-from-response>\", decision=\"approve\")")
 ```
 
 Or list open proposals:
@@ -49,6 +51,26 @@ Or list open proposals:
 request(ops="list(kind=\"proposal\", status=\"open\")")
 ```
 
+### 4. Amend after request_changes
+
+If a reviewer calls `review(decision="request_changes")`, create a new proposal referencing the original via `parent_id`. The runtime validates that the referenced `parent_id` exists and belongs to the namespace before accepting the new proposal:
+
+```text
+request(ops="propose(title=\"Add LoRA extends Attention edge (revised)\", description=\"Corrected weight to 0.9 per reviewer feedback.\", changeset={\"kind\":\"add_edge\",\"source\":\"<lora-id>\",\"target\":\"<attention-id>\",\"relation\":\"extends\",\"weight\":0.9}, parent_id=\"<original-proposal-id>\")")
+```
+
+## Lifecycle
+
+```
+open ──► approved ──► applying ──► applied
+  │
+  ├──► changes_requested (reviewer requests_changes)
+  ├──► rejected           (reviewer rejects)
+  └──► withdrawn          (proposer withdraws)
+```
+
+`applying` is a transient in-flight state held by the apply worker. A `withdraw` call that arrives while a proposal is `applying` will be rejected — the apply completes and the proposal moves to `applied`.
+
 ## Stop condition
 
-Proposal is open and assigned to reviewers. Do not apply the change manually — wait for `review` approval. If the proposal is rejected, revise the `changeset` or description based on reviewer feedback and re-propose.
+Proposal is open and assigned to reviewers. Do not apply the change manually — wait for `review` approval. If the proposal is rejected, revise the `changeset` or description based on reviewer feedback and re-propose with a `parent_id` referencing the rejected proposal.

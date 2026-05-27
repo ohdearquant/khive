@@ -55,7 +55,7 @@ Response: `{ "bound": true, "profile_id": "...", "actor": "...", "namespace": ".
 
 ### brain.unbind — remove bindings
 
-All args are optional filters. Only bindings matching ALL supplied criteria are removed.
+At least one filter is required. Only bindings matching ALL supplied criteria are removed.
 
 Remove all bindings for a specific actor:
 
@@ -77,7 +77,7 @@ request(ops="brain.unbind(profile_id=\"balanced-recall-v1\")")
 
 Response: `{ "unbound": N }` where N is the count of removed bindings.
 
-Calling `brain.unbind()` with no args removes ALL bindings. Use with caution.
+Calling `brain.unbind()` with no args is rejected — at least one filter must be provided.
 
 ### Verify a binding with brain.resolve
 
@@ -90,7 +90,7 @@ request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"researcher\")")
 ## Anti-patterns
 
 - **Using `*` inside a real value.** `*` is the wildcard sentinel. A value like `proj-*-team` is rejected.
-- **Unbinding with no args.** `brain.unbind()` removes every binding. The default `recall` wildcard is lost and `brain.resolve(consumer_kind="recall")` will return `NotFound` until re-bound.
+- **Unbinding with no args.** `brain.unbind()` with no filters is rejected with an error. At least one of `profile_id`, `actor`, `namespace`, or `consumer_kind` must be supplied.
 - **Binding to a nonexistent profile.** `brain.bind` validates the profile exists and returns `NotFound` if not. List profiles first with `brain.profiles()`.
 
 ## Stop condition

@@ -67,6 +67,12 @@ request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\
 | `review`    | Review a proposal                           |
 | `withdraw`  | Withdraw an open proposal                   |
 
+**Proposal lifecycle**: `open → approved → applying → applied` (happy path). Terminal states:
+`rejected`, `withdrawn`. `applying` is a transient in-flight state; `withdraw` is rejected while
+the apply worker holds it. `propose` returns `proposal_id` — pass this to `review` and `withdraw`,
+not an `id` field. `review` is rejected if the proposal is not in `open` or `changes_requested`
+state.
+
 ### 9 Skills (workflow-shaped, not verb docs)
 
 | Skill    | Command        | What it does                                                                                     |

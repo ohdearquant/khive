@@ -6,19 +6,25 @@ A memory is a note with `kind = "memory"`. The memory pack adds two focused verb
 
 ## Verbs
 
-All verbs are dispatched through the single MCP `request` tool ([ADR-020](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-020-request-dsl.md)).
+All verbs are dispatched through the single MCP `request` tool ([ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)).
 
-| Verb                                                                                                      | What it does                                                             |
-| --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `remember(content, memory_type?, salience?, decay_factor?/decay?, source_id?/source?, namespace?, tags?)` | Store a memory note with salience and decay metadata.                    |
-| `recall(query, limit?, memory_type?, min_score?, min_salience?, config?, namespace?)`                     | Search memory notes only, then rank by relevance, salience, and recency. |
+| Verb                                                                                                        | What it does                                                             |
+| ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `memory.remember(content, memory_type?, salience?, decay_factor?, source_id?, namespace?, tags?)`           | Store a memory note with salience and decay metadata.                    |
+| `memory.recall(query, limit?, memory_type?, min_score?, min_salience?, config?, namespace?, presentation?)` | Search memory notes only, then rank by relevance, salience, and recency. |
 
-Memory types:
+Memory types (`memory_type` values):
 
-| Type       | Use for                                                                        |
-| ---------- | ------------------------------------------------------------------------------ |
-| `episodic` | Event-like memories tied to a session, conversation, decision, or observation. |
-| `semantic` | Stable facts, preferences, project context, and reusable knowledge.            |
+| Type       | Use for                                                                                  |
+| ---------- | ---------------------------------------------------------------------------------------- |
+| `episodic` | Event-like memories tied to a session, conversation, decision, or observation. (default) |
+| `semantic` | Stable facts, preferences, project context, and reusable knowledge.                      |
+
+`memory.recall` results include a score triplet: `score` (absolute relevance, `[0.0, 1.0]`),
+`rank_score` (composite ordering score, `[0.0, 1.0]`), and `raw_score` (pre-fusion vector
+cosine similarity, `[0.0, 1.0]` or `null` for text-only hits). All values are bounded to
+`[0.0, 1.0]`. Passing `presentation="verbose"` adds a per-component `breakdown` field;
+`presentation` defaults to `"agent"` when omitted.
 
 ## Skills
 

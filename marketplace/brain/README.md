@@ -14,7 +14,7 @@ The brain pack maintains a profile registry. Each profile holds Bayesian posteri
 
 ## Verbs
 
-All verbs are dispatched through the single MCP `request` tool ([ADR-020](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-020-request-dsl.md)).
+All verbs are dispatched through the single MCP `request` tool ([ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)).
 
 Enable the brain pack by passing `--pack brain` (the kg pack dependency is resolved automatically):
 
@@ -22,13 +22,16 @@ Enable the brain pack by passing `--pack brain` (the kg pack dependency is resol
 khive-mcp --pack brain
 ```
 
+The `request` tool also accepts an optional `presentation` field (`agent` | `verbose` | `human`) per [ADR-045](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-045-verb-response-presentation.md). Default is `agent` (token-efficient) for MCP callers.
+
 ### Read (assertive)
 
-| Verb                                               | What it does                                              |
-| -------------------------------------------------- | --------------------------------------------------------- |
-| `brain.profiles(lifecycle?)`                       | List profiles, optionally filtered by lifecycle.          |
-| `brain.profile(id)`                                | Profile metadata, latest snapshot, current state summary. |
-| `brain.resolve(consumer_kind, actor?, namespace?)` | Show which profile would serve a caller context.          |
+| Verb                                                              | What it does                                              |
+| ----------------------------------------------------------------- | --------------------------------------------------------- |
+| `brain.profiles(lifecycle?)`                                      | List profiles, optionally filtered by lifecycle.          |
+| `brain.profile(profile_id)`                                       | Profile metadata, latest snapshot, current state summary. |
+| `brain.resolve(consumer_kind, actor?, namespace?)`                | Show which profile would serve a caller context.          |
+| `brain.bindings(profile_id?, actor?, namespace?, consumer_kind?)` | List binding rows, optionally filtered.                   |
 
 ### Write lifecycle (commissive)
 
@@ -39,13 +42,14 @@ khive-mcp --pack brain
 | `brain.archive(profile_id)`                                | Move a profile to Archived — read-only, audit-retained.         |
 | `brain.feedback(target_id, signal, served_by_profile_id?)` | Emit a FeedbackExplicit event and update posteriors.            |
 
-### Write binding (declaration)
+### Write binding / declaration
 
 | Verb                                                                    | What it does                                              |
 | ----------------------------------------------------------------------- | --------------------------------------------------------- |
+| `brain.create_profile(name, description?, consumer_kind?)`              | Create a new Bayesian profile; starts in Inactive state.  |
 | `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)` | Write a row in the profile resolution table.              |
-| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`         | Remove rows from the profile resolution table.            |
-| `brain.reset()`                                                         | Reset posteriors to priors; increments exploration_epoch. |
+| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`         | Remove rows (at least one filter required).               |
+| `brain.reset(profile_id?)`                                              | Reset posteriors to priors; increments exploration_epoch. |
 
 ### Internal / operator-only (Subhandler — not exposed on public MCP surface)
 

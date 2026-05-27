@@ -65,6 +65,16 @@ request(ops="review(proposal_id=\"<id>\", decision=\"request_changes\", comment=
 request(ops="review(proposal_id=\"<id>\", decision=\"comment\", comment=\"Related proposal <other-id> also touches this entity — coordinate.\")")
 ```
 
+## Constraints
+
+`review` only accepts proposals in `open` or `changes_requested` state. Attempting to review a
+proposal that is already `approved`, `rejected`, `applied`, or `withdrawn` returns an error.
+
+The apply worker runs asynchronously after an approval — the proposal transitions through
+`approved → applying → applied`. The reviewer sees an immediate "decision recorded" response; the
+apply result surfaces as a separate event.
+
 ## Stop condition
 
-Decision recorded. If approved, the runtime applies the changeset. If rejected or change-requested, the proposer must resubmit. Do not manually apply rejected changes.
+Decision recorded. If approved, the runtime applies the changeset asynchronously. If rejected or
+change-requested, the proposer must resubmit. Do not manually apply rejected changes.

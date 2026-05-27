@@ -15,7 +15,7 @@ If you're working on khive itself (writing code in this repo), see `CLAUDE.md` i
 ## Core verbs
 
 All verbs are dispatched through a single MCP tool, `request`, which accepts a function-call DSL
-or JSON form ([ADR-020](docs/adr/ADR-020-request-dsl.md),
+or JSON form ([ADR-016](docs/adr/ADR-016-request-dsl.md),
 [ADR-027](docs/adr/ADR-027-single-tool-mcp-surface.md)). Verb semantics and namespace contract are
 defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 
