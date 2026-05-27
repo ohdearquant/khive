@@ -671,47 +671,68 @@ impl PackRuntime for KgPack {
         // in production) so that cross-project graph structure is visible to all
         // actors regardless of their caller namespace.
         //
-        // The override target is `runtime.config().default_namespace` rather than
-        // the hardcoded `Namespace::local()` constant.  This means:
-        //  - Production (default_namespace=local): lambda:foo tokens redirect to local.
-        //  - Test environments (default_namespace=test): tokens that already carry
-        //    `test` are not redirected, so cross-pack lookups (GTD notes ↔ KG edges)
-        //    remain consistent within the same namespace.
-        //
-        // Note: scoped packs (memory, gtd, comm, …) are NOT overridden here; the
-        // caller's original token is used for their verbs.
+        // Notes are namespace-scoped (messages, tasks, memories belong to the
+        // caller's namespace), so the override is applied only to entity/edge
+        // verbs.  For kind-discriminated verbs (create, list, search) we peek
+        // at the `kind` param to decide; pure graph verbs always override.
         let graph_ns = self.runtime.config().default_namespace.clone();
         let kg_token;
-        let effective_token = if token.namespace() != &graph_ns {
-            tracing::warn!(
-                caller_namespace = token.namespace().as_str(),
-                graph_namespace = graph_ns.as_str(),
-                verb = verb,
-                "KG pack: caller namespace differs from graph namespace; overriding per \
-                 ADR-007 namespace-by-layer rule. KG entities are shared across projects."
-            );
+        let graph_token = if token.namespace() != &graph_ns {
             kg_token = token.with_namespace(graph_ns);
             &kg_token
         } else {
             token
         };
 
+        // Peek at `kind` for verbs that can operate on both entities and notes.
+        let raw_kind = params
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let kind_is_entity_or_edge = matches!(
+            raw_kind.as_str(),
+            "entity"
+                | "edge"
+                | "concept"
+                | "document"
+                | "dataset"
+                | "project"
+                | "person"
+                | "org"
+                | "artifact"
+                | "service"
+        );
+
         match verb {
-            "create" => self.handle_create(effective_token, params, registry).await,
-            "get" => self.handle_get(effective_token, params).await,
-            "list" => self.handle_list(effective_token, params, registry).await,
-            "stats" => self.handle_stats(effective_token, params).await,
-            "update" => self.handle_update(effective_token, params, registry).await,
-            "delete" => self.handle_delete(effective_token, params, registry).await,
-            "merge" => self.handle_merge(effective_token, params, registry).await,
-            "search" => self.handle_search(effective_token, params, registry).await,
-            "link" => self.handle_link(effective_token, params).await,
-            "neighbors" => self.handle_neighbors(effective_token, params).await,
-            "traverse" => self.handle_traverse(effective_token, params).await,
-            "query" => self.handle_query(effective_token, params).await,
-            "propose" => self.handle_propose(effective_token, params).await,
-            "review" => self.handle_review(effective_token, params, registry).await,
-            "withdraw" => self.handle_withdraw(effective_token, params).await,
+            // Kind-discriminated: override only for entity/edge kinds.
+            "create" | "list" | "search" => {
+                let tok = if kind_is_entity_or_edge {
+                    graph_token
+                } else {
+                    token
+                };
+                match verb {
+                    "create" => self.handle_create(tok, params, registry).await,
+                    "list" => self.handle_list(tok, params, registry).await,
+                    _ => self.handle_search(tok, params, registry).await,
+                }
+            }
+            // Pure graph verbs: always use graph namespace.
+            "link" => self.handle_link(graph_token, params).await,
+            "neighbors" => self.handle_neighbors(graph_token, params).await,
+            "traverse" => self.handle_traverse(graph_token, params).await,
+            "query" => self.handle_query(graph_token, params).await,
+            "propose" => self.handle_propose(graph_token, params).await,
+            "review" => self.handle_review(graph_token, params, registry).await,
+            "withdraw" => self.handle_withdraw(graph_token, params).await,
+            "stats" => self.handle_stats(graph_token, params).await,
+            "merge" => self.handle_merge(graph_token, params, registry).await,
+            // UUID-based: use caller token (entity access tested with local token).
+            "get" => self.handle_get(token, params).await,
+            "update" => self.handle_update(token, params, registry).await,
+            "delete" => self.handle_delete(token, params, registry).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "kg pack does not handle verb {verb:?}"
             ))),
