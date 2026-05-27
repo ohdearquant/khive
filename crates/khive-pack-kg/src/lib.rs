@@ -17,6 +17,7 @@
 //! update `proposals_open` directly.
 
 pub mod apply_worker;
+pub mod entity_type_registry;
 pub mod handlers;
 pub mod projection_worker;
 pub mod vocab;
@@ -28,6 +29,7 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
+pub use entity_type_registry::{EntityTypeDef, EntityTypeRegistry, ResolvedType};
 pub use khive_types::EntityKind;
 pub use vocab::NoteKind;
 
@@ -58,6 +60,28 @@ impl Pack for KgPack {
 //
 // Verbs 12-14 (propose, review, withdraw) added per ADR-046 (cluster-22).
 // Verb 15 (verbs) added for top-level verb discovery (ue-help-introspection H5).
+//
+// Issue #497 — Visibility audit:
+//   All 16 KG handlers are intentionally `Visibility::Verb` (agent-callable via
+//   the MCP `request` DSL).  There are NO `Visibility::Subhandler` entries in
+//   this pack.  Rationale:
+//
+//   - The KG pack has no operator-only introspection or internal plumbing that
+//     needs to be hidden from the agent surface.  Every verb is a first-class
+//     operation that agents are expected to invoke directly.
+//   - propose / review / withdraw (ADR-046) are deliberate agent-facing verbs:
+//     proposals flow from agents who must be able to call all three steps.  If a
+//     future requirement introduces an operator-only "admin_apply" or "force_reject"
+//     escape hatch it should be added as Visibility::Subhandler at that point.
+//   - The `verbs` introspection verb is agent-callable by design: it implements
+//     the self-describing verb catalog (ue-help-introspection H5) and explicitly
+//     filters out Subhandler entries before responding, so adding any future
+//     Subhandler entries here would automatically hide them from that output.
+//
+//   Packs with confirmed Subhandler entries as of this audit:
+//   - pack-memory: recall_embed, recall_candidates, recall_fuse, recall_rerank, recall_score
+//   - pack-knowledge: knowledge.reindex
+//   - pack-brain: brain.state, brain.config, brain.events, brain.emit (deprecated)
 static KG_HANDLERS: [HandlerDef; 16] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
@@ -109,6 +133,12 @@ static KG_HANDLERS: [HandlerDef; 16] = [
                 description: "Tag list.",
             },
             ParamDef {
+                name: "entity_type",
+                param_type: "string",
+                required: false,
+                description: "First-class entity type tag (e.g. \"paper\", \"algorithm\", \"tool\"). Stored in the entity's type field; also available in properties.",
+            },
+            ParamDef {
                 name: "properties",
                 param_type: "object",
                 required: false,
@@ -140,7 +170,7 @@ static KG_HANDLERS: [HandlerDef; 16] = [
                 name: "kind",
                 param_type: "string",
                 required: true,
-                description: "Substrate or granular kind to list: \"entity\" | \"note\" | \"edge\" | granular kinds.",
+                description: "Substrate or granular kind to list: \"entity\" | \"note\" | \"edge\" | \"event\" | \"proposal\" | granular kinds.",
             },
             ParamDef {
                 name: "limit",
@@ -155,10 +185,100 @@ static KG_HANDLERS: [HandlerDef; 16] = [
                 description: "Pagination offset (default 0).",
             },
             ParamDef {
+                name: "entity_kind",
+                param_type: "string",
+                required: false,
+                description: "Fine-grained entity kind filter when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service).",
+            },
+            ParamDef {
+                name: "entity_type",
+                param_type: "string",
+                required: false,
+                description: "Filter by entity type field when kind=\"entity\" (e.g. \"paper\", \"algorithm\", \"tool\").",
+            },
+            ParamDef {
+                name: "note_kind",
+                param_type: "string",
+                required: false,
+                description: "Fine-grained note kind filter when kind=\"note\" (observation | insight | question | decision | reference).",
+            },
+            ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,
-                description: "Filter by all listed tags.",
+                description: "Filter entities by any of these tags (kind=\"entity\" only).",
+            },
+            ParamDef {
+                name: "source_id",
+                param_type: "uuid",
+                required: false,
+                description: "Filter edges by source node UUID (kind=\"edge\" only).",
+            },
+            ParamDef {
+                name: "target_id",
+                param_type: "uuid",
+                required: false,
+                description: "Filter edges by target node UUID (kind=\"edge\" only).",
+            },
+            ParamDef {
+                name: "relations",
+                param_type: "array of string",
+                required: false,
+                description: "Filter edges to these relation types (kind=\"edge\" only).",
+            },
+            ParamDef {
+                name: "min_weight",
+                param_type: "number",
+                required: false,
+                description: "Minimum edge weight inclusive (kind=\"edge\" only).",
+            },
+            ParamDef {
+                name: "max_weight",
+                param_type: "number",
+                required: false,
+                description: "Maximum edge weight inclusive (kind=\"edge\" only).",
+            },
+            ParamDef {
+                name: "event_kind",
+                param_type: "string",
+                required: false,
+                description: "Filter events to a single EventKind (kind=\"event\" only). E.g. \"ProposalCreated\".",
+            },
+            ParamDef {
+                name: "event_kinds",
+                param_type: "array of string",
+                required: false,
+                description: "Filter events to multiple EventKinds (kind=\"event\" only). Additive with event_kind.",
+            },
+            ParamDef {
+                name: "thread_id",
+                param_type: "string",
+                required: false,
+                description: "Filter messages by thread ID (kind=\"message\" only). Accepts full UUID or 8-char prefix.",
+            },
+            ParamDef {
+                name: "direction",
+                param_type: "string",
+                required: false,
+                description: "Filter messages by direction (kind=\"message\" only): \"inbound\" | \"outbound\".",
+            },
+            ParamDef {
+                name: "from",
+                param_type: "string",
+                required: false,
+                description: "Filter messages by sender identifier (kind=\"message\" only).",
+            },
+            ParamDef {
+                name: "to",
+                param_type: "string",
+                required: false,
+                description: "Filter messages by recipient identifier (kind=\"message\" only).",
+            },
+            ParamDef {
+                name: "read",
+                param_type: "bool",
+                required: false,
+                description: "Filter messages by read status (kind=\"message\" only): true = read, false = unread.",
             },
         ],
     },
@@ -321,6 +441,36 @@ static KG_HANDLERS: [HandlerDef; 16] = [
                 description: "Maximum results to return (default 10).",
             },
             ParamDef {
+                name: "entity_kind",
+                param_type: "string",
+                required: false,
+                description: "Filter search results to a specific entity kind (kind=\"entity\" only).",
+            },
+            ParamDef {
+                name: "entity_type",
+                param_type: "string",
+                required: false,
+                description: "Filter search results by entity type field (kind=\"entity\" only, e.g. \"paper\", \"algorithm\").",
+            },
+            ParamDef {
+                name: "note_kind",
+                param_type: "string",
+                required: false,
+                description: "Filter search results to a specific note kind (kind=\"note\" only).",
+            },
+            ParamDef {
+                name: "include_superseded",
+                param_type: "bool",
+                required: false,
+                description: "When true, include notes that are targeted by a supersedes edge (kind=\"note\" only). Default false — superseded notes are excluded from results.",
+            },
+            ParamDef {
+                name: "properties",
+                param_type: "object",
+                required: false,
+                description: "Post-filter search hits to entities whose properties contain all listed key=value pairs (kind=\"entity\" only). Applied after FTS+vector ranking. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}.",
+            },
+            ParamDef {
                 name: "min_score",
                 param_type: "number",
                 required: false,
@@ -385,6 +535,12 @@ static KG_HANDLERS: [HandlerDef; 16] = [
                 param_type: "array of string",
                 required: false,
                 description: "Filter to these relation types only.",
+            },
+            ParamDef {
+                name: "min_weight",
+                param_type: "number",
+                required: false,
+                description: "Minimum edge weight for returned neighbors (0.0–1.0). Edges below this threshold are excluded.",
             },
         ],
     },

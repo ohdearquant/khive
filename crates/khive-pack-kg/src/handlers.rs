@@ -25,6 +25,7 @@ use khive_types::{
     ProposalReviewedPayload, ProposalWithdrawnPayload,
 };
 
+use crate::entity_type_registry::EntityTypeRegistry;
 use crate::vocab::NoteKind;
 use crate::KgPack;
 
@@ -69,6 +70,31 @@ pub(crate) fn canonical_note_kind(
         "unknown note_kind {raw:?}; valid: {}",
         all.join(" | ")
     )))
+}
+
+// ---- Entity-type validation (issue #345) ----
+//
+// `entity_type` is now validated against the EntityTypeRegistry before being
+// passed to the runtime.  Unrecognised subtypes are rejected with an
+// informative error listing the valid options for the resolved kind.
+
+/// Validate and normalise an `entity_type` value for the given canonical kind
+/// string.  Returns the canonical type name (or `None`) on success, or a
+/// `RuntimeError::InvalidInput` on failure.
+///
+/// When `entity_type` is absent, the call is always a no-op and returns `None`.
+fn validate_entity_type(
+    kind_name: &str,
+    entity_type: Option<&str>,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(raw) = entity_type else {
+        return Ok(None);
+    };
+    let kind = kind_name
+        .parse::<khive_types::EntityKind>()
+        .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind_name:?}")))?;
+    let resolved = EntityTypeRegistry::global().resolve(kind, Some(raw))?;
+    Ok(resolved.entity_type)
 }
 
 // ---- Granular `kind` discriminator (CRUD verbs) ----
@@ -320,7 +346,9 @@ struct DeleteParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MergeParams {
+    #[serde(alias = "winner_id", alias = "target_id")]
     into_id: String,
+    #[serde(alias = "loser_id", alias = "source_id")]
     from_id: String,
     kind: Option<String>,
     strategy: Option<String>,
@@ -399,9 +427,7 @@ struct NeighborsParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TraverseParams {
-    /// Accepts either `roots` (legacy) or `ids` (normalized). Each entry may
-    /// be a full UUID or an 8-char prefix; resolved via `resolve_uuid_async`.
-    #[serde(alias = "ids")]
+    #[serde(alias = "ids", alias = "start_ids")]
     roots: Vec<String>,
     max_depth: Option<usize>,
     direction: Option<String>,
@@ -451,6 +477,12 @@ struct WithdrawParams {
 struct ListProposalsParams {
     status: Option<String>,
     proposer: Option<String>,
+    /// Filter by creating actor.
+    ///
+    /// Issue #395: when absent, listing defaults to the caller's own actor so
+    /// that one actor cannot browse another actor's draft proposals.
+    /// Pass `actor="*"` to list proposals from all actors (e.g. for reviewers).
+    actor: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
 }
@@ -1371,12 +1403,16 @@ impl KgPack {
                     RuntimeError::InvalidInput("kind=entity requires 'name'".into())
                 })?;
                 let tags = p.tags.unwrap_or_default();
+                // Issue #345: validate entity_type against the registry before
+                // persisting.  Returns the canonical type name (or None).
+                let validated_type =
+                    validate_entity_type(&canonical, p.entity_type.as_deref())?;
                 let entity = self
                     .runtime
                     .create_entity(
                         token,
                         &canonical,
-                        p.entity_type.as_deref(),
+                        validated_type.as_deref(),
                         &name,
                         p.description.as_deref(),
                         p.properties,
@@ -1811,6 +1847,22 @@ impl KgPack {
                     |s| canonical_entity_kind(s, registry),
                     "entity_kind",
                 )?;
+                // Issue #345: validate entity_type filter against the registry.
+                // When kind_filter is present, validate against that kind;
+                // when absent, validate against any known kind (bare lookup).
+                let validated_et: Option<String> = if let Some(ref raw_et) = p.entity_type {
+                    if let Some(ref kf) = kind_filter {
+                        validate_entity_type(kf, Some(raw_et))?
+                    } else {
+                        // No kind filter: accept any registered subtype bare name
+                        // (just normalise; cross-kind ambiguity is tolerated here
+                        // because it's a filter, not a creation).
+                        let norm = raw_et.trim().to_ascii_lowercase();
+                        Some(norm)
+                    }
+                } else {
+                    None
+                };
                 let limit = p.limit.unwrap_or(50).min(500);
                 let offset = p.offset.unwrap_or(0);
                 // CC-2 fix: pass tags_any through EntityFilter so that
@@ -1823,7 +1875,7 @@ impl KgPack {
                             .list_entities(
                                 token,
                                 kind_filter.as_deref(),
-                                p.entity_type.as_deref(),
+                                validated_et.as_deref(),
                                 limit,
                                 offset,
                             )
@@ -1835,8 +1887,7 @@ impl KgPack {
                                 .as_deref()
                                 .map(|k| vec![k.to_string()])
                                 .unwrap_or_default(),
-                            entity_types: p
-                                .entity_type
+                            entity_types: validated_et
                                 .as_deref()
                                 .map(|t| vec![t.to_string()])
                                 .unwrap_or_default(),
@@ -1863,7 +1914,7 @@ impl KgPack {
                         .list_entities(
                             token,
                             kind_filter.as_deref(),
-                            p.entity_type.as_deref(),
+                            validated_et.as_deref(),
                             limit,
                             offset,
                         )
@@ -2367,6 +2418,17 @@ impl KgPack {
                     |s| canonical_entity_kind(s, registry),
                     "entity_kind",
                 )?;
+                // Issue #345: validate entity_type filter against the registry.
+                let validated_et: Option<String> = if let Some(ref raw_et) = p.entity_type {
+                    if let Some(ref kf) = kind_filter {
+                        validate_entity_type(kf, Some(raw_et))?
+                    } else {
+                        let norm = raw_et.trim().to_ascii_lowercase();
+                        Some(norm)
+                    }
+                } else {
+                    None
+                };
                 // When a properties filter is active, pull extra candidates so
                 // that filtering doesn't leave fewer results than `limit`.
                 let props_filter = p.properties.as_ref().and_then(|v| {
@@ -2389,7 +2451,7 @@ impl KgPack {
                         None,
                         search_limit,
                         kind_filter.as_deref(),
-                        p.entity_type.as_deref(),
+                        validated_et.as_deref(),
                     )
                     .await?;
 
@@ -3273,6 +3335,16 @@ impl KgPack {
             param_idx += 1;
         }
 
+        // Issue #395: actor-scoped listing prevents cross-actor visibility of
+        // draft proposals.  Default to the caller's own actor when no `actor`
+        // filter is provided.  Pass `actor="*"` to see all actors (reviewers).
+        let actor_filter = p.actor.as_deref().unwrap_or_else(|| token.actor().id.as_str());
+        if actor_filter != "*" {
+            sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
+            sql_params.push(SqlValue::Text(actor_filter.to_owned()));
+            param_idx += 1;
+        }
+
         sql_str.push_str(&format!(
             " ORDER BY updated_at DESC LIMIT ?{param_idx} OFFSET ?{}",
             param_idx + 1
@@ -3874,7 +3946,7 @@ mod tests {
         use khive_runtime::KhiveRuntime;
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let token = rt.authorize(khive_runtime::Namespace::local());
+        let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
         let src_val = rt
             .create_entity(&token, "concept", None, "ConceptA", None, None, vec![])
