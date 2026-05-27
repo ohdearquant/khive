@@ -457,7 +457,7 @@ fn fuse_candidates(
 fn recall_text_terms(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut terms: Vec<String> = query
-        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | '?' | '!' | ';' | ':'))
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | '?' | '!' | ';' | ':' | '(' | ')'))
         .map(|t| {
             t.trim_matches(|c: char| !c.is_alphanumeric())
                 .to_ascii_lowercase()
