@@ -1771,7 +1771,11 @@ async fn test_cross_namespace_send_denied_issue_481() {
         .list_notes(&sender_token, Some("message"), 100, 0)
         .await
         .expect("list_notes in sender ns");
-    assert_eq!(sender_notes.len(), 0, "#481 regression: no note in sender ns");
+    assert_eq!(
+        sender_notes.len(),
+        0,
+        "#481 regression: no note in sender ns"
+    );
 }
 
 #[tokio::test]

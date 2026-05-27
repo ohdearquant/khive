@@ -52,7 +52,10 @@ fn canonical_entity_kind(raw: &str, registry: &VerbRegistry) -> Result<String, R
     )))
 }
 
-pub(crate) fn canonical_note_kind(raw: &str, registry: &VerbRegistry) -> Result<String, RuntimeError> {
+pub(crate) fn canonical_note_kind(
+    raw: &str,
+    registry: &VerbRegistry,
+) -> Result<String, RuntimeError> {
     if let Ok(k) = NoteKind::from_str(raw) {
         return Ok(k.name().to_string());
     }

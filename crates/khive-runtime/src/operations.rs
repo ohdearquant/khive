@@ -410,9 +410,7 @@ impl KhiveRuntime {
         if actual == token.namespace().as_str() {
             return Ok(());
         }
-        Err(RuntimeError::NotFound(
-            "not found in this namespace".into(),
-        ))
+        Err(RuntimeError::NotFound("not found in this namespace".into()))
     }
 
     /// List entities in a namespace, optionally filtered by kind and entity_type.
@@ -2922,7 +2920,10 @@ mod tests {
             "cross-namespace delete must error"
         );
         assert!(
-            matches!(cross_ns_result.unwrap_err(), crate::RuntimeError::NotFound(_)),
+            matches!(
+                cross_ns_result.unwrap_err(),
+                crate::RuntimeError::NotFound(_)
+            ),
             "cross-namespace delete must return NotFound, not NamespaceMismatch"
         );
 

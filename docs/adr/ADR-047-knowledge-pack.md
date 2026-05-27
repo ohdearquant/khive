@@ -31,9 +31,54 @@ that encodes domain conventions, leaving the underlying substrate unchanged.
 
 ## Decision
 
-### 1. Three verbs, no new kinds
+### 1. Two tiers: corpus verbs and concept verbs
 
-The knowledge pack registers three verbs over the existing `concept` entity kind. It
+The knowledge pack has two tiers of functionality:
+
+**Corpus tier** (9 verbs) — a standalone knowledge-atom store with its own tables,
+FTS5 index, TF-IDF search, and budget-constrained selection. Atoms are slug-keyed
+content units; domains are named groupings of atoms. This tier ports the retrieval
+capabilities of the lore service into the pack system.
+
+**Concept tier** (3 verbs) — sugar over the kg pack's entity/edge substrate for
+research-concept workflows. These verbs use existing entity kinds and edge relations;
+they do not introduce new ones.
+
+| Verb                       | Tier    | Category   | Description                                             |
+| -------------------------- | ------- | ---------- | ------------------------------------------------------- |
+| `knowledge.upsert_atoms`   | Corpus  | Commissive | Bulk insert/update slug-keyed knowledge atoms           |
+| `knowledge.upsert_domains` | Corpus  | Commissive | Bulk insert/update domain groupings of atoms            |
+| `knowledge.get`            | Corpus  | Assertive  | Fetch one atom or domain by ID or slug                  |
+| `knowledge.list`           | Corpus  | Assertive  | Paginated listing of atoms or domains                   |
+| `knowledge.delete_atoms`   | Corpus  | Commissive | Soft-delete atoms by slug                               |
+| `knowledge.stats`          | Corpus  | Assertive  | Corpus statistics (counts, coverage)                    |
+| `knowledge.index`          | Corpus  | Commissive | Backfill embeddings + FTS for atoms                     |
+| `knowledge.fold`           | Corpus  | Assertive  | Budget-constrained knapsack selection (token budgeting) |
+| `knowledge.search`         | Corpus  | Assertive  | TF-IDF + optional embedding rerank over the corpus      |
+| `knowledge.learn`          | Concept | Commissive | Register a concept entity with domain promotion         |
+| `knowledge.cite`           | Concept | Commissive | Link a concept to its source paper via `introduced_by`  |
+| `knowledge.topic`          | Concept | Assertive  | List/search concepts, optionally filtered by domain     |
+
+### 1a. Corpus tier schema (V19 migration)
+
+The corpus tier introduces two tables via versioned migration V19
+(`knowledge_atoms_and_domains`):
+
+- `knowledge_atoms` — slug-keyed content units with name, description, content,
+  tags (JSON array), properties (JSON object), and finalized flag.
+- `knowledge_domains` — named groupings with slug, name, description, tags, and
+  members (JSON array of atom slugs).
+
+An FTS5 external-content virtual table (`fts_knowledge`) indexes slug, name,
+description, and content from `knowledge_atoms` via triggers that sync on
+insert/update/delete. The trigram tokenizer enables substring matching.
+
+Soft-deleted atoms (non-null `deleted_at`) are excluded from the FTS index via
+a `WHEN new.deleted_at IS NULL` guard on the insert trigger.
+
+### 1b. Concept tier: three verbs, no new kinds
+
+The concept tier registers three verbs over the existing `concept` entity kind. It
 does **not** introduce new note kinds, entity kinds, or edge relations:
 
 | Verb    | Underlying operation                           | Value-add                                                       |
@@ -42,9 +87,95 @@ does **not** introduce new note kinds, entity kinds, or edge relations:
 | `cite`  | `link(relation="introduced_by")`               | Domain-oriented parameter names; weight clamped to `[0.0, 1.0]` |
 | `topic` | `search(kind="concept")` + optional tag filter | Domain-filter parameter; consistent `limit` cap of 100          |
 
-No columns are added to the database. No new endpoints are required in the schema.
+### 2. Corpus tier verbs
 
-### 2. `learn` — concept registration with domain promotion
+#### `knowledge.upsert_atoms` — bulk atom insert/update
+
+```
+upsert_atoms(atoms: [{slug, name, content?, description?, tags?, properties?, finalized?}, ...], chunk_size?) → {upserted: N}
+```
+
+Inserts or updates atoms by `(namespace, slug)` key. On conflict, updates name,
+description, content, tags, properties, finalized, and `updated_at`. Empty `atoms`
+array is rejected. Tags are stored as a JSON array string; properties as a JSON
+object string.
+
+#### `knowledge.upsert_domains` — bulk domain insert/update
+
+```
+upsert_domains(domains: [{slug, name, description?, tags?, members?}, ...]) → {upserted: N}
+```
+
+Inserts or updates domains by `(namespace, slug)` key. Members is a JSON array of
+atom slugs.
+
+#### `knowledge.get` — fetch by ID or slug
+
+```
+get(id: <uuid|slug>) → {type: "atom"|"domain", ...fields}
+```
+
+Resolves by UUID first, then by slug against both `knowledge_atoms` and
+`knowledge_domains`. Returns 404 if not found.
+
+#### `knowledge.list` — paginated listing
+
+```
+list(type?: "atom"|"domain", limit?: 20, offset?: 0) → {items: [...], total: N}
+```
+
+Default type is `atom`. Limit capped at 500.
+
+#### `knowledge.delete_atoms` — soft delete
+
+```
+delete_atoms(ids: [<slug|uuid>, ...], cascade?: true) → {deleted: N}
+```
+
+Sets `deleted_at` timestamp. FTS trigger automatically removes from search index.
+
+#### `knowledge.stats` — corpus statistics
+
+```
+stats() → {atoms: N, domains: N, ...}
+```
+
+#### `knowledge.index` — backfill embeddings + FTS
+
+```
+index(ids?: [<slug|uuid>], batch_size?: 500, insert_only?: false) → {indexed: N}
+```
+
+Backfills embedding vectors and FTS content. When `ids` is omitted, indexes the
+entire corpus in batches. `insert_only` skips the delete-then-reinsert cycle for
+fresh corpus backfill.
+
+#### `knowledge.fold` — budget-constrained selection
+
+```
+fold(candidates: [{id, score, size, content?, category?}, ...], budget: N, min_score?: 0.0, category_weights?: {}) → {selected: [...], total_size: N}
+```
+
+Greedy knapsack: sorts candidates by score-density (score/size), applies category
+weight multipliers, filters by `min_score`, then packs greedily until budget is
+exhausted. Pure computation — no database access.
+
+#### `knowledge.search` — TF-IDF ranked search
+
+```
+search(query, type?, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: false, rerank_alpha?: 0.7) → {items: [...], total: N}
+```
+
+FTS5 recall → in-memory TF-IDF scoring across name, description, tags, and content
+fields with configurable weights. Optional features:
+
+- **Query decomposition**: splits long queries into sub-queries, scores each
+  independently, and bonuses items that appear across multiple sub-queries.
+- **Embedding rerank**: blends TF-IDF scores with cosine similarity against the
+  query embedding. `rerank_alpha` controls the blend (0.7 = TF-IDF dominant).
+- **Role weighting**: prepends the agent role to the query for contextual scoring.
+
+### 3. `learn` — concept registration with domain promotion
 
 ```
 learn(name, description?, domain?, tags?) → {id, full_id, kind, name, domain, tags, ...}
@@ -61,7 +192,7 @@ learn(name, description?, domain?, tags?) → {id, full_id, kind, name, domain, 
   anti-patterns section; the verb intentionally does not add the round-trip overhead by
   default.
 
-### 3. `cite` — provenance citation
+### 4. `cite` — provenance citation
 
 ```
 cite(concept_id, source_id, weight?) → {id, full_id, relation, concept_id, source_id, weight}
@@ -77,7 +208,7 @@ cite(concept_id, source_id, weight?) → {id, full_id, relation, concept_id, sou
 - The underlying edge relation is `EdgeRelation::IntroducedBy` (ADR-002). The pack does
   not bypass the closed edge ontology.
 
-### 4. `topic` — concept browsing
+### 5. `topic` — concept browsing
 
 ```
 topic(domain?, query?, limit?) → {items: [...], total: N}
@@ -90,14 +221,15 @@ topic(domain?, query?, limit?) → {items: [...], total: N}
   reflects the capped limit via `items` and `total`.
 - The domain filter is case-insensitive tag match (`eq_ignore_ascii_case`).
 
-### 5. Pack dependency declaration
+### 6. Pack dependency declaration
 
 The pack declares `REQUIRES: &["kg"]`. The runtime enforces this at boot: loading
-`knowledge` without `kg` fails with a dependency error. Because `knowledge` adds no new
-kinds or relations, `kg` must be active to handle any entity CRUD that `learn` or `topic`
-invokes.
+`knowledge` without `kg` fails with a dependency error. The concept tier delegates
+entity CRUD to the `kg` pack; the corpus tier operates on its own tables
+(`knowledge_atoms`, `knowledge_domains`) via direct SQL through the runtime's
+`SqlAccess` trait.
 
-### 6. Binary wiring
+### 7. Binary wiring
 
 `crates/khive-mcp/Cargo.toml` declares `khive-pack-knowledge` as a direct dependency.
 `crates/khive-mcp/src/pack.rs` re-exports `KnowledgePack` under a `#[doc(hidden)]` alias

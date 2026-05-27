@@ -47,6 +47,8 @@ The canonical ledger of database schema migration versions. Migration versions a
 |     V15 | c22/ADR-046  | proposals_open                                    | shipped |
 |     V16 | v022/ADR-043 | vector_embedding_model_tag                        | shipped |
 |     V17 | v023/ADR-043 | vector_embedding_model_tag_preserving_rebuild     | shipped |
+|     V18 | v025/ADR-046 | proposals_open_add_applying_status                | shipped |
+|     V19 | v025/ADR-047 | knowledge_atoms_and_domains                       | shipped |
 
 > **Amendment (2026-05-24, cluster-24 + post-integration)**: The ledger above reflects what
 > actually shipped on `integration/v1-adr-alignment` after parallel cluster landings c01, c03,
@@ -74,6 +76,16 @@ The canonical ledger of database schema migration versions. Migration versions a
 > discovery queries also gained `AND name NOT LIKE '%\_metadata%'` to exclude newer sqlite-vec
 > shadow tables (`_metadatachunks00`, `_metadatatext00`, etc.). Versions V1–V17 are production
 > schema and are frozen.
+>
+> **V18 amendment (2026-05-27, v025/ADR-046)**: V18 (`proposals_open_add_applying_status`)
+> adds `applying` to the `proposals_open` projection status enum (ADR-046 lifecycle
+> hardening). Computed at runtime from `proposals_open` DDL rebuild.
+>
+> **V19 amendment (2026-05-27, v025/ADR-047)**: V19 (`knowledge_atoms_and_domains`) creates
+> `knowledge_atoms` and `knowledge_domains` tables plus an FTS5 external-content virtual
+> table `fts_knowledge` with insert/delete/update triggers for automatic index sync. The
+> FTS5 index covers slug, name, description, and content fields with a trigram tokenizer.
+> Versions V1–V19 are production schema and are frozen.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 

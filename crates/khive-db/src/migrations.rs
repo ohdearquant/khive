@@ -436,6 +436,81 @@ const V15_PROPOSALS_OPEN: &str = "\
     CREATE INDEX IF NOT EXISTS idx_proposals_open_updated ON proposals_open(namespace, updated_at DESC);\
 ";
 
+// V18: knowledge pack — atoms table (slug-keyed knowledge corpus) and domains
+// (named groupings of atoms). FTS5 full-text index over name + description +
+// content + tags. Separate from the notes/entities tables so the knowledge
+// corpus can scale to hundreds of thousands of atoms without polluting the
+// general-purpose note store.
+const V19_KNOWLEDGE_ATOMS_AND_DOMAINS: &str = "\
+    CREATE TABLE IF NOT EXISTS knowledge_atoms (\
+        id TEXT PRIMARY KEY,\
+        namespace TEXT NOT NULL,\
+        slug TEXT NOT NULL,\
+        name TEXT NOT NULL,\
+        description TEXT,\
+        content TEXT NOT NULL DEFAULT '',\
+        tags TEXT NOT NULL DEFAULT '[]',\
+        properties TEXT,\
+        finalized INTEGER NOT NULL DEFAULT 0,\
+        created_at INTEGER NOT NULL,\
+        updated_at INTEGER NOT NULL,\
+        deleted_at INTEGER\
+    );\
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_atoms_ns_slug \
+        ON knowledge_atoms(namespace, slug);\
+    CREATE INDEX IF NOT EXISTS idx_knowledge_atoms_ns \
+        ON knowledge_atoms(namespace);\
+    CREATE INDEX IF NOT EXISTS idx_knowledge_atoms_ns_created \
+        ON knowledge_atoms(namespace, created_at DESC);\
+    CREATE TABLE IF NOT EXISTS knowledge_domains (\
+        id TEXT PRIMARY KEY,\
+        namespace TEXT NOT NULL,\
+        slug TEXT NOT NULL,\
+        name TEXT NOT NULL,\
+        description TEXT,\
+        tags TEXT NOT NULL DEFAULT '[]',\
+        members TEXT NOT NULL DEFAULT '[]',\
+        created_at INTEGER NOT NULL,\
+        updated_at INTEGER NOT NULL,\
+        deleted_at INTEGER\
+    );\
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_domains_ns_slug \
+        ON knowledge_domains(namespace, slug);\
+    CREATE INDEX IF NOT EXISTS idx_knowledge_domains_ns \
+        ON knowledge_domains(namespace);\
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_knowledge \
+        USING fts5(\
+            id UNINDEXED,\
+            namespace UNINDEXED,\
+            slug,\
+            name,\
+            description,\
+            content,\
+            content=knowledge_atoms,\
+            content_rowid=rowid,\
+            tokenize='trigram case_sensitive 0'\
+        );\
+    CREATE TRIGGER IF NOT EXISTS fts_knowledge_ai \
+        AFTER INSERT ON knowledge_atoms \
+        WHEN new.deleted_at IS NULL BEGIN \
+        INSERT INTO fts_knowledge(rowid, id, namespace, slug, name, description, content) \
+            VALUES(new.rowid, new.id, new.namespace, new.slug, new.name, new.description, new.content); \
+    END; \
+    CREATE TRIGGER IF NOT EXISTS fts_knowledge_ad \
+        AFTER DELETE ON knowledge_atoms BEGIN \
+        INSERT INTO fts_knowledge(fts_knowledge, rowid, id, namespace, slug, name, description, content) \
+            VALUES('delete', old.rowid, old.id, old.namespace, old.slug, old.name, old.description, old.content); \
+    END; \
+    CREATE TRIGGER IF NOT EXISTS fts_knowledge_au \
+        AFTER UPDATE ON knowledge_atoms BEGIN \
+        INSERT INTO fts_knowledge(fts_knowledge, rowid, id, namespace, slug, name, description, content) \
+            VALUES('delete', old.rowid, old.id, old.namespace, old.slug, old.name, old.description, old.content); \
+        INSERT INTO fts_knowledge(rowid, id, namespace, slug, name, description, content) \
+            SELECT new.rowid, new.id, new.namespace, new.slug, new.name, new.description, new.content \
+            WHERE new.deleted_at IS NULL; \
+    END;\
+";
+
 pub const MIGRATIONS: &[VersionedMigration] = &[
     VersionedMigration {
         version: 1,
@@ -539,15 +614,16 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         up: V17_VECTOR_EMBEDDING_MODEL_TAG_PRESERVING_REBUILD,
     },
     // V18: add 'applying' to proposals_open status CHECK (ADR-046 §3 amendment).
-    // The apply worker uses 'applying' as a transient state to prevent the
-    // apply/withdraw race: it atomically moves status='approved' → 'applying'
-    // before mutating the KG, so withdraw cannot land while KG mutations run.
-    // SQLite does not support ALTER COLUMN; the table is recreated preserving all
-    // existing rows.
     VersionedMigration {
         version: 18,
         name: "proposals_open_add_applying_status",
         up: "__v18_computed_at_runtime__",
+    },
+    // V19: knowledge pack — atoms and domains tables + FTS5 index.
+    VersionedMigration {
+        version: 19,
+        name: "knowledge_atoms_and_domains",
+        up: V19_KNOWLEDGE_ATOMS_AND_DOMAINS,
     },
 ];
 
@@ -1357,17 +1433,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
 
-        // Verify the tracking table has rows for V1 through V18.
+        // Verify the tracking table has rows for V1 through V19.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 18);
+        assert_eq!(count, 19);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -1548,16 +1624,16 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 18);
-        assert_eq!(v2, 18);
+        assert_eq!(v1, 19);
+        assert_eq!(v2, 19);
 
-        // Should still have exactly eighteen rows in the tracking table (V1..V18).
+        // Should still have exactly nineteen rows in the tracking table (V1..V19).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 18);
+        assert_eq!(count, 19);
     }
 
     // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
@@ -1567,8 +1643,8 @@ mod tests {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
         assert_eq!(
-            version, 18,
-            "F052: latest migration must be V18 (proposals_open_add_applying_status)"
+            version, 19,
+            "F052: latest migration must be V19 (knowledge_atoms_and_domains)"
         );
         let col: i64 = conn
             .query_row(
@@ -1596,42 +1672,42 @@ mod tests {
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v19 = VersionedMigration {
-            version: 19,
+        let bad_v20 = VersionedMigration {
+            version: 20,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1..V18) so the DB is at V18.
-        run_migrations(&mut conn).expect("V1..V18 should apply cleanly");
+        // Apply all real migrations (V1..V19) so the DB is at V19.
+        run_migrations(&mut conn).expect("V1..V19 should apply cleanly");
 
-        // Now manually drive the bad V19 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v19);
+        // Now manually drive the bad V20 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v20);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V18 — no V19 row in tracking.
-        let v19_count: i64 = conn
+        // DB should still be at V19 — no V20 row in tracking.
+        let v20_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 19",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 20",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v19_count, 0, "V19 must not be recorded after rollback");
+        assert_eq!(v20_count, 0, "V20 must not be recorded after rollback");
 
-        // V1..V18 should still be there.
+        // V1..V19 should all be recorded.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
-            applied_count, 18,
-            "V1..V18 must still be recorded after V19 rollback"
+            applied_count, 19,
+            "V1..V19 must still be recorded after V20 rollback"
         );
     }
 
@@ -1669,9 +1745,10 @@ mod tests {
         // V15 creates the proposals_open table;
         // V16 adds embedding_model column to regular vec_ tables;
         // V17 is a no-op when no old-schema vec0 tables exist;
-        // V18 adds 'applying' to proposals_open status CHECK.
+        // V18 adds 'applying' to proposals_open status CHECK;
+        // V19 creates knowledge_atoms/knowledge_domains tables.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -1863,7 +1940,7 @@ mod tests {
 
         // Run V2-V18 migrations.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
 
         // After V12, salience must be nullable (notnull=0).
         let notnull: i64 = conn
@@ -1907,7 +1984,7 @@ mod tests {
         ensure_events_schema(&conn).expect("store DDL should create events");
 
         let version = run_migrations(&mut conn).expect("migrations after events store DDL");
-        assert_eq!(version, 18, "must reach V18 even when events DDL ran first");
+        assert_eq!(version, 19, "must reach V19 even when events DDL ran first");
 
         let v13_count: i64 = conn
             .query_row(
@@ -1948,8 +2025,8 @@ mod tests {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
         assert_eq!(
-            version, 18,
-            "F227: latest migration must be V18 (proposals_open_add_applying_status)"
+            version, 19,
+            "F227: latest migration must be V19 (knowledge_atoms_and_domains)"
         );
 
         // Verify _embedding_models table exists.
@@ -2046,7 +2123,7 @@ mod tests {
         // Run the full migration suite — V14 should add embedding_model_id to the
         // regular vec_legacy_model table.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
 
         // The embedding_model_id column must now exist.
         let col_exists: bool = conn
@@ -2063,7 +2140,7 @@ mod tests {
 
         // Running migrations again must be idempotent (column already present).
         let version2 = run_migrations(&mut conn).expect("second run must succeed");
-        assert_eq!(version2, 18);
+        assert_eq!(version2, 19);
     }
 
     /// CRIT-2 regression: V14 discovery filter must NOT match sqlite-vec internal
@@ -2095,7 +2172,7 @@ mod tests {
         // Run the full migration suite — V14 must not add `embedding_model_id` to
         // any of the four shadow tables above.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
 
         for shadow in [
             "vec_test_chunks",
@@ -2274,7 +2351,7 @@ mod tests {
     fn v17_migration_is_noop_on_fresh_db() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations must succeed on fresh DB");
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
 
         // V17 and V18 are recorded.
         let v17: i64 = conn
