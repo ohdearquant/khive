@@ -808,37 +808,102 @@ follows `annotates` to the resource/atom, then reads the `operational_guidance` 
 
 ## Implementation
 
-### Phase 1: Section schema (khive-pack-knowledge)
+### Phase 0: Vamana ANN index (khive-vamana) — P0, unblocks lore absorption
 
-- Add `SectionType` enum and `SectionManifest` struct to `schema.rs`
-- Add section parsing to `upsert_atoms` (detect `##` headers, normalize via
-  header map, compute byte offsets and token counts)
-- Store section manifest in `properties.sections` JSON
-- Add `knowledge.import` verb for file-based ingest
-- Add `knowledge.edit` verb for section-level editing
-- Update `knowledge.compose` (new verb) to assemble sections with weights
+New crate `crates/khive-vamana/` — batch-built Vamana graph for approximate nearest
+neighbor search. Separate from `khive-hnsw` (different lifecycle: batch-build vs OLTP
+insert/delete).
 
-### Phase 2: Brain integration (khive-pack-brain)
+**Architecture decisions** (from DiskANN feasibility study):
 
-- Add `SectionPosteriorState` alongside `BalancedRecallState`
-- Register `consumer_kind = "knowledge_compose"` in brain profile system
-- Extend `brain.feedback` params with optional `section_signals` map
-- Add fold/reduce path for section-level Beta updates
-- Create seed profiles for common roles (implementer, theorist, researcher, etc.)
+- **Flat binary + mmap persistence**: `{data_dir}/vamana/{namespace}/vectors.bin` +
+  `graph.bin`. Graph (~88MB for 342K) stays in RAM. Vectors (526MB) mmap'd. Zero
+  SQLite dependency for index storage.
+- **Explicit rebuild**: `knowledge.index(rebuild_ann=true)`. Not at startup (5-30s
+  cold start unacceptable), not per-insert (Vamana is not incremental). Build time:
+  90-180s for 342K×384d with rayon.
+- **Parallel ANN signal**: FTS5 candidates (lexical) + Vamana ANN (semantic) fused
+  via RRF. Additive to existing pipeline — sqlite-vec stays as fallback.
+- **Pre-normalize vectors**: L2²(a,b) = 2−2·cos(a,b) for unit vectors. Graph uses
+  L2 (fast), output converts to cosine for RRF fusion.
+- **No PQ at 342K**: 526MB fits in RAM. PQ config field present but disabled until 2M+.
 
-### Phase 3: Hook wiring (.claude/hooks/)
+Files:
+- `crates/khive-vamana/src/{lib,config,distance,graph,index}.rs` — core implementation
+- `crates/khive-pack-knowledge/src/knowledge/vamana.rs` — ~150 LOC bridge
 
-- `UserPromptSubmit` hook: resolve profile from session identity
-- `PostToolUse` hook: buffer compose calls
-- Session-end hook: correlate with task outcomes, emit feedback
-- Map Claude Code session IDs to lambda identity via cwd heuristic
+### Phase 1: Brain persistence + section state — P0, unblocks learning
 
-### Phase 4: knowledge.suggest and knowledge.compose verbs
+**Brain profile persistence** (currently ALL in-memory, lost on restart):
+
+- V20 migration: `brain_profile_snapshots` table in SQLite
+- Save on every feedback event (or batched every N events)
+- Load on startup from latest snapshot
+- Without this, all learned preferences are throwaway
+
+**`SectionPosteriorState`** (does not exist yet):
+
+- New state type for `consumer_kind="knowledge_compose"`
+- 10 `BetaPosterior` fields (one per section type)
+- ESS cap at ~50 per parameter for temporal decay: when `α+β > cap`,
+  rescale toward prior (`α = α_prior + (α-α_prior) * cap/ESS`)
+- Weight floor: `max(0.05, mean)` prevents section collapse to zero
+- Exploration epoch decrement on each feedback event (currently broken —
+  epoch never decrements, Thompson sampling never transitions to exploit)
+
+**`brain.create_profile` seed_priors**: currently ignores the param.
+Implement section posterior initialization from caller-provided priors.
+
+### Phase 2: Resource entity kind + sections table
+
+- ADR-001 amendment: add 9th entity kind `resource`
+- `knowledge.upsert_atoms` creates dual entity (resource/atom in `entities` +
+  content row in `knowledge_atoms`)
+- V21 migration: `knowledge_sections` table with section_type enum, per-section
+  embeddings, FK to atom
+- `knowledge.edit` verb for section-level updates without wiping other sections
+- `knowledge.import` verb for atlas markdown file ingestion with section parsing
+
+### Phase 3: Compose + suggest verbs with profile resolution
 
 - `knowledge.suggest` — domain discovery with profile-weighted scoring
-- `knowledge.compose` — two-stage: suggest → assemble sections with weights
-  from brain profile posteriors. Budget-constrained by token limit.
+- `knowledge.compose` — two-stage: suggest → assemble sections with weights from
+  brain profile posteriors. Budget-constrained by token budget.
   Returns section-typed markdown with per-section scores.
+- Brain profile resolution via `brain.resolve(actor, consumer_kind="knowledge_compose")`
+- Thompson sampling when `exploration_epoch > 0`, posterior means otherwise
+
+### Phase 4: Hook wiring + implicit feedback
+
+- `UserPromptSubmit` hook: actor injection from cwd/lambda identity
+- `PostToolUse` hook: buffer compose calls with section manifests
+- Session-end attribution: correlate buffered compose calls with task outcomes
+- Emit `brain.feedback` with `section_signals` map
+- ESS cap + decay ensures preferences stay adaptive
+
+### Phase 5: Graph health, export, observability
+
+- `knowledge.health` verb: orphans, dangling edges, direction violations, density
+- `knowledge.export` verb: JSONL format for git-diffable graph snapshots
+- `brain.diagnostics` verb: ESS per parameter, weight vector entropy, delta-mean
+  over last N events, convergence trend
+- `reclassify` verb: change entity kind preserving UUID + edges (currently blocked —
+  entity_kind is immutable, delete+recreate loses edge references)
+
+## Benchmarks required (test-driven, bench-driven)
+
+Every phase ships with benchmarks that gate merge:
+
+| Phase | Benchmark | Pass criteria |
+|---|---|---|
+| 0 (Vamana) | recall@10 on 5K/384d random dataset | ≥ 85% |
+| 0 (Vamana) | build time for 342K × 384d | < 180s on M-series |
+| 0 (Vamana) | query latency at 342K (single query) | < 5ms p99 |
+| 1 (Brain) | profile save/load round-trip | snapshot == restored state |
+| 1 (Brain) | ESS cap convergence: 200 events then 200 opposing | mean shifts by ≥ 0.3 |
+| 2 (Sections) | section edit does not alter sibling sections | property test |
+| 3 (Compose) | compose with implementer profile returns > 60% ops_guidance tokens | weight test |
+| 4 (Hooks) | end-to-end: compose → feedback → posterior shift | integration test |
 
 ## References
 
