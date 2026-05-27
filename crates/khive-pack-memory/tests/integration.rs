@@ -15,6 +15,7 @@ fn make_runtime() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         embedding_model: None,
+        additional_embedding_models: vec![],
         ..RuntimeConfig::default()
     })
     .expect("in-memory runtime")
@@ -1928,6 +1929,7 @@ async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         embedding_model: None,
+        additional_embedding_models: vec![],
         ..RuntimeConfig::default()
     })
     .expect("runtime");
@@ -2000,6 +2002,7 @@ async fn test_weighted_fusion_multi_model_text_not_zeroed() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         embedding_model: None,
+        additional_embedding_models: vec![],
         ..RuntimeConfig::default()
     })
     .expect("runtime");
