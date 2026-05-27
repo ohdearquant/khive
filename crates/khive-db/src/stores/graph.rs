@@ -310,6 +310,22 @@ fn edge_sort_col(field: &EdgeSortField) -> &'static str {
 // GraphStore implementation
 // =============================================================================
 
+/// Canonical endpoint order for symmetric relations (F012).
+///
+/// For `competes_with` and `composed_with`, ensures `source_uuid < target_uuid`
+/// so A→B and B→A collapse to a single canonical row in storage.
+fn canonical_edge_endpoints(
+    relation: EdgeRelation,
+    source_id: Uuid,
+    target_id: Uuid,
+) -> (Uuid, Uuid) {
+    if relation.is_symmetric() && target_id < source_id {
+        (target_id, source_id)
+    } else {
+        (source_id, target_id)
+    }
+}
+
 #[async_trait]
 impl GraphStore for SqlGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> Result<(), StorageError> {
@@ -325,8 +341,10 @@ impl GraphStore for SqlGraphStore {
             });
         }
         let id_str = Uuid::from(edge.id).to_string();
-        let src_str = edge.source_id.to_string();
-        let tgt_str = edge.target_id.to_string();
+        let (source_id, target_id) =
+            canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+        let src_str = source_id.to_string();
+        let tgt_str = target_id.to_string();
         let relation_str = edge.relation.to_string();
         let metadata_str = edge
             .metadata
@@ -398,8 +416,10 @@ impl GraphStore for SqlGraphStore {
 
             for edge in &edges {
                 let id_str = Uuid::from(edge.id).to_string();
-                let src_str = edge.source_id.to_string();
-                let tgt_str = edge.target_id.to_string();
+                let (canon_src, canon_tgt) =
+                    canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+                let src_str = canon_src.to_string();
+                let tgt_str = canon_tgt.to_string();
                 let relation_str = edge.relation.to_string();
                 let metadata_str = edge
                     .metadata
@@ -1359,6 +1379,81 @@ mod tests {
             "F053: natural-key conflict must DO UPDATE (weight=0.5 from second upsert); \
              current DO NOTHING keeps stale weight={}",
             edges.items[0].weight
+        );
+    }
+
+    // Regression test for #476: symmetric edges stored via upsert_edge must
+    // always have source_id < target_id (lexicographic on UUID bytes).
+    #[tokio::test]
+    async fn upsert_edge_canonicalizes_symmetric_relation() {
+        let store = setup_memory_store();
+
+        // Construct two UUIDs where larger > smaller lexicographically.
+        let smaller = Uuid::from_bytes([0x00; 16]);
+        let larger = Uuid::from_bytes([0xff; 16]);
+        assert!(
+            larger > smaller,
+            "test setup: larger must sort after smaller"
+        );
+
+        // Insert with source > target — the invariant-violating order.
+        let edge = make_edge(larger, smaller, EdgeRelation::CompetesWith, 1.0);
+        let edge_id = edge.id;
+        store.upsert_edge(edge).await.unwrap();
+
+        let stored = store.get_edge(edge_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.source_id, smaller,
+            "#476: CompetesWith edge must be stored with source_id < target_id"
+        );
+        assert_eq!(
+            stored.target_id, larger,
+            "#476: CompetesWith edge must be stored with target_id > source_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_edges_batch_canonicalizes_symmetric_relation() {
+        let store = setup_memory_store();
+
+        let smaller = Uuid::from_bytes([0x11; 16]);
+        let larger = Uuid::from_bytes([0xee; 16]);
+
+        // ComposedWith is the other symmetric relation — insert reversed.
+        let edge = make_edge(larger, smaller, EdgeRelation::ComposedWith, 0.9);
+        let edge_id = edge.id;
+        store.upsert_edges(vec![edge]).await.unwrap();
+
+        let stored = store.get_edge(edge_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.source_id, smaller,
+            "#476: ComposedWith edge must be stored with source_id < target_id (batch path)"
+        );
+        assert_eq!(
+            stored.target_id, larger,
+            "#476: ComposedWith edge must be stored with target_id > source_id (batch path)"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_edge_non_symmetric_relation_preserves_direction() {
+        let store = setup_memory_store();
+
+        // DependsOn is not symmetric — direction must NOT be swapped.
+        let src = Uuid::from_bytes([0xff; 16]);
+        let tgt = Uuid::from_bytes([0x00; 16]);
+        let edge = make_edge(src, tgt, EdgeRelation::DependsOn, 1.0);
+        let edge_id = edge.id;
+        store.upsert_edge(edge).await.unwrap();
+
+        let stored = store.get_edge(edge_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.source_id, src,
+            "non-symmetric edge direction must be preserved"
+        );
+        assert_eq!(
+            stored.target_id, tgt,
+            "non-symmetric edge direction must be preserved"
         );
     }
 }

@@ -1129,9 +1129,14 @@ async fn test_thread_verb_returns_threaded_messages() {
         .and_then(|v| v.as_array())
         .expect("thread returns messages array");
     // Messages must be in chronological order (created_at ascending).
-    let timestamps: Vec<i64> = msgs
+    // created_at is an ISO 8601 string; compare lexicographically (not as_i64).
+    let timestamps: Vec<&str> = msgs
         .iter()
-        .filter_map(|m| m.get("created_at").and_then(|v| v.as_i64()))
+        .map(|m| {
+            m.get("created_at")
+                .and_then(|v| v.as_str())
+                .expect("H3: thread message must have ISO string created_at")
+        })
         .collect();
     let mut sorted = timestamps.clone();
     sorted.sort_unstable();
@@ -1733,20 +1738,10 @@ async fn test_list_message_finds_match_beyond_1000_backlog() {
 
 // ── #481 regression: cross-namespace send is denied (ACL gate) ────────────────
 
-/// comm.send to a different namespace must return CrossNamespaceWrite.
-///
-/// Before the fix, send() called runtime.authorize(recipient_ns) which always
-/// succeeded locally, writing an inbound message note into any syntactically valid
-/// recipient namespace without checking a recipient authorization gate (issue #481).
-///
-/// After the fix, any send where `to != caller_namespace` is rejected with an error
-/// that mentions the denied namespace (per ADR-040 §cross-namespace-messaging and
-/// ADR-018: until ACL policy is specified, cross-namespace delivery is DENIED).
 #[tokio::test]
 async fn test_cross_namespace_send_denied_issue_481() {
     let (registry, rt) = build_registry_for_ns("lambda:khive");
 
-    // Attempt to send to a different namespace.
     let result = registry
         .dispatch(
             "comm.send",
@@ -1764,37 +1759,21 @@ async fn test_cross_namespace_send_denied_issue_481() {
         "#481 regression: error must mention the denied namespace or 'cross-namespace'; got {err:?}"
     );
 
-    // Security: the recipient namespace must remain empty — no inbound note was written.
     let recipient_token = rt.authorize(khive_runtime::Namespace::parse("lambda:leo").unwrap());
     let notes = rt
         .list_notes(&recipient_token, Some("message"), 100, 0)
         .await
         .expect("list_notes in recipient ns");
-    assert_eq!(
-        notes.len(),
-        0,
-        "#481 regression: no note must be written to the recipient namespace on denial; \
-         got {notes:?}"
-    );
+    assert_eq!(notes.len(), 0, "#481 regression: no note in recipient ns");
 
-    // Security: the sender namespace must also be empty — no outbound note was written.
     let sender_token = rt.authorize(khive_runtime::Namespace::parse("lambda:khive").unwrap());
     let sender_notes = rt
         .list_notes(&sender_token, Some("message"), 100, 0)
         .await
         .expect("list_notes in sender ns");
-    assert_eq!(
-        sender_notes.len(),
-        0,
-        "#481 regression: no outbound note must be written to sender namespace on denial; \
-         got {sender_notes:?}"
-    );
+    assert_eq!(sender_notes.len(), 0, "#481 regression: no note in sender ns");
 }
 
-/// comm.send within the same namespace must succeed (ADR-040 §within-namespace).
-///
-/// Same-namespace send is the only permitted form in v0.2.x until ADR-018 specifies
-/// cross-namespace ACL policy.
 #[tokio::test]
 async fn test_same_namespace_send_succeeds_issue_481() {
     let (registry, _rt) = build_registry_for_ns("lambda:khive");
@@ -1814,5 +1793,81 @@ async fn test_same_namespace_send_succeeds_issue_481() {
     assert!(
         id.get("id").is_some(),
         "#481 regression: same-namespace send must return an id; got {id:?}"
+    );
+}
+
+// ── #485 regression: thread sort must use ISO string comparison, not as_i64 ──
+
+#[tokio::test]
+async fn test_thread_sort_is_not_a_noop_issue_485() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("root full_id");
+
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": root_full_id, "content": "reply-1" }),
+        )
+        .await
+        .expect("reply-1 succeeds");
+
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": root_full_id, "content": "reply-2" }),
+        )
+        .await
+        .expect("reply-2 succeeds");
+
+    let thread_result = registry
+        .dispatch("comm.thread", serde_json::json!({ "id": root_full_id }))
+        .await
+        .expect("#485 regression: thread verb must succeed");
+
+    let msgs = thread_result
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("thread returns messages array");
+
+    assert!(
+        msgs.len() >= 3,
+        "#485: expected at least 3 messages (root + 2 replies); got {}",
+        msgs.len()
+    );
+
+    for (i, m) in msgs.iter().enumerate() {
+        let ts = m
+            .get("created_at")
+            .expect("#485: message must have created_at field");
+        assert!(
+            ts.is_string(),
+            "#485: created_at[{i}] must be an ISO string, got: {ts:?}"
+        );
+    }
+
+    let timestamps: Vec<&str> = msgs
+        .iter()
+        .map(|m| {
+            m.get("created_at")
+                .and_then(|v| v.as_str())
+                .expect("#485: created_at must be ISO string")
+        })
+        .collect();
+    let mut sorted = timestamps.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        timestamps, sorted,
+        "#485: thread must return in chronological order"
     );
 }
