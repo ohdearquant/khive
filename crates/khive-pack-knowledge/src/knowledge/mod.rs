@@ -1038,6 +1038,7 @@ impl KnowledgeHandlers {
                 let ann_hits = bridge.search(&query_emb, ann_k);
                 if !ann_hits.is_empty() {
                     fuse_ann_hits(&mut hits, &ann_hits, min_score);
+                    hydrate_empty_hits(runtime, &ns, &mut hits).await;
                 }
             }
         }
@@ -1127,35 +1128,50 @@ struct ScoredHit {
     score: f32,
 }
 
-// ─── ANN fusion ─────────────────────────────────────────────────────────────
+// ─── ANN fusion (symmetric RRF) ─────────────────────────────────────────────
 
 const RRF_K: usize = 60;
 
+/// Fuse FTS and ANN results using symmetric Reciprocal Rank Fusion.
+///
+/// Both sources are converted to rank-based scores: `1/(k + rank)`.
+/// Documents appearing in both get the sum of their RRF contributions.
 fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_score: f32) {
-    let existing: HashSet<String> = fts_hits.iter().map(|h| h.id.clone()).collect();
+    // Build FTS rank map (1-indexed by current score order, which is pre-sorted)
+    let mut fts_ranks: HashMap<String, usize> = HashMap::new();
+    for (rank, hit) in fts_hits.iter().enumerate() {
+        fts_ranks.insert(hit.id.clone(), rank + 1);
+    }
 
-    // RRF boost for FTS hits that also appear in ANN results
-    let ann_ids: HashMap<String, usize> = ann_hits
+    // Build ANN rank map
+    let ann_ranks: HashMap<String, usize> = ann_hits
         .iter()
         .enumerate()
         .map(|(rank, (uuid, _))| (uuid.to_string(), rank + 1))
         .collect();
 
+    // Rescore FTS hits with symmetric RRF
     for hit in fts_hits.iter_mut() {
-        if let Some(&ann_rank) = ann_ids.get(&hit.id) {
-            let rrf_boost = 1.0 / (RRF_K + ann_rank) as f32;
-            hit.score += rrf_boost;
-        }
+        let fts_rrf = fts_ranks
+            .get(&hit.id)
+            .map(|&r| 1.0 / (RRF_K + r) as f32)
+            .unwrap_or(0.0);
+        let ann_rrf = ann_ranks
+            .get(&hit.id)
+            .map(|&r| 1.0 / (RRF_K + r) as f32)
+            .unwrap_or(0.0);
+        hit.score = fts_rrf + ann_rrf;
     }
 
-    // Inject ANN-only hits (semantic matches not found by FTS)
-    for (rank, (uuid, cosine)) in ann_hits.iter().enumerate() {
+    // Inject ANN-only hits
+    let existing: HashSet<String> = fts_ranks.keys().cloned().collect();
+    for (rank, (uuid, _cosine)) in ann_hits.iter().enumerate() {
         let id_str = uuid.to_string();
         if existing.contains(&id_str) {
             continue;
         }
         let rrf_score = 1.0 / (RRF_K + rank + 1) as f32;
-        if rrf_score < min_score && *cosine < min_score {
+        if rrf_score < min_score {
             continue;
         }
         fts_hits.push(ScoredHit {
@@ -1175,6 +1191,34 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_sc
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+}
+
+/// Hydrate ANN-only hits (empty slug/name) from the database.
+async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut [ScoredHit]) {
+    let sql = runtime.sql();
+    for hit in hits.iter_mut() {
+        if !hit.slug.is_empty() {
+            continue;
+        }
+        let mut reader = match sql.reader().await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let row = reader
+            .query_row(SqlStatement {
+                sql: "SELECT slug, name, description, tags, finalized FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                params: vec![SqlValue::Text(hit.id.clone()), SqlValue::Text(ns.to_owned())],
+                label: None,
+            })
+            .await;
+        if let Ok(Some(r)) = row {
+            hit.slug = row_str(&r, "slug").unwrap_or_default();
+            hit.name = row_str(&r, "name").unwrap_or_default();
+            hit.description = row_str(&r, "description");
+            hit.tags = row_str(&r, "tags");
+            hit.finalized = row_bool(&r, "finalized");
+        }
+    }
 }
 
 // ─── candidate (tokenized) ───────────────────────────────────────────────────

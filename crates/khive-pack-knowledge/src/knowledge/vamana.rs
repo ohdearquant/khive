@@ -21,7 +21,10 @@ pub(crate) fn new_shared() -> SharedAnn {
 }
 
 impl AnnBridge {
-    pub fn build(vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
+    pub fn build(mut vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
+        if dim == 0 {
+            return Err("dimension must be > 0".into());
+        }
         if vectors.is_empty() || id_map.is_empty() {
             return Err("no vectors to build ANN index from".into());
         }
@@ -33,13 +36,19 @@ impl AnnBridge {
                 n
             ));
         }
+        // L2→cosine conversion requires unit vectors; normalize before building.
+        for row in vectors.chunks_exact_mut(dim) {
+            l2_normalize(row);
+        }
         let cfg = VamanaConfig::with_dimensions(dim);
         let index = VamanaIndex::build(&vectors, cfg).map_err(|e| format!("{e}"))?;
         Ok(Self { index, id_map })
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(Uuid, f32)> {
-        match self.index.search(query, k) {
+        let mut q = query.to_vec();
+        l2_normalize(&mut q);
+        match self.index.search(&q, k) {
             Ok(results) => results
                 .into_iter()
                 .filter_map(|(idx, dist)| {
@@ -59,5 +68,14 @@ impl AnnBridge {
 
     pub fn num_vectors(&self) -> usize {
         self.index.num_vectors()
+    }
+}
+
+fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-8 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
     }
 }
