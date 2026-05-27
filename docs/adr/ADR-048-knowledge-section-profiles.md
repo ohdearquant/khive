@@ -27,63 +27,149 @@ sections than a lionagi lambda doing inference optimization. The profile system 
 resolve automatically based on the caller's identity — not require explicit profile naming
 in every call.
 
+### Entity kind amendment: `resource` (9th kind)
+
+Knowledge atoms, domains, skills, and tools are concrete resources that agents consume —
+distinct from abstract `concept` entities that model ideas and their relationships.
+ADR-001 is amended to add a 9th entity kind: **`resource`**.
+
+| Kind       | What it is                           | entity_type sub-classification           |
+| ---------- | ------------------------------------ | ---------------------------------------- |
+| `resource` | Actionable content agents consume    | atom, domain, skill, tool, template, prompt, runbook |
+
+The distinction from `concept`: a concept models "what IS it" (structural graph position,
+edges to other concepts, papers, projects). A resource models "how to USE it" (section-typed
+content, embeddings, composition weights). They link via `annotates`: resource annotates
+concept.
+
+Resources participate in the full graph — they can have edges, be traversed, appear in
+search results alongside concepts and documents. The knowledge pack creates resources
+(entity_type=atom, entity_type=domain) and manages their content in the `knowledge_atoms` /
+`knowledge_sections` tables. The entity row in `entities` gives them graph position; the
+content tables give them deep searchable content.
+
+### Sections as a dedicated table
+
+Sections are sub-records of resource/atom entities, stored in `knowledge_sections`:
+
+```sql
+CREATE TABLE knowledge_sections (
+    id          TEXT PRIMARY KEY,
+    atom_id     TEXT NOT NULL,
+    namespace   TEXT NOT NULL,
+    section_type TEXT NOT NULL,  -- closed enum: 10 values
+    heading     TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    tokens      INTEGER NOT NULL DEFAULT 0,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id)
+);
+```
+
+Section_type is a closed enum matching the atlas schema v1: `overview`, `core_model`,
+`boundary_conditions`, `formalism`, `operational_guidance`, `examples`, `failure_modes`,
+`expert_lens`, `references`, `other`.
+
+**Editing a section does not touch other sections.** `knowledge.edit(slug, sections=[...])`
+updates only the named section rows. Each section has its own embedding vector (re-embedded
+on edit, not the whole atom). The atom's own embedding (from description + keywords) is
+separate and only updates when the atom-level metadata changes.
+
+**Sections link to atoms structurally (FK), not via graph edges.** The section→atom
+relationship is always 1:N containment — there's no semantic edge type needed. All
+cross-entity connections for a section route through its parent atom's graph edges.
+
+### Embedding strategy (three levels)
+
+| Level | Source text | Standard length | Updates when |
+|---|---|---|---|
+| **Domain** | description + purpose + member slug prose | 100-200 tokens | domain metadata edited |
+| **Atom** | description (50-150 tok) + keywords as coherent sentences (50-100 tok) | 150-250 tokens | atom description/tags edited |
+| **Section** | section body content | up to 500 tokens (chunk if longer) | that section's content edited |
+
+The atom embedding captures "what is this about" for coarse retrieval. Section embeddings
+capture "what specifically does this say" for granular matching. Both use the dual-model
+default (all-minilm-l6-v2 + paraphrase-multilingual).
+
+Embedding text for atoms follows a standard template:
+
+```
+{name}. {description}. Keywords: {tag1}, {tag2}, {tag3}. Domain: {domain}.
+Related: {related_concept_1}, {related_concept_2}.
+```
+
+This produces consistent 150-250 token embedding inputs regardless of atom content length.
+
+### Audit trail: notes on graph edits
+
+Every `knowledge.edit` call creates an `observation` note annotating the atom:
+
+```
+create(kind="note", note_kind="observation",
+  content="Updated section:formalism — added convergence proof for entropic regularization",
+  annotates=["<atom-entity-id>"])
+```
+
+This gives a complete edit history queryable via the notes substrate. Graph traversal from
+an atom surfaces both its sections (content) and its edit history (notes).
+
 ### Scale: absorbing the lore corpus
 
-The atlas lore corpus has 342K atoms organized into 25K domains. The current knowledge
-pack tables (`knowledge_atoms`, `knowledge_domains`) with FTS5 + sqlite-vec are designed
-for this scale. The FTS5 trigram index handles substring matching over hundreds of
-thousands of rows efficiently. sqlite-vec uses brute-force cosine similarity — exact but
-O(n) per query.
+The atlas lore corpus has 342K atoms organized into 25K domains. With section-level
+embeddings (~5 sections per atom), the total vector count reaches ~2M rows across two
+embedding models. The FTS5 trigram index handles substring matching over millions of
+rows efficiently.
 
-At 342K atoms with two embedding models (all-minilm-l6-v2 at 384-dim + paraphrase at
-768-dim), the vector index reaches ~800K rows. Brute-force cosine at this scale is
-~50-100ms per query on Apple Silicon — acceptable for interactive use but a concern for
-batch composition pipelines.
+**Scaling roadmap** (DiskANN-informed, from RuVector `ruvector-diskann` research):
 
-The `khive-hnsw` crate (already in the workspace) provides approximate nearest-neighbor
-search at O(log n) per query. The RuVector ecosystem (120K-star Rust vector search
-library, partnership with lattice-inference) contains battle-tested implementations of
-DiskANN, GNN-based learned routing, RaBitQ quantization, and ACORN filtered HNSW that
-inform our architecture. **We do not depend on RuVector crates** — we study their
-algorithms and implement ourselves against khive's storage traits, except where a crate
-is pure math with clean dependencies.
+| Scale | What | Graph memory | PQ memory | Vectors | Query latency | Strategy |
+|---|---|---|---|---|---|---|
+| 342K atoms | Current corpus | 88MB | 16MB | 527MB (RAM) | <1ms | sqlite-vec brute force |
+| 2M sections | After section split | 512MB | 96MB | 3GB (RAM) | <5ms | khive-hnsw in-memory |
+| 10M atoms | Full lore absorption | 2.5GB | 480MB | 15GB (SSD) | <5ms | DiskANN: graph+PQ in RAM, vectors on SSD |
+| 100M sections | Multi-project corpus | 25GB | 4.8GB | 150GB (SSD) | <10ms | Sharded DiskANN + RaBitQ filtering |
 
-Key algorithms from RuVector research (source: `ruvector-gnn`, `ruvector-diskann`,
-`ruvector-rabitq`, `ruvector-acorn`):
+DiskANN's Vamana graph (bounded degree R=64, single layer) is SSD-friendly because
+neighbors are spatially local after alpha-robust pruning — unlike HNSW's multi-layer
+skip connections that cause random page faults. The integration path:
+
+1. **Now**: sqlite-vec brute force + FTS5 recall (2000 candidate pool). Works to ~2M vectors.
+2. **Medium term**: `khive-hnsw` in-memory index at startup. RaBitQ compressed fallback
+   for the full corpus (18MB per million vectors at D=384). ACORN over-connection for
+   filtered queries.
+3. **Long term**: Implement Vamana graph construction (from RuVector's algorithm, not as
+   dependency) in a new `khive-vamana` crate. PQ codes in memory, vectors on SSD via
+   mmap. The `khive-db` multi-backend federation (ADR-009) provides per-shard files.
+
+The practical bottleneck is embedding generation, not search. At 342K atoms with dual
+models, backfilling takes ~30 minutes on M-series. At 10M atoms, ~15 hours. Incremental
+indexing (`knowledge.index(ids=[...])`) is essential — only embed new/changed content.
+
+### RuVector algorithm reference (study, not dependency)
+
+The RuVector ecosystem (120K-star Rust vector search library, partnership with
+lattice-inference) contains battle-tested implementations that inform our architecture.
+**We do not depend on RuVector crates** — we study their algorithms and implement
+ourselves against khive's storage traits, except `ruvector-rabitq` which is pure math
+(rand + serde only).
+
+Key algorithms (source: `ruvector-gnn`, `ruvector-diskann`, `ruvector-rabitq`,
+`ruvector-acorn`):
 
 - **RaBitQ** (Gao & Long, SIGMOD 2024): 1-bit quantization via random rotation.
-  342K atom embeddings at D=384 compress from 527MB → 18MB. The `ruvector-rabitq`
-  crate has zero heavy dependencies (rand + serde only) and may be used directly.
+  342K embeddings at D=384 compress from 527MB → 18MB. May use crate directly.
 - **DiskANN/Vamana**: bounded-degree graph (R=64) with alpha-robust pruning.
-  Graph index is ~87MB for 342K atoms. Generation-counter visited set gives O(1)
-  clear between queries (no allocation per search).
+  SSD-friendly single-layer graph handles billions. Generation-counter visited
+  set gives O(1) clear between queries.
 - **ACORN** (Patel et al., SIGMOD 2024): filtered HNSW that maintains recall at
-  low selectivity by over-connecting the graph (gamma * M neighbors) and exploring
-  through non-matching nodes. Directly solves khive's filtered search problem
-  (e.g., "concepts where domain=attention AND status=implemented").
-- **GNN hierarchical search**: differentiable search through graph topology with
-  GRU-gated message passing and multi-head attention. Learns which entity
-  neighborhoods to prioritize per query type. The contrastive loss (InfoNCE) can
-  use khive's edge ontology as training signal. EWC (Elastic Weight Consolidation)
+  low selectivity by over-connecting the graph and exploring through non-matching nodes.
+- **GNN hierarchical search**: differentiable search with GRU-gated message passing.
+  InfoNCE contrastive loss can use khive's edge ontology as training signal. EWC
   prevents catastrophic forgetting as the graph grows.
 - **AdaptiveHotset**: LRU cache with decaying access counts (0.95 decay factor),
-  maps directly to hot/warm/cold tier promotion.
-
-Integration path (khive-native, not RuVector dependency):
-
-1. **Short term**: sqlite-vec brute-force handles 342K atoms. FTS5 recall provides the
-   candidate pool (2000 atoms); vector rerank only scores the top-N candidates, not the
-   full corpus. Dual embedding (minilm + paraphrase) already configured as defaults.
-2. **Medium term**: `khive-hnsw` builds an in-memory HNSW index at startup from the
-   vec tables. Query path becomes: FTS5 recall → HNSW rerank. RaBitQ-compressed
-   fallback index for the full corpus (18MB in memory). ACORN-style over-connection
-   for filtered search queries.
-3. **Long term**: Tiered indexing with access-frequency promotion (AdaptiveHotset
-   pattern). Hot tier: f32 HNSW. Warm tier: RaBitQ + rerank. Cold tier: sqlite-vec.
-   Brain profile feedback drives tier promotion — atoms that consistently score high
-   for active profiles stay hot. GNN learned routing replaces or augments the
-   Beta-posterior section weighting with a differentiable model that captures
-   query → section type → outcome relationships directly.
+  maps to hot/warm/cold tier promotion.
 
 ### Namespace injection: session-to-actor mapping
 
@@ -594,6 +680,99 @@ Agents can add, replace, or append to specific sections of an atom. The section
 manifest in `properties` is updated atomically. This enables agents to improve
 corpus quality during their normal workflow — after reading a paper, an agent can
 `knowledge.edit` the relevant atom's `formalism` section with new theorems.
+
+### 8. Hybrid retrieval pipeline
+
+All search paths fuse results from multiple channels via RRF:
+
+```
+query "attention pruning for inference"
+    │
+    ├── FTS5 (fts_knowledge trigram)    → atom candidates (2000 pool)
+    ├── FTS5 (fts_entities trigram)     → entity candidates
+    ├── FTS5 (fts_sections trigram)     → section candidates
+    ├── Vector search (atom embeddings)  → description+keyword similarity
+    ├── Vector search (section embeddings) → body content similarity
+    ├── Vector search (entity embeddings)  → existing entity search
+    │
+    └── RRF fusion (khive-fusion crate)
+        │
+        ├── section-level results (most granular, carry section_type)
+        ├── atom-level results (grouped sections, weighted by profile)
+        └── entity-level results (graph-connected, carry edge context)
+```
+
+Notes are also searchable — an `observation` note saying "this algorithm fails at
+batch sizes > 1024" surfaces alongside the entity/atom it annotates. The note's
+`annotates` edges connect it to the relevant graph context.
+
+Graph traversal enriches search results: when an entity appears in results, its
+immediate neighbors (via `neighbors`) provide context — related concepts, implementing
+projects, citing documents. This is the "graph retrieval" layer that pure vector search
+misses.
+
+### 9. Graph health and export
+
+**`knowledge.health`** verb — actionable diagnostic:
+
+```
+knowledge.health() → {
+  orphan_entities: [{id, name, kind}],        // 0 edges
+  dangling_edges: [{edge_id, source, target}], // target deleted
+  under_linked: [{id, name, kind, edge_count, min_required}],
+  direction_violations: [{edge_id, relation, source_kind, target_kind}],
+  missing_entity_type: [{id, name, kind}],     // project/resource without entity_type
+  total_entities: N,
+  total_edges: N,
+  avg_density: f64
+}
+```
+
+**`knowledge.export`** verb — version-controllable graph dump:
+
+```
+knowledge.export(format="jsonl") → writes to stdout or file:
+  // One line per entity, sorted by id for stable diffs
+  {"type":"entity","id":"...","kind":"concept","name":"...","properties":{...},"edges":[...]}
+  {"type":"entity","id":"...","kind":"resource","entity_type":"atom","name":"...","sections":[...]}
+  {"type":"note","id":"...","kind":"observation","content":"...","annotates":["..."]}
+```
+
+JSONL format diffs cleanly in git. The export includes edges inline with their source
+entity (no separate edge file). Import is idempotent — `knowledge.import` from an
+export file upserts by ID.
+
+### 10. Entity-atom-citation linking pattern
+
+The standard linking pattern between KG concepts, knowledge resources, and citations:
+
+```
+project "lattice-transport"
+    │ implements
+    ↓
+concept "Sinkhorn Algorithm"
+    ↑ annotates                    ↑ introduced_by
+    │                              │
+resource/atom "sinkhorn-algorithm" document "Cuturi 2013"
+    │ (section FK, not edge)
+    ├── section:overview
+    ├── section:core_model
+    ├── section:formalism
+    └── section:operational_guidance
+```
+
+Rules:
+- **project --implements--> concept**: code realizes algorithm
+- **resource --annotates--> concept**: resource provides actionable content about concept
+- **concept --introduced_by--> document**: concept was first described in this paper
+- **sections link to atoms via FK only**, not graph edges. All semantic connections
+  for a section route through its parent atom's graph edges.
+- **resource --introduced_by--> document**: the atom's content is sourced from this paper
+  (when the atom itself needs provenance, not just its concept)
+
+This avoids the combinatorial explosion of section-level edges while keeping the graph
+navigable. A query for "Sinkhorn implementation" finds the concept via graph search,
+follows `annotates` to the resource/atom, then reads the `operational_guidance` section.
 
 ## Consequences
 
