@@ -1,0 +1,20 @@
+[package]
+name = "khive-vamana"
+description = "Batch-built Vamana ANN index for pre-normalized vector search."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rayon = "1.10"
+memmap2 = "0.9"
+bytemuck = "1.16"
+rand = "0.8"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
