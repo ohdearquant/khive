@@ -711,22 +711,108 @@ immediate neighbors (via `neighbors`) provide context — related concepts, impl
 projects, citing documents. This is the "graph retrieval" layer that pure vector search
 misses.
 
-### 9. Graph health and export
+### 9. KG Lint — configurable graph hygiene rules
 
-**`knowledge.health`** verb — actionable diagnostic:
+The graph needs a linting system analogous to `clippy` for Rust or `eslint` for
+JavaScript. Static rules catch structural problems; configurable rules encode
+project-specific conventions. The output is machine-readable and actionable.
+
+**`knowledge.lint`** verb — run lint rules and report violations:
 
 ```
-knowledge.health() → {
-  orphan_entities: [{id, name, kind}],        // 0 edges
-  dangling_edges: [{edge_id, source, target}], // target deleted
-  under_linked: [{id, name, kind, edge_count, min_required}],
-  direction_violations: [{edge_id, relation, source_kind, target_kind}],
-  missing_entity_type: [{id, name, kind}],     // project/resource without entity_type
-  total_entities: N,
-  total_edges: N,
-  avg_density: f64
+knowledge.lint(rules?: [...], fix?: false, severity?: "warn") → {
+  violations: [
+    {
+      rule: "min-edge-density",
+      severity: "error",
+      entity_id: "abc123",
+      entity_name: "Sinkhorn Algorithm",
+      entity_kind: "concept",
+      message: "concept entity has 2 edges, minimum is 4",
+      suggestion: "Add instance_of, introduced_by, or competes_with edges",
+      auto_fixable: false
+    },
+    ...
+  ],
+  summary: {
+    total: N,
+    errors: N,
+    warnings: N,
+    fixed: N,    // when fix=true
+    by_rule: {"min-edge-density": 3, "orphan-entity": 1, ...}
+  },
+  stats: {
+    total_entities: N,
+    total_edges: N,
+    avg_density: f64,
+    entity_kinds: {"concept": N, "project": N, ...},
+    edge_relations: {"implements": N, "depends_on": N, ...}
+  }
 }
 ```
+
+**Built-in lint rules** (always available, severity configurable):
+
+| Rule ID | Default | What it checks |
+|---|---|---|
+| `orphan-entity` | error | Entities with 0 edges |
+| `dangling-edge` | error | Edges where source or target is soft-deleted |
+| `min-edge-density` | error | Entity below kind-specific minimum (concept ≥ 4, project ≥ 3, person ≥ 1) |
+| `direction-violation` | error | Edge where (source_kind, relation, target_kind) is not in the ADR-002 contract or pack EDGE_RULES |
+| `missing-entity-type` | warn | project/resource entity without `entity_type` in properties |
+| `missing-introduced-by` | warn | concept with `properties.type=paper` but no `introduced_by` edge |
+| `missing-implements` | warn | project entity with no `implements` edge to any concept |
+| `duplicate-name` | warn | Multiple entities of the same kind with identical names |
+| `superseded-not-marked` | warn | Entity with incoming `supersedes` edge but no `properties.status=deprecated` |
+| `concept-no-parent` | warn | concept with no `instance_of`, `extends`, or `variant_of` edge |
+| `paper-missing-metadata` | info | concept with type=paper missing authors/year/source in properties |
+| `low-weight-edge` | info | Edge with weight < 0.3 (possibly speculative) |
+| `note-no-annotates` | info | Note with no `annotates` edge |
+
+**Custom lint rules** (configurable via `knowledge.lint_config`):
+
+```
+knowledge.lint_config(rules=[
+  {
+    "id": "khive-crate-needs-adr",
+    "severity": "warn",
+    "description": "Every khive crate entity should link to at least one ADR entity",
+    "match": {"kind": "project", "properties.crate": {"$exists": true}},
+    "require": {"edge": {"relation": "implements", "target.properties.type": "adr"}}
+  },
+  {
+    "id": "retrieval-concept-needs-benchmark",
+    "severity": "info",
+    "description": "Retrieval domain concepts should have benchmark properties",
+    "match": {"kind": "concept", "properties.domain": "retrieval"},
+    "require": {"property": "benchmark"}
+  }
+])
+```
+
+The rule config is stored in `knowledge_atoms` as a domain-type resource (meta —
+the lint config is itself a knowledge artifact). Changes to lint rules are tracked
+as knowledge edits with observation notes.
+
+**Auto-fix** (`fix=true`): Some rules support auto-fix:
+- `dangling-edge` → soft-delete the edge
+- `duplicate-name` → propose merge (creates a `question` note, doesn't auto-merge)
+- `superseded-not-marked` → set `properties.status = "deprecated"`
+
+Non-fixable violations return `auto_fixable: false` with a `suggestion` string.
+
+**Integration with agent workflows**:
+
+Agents should run `knowledge.lint(severity="error")` after any batch KG operation
+(entity creation, edge wiring, polish). The `/kg-polish` skill already uses health
+checks — lint replaces and extends that surface. The lint result is structured for
+programmatic consumption: an orchestrator can dispatch fix agents per violation type.
+
+**State introspection** (`knowledge.lint(rules=["stats-only"])`):
+
+Returns only the `stats` section — entity/edge/note counts by kind, density
+histogram, relation distribution, property coverage. This is the "dashboard view"
+for understanding graph state without running any violation checks.
 
 **`knowledge.export`** verb — version-controllable graph dump:
 
@@ -881,9 +967,14 @@ Implement section posterior initialization from caller-provided priors.
 - Emit `brain.feedback` with `section_signals` map
 - ESS cap + decay ensures preferences stay adaptive
 
-### Phase 5: Graph health, export, observability
+### Phase 5: KG lint, export, observability
 
-- `knowledge.health` verb: orphans, dangling edges, direction violations, density
+- `knowledge.lint` verb: configurable rule engine for graph hygiene (§9). 13+ built-in
+  rules with severity levels. Custom rules via `knowledge.lint_config`. Auto-fix for
+  dangling edges, superseded-not-marked, duplicate proposals. Stats-only mode for
+  dashboard introspection.
+- `knowledge.lint_config` verb: CRUD for custom lint rules stored as knowledge atoms.
+  Rules specify match predicates + required properties/edges.
 - `knowledge.export` verb: JSONL format for git-diffable graph snapshots
 - `brain.diagnostics` verb: ESS per parameter, weight vector entropy, delta-mean
   over last N events, convergence trend
@@ -904,6 +995,202 @@ Every phase ships with benchmarks that gate merge:
 | 2 (Sections) | section edit does not alter sibling sections | property test |
 | 3 (Compose) | compose with implementer profile returns > 60% ops_guidance tokens | weight test |
 | 4 (Hooks) | end-to-end: compose → feedback → posterior shift | integration test |
+| 5 (Lint) | lint 1000 entities with 13 rules | < 500ms, zero false positives on clean graph |
+| 5 (Lint) | custom rule evaluation on 100 entities | < 50ms per rule |
+
+---
+
+## Amendment: Research-Informed Design Corrections (2026-05-27)
+
+**Authors**: Ocean, lambda:khive
+**Source**: 10 targeted ChatGPT research consultations (Q1-Q10), digested into KG as 17
+entities + 72 edges + 9 notes.
+
+### Correction 1: Normalized-Beta → Combinatorial TS (design-breaking)
+
+**Problem**: §4 Stage 4 specifies weight derivation as "Thompson sample from each
+Beta(α, β), then normalize to sum to 1." Research Q2 proves this has **Ω(T) linear
+regret** under a budgeted document composition objective. The normalized vector
+converges to `μ/Σμ` (proportional to means), but the optimal allocation under a fixed
+token budget is a vertex — put all weight on the highest-value section. The per-round
+regret gap is permanent and does not shrink with more data.
+
+**Fix — phased**:
+
+| Phase | Weight derivation | Why |
+|---|---|---|
+| Phase 1 (ship now) | `argmax` over sampled θ̃ᵢ with softmax temperature τ | Correct TS action for linear utility over simplex. τ controls exploration breadth. As τ→0, becomes pure exploit (vertex). As τ→∞, becomes uniform. |
+| Phase 3 (future) | Dirichlet-tree prior with 4-outcome feedback | Replaces Beta-Binomial entirely. Tree structure: root = positive/negative, children = strong/weak. Natural scalar utility derivation via `u⊤E[p]`. Conjugate, handles multi-outcome feedback without collapsing to binary. |
+
+**Phase 1 weight derivation (replaces §4 Step 4-5)**:
+
+```
+1. Sample θ̃ᵢ ~ Beta(αᵢ, βᵢ) for each section type i
+2. If exploration_epoch > 0:
+     wᵢ = softmax(θ̃ / τ)  where τ = τ₀ * (epoch / epoch_max)
+     # τ shrinks as epoch decreases → sharpens toward argmax
+   Else:
+     wᵢ = softmax(μᵢ / τ_exploit)  where μᵢ = αᵢ/(αᵢ+βᵢ), τ_exploit = 0.1
+     # Near-deterministic, heavily favors highest-mean section
+3. Apply weight floor: wᵢ = max(0.05, wᵢ), renormalize
+```
+
+The softmax-over-samples approach is standard in combinatorial TS literature (Combes et
+al. 2015). It preserves exploration when τ is large but converges to the optimal vertex
+allocation as τ→0. The weight floor prevents complete section starvation.
+
+**Phase 3 Dirichlet-tree storage (replaces §2 section_posteriors schema)**:
+
+```json
+{
+  "section_posteriors": {
+    "overview": {
+      "form": "dirichlet_tree",
+      "positive": {"strong": 1.0, "weak": 1.0},
+      "negative": {"strong": 1.0, "weak": 1.0},
+      "utility_vector": [1.0, 0.5, -0.2, -1.0]
+    }
+  }
+}
+```
+
+Until Phase 3, store as Beta(α, β) but compute weights via softmax, not normalization.
+
+### Correction 2: ESS cap implementation constraints
+
+**Problem**: Q1 reveals ESS capping is non-commutative — replaying events in different
+order produces different posteriors. This breaks event-sourced snapshot recovery.
+
+**Constraints added to Phase 1**:
+
+1. **Store posteriors as (m, s) canonical form**: `m = α/(α+β)`, `s = α+β`. Prevents
+   float drift across hundreds of updates. Convert back: `α = m*s`, `β = (1-m)*s`.
+2. **Snapshot stores `last_event_seq`**: replay from snapshot must process events in
+   strict sequence order. Out-of-order replay produces different posteriors.
+3. **ESS cap = 100** (not 50): half-life of ~140 feedback events. 50 was too aggressive
+   for sections that stabilize slowly (formalism, expert_lens). The research-derived
+   optimal: `C_opt ≈ 1/(2ε²)` where ε is acceptable mean-estimation error. For ε=0.07
+   (our target), C_opt ≈ 102.
+
+**V20 migration DDL (updated)**:
+
+```sql
+CREATE TABLE brain_profile_snapshots (
+    id           TEXT PRIMARY KEY,
+    profile_id   TEXT NOT NULL,
+    namespace    TEXT NOT NULL,
+    -- Posteriors stored as (mean, total_mass) pairs, not (alpha, beta)
+    state_json   TEXT NOT NULL,  -- {"section_posteriors": {"overview": {"m": 0.6, "s": 45.0}, ...}}
+    last_event_seq INTEGER NOT NULL DEFAULT 0,
+    exploration_epoch INTEGER NOT NULL DEFAULT 50,
+    created_at   INTEGER NOT NULL,
+    FOREIGN KEY (profile_id) REFERENCES brain_profiles(id)
+);
+
+CREATE TABLE brain_event_log (
+    id           TEXT PRIMARY KEY,
+    profile_id   TEXT NOT NULL,
+    namespace    TEXT NOT NULL,
+    event_seq    INTEGER NOT NULL,
+    event_kind   TEXT NOT NULL,    -- 'feedback', 'reset', 'merge', 'decay'
+    payload_json TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    FOREIGN KEY (profile_id) REFERENCES brain_profiles(id),
+    UNIQUE(profile_id, event_seq)
+);
+```
+
+### Correction 3: Filtered ANN — StitchedVamana, not ACORN
+
+**Problem**: §10 (scaling roadmap) and §Phase 0 reference ACORN for filtered queries.
+Q8 shows ACORN requires R≈768-1536 for 96 kind×domain filter combinations — a 12-24x
+regression on unfiltered search latency and memory. Not viable.
+
+**Fix**: Replace ACORN with FilteredVamana/StitchedVamana:
+
+```
+Old (§scaling roadmap, medium term):
+  "ACORN over-connection for filtered queries"
+
+New:
+  "StitchedVamana: per-predicate subgraph build + cross-partition stitching"
+```
+
+**StitchedVamana architecture** (from Filtered-DiskANN paper):
+
+1. Build per-label Vamana subgraphs: one for each entity_kind (8), one for each
+   domain (12). Each subgraph uses the global R=64 budget.
+2. Stitch: for each node, merge its subgraph neighbors with its global graph
+   neighbors. RobustPrune the combined set to R=64.
+3. Query: filtered greedy search starts from a label-valid entry point (not the
+   global medoid). Candidate expansion only follows edges to label-valid nodes.
+
+This keeps R=64 while maintaining >85% recall for selective predicates (kind+domain
+combinations). Memory overhead: ~20% over unfiltered graph (stitching edges are a
+subset of global candidates, not additive).
+
+**Updated scaling roadmap**:
+
+| Scale | Strategy |
+|---|---|
+| 342K atoms | sqlite-vec brute force + FTS5 (current) |
+| 2M sections | khive-vamana in-memory, StitchedVamana for filtered |
+| 10M atoms | DiskANN: graph+PQ in RAM, vectors on SSD via mmap |
+| 100M sections | Sharded DiskANN + RaBitQ + partition-index |
+
+### Correction 4: Embedding Drift Detection via lattice-transport
+
+**Problem**: When the base embedding model changes (new version of all-minilm-l6-v2, or
+switching models entirely), all stored embeddings are in the old space. The profile's
+learned preferences — section weights, expertise map, reranking — were calibrated against
+the old geometry. Without drift detection, the profile silently degrades. Content drift
+(KG entity updates) and behavioral drift (agent query pattern changes) are also undetected.
+
+**Fix**: Integrate `lattice-transport` (our OT crate) for three drift detection modes:
+
+| Scenario | Detector | Placement | Feed | Trigger |
+|---|---|---|---|---|
+| Model drift | `detect_drift_records` (batch) | Global, on model-change event | Sample of old vs re-embedded content | `wasserstein_distance > 0.3` for L2-normalized 384-dim |
+| Content drift | `OnlineDriftDetector` (streaming) | Per-model | Section embeddings from compose calls | Debiased Sinkhorn divergence exceeds threshold |
+| Behavioral drift | `detect_drift_records` (batch, periodic) | Per-profile, every ~50 sessions | Accumulated query embeddings | Wasserstein distance between windows |
+
+**Recalibration protocol — Transport Plan Warping**: On model drift detection, compute
+the OT transport plan T between old and new embedding distributions. Transfer learned
+preference weights from old entities to new entities proportional to T's sparse coupling
+entries (`SparseTransportPlan.entries[i].mass`). This preserves accumulated signal —
+preferred over reset-to-priors (loses all signal) and Wasserstein barycenter bridging
+(lattice-transport `barycenter` module is Unstable).
+
+**Performance budget**: `OnlineDriftDetector` at W=128, D=384 costs 1.18MB per instance
+(2 windows 393KB + 3 workspaces 786KB). Each check fires 3 Sinkhorn solves (debiased
+divergence), ~4.9M FP ops. At check_interval=16 and ~3 compose calls per session, fires
+roughly every 5 sessions — acceptable on M-series.
+
+**Known gap**: `MIN_ONLINE_DRIFT_WINDOW_SIZE = 128` (hardcoded in lattice-transport)
+blocks streaming behavioral drift at low query volumes. Reference window needs ~42 sessions
+at 3 queries/session to fill. Batch workaround is acceptable for Phase 1-2. Consider
+lowering the minimum or adding a separate low-volume detector in lattice-transport v0.3.
+
+**Cross-crate dependency**: Add `lattice-transport = "0.2.5"` to khive workspace deps.
+Integration point: `kkernel engine drift-check` stub (ADR-043 §5). Requires publishing
+lattice-transport 0.2.5 to crates.io (currently only 0.2.1 published).
+
+**Phase mapping**:
+- Phase 2: Model drift detection (batch, on model-change event)
+- Phase 3: Content drift detection (streaming OnlineDriftDetector in compose pipeline)
+- Phase 4: Behavioral drift detection + Transport Plan Warping recalibration
+- Phase 5+: Neural adapter invalidation on drift (ties to Q10 schema migration)
+
+### Non-changes (confirmed by research)
+
+| ADR-048 design | Research finding | Status |
+|---|---|---|
+| ParlayANN prefix-doubling build (Q3) | Confirmed as best Vamana parallelism strategy | No change |
+| Two-pass alpha (1.0 then 1.2) (Q4) | Confirmed; adaptive alpha is Phase 3 optimization | No change |
+| mmap + MADV_RANDOM for Phase 1 (Q10) | Confirmed for ≤1.5GB; io_uring for Phase 2 at 10M+ | No change |
+| AND-composition of lint rules (Q7) | Confirmed; auto-fix should NOT chain | No change |
+| ESS cap as primary temporal strategy (Q1) | Confirmed but as approximation, not principled posterior; combine with BOCD in Phase 2-3 | Deferred |
+| Binary feedback (Q9) | Under-specified; Dirichlet-tree recommended | Deferred to Phase 3 |
 
 ## References
 
