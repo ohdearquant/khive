@@ -69,6 +69,7 @@ fn build_full_registry() -> Vec<(String, String)> {
         default_namespace: khive_runtime::Namespace::parse("verb-contract-test")
             .unwrap_or_else(|_| khive_runtime::Namespace::local()),
         embedding_model: None,
+        additional_embedding_models: vec![],
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).expect("runtime for contract test");
