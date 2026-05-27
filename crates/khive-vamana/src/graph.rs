@@ -512,20 +512,35 @@ fn initial_random_adjacency(num_vectors: usize, max_degree: usize) -> Result<Vec
         return Err(VamanaError::EmptyInput);
     }
     let mut rng = StdRng::seed_from_u64(BUILD_SEED);
-    let n = num_vectors as u32;
+
+    // Use a partial Fisher-Yates shuffle over a candidate pool that excludes
+    // node `i` itself. This avoids the O(n²) worst-case of rejection sampling
+    // when `num_vectors` is close to `max_degree`.
+    //
+    // Build one shared pool [0..num_vectors), then for each node swap out its
+    // own index before sampling, and restore after. Because the function is
+    // single-threaded (uses a seeded RNG), this is deterministic.
+    let count = max_degree.min(num_vectors - 1);
+    let mut pool: Vec<u32> = (0..num_vectors as u32).collect();
 
     let adjacency: Vec<Vec<u32>> = (0..num_vectors)
         .map(|i| {
-            let count = max_degree.min(num_vectors - 1);
+            // Move i out of the active range by swapping with the last element.
+            let last = num_vectors - 1;
+            pool.swap(i, last);
+
+            // Partial Fisher-Yates over pool[0..last] (excludes i).
+            let available = last; // == num_vectors - 1
             let mut neighbors: Vec<u32> = Vec::with_capacity(count);
-            let mut attempts = 0usize;
-            while neighbors.len() < count && attempts < count * 4 {
-                let candidate = rng.gen_range(0..n);
-                if candidate != i as u32 && !neighbors.contains(&candidate) {
-                    neighbors.push(candidate);
-                }
-                attempts += 1;
+            for k in 0..count {
+                let j = rng.gen_range(k..available);
+                pool.swap(k, j);
+                neighbors.push(pool[k]);
             }
+
+            // Restore pool[i] so subsequent iterations see a full pool.
+            pool.swap(i, last);
+
             neighbors.sort_unstable();
             neighbors
         })

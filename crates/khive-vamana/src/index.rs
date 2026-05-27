@@ -160,7 +160,10 @@ impl VamanaIndex {
             )));
         }
 
-        let expected_len_f32 = meta.num_vectors * meta.dimensions;
+        let expected_len_f32 = meta
+            .num_vectors
+            .checked_mul(meta.dimensions)
+            .ok_or_else(|| VamanaError::invalid_format("metadata overflow".into()))?;
         let storage = mmap_vectors(&path.join("vectors.bin"), expected_len_f32)?;
 
         Ok(Self {

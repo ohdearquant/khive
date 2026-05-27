@@ -1,6 +1,6 @@
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "l2_squared requires equal-length slices");
+    debug_assert_eq!(a.len(), b.len(), "l2_squared requires equal-length slices");
 
     let mut s0 = 0.0f32;
     let mut s1 = 0.0f32;
@@ -89,8 +89,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "l2_squared requires equal-length slices")]
-    fn l2_squared_panics_on_length_mismatch() {
+    fn l2_squared_panics_on_length_mismatch_debug() {
         l2_squared(&[1.0], &[1.0, 2.0]);
     }
 }

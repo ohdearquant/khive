@@ -57,6 +57,7 @@ impl VamanaConfig {
     }
 
     pub fn with_dimensions(dimensions: usize) -> Self {
+        assert!(dimensions > 0, "dimensions must be > 0");
         Self {
             dimensions,
             ..Self::default()
@@ -185,6 +186,12 @@ mod tests {
             cfg.validate(),
             Err(VamanaError::InvalidConfig { .. })
         ));
+    }
+
+    #[test]
+    #[should_panic(expected = "dimensions must be > 0")]
+    fn with_dimensions_panics_on_zero() {
+        VamanaConfig::with_dimensions(0);
     }
 
     #[test]
