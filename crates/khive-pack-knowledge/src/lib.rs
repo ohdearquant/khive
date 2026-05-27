@@ -13,6 +13,10 @@
 //! - `knowledge.fold`            — budget-constrained knapsack selection (token budgeting)
 //! - `knowledge.search`          — TF-IDF + optional embedding rerank over the corpus
 //!
+//! **Section tier** (ADR-048 Phase 2):
+//! - `knowledge.edit`   — upsert sections for an atom (section-level, non-destructive)
+//! - `knowledge.import` — ingest atlas markdown files as atoms with parsed sections
+//!
 //! **Concept tier** (KG sugar):
 //! - `knowledge.learn`  — register a concept entity (commissive)
 //! - `knowledge.cite`   — link a concept to its source paper via `introduced_by`
@@ -44,7 +48,7 @@ impl Pack for KnowledgePack {
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
-static KNOWLEDGE_HANDLERS: [HandlerDef; 12] = [
+static KNOWLEDGE_HANDLERS: [HandlerDef; 14] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
@@ -267,6 +271,59 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 12] = [
             },
         ],
     },
+    // ── section tier (ADR-048 Phase 2) ───────────────────────────────────────
+    HandlerDef {
+        name: "knowledge.edit",
+        description: "Upsert sections for an atom without wiping other sections",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "string",
+                required: true,
+                description: "Atom UUID or slug to edit sections for",
+            },
+            ParamDef {
+                name: "sections",
+                param_type: "array<object>",
+                required: true,
+                description: "Sections to upsert: [{section_type, content, heading?, sort_order?}]",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "knowledge.import",
+        description: "Ingest atlas markdown file(s) as atoms with parsed sections",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "path",
+                param_type: "string",
+                required: true,
+                description: "Filesystem path to a markdown file or directory",
+            },
+            ParamDef {
+                name: "format",
+                param_type: "string",
+                required: false,
+                description: "Markdown format hint; only \"atlas_md\" supported (default)",
+            },
+            ParamDef {
+                name: "chunk_strategy",
+                param_type: "string",
+                required: false,
+                description: "\"section\" (one section per atom, default) or \"atom\" (entire file as one atom)",
+            },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Namespace to write into; defaults to caller namespace",
+            },
+        ],
+    },
     // ── concept tier (KG sugar) ───────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.learn",
@@ -426,6 +483,9 @@ impl PackRuntime for KnowledgePack {
             "knowledge.index" => KnowledgeHandlers::index(&self.runtime, token, params).await,
             "knowledge.fold" => KnowledgeHandlers::fold(&self.runtime, token, params).await,
             "knowledge.search" => KnowledgeHandlers::search(&self.runtime, token, params).await,
+            // section tier
+            "knowledge.edit" => KnowledgeHandlers::edit(&self.runtime, token, params).await,
+            "knowledge.import" => KnowledgeHandlers::import(&self.runtime, token, params).await,
             // concept tier
             "knowledge.learn" => self.handle_learn(token, params).await,
             "knowledge.cite" => self.handle_cite(token, params).await,
