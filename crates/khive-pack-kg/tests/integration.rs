@@ -4872,3 +4872,140 @@ async fn list_proposals_status_filter() {
         "#393 list-filter: withdrawn proposal {pid_withdrawn} must not appear in list(status=open); items: {list_open}"
     );
 }
+
+/// Negative path: withdraw on an applied proposal must fail.
+/// propose → approve (auto-applies) → withdraw → expect error mentioning "applied".
+#[tokio::test]
+async fn withdraw_after_apply_returns_error() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "withdraw-after-apply guard",
+                "description": "Applied proposals cannot be withdrawn",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    f.dispatch(
+        "review",
+        json!({ "proposal_id": pid, "decision": "approve" }),
+    )
+    .await
+    .expect("review(approve) must succeed");
+
+    let withdraw_result = f.dispatch("withdraw", json!({ "proposal_id": pid })).await;
+
+    assert!(
+        withdraw_result.is_err(),
+        "withdraw on applied proposal must fail; got: {withdraw_result:?}"
+    );
+    let err_msg = format!("{:?}", withdraw_result.unwrap_err());
+    assert!(
+        err_msg.contains("applied") || err_msg.contains("approved") || err_msg.contains("terminal"),
+        "error must mention terminal state; got: {err_msg}"
+    );
+}
+
+/// Negative path: review on a rejected proposal must fail.
+/// propose → reject → attempt second review → expect error mentioning "rejected".
+#[tokio::test]
+async fn review_after_reject_returns_error() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "review-after-reject guard",
+                "description": "Rejected proposals cannot be re-reviewed",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    f.dispatch(
+        "review",
+        json!({ "proposal_id": pid, "decision": "reject" }),
+    )
+    .await
+    .expect("review(reject) must succeed");
+
+    let second_review = f
+        .dispatch(
+            "review",
+            json!({ "proposal_id": pid, "decision": "approve" }),
+        )
+        .await;
+
+    assert!(
+        second_review.is_err(),
+        "review on rejected proposal must fail; got: {second_review:?}"
+    );
+    let err_msg = format!("{:?}", second_review.unwrap_err());
+    assert!(
+        err_msg.contains("rejected"),
+        "error must mention 'rejected'; got: {err_msg}"
+    );
+}
+
+/// CAS divergence: withdraw after concurrent approval.
+/// propose → approve (status moves to applied) → withdraw → CAS fails.
+/// This exercises the SQL-level CAS guard in `withdrawn_and_emit`:
+/// the precheck sees "open" but by the time CAS runs, status is "applied".
+///
+/// In practice with SQLite WAL mode, the approve+apply commits before the
+/// withdraw starts. This test verifies the CAS guard catches the terminal state.
+#[tokio::test]
+async fn withdraw_cas_divergence_after_approval() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "CAS divergence test",
+                "description": "Tests CAS guard when status shifts under us",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    // Approve moves status → approved → applied (inline apply worker).
+    f.dispatch(
+        "review",
+        json!({ "proposal_id": pid, "decision": "approve" }),
+    )
+    .await
+    .expect("review(approve) must succeed");
+
+    // Withdraw now — status is applied, CAS should reject.
+    let result = f.dispatch("withdraw", json!({ "proposal_id": pid })).await;
+    assert!(
+        result.is_err(),
+        "CAS divergence: withdraw must fail after approval; got: {result:?}"
+    );
+
+    // Verify the proposal is still "applied" (not corrupted by the failed withdraw).
+    let list = f
+        .dispatch("list", json!({ "kind": "proposal", "status": "applied" }))
+        .await
+        .expect("list must succeed");
+    let items = list.as_array().expect("must be array");
+    let found = items
+        .iter()
+        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid));
+    assert!(
+        found,
+        "CAS divergence: proposal must still be 'applied' after failed withdraw; items: {list}"
+    );
+}
