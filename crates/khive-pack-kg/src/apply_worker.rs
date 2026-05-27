@@ -512,7 +512,7 @@ mod tests {
 
     fn setup() -> (KhiveRuntime, NamespaceToken) {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let tok = rt.authorize(Namespace::local());
+        let tok = rt.authorize(Namespace::local()).unwrap();
         (rt, tok)
     }
 

@@ -20,7 +20,7 @@ fn rt() -> KhiveRuntime {
 #[tokio::test]
 async fn entity_create_and_get_roundtrip() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     let entity = rt
         .create_entity(
@@ -45,7 +45,7 @@ async fn entity_create_and_get_roundtrip() {
 #[tokio::test]
 async fn entity_create_with_properties_and_tags() {
     let rt = rt();
-    let research_tok = rt.authorize(Namespace::parse("research").unwrap());
+    let research_tok = rt.authorize(Namespace::parse("research").unwrap()).unwrap();
 
     let props = serde_json::json!({"domain": "fine-tuning", "type": "technique"});
     let entity = rt
@@ -69,7 +69,7 @@ async fn entity_create_with_properties_and_tags() {
 #[tokio::test]
 async fn entity_list_by_kind() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     rt.create_entity(&tok, "concept", None, "FlashAttention", None, None, vec![])
         .await
@@ -111,7 +111,7 @@ async fn entity_list_by_kind() {
 #[tokio::test]
 async fn entity_delete_soft() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     let entity = rt
         .create_entity(&tok, "concept", None, "to-delete", None, None, vec![])
@@ -129,7 +129,7 @@ async fn entity_delete_soft() {
 #[tokio::test]
 async fn entity_count_by_kind() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     for _ in 0..3 {
         rt.create_entity(&tok, "concept", None, "concept-X", None, None, vec![])
@@ -158,7 +158,7 @@ async fn entity_count_by_kind() {
 #[tokio::test]
 async fn link_and_neighbors() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     let lora = rt
         .create_entity(&tok, "concept", None, "LoRA", None, None, vec![])
@@ -185,7 +185,7 @@ async fn link_and_neighbors() {
 #[tokio::test]
 async fn traverse_multi_hop() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     let a = rt
         .create_entity(&tok, "concept", None, "A", None, None, vec![])
@@ -237,7 +237,7 @@ async fn traverse_multi_hop() {
 #[tokio::test]
 async fn create_note_and_list_notes() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     rt.create_note(
         &tok,
@@ -290,7 +290,7 @@ async fn create_note_and_list_notes() {
 #[tokio::test]
 async fn create_all_note_kinds() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
     for kind in [
         "observation",
         "insight",
@@ -313,7 +313,7 @@ async fn create_all_note_kinds() {
 #[tokio::test]
 async fn query_via_gql() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     // Set up entities and edges
     let lora = rt
@@ -350,8 +350,8 @@ async fn query_via_gql() {
 #[tokio::test]
 async fn namespace_isolation() {
     let rt = rt();
-    let ns_a_tok = rt.authorize(Namespace::parse("ns-a").unwrap());
-    let ns_b_tok = rt.authorize(Namespace::parse("ns-b").unwrap());
+    let ns_a_tok = rt.authorize(Namespace::parse("ns-a").unwrap()).unwrap();
+    let ns_b_tok = rt.authorize(Namespace::parse("ns-b").unwrap()).unwrap();
 
     rt.create_entity(&ns_a_tok, "concept", None, "EntityA", None, None, vec![])
         .await
@@ -382,7 +382,7 @@ async fn namespace_isolation() {
 #[tokio::test]
 async fn create_entity_indexes_into_text_search() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
     let entity = rt
         .create_entity(
             &tok,
@@ -409,7 +409,7 @@ async fn create_entity_indexes_into_text_search() {
 async fn create_entity_no_embedding_model_does_not_propagate_vector_error() {
     // KhiveRuntime::memory() has embedding_model: None — vector indexing is silently skipped.
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
     let result = rt
         .create_entity(
             &tok,
@@ -435,7 +435,7 @@ async fn create_entity_no_embedding_model_does_not_propagate_vector_error() {
 #[tokio::test]
 async fn hybrid_search_excludes_soft_deleted_entities() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
     let entity = rt
         .create_entity(
             &tok,
@@ -475,7 +475,7 @@ async fn hybrid_search_excludes_soft_deleted_entities() {
 #[tokio::test]
 async fn hybrid_search_excludes_hard_deleted_entities() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
     let entity = rt
         .create_entity(
             &tok,
@@ -518,7 +518,7 @@ async fn list_notes_excludes_soft_deleted() {
     use khive_storage::types::DeleteMode;
 
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
     let note = rt
         .create_note(
             &tok,
@@ -571,7 +571,7 @@ async fn file_backed_runtime_persists() {
             additional_embedding_models: vec![],
         };
         let rt = KhiveRuntime::new(config).unwrap();
-        let tok = rt.authorize(Namespace::local());
+        let tok = rt.authorize(Namespace::local()).unwrap();
         rt.create_entity(&tok, "concept", None, "Persistent", None, None, vec![])
             .await
             .unwrap();
@@ -589,7 +589,7 @@ async fn file_backed_runtime_persists() {
             additional_embedding_models: vec![],
         };
         let rt = KhiveRuntime::new(config).unwrap();
-        let tok = rt.authorize(Namespace::local());
+        let tok = rt.authorize(Namespace::local()).unwrap();
         let entities = rt.list_entities(&tok, None, None, 50, 0).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "Persistent");
@@ -609,7 +609,7 @@ async fn file_backed_runtime_persists() {
 #[tokio::test]
 async fn synthetic_edge_observed_as_selected_returns_memory_note() {
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
     let ns = "local";
 
     // Step 1: create a memory note (the observed entity).
@@ -706,7 +706,7 @@ async fn update_edge_returns_surviving_canonical_id_on_conflict() {
     use khive_runtime::EdgePatch;
 
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     let a = rt
         .create_entity(&tok, "concept", None, "SurvA", None, None, vec![])
@@ -799,7 +799,7 @@ async fn update_edge_canonical_orientation_conflict() {
     use khive_runtime::EdgePatch;
 
     let rt = rt();
-    let tok = rt.authorize(Namespace::local());
+    let tok = rt.authorize(Namespace::local()).unwrap();
 
     let a = rt
         .create_entity(&tok, "concept", None, "CanOrA", None, None, vec![])

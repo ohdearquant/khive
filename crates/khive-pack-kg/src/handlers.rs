@@ -3874,7 +3874,7 @@ mod tests {
         use khive_runtime::KhiveRuntime;
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let token = rt.authorize(khive_runtime::Namespace::local());
+        let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
         let src_val = rt
             .create_entity(&token, "concept", None, "ConceptA", None, None, vec![])

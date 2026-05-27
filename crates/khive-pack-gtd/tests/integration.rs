@@ -225,7 +225,7 @@ async fn complete_rejects_non_task_notes() {
     let runtime = rt();
     let note = runtime
         .create_note(
-            &runtime.authorize(Namespace::local()),
+            &runtime.authorize(Namespace::local()).unwrap(),
             "observation",
             None,
             "hello",
@@ -349,7 +349,7 @@ async fn assign_creates_depends_on_edge_between_tasks() {
     let blocker_uuid = uuid::Uuid::parse_str(blocker_full).unwrap();
 
     let graph = rt
-        .graph(&rt.authorize(Namespace::local()))
+        .graph(&rt.authorize(Namespace::local()).unwrap())
         .expect("graph store");
     let neighbors = graph
         .neighbors(
@@ -383,7 +383,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
     // the task is never persisted (ADR-030: no failure after successful write).
     let other = rt
         .create_note(
-            &rt.authorize(Namespace::local()),
+            &rt.authorize(Namespace::local()).unwrap(),
             "observation",
             None,
             "an observation",
@@ -410,7 +410,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
 
     // Atomicity: the rejected `assign` must not leave a task row behind.
     let notes = rt
-        .notes(&rt.authorize(Namespace::local()))
+        .notes(&rt.authorize(Namespace::local()).unwrap())
         .expect("note store");
     let task_page = notes
         .query_notes(
@@ -1168,7 +1168,7 @@ async fn complete_sets_properties_status_to_done() {
         .await
         .expect("complete must succeed");
 
-    let token = rt.authorize(khive_runtime::Namespace::local());
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
     let note = rt
         .notes(&token)
         .expect("note store")
@@ -1896,7 +1896,9 @@ async fn next_resolves_deps_older_than_500_task_window() {
     use serde_json::json;
 
     let runtime = rt();
-    let token = runtime.authorize(khive_runtime::Namespace::local());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
     let note_store = runtime.notes(&token).expect("note store");
 
     // Create a blocker task with `done` status directly in storage, timestamped

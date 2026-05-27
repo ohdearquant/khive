@@ -177,10 +177,10 @@ impl KhiveMcpServer {
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace.as_str());
         // ADR-035: wire the EventStore into the registry for audit persistence.
-        if let Ok(event_store) =
-            runtime.events(&runtime.authorize(khive_runtime::Namespace::local()))
-        {
-            builder.with_event_store(event_store);
+        if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
+            if let Ok(event_store) = runtime.events(&tok) {
+                builder.with_event_store(event_store);
+            }
         }
         if let Err(load_err) = PackRegistry::register_packs(packs, runtime.clone(), &mut builder) {
             let failure = match load_err {

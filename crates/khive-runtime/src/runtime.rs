@@ -3,7 +3,7 @@
 use std::sync::{Arc, RwLock};
 
 use khive_db::StorageBackend;
-use khive_gate::{ActorRef, AllowAllGate, GateRef};
+use khive_gate::{ActorRef, AllowAllGate, GateRef, GateRequest};
 use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
 use khive_types::{EdgeEndpointRule, Namespace};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
@@ -452,12 +452,43 @@ impl KhiveRuntime {
 
     /// Mint an authorization token for the given namespace.
     ///
-    /// This is the official OSS API for obtaining a [`NamespaceToken`]. In
-    /// local / single-user mode (the default) this always succeeds — there is
-    /// no multi-tenant gate to consult. Multi-tenant deployments replace the
-    /// gate with a policy-backed impl; this method would then enforce it.
-    pub fn authorize(&self, ns: Namespace) -> NamespaceToken {
-        NamespaceToken::mint_authorized(ns, ActorRef::anonymous())
+    /// Consults the configured [`Gate`] before minting. With the default
+    /// `AllowAllGate` this always succeeds. When a real policy-backed gate is
+    /// installed, this method enforces it and returns `PermissionDenied` on
+    /// denial.
+    pub fn authorize(&self, ns: Namespace) -> RuntimeResult<NamespaceToken> {
+        let actor = ActorRef::anonymous();
+        let req = GateRequest::new(
+            actor.clone(),
+            ns.clone(),
+            "authorize",
+            serde_json::Value::Null,
+        );
+        match self.config.gate.check(&req) {
+            Ok(ref decision) if decision.is_allow() => {
+                if let khive_gate::GateDecision::Allow { ref obligations } = decision {
+                    if !obligations.is_empty() {
+                        tracing::debug!(
+                            namespace = %ns.as_str(),
+                            "authorize: obligations={:?}",
+                            obligations
+                        );
+                    }
+                }
+                Ok(NamespaceToken::mint_authorized(ns, actor))
+            }
+            Ok(khive_gate::GateDecision::Deny { reason }) => {
+                Err(crate::RuntimeError::PermissionDenied {
+                    verb: "authorize".to_string(),
+                    reason,
+                })
+            }
+            Ok(_) => Err(crate::RuntimeError::PermissionDenied {
+                verb: "authorize".to_string(),
+                reason: "gate denied".to_string(),
+            }),
+            Err(e) => Err(crate::RuntimeError::Internal(format!("gate error: {e}"))),
+        }
     }
 
     /// Install the pack-aggregated edge endpoint rules (ADR-031).
