@@ -415,12 +415,49 @@ impl KhiveMcpServer {
 
         match mode {
             ExecutionMode::Single | ExecutionMode::Parallel => {
+                // Write-key conflict preflight (ADR-038 Part 2).
+                //
+                // Detect ops that target the same write key in the same parallel/single
+                // batch. Per ADR-038, conflicting ops receive per-op error entries;
+                // non-conflicting ops execute normally.  `results.length == summary.total`
+                // is preserved (ADR-016 contract).
+                let conflict_indices: std::collections::HashSet<usize> = {
+                    let mut seen: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    let mut bad: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
+                    for (i, op) in ops.iter().enumerate() {
+                        for key in khive_request::write_keys_for_op_pub(op) {
+                            if let Some(&prior) = seen.get(&key) {
+                                bad.insert(prior);
+                                bad.insert(i);
+                            } else {
+                                seen.insert(key, i);
+                            }
+                        }
+                    }
+                    bad
+                };
+
                 // Independent dispatch — run all concurrently, results in input order.
                 let futures = ops.into_iter().enumerate().map(|(i, op)| {
+                    let conflict_with: Option<String> = if conflict_indices.contains(&i) {
+                        Some(format!(
+                            "conflict: writes overlap with another op in this batch (op #{})",
+                            i
+                        ))
+                    } else {
+                        None
+                    };
+
                     let registry = self.registry.clone();
                     let op_mode = mode_for_op(i);
                     async move {
                         let tool = op.tool.clone();
+                        // ADR-038: conflicting ops get a per-op error; skip dispatch.
+                        if let Some(msg) = conflict_with {
+                            return json!({ "ok": false, "tool": tool, "error": msg });
+                        }
                         // ADR-045 §6: AlwaysVerbose verbs override the caller's mode.
                         let effective_mode =
                             if registry.presentation_policy_for(&tool)

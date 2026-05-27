@@ -34,6 +34,7 @@ fn integration_random_1000x384_recall_at_10_at_least_80_percent() {
 }
 
 #[test]
+#[ignore] // ~60s on CI; run with `cargo test --ignored`
 fn benchmark_random_5000x384_recall_at_10_at_least_85_percent() {
     let n = 5000usize;
     let dim = 384usize;

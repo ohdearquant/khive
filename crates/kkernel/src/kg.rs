@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ── Subcommand tree ────────────────────────────────────────────────────────────
 
@@ -52,7 +52,7 @@ pub struct ValidateArgs {
     #[arg(long)]
     pub quiet: bool,
 
-    /// Override the default `.khive/kg/rules.yaml` path.
+    /// Override the default `.khive/kg/rules.toml` path.
     #[arg(long)]
     pub rules: Option<PathBuf>,
 
@@ -176,7 +176,7 @@ fn cmd_validate(args: ValidateArgs) -> Result<()> {
     let entities = count_ndjson_lines(&entities_path).unwrap_or(0);
     let edges = count_ndjson_lines(&edges_path).unwrap_or(0);
 
-    let rules_path = args.rules.unwrap_or_else(|| kg_dir.join("rules.yaml"));
+    let rules_path = args.rules.unwrap_or_else(|| kg_dir.join("rules.toml"));
 
     // Run structural checks (ADR-020 built-ins).
     let mut rule_results: Vec<RuleResult> = structural_checks(&entities_path, &edges_path);
@@ -407,16 +407,229 @@ fn check_referential_integrity(entities_path: &Path, edges_path: &Path) -> RuleR
     }
 }
 
+// ── Configurable rule loader (issue #382, ADR-034) ────────────────────────────
+
+/// A single configurable lint rule loaded from `rules.toml`.
+///
+/// Rules are checked against entities and edges in the KG. Each rule has:
+/// - `id`        — unique identifier (used in `RuleResult.id`)
+/// - `severity`  — "error" | "warning" | "info"
+/// - `kind`      — "entity" | "edge" (what substrate the rule applies to)
+/// - `condition` — a `key=value` equality predicate evaluated against each record
+///
+/// Example `rules.toml`:
+/// ```toml
+/// [[rules]]
+/// id = "concept-must-have-description"
+/// severity = "warning"
+/// kind = "entity"
+/// # field=value predicate: entity.kind must equal "concept"
+/// condition = "kind=concept"
+/// # require_field: the entity must have a non-empty value for this field
+/// require_field = "description"
+/// message = "Concept entities must have a description"
+///
+/// [[rules]]
+/// id = "no-self-loops"
+/// severity = "error"
+/// kind = "edge"
+/// condition = "source_id=target_id"
+/// message = "Edges must not be self-loops"
+/// ```
+#[derive(Debug, Deserialize)]
+struct RuleConfig {
+    /// Unique rule ID.
+    id: String,
+    /// Severity: "error", "warning", or "info".
+    #[serde(default = "default_severity")]
+    severity: String,
+    /// Substrate: "entity" or "edge".
+    kind: String,
+    /// `field=value` filter: only records where `record[field] == value` are checked.
+    /// Use `source_id=target_id` (literal string) for the special self-loop sentinel.
+    condition: Option<String>,
+    /// When set, the rule fails for any record (passing the condition filter)
+    /// that has an empty or absent value for this field.
+    require_field: Option<String>,
+    /// Human-readable violation message template. `{id}` is replaced with the
+    /// record's `id` field when present.
+    #[serde(default)]
+    message: String,
+}
+
+fn default_severity() -> String {
+    "warning".to_owned()
+}
+
+/// Top-level structure of a `rules.toml` file.
+#[derive(Debug, Deserialize)]
+struct RulesFile {
+    #[serde(default)]
+    rules: Vec<RuleConfig>,
+}
+
+fn severity_static(s: &str) -> &'static str {
+    match s {
+        "error" => "error",
+        "info" => "info",
+        _ => "warning",
+    }
+}
+
+/// Load and evaluate configurable rules from a TOML rules file (issue #382).
+///
+/// Supports `.toml` files directly. For `.yaml` / `.yml` files the function
+/// returns an error directing the user to use TOML format, as `serde_yaml` is
+/// not a workspace dependency.
+///
+/// Rule evaluation:
+/// 1. Parse the TOML file into a `RulesFile` containing a `Vec<RuleConfig>`.
+/// 2. For each rule, load the appropriate NDJSON file (entities or edges).
+/// 3. Apply the `condition` filter (field=value equality or self-loop sentinel).
+/// 4. For `require_field` rules, collect violations where the field is absent/empty.
+/// 5. Return one `RuleResult` per rule.
 fn configurable_rule_checks(
-    _entities_path: &Path,
-    _edges_path: &Path,
-    _rules_path: &Path,
+    entities_path: &Path,
+    edges_path: &Path,
+    rules_path: &Path,
 ) -> Result<Vec<RuleResult>> {
-    // Rules.yaml loading and evaluation is deferred to the runtime library
-    // (ADR-034 §10 specifies schema validation with exit code 2). This stub
-    // returns no additional results when the rules file is present but the
-    // rule-evaluation runtime hasn't loaded it yet.
-    Ok(Vec::new())
+    // Extension-based format routing.
+    let ext = rules_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if matches!(ext, "yaml" | "yml") {
+        bail!(
+            "rules file {:?} uses YAML format which is not supported in this build. \
+             Rename it to {}.toml and use TOML format instead.",
+            rules_path,
+            rules_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("rules")
+        );
+    }
+
+    let content = std::fs::read_to_string(rules_path)
+        .with_context(|| format!("read rules file {}", rules_path.display()))?;
+
+    let rules_file: RulesFile = toml::from_str(&content)
+        .with_context(|| format!("parse rules TOML {}", rules_path.display()))?;
+
+    let mut results = Vec::with_capacity(rules_file.rules.len());
+    for rule in &rules_file.rules {
+        let path = match rule.kind.as_str() {
+            "entity" => entities_path,
+            "edge" => edges_path,
+            other => {
+                // Unknown kind — emit an error rule result.
+                results.push(RuleResult {
+                    id: rule.id.clone(),
+                    severity: "error",
+                    passed: false,
+                    violations: vec![Violation {
+                        entity_id: None,
+                        entity_name: None,
+                        entity_kind: None,
+                        rule_id: rule.id.clone(),
+                        severity: "error",
+                        message: format!(
+                            "Rule {:?}: unknown kind {other:?}; must be \"entity\" or \"edge\"",
+                            rule.id
+                        ),
+                        fixable: false,
+                    }],
+                });
+                continue;
+            }
+        };
+
+        let violations = evaluate_rule(rule, path);
+        let sev = severity_static(&rule.severity);
+        results.push(RuleResult {
+            id: rule.id.clone(),
+            severity: sev,
+            passed: violations.is_empty(),
+            violations,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Evaluate a single `RuleConfig` against an NDJSON file.
+fn evaluate_rule(rule: &RuleConfig, path: &Path) -> Vec<Violation> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    // Parse the condition: "field=value" or the sentinel "source_id=target_id".
+    let condition: Option<(&str, &str)> = rule.condition.as_deref().and_then(|c| c.split_once('='));
+
+    let sev = severity_static(&rule.severity);
+    let mut violations = Vec::new();
+
+    for line in content.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(val) => val,
+            Err(_) => continue,
+        };
+
+        // Apply condition filter.
+        if let Some((field, expected)) = condition {
+            // Special sentinel: "source_id=target_id" means check for self-loops.
+            if field == "source_id" && expected == "target_id" {
+                let src = v.get("source_id").and_then(|s| s.as_str()).unwrap_or("");
+                let tgt = v.get("target_id").and_then(|s| s.as_str()).unwrap_or("");
+                if src == tgt {
+                    // Self-loop detected — always a violation for this rule type.
+                    violations.push(Violation {
+                        entity_id: Some(src.to_owned()),
+                        entity_name: None,
+                        entity_kind: v
+                            .get("relation")
+                            .and_then(|r| r.as_str())
+                            .map(str::to_owned),
+                        rule_id: rule.id.clone(),
+                        severity: sev,
+                        message: rule.message.replace("{id}", src),
+                        fixable: false,
+                    });
+                }
+                continue;
+            }
+
+            // Normal field=value filter: only proceed for records where field matches.
+            let actual = v.get(field).and_then(|f| f.as_str()).unwrap_or("");
+            if actual != expected {
+                continue;
+            }
+        }
+
+        // require_field check: the record must have a non-empty value for this field.
+        if let Some(req) = rule.require_field.as_deref() {
+            let val = v.get(req).and_then(|f| f.as_str()).unwrap_or("");
+            if val.is_empty() {
+                let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                violations.push(Violation {
+                    entity_id: if id.is_empty() {
+                        None
+                    } else {
+                        Some(id.to_owned())
+                    },
+                    entity_name: v.get("name").and_then(|n| n.as_str()).map(str::to_owned),
+                    entity_kind: v.get("kind").and_then(|k| k.as_str()).map(str::to_owned),
+                    rule_id: rule.id.clone(),
+                    severity: sev,
+                    message: rule.message.replace("{id}", id),
+                    fixable: false,
+                });
+            }
+        }
+    }
+
+    violations
 }
 
 fn apply_fixes(repo: &Path) -> Result<()> {
@@ -896,6 +1109,174 @@ mod tests {
 
         let content = std::fs::read_to_string(&toml_path).unwrap();
         assert_eq!(content, "# custom\n", "should not overwrite existing toml");
+    }
+
+    // ── configurable_rule_checks (issue #382) ─────────────────────────────────
+
+    #[test]
+    fn configurable_rule_checks_empty_rules_file_returns_no_results() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+
+        let rules_path = tmp.path().join("rules.toml");
+        // Valid TOML with empty rules array.
+        std::fs::write(&rules_path, "rules = []\n").unwrap();
+
+        let results = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &rules_path,
+        )
+        .unwrap();
+        assert!(results.is_empty(), "no rules → no results");
+    }
+
+    #[test]
+    fn configurable_rule_checks_require_field_detects_missing_description() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+
+        // One entity with description, one without.
+        let entities = r#"{"id":"aaa1","kind":"concept","name":"A","description":"has one"}
+{"id":"aaa2","kind":"concept","name":"B"}
+"#;
+        std::fs::write(kg_dir.join("entities.ndjson"), entities).unwrap();
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+
+        let rules_toml = r#"
+[[rules]]
+id = "concept-must-have-description"
+severity = "warning"
+kind = "entity"
+condition = "kind=concept"
+require_field = "description"
+message = "Concept {id} missing description"
+"#;
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(&rules_path, rules_toml).unwrap();
+
+        let results = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &rules_path,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.id, "concept-must-have-description");
+        assert!(
+            !r.passed,
+            "rule should fail when a concept lacks description"
+        );
+        assert_eq!(r.violations.len(), 1);
+        assert_eq!(r.violations[0].entity_id.as_deref(), Some("aaa2"));
+    }
+
+    #[test]
+    fn configurable_rule_checks_self_loop_sentinel_detects_loop() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        // One self-loop edge, one valid edge.
+        let edges = r#"{"source_id":"aaaaaaaa-0000-0000-0000-000000000001","target_id":"aaaaaaaa-0000-0000-0000-000000000001","relation":"extends"}
+{"source_id":"aaaaaaaa-0000-0000-0000-000000000001","target_id":"bbbbbbbb-0000-0000-0000-000000000002","relation":"extends"}
+"#;
+        std::fs::write(kg_dir.join("edges.ndjson"), edges).unwrap();
+
+        let rules_toml = r#"
+[[rules]]
+id = "no-self-loops"
+severity = "error"
+kind = "edge"
+condition = "source_id=target_id"
+message = "Self-loop detected on {id}"
+"#;
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(&rules_path, rules_toml).unwrap();
+
+        let results = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &rules_path,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert!(!r.passed);
+        assert_eq!(r.violations.len(), 1, "exactly one self-loop");
+    }
+
+    #[test]
+    fn configurable_rule_checks_yaml_extension_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+
+        let rules_path = tmp.path().join("rules.yaml");
+        std::fs::write(&rules_path, "rules: []\n").unwrap();
+
+        let result = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &rules_path,
+        );
+        assert!(result.is_err(), "YAML extension must return an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("YAML") || msg.contains("toml"),
+            "error message should mention TOML: {msg}"
+        );
+    }
+
+    #[test]
+    fn configurable_rule_checks_unknown_kind_produces_error_result() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+
+        let rules_toml = r#"
+[[rules]]
+id = "bad-kind"
+severity = "error"
+kind = "note"
+condition = "kind=concept"
+require_field = "description"
+message = "bad"
+"#;
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(&rules_path, rules_toml).unwrap();
+
+        let results = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &rules_path,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].passed);
+        assert_eq!(results[0].severity, "error");
     }
 
     #[test]
