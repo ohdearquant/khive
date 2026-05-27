@@ -33,9 +33,9 @@ Knowledge atoms, domains, skills, and tools are concrete resources that agents c
 distinct from abstract `concept` entities that model ideas and their relationships.
 ADR-001 is amended to add a 9th entity kind: **`resource`**.
 
-| Kind       | What it is                           | entity_type sub-classification           |
-| ---------- | ------------------------------------ | ---------------------------------------- |
-| `resource` | Actionable content agents consume    | atom, domain, skill, tool, template, prompt, runbook |
+| Kind       | What it is                        | entity_type sub-classification                       |
+| ---------- | --------------------------------- | ---------------------------------------------------- |
+| `resource` | Actionable content agents consume | atom, domain, skill, tool, template, prompt, runbook |
 
 The distinction from `concept`: a concept models "what IS it" (structural graph position,
 edges to other concepts, papers, projects). A resource models "how to USE it" (section-typed
@@ -83,11 +83,11 @@ cross-entity connections for a section route through its parent atom's graph edg
 
 ### Embedding strategy (three levels)
 
-| Level | Source text | Standard length | Updates when |
-|---|---|---|---|
-| **Domain** | description + purpose + member slug prose | 100-200 tokens | domain metadata edited |
-| **Atom** | description (50-150 tok) + keywords as coherent sentences (50-100 tok) | 150-250 tokens | atom description/tags edited |
-| **Section** | section body content | up to 500 tokens (chunk if longer) | that section's content edited |
+| Level       | Source text                                                            | Standard length                    | Updates when                  |
+| ----------- | ---------------------------------------------------------------------- | ---------------------------------- | ----------------------------- |
+| **Domain**  | description + purpose + member slug prose                              | 100-200 tokens                     | domain metadata edited        |
+| **Atom**    | description (50-150 tok) + keywords as coherent sentences (50-100 tok) | 150-250 tokens                     | atom description/tags edited  |
+| **Section** | section body content                                                   | up to 500 tokens (chunk if longer) | that section's content edited |
 
 The atom embedding captures "what is this about" for coarse retrieval. Section embeddings
 capture "what specifically does this say" for granular matching. Both use the dual-model
@@ -124,12 +124,12 @@ rows efficiently.
 
 **Scaling roadmap** (DiskANN-informed, from RuVector `ruvector-diskann` research):
 
-| Scale | What | Graph memory | PQ memory | Vectors | Query latency | Strategy |
-|---|---|---|---|---|---|---|
-| 342K atoms | Current corpus | 88MB | 16MB | 527MB (RAM) | <1ms | sqlite-vec brute force |
-| 2M sections | After section split | 512MB | 96MB | 3GB (RAM) | <5ms | khive-hnsw in-memory |
-| 10M atoms | Full lore absorption | 2.5GB | 480MB | 15GB (SSD) | <5ms | DiskANN: graph+PQ in RAM, vectors on SSD |
-| 100M sections | Multi-project corpus | 25GB | 4.8GB | 150GB (SSD) | <10ms | Sharded DiskANN + RaBitQ filtering |
+| Scale         | What                 | Graph memory | PQ memory | Vectors     | Query latency | Strategy                                 |
+| ------------- | -------------------- | ------------ | --------- | ----------- | ------------- | ---------------------------------------- |
+| 342K atoms    | Current corpus       | 88MB         | 16MB      | 527MB (RAM) | <1ms          | sqlite-vec brute force                   |
+| 2M sections   | After section split  | 512MB        | 96MB      | 3GB (RAM)   | <5ms          | khive-hnsw in-memory                     |
+| 10M atoms     | Full lore absorption | 2.5GB        | 480MB     | 15GB (SSD)  | <5ms          | DiskANN: graph+PQ in RAM, vectors on SSD |
+| 100M sections | Multi-project corpus | 25GB         | 4.8GB     | 150GB (SSD) | <10ms         | Sharded DiskANN + RaBitQ filtering       |
 
 DiskANN's Vamana graph (bounded degree R=64, single layer) is SSD-friendly because
 neighbors are spatially local after alpha-robust pruning — unlike HNSW's multi-layer
@@ -198,7 +198,10 @@ sessions) but works for single-user local dev.
 A future MCP protocol extension could carry caller context in the request envelope:
 
 ```json
-{"tool": "request", "args": {"ops": "...", "_context": {"actor": "lambda:khive", "session": "abc123"}}}
+{
+  "tool": "request",
+  "args": { "ops": "...", "_context": { "actor": "lambda:khive", "session": "abc123" } }
+}
 ```
 
 The server would use `_context.actor` for brain resolution and `_context.session` for
@@ -259,9 +262,9 @@ This enum is stored in the atom's `properties` JSON as a section manifest:
 ```json
 {
   "sections": [
-    {"type": "overview", "heading": "Overview", "offset": 0, "tokens": 85},
-    {"type": "core_model", "heading": "Core Model", "offset": 312, "tokens": 210},
-    {"type": "operational_guidance", "heading": "Implementation", "offset": 1024, "tokens": 340}
+    { "type": "overview", "heading": "Overview", "offset": 0, "tokens": 85 },
+    { "type": "core_model", "heading": "Core Model", "offset": 312, "tokens": 210 },
+    { "type": "operational_guidance", "heading": "Implementation", "offset": 1024, "tokens": 340 }
   ],
   "profile": "computational_engineering"
 }
@@ -274,13 +277,13 @@ is metadata, not a new column.
 The `profile` field maps to one of five atom profiles that determine default section
 selection (from the atlas taxonomy):
 
-| AtomProfile                  | Default sections                                                        |
-| ---------------------------- | ----------------------------------------------------------------------- |
-| `formal_mathematical`        | overview, core_model, formalism, examples, failure_modes, expert_lens   |
-| `mechanistic_empirical`      | overview, core_model, boundary_conditions, examples, failure_modes, expert_lens |
-| `computational_engineering`  | overview, core_model, formalism, operational_guidance, examples, failure_modes, expert_lens |
-| `institutional_decision`     | overview, core_model, boundary_conditions, operational_guidance, examples, failure_modes, expert_lens |
-| `interpretive_historical`    | overview, core_model, examples, failure_modes, expert_lens              |
+| AtomProfile                 | Default sections                                                                                      |
+| --------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `formal_mathematical`       | overview, core_model, formalism, examples, failure_modes, expert_lens                                 |
+| `mechanistic_empirical`     | overview, core_model, boundary_conditions, examples, failure_modes, expert_lens                       |
+| `computational_engineering` | overview, core_model, formalism, operational_guidance, examples, failure_modes, expert_lens           |
+| `institutional_decision`    | overview, core_model, boundary_conditions, operational_guidance, examples, failure_modes, expert_lens |
+| `interpretive_historical`   | overview, core_model, examples, failure_modes, expert_lens                                            |
 
 ### 2. Section posteriors in brain profiles
 
@@ -290,14 +293,14 @@ Profiles of this kind maintain per-section-type Beta posteriors:
 ```json
 {
   "section_posteriors": {
-    "overview":              {"alpha": 2.0, "beta": 2.0},
-    "core_model":            {"alpha": 4.0, "beta": 2.0},
-    "boundary_conditions":   {"alpha": 2.0, "beta": 3.0},
-    "formalism":             {"alpha": 1.5, "beta": 4.0},
-    "operational_guidance":  {"alpha": 6.0, "beta": 1.5},
-    "examples":              {"alpha": 5.0, "beta": 2.0},
-    "failure_modes":         {"alpha": 3.0, "beta": 2.0},
-    "expert_lens":           {"alpha": 3.0, "beta": 2.0}
+    "overview": { "alpha": 2.0, "beta": 2.0 },
+    "core_model": { "alpha": 4.0, "beta": 2.0 },
+    "boundary_conditions": { "alpha": 2.0, "beta": 3.0 },
+    "formalism": { "alpha": 1.5, "beta": 4.0 },
+    "operational_guidance": { "alpha": 6.0, "beta": 1.5 },
+    "examples": { "alpha": 5.0, "beta": 2.0 },
+    "failure_modes": { "alpha": 3.0, "beta": 2.0 },
+    "expert_lens": { "alpha": 3.0, "beta": 2.0 }
   }
 }
 ```
@@ -409,6 +412,7 @@ Attribution happens at two points:
 
 When the agent calls `knowledge.compose` and the response includes sections, then
 within the next N tool calls (N=5 window), if the agent:
+
 - Writes code that references concepts from `operational_guidance` → that section is "useful"
 - Quotes text from `formalism` in a message → that section is "useful"
 - Ignores `boundary_conditions` entirely (no reference in 5 turns) → "not_useful"
@@ -511,6 +515,7 @@ a new exploration epoch.
 
 The result: an implementer profile that has learned `operational_guidance=0.82,
 formalism=0.21` will:
+
 - Prefer atoms rich in operational guidance sections
 - Within those atoms, lead with the guidance sections
 - Truncate formalism sections first when budget is tight
@@ -540,13 +545,13 @@ brain.bind(actor="*", namespace="*", consumer_kind="knowledge_compose", profile_
 
 Resolution is longest-match-wins (most specific actor > less specific > wildcard):
 
-| Session context | Hook sets actor to | Resolves to |
-| --- | --- | --- |
-| khive implementer subagent | `lambda:khive:implementer` | `khive-impl-v1` (exact compound match) |
-| khive session, no role | `lambda:khive` | `khive-knowledge-v1` (project match) |
-| lionagi theorist subagent | `lambda:lionagi:theorist` | `lionagi-theory-v1` (exact compound match) |
-| unknown project, implementer | `local:implementer` | `impl-knowledge-v1` (role match) |
-| completely generic | `local` | `balanced-knowledge-v1` (wildcard) |
+| Session context              | Hook sets actor to         | Resolves to                                |
+| ---------------------------- | -------------------------- | ------------------------------------------ |
+| khive implementer subagent   | `lambda:khive:implementer` | `khive-impl-v1` (exact compound match)     |
+| khive session, no role       | `lambda:khive`             | `khive-knowledge-v1` (project match)       |
+| lionagi theorist subagent    | `lambda:lionagi:theorist`  | `lionagi-theory-v1` (exact compound match) |
+| unknown project, implementer | `local:implementer`        | `impl-knowledge-v1` (role match)           |
+| completely generic           | `local`                    | `balanced-knowledge-v1` (wildcard)         |
 
 Each profile learns independently. The khive implementer's posteriors reflect what
 khive implementation work needs. The lionagi theorist's posteriors reflect what
@@ -621,14 +626,14 @@ The hooks form a three-stage pipeline:
 
 **Failure modes and mitigations**:
 
-| Failure mode | Consequence | Mitigation |
-| --- | --- | --- |
-| Hook A doesn't fire (no actor_context) | Compose uses wildcard profile | Acceptable fallback; balanced profile still works |
-| Hook B doesn't fire (no buffer) | No feedback for this session | Posterior unchanged; no harm, just slower learning |
-| Hook C misattributes usage | Wrong section gets "useful"/"not_useful" | Beta priors dampen noise; needs ~5 consistent wrong signals to shift by 0.1 |
-| Session crashes (no deferred attribution) | Buffer is orphaned | Cron job cleans buffers older than 24h; immediate attribution still fires |
-| Two concurrent sessions write same actor | Race on actor_context file | Per-session actor file keyed by session_id (not shared path) |
-| Agent explicitly calls brain.feedback too | Double-counting | Dedup by event_id in compose buffer; same event_id → skip hook feedback |
+| Failure mode                              | Consequence                              | Mitigation                                                                  |
+| ----------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------- |
+| Hook A doesn't fire (no actor_context)    | Compose uses wildcard profile            | Acceptable fallback; balanced profile still works                           |
+| Hook B doesn't fire (no buffer)           | No feedback for this session             | Posterior unchanged; no harm, just slower learning                          |
+| Hook C misattributes usage                | Wrong section gets "useful"/"not_useful" | Beta priors dampen noise; needs ~5 consistent wrong signals to shift by 0.1 |
+| Session crashes (no deferred attribution) | Buffer is orphaned                       | Cron job cleans buffers older than 24h; immediate attribution still fires   |
+| Two concurrent sessions write same actor  | Race on actor_context file               | Per-session actor file keyed by session_id (not shared path)                |
+| Agent explicitly calls brain.feedback too | Double-counting                          | Dedup by event_id in compose buffer; same event_id → skip hook feedback     |
 
 **Smart attribution heuristics**:
 
@@ -753,21 +758,21 @@ knowledge.lint(rules?: [...], fix?: false, severity?: "warn") → {
 
 **Built-in lint rules** (always available, severity configurable):
 
-| Rule ID | Default | What it checks |
-|---|---|---|
-| `orphan-entity` | error | Entities with 0 edges |
-| `dangling-edge` | error | Edges where source or target is soft-deleted |
-| `min-edge-density` | error | Entity below kind-specific minimum (concept ≥ 4, project ≥ 3, person ≥ 1) |
-| `direction-violation` | error | Edge where (source_kind, relation, target_kind) is not in the ADR-002 contract or pack EDGE_RULES |
-| `missing-entity-type` | warn | project/resource entity without `entity_type` in properties |
-| `missing-introduced-by` | warn | concept with `properties.type=paper` but no `introduced_by` edge |
-| `missing-implements` | warn | project entity with no `implements` edge to any concept |
-| `duplicate-name` | warn | Multiple entities of the same kind with identical names |
-| `superseded-not-marked` | warn | Entity with incoming `supersedes` edge but no `properties.status=deprecated` |
-| `concept-no-parent` | warn | concept with no `instance_of`, `extends`, or `variant_of` edge |
-| `paper-missing-metadata` | info | concept with type=paper missing authors/year/source in properties |
-| `low-weight-edge` | info | Edge with weight < 0.3 (possibly speculative) |
-| `note-no-annotates` | info | Note with no `annotates` edge |
+| Rule ID                  | Default | What it checks                                                                                    |
+| ------------------------ | ------- | ------------------------------------------------------------------------------------------------- |
+| `orphan-entity`          | error   | Entities with 0 edges                                                                             |
+| `dangling-edge`          | error   | Edges where source or target is soft-deleted                                                      |
+| `min-edge-density`       | error   | Entity below kind-specific minimum (concept ≥ 4, project ≥ 3, person ≥ 1)                         |
+| `direction-violation`    | error   | Edge where (source_kind, relation, target_kind) is not in the ADR-002 contract or pack EDGE_RULES |
+| `missing-entity-type`    | warn    | project/resource entity without `entity_type` in properties                                       |
+| `missing-introduced-by`  | warn    | concept with `properties.type=paper` but no `introduced_by` edge                                  |
+| `missing-implements`     | warn    | project entity with no `implements` edge to any concept                                           |
+| `duplicate-name`         | warn    | Multiple entities of the same kind with identical names                                           |
+| `superseded-not-marked`  | warn    | Entity with incoming `supersedes` edge but no `properties.status=deprecated`                      |
+| `concept-no-parent`      | warn    | concept with no `instance_of`, `extends`, or `variant_of` edge                                    |
+| `paper-missing-metadata` | info    | concept with type=paper missing authors/year/source in properties                                 |
+| `low-weight-edge`        | info    | Edge with weight < 0.3 (possibly speculative)                                                     |
+| `note-no-annotates`      | info    | Note with no `annotates` edge                                                                     |
 
 **Custom lint rules** (configurable via `knowledge.lint_config`):
 
@@ -795,6 +800,7 @@ the lint config is itself a knowledge artifact). Changes to lint rules are track
 as knowledge edits with observation notes.
 
 **Auto-fix** (`fix=true`): Some rules support auto-fix:
+
 - `dangling-edge` → soft-delete the edge
 - `duplicate-name` → propose merge (creates a `question` note, doesn't auto-merge)
 - `superseded-not-marked` → set `properties.status = "deprecated"`
@@ -848,6 +854,7 @@ resource/atom "sinkhorn-algorithm" document "Cuturi 2013"
 ```
 
 Rules:
+
 - **project --implements--> concept**: code realizes algorithm
 - **resource --annotates--> concept**: resource provides actionable content about concept
 - **concept --introduced_by--> document**: concept was first described in this paper
@@ -915,6 +922,7 @@ insert/delete).
 - **No PQ at 342K**: 526MB fits in RAM. PQ config field present but disabled until 2M+.
 
 Files:
+
 - `crates/khive-vamana/src/{lib,config,distance,graph,index}.rs` — core implementation
 - `crates/khive-pack-knowledge/src/knowledge/vamana.rs` — ~150 LOC bridge
 
@@ -985,18 +993,18 @@ Implement section posterior initialization from caller-provided priors.
 
 Every phase ships with benchmarks that gate merge:
 
-| Phase | Benchmark | Pass criteria |
-|---|---|---|
-| 0 (Vamana) | recall@10 on 5K/384d random dataset | ≥ 85% |
-| 0 (Vamana) | build time for 342K × 384d | < 180s on M-series |
-| 0 (Vamana) | query latency at 342K (single query) | < 5ms p99 |
-| 1 (Brain) | profile save/load round-trip | snapshot == restored state |
-| 1 (Brain) | ESS cap convergence: 200 events then 200 opposing | mean shifts by ≥ 0.3 |
-| 2 (Sections) | section edit does not alter sibling sections | property test |
-| 3 (Compose) | compose with implementer profile returns > 60% ops_guidance tokens | weight test |
-| 4 (Hooks) | end-to-end: compose → feedback → posterior shift | integration test |
-| 5 (Lint) | lint 1000 entities with 13 rules | < 500ms, zero false positives on clean graph |
-| 5 (Lint) | custom rule evaluation on 100 entities | < 50ms per rule |
+| Phase        | Benchmark                                                          | Pass criteria                                |
+| ------------ | ------------------------------------------------------------------ | -------------------------------------------- |
+| 0 (Vamana)   | recall@10 on 5K/384d random dataset                                | ≥ 85%                                        |
+| 0 (Vamana)   | build time for 342K × 384d                                         | < 180s on M-series                           |
+| 0 (Vamana)   | query latency at 342K (single query)                               | < 5ms p99                                    |
+| 1 (Brain)    | profile save/load round-trip                                       | snapshot == restored state                   |
+| 1 (Brain)    | ESS cap convergence: 200 events then 200 opposing                  | mean shifts by ≥ 0.3                         |
+| 2 (Sections) | section edit does not alter sibling sections                       | property test                                |
+| 3 (Compose)  | compose with implementer profile returns > 60% ops_guidance tokens | weight test                                  |
+| 4 (Hooks)    | end-to-end: compose → feedback → posterior shift                   | integration test                             |
+| 5 (Lint)     | lint 1000 entities with 13 rules                                   | < 500ms, zero false positives on clean graph |
+| 5 (Lint)     | custom rule evaluation on 100 entities                             | < 50ms per rule                              |
 
 ---
 
@@ -1017,10 +1025,10 @@ regret gap is permanent and does not shrink with more data.
 
 **Fix — phased**:
 
-| Phase | Weight derivation | Why |
-|---|---|---|
-| Phase 1 (ship now) | `argmax` over sampled θ̃ᵢ with softmax temperature τ | Correct TS action for linear utility over simplex. τ controls exploration breadth. As τ→0, becomes pure exploit (vertex). As τ→∞, becomes uniform. |
-| Phase 3 (future) | Dirichlet-tree prior with 4-outcome feedback | Replaces Beta-Binomial entirely. Tree structure: root = positive/negative, children = strong/weak. Natural scalar utility derivation via `u⊤E[p]`. Conjugate, handles multi-outcome feedback without collapsing to binary. |
+| Phase              | Weight derivation                                   | Why                                                                                                                                                                                                                        |
+| ------------------ | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Phase 1 (ship now) | `argmax` over sampled θ̃ᵢ with softmax temperature τ | Correct TS action for linear utility over simplex. τ controls exploration breadth. As τ→0, becomes pure exploit (vertex). As τ→∞, becomes uniform.                                                                         |
+| Phase 3 (future)   | Dirichlet-tree prior with 4-outcome feedback        | Replaces Beta-Binomial entirely. Tree structure: root = positive/negative, children = strong/weak. Natural scalar utility derivation via `u⊤E[p]`. Conjugate, handles multi-outcome feedback without collapsing to binary. |
 
 **Phase 1 weight derivation (replaces §4 Step 4-5)**:
 
@@ -1046,8 +1054,8 @@ allocation as τ→0. The weight floor prevents complete section starvation.
   "section_posteriors": {
     "overview": {
       "form": "dirichlet_tree",
-      "positive": {"strong": 1.0, "weak": 1.0},
-      "negative": {"strong": 1.0, "weak": 1.0},
+      "positive": { "strong": 1.0, "weak": 1.0 },
+      "negative": { "strong": 1.0, "weak": 1.0 },
       "utility_vector": [1.0, 0.5, -0.2, -1.0]
     }
   }
@@ -1131,12 +1139,12 @@ subset of global candidates, not additive).
 
 **Updated scaling roadmap**:
 
-| Scale | Strategy |
-|---|---|
-| 342K atoms | sqlite-vec brute force + FTS5 (current) |
-| 2M sections | khive-vamana in-memory, StitchedVamana for filtered |
-| 10M atoms | DiskANN: graph+PQ in RAM, vectors on SSD via mmap |
-| 100M sections | Sharded DiskANN + RaBitQ + partition-index |
+| Scale         | Strategy                                            |
+| ------------- | --------------------------------------------------- |
+| 342K atoms    | sqlite-vec brute force + FTS5 (current)             |
+| 2M sections   | khive-vamana in-memory, StitchedVamana for filtered |
+| 10M atoms     | DiskANN: graph+PQ in RAM, vectors on SSD via mmap   |
+| 100M sections | Sharded DiskANN + RaBitQ + partition-index          |
 
 ### Correction 4: Embedding Drift Detection via lattice-transport
 
@@ -1148,11 +1156,11 @@ the old geometry. Without drift detection, the profile silently degrades. Conten
 
 **Fix**: Integrate `lattice-transport` (our OT crate) for three drift detection modes:
 
-| Scenario | Detector | Placement | Feed | Trigger |
-|---|---|---|---|---|
-| Model drift | `detect_drift_records` (batch) | Global, on model-change event | Sample of old vs re-embedded content | `wasserstein_distance > 0.3` for L2-normalized 384-dim |
-| Content drift | `OnlineDriftDetector` (streaming) | Per-model | Section embeddings from compose calls | Debiased Sinkhorn divergence exceeds threshold |
-| Behavioral drift | `detect_drift_records` (batch, periodic) | Per-profile, every ~50 sessions | Accumulated query embeddings | Wasserstein distance between windows |
+| Scenario         | Detector                                 | Placement                       | Feed                                  | Trigger                                                |
+| ---------------- | ---------------------------------------- | ------------------------------- | ------------------------------------- | ------------------------------------------------------ |
+| Model drift      | `detect_drift_records` (batch)           | Global, on model-change event   | Sample of old vs re-embedded content  | `wasserstein_distance > 0.3` for L2-normalized 384-dim |
+| Content drift    | `OnlineDriftDetector` (streaming)        | Per-model                       | Section embeddings from compose calls | Debiased Sinkhorn divergence exceeds threshold         |
+| Behavioral drift | `detect_drift_records` (batch, periodic) | Per-profile, every ~50 sessions | Accumulated query embeddings          | Wasserstein distance between windows                   |
 
 **Recalibration protocol — Transport Plan Warping**: On model drift detection, compute
 the OT transport plan T between old and new embedding distributions. Transfer learned
@@ -1176,6 +1184,7 @@ Integration point: `kkernel engine drift-check` stub (ADR-043 §5). Requires pub
 lattice-transport 0.2.5 to crates.io (currently only 0.2.1 published).
 
 **Phase mapping**:
+
 - Phase 2: Model drift detection (batch, on model-change event)
 - Phase 3: Content drift detection (streaming OnlineDriftDetector in compose pipeline)
 - Phase 4: Behavioral drift detection + Transport Plan Warping recalibration
@@ -1183,14 +1192,14 @@ lattice-transport 0.2.5 to crates.io (currently only 0.2.1 published).
 
 ### Non-changes (confirmed by research)
 
-| ADR-048 design | Research finding | Status |
-|---|---|---|
-| ParlayANN prefix-doubling build (Q3) | Confirmed as best Vamana parallelism strategy | No change |
-| Two-pass alpha (1.0 then 1.2) (Q4) | Confirmed; adaptive alpha is Phase 3 optimization | No change |
-| mmap + MADV_RANDOM for Phase 1 (Q10) | Confirmed for ≤1.5GB; io_uring for Phase 2 at 10M+ | No change |
-| AND-composition of lint rules (Q7) | Confirmed; auto-fix should NOT chain | No change |
-| ESS cap as primary temporal strategy (Q1) | Confirmed but as approximation, not principled posterior; combine with BOCD in Phase 2-3 | Deferred |
-| Binary feedback (Q9) | Under-specified; Dirichlet-tree recommended | Deferred to Phase 3 |
+| ADR-048 design                            | Research finding                                                                         | Status              |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------- |
+| ParlayANN prefix-doubling build (Q3)      | Confirmed as best Vamana parallelism strategy                                            | No change           |
+| Two-pass alpha (1.0 then 1.2) (Q4)        | Confirmed; adaptive alpha is Phase 3 optimization                                        | No change           |
+| mmap + MADV_RANDOM for Phase 1 (Q10)      | Confirmed for ≤1.5GB; io_uring for Phase 2 at 10M+                                       | No change           |
+| AND-composition of lint rules (Q7)        | Confirmed; auto-fix should NOT chain                                                     | No change           |
+| ESS cap as primary temporal strategy (Q1) | Confirmed but as approximation, not principled posterior; combine with BOCD in Phase 2-3 | Deferred            |
+| Binary feedback (Q9)                      | Under-specified; Dirichlet-tree recommended                                              | Deferred to Phase 3 |
 
 ## References
 
