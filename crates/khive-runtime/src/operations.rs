@@ -3280,10 +3280,14 @@ mod tests {
         store.upsert_entity(entity_a).await.unwrap();
         store.upsert_entity(entity_b).await.unwrap();
 
-        let result = rt.resolve_prefix(&tok, "aabbccdd").await;
+        let err = rt.resolve_prefix(&tok, "aabbccdd").await.unwrap_err();
         assert!(
-            result.is_err(),
-            "shared 8-char prefix must return Ambiguous error"
+            matches!(
+                err,
+                RuntimeError::AmbiguousPrefix { ref prefix, ref matches }
+                    if prefix == "aabbccdd" && matches.len() == 2
+            ),
+            "shared 8-char prefix must return AmbiguousPrefix; got {err:?}"
         );
     }
 

@@ -91,8 +91,11 @@ struct RecallParams {
     score_floor: Option<f32>,
     #[serde(default)]
     embedding_model: Option<String>,
-    /// When "verbose", include per-component score breakdown in each result.
-    /// Does not affect non-verbose (agent-mode) shape.
+    /// Include per-component score breakdown in each result.
+    #[serde(default)]
+    include_breakdown: Option<bool>,
+
+    /// Deprecated alias for pre-#482 clients. Prefer include_breakdown.
     #[serde(default)]
     presentation: Option<String>,
     /// Entity names to boost in scoring. Memories containing these names
@@ -444,7 +447,79 @@ fn fuse_candidates(
         .collect()
 }
 
+/// Break a recall query into individual search terms for FTS fanout.
+///
+/// Splits on whitespace and common punctuation, lowercases, deduplicates, and
+/// drops empty tokens. This turns a multi-word query into individual FTS5
+/// MATCH probes so that notes containing ANY single term enter the candidate
+/// pool — whereas a plain conjunction MATCH only returns notes containing ALL
+/// terms.
+fn recall_text_terms(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut terms: Vec<String> = query
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | '?' | '!' | ';' | ':' | '(' | ')'))
+        .map(|t| {
+            t.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|t| !t.is_empty() && seen.insert(t.clone()))
+        .collect();
+    terms.truncate(10);
+    terms
+}
+
 impl MemoryPack {
+    /// Issue #288: term-fanout FTS search for recall candidates.
+    ///
+    /// Breaks the query into individual terms and issues one FTS5 MATCH probe
+    /// per term. Deduplicates by note id, keeping the best rank, and truncates
+    /// to `candidate_limit`. This ensures notes partially matching the query
+    /// appear in `text_candidates` instead of being excluded by the AND
+    /// conjunction semantics of a single-query Plain MATCH.
+    async fn collect_recall_text_hits(
+        &self,
+        token: &NamespaceToken,
+        query: &str,
+        ns: &str,
+        candidate_limit: u32,
+    ) -> Result<Vec<TextSearchHit>, RuntimeError> {
+        let terms = recall_text_terms(query);
+        let searcher = self.runtime.text_for_notes(token)?;
+        let mut by_id: HashMap<Uuid, TextSearchHit> = HashMap::new();
+
+        for term in terms {
+            let hits = searcher
+                .search(TextSearchRequest {
+                    query: term,
+                    mode: TextQueryMode::Plain,
+                    filter: Some(TextFilter {
+                        namespaces: vec![ns.to_string()],
+                        kinds: vec![SubstrateKind::Note],
+                        ..TextFilter::default()
+                    }),
+                    top_k: candidate_limit,
+                    snippet_chars: 200,
+                })
+                .await?;
+
+            for hit in hits {
+                by_id
+                    .entry(hit.subject_id)
+                    .and_modify(|old| {
+                        if hit.rank < old.rank {
+                            *old = hit.clone();
+                        }
+                    })
+                    .or_insert(hit);
+            }
+        }
+
+        let mut hits: Vec<_> = by_id.into_values().collect();
+        hits.sort_by_key(|h| h.rank);
+        hits.truncate(candidate_limit as usize);
+        Ok(hits)
+    }
+
     async fn collect_recall_candidates(
         &self,
         query: &str,
@@ -459,22 +534,12 @@ impl MemoryPack {
         let ns = token.namespace().as_str().to_string();
         // Tracks whether CJK routing was actually applied (multilingual model found).
         let mut cjk_routed = false;
-        // F111: restrict text candidates to Note substrate kind so entity records
-        // cannot fill the candidate pool before any memory note is considered.
+        // F111 + Issue #288: fan out one FTS5 MATCH per term so notes matching
+        // ANY term enter the candidate pool. A single conjunction MATCH ("term1
+        // term2 term3") only returns notes containing all terms, which leaves
+        // text_candidates empty for memory notes that partially match the query.
         let text_hits = self
-            .runtime
-            .text_for_notes(token)?
-            .search(TextSearchRequest {
-                query: query.to_string(),
-                mode: TextQueryMode::Plain,
-                filter: Some(TextFilter {
-                    namespaces: vec![ns.clone()],
-                    kinds: vec![SubstrateKind::Note],
-                    ..TextFilter::default()
-                }),
-                top_k: candidate_limit,
-                snippet_chars: 200,
-            })
+            .collect_recall_text_hits(token, query, &ns, candidate_limit)
             .await?;
 
         // Determine which embedding models to query.
@@ -1114,7 +1179,17 @@ impl MemoryPack {
             true
         });
 
-        let is_verbose = cfg.include_breakdown || p.presentation.as_deref() == Some("verbose");
+        let legacy_breakdown = match p.presentation.as_deref() {
+            None => false,
+            Some("verbose") => true,
+            Some(other) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "memory.recall presentation={other:?} is deprecated; use include_breakdown=true"
+                )));
+            }
+        };
+        let is_verbose =
+            cfg.include_breakdown || p.include_breakdown.unwrap_or(false) || legacy_breakdown;
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
 
@@ -1230,9 +1305,13 @@ impl MemoryPack {
             )
             .await?;
 
+        // Issue #288: filter text_candidates to memory notes so the diagnostic
+        // output reflects the same pool that recall uses, not all notes.
+        let (memory_ids, _) = self.load_memory_candidate_notes(token, &candidates).await?;
         let text_candidates: Vec<Value> = candidates
             .text_hits
             .iter()
+            .filter(|hit| memory_ids.contains(&hit.subject_id))
             .map(|hit| {
                 json!({
                     "note_id": hit.subject_id.to_string(),
@@ -1548,6 +1627,7 @@ mod tests {
             fusion_strategy: None,
             score_floor: None,
             embedding_model: None,
+            include_breakdown: None,
             presentation: None,
             entity_names: None,
             full_content: None,
@@ -1571,6 +1651,7 @@ mod tests {
             fusion_strategy: None,
             score_floor: None,
             embedding_model: None,
+            include_breakdown: None,
             presentation: None,
             entity_names: None,
             full_content: None,
@@ -1596,6 +1677,7 @@ mod tests {
             fusion_strategy: None,
             score_floor: None,
             embedding_model: None,
+            include_breakdown: None,
             presentation: None,
             entity_names: None,
             full_content: None,
@@ -1630,6 +1712,7 @@ mod tests {
             fusion_strategy: Some("weighted".to_string()),
             score_floor: None,
             embedding_model: None,
+            include_breakdown: None,
             presentation: None,
             entity_names: None,
             full_content: None,
