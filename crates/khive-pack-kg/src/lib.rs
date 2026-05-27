@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
 pub use khive_types::EntityKind;
@@ -666,16 +666,31 @@ impl PackRuntime for KgPack {
             return handle_verbs(params, registry);
         }
 
-        let local_ns = Namespace::local();
+        // ADR-007 §"Namespace-by-Layer Rule": KG entities/edges always use the
+        // runtime's shared graph namespace (`default_namespace`, which is `local`
+        // in production) so that cross-project graph structure is visible to all
+        // actors regardless of their caller namespace.
+        //
+        // The override target is `runtime.config().default_namespace` rather than
+        // the hardcoded `Namespace::local()` constant.  This means:
+        //  - Production (default_namespace=local): lambda:foo tokens redirect to local.
+        //  - Test environments (default_namespace=test): tokens that already carry
+        //    `test` are not redirected, so cross-pack lookups (GTD notes ↔ KG edges)
+        //    remain consistent within the same namespace.
+        //
+        // Note: scoped packs (memory, gtd, comm, …) are NOT overridden here; the
+        // caller's original token is used for their verbs.
+        let graph_ns = self.runtime.config().default_namespace.clone();
         let kg_token;
-        let effective_token = if token.namespace() != &local_ns {
+        let effective_token = if token.namespace() != &graph_ns {
             tracing::warn!(
                 caller_namespace = token.namespace().as_str(),
+                graph_namespace = graph_ns.as_str(),
                 verb = verb,
-                "KG pack: caller namespace is not `local`; overriding to `local` per \
+                "KG pack: caller namespace differs from graph namespace; overriding per \
                  ADR-007 namespace-by-layer rule. KG entities are shared across projects."
             );
-            kg_token = token.with_namespace(local_ns);
+            kg_token = token.with_namespace(graph_ns);
             &kg_token
         } else {
             token
