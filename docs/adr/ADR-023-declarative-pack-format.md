@@ -136,7 +136,7 @@ config can only shrink the MCP surface, never expand it.
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
-bare verb names (15 verbs total):
+bare verb names (16 verbs total):
 
 | Verb        | Speech act  | Description                                                                      |
 | ----------- | ----------- | -------------------------------------------------------------------------------- |
@@ -154,6 +154,7 @@ bare verb names (15 verbs total):
 | `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                      |
 | `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`. |
 | `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.             |
+| `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                     |
 | `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.        |
 
 `verbs` was added in Wave 4 (ue-help-introspection H5) to provide a machine-readable discovery
@@ -187,7 +188,7 @@ The single rule: **first dot is always the pack name. There is no second dot.**
 `crates/kkernel/tests/verb_namespace_contract.rs`. The test loads every
 `inventory`-registered pack, walks all `HandlerDef` names, and asserts:
 
-- A bare name (no dot) must be in the 14-entry kg-substrate allowlist.
+- A bare name (no dot) must be in the 16-entry kg-substrate allowlist.
 - A dotted name must carry exactly one dot whose prefix matches `Pack::NAME`.
 - Two or more dots are always a violation.
 
