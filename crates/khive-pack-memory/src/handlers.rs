@@ -1336,14 +1336,68 @@ impl MemoryPack {
             query: String,
         }
         let p: EmbedParams = deser(params)?;
-        if self.runtime.config().embedding_model.is_none() {
-            return to_json(&json!({ "embedding": null, "model": null }));
+
+        let model_names = self.runtime.registered_embedding_model_names();
+        if model_names.is_empty() {
+            return to_json(&json!({
+                "embedding": null,
+                "model": null,
+                "engines": [],
+            }));
         }
-        let vec = self.runtime.embed(&p.query).await?;
-        to_json(&json!({
-            "embedding": vec,
-            "dimensions": vec.len(),
-        }))
+
+        // Query every registered model and collect per-model results.
+        let mut engines: Vec<Value> = Vec::with_capacity(model_names.len());
+        let mut primary_embedding: Option<Vec<f32>> = None;
+        let primary_model = self.runtime.default_embedder_name().to_owned();
+
+        for model_name in &model_names {
+            match self.runtime.embed_with_model(model_name, &p.query).await {
+                Ok(vec) => {
+                    let dims = vec.len();
+                    // Use the primary/default model's embedding as the top-level field
+                    // for backward compatibility.
+                    if primary_embedding.is_none() || model_name == &primary_model {
+                        primary_embedding = Some(vec.clone());
+                    }
+                    engines.push(json!({
+                        "model": model_name,
+                        "dimensions": dims,
+                        "embedding": vec,
+                    }));
+                }
+                Err(e) => {
+                    // Non-fatal: report the error per model so the caller knows which
+                    // models were consulted and which failed.
+                    engines.push(json!({
+                        "model": model_name,
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        // Primary embedding is from the configured default model (or the first
+        // model if no default is configured), for backward compatibility.
+        match primary_embedding {
+            Some(vec) => {
+                let dims = vec.len();
+                to_json(&json!({
+                    "embedding": vec,
+                    "dimensions": dims,
+                    "engines": engines,
+                }))
+            }
+            None => {
+                // All models failed — surface the aggregate engines list so callers
+                // can see why; top-level fields are null for compat.
+                to_json(&json!({
+                    "embedding": null,
+                    "model": null,
+                    "engines": engines,
+                }))
+            }
+        }
     }
 
     pub(crate) async fn handle_recall_candidates(
@@ -2194,13 +2248,6 @@ mod tests {
     fn recall_config_reranker_fields_default_empty() {
         let cfg = RecallConfig::default();
         assert!(cfg.reranker_weights.is_empty());
-        assert!(cfg.reranker_params.is_empty());
-    }
-
-    #[test]
-    fn recall_config_fallback_during_migration_defaults_true() {
-        let cfg = RecallConfig::default();
-        assert!(cfg.fallback_during_migration);
     }
 
     #[test]

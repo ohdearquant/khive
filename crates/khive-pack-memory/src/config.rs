@@ -48,8 +48,6 @@ pub struct RecallConfig {
     /// Per-reranker weights, keyed by reranker name. Missing keys → 0.0 (disabled).
     /// v1 built-in names: "cross_encoder", "salience", "graph_proximity".
     pub reranker_weights: HashMap<String, f64>,
-    /// Per-reranker config params (e.g., graph_proximity anchors, salience α).
-    pub reranker_params: HashMap<String, serde_json::Value>,
 
     // --- Temporal parameters ---
     /// Days for temporal score to halve. Default 30.0.
@@ -72,11 +70,6 @@ pub struct RecallConfig {
     /// Include per-component score breakdowns in recall responses. Default false.
     pub include_breakdown: bool,
 
-    // --- Migration behavior (ADR-033 §1, ADR-043) ---
-    /// When true and no active embedding model is configured, fall back to FTS5-only
-    /// candidate retrieval rather than failing. Default true.
-    pub fallback_during_migration: bool,
-
     // --- Archive scoring pipeline override ---
     /// Optional full archive scoring config override. When provided, `handle_recall`
     /// uses `calculate_score` + all archive pipeline features (MMR, supersedes
@@ -85,6 +78,60 @@ pub struct RecallConfig {
     /// `ScoringConfig::default()` is used when this is `None` and the caller provides
     /// entity_names or sets `use_archive_scoring = true`.
     pub scoring: Option<crate::scoring::ScoringConfig>,
+
+    // --- Brain profile integration (issue #484) ---
+    /// Optional brain profile hint for score boosting.
+    ///
+    /// When set, `handle_recall` fetches the named brain profile's entity
+    /// posteriors and applies a salience multiplier to results whose note id
+    /// or source entity appears in the profile's high-posterior set.
+    ///
+    /// Integration point: after `ranked` is populated, iterate results and
+    /// multiply `rank_score` by `brain_profile_boost` for IDs whose
+    /// Beta posterior mean exceeds `brain_profile_threshold`.
+    pub brain_profile: Option<BrainProfileHint>,
+}
+
+/// Hint for brain-profile-guided score boosting during recall (issue #484).
+///
+/// When a `brain_profile` hint is present in `RecallConfig`, the recall handler
+/// will apply `boost` as a rank-score multiplier to results whose associated
+/// entity posterior mean in the named brain profile exceeds `threshold`.
+///
+/// This ties the memory pack's retrieval scoring to the brain pack's Bayesian
+/// entity posteriors, allowing frequently-recalled or explicitly-marked-useful
+/// entities to surface more prominently.
+///
+/// # Wire shape
+/// ```json
+/// "brain_profile": {"profile_id": "balanced-recall-v1", "boost": 1.3, "threshold": 0.6}
+/// ```
+///
+/// # Integration status (issue #484)
+/// The configuration field is live; the runtime lookup requires a cross-pack
+/// call to `brain.profile` which is not yet wired at the handler level.
+/// TODO(#484): wire brain pack handle lookup into recall scoring loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrainProfileHint {
+    /// Profile ID to resolve. Passed to `brain.resolve` / `brain.profile`.
+    pub profile_id: String,
+    /// Score multiplier applied to matching results. Default 1.3×.
+    #[serde(default = "BrainProfileHint::default_boost")]
+    pub boost: f64,
+    /// Minimum Beta posterior mean required for a result to receive the boost.
+    /// Posterior mean = alpha / (alpha + beta). Default 0.6 (slightly above
+    /// the uniform prior mean of 0.5).
+    #[serde(default = "BrainProfileHint::default_threshold")]
+    pub threshold: f64,
+}
+
+impl BrainProfileHint {
+    fn default_boost() -> f64 {
+        1.3
+    }
+    fn default_threshold() -> f64 {
+        0.6
+    }
 }
 
 // Tuning artifact: tests/khive-contract/tune/ swept 116 configs but the synthetic corpus
@@ -107,7 +154,6 @@ impl Default for RecallConfig {
             salience_weight: 0.20,
             temporal_weight: 0.10,
             reranker_weights: HashMap::new(),
-            reranker_params: HashMap::new(),
             temporal_half_life_days: 30.0,
             decay_model: DecayModel::default(),
             candidate_multiplier: 20,
@@ -123,8 +169,8 @@ impl Default for RecallConfig {
             min_score: 0.0,
             min_salience: 0.0,
             include_breakdown: false,
-            fallback_during_migration: true,
             scoring: None,
+            brain_profile: None,
         }
     }
 }

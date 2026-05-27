@@ -885,10 +885,10 @@ impl PackRuntime for KgPack {
             "withdraw" => self.handle_withdraw(graph_token, params).await,
             "stats" => self.handle_stats(graph_token, params).await,
             "merge" => self.handle_merge(graph_token, params, registry).await,
-            // UUID-based: use caller token (entity access tested with local token).
-            "get" => self.handle_get(token, params).await,
-            "update" => self.handle_update(token, params, registry).await,
-            "delete" => self.handle_delete(token, params, registry).await,
+            // UUID-based: entities/edges use graph token, notes/events use caller token.
+            "get" => self.handle_get(token, graph_token, params).await,
+            "update" => self.handle_update(graph_token, params, registry).await,
+            "delete" => self.handle_delete(graph_token, params, registry).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "kg pack does not handle verb {verb:?}"
             ))),

@@ -875,9 +875,17 @@ impl BrainPack {
             "useful" => "useful",
             "not_useful" => "not_useful",
             "wrong" => "wrong",
+            // Issue #268: semantic event taxonomy names are also valid.
+            "explicit_positive" => "explicit_positive",
+            "explicit_negative" => "explicit_negative",
+            "implicit_positive" => "implicit_positive",
+            "implicit_negative" => "implicit_negative",
+            "correction" => "correction",
             other => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "unknown signal {other:?}; valid: useful | not_useful | wrong"
+                    "unknown signal {other:?}; valid: useful | not_useful | wrong | \
+                     explicit_positive | explicit_negative | implicit_positive | \
+                     implicit_negative | correction"
                 )))
             }
         };

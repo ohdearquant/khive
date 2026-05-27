@@ -1610,6 +1610,7 @@ impl KgPack {
     pub(crate) async fn handle_get(
         &self,
         token: &NamespaceToken,
+        graph_token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params)?;
@@ -1620,46 +1621,51 @@ impl KgPack {
         // ProposalCreated event payload.  Standard substrates win when the same
         // id matches both (shouldn't happen in practice; proposal IDs are fresh UUIDs).
 
-        // Attempt standard UUID resolution for entity/note/edge/event substrates.
-        if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, token).await {
-            if let Ok(entity) = self.runtime.get_entity(token, id).await {
-                return flatten_get_result(
-                    "entity",
-                    normalize_entity_timestamps(to_json(&entity)?),
-                );
+        // UUID resolution: try graph namespace first (entities live there), then caller.
+        let id = if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, graph_token).await {
+            id
+        } else if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, token).await {
+            id
+        } else {
+            // Fall back to proposal lookup below.
+            if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
+                return Ok(payload_val);
             }
+            return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
+        };
 
-            if let Some(note) = self
-                .runtime
-                .notes(token)?
-                .get_note(id)
-                .await
-                .map_err(RuntimeError::Storage)?
-            {
-                if note.namespace == token.namespace().as_str() {
-                    let note_val = normalize_entity_timestamps(to_json(&note)?);
-                    let remapped = remap_note_status(note_val);
-                    return flatten_get_result("note", remapped);
-                }
+        // Entities and edges use graph namespace; notes and events use caller namespace.
+        if let Ok(entity) = self.runtime.get_entity(graph_token, id).await {
+            return flatten_get_result("entity", normalize_entity_timestamps(to_json(&entity)?));
+        }
+
+        if let Some(note) = self
+            .runtime
+            .notes(token)?
+            .get_note(id)
+            .await
+            .map_err(RuntimeError::Storage)?
+        {
+            if note.namespace == token.namespace().as_str() {
+                let note_val = normalize_entity_timestamps(to_json(&note)?);
+                let remapped = remap_note_status(note_val);
+                return flatten_get_result("note", remapped);
             }
+        }
 
-            if let Some(edge) = self.runtime.get_edge(token, id).await? {
-                return flatten_get_result("edge", to_json(&edge)?);
-            }
+        if let Some(edge) = self.runtime.get_edge(graph_token, id).await? {
+            return flatten_get_result("edge", to_json(&edge)?);
+        }
 
-            if let Some(event) = self
-                .runtime
-                .events(token)?
-                .get_event(id)
-                .await
-                .map_err(RuntimeError::Storage)?
-            {
-                if event.namespace == token.namespace().as_str() {
-                    return flatten_get_result(
-                        "event",
-                        normalize_event_timestamps(to_json(&event)?),
-                    );
-                }
+        if let Some(event) = self
+            .runtime
+            .events(token)?
+            .get_event(id)
+            .await
+            .map_err(RuntimeError::Storage)?
+        {
+            if event.namespace == token.namespace().as_str() {
+                return flatten_get_result("event", normalize_event_timestamps(to_json(&event)?));
             }
         }
 

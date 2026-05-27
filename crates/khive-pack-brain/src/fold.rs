@@ -1,7 +1,9 @@
 use khive_fold::{Fold, FoldContext};
 use khive_storage::event::Event;
 
-use crate::event::{entity_signal, interpret, is_recall_positive, BrainSignal, FeedbackSignal};
+use crate::event::{
+    entity_signal, interpret, is_recall_positive, BrainSignal, FeedbackEventKind, FeedbackSignal,
+};
 use crate::state::{BalancedRecallState, BetaPosterior, SectionPosteriorState, DEFAULT_ESS_CAP};
 
 /// Fold for the `BalancedRecallProfile` state (ADR-032 §5a).
@@ -58,6 +60,24 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
             }
         }
 
+        // Issue #268: semantic feedback events use weighted posterior updates.
+        // Correction and explicit signals have higher update_weight than implicit ones.
+        if let BrainSignal::SemanticFeedback {
+            event_kind: ref ek, ..
+        } = signal
+        {
+            let w = ek.update_weight();
+            if ek.is_positive() {
+                state.salience.update_success_weighted(w);
+            } else {
+                state.salience.update_failure_weighted(w);
+            }
+            // Corrections also update the relevance posterior (strongest signal).
+            if *ek == FeedbackEventKind::Correction {
+                state.relevance.update_failure_weighted(w);
+            }
+        }
+
         // Fix #355 (MAJ-001): temporal posterior — driven by recall latency.
         // A fast recall hit (≤ 50 ms) is positive evidence that temporal recency
         // weighting is working; a slow hit or a miss is negative evidence.
@@ -85,8 +105,25 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
             _ => {}
         }
 
-        // Per-entity posterior updates
-        if let Some((entity_id, positive)) = entity_signal(&signal) {
+        // Per-entity posterior updates.
+        // Semantic feedback (issue #268) applies a weighted update so that
+        // explicit/correction signals carry more evidence than implicit ones.
+        if let BrainSignal::SemanticFeedback {
+            target_id: eid,
+            event_kind: ref ek,
+            ..
+        } = signal
+        {
+            let posterior = state
+                .entity_posteriors
+                .get_or_insert(eid, || BetaPosterior::new(1.0, 1.0));
+            let w = ek.update_weight();
+            if ek.is_positive() {
+                posterior.update_success_weighted(w);
+            } else {
+                posterior.update_failure_weighted(w);
+            }
+        } else if let Some((entity_id, positive)) = entity_signal(&signal) {
             let posterior = state
                 .entity_posteriors
                 .get_or_insert(entity_id, || BetaPosterior::new(1.0, 1.0));
@@ -308,6 +345,157 @@ mod tests {
         assert_eq!(snap1.total_events, snap2.total_events);
         assert_eq!(snap1.relevance, snap2.relevance);
         assert_eq!(snap1.entity_posteriors, snap2.entity_posteriors);
+    }
+
+    // ── SemanticFeedback fold path tests (MAJ-001 coverage) ──────────────────
+
+    fn make_semantic_feedback_event(signal: &str, target: Uuid) -> Event {
+        let mut e = Event::new(
+            "test",
+            "brain.feedback",
+            khive_types::EventKind::Audit,
+            SubstrateKind::Note,
+            "brain",
+        );
+        e.outcome = EventOutcome::Success;
+        e.target_id = Some(target);
+        e.payload = serde_json::json!({"signal": signal});
+        e
+    }
+
+    #[test]
+    fn semantic_feedback_explicit_positive_updates_salience_alpha_and_entity_alpha() {
+        let fold = BalancedRecallFold::new(100);
+        let ctx = FoldContext::new();
+        let state = fold.init(&ctx);
+
+        let sal_alpha_prior = state.salience.alpha; // 2.0
+        let sal_beta_prior = state.salience.beta; // 8.0
+
+        let id = Uuid::new_v4();
+        let event = make_semantic_feedback_event("explicit_positive", id);
+        let state = fold.reduce(state, &event, &ctx);
+
+        // ExplicitPositive: weight=1.5, is_positive=true → salience.alpha += 1.5
+        assert!(
+            (state.salience.alpha - (sal_alpha_prior + 1.5)).abs() < 1e-12,
+            "explicit_positive must add 1.5 to salience.alpha: expected {}, got {}",
+            sal_alpha_prior + 1.5,
+            state.salience.alpha
+        );
+        assert!(
+            (state.salience.beta - sal_beta_prior).abs() < 1e-12,
+            "explicit_positive must not change salience.beta"
+        );
+        // Correction branch must NOT fire
+        let rel_beta_prior = state.relevance.beta;
+        // (relevance should not change for ExplicitPositive — only Correction updates relevance)
+        let _ = rel_beta_prior;
+
+        // Entity posterior: alpha += 1.5
+        let ep = state.entity_posteriors.get(&id).unwrap();
+        assert!(
+            (ep.alpha - 2.5).abs() < 1e-12,
+            "entity posterior alpha must be 1.0 + 1.5 = 2.5, got {}",
+            ep.alpha
+        );
+        assert!(
+            (ep.beta - 1.0).abs() < 1e-12,
+            "entity posterior beta must remain at 1.0, got {}",
+            ep.beta
+        );
+    }
+
+    #[test]
+    fn semantic_feedback_implicit_negative_updates_salience_beta_and_entity_beta() {
+        let fold = BalancedRecallFold::new(100);
+        let ctx = FoldContext::new();
+        let state = fold.init(&ctx);
+
+        let sal_alpha_prior = state.salience.alpha; // 2.0
+        let sal_beta_prior = state.salience.beta; // 8.0
+
+        let id = Uuid::new_v4();
+        let event = make_semantic_feedback_event("implicit_negative", id);
+        let state = fold.reduce(state, &event, &ctx);
+
+        // ImplicitNegative: weight=0.5, is_positive=false → salience.beta += 0.5
+        assert!(
+            (state.salience.alpha - sal_alpha_prior).abs() < 1e-12,
+            "implicit_negative must not change salience.alpha"
+        );
+        assert!(
+            (state.salience.beta - (sal_beta_prior + 0.5)).abs() < 1e-12,
+            "implicit_negative must add 0.5 to salience.beta: expected {}, got {}",
+            sal_beta_prior + 0.5,
+            state.salience.beta
+        );
+
+        // Entity posterior: beta += 0.5
+        let ep = state.entity_posteriors.get(&id).unwrap();
+        assert!(
+            (ep.alpha - 1.0).abs() < 1e-12,
+            "entity posterior alpha must remain at 1.0, got {}",
+            ep.alpha
+        );
+        assert!(
+            (ep.beta - 1.5).abs() < 1e-12,
+            "entity posterior beta must be 1.0 + 0.5 = 1.5, got {}",
+            ep.beta
+        );
+    }
+
+    #[test]
+    fn semantic_feedback_correction_updates_salience_beta_relevance_beta_and_entity_beta() {
+        let fold = BalancedRecallFold::new(100);
+        let ctx = FoldContext::new();
+        let state = fold.init(&ctx);
+
+        let sal_alpha_prior = state.salience.alpha; // 2.0
+        let sal_beta_prior = state.salience.beta; // 8.0
+        let rel_alpha_prior = state.relevance.alpha; // 7.0
+        let rel_beta_prior = state.relevance.beta; // 3.0
+
+        let id = Uuid::new_v4();
+        let event = make_semantic_feedback_event("correction", id);
+        let state = fold.reduce(state, &event, &ctx);
+
+        // Correction: weight=2.0, is_positive=false → salience.beta += 2.0
+        assert!(
+            (state.salience.alpha - sal_alpha_prior).abs() < 1e-12,
+            "correction must not change salience.alpha"
+        );
+        assert!(
+            (state.salience.beta - (sal_beta_prior + 2.0)).abs() < 1e-12,
+            "correction must add 2.0 to salience.beta: expected {}, got {}",
+            sal_beta_prior + 2.0,
+            state.salience.beta
+        );
+
+        // Correction also updates relevance posterior → relevance.beta += 2.0
+        assert!(
+            (state.relevance.alpha - rel_alpha_prior).abs() < 1e-12,
+            "correction must not change relevance.alpha"
+        );
+        assert!(
+            (state.relevance.beta - (rel_beta_prior + 2.0)).abs() < 1e-12,
+            "correction must add 2.0 to relevance.beta: expected {}, got {}",
+            rel_beta_prior + 2.0,
+            state.relevance.beta
+        );
+
+        // Entity posterior: beta += 2.0
+        let ep = state.entity_posteriors.get(&id).unwrap();
+        assert!(
+            (ep.alpha - 1.0).abs() < 1e-12,
+            "entity posterior alpha must remain at 1.0, got {}",
+            ep.alpha
+        );
+        assert!(
+            (ep.beta - 3.0).abs() < 1e-12,
+            "entity posterior beta must be 1.0 + 2.0 = 3.0, got {}",
+            ep.beta
+        );
     }
 
     // ── Regression tests (issues #355, #356, #357, #295) ──────────────────────

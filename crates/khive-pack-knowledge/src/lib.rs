@@ -48,7 +48,7 @@ impl Pack for KnowledgePack {
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
-static KNOWLEDGE_HANDLERS: [HandlerDef; 14] = [
+static KNOWLEDGE_HANDLERS: [HandlerDef; 15] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
@@ -324,6 +324,33 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 14] = [
             },
         ],
     },
+    // ── operator-only ─────────────────────────────────────────────────────────
+    HandlerDef {
+        name: "knowledge.reindex",
+        description: "Re-embed all entities and notes using the configured embedding model. Operator-only subhandler — not exposed via the MCP request DSL.",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Directive,
+        params: &[
+            ParamDef {
+                name: "model",
+                param_type: "string",
+                required: false,
+                description: "Embedding model name (uses runtime default when omitted)",
+            },
+            ParamDef {
+                name: "batch_size",
+                param_type: "integer",
+                required: false,
+                description: "Records per embedding batch (default 100, max 500)",
+            },
+            ParamDef {
+                name: "drop_existing",
+                param_type: "boolean",
+                required: false,
+                description: "Drop existing vectors before reindexing (default true)",
+            },
+        ],
+    },
     // ── concept tier (KG sugar) ───────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.learn",
@@ -486,6 +513,7 @@ impl PackRuntime for KnowledgePack {
             // section tier
             "knowledge.edit" => KnowledgeHandlers::edit(&self.runtime, token, params).await,
             "knowledge.import" => KnowledgeHandlers::import(&self.runtime, token, params).await,
+            "knowledge.reindex" => KnowledgeHandlers::reindex(&self.runtime, token, params).await,
             // concept tier
             "knowledge.learn" => self.handle_learn(token, params).await,
             "knowledge.cite" => self.handle_cite(token, params).await,

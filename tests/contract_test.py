@@ -247,87 +247,76 @@ def _run_test(name: str, fn) -> None:
 # ---------------------------------------------------------------------------
 
 def test_namespace_isolation(proc: subprocess.Popen) -> None:
-    """Entity in namespace A must be invisible via get/search/list from namespace B."""
-    # Create entity in namespace "ns-alpha"
+    """Entities live in shared graph namespace; notes are caller-namespace-isolated."""
+    # ADR-007: KG entities/edges use a shared graph namespace so that cross-project
+    # graph structure is visible to all actors.  Notes (tasks, memories, observations)
+    # remain scoped to the caller's namespace.
+
+    # ---- entities: shared graph — visible across namespaces ----
     entity = _tool(proc, "create", {
         "kind": "entity",
         "entity_kind": "concept",
         "name": "AlphaEntity",
-        "description": "Only visible in ns-alpha",
+        "description": "Visible from any namespace",
         "namespace": "ns-alpha",
     })
     full_id = entity["id"]
-    short_prefix = full_id[:8]
 
-    # ---- get from ns-beta must not find it (RPC-level error) ----
-    err_text = _expect_rpc_error(proc, "get", {"id": full_id, "namespace": "ns-beta"})
-    assert "not found" in err_text.lower(), (
-        f"Expected 'not found' error from ns-beta get, got: {err_text!r}"
-    )
+    # get from ns-beta MUST succeed (shared graph namespace)
+    fetched = _tool(proc, "get", {"id": full_id, "namespace": "ns-beta"})
+    assert fetched["kind"] == "concept", f"Expected kind=concept, got {fetched['kind']}"
+    assert fetched["name"] == "AlphaEntity"
 
-    # ---- list from ns-beta must return empty ----
+    # get from ns-alpha MUST also succeed
+    fetched_alpha = _tool(proc, "get", {"id": full_id, "namespace": "ns-alpha"})
+    assert fetched_alpha["name"] == "AlphaEntity"
+
+    # list from ns-beta MUST find the entity (shared graph)
     entities_beta = _tool(proc, "list", {
         "kind": "entity",
         "entity_kind": "concept",
         "namespace": "ns-beta",
     })
     ids_beta = [e["id"] for e in entities_beta]
-    assert full_id not in ids_beta, (
-        f"AlphaEntity full_id appeared in ns-beta list: {ids_beta}"
+    assert full_id in ids_beta, (
+        f"AlphaEntity must be visible in ns-beta list (shared graph): {ids_beta}"
     )
 
-    # ---- search from ns-beta must not contain it ----
-    hits_beta = _tool(proc, "search", {
-        "kind": "entity",
-        "query": "AlphaEntity",
-        "namespace": "ns-beta",
-    })
-    hit_ids_beta = [h.get("entity_id", "") for h in hits_beta]
-    assert full_id not in hit_ids_beta, (
-        f"AlphaEntity appeared in ns-beta search hits: {hit_ids_beta}"
-    )
-
-    # ---- get from ns-alpha must succeed ----
-    # Post-W2 (PR #454): get returns FLAT shape with granular kind (concept,
-    # observation, …) — same shape as create/list. No more {kind, data} wrapper.
-    fetched = _tool(proc, "get", {"id": full_id, "namespace": "ns-alpha"})
-    assert fetched["kind"] == "concept", f"Expected granular kind=concept, got {fetched['kind']}"
-    assert fetched["name"] == "AlphaEntity"
-
-    # ---- short prefix from ns-beta must not resolve to the entity (RPC-level error) ----
-    err_prefix = _expect_rpc_error(proc, "get", {"id": short_prefix, "namespace": "ns-beta"})
-    # The error should say "no record matches" rather than returning the entity from ns-alpha
-    assert ("no record" in err_prefix.lower() or "not found" in err_prefix.lower()), (
-        f"Expected prefix-not-found from ns-beta, got: {err_prefix!r}"
-    )
-
-    # ---- link from ns-beta using ns-alpha entity UUID must fail ----
-    # The write path (link) must enforce namespace isolation, not just the read paths.
+    # link across namespaces MUST succeed (both entities in shared graph)
     beta_entity = _tool(proc, "create", {
         "kind": "entity",
         "entity_kind": "concept",
         "name": "BetaEntity",
         "namespace": "ns-beta",
     })
-    err_link = _expect_rpc_error(proc, "link", {
+    link_result = _tool(proc, "link", {
         "source_id": beta_entity["id"],
-        "target_id": full_id,  # ns-alpha entity
-        "relation": "depends_on",
-        "namespace": "ns-beta",
-    })
-    assert "not found" in err_link.lower(), (
-        f"Cross-namespace link (beta→alpha) must fail with not-found, got: {err_link!r}"
-    )
-    # Reverse direction: ns-alpha source linked from ns-beta caller
-    err_link_rev = _expect_rpc_error(proc, "link", {
-        "source_id": full_id,  # ns-alpha entity
-        "target_id": beta_entity["id"],
+        "target_id": full_id,
         "relation": "extends",
         "namespace": "ns-beta",
     })
-    assert "not found" in err_link_rev.lower(), (
-        f"Cross-namespace link (alpha→beta from beta caller) must fail, got: {err_link_rev!r}"
+    assert link_result.get("ok", link_result.get("id")) is not None, (
+        f"Cross-namespace link must succeed in shared graph: {link_result}"
     )
+
+    # ---- notes: namespace-isolated ----
+    note = _tool(proc, "create", {
+        "kind": "note",
+        "note_kind": "observation",
+        "content": "Alpha-only observation",
+        "namespace": "ns-alpha",
+    })
+    note_id = note["id"]
+
+    # get note from ns-beta must NOT find it
+    err_text = _expect_rpc_error(proc, "get", {"id": note_id, "namespace": "ns-beta"})
+    assert "not found" in err_text.lower(), (
+        f"Expected note not found from ns-beta, got: {err_text!r}"
+    )
+
+    # get note from ns-alpha MUST succeed
+    fetched_note = _tool(proc, "get", {"id": note_id, "namespace": "ns-alpha"})
+    assert fetched_note["kind"] == "observation"
 
 
 # ---------------------------------------------------------------------------

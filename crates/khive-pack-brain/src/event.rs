@@ -17,6 +17,72 @@ pub enum FeedbackSignal {
     Wrong,
 }
 
+/// Semantic event taxonomy for brain fold updates (issue #268).
+///
+/// Captures the *kind* of feedback event so that the fold can apply
+/// different update magnitudes to posteriors. Explicit signals carry
+/// stronger evidence than implicit ones; corrections are strongest of all.
+///
+/// Update magnitude guidelines (applied by `FeedbackEventKind::update_weight`):
+///   - `Correction`        → 2.0× (strongest — user actively corrected output)
+///   - `ExplicitPositive`  → 1.5× (user explicitly marked as good)
+///   - `ExplicitNegative`  → 1.5× (user explicitly marked as bad)
+///   - `ImplicitPositive`  → 0.5× (user expanded / interacted — weaker signal)
+///   - `ImplicitNegative`  → 0.5× (user skipped / ignored — weaker signal)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackEventKind {
+    /// User explicitly rated a result as good (e.g., clicked "thumbs up").
+    ExplicitPositive,
+    /// User explicitly rated a result as bad (e.g., clicked "thumbs down").
+    ExplicitNegative,
+    /// User implicitly signalled satisfaction (e.g., expanded a section, dwell time).
+    ImplicitPositive,
+    /// User implicitly signalled dissatisfaction (e.g., skipped result, quick dismiss).
+    ImplicitNegative,
+    /// User corrected the output — strongest signal; overrides relevance posterior.
+    Correction,
+}
+
+impl FeedbackEventKind {
+    /// Magnitude multiplier for posterior updates.
+    ///
+    /// The fold multiplies the standard Beta update step (+1 to α or β) by this
+    /// weight to produce fractional updates. Explicit evidence counts more than
+    /// implicit; corrections count most (2×).
+    pub fn update_weight(&self) -> f64 {
+        match self {
+            FeedbackEventKind::Correction => 2.0,
+            FeedbackEventKind::ExplicitPositive | FeedbackEventKind::ExplicitNegative => 1.5,
+            FeedbackEventKind::ImplicitPositive | FeedbackEventKind::ImplicitNegative => 0.5,
+        }
+    }
+
+    /// Whether this event kind represents a positive signal.
+    pub fn is_positive(&self) -> bool {
+        matches!(
+            self,
+            FeedbackEventKind::ExplicitPositive | FeedbackEventKind::ImplicitPositive
+        )
+    }
+
+    /// Parse from the `signal` string in a `brain.feedback` event payload.
+    ///
+    /// Accepts the semantic event kind names. Falls back to `None` when the
+    /// string is not a recognised `FeedbackEventKind` (callers can then try
+    /// parsing as the legacy `FeedbackSignal` enum).
+    pub fn from_signal_str(s: &str) -> Option<Self> {
+        match s {
+            "explicit_positive" => Some(FeedbackEventKind::ExplicitPositive),
+            "explicit_negative" => Some(FeedbackEventKind::ExplicitNegative),
+            "implicit_positive" => Some(FeedbackEventKind::ImplicitPositive),
+            "implicit_negative" => Some(FeedbackEventKind::ImplicitNegative),
+            "correction" => Some(FeedbackEventKind::Correction),
+            _ => None,
+        }
+    }
+}
+
 /// Interpreted brain signal extracted from a raw Event (ADR-032 §4).
 ///
 /// `interpret()` is the single mapping layer from the shared event log to
@@ -37,6 +103,16 @@ pub enum BrainSignal {
         /// Profile that served the event being rated, if known.
         served_by_profile_id: Option<String>,
         section_signals: Option<HashMap<SectionType, FeedbackSignal>>,
+    },
+    /// Semantic feedback with event kind (issue #268).
+    ///
+    /// Produced when the `signal` field in a `brain.feedback` event is one of
+    /// the `FeedbackEventKind` names (`explicit_positive`, `correction`, etc.).
+    /// The fold uses `event_kind.update_weight()` to scale the posterior update.
+    SemanticFeedback {
+        target_id: Uuid,
+        event_kind: FeedbackEventKind,
+        served_by_profile_id: Option<String>,
     },
     /// Any other note-substrate access (get, list on notes).
     NoteAccessed { target_id: Uuid },
@@ -75,10 +151,11 @@ pub fn interpret(event: &Event) -> BrainSignal {
                 Some(t) => t,
                 None => return BrainSignal::Irrelevant,
             };
-            let signal = event
+            let signal_str = event
                 .payload
                 .get("signal")
-                .and_then(|s| serde_json::from_value::<FeedbackSignal>(s.clone()).ok());
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
             let served_by = event
                 .payload
                 .get("served_by_profile_id")
@@ -87,14 +164,29 @@ pub fn interpret(event: &Event) -> BrainSignal {
             let section_signals = event.payload.get("section_signals").and_then(|v| {
                 serde_json::from_value::<HashMap<SectionType, FeedbackSignal>>(v.clone()).ok()
             });
-            match signal {
-                Some(s) => BrainSignal::Feedback {
+
+            // Issue #268: try semantic event kind names first, then fall back to
+            // legacy FeedbackSignal (useful / not_useful / wrong).
+            if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal_str) {
+                BrainSignal::SemanticFeedback {
                     target_id: target,
-                    signal: s,
+                    event_kind,
                     served_by_profile_id: served_by,
-                    section_signals,
-                },
-                None => BrainSignal::Irrelevant,
+                }
+            } else {
+                let signal = serde_json::from_value::<FeedbackSignal>(serde_json::Value::String(
+                    signal_str.to_owned(),
+                ))
+                .ok();
+                match signal {
+                    Some(s) => BrainSignal::Feedback {
+                        target_id: target,
+                        signal: s,
+                        served_by_profile_id: served_by,
+                        section_signals,
+                    },
+                    None => BrainSignal::Irrelevant,
+                }
             }
         }
         "get" | "remember" => match event.target_id {
@@ -113,6 +205,11 @@ pub fn entity_signal(signal: &BrainSignal) -> Option<(Uuid, bool)> {
         BrainSignal::Feedback {
             target_id, signal, ..
         } => Some((*target_id, matches!(signal, FeedbackSignal::Useful))),
+        BrainSignal::SemanticFeedback {
+            target_id,
+            event_kind,
+            ..
+        } => Some((*target_id, event_kind.is_positive())),
         BrainSignal::RecallMiss | BrainSignal::SearchCompleted { .. } | BrainSignal::Irrelevant => {
             None
         }
@@ -348,6 +445,77 @@ mod tests {
         }
     }
 
+    // ── FeedbackEventKind unit tests (MAJ-001 coverage) ──────────────────────
+
+    #[test]
+    fn feedback_event_kind_from_signal_str_all_variants() {
+        assert_eq!(
+            FeedbackEventKind::from_signal_str("explicit_positive"),
+            Some(FeedbackEventKind::ExplicitPositive)
+        );
+        assert_eq!(
+            FeedbackEventKind::from_signal_str("explicit_negative"),
+            Some(FeedbackEventKind::ExplicitNegative)
+        );
+        assert_eq!(
+            FeedbackEventKind::from_signal_str("implicit_positive"),
+            Some(FeedbackEventKind::ImplicitPositive)
+        );
+        assert_eq!(
+            FeedbackEventKind::from_signal_str("implicit_negative"),
+            Some(FeedbackEventKind::ImplicitNegative)
+        );
+        assert_eq!(
+            FeedbackEventKind::from_signal_str("correction"),
+            Some(FeedbackEventKind::Correction)
+        );
+    }
+
+    #[test]
+    fn feedback_event_kind_from_signal_str_unknown_returns_none() {
+        assert_eq!(FeedbackEventKind::from_signal_str("useful"), None);
+        assert_eq!(FeedbackEventKind::from_signal_str("not_useful"), None);
+        assert_eq!(FeedbackEventKind::from_signal_str(""), None);
+        assert_eq!(FeedbackEventKind::from_signal_str("ExplicitPositive"), None);
+    }
+
+    #[test]
+    fn feedback_event_kind_update_weight_values() {
+        assert!((FeedbackEventKind::Correction.update_weight() - 2.0).abs() < 1e-12);
+        assert!((FeedbackEventKind::ExplicitPositive.update_weight() - 1.5).abs() < 1e-12);
+        assert!((FeedbackEventKind::ExplicitNegative.update_weight() - 1.5).abs() < 1e-12);
+        assert!((FeedbackEventKind::ImplicitPositive.update_weight() - 0.5).abs() < 1e-12);
+        assert!((FeedbackEventKind::ImplicitNegative.update_weight() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn feedback_event_kind_is_positive_classification() {
+        assert!(FeedbackEventKind::ExplicitPositive.is_positive());
+        assert!(FeedbackEventKind::ImplicitPositive.is_positive());
+        assert!(!FeedbackEventKind::ExplicitNegative.is_positive());
+        assert!(!FeedbackEventKind::ImplicitNegative.is_positive());
+        assert!(!FeedbackEventKind::Correction.is_positive());
+    }
+
+    #[test]
+    fn brain_feedback_semantic_explicit_positive_produces_semantic_signal() {
+        let id = Uuid::new_v4();
+        let mut e = make_event("brain.feedback", EventOutcome::Success, Some(id));
+        e.payload = serde_json::json!({"signal": "explicit_positive"});
+        match interpret(&e) {
+            BrainSignal::SemanticFeedback {
+                target_id,
+                event_kind,
+                served_by_profile_id,
+            } => {
+                assert_eq!(target_id, id);
+                assert_eq!(event_kind, FeedbackEventKind::ExplicitPositive);
+                assert!(served_by_profile_id.is_none());
+            }
+            other => panic!("expected SemanticFeedback, got {other:?}"),
+        }
+    }
+
     #[test]
     fn feedback_without_section_signals_is_none() {
         let id = Uuid::new_v4();
@@ -361,5 +529,56 @@ mod tests {
             }
             other => panic!("expected Feedback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn brain_feedback_semantic_correction_produces_semantic_signal() {
+        let id = Uuid::new_v4();
+        let mut e = make_event("brain.feedback", EventOutcome::Success, Some(id));
+        e.payload = serde_json::json!({"signal": "correction"});
+        match interpret(&e) {
+            BrainSignal::SemanticFeedback {
+                target_id,
+                event_kind,
+                ..
+            } => {
+                assert_eq!(target_id, id);
+                assert_eq!(event_kind, FeedbackEventKind::Correction);
+            }
+            other => panic!("expected SemanticFeedback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn semantic_feedback_entity_signal_positive_for_explicit_positive() {
+        let id = Uuid::new_v4();
+        let sig = BrainSignal::SemanticFeedback {
+            target_id: id,
+            event_kind: FeedbackEventKind::ExplicitPositive,
+            served_by_profile_id: None,
+        };
+        assert_eq!(entity_signal(&sig), Some((id, true)));
+    }
+
+    #[test]
+    fn semantic_feedback_entity_signal_negative_for_implicit_negative() {
+        let id = Uuid::new_v4();
+        let sig = BrainSignal::SemanticFeedback {
+            target_id: id,
+            event_kind: FeedbackEventKind::ImplicitNegative,
+            served_by_profile_id: None,
+        };
+        assert_eq!(entity_signal(&sig), Some((id, false)));
+    }
+
+    #[test]
+    fn semantic_feedback_entity_signal_negative_for_correction() {
+        let id = Uuid::new_v4();
+        let sig = BrainSignal::SemanticFeedback {
+            target_id: id,
+            event_kind: FeedbackEventKind::Correction,
+            served_by_profile_id: None,
+        };
+        assert_eq!(entity_signal(&sig), Some((id, false)));
     }
 }

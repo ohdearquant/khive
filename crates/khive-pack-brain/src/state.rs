@@ -122,6 +122,30 @@ impl BetaPosterior {
         self.beta += 1.0;
     }
 
+    /// Weighted success update (issue #268).
+    ///
+    /// Adds `weight` to α instead of a fixed 1.0. Used by semantic feedback
+    /// event kinds that carry different evidence strength (explicit vs implicit).
+    pub fn update_success_weighted(&mut self, weight: f64) {
+        debug_assert!(
+            weight > 0.0,
+            "update_success_weighted: weight must be positive, got {weight}"
+        );
+        self.alpha += weight;
+    }
+
+    /// Weighted failure update (issue #268).
+    ///
+    /// Adds `weight` to β instead of a fixed 1.0. Used by semantic feedback
+    /// event kinds that carry different evidence strength (explicit vs implicit).
+    pub fn update_failure_weighted(&mut self, weight: f64) {
+        debug_assert!(
+            weight > 0.0,
+            "update_failure_weighted: weight must be positive, got {weight}"
+        );
+        self.beta += weight;
+    }
+
     /// Combine evidence from two independent observers sharing the same prior.
     ///
     /// merged = Beta(a₁ + a₂ − a_prior, b₁ + b₂ − b_prior)
@@ -1234,5 +1258,45 @@ mod tests {
         let neutral = &state.priors[&SectionType::Examples];
         assert!((neutral.alpha - 2.0).abs() < 1e-12);
         assert!((neutral.beta - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn beta_posterior_weighted_success_adds_weight_to_alpha() {
+        let mut p = BetaPosterior::new(2.0, 8.0);
+        p.update_success_weighted(1.5);
+        assert!((p.alpha - 3.5).abs() < 1e-12);
+        assert!((p.beta - 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn beta_posterior_weighted_failure_adds_weight_to_beta() {
+        let mut p = BetaPosterior::new(2.0, 8.0);
+        p.update_failure_weighted(2.0);
+        assert!((p.alpha - 2.0).abs() < 1e-12);
+        assert!((p.beta - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn beta_posterior_weighted_fractional_update() {
+        let mut p = BetaPosterior::new(1.0, 1.0);
+        p.update_success_weighted(0.5);
+        assert!((p.alpha - 1.5).abs() < 1e-12);
+        assert!((p.beta - 1.0).abs() < 1e-12);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "update_success_weighted: weight must be positive")]
+    fn beta_posterior_weighted_success_rejects_zero_weight() {
+        let mut p = BetaPosterior::new(1.0, 1.0);
+        p.update_success_weighted(0.0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "update_failure_weighted: weight must be positive")]
+    fn beta_posterior_weighted_failure_rejects_negative_weight() {
+        let mut p = BetaPosterior::new(1.0, 1.0);
+        p.update_failure_weighted(-1.0);
     }
 }
