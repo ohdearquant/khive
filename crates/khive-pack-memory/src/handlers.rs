@@ -8,8 +8,8 @@ use khive_retrieval::{
     fuse_search_results, FusionStrategy as RetrievalFusionStrategy, HybridConfig,
 };
 use khive_runtime::{
-    micros_to_iso, FusionStrategy as RuntimeFusionStrategy, NamespaceToken, RuntimeError,
-    SearchHit, SearchSource, VerbRegistry,
+    micros_to_iso, FusionStrategy as RuntimeFusionStrategy, MemoryRecallPipeline, NamespaceToken,
+    NoteCandidate, RuntimeError, SearchHit, SearchSource, VerbRegistry,
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{
@@ -173,7 +173,10 @@ fn compute_score(
     decay_factor: f64,
     age_days: f64,
 ) -> (f64, ScoreBreakdown) {
+    // Normalize relevance from fusion-strategy-specific scale into [0, 1].
     let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
+
+    // Compute intermediate signals for the breakdown (backward compat).
     let effective_salience = cfg.decay_model.apply(
         salience,
         age_days,
@@ -184,21 +187,40 @@ fn compute_score(
         let k = std::f64::consts::LN_2 / cfg.temporal_half_life_days;
         (-k * age_days).exp()
     };
+
+    // Build a NoteCandidate carrying the pre-normalized relevance as rrf_score.
+    // The pipeline uses RrfFusionObjective (reads rrf_score), AmplifiedDecayAwareSalienceObjective
+    // (reads salience + decay_factor + age_days), and TemporalRecencyObjective (reads age_days).
+    use uuid::Uuid;
+    let candidate = NoteCandidate {
+        id: Uuid::nil(), // scoring is pure math; UUID is unused by objectives
+        rrf_score: Some(relevance),
+        salience,
+        decay_factor,
+        age_days,
+        rerank_scores: std::collections::HashMap::new(),
+    };
+
+    // Build and run the pipeline with the config's weight parameters.
+    let pipeline = MemoryRecallPipeline::new(
+        cfg.relevance_weight,
+        cfg.salience_weight,
+        cfg.temporal_weight,
+        cfg.temporal_half_life_days,
+        SALIENCE_AMPLIFIER_ALPHA,
+    );
+    let total = pipeline.score(&candidate);
+
+    // Compute per-component contributions for the breakdown (verbose mode).
+    // The pipeline normalises by weight_sum; replicate that here so the
+    // breakdown values are consistent with the total.
     let weight_sum = cfg.relevance_weight + cfg.salience_weight + cfg.temporal_weight;
     let norm = if weight_sum > 0.0 { weight_sum } else { 1.0 };
-    let r_contrib = cfg.relevance_weight * relevance / norm;
-    // Amplify the salience contribution so that high-salience memories rank
-    // clearly above low-salience ones when relevance is similar. Without
-    // amplification, the 3× linear spread (0.9 vs 0.3) is too narrow relative
-    // to the 70% relevance weight. SALIENCE_AMPLIFIER_ALPHA=1.5 gives ~5.2×
-    // spread (0.854 vs 0.164), making salience a meaningful tiebreaker.
     let amplified_salience = effective_salience.powf(SALIENCE_AMPLIFIER_ALPHA);
+    let r_contrib = cfg.relevance_weight * relevance / norm;
     let i_contrib = cfg.salience_weight * amplified_salience / norm;
     let t_contrib = cfg.temporal_weight * temporal / norm;
-    // Clamp to [0,1]: each component is in [0, weight/norm] and their sum is
-    // in [0, 1] by construction when relevance is clamped. The explicit clamp
-    // is a defensive guard against floating-point accumulation (CC-5).
-    let total = (r_contrib + i_contrib + t_contrib).clamp(0.0, 1.0);
+
     let breakdown = ScoreBreakdown {
         relevance,
         salience_raw: salience,

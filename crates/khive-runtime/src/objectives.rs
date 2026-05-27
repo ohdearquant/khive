@@ -223,6 +223,49 @@ impl Objective<NoteCandidate> for DecayAwareSalienceObjective {
     }
 }
 
+// ── AmplifiedDecayAwareSalienceObjective ─────────────────────────────────────
+
+/// Scores a `NoteCandidate` by salience with exponential decay and a non-linear
+/// amplification exponent applied after decay.
+///
+/// Formula: `(salience * exp(-decay_factor * age_days)) ^ alpha`
+///
+/// With `alpha > 1.0`, high-salience memories rank more clearly above low-salience
+/// ones when relevance is similar. At `alpha = 1.5` (the memory-recall default),
+/// salience 0.9 → 0.854 and salience 0.3 → 0.164 — a ~5.2× spread vs the ~3× linear
+/// spread. Keep `alpha ≤ 2.0`; values above 2 compress near-zero salience toward 0.
+///
+/// Used by the memory recall pipeline (ADR-033 §4) to make salience a meaningful
+/// tiebreaker without dominating relevance at the default weight of 0.20.
+pub struct AmplifiedDecayAwareSalienceObjective {
+    /// Power applied to the decayed salience value. Must be > 0.
+    pub alpha: f64,
+}
+
+impl AmplifiedDecayAwareSalienceObjective {
+    /// Create with the given amplification exponent.
+    pub fn new(alpha: f64) -> Self {
+        Self { alpha }
+    }
+
+    /// Default memory alpha from the memory recall handler: 1.5.
+    pub fn default_memory() -> Self {
+        Self::new(1.5)
+    }
+}
+
+impl Objective<NoteCandidate> for AmplifiedDecayAwareSalienceObjective {
+    #[inline]
+    fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
+        let decayed = candidate.salience * (-candidate.decay_factor * candidate.age_days).exp();
+        decayed.powf(self.alpha)
+    }
+
+    fn name(&self) -> &str {
+        "AmplifiedDecayAwareSalienceObjective"
+    }
+}
+
 // ── TemporalRecencyObjective ─────────────────────────────────────────────────
 
 /// Scores a `NoteCandidate` by pure temporal recency with a configurable half-life.
@@ -296,6 +339,66 @@ impl Objective<NoteCandidate> for RerankerObjective {
 
     fn name(&self) -> &str {
         "RerankerObjective"
+    }
+}
+
+// ── MemoryRecallPipeline ──────────────────────────────────────────────────────
+
+/// Composable scoring pipeline for memory recall candidates.
+///
+/// Wraps a `WeightedObjective<NoteCandidate>` with the three standard memory
+/// scoring components (RRF relevance, amplified salience, temporal recency)
+/// weighted by the recall config parameters. Pack code uses this type to avoid
+/// a direct dependency on `khive-fold`.
+///
+/// See ADR-033 §4.
+pub struct MemoryRecallPipeline {
+    pipeline: khive_fold::WeightedObjective<NoteCandidate>,
+}
+
+impl MemoryRecallPipeline {
+    /// Build a pipeline from explicit component weights and temporal half-life.
+    ///
+    /// `relevance_weight`, `salience_weight`, `temporal_weight` correspond to
+    /// `RecallConfig`'s three weight fields. `half_life_days` drives
+    /// `TemporalRecencyObjective`. `salience_alpha` is the amplification exponent
+    /// for `AmplifiedDecayAwareSalienceObjective` (default 1.5).
+    pub fn new(
+        relevance_weight: f64,
+        salience_weight: f64,
+        temporal_weight: f64,
+        half_life_days: f64,
+        salience_alpha: f64,
+    ) -> Self {
+        use khive_fold::WeightedObjective;
+        let pipeline = WeightedObjective::<NoteCandidate>::new()
+            .add(Box::new(RrfFusionObjective), relevance_weight)
+            .add(
+                Box::new(AmplifiedDecayAwareSalienceObjective::new(salience_alpha)),
+                salience_weight,
+            )
+            .add(
+                Box::new(TemporalRecencyObjective { half_life_days }),
+                temporal_weight,
+            );
+        Self { pipeline }
+    }
+
+    /// Build a pipeline using the standard memory recall defaults from ADR-033.
+    ///
+    /// Weights: relevance=0.70, salience=0.20, temporal=0.10; half_life=30 days; alpha=1.5.
+    pub fn default_memory() -> Self {
+        Self::new(0.70, 0.20, 0.10, 30.0, 1.5)
+    }
+
+    /// Score a `NoteCandidate` through the pipeline.
+    ///
+    /// The result is in [0.0, 1.0]. The `NoteCandidate.rrf_score` field should
+    /// carry the pre-normalized relevance (output of `normalize_relevance` / `RrfFusionObjective`).
+    pub fn score(&self, candidate: &NoteCandidate) -> f64 {
+        let ctx = ObjectiveContext::new();
+        use khive_fold::objective::Objective;
+        self.pipeline.score(candidate, &ctx).clamp(0.0, 1.0)
     }
 }
 
