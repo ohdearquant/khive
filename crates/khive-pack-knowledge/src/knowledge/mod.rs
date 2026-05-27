@@ -18,6 +18,7 @@
 
 pub(crate) mod matching;
 pub(crate) mod schema;
+pub(crate) mod vamana;
 
 use std::collections::{HashMap, HashSet};
 
@@ -744,8 +745,10 @@ impl KnowledgeHandlers {
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
         params: Value,
+        ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
         let p: IndexParams = deser(params)?;
+        let rebuild_ann = p.rebuild_ann.unwrap_or(false);
         let ns = token.namespace().as_str().to_owned();
 
         // If no embedder is configured, return immediately — nothing to index.
@@ -813,6 +816,10 @@ impl KnowledgeHandlers {
         let mut indexed = 0usize;
         let mut skipped = 0usize;
 
+        let mut ann_vectors: Vec<f32> = Vec::new();
+        let mut ann_ids: Vec<Uuid> = Vec::new();
+        let mut ann_dim: usize = 0;
+
         for chunk in atoms.chunks(EMBED_BATCH) {
             let mut staged: Vec<(Uuid, String)> = Vec::with_capacity(chunk.len());
             for atom in chunk {
@@ -874,13 +881,40 @@ impl KnowledgeHandlers {
                 }
             }
 
+            if rebuild_ann {
+                for ((id, _), emb) in staged.iter().zip(embeddings.iter()) {
+                    if ann_dim == 0 {
+                        ann_dim = emb.len();
+                    }
+                    if emb.len() == ann_dim {
+                        ann_ids.push(*id);
+                        ann_vectors.extend_from_slice(emb);
+                    }
+                }
+            }
+
             indexed += staged.len();
+        }
+
+        let mut ann_count: Option<usize> = None;
+        if rebuild_ann && !ann_vectors.is_empty() && ann_dim > 0 {
+            match vamana::AnnBridge::build(ann_vectors, ann_dim, ann_ids) {
+                Ok(bridge) => {
+                    ann_count = Some(bridge.num_vectors());
+                    let mut guard = ann.write().await;
+                    *guard = Some(bridge);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to build Vamana ANN index");
+                }
+            }
         }
 
         Ok(json!({
             "indexed": indexed,
             "skipped": skipped,
             "total": total,
+            "ann_vectors": ann_count,
         }))
     }
 
@@ -954,6 +988,7 @@ impl KnowledgeHandlers {
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
         params: Value,
+        ann: &vamana::SharedAnn,
     ) -> Result<Value, RuntimeError> {
         let p: SearchParams = deser(params)?;
         let raw_query = p.query.trim().to_string();
@@ -994,6 +1029,19 @@ impl KnowledgeHandlers {
         } else {
             search_core(&ctx, &raw_query).await?
         };
+
+        // ANN parallel signal: embed query, search Vamana, fuse via RRF
+        let ann_guard = ann.read().await;
+        if let Some(ref bridge) = *ann_guard {
+            if let Ok(query_emb) = runtime.embed(&raw_query).await {
+                let ann_k = fetch_limit.max(20);
+                let ann_hits = bridge.search(&query_emb, ann_k);
+                if !ann_hits.is_empty() {
+                    fuse_ann_hits(&mut hits, &ann_hits, min_score);
+                }
+            }
+        }
+        drop(ann_guard);
 
         if do_rerank && !hits.is_empty() {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
@@ -1077,6 +1125,56 @@ struct ScoredHit {
     finalized: bool,
     is_domain: bool,
     score: f32,
+}
+
+// ─── ANN fusion ─────────────────────────────────────────────────────────────
+
+const RRF_K: usize = 60;
+
+fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_score: f32) {
+    let existing: HashSet<String> = fts_hits.iter().map(|h| h.id.clone()).collect();
+
+    // RRF boost for FTS hits that also appear in ANN results
+    let ann_ids: HashMap<String, usize> = ann_hits
+        .iter()
+        .enumerate()
+        .map(|(rank, (uuid, _))| (uuid.to_string(), rank + 1))
+        .collect();
+
+    for hit in fts_hits.iter_mut() {
+        if let Some(&ann_rank) = ann_ids.get(&hit.id) {
+            let rrf_boost = 1.0 / (RRF_K + ann_rank) as f32;
+            hit.score += rrf_boost;
+        }
+    }
+
+    // Inject ANN-only hits (semantic matches not found by FTS)
+    for (rank, (uuid, cosine)) in ann_hits.iter().enumerate() {
+        let id_str = uuid.to_string();
+        if existing.contains(&id_str) {
+            continue;
+        }
+        let rrf_score = 1.0 / (RRF_K + rank + 1) as f32;
+        if rrf_score < min_score && *cosine < min_score {
+            continue;
+        }
+        fts_hits.push(ScoredHit {
+            id: id_str,
+            slug: String::new(),
+            name: String::new(),
+            description: None,
+            tags: None,
+            finalized: false,
+            is_domain: false,
+            score: rrf_score,
+        });
+    }
+
+    fts_hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 // ─── candidate (tokenized) ───────────────────────────────────────────────────
