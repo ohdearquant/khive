@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::runtime::{parse_embedding_model_alias, KhiveRuntime, NamespaceToken};
+use crate::runtime::{parse_embedding_model_alias, sanitize_key, KhiveRuntime, NamespaceToken};
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
@@ -354,160 +354,180 @@ impl KhiveRuntime {
 
         for model_name in &model_names {
             // Derive the vec table name from the model name (must match vec_model_key logic).
-            let model_key: String = model_name
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            let vec_table = format!("vec_{model_key}");
+            let vec_table = format!("vec_{}", sanitize_key(model_name));
 
             // --- Entities: embed description where no vector entry exists ---
-            let entity_sql = SqlStatement {
-                sql: format!(
-                    "SELECT id, name, description FROM entities \
-                     WHERE namespace = ?1 AND deleted_at IS NULL \
-                     AND id NOT IN (\
-                         SELECT subject_id FROM {vec_table} \
-                         WHERE namespace = ?1 AND embedding_model = ?2 \
-                     ) LIMIT 500"
-                ),
-                params: vec![
-                    SqlValue::Text(ns.clone()),
-                    SqlValue::Text(model_name.clone()),
-                ],
-                label: Some("backfill_entities".into()),
-            };
+            // Loop until a batch returns fewer than PAGE_SIZE rows. Because the query uses
+            // NOT IN (SELECT subject_id FROM vec_table ...), each successfully inserted row is
+            // excluded from subsequent pages — no OFFSET needed.
+            const PAGE_SIZE: usize = 500;
+            let mut entity_total = 0usize;
+            loop {
+                let entity_sql = SqlStatement {
+                    sql: format!(
+                        "SELECT id, name, description FROM entities \
+                         WHERE namespace = ?1 AND deleted_at IS NULL \
+                         AND id NOT IN (\
+                             SELECT subject_id FROM {vec_table} \
+                             WHERE namespace = ?1 AND embedding_model = ?2 \
+                         ) LIMIT {PAGE_SIZE}"
+                    ),
+                    params: vec![
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Text(model_name.clone()),
+                    ],
+                    label: Some("backfill_entities".into()),
+                };
 
-            let entity_rows: Vec<SqlRow> = {
-                let sql = self.sql();
-                match sql.reader().await {
-                    Ok(mut reader) => reader.query_all(entity_sql).await.unwrap_or_default(),
-                    Err(_) => vec![],
-                }
-            };
+                let entity_rows: Vec<SqlRow> = {
+                    let sql = self.sql();
+                    match sql.reader().await {
+                        Ok(mut reader) => reader.query_all(entity_sql).await.unwrap_or_default(),
+                        Err(_) => vec![],
+                    }
+                };
 
-            for row in &entity_rows {
-                let id_str = row.columns.first().and_then(|c| {
-                    if let SqlValue::Text(s) = &c.value { Some(s.clone()) } else { None }
-                });
-                let description = row.columns.get(2).and_then(|c| {
-                    if let SqlValue::Text(s) = &c.value { Some(s.clone()) }
-                    else if let SqlValue::Null = &c.value { None }
-                    else { None }
-                });
+                let batch_len = entity_rows.len();
+                entity_total += batch_len;
 
-                let (Some(id_str), Some(desc)) = (id_str, description) else { continue };
-                let Ok(id) = id_str.parse::<Uuid>() else { continue };
-                if desc.trim().is_empty() { continue; }
+                for row in &entity_rows {
+                    let id_str = row.columns.first().and_then(|c| {
+                        if let SqlValue::Text(s) = &c.value { Some(s.clone()) } else { None }
+                    });
+                    let description = row.columns.get(2).and_then(|c| {
+                        if let SqlValue::Text(s) = &c.value { Some(s.clone()) }
+                        else if let SqlValue::Null = &c.value { None }
+                        else { None }
+                    });
 
-                match self.embed_with_model(model_name, &desc).await {
-                    Ok(vector) => {
-                        if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                            match vs.insert(id, SubstrateKind::Entity, &ns, "entity.description", vec![vector]).await {
-                                Ok(()) => { total_backfilled += 1; }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        id = %id, model = %model_name,
-                                        error = %e,
-                                        "backfill_missing_embeddings: entity vector insert failed"
-                                    );
+                    let (Some(id_str), Some(desc)) = (id_str, description) else { continue };
+                    let Ok(id) = id_str.parse::<Uuid>() else { continue };
+                    if desc.trim().is_empty() { continue; }
+
+                    match self.embed_with_model(model_name, &desc).await {
+                        Ok(vector) => {
+                            if let Ok(vs) = self.vectors_for_model(token, model_name) {
+                                match vs.insert(id, SubstrateKind::Entity, &ns, "entity.description", vec![vector]).await {
+                                    Ok(()) => { total_backfilled += 1; }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            id = %id, model = %model_name,
+                                            error = %e,
+                                            "backfill_missing_embeddings: entity vector insert failed"
+                                        );
+                                    }
                                 }
                             }
                         }
+                        Err(e) => {
+                            tracing::warn!(
+                                id = %id, model = %model_name,
+                                error = %e,
+                                "backfill_missing_embeddings: entity embed failed"
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            id = %id, model = %model_name,
-                            error = %e,
-                            "backfill_missing_embeddings: entity embed failed"
-                        );
-                    }
+                }
+
+                if batch_len < PAGE_SIZE {
+                    break;
                 }
             }
 
             // --- Notes: embed content where no vector entry exists ---
-            let note_sql = SqlStatement {
-                sql: format!(
-                    "SELECT id, content FROM notes \
-                     WHERE namespace = ?1 AND deleted_at IS NULL \
-                     AND id NOT IN (\
-                         SELECT subject_id FROM {vec_table} \
-                         WHERE namespace = ?1 AND embedding_model = ?2 \
-                     ) LIMIT 500"
-                ),
-                params: vec![
-                    SqlValue::Text(ns.clone()),
-                    SqlValue::Text(model_name.clone()),
-                ],
-                label: Some("backfill_notes".into()),
-            };
-
-            let note_rows: Vec<SqlRow> = {
-                let sql = self.sql();
-                match sql.reader().await {
-                    Ok(mut reader) => reader.query_all(note_sql).await.unwrap_or_default(),
-                    Err(_) => vec![],
-                }
-            };
-
             let text_store = self.text_for_notes(token).ok();
-            for row in &note_rows {
-                let id_str = row.columns.first().and_then(|c| {
-                    if let SqlValue::Text(s) = &c.value { Some(s.clone()) } else { None }
-                });
-                let content = row.columns.get(1).and_then(|c| {
-                    if let SqlValue::Text(s) = &c.value { Some(s.clone()) } else { None }
-                });
+            let mut note_total = 0usize;
+            loop {
+                let note_sql = SqlStatement {
+                    sql: format!(
+                        "SELECT id, content FROM notes \
+                         WHERE namespace = ?1 AND deleted_at IS NULL \
+                         AND id NOT IN (\
+                             SELECT subject_id FROM {vec_table} \
+                             WHERE namespace = ?1 AND embedding_model = ?2 \
+                         ) LIMIT {PAGE_SIZE}"
+                    ),
+                    params: vec![
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Text(model_name.clone()),
+                    ],
+                    label: Some("backfill_notes".into()),
+                };
 
-                let (Some(id_str), Some(content)) = (id_str, content) else { continue };
-                let Ok(id) = id_str.parse::<Uuid>() else { continue };
-                if content.trim().is_empty() { continue; }
-
-                // Repopulate FTS entry if missing (best-effort, first model only to avoid N duplicates).
-                if model_names.first().map(|n| n.as_str()) == Some(model_name.as_str()) {
-                    if let Some(ref ts) = text_store {
-                        let _ = ts.upsert_document(TextDocument {
-                            subject_id: id,
-                            namespace: ns.clone(),
-                            kind: SubstrateKind::Note,
-                            title: None,
-                            body: content.clone(),
-                            tags: vec![],
-                            metadata: None,
-                            updated_at: chrono::Utc::now(),
-                        }).await;
+                let note_rows: Vec<SqlRow> = {
+                    let sql = self.sql();
+                    match sql.reader().await {
+                        Ok(mut reader) => reader.query_all(note_sql).await.unwrap_or_default(),
+                        Err(_) => vec![],
                     }
-                }
+                };
 
-                match self.embed_with_model(model_name, &content).await {
-                    Ok(vector) => {
-                        if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                            match vs.insert(id, SubstrateKind::Note, &ns, "note.content", vec![vector]).await {
-                                Ok(()) => { total_backfilled += 1; }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        id = %id, model = %model_name,
-                                        error = %e,
-                                        "backfill_missing_embeddings: note vector insert failed"
-                                    );
+                let batch_len = note_rows.len();
+                note_total += batch_len;
+
+                for row in &note_rows {
+                    let id_str = row.columns.first().and_then(|c| {
+                        if let SqlValue::Text(s) = &c.value { Some(s.clone()) } else { None }
+                    });
+                    let content = row.columns.get(1).and_then(|c| {
+                        if let SqlValue::Text(s) = &c.value { Some(s.clone()) } else { None }
+                    });
+
+                    let (Some(id_str), Some(content)) = (id_str, content) else { continue };
+                    let Ok(id) = id_str.parse::<Uuid>() else { continue };
+                    if content.trim().is_empty() { continue; }
+
+                    // Repopulate FTS entry if missing (best-effort, first model only to avoid N duplicates).
+                    if model_names.first().map(|n| n.as_str()) == Some(model_name.as_str()) {
+                        if let Some(ref ts) = text_store {
+                            let _ = ts.upsert_document(TextDocument {
+                                subject_id: id,
+                                namespace: ns.clone(),
+                                kind: SubstrateKind::Note,
+                                title: None,
+                                body: content.clone(),
+                                tags: vec![],
+                                metadata: None,
+                                updated_at: chrono::Utc::now(),
+                            }).await;
+                        }
+                    }
+
+                    match self.embed_with_model(model_name, &content).await {
+                        Ok(vector) => {
+                            if let Ok(vs) = self.vectors_for_model(token, model_name) {
+                                match vs.insert(id, SubstrateKind::Note, &ns, "note.content", vec![vector]).await {
+                                    Ok(()) => { total_backfilled += 1; }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            id = %id, model = %model_name,
+                                            error = %e,
+                                            "backfill_missing_embeddings: note vector insert failed"
+                                        );
+                                    }
                                 }
                             }
                         }
+                        Err(e) => {
+                            tracing::warn!(
+                                id = %id, model = %model_name,
+                                error = %e,
+                                "backfill_missing_embeddings: note embed failed"
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            id = %id, model = %model_name,
-                            error = %e,
-                            "backfill_missing_embeddings: note embed failed"
-                        );
-                    }
+                }
+
+                if batch_len < PAGE_SIZE {
+                    break;
                 }
             }
 
             tracing::info!(
                 model = %model_name,
                 namespace = %ns,
-                entities = entity_rows.len(),
-                notes = note_rows.len(),
+                entities = entity_total,
+                notes = note_total,
                 "backfill_missing_embeddings: model pass complete"
             );
         }

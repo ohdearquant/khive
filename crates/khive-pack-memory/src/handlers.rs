@@ -168,6 +168,7 @@ const SALIENCE_AMPLIFIER_ALPHA: f64 = 1.5;
 
 fn compute_score(
     cfg: &RecallConfig,
+    pipeline: &MemoryRecallPipeline,
     raw_relevance: f64,
     salience: f64,
     decay_factor: f64,
@@ -177,6 +178,8 @@ fn compute_score(
     let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
 
     // Compute intermediate signals for the breakdown (backward compat).
+    // Uses the configured DecayModel so Hyperbolic, PowerLaw, and None variants
+    // produce correct effective_salience (fixes F1: was hardcoded to Exponential).
     let effective_salience = cfg.decay_model.apply(
         salience,
         age_days,
@@ -188,9 +191,9 @@ fn compute_score(
         (-k * age_days).exp()
     };
 
-    // Build a NoteCandidate carrying the pre-normalized relevance as rrf_score.
-    // The pipeline uses RrfFusionObjective (reads rrf_score), AmplifiedDecayAwareSalienceObjective
-    // (reads salience + decay_factor + age_days), and TemporalRecencyObjective (reads age_days).
+    // Build a NoteCandidate carrying the pre-normalized relevance as rrf_score
+    // and the pre-computed effective_salience so AmplifiedDecayAwareSalienceObjective
+    // can use the correct DecayModel result rather than recomputing with Exponential.
     use uuid::Uuid;
     let candidate = NoteCandidate {
         id: Uuid::nil(), // scoring is pure math; UUID is unused by objectives
@@ -198,17 +201,10 @@ fn compute_score(
         salience,
         decay_factor,
         age_days,
+        effective_salience,
         rerank_scores: std::collections::HashMap::new(),
     };
 
-    // Build and run the pipeline with the config's weight parameters.
-    let pipeline = MemoryRecallPipeline::new(
-        cfg.relevance_weight,
-        cfg.salience_weight,
-        cfg.temporal_weight,
-        cfg.temporal_half_life_days,
-        SALIENCE_AMPLIFIER_ALPHA,
-    );
     let total = pipeline.score(&candidate);
 
     // Compute per-component contributions for the breakdown (verbose mode).
@@ -233,6 +229,20 @@ fn compute_score(
         },
     };
     (total, breakdown)
+}
+
+/// Build a `MemoryRecallPipeline` from a `RecallConfig`.
+///
+/// Extracted so callers can construct the pipeline once before a scoring loop
+/// rather than allocating 3 `Box<dyn Objective>` per candidate (F4 fix).
+fn make_pipeline(cfg: &RecallConfig) -> MemoryRecallPipeline {
+    MemoryRecallPipeline::new(
+        cfg.relevance_weight,
+        cfg.salience_weight,
+        cfg.temporal_weight,
+        cfg.temporal_half_life_days,
+        SALIENCE_AMPLIFIER_ALPHA,
+    )
 }
 
 struct RecallCandidateSet {
@@ -1012,6 +1022,9 @@ impl MemoryPack {
             note: khive_storage::note::Note,
         }
 
+        // Build the scoring pipeline once before the loop (F4: was rebuilt per candidate).
+        let recall_pipeline = make_pipeline(&cfg);
+
         let mut ranked: Vec<ScoredNote> = Vec::new();
         for hit in &fused {
             let id = hit.entity_id;
@@ -1074,6 +1087,7 @@ impl MemoryPack {
                 ((now_micros - note.created_at).max(0) as f64) / (1_000_000.0 * 86_400.0);
             let (_, breakdown) = compute_score(
                 &cfg,
+                &recall_pipeline,
                 norm_relevance as f64,
                 salience,
                 decay_factor,
@@ -1631,7 +1645,8 @@ impl MemoryPack {
         let p: ScoreParams = deser(params)?;
         let cfg = p.config.unwrap_or_else(|| self.active_config());
         cfg.validate()?;
-        let (total, breakdown) = compute_score(&cfg, p.rrf, p.salience, p.decay_factor, p.age_days);
+        let pipeline = make_pipeline(&cfg);
+        let (total, breakdown) = compute_score(&cfg, &pipeline, p.rrf, p.salience, p.decay_factor, p.age_days);
         to_json(&json!({
             "total": total,
             "breakdown": breakdown,
@@ -1923,7 +1938,8 @@ mod tests {
         let salience = 0.8;
         let decay_factor = 0.01;
         let age_days = 0.0;
-        let (total, bd) = compute_score(&cfg, relevance, salience, decay_factor, age_days);
+        let pipeline = make_pipeline(&cfg);
+        let (total, bd) = compute_score(&cfg, &pipeline, relevance, salience, decay_factor, age_days);
         // At age=0: salience_decayed = salience = 0.8, temporal = 1.0
         // amplified = 0.8^1.5 ≈ 0.71554
         // total = 0.70*0.5 + 0.20*0.71554 + 0.10*1.0 ≈ 0.35 + 0.14311 + 0.10 ≈ 0.59311
@@ -1948,7 +1964,8 @@ mod tests {
             ..RecallConfig::default()
         };
         let raw_rrf_rank1 = 1.0 / 61.0;
-        let (_, bd) = compute_score(&cfg, raw_rrf_rank1, 1.0, 0.0, 0.0);
+        let pipeline = make_pipeline(&cfg);
+        let (_, bd) = compute_score(&cfg, &pipeline, raw_rrf_rank1, 1.0, 0.0, 0.0);
         assert!(
             (bd.relevance - 1.0).abs() < 1e-10,
             "RRF rank-1 relevance should normalize to 1.0, got {}",
@@ -1967,7 +1984,8 @@ mod tests {
             ..RecallConfig::default()
         };
         let raw_rrf_two_sources = 2.0 / 61.0; // rank-1 in both vector and text
-        let (total, bd) = compute_score(&cfg, raw_rrf_two_sources, 1.0, 0.0, 0.0);
+        let pipeline = make_pipeline(&cfg);
+        let (total, bd) = compute_score(&cfg, &pipeline, raw_rrf_two_sources, 1.0, 0.0, 0.0);
         assert!(
             bd.relevance <= 1.0,
             "relevance must not exceed 1.0 for multi-source RRF, got {}",
@@ -1994,7 +2012,8 @@ mod tests {
             ..RecallConfig::default()
         };
         let age_days = std::f64::consts::LN_2 / 0.01;
-        let (_, bd) = compute_score(&cfg, 0.5, 1.0, 0.01, age_days);
+        let pipeline = make_pipeline(&cfg);
+        let (_, bd) = compute_score(&cfg, &pipeline, 0.5, 1.0, 0.01, age_days);
         assert!(
             (bd.salience_decayed - 0.5).abs() < 1e-10,
             "salience_decayed = {}",
@@ -2012,7 +2031,8 @@ mod tests {
             temporal_half_life_days: 30.0,
             ..RecallConfig::default()
         };
-        let (_, bd) = compute_score(&cfg, 0.5, 1.0, 0.01, 30.0);
+        let pipeline = make_pipeline(&cfg);
+        let (_, bd) = compute_score(&cfg, &pipeline, 0.5, 1.0, 0.01, 30.0);
         // At age = temporal_half_life = 30 days: temporal = exp(-ln2/30 * 30) = 0.5
         assert!(
             (bd.temporal - 0.5).abs() < 1e-10,
@@ -2033,7 +2053,8 @@ mod tests {
             },
             ..RecallConfig::default()
         };
-        let (total, _) = compute_score(&cfg, 0.8, 0.9, 0.01, 10.0);
+        let pipeline = make_pipeline(&cfg);
+        let (total, _) = compute_score(&cfg, &pipeline, 0.8, 0.9, 0.01, 10.0);
         // Only relevance matters: total = 0.8
         assert!((total - 0.8).abs() < 1e-10, "got {total}");
     }
@@ -2209,9 +2230,10 @@ mod tests {
         let relevance = 0.5; // identical for both
         let age_days = 0.0; // brand new
         let decay_factor = 0.01;
+        let pipeline = make_pipeline(&cfg);
 
-        let (score_high, _) = compute_score(&cfg, relevance, 0.9, decay_factor, age_days);
-        let (score_low, _) = compute_score(&cfg, relevance, 0.3, decay_factor, age_days);
+        let (score_high, _) = compute_score(&cfg, &pipeline, relevance, 0.9, decay_factor, age_days);
+        let (score_low, _) = compute_score(&cfg, &pipeline, relevance, 0.3, decay_factor, age_days);
 
         assert!(
             score_high > score_low,
@@ -2231,9 +2253,10 @@ mod tests {
         let cfg = RecallConfig::default();
         let relevance = 0.0; // zero out relevance to isolate salience contribution
         let age_days = 0.0;
+        let pipeline = make_pipeline(&cfg);
 
-        let (score_high, _) = compute_score(&cfg, relevance, 0.9, 0.0, age_days);
-        let (score_low, _) = compute_score(&cfg, relevance, 0.3, 0.0, age_days);
+        let (score_high, _) = compute_score(&cfg, &pipeline, relevance, 0.9, 0.0, age_days);
+        let (score_low, _) = compute_score(&cfg, &pipeline, relevance, 0.3, 0.0, age_days);
         let amplified_spread = score_high - score_low;
 
         // Linear spread without amplification: 0.20*(0.9-0.3) = 0.12
@@ -2345,9 +2368,10 @@ mod tests {
             },
         ];
         for cfg in &cfgs {
+            let pipeline = make_pipeline(cfg);
             for raw_relevance in [0.0, 0.5, 1.0, 2.0 / 61.0, 1.0 / 61.0] {
                 for salience in [0.0, 0.3, 0.9, 1.0] {
-                    let (total, _) = compute_score(cfg, raw_relevance, salience, 0.01, 0.0);
+                    let (total, _) = compute_score(cfg, &pipeline, raw_relevance, salience, 0.01, 0.0);
                     assert!(
                         (0.0..=1.0).contains(&total),
                         "composite score out of [0,1]: {total} (relevance={raw_relevance}, salience={salience}, strategy={:?})",
@@ -2386,14 +2410,15 @@ mod tests {
         let cfg = RecallConfig::default();
         let age_days = 0.0;
         let decay = 0.01;
+        let pipeline = make_pipeline(&cfg);
 
         // Simulates the audit scenario: low-salience has better relevance (0.9 vs 0.8)
         // but high-salience should still win thanks to the amplifier.
         let relevance_low = 0.9;
         let relevance_high = 0.8;
 
-        let (score_high, _) = compute_score(&cfg, relevance_high, 0.9, decay, age_days);
-        let (score_low, _) = compute_score(&cfg, relevance_low, 0.3, decay, age_days);
+        let (score_high, _) = compute_score(&cfg, &pipeline, relevance_high, 0.9, decay, age_days);
+        let (score_low, _) = compute_score(&cfg, &pipeline, relevance_low, 0.3, decay, age_days);
 
         assert!(
             score_high > score_low,

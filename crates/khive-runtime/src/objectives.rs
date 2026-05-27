@@ -167,6 +167,12 @@ pub struct NoteCandidate {
     pub decay_factor: f64,
     /// Age of the note in days at query time.
     pub age_days: f64,
+    /// Salience after applying the configured `DecayModel` (pre-computed by the caller).
+    ///
+    /// The caller must set this to `DecayModel::apply(salience, age_days, decay_factor, half_life)`
+    /// so that objectives respect the configured decay model variant rather than
+    /// always applying exponential decay. When not set, defaults to 0.0.
+    pub effective_salience: f64,
     /// Per-reranker scores populated by the rerank stage.
     /// Keyed by reranker name (e.g. "cross_encoder", "salience", "graph_proximity").
     pub rerank_scores: HashMap<String, f64>,
@@ -257,8 +263,10 @@ impl AmplifiedDecayAwareSalienceObjective {
 impl Objective<NoteCandidate> for AmplifiedDecayAwareSalienceObjective {
     #[inline]
     fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
-        let decayed = candidate.salience * (-candidate.decay_factor * candidate.age_days).exp();
-        decayed.powf(self.alpha)
+        // Use the pre-computed effective_salience which was produced by the caller
+        // via DecayModel::apply(). This respects all four DecayModel variants
+        // (Exponential, Hyperbolic, PowerLaw, None) instead of hardcoding exponential.
+        candidate.effective_salience.powf(self.alpha)
     }
 
     fn name(&self) -> &str {
@@ -436,12 +444,15 @@ mod tests {
         decay_factor: f64,
         age_days: f64,
     ) -> NoteCandidate {
+        // For tests, compute effective_salience using the default Exponential formula.
+        let effective_salience = salience * (-decay_factor * age_days).exp();
         NoteCandidate {
             id: Uuid::new_v4(),
             rrf_score: rrf,
             salience,
             decay_factor,
             age_days,
+            effective_salience,
             rerank_scores: HashMap::new(),
         }
     }
@@ -635,6 +646,7 @@ mod tests {
             salience: 0.5,
             decay_factor: 0.01,
             age_days: 0.0,
+            effective_salience: 0.5,
             rerank_scores: HashMap::new(),
         };
         assert_eq!(c.id(), id);
@@ -761,6 +773,7 @@ mod tests {
             salience: 0.8,
             decay_factor: 0.01,
             age_days: 0.0,
+            effective_salience: 0.8, // age=0, so effective_salience == salience
             rerank_scores: HashMap::new(),
         };
         let pipeline = WeightedObjective::<NoteCandidate>::new()
