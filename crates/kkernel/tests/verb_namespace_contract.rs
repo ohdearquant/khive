@@ -1,6 +1,6 @@
 //! Contract test: every non-kg verb must be namespaced as `<pack>.<verb>`.
 //!
-//! ADR-023 §4 establishes that the kg substrate pack owns the 14 bare verb
+//! ADR-023 §4 establishes that the kg substrate pack owns the 16 bare verb
 //! names (create, get, list, …). Every other pack must prefix its verbs with
 //! the pack name followed by a single dot: `memory.recall`, `gtd.assign`, etc.
 //! Sub-variants use a single additional underscore-delimited segment, NOT a
@@ -8,7 +8,7 @@
 //!
 //! This test walks every `HandlerDef` across every pack registered in the
 //! `inventory` (i.e. linked into this test binary) and asserts:
-//!   1. A name without a dot must be in the kg-substrate-14 allowlist.
+//!   1. A name without a dot must be in the kg-substrate-16 allowlist.
 //!   2. A name with exactly one dot must have a prefix equal to `Pack::NAME`
 //!      (validated via `all_handlers_with_names`).
 //!   3. A name with two or more dots is always invalid — sub-variants use
@@ -105,7 +105,7 @@ fn every_non_kg_verb_is_namespaced() {
                 if !KG_SUBSTRATE_VERBS.contains(&verb_name.as_str()) {
                     violations.push(format!(
                         "pack={pack_name:?} verb={verb_name:?}: bare name is not in the \
-                         kg-substrate-14 allowlist (ADR-023 §4). Add `{pack_name}.` prefix."
+                         kg-substrate-16 allowlist (ADR-023 §4). Add `{pack_name}.` prefix."
                     ));
                 }
             }
@@ -137,7 +137,7 @@ fn every_non_kg_verb_is_namespaced() {
     );
 }
 
-/// Complementary check: the kg substrate pack must expose all 14 mandated bare
+/// Complementary check: the kg substrate pack must expose all 16 mandated bare
 /// verbs and no dotted ones. This catches regressions in the kg pack itself.
 #[test]
 fn kg_pack_exposes_bare_verbs_only() {
@@ -149,7 +149,7 @@ fn kg_pack_exposes_bare_verbs_only() {
         .map(|(_, verb)| verb.as_str())
         .collect();
 
-    // Every kg-substrate-14 name must be present.
+    // Every kg-substrate-16 name must be present.
     let missing: Vec<&&str> = KG_SUBSTRATE_VERBS
         .iter()
         .filter(|v| !kg_verbs.contains(v))
