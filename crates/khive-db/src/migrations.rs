@@ -1726,7 +1726,19 @@ mod tests {
         }
 
         // Verify knowledge_sections columns.
-        for col in ["id", "atom_id", "namespace", "section_type", "heading", "content", "tokens", "sort_order", "embedding", "created_at", "updated_at"] {
+        for col in [
+            "id",
+            "atom_id",
+            "namespace",
+            "section_type",
+            "heading",
+            "content",
+            "tokens",
+            "sort_order",
+            "embedding",
+            "created_at",
+            "updated_at",
+        ] {
             let exists: bool = conn
                 .query_row(
                     "SELECT COUNT(*) > 0 FROM pragma_table_info('knowledge_sections') WHERE name = ?1",

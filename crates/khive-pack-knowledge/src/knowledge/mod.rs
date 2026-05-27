@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::knowledge::schema::{
-    Atom, DeleteAtomsParams, Domain, EditParams, FoldCandidate, FoldParams, GetParams, ImportParams,
-    IndexParams, ListParams, SearchParams, Section, SectionType, UpsertAtomsParams,
+    Atom, DeleteAtomsParams, Domain, EditParams, FoldCandidate, FoldParams, GetParams,
+    ImportParams, IndexParams, ListParams, SearchParams, Section, SectionType, UpsertAtomsParams,
     UpsertDomainsParams,
 };
 
@@ -1762,11 +1762,7 @@ impl KnowledgeHandlers {
 
         for su in &p.sections {
             let stype = parse_section_type(&su.section_type)?;
-            let heading = su
-                .heading
-                .as_deref()
-                .unwrap_or(stype.as_str())
-                .to_string();
+            let heading = su.heading.as_deref().unwrap_or(stype.as_str()).to_string();
             let tokens = count_tokens(&su.content);
             let sort_order = su.sort_order.unwrap_or_else(|| {
                 SectionType::ALL
@@ -1919,9 +1915,8 @@ impl KnowledgeHandlers {
         let mut imported_sections = 0usize;
 
         for file in &files {
-            let content = std::fs::read_to_string(file).map_err(|e| {
-                RuntimeError::Internal(format!("failed to read {:?}: {e}", file))
-            })?;
+            let content = std::fs::read_to_string(file)
+                .map_err(|e| RuntimeError::Internal(format!("failed to read {:?}: {e}", file)))?;
 
             let stem = file
                 .file_stem()
@@ -2001,7 +1996,13 @@ fn collect_md_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 fn to_slug(stem: &str) -> String {
     stem.to_ascii_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
@@ -2062,8 +2063,7 @@ fn parse_atlas_md(content: &str) -> (String, String, Vec<(SectionType, String, S
                 in_pre = false;
             }
             let heading_text = rest.trim().to_string();
-            let stype = SectionType::from_str_loose(&heading_text)
-                .unwrap_or(SectionType::Other);
+            let stype = SectionType::from_str_loose(&heading_text).unwrap_or(SectionType::Other);
             current_heading = Some((stype, heading_text));
             continue;
         }

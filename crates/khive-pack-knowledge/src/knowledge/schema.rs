@@ -81,7 +81,12 @@ impl SectionType {
     ///
     /// Also accepts common heading aliases used in atlas markdown files.
     pub fn from_str_loose(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
             "overview" | "introduction" | "intro" | "context" | "motivation" | "background" => {
                 Some(Self::Overview)
             }
@@ -95,16 +100,8 @@ impl SectionType {
             | "constraints"
             | "prerequisites"
             | "preconditions" => Some(Self::BoundaryConditions),
-            "formalism"
-            | "formal"
-            | "theory"
-            | "math"
-            | "mathematics"
-            | "theorems"
-            | "algorithm"
-            | "algorithms"
-            | "proof"
-            | "complexity" => Some(Self::Formalism),
+            "formalism" | "formal" | "theory" | "math" | "mathematics" | "theorems"
+            | "algorithm" | "algorithms" | "proof" | "complexity" => Some(Self::Formalism),
             "operational_guidance"
             | "operational guidance"
             | "implementation"
@@ -121,28 +118,13 @@ impl SectionType {
             | "best practices" => Some(Self::OperationalGuidance),
             "examples" | "example" | "worked_examples" | "worked examples" | "case_study"
             | "case study" | "cases" | "demos" | "demo" => Some(Self::Examples),
-            "failure_modes"
-            | "failure modes"
-            | "pitfalls"
-            | "anti_patterns"
-            | "anti patterns"
-            | "antipatterns"
-            | "gotchas"
-            | "edge_cases"
-            | "edge cases"
-            | "warnings"
+            "failure_modes" | "failure modes" | "pitfalls" | "anti_patterns" | "anti patterns"
+            | "antipatterns" | "gotchas" | "edge_cases" | "edge cases" | "warnings"
             | "cautions" => Some(Self::FailureModes),
-            "expert_lens"
-            | "expert lens"
-            | "trade_offs"
-            | "trade offs"
-            | "tradeoffs"
-            | "advanced"
-            | "nuances"
-            | "insights"
-            | "discussion" => Some(Self::ExpertLens),
-            "references" | "reference" | "bibliography" | "related" | "see_also"
-            | "see also" | "further_reading" | "further reading" | "citations" | "links" => {
+            "expert_lens" | "expert lens" | "trade_offs" | "trade offs" | "tradeoffs"
+            | "advanced" | "nuances" | "insights" | "discussion" => Some(Self::ExpertLens),
+            "references" | "reference" | "bibliography" | "related" | "see_also" | "see also"
+            | "further_reading" | "further reading" | "citations" | "links" => {
                 Some(Self::References)
             }
             "other" | "misc" | "miscellaneous" | "notes" | "appendix" => Some(Self::Other),

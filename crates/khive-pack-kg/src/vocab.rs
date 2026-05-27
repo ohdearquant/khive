@@ -198,7 +198,11 @@ mod tests {
         // ADR-048: aliases for resource entity_type values.
         for alias in ["atom", "runbook", "template", "prompt", "skill", "tool"] {
             let parsed = EntityKind::from_str(alias).unwrap();
-            assert_eq!(parsed, EntityKind::Resource, "alias {alias:?} must map to Resource");
+            assert_eq!(
+                parsed,
+                EntityKind::Resource,
+                "alias {alias:?} must map to Resource"
+            );
         }
     }
 

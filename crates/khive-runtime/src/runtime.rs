@@ -187,7 +187,13 @@ impl Default for RuntimeConfig {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| {
                 vec![
-                    "kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge",
+                    "kg",
+                    "gtd",
+                    "memory",
+                    "brain",
+                    "comm",
+                    "schedule",
+                    "knowledge",
                 ]
                 .into_iter()
                 .map(String::from)
