@@ -86,7 +86,7 @@ fn pack_verbs_returns_fifteen() {
     assert_eq!(
         pack.verbs().len(),
         15,
-        "KgPack must expose exactly 15 verbs (14 original + verbs introspection)"
+        "KgPack must expose exactly 15 verbs"
     );
 }
 
@@ -4313,5 +4313,342 @@ async fn withdraw_on_already_withdrawn_proposal_returns_error() {
     assert!(
         second_withdraw.is_err(),
         "BUG-4: second withdraw must return error (proposal already withdrawn); got: {second_withdraw:?}"
+    );
+}
+
+// ---- Issue #489: create_linked — entity creation with immediate edge attachment ----
+
+/// Happy path: create an entity with a valid edge spec.
+/// Response must include the created entity fields plus an `edges` array with one entry.
+#[tokio::test]
+async fn create_entity_with_edges_returns_entity_and_edge() {
+    let f = pack();
+
+    let target = f
+        .dispatch(
+            "create",
+            json!({ "kind": "concept", "name": "TargetConcept489" }),
+        )
+        .await
+        .expect("create target entity");
+    let target_id = target["id"].as_str().expect("target id");
+
+    let result = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "SourceConcept489",
+                "edges": [
+                    { "target_id": target_id, "relation": "extends" }
+                ],
+            }),
+        )
+        .await
+        .expect("create with edges must succeed");
+
+    assert!(
+        result["id"].as_str().is_some(),
+        "#489: response must contain entity id; got: {result}"
+    );
+    assert_eq!(
+        result["kind"].as_str(),
+        Some("concept"),
+        "#489: response must carry entity kind"
+    );
+
+    let edges = result["edges"]
+        .as_array()
+        .expect("#489: response must contain 'edges' array");
+    assert_eq!(
+        edges.len(),
+        1,
+        "#489: exactly one edge must have been created; got: {edges:?}"
+    );
+
+    assert!(
+        result.get("edge_errors").is_none(),
+        "#489: no edge_errors expected; got: {result}"
+    );
+}
+
+/// When `edges` is absent the response is unchanged from the normal create response.
+#[tokio::test]
+async fn create_entity_without_edges_returns_normal_response() {
+    let f = pack();
+
+    let result = f
+        .dispatch(
+            "create",
+            json!({ "kind": "concept", "name": "NormalConcept489" }),
+        )
+        .await
+        .expect("create without edges must succeed");
+
+    assert!(
+        result["id"].as_str().is_some(),
+        "#489: response must contain entity id; got: {result}"
+    );
+    assert!(
+        result.get("edges").is_none(),
+        "#489: no edges key expected when edges param absent; got: {result}"
+    );
+}
+
+/// When an edge spec has an invalid relation the entity is still created and the
+/// error is reported in `edge_errors` (individual failure, no rollback).
+#[tokio::test]
+async fn create_entity_with_invalid_edge_relation_reports_error_entity_survives() {
+    let f = pack();
+
+    let target = f
+        .dispatch(
+            "create",
+            json!({ "kind": "concept", "name": "EdgeTarget489b" }),
+        )
+        .await
+        .expect("create target");
+    let target_id = target["id"].as_str().expect("target id");
+
+    let result = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "EdgeSource489b",
+                "edges": [
+                    { "target_id": target_id, "relation": "not_a_real_relation" }
+                ],
+            }),
+        )
+        .await
+        .expect("create must succeed even when edge spec is invalid");
+
+    assert!(
+        result["id"].as_str().is_some(),
+        "#489: entity must be created even when edge fails; got: {result}"
+    );
+
+    let edges = result["edges"]
+        .as_array()
+        .expect("#489: edges array must be present");
+    assert!(
+        edges.is_empty(),
+        "#489: edges must be empty when all fail; got: {edges:?}"
+    );
+
+    let errs = result["edge_errors"]
+        .as_array()
+        .expect("#489: edge_errors must be present when edge fails");
+    assert_eq!(errs.len(), 1, "#489: exactly one edge error; got: {errs:?}");
+    assert_eq!(
+        errs[0]["index"].as_u64(),
+        Some(0),
+        "#489: error index must be 0"
+    );
+}
+
+/// When an edge spec has an unknown target_id the entity is still created and
+/// the lookup failure is reported in `edge_errors`.
+#[tokio::test]
+async fn create_entity_with_unknown_target_id_reports_error_entity_survives() {
+    let f = pack();
+
+    let result = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "EdgeSource489c",
+                "edges": [
+                    { "target_id": "00000000-0000-0000-0000-000000000001", "relation": "extends" }
+                ],
+            }),
+        )
+        .await
+        .expect("create must succeed even when target does not exist");
+
+    assert!(
+        result["id"].as_str().is_some(),
+        "#489: entity must be created even when target lookup fails; got: {result}"
+    );
+
+    let errs = result["edge_errors"]
+        .as_array()
+        .expect("#489: edge_errors must be present when target is not found");
+    assert_eq!(errs.len(), 1, "#489: one error expected; got: {errs:?}");
+}
+
+/// Multiple edges: one valid, one with an invalid relation.
+/// Entity created, one edge in results, one error in edge_errors.
+#[tokio::test]
+async fn create_entity_with_mixed_edges_partial_success() {
+    let f = pack();
+
+    let target = f
+        .dispatch(
+            "create",
+            json!({ "kind": "concept", "name": "EdgeTarget489d" }),
+        )
+        .await
+        .expect("create target");
+    let target_id = target["id"].as_str().expect("target id");
+
+    let result = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "EdgeSource489d",
+                "edges": [
+                    { "target_id": target_id, "relation": "extends" },
+                    { "target_id": target_id, "relation": "totally_invalid" },
+                ],
+            }),
+        )
+        .await
+        .expect("create must succeed with partial edge failure");
+
+    let edges = result["edges"]
+        .as_array()
+        .expect("#489: edges array must be present");
+    assert_eq!(edges.len(), 1, "#489: one successful edge; got: {edges:?}");
+
+    let errs = result["edge_errors"]
+        .as_array()
+        .expect("#489: edge_errors must be present");
+    assert_eq!(errs.len(), 1, "#489: one failed edge; got: {errs:?}");
+}
+
+// ---- Issue #487: dedup guard tests ----
+
+// Creating a uniquely-named entity produces no `similar_existing` field.
+#[tokio::test]
+async fn create_entity_dedup_no_similar_when_unique() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Completely Unique Entity XYZ123",
+            }),
+        )
+        .await
+        .expect("create must succeed");
+
+    assert!(
+        result.get("similar_existing").is_none(),
+        "#487: no similar_existing when no duplicates exist; got: {result}"
+    );
+}
+
+// Creating a second entity with the same name should surface the first as
+// similar_existing.
+#[tokio::test]
+async fn create_entity_dedup_surfaces_similar_entity() {
+    let pack = pack();
+
+    // Create the first entity.
+    let _first = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "FlashAttention",
+            }),
+        )
+        .await
+        .expect("first create must succeed");
+
+    // Create a second entity with the same name. The first should appear in
+    // similar_existing.
+    let second = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "FlashAttention",
+            }),
+        )
+        .await
+        .expect("second create must succeed (dedup is advisory only)");
+
+    let similar = second.get("similar_existing");
+    assert!(
+        similar.is_some(),
+        "#487: similar_existing must be present when a duplicate name exists; got: {second}"
+    );
+    let arr = similar
+        .unwrap()
+        .as_array()
+        .expect("similar_existing must be an array");
+    assert!(
+        !arr.is_empty(),
+        "#487: similar_existing array must be non-empty; got: {second}"
+    );
+    let first_hit = &arr[0];
+    assert!(
+        first_hit.get("id").is_some(),
+        "#487: each similar entry must have an id field; got: {first_hit}"
+    );
+    assert!(
+        first_hit.get("score").is_some(),
+        "#487: each similar entry must have a score field; got: {first_hit}"
+    );
+}
+
+// skip_dedup_check=true suppresses the similarity search entirely.
+#[tokio::test]
+async fn create_entity_dedup_skipped_when_skip_flag_set() {
+    let pack = pack();
+
+    // Create baseline entity.
+    pack.dispatch(
+        "create",
+        json!({ "kind": "concept", "name": "SkipDedupTestEntity" }),
+    )
+    .await
+    .expect("first create must succeed");
+
+    // Create duplicate with skip_dedup_check=true.
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "SkipDedupTestEntity",
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("create with skip_dedup_check must succeed");
+
+    assert!(
+        result.get("similar_existing").is_none(),
+        "#487: skip_dedup_check=true must suppress similar_existing; got: {result}"
+    );
+}
+
+// Note creates never run the dedup check.
+#[tokio::test]
+async fn create_note_dedup_never_runs() {
+    let pack = pack();
+
+    // Create a note — the dedup field must not appear in the response.
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": "Some observation content",
+            }),
+        )
+        .await
+        .expect("note create must succeed");
+
+    assert!(
+        result.get("similar_existing").is_none(),
+        "#487: dedup guard must not run for note creates; got: {result}"
     );
 }
