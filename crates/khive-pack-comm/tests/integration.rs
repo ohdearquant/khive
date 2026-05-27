@@ -95,7 +95,7 @@ async fn read_marks_message_as_read() {
         .expect("send succeeds");
 
     // Find the inbound copy in the caller namespace.
-    let caller_token = rt.authorize(khive_runtime::Namespace::parse("local").unwrap());
+    let caller_token = rt.authorize(khive_runtime::Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -236,7 +236,7 @@ async fn test_read_accepts_short_id() {
         .expect("send succeeds");
 
     // Locate the inbound copy.
-    let caller_token = rt.authorize(khive_runtime::Namespace::parse("local").unwrap());
+    let caller_token = rt.authorize(khive_runtime::Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -330,7 +330,7 @@ async fn test_short_id_collision_errors_clearly() {
     use uuid::Uuid;
 
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let token = rt.authorize(khive_runtime::Namespace::local());
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
     // Construct two UUIDs that share the first 8 hex chars (before the first '-').
     let base = "aabbccdd";
@@ -415,7 +415,7 @@ async fn test_send_writes_outbound_in_caller_ns() {
         .expect("same-namespace send succeeds");
 
     // Verify: lambda:khive namespace has exactly 1 outbound note.
-    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -464,7 +464,7 @@ async fn test_send_writes_inbound_in_recipient_ns() {
         .expect("same-namespace send succeeds");
 
     // Verify: lambda:khive namespace has exactly 1 inbound note.
-    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -560,7 +560,7 @@ async fn test_send_to_self_writes_two_notes() {
         .await
         .expect("send-to-self succeeds");
 
-    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -840,7 +840,7 @@ async fn test_send_inbound_failure_rolls_back_outbound() {
     );
 
     // Atomicity: no outbound note should remain in lambda:khive.
-    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -1261,7 +1261,7 @@ async fn test_thread_rejects_non_message_root() {
     // Resolve the short id to full UUID if needed.
     let full_id = if obs_full_id.len() == 8 {
         // Need to get the full UUID from the note store.
-        let tok = rt.authorize(khive_runtime::Namespace::parse("local").unwrap());
+        let tok = rt.authorize(khive_runtime::Namespace::parse("local").unwrap()).unwrap();
         let notes = rt
             .list_notes(&tok, Some("observation"), 10, 0)
             .await
@@ -1324,7 +1324,7 @@ async fn test_inbox_paginated_scan_finds_message_beyond_prefetch_window() {
     for i in 0..25u32 {
         // Cross-namespace send: outbound stays in "local", inbound goes to "lambda:other".
         // We need a second runtime/registry scoped to "local" to write outbound notes.
-        let tok = rt.authorize(khive_runtime::Namespace::parse("local").unwrap());
+        let tok = rt.authorize(khive_runtime::Namespace::parse("local").unwrap()).unwrap();
         let _ = rt
             .create_note(
                 &tok,
@@ -1489,7 +1489,7 @@ async fn test_cross_namespace_thread_query_finds_reply() {
         .expect("send returns full_id");
 
     // Find the inbound copy — it has a different UUID from the outbound copy.
-    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -1573,7 +1573,7 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
         .expect("outbound full_id");
 
     // Find the inbound copy (direction=inbound) — it has a different UUID.
-    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let caller_token = rt.authorize(Namespace::parse("lambda:khive").unwrap()).unwrap();
     let notes = rt
         .list_notes(&caller_token, Some("message"), 100, 0)
         .await
@@ -1648,7 +1648,7 @@ async fn test_thread_resolves_from_inbound_copy_uuid() {
 async fn test_list_message_finds_match_beyond_1000_backlog() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
 
-    let tok = rt.authorize(Namespace::parse("lambda:khive").unwrap());
+    let tok = rt.authorize(Namespace::parse("lambda:khive").unwrap()).unwrap();
 
     // Write the inbound target FIRST so it is stored with the earliest created_at.
     // Notes are returned newest-first by the DB; if the target were written last it
@@ -1759,14 +1759,14 @@ async fn test_cross_namespace_send_denied_issue_481() {
         "#481 regression: error must mention the denied namespace or 'cross-namespace'; got {err:?}"
     );
 
-    let recipient_token = rt.authorize(khive_runtime::Namespace::parse("lambda:leo").unwrap());
+    let recipient_token = rt.authorize(khive_runtime::Namespace::parse("lambda:leo").unwrap()).unwrap();
     let notes = rt
         .list_notes(&recipient_token, Some("message"), 100, 0)
         .await
         .expect("list_notes in recipient ns");
     assert_eq!(notes.len(), 0, "#481 regression: no note in recipient ns");
 
-    let sender_token = rt.authorize(khive_runtime::Namespace::parse("lambda:khive").unwrap());
+    let sender_token = rt.authorize(khive_runtime::Namespace::parse("lambda:khive").unwrap()).unwrap();
     let sender_notes = rt
         .list_notes(&sender_token, Some("message"), 100, 0)
         .await

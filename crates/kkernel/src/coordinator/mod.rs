@@ -438,7 +438,7 @@ impl SubstrateCoordinator {
         // Single-backend shortcut: avoid tokio::spawn overhead.
         if entries.len() == 1 {
             let (backend_id, runtime) = &entries[0];
-            let token = runtime.authorize(namespace.clone());
+            let token = runtime.authorize(namespace.clone()).unwrap();
             let ns_str = namespace.as_str().to_string();
 
             // Entity probe.
@@ -484,7 +484,7 @@ impl SubstrateCoordinator {
             let ns = ns_clone.clone();
             let locator = Arc::clone(&locator);
             let handle = tokio::spawn(async move {
-                let token = runtime.authorize(ns.clone());
+                let token = runtime.authorize(ns.clone()).unwrap();
                 let ns_str = ns.as_str().to_string();
 
                 // Entity probe.
@@ -571,7 +571,7 @@ impl SubstrateCoordinator {
         // Single-backend shortcut.
         if entries.len() == 1 {
             let (backend_id, runtime) = &entries[0];
-            let token = runtime.authorize(namespace.clone());
+            let token = runtime.authorize(namespace.clone()).unwrap();
             match runtime
                 .hybrid_search(&token, query, None, limit, None, None)
                 .await
@@ -622,7 +622,7 @@ impl SubstrateCoordinator {
                         )),
                     );
                 }
-                let token = runtime.authorize(ns);
+                let token = runtime.authorize(ns).unwrap();
                 let result = runtime
                     .hybrid_search(&token, &q, None, limit, None, None)
                     .await;
@@ -858,7 +858,7 @@ mod tests {
 
         // Create an entity on the primary backend.
         let runtime = coord.primary_runtime().unwrap();
-        let token = runtime.authorize(ns.clone());
+        let token = runtime.authorize(ns.clone()).unwrap();
         let entity = runtime
             .create_entity(&token, "concept", None, "LoRA", None, None, vec![])
             .await
@@ -895,7 +895,7 @@ mod tests {
         let ns = Namespace::local();
 
         let runtime = coord.primary_runtime().unwrap();
-        let token = runtime.authorize(ns.clone());
+        let token = runtime.authorize(ns.clone()).unwrap();
         runtime
             .create_entity(
                 &token,
@@ -927,7 +927,7 @@ mod tests {
         let ns = Namespace::local();
 
         // Create one entity on each backend.
-        let tok_main = rt_main.authorize(ns.clone());
+        let tok_main = rt_main.authorize(ns.clone()).unwrap();
         rt_main
             .create_entity(
                 &tok_main,
@@ -941,7 +941,7 @@ mod tests {
             .await
             .expect("create on main");
 
-        let tok_lore = rt_lore.authorize(ns.clone());
+        let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
         rt_lore
             .create_entity(
                 &tok_lore,
@@ -988,7 +988,7 @@ mod tests {
         let ns = Namespace::local();
 
         // Seed one entity on the "lore" backend so a search returns a hit.
-        let tok_lore = rt_lore.authorize(ns.clone());
+        let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
         rt_lore
             .create_entity(
                 &tok_lore,
@@ -1058,7 +1058,7 @@ mod tests {
         let ns = Namespace::local();
 
         let runtime = coord.primary_runtime().unwrap();
-        let token = runtime.authorize(ns.clone());
+        let token = runtime.authorize(ns.clone()).unwrap();
         let note = runtime
             .create_note(
                 &token,
@@ -1118,7 +1118,7 @@ mod tests {
         let ns = Namespace::local();
 
         let runtime = coord.primary_runtime().unwrap();
-        let token = runtime.authorize(ns.clone());
+        let token = runtime.authorize(ns.clone()).unwrap();
         let entity = runtime
             .create_entity(
                 &token,

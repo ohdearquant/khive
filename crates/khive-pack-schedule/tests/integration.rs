@@ -697,7 +697,7 @@ async fn h2_agenda_finds_valid_event_past_corrupt_legacy_rows() {
     builder.register(SchedulePack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
 
-    let tok = runtime.authorize(khive_types::Namespace::local());
+    let tok = runtime.authorize(khive_types::Namespace::local()).unwrap();
     let note_store = runtime.notes(&tok).expect("note store accessible");
 
     // Step 1: insert the valid event FIRST (oldest created_at).

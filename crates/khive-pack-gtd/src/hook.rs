@@ -83,7 +83,7 @@ impl KindHook for TaskHook {
             .and_then(Value::as_str)
             .and_then(|s| Namespace::parse(s).ok())
             .map(|ns| runtime.authorize(ns))
-            .unwrap_or_else(|| runtime.authorize(Namespace::local()));
+            .unwrap_or_else(|| runtime.authorize(Namespace::local()))?;
 
         // Resolve depends_on entries (full UUID or 8+ hex prefix) to canonical
         // UUID strings — matches the shape gtd's `assign` produces. Also
@@ -198,7 +198,7 @@ impl KindHook for TaskHook {
                 .and_then(Value::as_str)
                 .and_then(|s| Namespace::parse(s).ok())
                 .map(|ns| runtime.authorize(ns))
-                .unwrap_or_else(|| runtime.authorize(Namespace::local()));
+                .unwrap_or_else(|| runtime.authorize(Namespace::local()))?;
             for entry in arr {
                 let Some(raw) = entry.as_str() else { continue };
                 let target = match Uuid::parse_str(raw) {

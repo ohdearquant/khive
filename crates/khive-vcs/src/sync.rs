@@ -554,7 +554,7 @@ async fn upsert_entities(
 ) -> Result<usize> {
     let ns = khive_types::Namespace::parse(namespace)
         .map_err(|e| anyhow!("invalid namespace {namespace:?}: {e}"))?;
-    let token = runtime.authorize(ns);
+    let token = runtime.authorize(ns)?;
     let store = runtime.entities(&token).context("opening entity store")?;
     let text = runtime.text(&token).context("opening text store")?;
     let mut count = 0;
@@ -613,7 +613,7 @@ async fn upsert_edges(
 ) -> Result<usize> {
     let ns = khive_types::Namespace::parse(namespace)
         .map_err(|e| anyhow!("invalid namespace {namespace:?}: {e}"))?;
-    let token = runtime.authorize(ns);
+    let token = runtime.authorize(ns)?;
     let graph = runtime.graph(&token).context("opening graph store")?;
     let mut count = 0;
     for r in records {
@@ -765,7 +765,7 @@ mod tests {
             ..RuntimeConfig::default()
         };
         let rt = KhiveRuntime::new(config).unwrap();
-        let token = rt.authorize(ns);
+        let token = rt.authorize(ns).unwrap();
         let alpha = rt
             .entities(&token)
             .unwrap()
@@ -838,7 +838,7 @@ mod tests {
             ..RuntimeConfig::default()
         };
         let rt = KhiveRuntime::new(config).unwrap();
-        let token = rt.authorize(ns);
+        let token = rt.authorize(ns).unwrap();
 
         let hits = rt
             .text(&token)

@@ -10,7 +10,7 @@
 //!
 //! // In-memory for tests:
 //! let rt = KhiveRuntime::memory()?;
-//! let tok = rt.authorize(Namespace::local());
+//! let tok = rt.authorize(Namespace::local()).unwrap();
 //!
 //! // Create an entity:
 //! let entity = rt.create_entity(&tok, "concept", None, "LoRA", None, None, vec![]).await?;
