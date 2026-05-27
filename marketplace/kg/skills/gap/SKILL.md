@@ -22,6 +22,10 @@ request(ops="[neighbors(node_id=\"<u>\", direction=\"in\", relations=[\"depends_
 
 The verb examples below show the inner call. Wrap each one as `request(ops="…")`.
 
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`),
+even when the MCP server runs with `--actor lambda:myproject`. Do NOT override the
+namespace for entity/edge/note operations. The knowledge graph is cross-project by design.
+
 ## Workflow
 
 ### 1. Snapshot the graph

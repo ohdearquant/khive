@@ -15,6 +15,9 @@ request(ops="withdraw(proposal_id=\"00000000-0000-0000-0000-000000000001\", rati
 Required args: `proposal_id`.
 Optional args: `rationale`, `namespace`.
 
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`).
+Do NOT override the namespace with `lambda:*` actor namespaces.
+
 ## When to withdraw
 
 - The changeset was superseded by a better proposal

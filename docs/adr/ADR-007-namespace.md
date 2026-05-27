@@ -448,3 +448,73 @@ deployment-time configuration, not a code change.
 - `khive-mcp` binary gains `--actor` / `KHIVE_ACTOR` as the preferred namespace override,
   with `--namespace` retained as a legacy alias.
 - `KhiveConfig::load_with_home_fallback` implements the 4-tier config search path.
+
+---
+
+## Amendment: Namespace-by-Layer Rule (2026-05-27)
+
+**Authors**: Ocean, lambda:khive
+
+### Problem
+
+When different projects (lionagi, khive, lattice) each run MCP with `--actor lambda:{project}`,
+their KG entities land in separate namespaces. This makes shared concepts invisible across
+projects, creates duplicates, and prevents cross-project edges — defeating the purpose of a
+shared knowledge graph.
+
+### Rule: KG uses shared namespace, scoped packs use actor namespace
+
+| Pack layer | Namespace | Rationale |
+|---|---|---|
+| **KG** (entities, edges, notes) | `local` (default, shared) | One "LoRA" entity — all projects link to it via edges |
+| **Memory** (remember/recall) | `lambda:{project}` | Scoped episodic/semantic memory per agent |
+| **GTD** (assign/next/complete) | `lambda:{project}` | Scoped task queues per orchestrator |
+| **Comm** (send/inbox) | `lambda:{project}` | Scoped messaging between agents |
+| **Brain** (profiles/feedback) | `lambda:{project}` | Scoped priors per agent context |
+| **Schedule** (agenda/remind) | `lambda:{project}` | Scoped schedules per agent |
+| **Knowledge** (learn/cite) | `local` (shared) | Extends KG — same shared namespace |
+
+**Invariant**: `create`, `link`, `search`, `list`, `get`, `neighbors`, `traverse`, `query`,
+`knowledge.learn`, `knowledge.cite` MUST use the default shared namespace. Agents MUST NOT
+override the namespace for KG operations with `lambda:*` actor namespaces.
+
+### Why not one namespace for everything?
+
+Memory recall under `lambda:lionagi` returns only lionagi's working memories. If all memory
+went to `local`, every agent would recall every other agent's episodic notes — noise that
+degrades recall precision. The separation is correct for scoped operational data and wrong
+for shared structural knowledge.
+
+### Cross-project connection model
+
+Projects connect through the edge ontology, not through namespace sharing:
+
+```text
+Entity: "LoRA" (concept, namespace=local)
+  ←implements— "lattice-lora" (project, namespace=local)
+  ←depends_on— "lionagi-finetune" (project, namespace=local)
+  ←introduced_by— "Hu et al. 2021" (concept, namespace=local)
+```
+
+Each project's `project` entity lives in the shared graph. The `implements`, `depends_on`,
+`competes_with` edges ARE the cross-project synergy layer.
+
+### Implementation
+
+1. **MCP server**: KG pack verbs always use `RuntimeConfig::default_namespace` (already
+   `Namespace::local()` by default). The `--actor` flag affects memory/gtd/comm/brain
+   namespace selection but NOT KG verbs.
+2. **Pack dispatch**: Each pack determines its own namespace policy. KG pack ignores actor
+   override for entity/edge/note operations. Memory/GTD/Comm packs use actor namespace.
+3. **Plugin skills**: All KG plugin skills (digest, expand, polish, gap, explore, etc.)
+   document that they operate in the shared namespace.
+4. **Agent instructions**: Agents using `--actor lambda:{project}` must understand that KG
+   operations are cross-project by design.
+
+### Consequences
+
+- No duplicate entities across projects — one canonical concept per name.
+- Cross-project edges work without namespace gymnastics.
+- Memory/task isolation preserved — agents don't pollute each other's working state.
+- Requires pack-level namespace routing (KG pack → shared, memory pack → actor) rather than
+  a single session-wide namespace.

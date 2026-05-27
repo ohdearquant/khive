@@ -132,6 +132,21 @@ read those to understand which tasks land in your queue and which you assign on
 completion. A scheduled (or hook-triggered) `gtd.next(assignee=<agent>)` poll is enough
 to keep the swarm moving; no central orchestrator required.
 
+## Namespace Rule (ADR-007)
+
+KG entities live in the **shared** namespace (`local` by default). Even when your MCP
+server runs with `--actor lambda:myproject`, KG operations (`create`, `link`, `search`,
+`list`, `get`, `neighbors`, `traverse`, `query`) use the shared namespace — not the
+actor namespace.
+
+This is by design: the knowledge graph is cross-project shared knowledge. "LoRA" is one
+entity that multiple projects link to via `implements`/`depends_on` edges. If each project
+wrote to its own namespace, entities would be invisible across projects, duplicates would
+proliferate, and cross-project edges would be impossible.
+
+Scoped packs (memory, GTD, comm, brain, schedule) correctly use the actor namespace —
+those are per-agent operational data.
+
 ## Schema
 
 **8 entity kinds**: concept, document, dataset, project, person, org, artifact, service

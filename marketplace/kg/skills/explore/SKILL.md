@@ -16,6 +16,10 @@ request(ops="[search(kind=\"entity\", query=\"X\"), search(kind=\"note\", query=
 
 The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
 
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`),
+even when the MCP server runs with `--actor lambda:myproject`. Do NOT override the
+namespace for entity/edge/note operations. The knowledge graph is cross-project by design.
+
 ## Workflow
 
 ### 1. Search for entry points

@@ -17,6 +17,10 @@ Optional args: `reviewers`, `expiry`, `parent_id`, `namespace`.
 
 Valid `changeset.kind` values: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound`.
 
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`),
+even when the MCP server runs with `--actor lambda:myproject`. Do NOT override the
+namespace for entity/edge/note operations. The knowledge graph is cross-project by design.
+
 ## Workflow
 
 ### 1. Draft the proposal

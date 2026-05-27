@@ -17,6 +17,9 @@ Optional args: `comment`, `namespace`.
 
 Valid `decision` values: `approve`, `reject`, `comment`, `request_changes`, `requestchanges`.
 
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`).
+Do NOT override the namespace with `lambda:*` actor namespaces.
+
 ## Workflow
 
 ### 1. Read the proposal
