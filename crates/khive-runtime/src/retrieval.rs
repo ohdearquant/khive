@@ -520,6 +520,108 @@ impl KhiveRuntime {
 
         Ok(total_backfilled)
     }
+
+    /// Sweep orphaned vector entries for all registered embedding models.
+    ///
+    /// A vector entry is orphaned when its `subject_id` no longer exists as a
+    /// live row in the entity or note tables (i.e. either the row is absent or
+    /// has `deleted_at IS NOT NULL`). Orphaned entries accumulate after
+    /// hard-deletes because the vector store and SQL substrate are decoupled
+    /// (ADR-044 §rationale).
+    ///
+    /// Iterates over every registered embedding model and calls
+    /// [`VectorStore::orphan_sweep`] for the token's namespace. Models whose
+    /// backend returns [`StorageError::Unsupported`] are skipped without error —
+    /// this preserves forward-compat when a newly registered model does not yet
+    /// implement sweep.
+    ///
+    /// Returns the total number of vector rows deleted across all models.
+    pub async fn sweep_orphan_vectors(
+        &self,
+        token: &NamespaceToken,
+        max_delete_per_model: u32,
+        dry_run: bool,
+    ) -> RuntimeResult<u64> {
+        use khive_storage::types::OrphanSweepConfig;
+        use khive_storage::StorageError;
+
+        let model_names = self.registered_embedding_model_names();
+        if model_names.is_empty() {
+            tracing::debug!("sweep_orphan_vectors: no embedding models registered, skipping");
+            return Ok(0);
+        }
+
+        let ns = token.namespace().as_str().to_string();
+        let mut total_deleted = 0u64;
+
+        for model_name in &model_names {
+            let store = match self.vectors_for_model(token, model_name) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        model = %model_name,
+                        error = %e,
+                        "sweep_orphan_vectors: failed to get vector store, skipping model"
+                    );
+                    continue;
+                }
+            };
+
+            let caps = store.capabilities();
+            if !caps.supports_orphan_sweep {
+                tracing::debug!(
+                    model = %model_name,
+                    "sweep_orphan_vectors: backend does not support orphan sweep, skipping"
+                );
+                continue;
+            }
+
+            let config = OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec![ns.clone()],
+                substrate_kinds: vec![],
+                max_delete: max_delete_per_model,
+                dry_run,
+            };
+
+            match store.orphan_sweep(&config).await {
+                Ok(result) => {
+                    tracing::info!(
+                        model = %model_name,
+                        namespace = %ns,
+                        scanned = result.scanned,
+                        deleted = result.deleted,
+                        would_delete = result.would_delete,
+                        dry_run = dry_run,
+                        "sweep_orphan_vectors: sweep complete"
+                    );
+                    total_deleted += result.deleted;
+                }
+                Err(StorageError::Unsupported { .. }) => {
+                    tracing::debug!(
+                        model = %model_name,
+                        "sweep_orphan_vectors: backend returned Unsupported, skipping"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %model_name,
+                        error = %e,
+                        "sweep_orphan_vectors: sweep failed, continuing with other models"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            namespace = %ns,
+            total_deleted = total_deleted,
+            dry_run = dry_run,
+            "sweep_orphan_vectors: finished"
+        );
+
+        Ok(total_deleted)
+    }
 }
 
 /// Score bonus applied when an entity's title is an exact case-insensitive match for
