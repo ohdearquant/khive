@@ -10,13 +10,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
+use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::EdgeRelation;
 
 use crate::schema::{
     allowed_transitions, can_transition, is_actionable, is_terminal, is_valid_priority,
-    is_valid_status, normalize_status, priority_to_salience,
+    is_valid_status, normalize_status, priority_to_salience, TASK_LIFECYCLE_HELP,
 };
 use crate::GtdPack;
 
@@ -247,7 +247,8 @@ fn render_task(note: &khive_storage::note::Note) -> Value {
     let title = note
         .name
         .clone()
-        .unwrap_or_else(|| note.content.chars().take(80).collect());
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("[{}]", note.kind.as_str()));
     let status = props
         .get("status")
         .and_then(|v| v.as_str())
@@ -306,9 +307,7 @@ pub(crate) fn parse_due(value: &str) -> Result<String, RuntimeError> {
 }
 
 fn ts_to_rfc(micros: i64) -> String {
-    chrono::DateTime::<Utc>::from_timestamp_micros(micros)
-        .unwrap_or_else(Utc::now)
-        .to_rfc3339()
+    micros_to_iso(micros)
 }
 
 /// Load a task note and verify (a) it exists, (b) namespace matches, (c) it is
@@ -884,9 +883,15 @@ impl GtdPack {
             )));
         }
         if !can_transition(&current, target) {
-            let allowed = allowed_transitions(&current).join(", ");
+            let allowed = allowed_transitions(&current);
+            let allowed_display = if allowed.is_empty() {
+                "(none)".to_string()
+            } else {
+                allowed.join(", ")
+            };
             return Err(RuntimeError::InvalidInput(format!(
-                "cannot transition from {current:?} to {target:?} — allowed: {allowed}"
+                "cannot transition from {current:?} to {target:?}; \
+                 allowed from {current:?}: {allowed_display}. Full lifecycle: {TASK_LIFECYCLE_HELP}"
             )));
         }
 

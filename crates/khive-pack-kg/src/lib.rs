@@ -58,7 +58,7 @@ impl Pack for KgPack {
 //
 // Verbs 12-14 (propose, review, withdraw) added per ADR-046 (cluster-22).
 // Verb 15 (verbs) added for top-level verb discovery (ue-help-introspection H5).
-static KG_HANDLERS: [HandlerDef; 15] = [
+static KG_HANDLERS: [HandlerDef; 16] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -161,6 +161,14 @@ static KG_HANDLERS: [HandlerDef; 15] = [
                 description: "Filter by all listed tags.",
             },
         ],
+    },
+    // Assertive: returns aggregate substrate counts (#280)
+    HandlerDef {
+        name: "stats",
+        description: "Return aggregate KG substrate counts (entities, edges, notes)",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
     },
     // Declaration: changes entity or edge state by fiat
     HandlerDef {
@@ -647,6 +655,7 @@ impl PackRuntime for KgPack {
             "create" => self.handle_create(token, params, registry).await,
             "get" => self.handle_get(token, params).await,
             "list" => self.handle_list(token, params, registry).await,
+            "stats" => self.handle_stats(token, params).await,
             "update" => self.handle_update(token, params, registry).await,
             "delete" => self.handle_delete(token, params, registry).await,
             "merge" => self.handle_merge(token, params, registry).await,

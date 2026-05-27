@@ -81,12 +81,12 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 // ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
 // handler count from 11 to 14, then 15 with verbs introspection.
 #[test]
-fn pack_verbs_returns_fifteen() {
+fn pack_verbs_returns_sixteen() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        15,
-        "KgPack must expose exactly 15 verbs"
+        16,
+        "KgPack must expose exactly 16 verbs (15 previous + stats)"
     );
 }
 
@@ -98,6 +98,7 @@ fn pack_verbs_names_are_correct() {
         "create",
         "get",
         "list",
+        "stats",
         "update",
         "delete",
         "merge",
