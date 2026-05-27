@@ -149,10 +149,10 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 description: "Model name for vector recall (must be registered). Defaults to pack-configured model.",
             },
             ParamDef {
-                name: "presentation",
-                param_type: "string",
+                name: "include_breakdown",
+                param_type: "boolean",
                 required: false,
-                description: "Set to \"verbose\" to include per-component score breakdowns in results.",
+                description: "Include per-component score breakdowns in results.",
             },
             ParamDef {
                 name: "entity_names",

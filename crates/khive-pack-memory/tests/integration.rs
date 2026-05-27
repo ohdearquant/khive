@@ -1663,9 +1663,14 @@ fn test_handler_def_recall_params_complete() {
         param_names.contains(&"embedding_model"),
         "recall HandlerDef must expose embedding_model param; got: {param_names:?}"
     );
+    // Issue #482: verb-level presentation renamed to include_breakdown.
     assert!(
-        param_names.contains(&"presentation"),
-        "recall HandlerDef must expose presentation param; got: {param_names:?}"
+        param_names.contains(&"include_breakdown"),
+        "recall HandlerDef must expose include_breakdown param (not presentation); got: {param_names:?}"
+    );
+    assert!(
+        !param_names.contains(&"presentation"),
+        "recall HandlerDef must not expose verb-level presentation (ambiguous with MCP envelope); got: {param_names:?}"
     );
 }
 
@@ -2200,5 +2205,171 @@ fn test_handler_def_remember_memory_type_description_lists_valid_values() {
         !mt_param.description.contains("e.g."),
         "memory_type description must not use 'e.g.' — values are exhaustive; got: {:?}",
         mt_param.description
+    );
+}
+
+// Issue #288: recall text_candidates must be non-empty when the query partially
+// matches a memory note. Previously the conjunction Plain MATCH returned zero
+// candidates if the note only contained some of the query terms.
+#[tokio::test]
+async fn recall_candidates_text_candidates_non_empty_for_partial_match() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    // Create a memory note whose content matches only the first two words of the query.
+    registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": "attention mechanism in neural networks",
+                "salience": 0.9,
+                "memory_type": "semantic"
+            }),
+        )
+        .await
+        .expect("remember succeeds");
+
+    // The query contains the note's terms plus extras the note doesn't have.
+    let result = registry
+        .dispatch(
+            "memory.recall_candidates",
+            serde_json::json!({
+                "query": "attention mechanism transformers deep learning architecture"
+            }),
+        )
+        .await
+        .expect("recall_candidates succeeds");
+
+    let text_candidates = result["text_candidates"]
+        .as_array()
+        .expect("text_candidates is array");
+
+    assert!(
+        !text_candidates.is_empty(),
+        "text_candidates must be non-empty when a memory note partially matches the query; \
+         got empty array. Query fanout is likely not working."
+    );
+
+    // All returned text candidates must be memory-kind notes.
+    for tc in text_candidates {
+        let note_id = tc["note_id"].as_str().expect("note_id present");
+        assert!(
+            !note_id.is_empty(),
+            "text_candidate note_id must be non-empty"
+        );
+    }
+}
+
+// Issue #482: recall include_breakdown=true must include per-component breakdown.
+// Also verifies the deprecated presentation="verbose" alias still works and that
+// unknown presentation values are rejected, removing dual-meaning ambiguity.
+#[tokio::test]
+async fn recall_include_breakdown_true_includes_breakdown() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({ "content": "breakdown test memory", "salience": 0.8 }),
+        )
+        .await
+        .expect("remember succeeds");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({ "query": "breakdown test memory", "include_breakdown": true }),
+        )
+        .await
+        .expect("recall with include_breakdown=true succeeds");
+
+    let hits = result.as_array().expect("array of hits");
+    assert!(!hits.is_empty(), "recall returned results");
+    assert!(
+        hits[0].get("breakdown").is_some(),
+        "include_breakdown=true must include 'breakdown' in results"
+    );
+}
+
+#[tokio::test]
+async fn recall_default_omits_breakdown() {
+    let rt = make_runtime();
+    let registry = make_registry(rt.clone());
+
+    registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({ "content": "no breakdown memory", "salience": 0.8 }),
+        )
+        .await
+        .expect("remember succeeds");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({ "query": "no breakdown memory" }),
+        )
+        .await
+        .expect("recall without include_breakdown succeeds");
+
+    let hits = result.as_array().expect("array of hits");
+    if !hits.is_empty() {
+        assert!(
+            hits[0].get("breakdown").is_none(),
+            "default recall must not include 'breakdown' in results"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recall_handler_metadata_advertises_include_breakdown_not_presentation() {
+    let recall_def = khive_pack_memory::MemoryPack::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall handler must be registered");
+
+    let has_include_breakdown = recall_def
+        .params
+        .iter()
+        .any(|p| p.name == "include_breakdown");
+    assert!(
+        has_include_breakdown,
+        "memory.recall must advertise include_breakdown param in metadata"
+    );
+
+    // presentation must no longer be advertised as a public param.
+    let has_presentation = recall_def.params.iter().any(|p| p.name == "presentation");
+    assert!(
+        !has_presentation,
+        "memory.recall must not advertise verb-level 'presentation' param to avoid ambiguity with MCP envelope"
+    );
+}
+
+// Issue #277: search(kind="memory") must resolve when memory pack is loaded.
+// The KG resolver is registry-driven: memory kind only appears in all_note_kinds()
+// when MemoryPack is registered alongside KgPack. Without it the verb rejects
+// "memory" as an unknown kind.
+#[tokio::test]
+async fn search_kind_memory_resolves_when_memory_pack_loaded() {
+    let registry = make_registry(make_runtime());
+
+    assert!(
+        registry.all_note_kinds().contains(&"memory"),
+        "registry.all_note_kinds() must include \"memory\" when memory pack is loaded; got: {:?}",
+        registry.all_note_kinds()
+    );
+
+    // search(kind="memory") must succeed — previously failed with "unknown kind".
+    let result = registry
+        .dispatch(
+            "search",
+            serde_json::json!({ "kind": "memory", "query": "test" }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "search(kind=\"memory\") must succeed when memory pack is loaded; got: {:?}",
+        result.err()
     );
 }
