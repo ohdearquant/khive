@@ -1646,7 +1646,14 @@ impl MemoryPack {
         let cfg = p.config.unwrap_or_else(|| self.active_config());
         cfg.validate()?;
         let pipeline = make_pipeline(&cfg);
-        let (total, breakdown) = compute_score(&cfg, &pipeline, p.rrf, p.salience, p.decay_factor, p.age_days);
+        let (total, breakdown) = compute_score(
+            &cfg,
+            &pipeline,
+            p.rrf,
+            p.salience,
+            p.decay_factor,
+            p.age_days,
+        );
         to_json(&json!({
             "total": total,
             "breakdown": breakdown,
@@ -1939,7 +1946,8 @@ mod tests {
         let decay_factor = 0.01;
         let age_days = 0.0;
         let pipeline = make_pipeline(&cfg);
-        let (total, bd) = compute_score(&cfg, &pipeline, relevance, salience, decay_factor, age_days);
+        let (total, bd) =
+            compute_score(&cfg, &pipeline, relevance, salience, decay_factor, age_days);
         // At age=0: salience_decayed = salience = 0.8, temporal = 1.0
         // amplified = 0.8^1.5 ≈ 0.71554
         // total = 0.70*0.5 + 0.20*0.71554 + 0.10*1.0 ≈ 0.35 + 0.14311 + 0.10 ≈ 0.59311
@@ -2232,7 +2240,8 @@ mod tests {
         let decay_factor = 0.01;
         let pipeline = make_pipeline(&cfg);
 
-        let (score_high, _) = compute_score(&cfg, &pipeline, relevance, 0.9, decay_factor, age_days);
+        let (score_high, _) =
+            compute_score(&cfg, &pipeline, relevance, 0.9, decay_factor, age_days);
         let (score_low, _) = compute_score(&cfg, &pipeline, relevance, 0.3, decay_factor, age_days);
 
         assert!(
@@ -2371,7 +2380,8 @@ mod tests {
             let pipeline = make_pipeline(cfg);
             for raw_relevance in [0.0, 0.5, 1.0, 2.0 / 61.0, 1.0 / 61.0] {
                 for salience in [0.0, 0.3, 0.9, 1.0] {
-                    let (total, _) = compute_score(cfg, &pipeline, raw_relevance, salience, 0.01, 0.0);
+                    let (total, _) =
+                        compute_score(cfg, &pipeline, raw_relevance, salience, 0.01, 0.0);
                     assert!(
                         (0.0..=1.0).contains(&total),
                         "composite score out of [0,1]: {total} (relevance={raw_relevance}, salience={salience}, strategy={:?})",

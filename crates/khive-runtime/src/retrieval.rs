@@ -345,7 +345,9 @@ impl KhiveRuntime {
 
         let model_names = self.registered_embedding_model_names();
         if model_names.is_empty() {
-            tracing::debug!("backfill_missing_embeddings: no embedding models registered, skipping");
+            tracing::debug!(
+                "backfill_missing_embeddings: no embedding models registered, skipping"
+            );
             return Ok(0);
         }
 
@@ -392,23 +394,48 @@ impl KhiveRuntime {
 
                 for row in &entity_rows {
                     let id_str = row.columns.first().and_then(|c| {
-                        if let SqlValue::Text(s) = &c.value { Some(s.clone()) } else { None }
+                        if let SqlValue::Text(s) = &c.value {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
                     });
                     let description = row.columns.get(2).and_then(|c| {
-                        if let SqlValue::Text(s) = &c.value { Some(s.clone()) }
-                        else if let SqlValue::Null = &c.value { None }
-                        else { None }
+                        if let SqlValue::Text(s) = &c.value {
+                            Some(s.clone())
+                        } else if let SqlValue::Null = &c.value {
+                            None
+                        } else {
+                            None
+                        }
                     });
 
-                    let (Some(id_str), Some(desc)) = (id_str, description) else { continue };
-                    let Ok(id) = id_str.parse::<Uuid>() else { continue };
-                    if desc.trim().is_empty() { continue; }
+                    let (Some(id_str), Some(desc)) = (id_str, description) else {
+                        continue;
+                    };
+                    let Ok(id) = id_str.parse::<Uuid>() else {
+                        continue;
+                    };
+                    if desc.trim().is_empty() {
+                        continue;
+                    }
 
                     match self.embed_with_model(model_name, &desc).await {
                         Ok(vector) => {
                             if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                                match vs.insert(id, SubstrateKind::Entity, &ns, "entity.description", vec![vector]).await {
-                                    Ok(()) => { total_backfilled += 1; }
+                                match vs
+                                    .insert(
+                                        id,
+                                        SubstrateKind::Entity,
+                                        &ns,
+                                        "entity.description",
+                                        vec![vector],
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        total_backfilled += 1;
+                                    }
                                     Err(e) => {
                                         tracing::warn!(
                                             id = %id, model = %model_name,
@@ -467,37 +494,64 @@ impl KhiveRuntime {
 
                 for row in &note_rows {
                     let id_str = row.columns.first().and_then(|c| {
-                        if let SqlValue::Text(s) = &c.value { Some(s.clone()) } else { None }
+                        if let SqlValue::Text(s) = &c.value {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
                     });
                     let content = row.columns.get(1).and_then(|c| {
-                        if let SqlValue::Text(s) = &c.value { Some(s.clone()) } else { None }
+                        if let SqlValue::Text(s) = &c.value {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
                     });
 
-                    let (Some(id_str), Some(content)) = (id_str, content) else { continue };
-                    let Ok(id) = id_str.parse::<Uuid>() else { continue };
-                    if content.trim().is_empty() { continue; }
+                    let (Some(id_str), Some(content)) = (id_str, content) else {
+                        continue;
+                    };
+                    let Ok(id) = id_str.parse::<Uuid>() else {
+                        continue;
+                    };
+                    if content.trim().is_empty() {
+                        continue;
+                    }
 
                     // Repopulate FTS entry if missing (best-effort, first model only to avoid N duplicates).
                     if model_names.first().map(|n| n.as_str()) == Some(model_name.as_str()) {
                         if let Some(ref ts) = text_store {
-                            let _ = ts.upsert_document(TextDocument {
-                                subject_id: id,
-                                namespace: ns.clone(),
-                                kind: SubstrateKind::Note,
-                                title: None,
-                                body: content.clone(),
-                                tags: vec![],
-                                metadata: None,
-                                updated_at: chrono::Utc::now(),
-                            }).await;
+                            let _ = ts
+                                .upsert_document(TextDocument {
+                                    subject_id: id,
+                                    namespace: ns.clone(),
+                                    kind: SubstrateKind::Note,
+                                    title: None,
+                                    body: content.clone(),
+                                    tags: vec![],
+                                    metadata: None,
+                                    updated_at: chrono::Utc::now(),
+                                })
+                                .await;
                         }
                     }
 
                     match self.embed_with_model(model_name, &content).await {
                         Ok(vector) => {
                             if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                                match vs.insert(id, SubstrateKind::Note, &ns, "note.content", vec![vector]).await {
-                                    Ok(()) => { total_backfilled += 1; }
+                                match vs
+                                    .insert(
+                                        id,
+                                        SubstrateKind::Note,
+                                        &ns,
+                                        "note.content",
+                                        vec![vector],
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        total_backfilled += 1;
+                                    }
                                     Err(e) => {
                                         tracing::warn!(
                                             id = %id, model = %model_name,
