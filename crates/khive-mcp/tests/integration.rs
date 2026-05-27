@@ -27,6 +27,7 @@ fn make_server() -> KhiveMcpServer {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "gtd".to_string()],
         ..RuntimeConfig::default()
     };
@@ -381,6 +382,7 @@ async fn pack_only_kg_omits_gtd_verbs_from_catalog() {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string()],
         ..RuntimeConfig::default()
     };
@@ -403,6 +405,7 @@ async fn pack_gtd_without_kg_fails_at_boot() {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["gtd".to_string()],
         ..RuntimeConfig::default()
     };
@@ -426,6 +429,7 @@ async fn pack_gtd_with_kg_explicit_works() {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "gtd".to_string()],
         ..RuntimeConfig::default()
     };
@@ -1532,6 +1536,7 @@ fn make_full_server() -> KhiveMcpServer {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec![
             "kg".to_string(),
             "gtd".to_string(),
@@ -1654,6 +1659,7 @@ fn make_comm_schedule_server() -> KhiveMcpServer {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()],
         ..RuntimeConfig::default()
     };
@@ -1816,6 +1822,7 @@ async fn startup_migrations_applied_to_fresh_file_backed_db() -> anyhow::Result<
         db_path: Some(db_file.path().to_path_buf()),
         default_namespace: Namespace::parse("fix1test").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string()],
         ..RuntimeConfig::default()
     };
@@ -1889,6 +1896,7 @@ fn make_brain_server() -> KhiveMcpServer {
         db_path: None,
         default_namespace: Namespace::parse("braintest").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "brain".to_string()],
         ..RuntimeConfig::default()
     };
@@ -2404,6 +2412,7 @@ fn actor_precedence_explicit_namespace_local_wins_over_config() {
 
     let base = RuntimeConfig {
         default_namespace: Namespace::parse("local").unwrap(), // explicit CLI value
+        additional_embedding_models: vec![],
         ..RuntimeConfig::default()
     };
     let resolved = runtime_config_from_khive_config(&effective_cfg, base);
@@ -2438,6 +2447,7 @@ fn actor_precedence_cli_actor_wins_over_config() {
 
     let base = RuntimeConfig {
         default_namespace: Namespace::parse("lambda:cli-actor").unwrap(),
+        additional_embedding_models: vec![],
         ..RuntimeConfig::default()
     };
     let resolved = runtime_config_from_khive_config(&effective_cfg, base);
@@ -3035,6 +3045,7 @@ fn make_comm_server_only() -> KhiveMcpServer {
         db_path: None,
         default_namespace: Namespace::parse("commtest").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "comm".to_string()],
         ..RuntimeConfig::default()
     };
@@ -3099,6 +3110,7 @@ fn make_schedule_server_only() -> KhiveMcpServer {
         db_path: None,
         default_namespace: Namespace::parse("schedtest").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "schedule".to_string()],
         ..RuntimeConfig::default()
     };
@@ -3152,6 +3164,7 @@ async fn connect_brain_only(
         db_path: None,
         default_namespace: Namespace::parse("braintest2").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "brain".to_string()],
         ..RuntimeConfig::default()
     };
@@ -3350,6 +3363,7 @@ fn make_knowledge_server() -> KhiveMcpServer {
         db_path: None,
         default_namespace: Namespace::parse("knowtest").unwrap(),
         embedding_model: None,
+        additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "knowledge".to_string()],
         ..RuntimeConfig::default()
     };
