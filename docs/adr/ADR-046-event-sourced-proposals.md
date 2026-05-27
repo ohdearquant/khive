@@ -167,11 +167,11 @@ on an ADR-014 guarantee. If a future ADR-014 amendment introduces
 
 ### 3. Verb surface — three new verbs
 
-| Verb       | Speech act (ADR-025) | Visibility | Purpose                                                                 |
-| ---------- | -------------------- | ---------- | ----------------------------------------------------------------------- |
-| `propose`  | commissive           | Verb       | Create a proposal. Emits `ProposalCreated`. Returns the proposal id.    |
-| `review`   | declaration          | Verb       | Approve / reject / comment / request-changes. Emits `ProposalReviewed`. |
-| `withdraw` | commissive           | Verb       | Rescind a proposal (proposer-only). Emits `ProposalWithdrawn`.          |
+| Verb       | Speech act (ADR-025) | Visibility | Purpose                                                                                                                                                   |
+| ---------- | -------------------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `propose`  | commissive           | Verb       | Create a proposal. Emits `ProposalCreated`. Returns the proposal id.                                                                                      |
+| `review`   | declaration          | Verb       | Approve / reject / comment / request-changes. Emits `ProposalReviewed`.                                                                                   |
+| `withdraw` | commissive           | Verb       | Rescind a proposal (proposer-only). Emits `ProposalWithdrawn`. Rejected if status is `applied`, `withdrawn`, `rejected`, or `applying` (in-flight apply). |
 
 Apply is NOT a verb:
 
@@ -250,7 +250,7 @@ CREATE TABLE proposals_open (
     namespace      TEXT NOT NULL,
     proposer       TEXT NOT NULL,
     title          TEXT NOT NULL,
-    status         TEXT NOT NULL CHECK (status IN ('open', 'changes_requested', 'approved', 'rejected', 'applied', 'withdrawn')),
+    status         TEXT NOT NULL CHECK (status IN ('open', 'changes_requested', 'approved', 'applying', 'rejected', 'applied', 'withdrawn')),
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL,
     expiry         INTEGER,
@@ -271,8 +271,18 @@ over the four proposal events and maintains this table:
 - `ProposalCreated` → INSERT with status='open'
 - `ProposalReviewed` → UPDATE counts; if `decision = Approve` and approval
   threshold met, set status='approved' (threshold logic in §6)
-- `ProposalApplied` → UPDATE status='applied'
+- `ProposalApplied` → UPDATE status='applied' (CAS: `WHERE status='applying'`)
 - `ProposalWithdrawn` → UPDATE status='withdrawn'
+
+**`applying` — transient in-flight state (V18 amendment):** The apply worker
+atomically transitions status from `'approved'` to `'applying'` (a CAS UPDATE)
+before executing any KG mutations. This prevents a concurrent `withdraw` from
+landing while the apply is in progress — `withdraw`'s own CAS requires
+`status NOT IN ('applied', 'applying', 'withdrawn', 'rejected')`, so it fails
+with an error when the apply worker holds `'applying'`. The apply worker
+transitions to `'applied'` on success, or reverts to `'approved'` on failure so
+the proposal is not permanently stuck. `'applying'` is never written to the
+event log — it is a purely transient projection state.
 
 Hard-state (status != 'open' | 'changes_requested') rows are retained for
 audit; cleanup is operator-driven (`kkernel call kg proposal_cleanup
@@ -479,8 +489,8 @@ verbs and the apply worker each have policy hooks:
 
 | Condition                                         | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Proposer withdraws after Approve but before Apply | `ProposalWithdrawn` emitted; worker skips application; status='withdrawn'                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Apply fails (validation, network, etc.)           | `ProposalApplied { Failed }` emitted; status='approved' but unapplied. Apply retry is deferred to a follow-up ADR. v1 behavior: failed applies remain in `approved` status; operators may issue a new `propose` (with `parent_id` referencing the failed proposal) to retry. Direct re-emission of `apply` events is not supported in v1.                                                                                                                                                                                                                                                                                                                                                               |
+| Proposer withdraws after Approve but before Apply | If `withdraw` arrives before the apply worker claims `'applying'`: `ProposalWithdrawn` emitted; worker sees status≠'approved' (pre-apply CAS fails); skips KG mutations; no `ProposalApplied` emitted. If `withdraw` arrives after the apply worker claims `'applying'`: `withdraw` CAS finds status='applying' and returns an error — the withdraw is rejected. KG mutations proceed and `ProposalApplied` is emitted normally.                                                                                                                                                                                                                                                                        |
+| Apply fails (validation, network, etc.)           | `ProposalApplied { Failed }` emitted; status is reverted from `'applying'` back to `'approved'` (best-effort CAS) so the proposal is not permanently stuck. Apply retry is deferred to a follow-up ADR. v1 behavior: failed applies return to `'approved'`; operators may issue a new `propose` (with `parent_id` referencing the failed proposal) to retry. Direct re-emission of `apply` events is not supported in v1.                                                                                                                                                                                                                                                                               |
 | Apply policy denied                               | Same as Apply fails with `error = "denied by policy"`. Operator adjusts policy and issues a new `propose` (with `parent_id`) to retry; direct `apply` re-emission is not supported in v1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Reviewer reverses Approve to Reject               | Each review is its own event; the worker uses the latest decision per reviewer. If a previously-approved proposal hits Reject before Apply fires, status moves to 'rejected'.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Two reviewers race (both Approve simultaneously)  | Each emits its own `ProposalReviewed` event; the apply worker is single-threaded per process — it sees them in event order and fires apply on the first one that crosses threshold. Idempotency on the worker side: it checks `proposals_open.status` before applying; if already applied, no-op.                                                                                                                                                                                                                                                                                                                                                                                                       |

@@ -2538,6 +2538,46 @@ impl KgPack {
         let actor = token.actor().id.clone();
         let ns = token.namespace().as_str().to_owned();
 
+        // BUG-6 fix: validate parent_id exists in proposals_open before creating the
+        // amendment proposal.  ADR-046 §2 says parent_id is set when amending an
+        // earlier proposal after RequestChanges; an orphaned parent_id (pointing at
+        // a non-existent proposal) corrupts the amendment chain.
+        let validated_parent_id: Option<khive_types::Id128> = p
+            .parent_id
+            .as_deref()
+            .map(|s| -> Result<khive_types::Id128, RuntimeError> {
+                let parent_uuid = Uuid::from_str(s).map_err(|e| {
+                    RuntimeError::InvalidInput(format!("invalid parent_id {s:?}: {e}"))
+                })?;
+                Ok(khive_types::Id128::from_u128(parent_uuid.as_u128()))
+            })
+            .transpose()?;
+
+        if let Some(ref parent_id128) = validated_parent_id {
+            let parent_uuid = Uuid::from_u128(parent_id128.to_u128());
+            let sql = self.runtime.sql();
+            let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+            let parent_row = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT status FROM proposals_open \
+                          WHERE proposal_id = ?1 AND namespace = ?2"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(parent_uuid.to_string()),
+                        SqlValue::Text(ns.clone()),
+                    ],
+                    label: Some("proposals_open.validate_parent_id".into()),
+                })
+                .await
+                .map_err(RuntimeError::Storage)?;
+            if parent_row.is_none() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "parent_id {:?} not found; it must reference an existing proposal",
+                    parent_uuid.to_string()
+                )));
+            }
+        }
+
         let payload = ProposalCreatedPayload {
             proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
             proposer: actor.clone(),
@@ -2548,17 +2588,7 @@ impl KgPack {
             expiry: p
                 .expiry
                 .map(|v| khive_types::Timestamp::from_micros(v as u64)),
-            parent_id: p
-                .parent_id
-                .as_deref()
-                .map(|s| {
-                    Uuid::from_str(s)
-                        .map(|u| khive_types::Id128::from_u128(u.as_u128()))
-                        .map_err(|e| {
-                            RuntimeError::InvalidInput(format!("invalid parent_id {s:?}: {e}"))
-                        })
-                })
-                .transpose()?,
+            parent_id: validated_parent_id,
         };
 
         let event_payload_json = serde_json::to_value(&payload)
@@ -2661,7 +2691,16 @@ impl KgPack {
             })
             .unwrap_or("open");
 
-        if matches!(current_status, "applied" | "withdrawn" | "rejected") {
+        // BUG-5 fix: 'approved' is a terminal state for the review(approve) path.
+        // Without this guard a second review(approve) on an already-approved proposal
+        // would silently succeed, inflating approve_count and creating spurious audit
+        // events.  'approved' is included here alongside the other terminal states.
+        // Per ADR-046 §4 the apply worker runs inline after approve and sets
+        // status='applied'; after that point 'applied' also blocks re-review.
+        if matches!(
+            current_status,
+            "applied" | "withdrawn" | "rejected" | "approved"
+        ) {
             return Err(RuntimeError::InvalidInput(format!(
                 "proposal {} is already {current_status} and cannot be reviewed",
                 p.proposal_id
@@ -2700,12 +2739,6 @@ impl KgPack {
         event.aggregate_kind = Some("proposal".to_string());
         event.aggregate_id = Some(proposal_id);
 
-        let event_store = self.runtime.events(token)?;
-        event_store
-            .append_event(event)
-            .await
-            .map_err(RuntimeError::Storage)?;
-
         // Compute response status for the ACK (mirrors what the projection worker writes).
         let new_status = match decision {
             ProposalDecision::Approve => "approved",
@@ -2714,10 +2747,30 @@ impl KgPack {
             ProposalDecision::RequestChanges => "changes_requested",
         };
 
-        // ADR-046 §4: projection is maintained by ProposalsProjectionWorker.
-        crate::projection_worker::ProposalsProjectionWorker::new(self.runtime.clone())
-            .on_proposal_reviewed(token, &payload)
-            .await?;
+        // H2 fix (atomic CAS + event):
+        // `reviewed_and_emit` runs the projection CAS UPDATE and the ProposalReviewed
+        // event INSERT in a single `BEGIN IMMEDIATE` transaction.  This ensures the
+        // event log and the projection always advance together — a process crash between
+        // the two cannot leave a committed projection state without a corresponding event.
+        //
+        // If the CAS loses (concurrent op won the race), `reviewed_and_emit` returns
+        // cas_hit=false.  In that case NEITHER the projection NOR the event was written
+        // (because the batch transaction rolled back).  We return an error and the audit
+        // log stays clean.
+        let decision_changes_state = decision != ProposalDecision::Comment;
+        let (projection_updated, _event_id) =
+            crate::projection_worker::ProposalsProjectionWorker::new(self.runtime.clone())
+                .reviewed_and_emit(token, &payload, event, decision_changes_state)
+                .await?;
+
+        if !projection_updated && decision_changes_state {
+            return Err(RuntimeError::InvalidInput(format!(
+                "proposal {} status changed concurrently; review was not recorded — \
+                 the proposal may have been withdrawn or approved by another reviewer \
+                 simultaneously",
+                p.proposal_id
+            )));
+        }
 
         // ADR-046 §5: apply worker fires on approval — idempotent on status check.
         if decision == ProposalDecision::Approve {
@@ -2794,9 +2847,11 @@ impl KgPack {
             })
             .unwrap_or("open");
 
-        if matches!(current_status, "applied" | "withdrawn") {
+        // H1 fix: 'applying' is a transient state owned by the apply worker — once
+        // the apply worker claims it via pre_apply_cas, no withdraw can land.
+        if matches!(current_status, "applied" | "withdrawn" | "applying") {
             return Err(RuntimeError::InvalidInput(format!(
-                "proposal {} is already {current_status}",
+                "proposal {} is already {current_status} and cannot be withdrawn",
                 p.proposal_id
             )));
         }
@@ -2820,16 +2875,23 @@ impl KgPack {
         event.aggregate_kind = Some("proposal".to_string());
         event.aggregate_id = Some(proposal_id);
 
-        let event_store = self.runtime.events(token)?;
-        event_store
-            .append_event(event)
-            .await
-            .map_err(RuntimeError::Storage)?;
+        // H2 fix (atomic CAS + event):
+        // `withdrawn_and_emit` runs the projection CAS UPDATE and the ProposalWithdrawn
+        // event INSERT in a single `BEGIN IMMEDIATE` transaction — projection and event
+        // log always advance together.  If the CAS loses (concurrent op claimed
+        // 'applying' or terminal state), NEITHER the projection NOR the event is
+        // written; we return an error to the caller.
+        let (updated, _event_id) =
+            crate::projection_worker::ProposalsProjectionWorker::new(self.runtime.clone())
+                .withdrawn_and_emit(token, proposal_id, event)
+                .await?;
 
-        // ADR-046 §4: projection is maintained by ProposalsProjectionWorker.
-        crate::projection_worker::ProposalsProjectionWorker::new(self.runtime.clone())
-            .on_proposal_withdrawn(token, proposal_id)
-            .await?;
+        if !updated {
+            return Err(RuntimeError::InvalidInput(format!(
+                "proposal {} is already in a terminal or in-flight state and cannot be withdrawn",
+                p.proposal_id
+            )));
+        }
 
         to_json(&serde_json::json!({
             "proposal_id": proposal_id.to_string(),

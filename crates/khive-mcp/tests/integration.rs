@@ -2104,14 +2104,38 @@ async fn link_is_always_verbose_returns_full_uuids_in_agent_mode() -> anyhow::Re
 async fn get_proposal_id_returns_proposal_created_payload() -> anyhow::Result<()> {
     let client = connect().await?;
 
-    // Create a parent entity so we can set parent_id on the proposal.
-    let parent = ok_one(
+    // Create a parent proposal so we can set parent_id on the amendment proposal.
+    // BUG-6 fix: parent_id must reference an existing proposal in proposals_open,
+    // not an arbitrary entity UUID.
+    let parent_ops = serde_json::to_string(&json!([{
+        "tool": "propose",
+        "args": {
+            "title": "parent proposal",
+            "description": "base proposal that the amendment will reference",
+            "changeset": {
+                "kind": "add_entity",
+                "entity": { "kind": "concept", "name": "ParentProposalEntity" }
+            }
+        }
+    }]))
+    .unwrap();
+    let parent_result = call(
         &client,
-        r#"create(kind="entity", entity_kind="concept", name="ParentEntity")"#,
+        "request",
+        json!({"ops": parent_ops, "presentation": "verbose"}),
     )
     .await?;
-    let parent_id = parent["id"].as_str().unwrap().to_string();
-    assert_eq!(parent_id.len(), 36, "parent entity id must be full UUID");
+    let parent_body: Value = serde_json::from_str(&first_text(&parent_result))?;
+    let parent_first = &parent_body["results"][0];
+    assert_eq!(
+        parent_first["ok"], true,
+        "parent propose must succeed; got: {parent_first}"
+    );
+    let parent_id = parent_first["result"]["proposal_id"]
+        .as_str()
+        .expect("parent proposal_id")
+        .to_string();
+    assert_eq!(parent_id.len(), 36, "parent proposal_id must be full UUID");
 
     // Propose with all optional fields populated: description, reviewers, parent_id,
     // and a changeset that carries a named entity.

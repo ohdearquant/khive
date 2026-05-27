@@ -538,6 +538,17 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "vector_embedding_model_tag_preserving_rebuild",
         up: V17_VECTOR_EMBEDDING_MODEL_TAG_PRESERVING_REBUILD,
     },
+    // V18: add 'applying' to proposals_open status CHECK (ADR-046 §3 amendment).
+    // The apply worker uses 'applying' as a transient state to prevent the
+    // apply/withdraw race: it atomically moves status='approved' → 'applying'
+    // before mutating the KG, so withdraw cannot land while KG mutations run.
+    // SQLite does not support ALTER COLUMN; the table is recreated preserving all
+    // existing rows.
+    VersionedMigration {
+        version: 18,
+        name: "proposals_open_add_applying_status",
+        up: "__v18_computed_at_runtime__",
+    },
 ];
 
 const MIGRATION_TRACKING_TABLE: &str = "\
@@ -761,6 +772,11 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
             })?
         } else if migration.version == 17 {
             build_v17_preserving_rebuild_sql(&tx).map_err(|e| SqliteError::Migration {
+                version: migration.version,
+                error: e.to_string(),
+            })?
+        } else if migration.version == 18 {
+            build_v18_proposals_applying_sql(&tx).map_err(|e| SqliteError::Migration {
                 version: migration.version,
                 error: e.to_string(),
             })?
@@ -1260,6 +1276,71 @@ pub fn query_embedding_models(
     }
 }
 
+/// Build the V18 migration SQL: recreate `proposals_open` adding `'applying'` to the
+/// status CHECK constraint (ADR-046 §3 amendment — apply/withdraw race fix).
+///
+/// SQLite does not support `ALTER TABLE … ALTER COLUMN`, so we rename the old table,
+/// create a new one with the extended CHECK, copy all rows, then drop the old table.
+/// The three indexes are also recreated.  If `proposals_open` does not yet exist
+/// (fresh DB where V15 migration hasn't run yet) this returns `SELECT 1;` — a no-op
+/// that lets V18 be recorded without error; V15 will create the correct schema.
+pub(crate) fn build_v18_proposals_applying_sql(
+    conn: &Connection,
+) -> Result<String, rusqlite::Error> {
+    let table_exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='proposals_open'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if !table_exists {
+        return Ok("SELECT 1;".to_string());
+    }
+
+    // Check whether 'applying' is already in the CHECK (idempotency guard).
+    // We inspect the stored CREATE TABLE DDL.
+    let ddl: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='proposals_open'",
+        [],
+        |row| row.get(0),
+    )?;
+    if ddl.contains("'applying'") {
+        return Ok("SELECT 1;".to_string());
+    }
+
+    // `run_migrations` already wraps each migration in `conn.transaction()`.
+    // Do NOT include BEGIN/COMMIT here — they would create a nested transaction.
+    // PRAGMA foreign_keys cannot be changed inside a transaction in SQLite, but
+    // the rename+recreate pattern works without it since we are not altering FK
+    // references that point to proposals_open from other tables.
+    Ok("\
+        ALTER TABLE proposals_open RENAME TO proposals_open_v15;\
+        CREATE TABLE proposals_open (\
+            proposal_id    TEXT PRIMARY KEY,\
+            namespace      TEXT NOT NULL,\
+            proposer       TEXT NOT NULL,\
+            title          TEXT NOT NULL,\
+            status         TEXT NOT NULL CHECK (status IN ('open', 'changes_requested', 'approved', 'applying', 'rejected', 'applied', 'withdrawn')),\
+            created_at     INTEGER NOT NULL,\
+            updated_at     INTEGER NOT NULL,\
+            expiry         INTEGER,\
+            last_decision  TEXT,\
+            review_count   INTEGER NOT NULL DEFAULT 0,\
+            approve_count  INTEGER NOT NULL DEFAULT 0,\
+            reject_count   INTEGER NOT NULL DEFAULT 0\
+        );\
+        INSERT INTO proposals_open \
+            SELECT proposal_id, namespace, proposer, title, status, created_at, updated_at, \
+                   expiry, last_decision, review_count, approve_count, reject_count \
+            FROM proposals_open_v15;\
+        DROP TABLE proposals_open_v15;\
+        CREATE INDEX IF NOT EXISTS idx_proposals_open_ns_status ON proposals_open(namespace, status);\
+        CREATE INDEX IF NOT EXISTS idx_proposals_open_proposer ON proposals_open(namespace, proposer);\
+        CREATE INDEX IF NOT EXISTS idx_proposals_open_updated ON proposals_open(namespace, updated_at DESC);\
+    "
+    .to_string())
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1276,17 +1357,17 @@ mod tests {
     fn fresh_db_migrates_to_latest() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
 
-        // Verify the tracking table has rows for V1 through V17.
+        // Verify the tracking table has rows for V1 through V18.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 17);
+        assert_eq!(count, 18);
 
         // Verify the entities table was created.
         let tbl_count: i64 = conn
@@ -1467,16 +1548,16 @@ mod tests {
         let mut conn = open_memory();
         let v1 = run_migrations(&mut conn).expect("first run");
         let v2 = run_migrations(&mut conn).expect("second run");
-        assert_eq!(v1, 17);
-        assert_eq!(v2, 17);
+        assert_eq!(v1, 18);
+        assert_eq!(v2, 18);
 
-        // Should still have exactly seventeen rows in the tracking table (V1..V17).
+        // Should still have exactly eighteen rows in the tracking table (V1..V18).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 17);
+        assert_eq!(count, 18);
     }
 
     // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
@@ -1486,8 +1567,8 @@ mod tests {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
         assert_eq!(
-            version, 17,
-            "F052: latest migration must be V17 (vector_embedding_model_tag_preserving_rebuild)"
+            version, 18,
+            "F052: latest migration must be V18 (proposals_open_add_applying_status)"
         );
         let col: i64 = conn
             .query_row(
@@ -1515,42 +1596,42 @@ mod tests {
 
     #[test]
     fn failed_migration_rolls_back() {
-        let bad_v18 = VersionedMigration {
-            version: 18,
+        let bad_v19 = VersionedMigration {
+            version: 19,
             name: "bad_migration",
             up: "THIS IS NOT VALID SQL;",
         };
 
         let mut conn = open_memory();
 
-        // Apply all real migrations (V1..V17) so the DB is at V17.
-        run_migrations(&mut conn).expect("V1..V17 should apply cleanly");
+        // Apply all real migrations (V1..V18) so the DB is at V18.
+        run_migrations(&mut conn).expect("V1..V18 should apply cleanly");
 
-        // Now manually drive the bad V18 migration to check rollback behaviour.
-        let result = apply_single_migration(&mut conn, &bad_v18);
+        // Now manually drive the bad V19 migration to check rollback behaviour.
+        let result = apply_single_migration(&mut conn, &bad_v19);
         assert!(result.is_err(), "bad migration should return error");
 
-        // DB should still be at V17 — no V18 row in tracking.
-        let v18_count: i64 = conn
+        // DB should still be at V18 — no V19 row in tracking.
+        let v19_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 18",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 19",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(v18_count, 0, "V18 must not be recorded after rollback");
+        assert_eq!(v19_count, 0, "V19 must not be recorded after rollback");
 
-        // V1..V17 should still be there.
+        // V1..V18 should still be there.
         let applied_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)",
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
-            applied_count, 17,
-            "V1..V17 must still be recorded after V18 rollback"
+            applied_count, 18,
+            "V1..V18 must still be recorded after V19 rollback"
         );
     }
 
@@ -1587,9 +1668,10 @@ mod tests {
         // V14 creates the _embedding_models registry table;
         // V15 creates the proposals_open table;
         // V16 adds embedding_model column to regular vec_ tables;
-        // V17 is a no-op when no old-schema vec0 tables exist.
+        // V17 is a no-op when no old-schema vec0 tables exist;
+        // V18 adds 'applying' to proposals_open status CHECK.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
 
         // V2 should be recorded as applied (skipped but tracked).
         let v2_count: i64 = conn
@@ -1779,9 +1861,9 @@ mod tests {
         )
         .unwrap();
 
-        // Run V2-V17 migrations.
+        // Run V2-V18 migrations.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
 
         // After V12, salience must be nullable (notnull=0).
         let notnull: i64 = conn
@@ -1825,7 +1907,7 @@ mod tests {
         ensure_events_schema(&conn).expect("store DDL should create events");
 
         let version = run_migrations(&mut conn).expect("migrations after events store DDL");
-        assert_eq!(version, 17, "must reach V17 even when events DDL ran first");
+        assert_eq!(version, 18, "must reach V18 even when events DDL ran first");
 
         let v13_count: i64 = conn
             .query_row(
@@ -1866,8 +1948,8 @@ mod tests {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations should succeed");
         assert_eq!(
-            version, 17,
-            "F227: latest migration must be V17 (vector_embedding_model_tag_preserving_rebuild)"
+            version, 18,
+            "F227: latest migration must be V18 (proposals_open_add_applying_status)"
         );
 
         // Verify _embedding_models table exists.
@@ -1964,7 +2046,7 @@ mod tests {
         // Run the full migration suite — V14 should add embedding_model_id to the
         // regular vec_legacy_model table.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
 
         // The embedding_model_id column must now exist.
         let col_exists: bool = conn
@@ -1981,7 +2063,7 @@ mod tests {
 
         // Running migrations again must be idempotent (column already present).
         let version2 = run_migrations(&mut conn).expect("second run must succeed");
-        assert_eq!(version2, 17);
+        assert_eq!(version2, 18);
     }
 
     /// CRIT-2 regression: V14 discovery filter must NOT match sqlite-vec internal
@@ -2013,7 +2095,7 @@ mod tests {
         // Run the full migration suite — V14 must not add `embedding_model_id` to
         // any of the four shadow tables above.
         let version = run_migrations(&mut conn).expect("migrations should succeed");
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
 
         for shadow in [
             "vec_test_chunks",
@@ -2192,9 +2274,9 @@ mod tests {
     fn v17_migration_is_noop_on_fresh_db() {
         let mut conn = open_memory();
         let version = run_migrations(&mut conn).expect("migrations must succeed on fresh DB");
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
 
-        // V17 is recorded.
+        // V17 and V18 are recorded.
         let v17: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM _schema_migrations WHERE version = 17",
@@ -2203,6 +2285,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v17, 1, "V17 must be recorded on fresh DB");
+
+        let v18: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 18",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v18, 1, "V18 must be recorded on fresh DB");
     }
 
     /// V17 round-trip: a plain vec_* table that already has both `field` and

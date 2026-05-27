@@ -449,6 +449,21 @@ pub enum ProposalDecision {
     RequestChanges,
 }
 
+impl ProposalDecision {
+    /// Returns the bare variant name as a lowercase string, matching the serde
+    /// `rename_all = "snake_case"` representation.  Use this when storing the
+    /// decision as a plain TEXT column — **not** `serde_json::to_string`, which
+    /// would produce a JSON-quoted string (`"\"approve\""` instead of `"approve"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+            Self::Comment => "comment",
+            Self::RequestChanges => "request_changes",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProposalAppliedPayload {

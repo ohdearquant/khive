@@ -3831,6 +3831,7 @@ async fn proposal_applied_event_payload_applied_at_via_live_dispatch() {
         )
         .await
         .expect("propose must succeed");
+
     let proposal_id = propose_result["proposal_id"]
         .as_str()
         .expect("must have proposal_id")
@@ -4136,5 +4137,181 @@ async fn note_expires_at_is_normalized_to_iso8601() {
     assert!(
         found.is_some(),
         "list must include the note we inserted (id={note_id}); got {items:?}"
+    );
+}
+
+// ── Wave 5 proposal lifecycle regression tests ──────────────────────────────
+
+fn changeset_add_entity() -> Value {
+    json!({
+        "kind": "add_entity",
+        "entity": {"kind": "concept", "name": "TestNode"}
+    })
+}
+
+/// BUG-3 regression: `list(kind=proposal)` must return `last_decision` as a
+/// bare string ("approve") not a double-JSON-encoded string ("\"approve\"").
+#[tokio::test]
+async fn list_proposal_last_decision_is_bare_string_not_json_encoded() {
+    let f = pack_with_events();
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "BUG-3 test",
+                "description": "Verify last_decision encoding",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    f.dispatch(
+        "review",
+        json!({ "proposal_id": pid, "decision": "approve" }),
+    )
+    .await
+    .expect("review must succeed");
+
+    // list(kind=proposal) returns a JSON array directly (not wrapped in {"items":[...]}).
+    let list = f
+        .dispatch("list", json!({"kind": "proposal"}))
+        .await
+        .expect("list proposals must succeed");
+    let items = list
+        .as_array()
+        .expect("list(kind=proposal) must return a JSON array");
+    let proposal = items
+        .iter()
+        .find(|v| {
+            v["proposal_id"]
+                .as_str()
+                .is_some_and(|id| id == pid || id.starts_with(&pid[..8]))
+        })
+        .or_else(|| items.first())
+        .expect("at least one proposal in list");
+
+    let last_decision = proposal["last_decision"].as_str().unwrap_or("");
+    assert!(
+        !last_decision.starts_with('"'),
+        "BUG-3: last_decision must be a bare string, not JSON-quoted; got: {last_decision:?}"
+    );
+    assert_eq!(
+        last_decision, "approve",
+        "BUG-3: last_decision must be 'approve' (bare), not '\"approve\"'; got: {last_decision:?}"
+    );
+}
+
+/// BUG-5 regression: `review(approve)` on an already-approved proposal must
+/// return an error, not silently increment approve_count.
+#[tokio::test]
+async fn review_approve_on_already_approved_proposal_returns_error() {
+    let f = pack_with_events();
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "BUG-5 test",
+                "description": "Review on approved proposal should fail",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    f.dispatch(
+        "review",
+        json!({ "proposal_id": pid, "decision": "approve" }),
+    )
+    .await
+    .expect("first review(approve) must succeed");
+
+    let second_review = f
+        .dispatch(
+            "review",
+            json!({ "proposal_id": pid, "decision": "approve" }),
+        )
+        .await;
+
+    assert!(
+        second_review.is_err(),
+        "BUG-5: second review(approve) on approved/applied proposal must return error; got: {second_review:?}"
+    );
+    // The apply worker may have run inline and moved the status to 'applied' before the second
+    // review attempt.  Either 'approved' or 'applied' in the error message is correct — both
+    // indicate the proposal is in a terminal state for review purposes.
+    let err_msg = format!("{:?}", second_review.unwrap_err());
+    assert!(
+        err_msg.contains("approved") || err_msg.contains("applied"),
+        "BUG-5: error must mention 'approved' or 'applied'; got: {err_msg}"
+    );
+}
+
+/// BUG-6 regression: `propose` with a non-existent `parent_id` must return
+/// an `InvalidInput` error, not silently create an orphaned proposal.
+#[tokio::test]
+async fn propose_with_nonexistent_parent_id_returns_error() {
+    let f = pack_with_events();
+    let fake_parent = "00000000-0000-0000-0000-000000000042";
+    let result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "BUG-6 amendment",
+                "description": "Amending a non-existent proposal",
+                "changeset": changeset_add_entity(),
+                "parent_id": fake_parent,
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "BUG-6: propose with non-existent parent_id must return error; got: {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "BUG-6: error must be InvalidInput; got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains(fake_parent),
+        "BUG-6: error must quote the offending parent_id; got: {msg}"
+    );
+}
+
+/// BUG-4 regression: two concurrent `withdraw` calls on the same proposal must
+/// result in exactly one success and one error (CAS enforcement).
+/// Note: SQLite in WAL mode is effectively single-writer; this test exercises
+/// the SQL-level CAS by issuing two sequential withdraw calls after the status
+/// is already 'withdrawn' from the first.
+#[tokio::test]
+async fn withdraw_on_already_withdrawn_proposal_returns_error() {
+    let f = pack_with_events();
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "BUG-4 withdraw race",
+                "description": "Second withdraw must fail",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    f.dispatch("withdraw", json!({ "proposal_id": pid }))
+        .await
+        .expect("first withdraw must succeed");
+
+    let second_withdraw = f.dispatch("withdraw", json!({ "proposal_id": pid })).await;
+
+    assert!(
+        second_withdraw.is_err(),
+        "BUG-4: second withdraw must return error (proposal already withdrawn); got: {second_withdraw:?}"
     );
 }

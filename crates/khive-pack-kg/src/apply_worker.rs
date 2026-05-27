@@ -84,7 +84,30 @@ impl ProposalApplyWorker {
             }
         };
 
-        // Apply the changeset.
+        // H1 fix (apply/withdraw race — pre-apply CAS):
+        //
+        // Atomically transition status='approved' → 'applying' before touching the KG.
+        // This closes the race window between the first status check above and the KG
+        // mutation below.  If withdraw lands between those two points, it will find
+        // status='applying' and its own CAS (on_proposal_withdrawn) will return false —
+        // the withdrawal is rejected with an error.  Only this worker can transition
+        // out of 'applying' (to 'applied'), so the KG mutation is now exclusively owned.
+        //
+        // If the CAS fails here it means: (a) a concurrent withdraw already moved to
+        // 'withdrawn', (b) another apply worker won the race (shouldn't happen in v1's
+        // synchronous call-from-review model), or (c) the status changed for another
+        // reason.  In all cases we abort without any KG mutation — ADR-046 §9.
+        let claimed = self.projection.pre_apply_cas(token, proposal_id).await?;
+        if !claimed {
+            tracing::debug!(
+                proposal_id = %proposal_id,
+                "ProposalApplyWorker: pre-apply CAS missed — proposal already in \
+                 non-approved state (withdrawn or applied concurrently); skipping (ADR-046 §9)"
+            );
+            return Ok(());
+        }
+
+        // Apply the changeset — we exclusively own the 'applying' state now.
         let apply_result = self.apply_changeset(token, &changeset).await;
 
         match apply_result {
@@ -95,23 +118,48 @@ impl ProposalApplyWorker {
                     .collect();
                 self.emit_apply_success(token, proposal_id, created_ids)
                     .await;
-                // Update projection: status='applied'.
-                if let Err(e) = self
+                // Update projection: status='applying' → 'applied'.
+                // on_proposal_applied uses CAS WHERE status='applying'; since only this
+                // worker can exit 'applying', this must succeed — but we log if it doesn't.
+                match self
                     .projection
                     .on_proposal_applied(token, proposal_id)
                     .await
                 {
-                    tracing::warn!(
-                        proposal_id = %proposal_id,
-                        error = %e,
-                        "ProposalApplyWorker: projection update failed after successful apply (non-fatal)"
-                    );
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(
+                            proposal_id = %proposal_id,
+                            "ProposalApplyWorker: CAS missed on applied projection update — \
+                             unexpected; KG mutations committed but status may not reflect 'applied'"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            proposal_id = %proposal_id,
+                            error = %e,
+                            "ProposalApplyWorker: projection update failed after successful apply (non-fatal)"
+                        );
+                    }
                 }
             }
             Err(e) => {
                 self.emit_apply_failed(token, proposal_id, e.to_string(), 0)
                     .await;
-                // ADR-046 §9: failed applies leave status='approved' — no projection update.
+                // ADR-046 §9: failed applies leave status='applying' — revert to 'approved'
+                // so the proposal is not stuck.  Best-effort; log on failure.
+                if let Err(e2) = self
+                    .projection
+                    .revert_applying_to_approved(token, proposal_id)
+                    .await
+                {
+                    tracing::warn!(
+                        proposal_id = %proposal_id,
+                        error = %e2,
+                        "ProposalApplyWorker: failed to revert 'applying' back to 'approved' \
+                         after failed apply — proposal may be stuck in 'applying'"
+                    );
+                }
             }
         }
 
@@ -728,6 +776,72 @@ mod tests {
         assert!(
             !entities.iter().any(|e| e.name == "BadEntity"),
             "entity with invalid kind must not be created in the KG"
+        );
+    }
+
+    /// H2 regression: apply worker must NOT mutate the KG when the proposal was
+    /// withdrawn after approval but before the worker runs.
+    ///
+    /// Sequence: approve (status='approved') → withdraw (status='withdrawn') →
+    /// maybe_apply() → assert no entity created, no ProposalApplied event emitted.
+    #[tokio::test]
+    async fn apply_worker_skips_kg_mutation_when_withdrawn_after_approve() {
+        let (rt, tok) = setup();
+        ensure_schema(&rt).await;
+
+        let proposal_id = Uuid::new_v4();
+        let changeset = ProposalChangeset::AddEntity {
+            entity: EntityDraft {
+                kind: "concept".to_string(),
+                name: "ShouldNotExist".to_string(),
+                description: Some("withdrawn before apply".to_string()),
+                properties: None,
+                tags: vec![],
+            },
+        };
+
+        seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+
+        // Start in 'withdrawn' status — simulates: approve → withdraw both landed
+        // before the apply worker runs.
+        insert_projection_row(&rt, &tok, proposal_id, "withdrawn").await;
+
+        let worker = ProposalApplyWorker::new(rt.clone());
+        worker
+            .maybe_apply(&tok, proposal_id)
+            .await
+            .expect("maybe_apply must succeed without error");
+
+        // Assert: no ProposalApplied event was emitted (worker bailed out early).
+        let event_store = rt.events(&tok).expect("event store");
+        let applied_events = event_store
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::ProposalApplied],
+                    payload_proposal_id: Some(proposal_id),
+                    ..Default::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("query applied events");
+        assert_eq!(
+            applied_events.items.len(),
+            0,
+            "H2: no ProposalApplied event must be emitted when proposal is withdrawn"
+        );
+
+        // Assert: no entity was created in the KG.
+        let entities = rt
+            .list_entities(&tok, None, None, 100, 0)
+            .await
+            .expect("list_entities");
+        assert!(
+            !entities.iter().any(|e| e.name == "ShouldNotExist"),
+            "H2: KG must not be mutated when proposal was withdrawn before apply"
         );
     }
 }
