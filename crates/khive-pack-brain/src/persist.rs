@@ -1,0 +1,290 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+use khive_fold::Fold;
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::SqlAccess;
+use serde_json::Value;
+
+use crate::state::{BrainState, BrainStateSnapshot};
+
+const SNAPSHOT_PROFILE_ID: &str = "__brain__";
+const DEFAULT_SNAPSHOT_BATCH_SIZE: u64 = 5;
+
+pub struct PersistenceTracker {
+    loaded_namespaces: HashSet<String>,
+    dirty_counts: HashMap<String, u64>,
+    snapshot_batch_size: u64,
+}
+
+impl Default for PersistenceTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PersistenceTracker {
+    pub fn new() -> Self {
+        Self {
+            loaded_namespaces: HashSet::new(),
+            dirty_counts: HashMap::new(),
+            snapshot_batch_size: DEFAULT_SNAPSHOT_BATCH_SIZE,
+        }
+    }
+
+    pub fn is_loaded(&self, namespace: &str) -> bool {
+        self.loaded_namespaces.contains(namespace)
+    }
+
+    pub fn mark_loaded(&mut self, namespace: String) {
+        self.loaded_namespaces.insert(namespace);
+    }
+
+    pub fn increment_dirty(&mut self, namespace: &str) -> bool {
+        let count = self.dirty_counts.entry(namespace.to_string()).or_insert(0);
+        *count += 1;
+        *count >= self.snapshot_batch_size
+    }
+
+    pub fn reset_dirty(&mut self, namespace: &str) {
+        self.dirty_counts.insert(namespace.to_string(), 0);
+    }
+}
+
+fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::Internal(format!("brain persistence {context}: {e}"))
+}
+
+pub async fn append_brain_event(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    profile_id: &str,
+    event_kind: &str,
+    payload: &Value,
+    created_at_us: i64,
+) -> Result<(), RuntimeError> {
+    let payload_str = serde_json::to_string(payload).map_err(|e| sql_err("serialize event", e))?;
+
+    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO brain_event_log (profile_id, namespace, event_kind, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5)".into(),
+            params: vec![
+                SqlValue::Text(profile_id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(event_kind.to_string()),
+                SqlValue::Text(payload_str),
+                SqlValue::Integer(created_at_us),
+            ],
+            label: Some("brain_event_log_append".into()),
+        })
+        .await
+        .map_err(|e| sql_err("append event", e))?;
+
+    Ok(())
+}
+
+pub async fn upsert_snapshot(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    snapshot: &BrainStateSnapshot,
+    updated_at_us: i64,
+) -> Result<(), RuntimeError> {
+    let snapshot_json =
+        serde_json::to_string(snapshot).map_err(|e| sql_err("serialize snapshot", e))?;
+
+    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO brain_profile_snapshots (profile_id, namespace, snapshot_json, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(profile_id, namespace) DO UPDATE SET snapshot_json = excluded.snapshot_json, updated_at = excluded.updated_at".into(),
+            params: vec![
+                SqlValue::Text(SNAPSHOT_PROFILE_ID.to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(snapshot_json),
+                SqlValue::Integer(updated_at_us),
+            ],
+            label: Some("brain_snapshot_upsert".into()),
+        })
+        .await
+        .map_err(|e| sql_err("upsert snapshot", e))?;
+
+    Ok(())
+}
+
+pub async fn load_latest_snapshot(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+) -> Result<Option<(BrainStateSnapshot, i64)>, RuntimeError> {
+    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT snapshot_json, updated_at FROM brain_profile_snapshots WHERE profile_id = ?1 AND namespace = ?2 ORDER BY updated_at DESC LIMIT 1".into(),
+            params: vec![
+                SqlValue::Text(SNAPSHOT_PROFILE_ID.to_string()),
+                SqlValue::Text(namespace.to_string()),
+            ],
+            label: Some("brain_snapshot_load".into()),
+        })
+        .await
+        .map_err(|e| sql_err("load snapshot", e))?;
+
+    match row {
+        None => Ok(None),
+        Some(row) => {
+            let json_str = match row.get("snapshot_json") {
+                Some(SqlValue::Text(s)) => s.clone(),
+                _ => return Err(sql_err("load snapshot", "missing snapshot_json column")),
+            };
+            let updated_at = match row.get("updated_at") {
+                Some(SqlValue::Integer(n)) => *n,
+                _ => return Err(sql_err("load snapshot", "missing updated_at column")),
+            };
+            let snapshot: BrainStateSnapshot =
+                serde_json::from_str(&json_str).map_err(|e| sql_err("deserialize snapshot", e))?;
+            Ok(Some((snapshot, updated_at)))
+        }
+    }
+}
+
+pub async fn load_events_since(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    since_us: i64,
+) -> Result<Vec<khive_storage::event::Event>, RuntimeError> {
+    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT payload FROM brain_event_log WHERE namespace = ?1 AND created_at > ?2 ORDER BY created_at ASC, id ASC".into(),
+            params: vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(since_us),
+            ],
+            label: Some("brain_events_replay".into()),
+        })
+        .await
+        .map_err(|e| sql_err("load events", e))?;
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let payload_str = match row.get("payload") {
+            Some(SqlValue::Text(s)) => s,
+            _ => continue,
+        };
+        match serde_json::from_str::<khive_storage::event::Event>(payload_str) {
+            Ok(event) => events.push(event),
+            Err(_) => continue,
+        }
+    }
+    Ok(events)
+}
+
+pub async fn ensure_loaded(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    tracker: &Mutex<PersistenceTracker>,
+    state: &Mutex<BrainState>,
+    fold: &crate::fold::BalancedRecallFold,
+    section_fold: &crate::fold::SectionPosteriorFold,
+    entity_capacity: usize,
+) -> Result<(), RuntimeError> {
+    let namespace = token.namespace().as_str().to_string();
+
+    {
+        let t = tracker.lock().unwrap();
+        if t.is_loaded(&namespace) {
+            return Ok(());
+        }
+    }
+
+    let sql = runtime.sql();
+
+    let snapshot_result = load_latest_snapshot(sql.as_ref(), &namespace).await?;
+
+    if let Some((snapshot, updated_at)) = snapshot_result {
+        let replay_events = load_events_since(sql.as_ref(), &namespace, updated_at).await?;
+
+        let ctx = khive_fold::FoldContext::new();
+        let mut brain_state = BrainState::from_snapshot(snapshot, entity_capacity);
+
+        for event in &replay_events {
+            let current = std::mem::replace(
+                &mut brain_state.balanced_recall,
+                crate::state::BalancedRecallState::new(0),
+            );
+            brain_state.balanced_recall = fold.reduce(current, event, &ctx);
+
+            let serving_profile = event
+                .payload
+                .get("served_by_profile_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("balanced-recall-v1");
+
+            if let Some(section_state) = brain_state.section_states.remove(serving_profile) {
+                let updated = section_fold.reduce(section_state, event, &ctx);
+                brain_state
+                    .section_states
+                    .insert(serving_profile.to_string(), updated);
+            }
+        }
+
+        crate::sync_balanced_recall_record(&mut brain_state);
+
+        {
+            let mut s = state.lock().unwrap();
+            *s = brain_state;
+        }
+    }
+
+    {
+        let mut t = tracker.lock().unwrap();
+        t.mark_loaded(namespace);
+    }
+
+    Ok(())
+}
+
+pub async fn persist_after_feedback(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    tracker: &Mutex<PersistenceTracker>,
+    state: &Mutex<BrainState>,
+    event: &khive_storage::event::Event,
+    serving_profile: &str,
+) -> Result<(), RuntimeError> {
+    let namespace = token.namespace().as_str().to_string();
+    let now_us = chrono::Utc::now().timestamp_micros();
+
+    let sql = runtime.sql();
+
+    let event_payload = serde_json::to_value(event).map_err(|e| sql_err("serialize event", e))?;
+
+    append_brain_event(
+        sql.as_ref(),
+        &namespace,
+        serving_profile,
+        &event.verb,
+        &event_payload,
+        now_us,
+    )
+    .await?;
+
+    let should_snapshot = {
+        let mut t = tracker.lock().unwrap();
+        t.increment_dirty(&namespace)
+    };
+
+    if should_snapshot {
+        let snapshot = {
+            let s = state.lock().unwrap();
+            s.to_snapshot()
+        };
+
+        upsert_snapshot(sql.as_ref(), &namespace, &snapshot, now_us).await?;
+
+        let mut t = tracker.lock().unwrap();
+        t.reset_dirty(&namespace);
+    }
+
+    Ok(())
+}

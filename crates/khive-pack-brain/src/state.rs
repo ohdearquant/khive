@@ -1,8 +1,91 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+// ── SectionType ───────────────────────────────────────────────────────────────
+
+/// Knowledge-section types that the brain tracks per-profile (ADR-048).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionType {
+    Overview,
+    CoreModel,
+    BoundaryConditions,
+    Formalism,
+    OperationalGuidance,
+    Examples,
+    FailureModes,
+    ExpertLens,
+    References,
+    Other,
+}
+
+impl SectionType {
+    /// Canonical string representation (matches serde snake_case).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SectionType::Overview => "overview",
+            SectionType::CoreModel => "core_model",
+            SectionType::BoundaryConditions => "boundary_conditions",
+            SectionType::Formalism => "formalism",
+            SectionType::OperationalGuidance => "operational_guidance",
+            SectionType::Examples => "examples",
+            SectionType::FailureModes => "failure_modes",
+            SectionType::ExpertLens => "expert_lens",
+            SectionType::References => "references",
+            SectionType::Other => "other",
+        }
+    }
+
+    /// All section types in a stable canonical order.
+    pub fn all() -> &'static [SectionType] {
+        &Self::ALL
+    }
+
+    /// All section types as a const array.
+    pub const ALL: [SectionType; 10] = [
+        SectionType::Overview,
+        SectionType::CoreModel,
+        SectionType::BoundaryConditions,
+        SectionType::Formalism,
+        SectionType::OperationalGuidance,
+        SectionType::Examples,
+        SectionType::FailureModes,
+        SectionType::ExpertLens,
+        SectionType::References,
+        SectionType::Other,
+    ];
+}
+
+impl fmt::Display for SectionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SectionType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "overview" => Ok(SectionType::Overview),
+            "core_model" => Ok(SectionType::CoreModel),
+            "boundary_conditions" => Ok(SectionType::BoundaryConditions),
+            "formalism" => Ok(SectionType::Formalism),
+            "operational_guidance" => Ok(SectionType::OperationalGuidance),
+            "examples" => Ok(SectionType::Examples),
+            "failure_modes" => Ok(SectionType::FailureModes),
+            "expert_lens" => Ok(SectionType::ExpertLens),
+            "references" => Ok(SectionType::References),
+            "other" => Ok(SectionType::Other),
+            _ => Err(format!("unknown SectionType: {s:?}")),
+        }
+    }
+}
 
 // ── BetaPosterior ─────────────────────────────────────────────────────────────
 
@@ -47,6 +130,27 @@ impl BetaPosterior {
             alpha: self.alpha + other.alpha - prior.alpha,
             beta: self.beta + other.beta - prior.beta,
         }
+    }
+
+    /// Cap ESS at `cap` by scaling excess evidence back toward the prior.
+    ///
+    /// If current ESS exceeds cap, the excess evidence (above the prior) is
+    /// scaled so the resulting ESS equals cap exactly.
+    ///
+    /// Formula: scale = (cap - prior_ess) / (ess - prior_ess)
+    pub fn apply_ess_cap(&mut self, prior: &BetaPosterior, cap: f64) {
+        let ess = self.effective_sample_size();
+        if ess > cap {
+            let prior_ess = prior.effective_sample_size();
+            let scale = (cap - prior_ess) / (ess - prior_ess);
+            self.alpha = prior.alpha + (self.alpha - prior.alpha) * scale;
+            self.beta = prior.beta + (self.beta - prior.beta) * scale;
+        }
+    }
+
+    /// Posterior mean floored at `floor`.
+    pub fn floored_mean(&self, floor: f64) -> f64 {
+        self.mean().max(floor)
     }
 }
 
@@ -201,6 +305,285 @@ pub struct BalancedRecallSnapshot {
     pub exploration_epoch: u64,
 }
 
+// ── SectionPosteriorState ─────────────────────────────────────────────────────
+
+/// Default ESS cap for section posteriors (ADR-048 Correction 2: cap=100).
+pub const DEFAULT_ESS_CAP: f64 = 100.0;
+
+/// Default exploration epoch countdown (ADR-048 §489).
+pub const DEFAULT_EXPLORATION_EPOCH: u64 = 50;
+
+/// Initial temperature for Thompson sampling softmax (ADR-048 Correction 1).
+pub const DEFAULT_TAU_0: f64 = 1.0;
+
+/// Exploit-mode temperature when exploration_epoch == 0 (ADR-048 Correction 1).
+pub const DEFAULT_TAU_EXPLOIT: f64 = 0.1;
+
+/// Default weight floor for section weights (5%).
+pub const DEFAULT_SECTION_WEIGHT_FLOOR: f64 = 0.05;
+
+/// Per-profile section posterior state (ADR-048 Phase 1).
+pub struct SectionPosteriorState {
+    pub posteriors: HashMap<SectionType, BetaPosterior>,
+    pub priors: HashMap<SectionType, BetaPosterior>,
+    pub total_events: u64,
+    pub exploration_epoch: u64,
+}
+
+impl SectionPosteriorState {
+    /// Create with default informative priors for all 10 section types.
+    pub fn new() -> Self {
+        let priors = Self::default_priors();
+        let posteriors = priors.clone();
+        Self {
+            posteriors,
+            priors,
+            total_events: 0,
+            exploration_epoch: DEFAULT_EXPLORATION_EPOCH,
+        }
+    }
+
+    /// Create from explicit prior map. Missing sections get neutral Beta(2,2) fallback.
+    pub fn from_priors(mut priors: HashMap<SectionType, BetaPosterior>) -> Self {
+        let neutral = BetaPosterior::new(2.0, 2.0);
+        for &st in SectionType::all() {
+            priors.entry(st).or_insert_with(|| neutral.clone());
+        }
+        let posteriors = priors.clone();
+        Self {
+            posteriors,
+            priors,
+            total_events: 0,
+            exploration_epoch: DEFAULT_EXPLORATION_EPOCH,
+        }
+    }
+
+    /// Default informative priors from ADR-048.
+    pub fn default_priors() -> HashMap<SectionType, BetaPosterior> {
+        let mut m = HashMap::new();
+        m.insert(SectionType::Overview, BetaPosterior::new(2.0, 2.0));
+        m.insert(SectionType::CoreModel, BetaPosterior::new(4.0, 2.0));
+        m.insert(
+            SectionType::BoundaryConditions,
+            BetaPosterior::new(2.0, 3.0),
+        );
+        m.insert(SectionType::Formalism, BetaPosterior::new(1.5, 4.0));
+        m.insert(
+            SectionType::OperationalGuidance,
+            BetaPosterior::new(6.0, 1.5),
+        );
+        m.insert(SectionType::Examples, BetaPosterior::new(5.0, 2.0));
+        m.insert(SectionType::FailureModes, BetaPosterior::new(3.0, 2.0));
+        m.insert(SectionType::ExpertLens, BetaPosterior::new(3.0, 2.0));
+        m.insert(SectionType::References, BetaPosterior::new(2.0, 2.0));
+        m.insert(SectionType::Other, BetaPosterior::new(2.0, 2.0));
+        m
+    }
+
+    pub fn to_snapshot(&self) -> SectionPosteriorSnapshot {
+        SectionPosteriorSnapshot {
+            posteriors: self.posteriors.clone(),
+            priors: self.priors.clone(),
+            total_events: self.total_events,
+            exploration_epoch: self.exploration_epoch,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: SectionPosteriorSnapshot) -> Self {
+        Self {
+            posteriors: snapshot.posteriors,
+            priors: snapshot.priors,
+            total_events: snapshot.total_events,
+            exploration_epoch: snapshot.exploration_epoch,
+        }
+    }
+
+    /// Thompson sampling weights (stochastic when exploring, deterministic otherwise).
+    pub fn weights(&self, rng: &mut impl rand::Rng) -> HashMap<SectionType, f64> {
+        if self.exploration_epoch > 0 {
+            self.sample_weights(rng)
+        } else {
+            self.deterministic_weights()
+        }
+    }
+
+    /// Stochastic weights via Thompson sampling + softmax (ADR-048 Correction 1).
+    ///
+    /// Explore mode (exploration_epoch > 0):
+    ///   tau = tau_0 * (exploration_epoch / DEFAULT_EXPLORATION_EPOCH)
+    ///   theta_i ~ Beta(alpha_i, beta_i) via Gamma-ratio method
+    ///   w_i = softmax(theta_i / tau), then floor at DEFAULT_SECTION_WEIGHT_FLOOR + renorm
+    ///
+    /// Exploit mode (exploration_epoch == 0): delegates to deterministic_weights() with
+    ///   tau_exploit = DEFAULT_TAU_EXPLOIT applied over posterior means.
+    pub fn sample_weights(&self, rng: &mut impl rand::Rng) -> HashMap<SectionType, f64> {
+        // Compute tau proportional to remaining exploration budget.
+        let tau =
+            DEFAULT_TAU_0 * (self.exploration_epoch as f64 / DEFAULT_EXPLORATION_EPOCH as f64);
+        let tau = tau.max(1e-6); // guard against divide-by-zero at epoch boundary
+
+        // Draw one Thompson sample per section.
+        let mut samples: HashMap<SectionType, f64> = HashMap::new();
+        for (&st, posterior) in &self.posteriors {
+            let theta = sample_beta_gamma(posterior.alpha.max(1e-6), posterior.beta.max(1e-6), rng);
+            samples.insert(st, theta / tau);
+        }
+
+        // Numerically stable softmax: subtract max before exp.
+        let max_val = samples.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mut raw: HashMap<SectionType, f64> = HashMap::new();
+        for (&st, &logit) in &samples {
+            raw.insert(st, (logit - max_val).exp());
+        }
+
+        apply_floor_and_renorm(&mut raw, DEFAULT_SECTION_WEIGHT_FLOOR);
+        raw
+    }
+
+    /// Deterministic weights from posterior means with exploit-mode softmax (ADR-048 Correction 1).
+    ///
+    /// Uses tau_exploit = DEFAULT_TAU_EXPLOIT (0.1) over posterior means, then applies
+    /// weight floor at DEFAULT_SECTION_WEIGHT_FLOOR and renormalizes.
+    pub fn deterministic_weights(&self) -> HashMap<SectionType, f64> {
+        let tau = DEFAULT_TAU_EXPLOIT;
+
+        // Numerically stable softmax over posterior means / tau.
+        let logits: HashMap<SectionType, f64> = self
+            .posteriors
+            .iter()
+            .map(|(&st, p)| (st, p.mean() / tau))
+            .collect();
+        let max_val = logits.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mut raw: HashMap<SectionType, f64> = HashMap::new();
+        for (&st, &logit) in &logits {
+            raw.insert(st, (logit - max_val).exp());
+        }
+
+        apply_floor_and_renorm(&mut raw, DEFAULT_SECTION_WEIGHT_FLOOR);
+        raw
+    }
+
+    /// Reset posteriors to their stored priors.
+    pub fn reset_posteriors(&mut self) {
+        self.posteriors = self.priors.clone();
+    }
+}
+
+impl Default for SectionPosteriorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Weight floor helpers ──────────────────────────────────────────────────────
+
+/// Apply a weight floor and renormalize iteratively until all weights meet the floor.
+///
+/// A single floor+renorm pass can push other weights below the floor after renorm.
+/// Iterate until stable (at most N iterations; in practice 2-3 suffice).
+fn apply_floor_and_renorm(weights: &mut HashMap<SectionType, f64>, floor: f64) {
+    // Normalize first so we work with probabilities.
+    let sum: f64 = weights.values().sum();
+    if sum > 0.0 {
+        for v in weights.values_mut() {
+            *v /= sum;
+        }
+    }
+    // Iterative floor: push up pinned values, renormalize the free mass.
+    for _ in 0..20 {
+        let (pinned_sum, n_free) = weights.values().fold((0.0f64, 0usize), |(ps, nf), &w| {
+            if w <= floor {
+                (ps + floor, nf)
+            } else {
+                (ps, nf + 1)
+            }
+        });
+        if n_free == 0 {
+            // All sections are at or above floor; uniform renorm suffices.
+            let total: f64 = weights.values().sum();
+            if total > 0.0 {
+                for v in weights.values_mut() {
+                    *v /= total;
+                }
+            }
+            break;
+        }
+        let free_mass = (1.0 - pinned_sum).max(0.0);
+        let free_sum: f64 = weights.values().filter(|&&w| w > floor).sum();
+        // Rescale free entries so they fill free_mass proportionally.
+        for v in weights.values_mut() {
+            if *v <= floor {
+                *v = floor;
+            } else if free_sum > 0.0 {
+                *v = (*v / free_sum) * free_mass;
+            }
+        }
+        // Check convergence: all free entries above floor?
+        if weights.values().all(|&w| w >= floor - 1e-12) {
+            break;
+        }
+    }
+}
+
+// ── Beta/Gamma sampling helpers ───────────────────────────────────────────────
+
+/// Sample from Beta(alpha, beta) using the Gamma-ratio method.
+///
+/// X ~ Gamma(alpha, 1), Y ~ Gamma(beta, 1) → Beta = X / (X + Y).
+fn sample_beta_gamma(alpha: f64, beta: f64, rng: &mut impl rand::Rng) -> f64 {
+    let x = sample_gamma_mt(alpha, rng);
+    let y = sample_gamma_mt(beta, rng);
+    let s = x + y;
+    if s <= 0.0 {
+        0.5
+    } else {
+        x / s
+    }
+}
+
+/// Sample from Gamma(shape, 1) using Marsaglia-Tsang's method (shape >= 1),
+/// or the transformation Gamma(shape) = Gamma(shape+1) * U^(1/shape) for shape < 1.
+fn sample_gamma_mt(shape: f64, rng: &mut impl rand::Rng) -> f64 {
+    if shape < 1.0 {
+        let g = sample_gamma_mt(shape + 1.0, rng);
+        let u: f64 = rng.gen();
+        return g * u.powf(1.0 / shape);
+    }
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        let x: f64 = sample_standard_normal_bm(rng);
+        let v_raw = 1.0 + c * x;
+        if v_raw <= 0.0 {
+            continue;
+        }
+        let v = v_raw * v_raw * v_raw;
+        let u: f64 = rng.gen();
+        if u < 1.0 - 0.0331 * (x * x) * (x * x) {
+            return d * v;
+        }
+        if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+            return d * v;
+        }
+    }
+}
+
+/// Sample from N(0,1) using the Box-Muller transform.
+fn sample_standard_normal_bm(rng: &mut impl rand::Rng) -> f64 {
+    let u1: f64 = rng.gen::<f64>().max(f64::EPSILON);
+    let u2: f64 = rng.gen();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+/// Serializable snapshot of SectionPosteriorState.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionPosteriorSnapshot {
+    pub posteriors: HashMap<SectionType, BetaPosterior>,
+    pub priors: HashMap<SectionType, BetaPosterior>,
+    pub total_events: u64,
+    pub exploration_epoch: u64,
+}
+
 // ── ProfileLifecycle ──────────────────────────────────────────────────────────
 
 /// Lifecycle states for a registered profile (ADR-032 §10).
@@ -282,6 +665,9 @@ pub struct ProfileBinding {
 /// for every user-created Bayesian profile. Both maps are initialised at profile
 /// creation and cleared on hard-delete; they are never absent for a living profile
 /// whose `state_class == "Bayesian"`.
+///
+/// `section_states`: per-profile section-level Beta posteriors (ADR-048 §Phase1).
+/// Keys are profile_id; values are `SectionPosteriorState`.
 pub struct BrainState {
     /// Registered profiles indexed by profile_id.
     pub profiles: HashMap<String, ProfileRecord>,
@@ -291,18 +677,23 @@ pub struct BrainState {
     pub profile_states: HashMap<String, BalancedRecallState>,
     /// Profile binding table — maps (actor, namespace, consumer_kind) → profile_id.
     pub bindings: Vec<ProfileBinding>,
+    /// Per-profile section posteriors (ADR-048).
+    pub section_states: HashMap<String, SectionPosteriorState>,
 }
 
 impl BrainState {
     pub fn new(entity_capacity: usize) -> Self {
         let mut profiles = HashMap::new();
         let record = ProfileRecord::new_balanced_recall(entity_capacity);
-        profiles.insert(record.id.clone(), record);
+        let profile_id = record.id.clone();
+        profiles.insert(profile_id.clone(), record);
+
         Self {
             profiles,
             balanced_recall: BalancedRecallState::new(entity_capacity),
             profile_states: HashMap::new(),
             bindings: Vec::new(),
+            section_states: HashMap::new(),
         }
     }
 
@@ -312,11 +703,17 @@ impl BrainState {
             .iter()
             .map(|(id, s)| (id.clone(), s.to_snapshot()))
             .collect();
+        let section_states: HashMap<String, SectionPosteriorSnapshot> = self
+            .section_states
+            .iter()
+            .map(|(id, s)| (id.clone(), s.to_snapshot()))
+            .collect();
         BrainStateSnapshot {
             profiles: self.profiles.clone(),
             balanced_recall: self.balanced_recall.to_snapshot(),
             profile_states: extra,
             bindings: self.bindings.clone(),
+            section_states,
         }
     }
 
@@ -326,6 +723,11 @@ impl BrainState {
             .into_iter()
             .map(|(id, s)| (id, BalancedRecallState::from_snapshot(s, entity_capacity)))
             .collect();
+        let section_states: HashMap<String, SectionPosteriorState> = snapshot
+            .section_states
+            .into_iter()
+            .map(|(id, s)| (id, SectionPosteriorState::from_snapshot(s)))
+            .collect();
         Self {
             profiles: snapshot.profiles,
             balanced_recall: BalancedRecallState::from_snapshot(
@@ -334,6 +736,7 @@ impl BrainState {
             ),
             profile_states: extra,
             bindings: snapshot.bindings,
+            section_states,
         }
     }
 
@@ -343,6 +746,9 @@ impl BrainState {
         if let Some(record) = self.profiles.get_mut("balanced-recall-v1") {
             record.exploration_epoch = self.balanced_recall.exploration_epoch;
             record.state_snapshot = serde_json::to_value(self.balanced_recall.to_snapshot()).ok();
+        }
+        if let Some(ss) = self.section_states.get_mut("balanced-recall-v1") {
+            ss.reset_posteriors();
         }
     }
 
@@ -356,6 +762,9 @@ impl BrainState {
                 record.exploration_epoch = epoch;
                 record.state_snapshot = snap;
             }
+        }
+        if let Some(ss) = self.section_states.get_mut(profile_id) {
+            ss.reset_posteriors();
         }
     }
 
@@ -457,6 +866,9 @@ pub struct BrainStateSnapshot {
     #[serde(default)]
     pub profile_states: HashMap<String, BalancedRecallSnapshot>,
     pub bindings: Vec<ProfileBinding>,
+    /// Per-profile section posteriors (ADR-048).
+    #[serde(default)]
+    pub section_states: HashMap<String, SectionPosteriorSnapshot>,
 }
 
 #[cfg(test)]
@@ -502,6 +914,41 @@ mod tests {
         // merged = (5+4-2, 9+10-8) = (7, 11)
         assert!((merged.alpha - 7.0).abs() < 1e-12);
         assert!((merged.beta - 11.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn beta_posterior_apply_ess_cap_noop() {
+        // ESS = 10 ≤ cap = 50 → no change
+        let prior = BetaPosterior::new(2.0, 2.0);
+        let mut p = BetaPosterior::new(7.0, 3.0);
+        p.apply_ess_cap(&prior, 50.0);
+        assert!((p.alpha - 7.0).abs() < 1e-12);
+        assert!((p.beta - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn beta_posterior_apply_ess_cap_rescale() {
+        // alpha=30, beta=30 → ESS=60 > cap=50, prior_ess=4
+        // scale = (cap - prior_ess) / (ess - prior_ess) = (50-4)/(60-4) = 46/56
+        // new_alpha = 2 + 28*(46/56), new_beta = 2 + 28*(46/56)
+        // new_ess = 4 + 56*(46/56) = 50 exactly
+        let prior = BetaPosterior::new(2.0, 2.0);
+        let mut p = BetaPosterior::new(30.0, 30.0);
+        p.apply_ess_cap(&prior, 50.0);
+        let scale = (50.0 - 4.0) / (60.0 - 4.0); // (cap - prior_ess) / (ess - prior_ess)
+        let expected_excess = 28.0 * scale;
+        assert!((p.alpha - (2.0 + expected_excess)).abs() < 1e-10);
+        assert!((p.beta - (2.0 + expected_excess)).abs() < 1e-10);
+        assert!((p.effective_sample_size() - 50.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn beta_posterior_floored_mean() {
+        let p = BetaPosterior::new(1.0, 99.0); // mean = 0.01
+        assert!((p.floored_mean(0.05) - 0.05).abs() < 1e-12);
+
+        let p2 = BetaPosterior::new(7.0, 3.0); // mean = 0.7
+        assert!((p2.floored_mean(0.05) - 0.7).abs() < 1e-12);
     }
 
     #[test]
@@ -691,5 +1138,101 @@ mod tests {
         assert!((p.alpha - 1.0).abs() < 1e-12);
         assert!((p.beta - 1.0).abs() < 1e-12);
         assert!((p.mean() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn section_type_serde_roundtrip() {
+        for &st in SectionType::all() {
+            let json = serde_json::to_string(&st).unwrap();
+            let back: SectionType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, st, "roundtrip failed for {st}");
+        }
+    }
+
+    #[test]
+    fn section_type_display_and_from_str() {
+        for &st in SectionType::all() {
+            let s = st.to_string();
+            let parsed: SectionType = s.parse().expect("parse should succeed");
+            assert_eq!(parsed, st);
+        }
+    }
+
+    #[test]
+    fn section_type_from_str_unknown_rejected() {
+        let result = "unknown_section".parse::<SectionType>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn section_posterior_state_new_has_all_sections() {
+        let state = SectionPosteriorState::new();
+        assert_eq!(state.posteriors.len(), 10);
+        assert_eq!(state.priors.len(), 10);
+        for &st in SectionType::all() {
+            assert!(
+                state.posteriors.contains_key(&st),
+                "missing section {st} in posteriors"
+            );
+            assert!(
+                state.priors.contains_key(&st),
+                "missing section {st} in priors"
+            );
+        }
+    }
+
+    #[test]
+    fn section_posterior_state_snapshot_roundtrip() {
+        let state = SectionPosteriorState::new();
+        let snap = state.to_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SectionPosteriorSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.posteriors.len(), 10);
+        assert_eq!(back.total_events, 0);
+        assert_eq!(back.exploration_epoch, DEFAULT_EXPLORATION_EPOCH);
+
+        // Reconstruct from snapshot and verify posteriors match
+        let restored = SectionPosteriorState::from_snapshot(back);
+        assert_eq!(restored.posteriors.len(), 10);
+        let op = &state.posteriors[&SectionType::OperationalGuidance];
+        let rp = &restored.posteriors[&SectionType::OperationalGuidance];
+        assert!((op.alpha - rp.alpha).abs() < 1e-12);
+        assert!((op.beta - rp.beta).abs() < 1e-12);
+    }
+
+    #[test]
+    fn section_posterior_state_deterministic_weights_normalized() {
+        let state = SectionPosteriorState::new();
+        let weights = state.deterministic_weights();
+        assert_eq!(weights.len(), 10);
+        let sum: f64 = weights.values().sum();
+        assert!((sum - 1.0).abs() < 1e-10, "weights sum = {sum}");
+        for (&st, &w) in &weights {
+            assert!(
+                w >= DEFAULT_SECTION_WEIGHT_FLOOR - 1e-12,
+                "weight for {st} below floor: {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn section_posterior_state_from_priors_fills_missing() {
+        // Provide only 3 sections; the other 7 should be filled with neutral Beta(2,2)
+        let mut partial: HashMap<SectionType, BetaPosterior> = HashMap::new();
+        partial.insert(SectionType::Overview, BetaPosterior::new(5.0, 1.0));
+        partial.insert(SectionType::CoreModel, BetaPosterior::new(4.0, 2.0));
+        partial.insert(SectionType::Formalism, BetaPosterior::new(3.0, 3.0));
+
+        let state = SectionPosteriorState::from_priors(partial);
+        assert_eq!(state.priors.len(), 10);
+        assert_eq!(state.posteriors.len(), 10);
+
+        // Explicitly provided priors are preserved
+        assert!((state.priors[&SectionType::Overview].alpha - 5.0).abs() < 1e-12);
+
+        // Missing sections get neutral Beta(2,2)
+        let neutral = &state.priors[&SectionType::Examples];
+        assert!((neutral.alpha - 2.0).abs() < 1e-12);
+        assert!((neutral.beta - 2.0).abs() < 1e-12);
     }
 }
