@@ -41,10 +41,9 @@ use khive_pack_schedule::SchedulePack as _;
 /// Bare verb names owned by the kg substrate pack (ADR-023 §4, ADR-024,
 /// ADR-046). These are the only names permitted to omit the `<pack>.` prefix.
 ///
-/// The base 14 are the substrate CRUD + graph + curation + proposal primitives.
-/// `verbs` is the substrate-level verb-registry introspection primitive (J-help
-/// PR #464) — it is conceptually part of the kg substrate surface because it
-/// reports the union of all registered verbs across all packs.
+/// The 16 entries cover CRUD + graph + curation + proposal primitives, plus
+/// `stats` for aggregate namespace metrics and `verbs` for verb-registry
+/// introspection (J-help PR #464).
 const KG_SUBSTRATE_VERBS: &[&str] = &[
     "create",
     "get",
