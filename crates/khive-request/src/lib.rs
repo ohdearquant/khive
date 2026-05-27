@@ -381,6 +381,9 @@ fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedReque
         p.skip_ws();
     }
     if !p.eof() {
+        if p.peek() == Some(',') {
+            return Err(DslError::MixedSeparators);
+        }
         return Err(DslError::UnexpectedChar {
             pos: p.pos,
             found: p.peek().unwrap(),
@@ -488,6 +491,7 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
                 p.advance(1);
                 break;
             }
+            Some('|') => return Err(DslError::MixedSeparators),
             Some(c) => {
                 return Err(DslError::UnexpectedChar {
                     pos: p.pos,
@@ -1796,6 +1800,44 @@ mod tests {
             matches!(err, DslError::PrevRefOutsideChain { .. }),
             "expected PrevRefOutsideChain, got {err:?}"
         );
+    }
+
+    // ── adr-dsl-packs H3: MixedSeparators emitted at parse time ──────────────
+
+    #[test]
+    fn mixed_separators_in_fn_batch_rejected() {
+        // adr-dsl-packs H3: `[a() | b(), c()]` mixes `|` and `,` at top level.
+        let err = parse_request("[a() | b(), c()]").unwrap_err();
+        assert!(
+            matches!(err, DslError::MixedSeparators),
+            "expected MixedSeparators, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_separator_after_chain_rejected() {
+        // adr-dsl-packs H3: `a() | b(), c()` mixes `|` chain with trailing `,`.
+        let err = parse_request("a() | b(), c()").unwrap_err();
+        assert!(
+            matches!(err, DslError::MixedSeparators),
+            "expected MixedSeparators, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn comma_only_parallel_accepted() {
+        // adr-dsl-packs H3: `[a(), b(), c()]` is valid comma-only parallel batch.
+        let req = parse_request("[a(), b(), c()]").unwrap();
+        assert_eq!(req.mode, ExecutionMode::Parallel);
+        assert_eq!(req.ops.len(), 3);
+    }
+
+    #[test]
+    fn pipe_only_chain_accepted() {
+        // adr-dsl-packs H3: `a() | b() | c()` is valid pipe-only chain.
+        let req = parse_request("a() | b() | c()").unwrap();
+        assert_eq!(req.mode, ExecutionMode::Chain);
+        assert_eq!(req.ops.len(), 3);
     }
 
     // ── adr-dsl-packs H2: multi-segment dotted verb → clear error ─────────────

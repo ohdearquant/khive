@@ -675,7 +675,13 @@ pub(crate) async fn handle_thread(
     }
 
     // Sort chronologically ascending (earliest first).
-    messages.sort_by_key(|m| m.get("created_at").and_then(Value::as_i64).unwrap_or(0));
+    // ISO 8601 timestamps (e.g. "2026-05-27T10:30:00.000000Z") are lexicographically
+    // ordered, so string comparison is correct and cheaper than parsing.
+    messages.sort_by(|a, b| {
+        let a_ts = a.get("created_at").and_then(Value::as_str).unwrap_or("");
+        let b_ts = b.get("created_at").and_then(Value::as_str).unwrap_or("");
+        a_ts.cmp(b_ts)
+    });
     messages.truncate(limit);
     let count = messages.len();
 
