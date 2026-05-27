@@ -754,6 +754,9 @@ impl MemoryPack {
             self.runtime.resolve_embedding_model(Some(model_name))?;
         }
 
+        // Preserve the annotates target before moving the vec into the create call (#291).
+        let annotates_target = annotates.first().copied();
+
         let note = self
             .runtime
             .create_note_with_decay_for_embedding_model(
@@ -769,14 +772,38 @@ impl MemoryPack {
             )
             .await?;
 
-        to_json(&json!({
+        let edge_id = if let Some(target_id) = annotates_target {
+            self.runtime
+                .neighbors_with_query(
+                    token,
+                    note.id,
+                    NeighborQuery {
+                        direction: Direction::Out,
+                        relations: Some(vec![EdgeRelation::Annotates]),
+                        limit: None,
+                        min_weight: None,
+                    },
+                )
+                .await?
+                .into_iter()
+                .find(|hit| hit.node_id == target_id)
+                .map(|hit| hit.edge_id.to_string())
+        } else {
+            None
+        };
+
+        let mut response = json!({
             "note_id": note.id.to_string(),
             "kind": note.kind,
             "salience": note.salience,
             "decay_factor": note.decay_factor,
             "memory_type": memory_type,
             "created_at": micros_to_iso(note.created_at),
-        }))
+        });
+        if let Some(eid) = edge_id {
+            response["edge_id"] = json!(eid);
+        }
+        to_json(&response)
     }
 
     pub(crate) async fn handle_recall(

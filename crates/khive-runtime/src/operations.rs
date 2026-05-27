@@ -81,7 +81,7 @@ fn note_title(note: &Note) -> Option<String> {
     note.name
         .clone()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| text_preview(&note.content, 80))
+        .or_else(|| Some(format!("[{}]", note.kind.as_str())))
 }
 
 fn note_snippet(note: &Note) -> Option<String> {
@@ -940,24 +940,34 @@ impl KhiveRuntime {
     }
 
     /// Populate `name` and `kind` on each `NeighborHit` from the corresponding
-    /// entity record (#162). Best-effort — IDs that don't resolve to an entity
-    /// (e.g. note-to-note `annotates` edges) leave the fields `None`.
-    ///
-    /// Done as a single batched entity fetch instead of an SQL JOIN at the
-    /// graph store, so test databases that wire up a graph store without an
-    /// entities table still work. Cost: one query per neighbors() call.
+    /// entity or note record. Best-effort: unresolved IDs leave the fields `None`.
     async fn enrich_neighbor_hits(&self, token: &NamespaceToken, hits: &mut [NeighborHit]) {
         if hits.is_empty() {
             return;
         }
-        let store = match self.entities(token) {
-            Ok(s) => s,
-            Err(_) => return, // no entity store configured; leave name/kind as None
-        };
+
+        let entity_store = self.entities(token).ok();
+        let note_store = self.notes(token).ok();
+
         for hit in hits.iter_mut() {
-            if let Ok(Some(entity)) = store.get_entity(hit.node_id).await {
-                hit.name = Some(entity.name);
-                hit.kind = Some(entity.kind);
+            if let Some(store) = &entity_store {
+                if let Ok(Some(entity)) = store.get_entity(hit.node_id).await {
+                    hit.name = Some(entity.name);
+                    hit.kind = Some(entity.kind);
+                    continue;
+                }
+            }
+
+            if let Some(store) = &note_store {
+                if let Ok(Some(note)) = store.get_note(hit.node_id).await {
+                    let kind = note.kind;
+                    let name = note
+                        .name
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| format!("[{kind}]"));
+                    hit.name = Some(name);
+                    hit.kind = Some(kind);
+                }
             }
         }
     }

@@ -3,6 +3,16 @@
 //! Mirrors khive-internal's `services/note/src/schema.rs` GTD section so the OSS
 //! pack stays interface-compatible with the internal task model.
 
+/// Full lifecycle map for use in error messages and documentation.
+pub const TASK_LIFECYCLE_HELP: &str = concat!(
+    "inbox -> next | waiting | someday | active | done | cancelled; ",
+    "next -> active | waiting | someday | done | cancelled; ",
+    "active -> next | waiting | done | cancelled; ",
+    "waiting -> next | active | done | cancelled; ",
+    "someday -> next | active | done | cancelled; ",
+    "done/cancelled -> terminal"
+);
+
 /// Canonical GTD statuses. Order is documentary, not lifecycle-derived.
 pub const TASK_STATUSES: &[&str] = &[
     "inbox",

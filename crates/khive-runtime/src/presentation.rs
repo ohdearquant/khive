@@ -123,13 +123,19 @@ const SCORE_FIELDS: &[&str] = &[
 /// UUID v4 canonical string length (8-4-4-4-12 = 32 hex + 4 dashes = 36).
 const UUID_CANONICAL_LEN: usize = 36;
 
-/// Field names whose UUID values MUST NOT be shortened in Agent mode.
+/// Return true for fields whose whole-string UUID values may be shortened in
+/// Agent mode. Content-like fields are intentionally excluded even when their
+/// value happens to be UUID-shaped.
 ///
-/// `full_id` is the canonical 36-char UUID companion to the short `id` field.
-/// The entire point of exposing `full_id` is to give callers an unambiguous
-/// chaining handle regardless of presentation mode — shortening it makes it
-/// identical to `id` and defeats its purpose (P-C1).
-const NEVER_SHORTEN_UUID_FIELDS: &[&str] = &["full_id"];
+/// `full_id` is explicitly excluded (P-C1): its purpose is to give callers a
+/// stable chaining handle, so shortening it makes it identical to `id` and
+/// defeats the field entirely.
+fn should_shorten_uuid_field(key: &str) -> bool {
+    if key == "full_id" {
+        return false;
+    }
+    key == "id" || key.ends_with("_id") || matches!(key, "superseded_by" | "replaced_by")
+}
 
 /// Transform a successful verb result value according to the given
 /// [`PresentationMode`].
@@ -215,11 +221,8 @@ fn transform_field_agent(
                 Some(value)
             }
         }
-        // Shorten UUIDs in string fields — UNLESS the field is exempted.
-        // `full_id` must always pass through as the full 36-char UUID (P-C1):
-        // its purpose is to give callers a stable chaining handle, so shortening
-        // it makes it identical to `id` and defeats the field entirely.
-        Value::String(s) if is_canonical_uuid(s) && !NEVER_SHORTEN_UUID_FIELDS.contains(&key) => {
+        // Shorten UUIDs only in fields whose names carry ID semantics.
+        Value::String(s) if is_canonical_uuid(s) && should_shorten_uuid_field(key) => {
             Some(Value::String(s[..8].to_string()))
         }
         // Compact ISO-8601 timestamps in string fields.
@@ -535,5 +538,41 @@ mod tests {
         let mo = if mp < 10 { mp + 3 } else { mp - 9 };
         let y = if mo <= 2 { y + 1 } else { y };
         (y, mo, d, h, m, sec)
+    }
+
+    #[test]
+    fn agent_does_not_shorten_uuid_shaped_content_fields() {
+        let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let out = agent(json!({
+            "id": uuid,
+            "full_id": uuid,
+            "content": uuid,
+            "description": uuid,
+            "title": uuid,
+            "query": uuid,
+        }));
+
+        assert_eq!(out["id"], json!("a1b2c3d4"));
+        assert_eq!(out["full_id"], json!(uuid));
+        assert_eq!(out["content"], json!(uuid));
+        assert_eq!(out["description"], json!(uuid));
+        assert_eq!(out["title"], json!(uuid));
+        assert_eq!(out["query"], json!(uuid));
+    }
+
+    #[test]
+    fn agent_shortens_suffix_id_fields() {
+        let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let out = agent(json!({
+            "note_id": uuid,
+            "source_id": uuid,
+            "target_id": uuid,
+            "proposal_id": uuid,
+        }));
+
+        assert_eq!(out["note_id"], json!("a1b2c3d4"));
+        assert_eq!(out["source_id"], json!("a1b2c3d4"));
+        assert_eq!(out["target_id"], json!("a1b2c3d4"));
+        assert_eq!(out["proposal_id"], json!("a1b2c3d4"));
     }
 }

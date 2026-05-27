@@ -3524,14 +3524,14 @@ mod tests {
 
     // ADR-046: KG pack must expose exactly 14 handlers including propose/review/withdraw
     #[test]
-    fn kg_pack_exposes_15_handlers() {
+    fn kg_pack_exposes_16_handlers() {
         use crate::KgPack;
         use khive_types::Pack;
         let handlers = KgPack::HANDLERS;
         assert_eq!(
             handlers.len(),
-            15,
-            "kg pack must expose 15 handlers"
+            16,
+            "kg pack must expose 16 handlers (was 15, +1 for stats — #280)"
         );
         let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
         assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
@@ -3541,6 +3541,7 @@ mod tests {
             "withdraw must be in KG_HANDLERS"
         );
         assert!(names.contains(&"verbs"), "verbs must be in KG_HANDLERS");
+        assert!(names.contains(&"stats"), "stats must be in KG_HANDLERS");
     }
 
     // ---- Wave 4 regression tests ----
