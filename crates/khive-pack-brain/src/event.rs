@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use khive_storage::event::Event;
 use khive_types::EventOutcome;
+
+use crate::state::SectionType;
 
 /// Feedback signal values for the `brain.feedback` verb (ADR-032 §3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -32,6 +36,7 @@ pub enum BrainSignal {
         signal: FeedbackSignal,
         /// Profile that served the event being rated, if known.
         served_by_profile_id: Option<String>,
+        section_signals: Option<HashMap<SectionType, FeedbackSignal>>,
     },
     /// Any other note-substrate access (get, list on notes).
     NoteAccessed { target_id: Uuid },
@@ -79,11 +84,15 @@ pub fn interpret(event: &Event) -> BrainSignal {
                 .get("served_by_profile_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_owned());
+            let section_signals = event.payload.get("section_signals").and_then(|v| {
+                serde_json::from_value::<HashMap<SectionType, FeedbackSignal>>(v.clone()).ok()
+            });
             match signal {
                 Some(s) => BrainSignal::Feedback {
                     target_id: target,
                     signal: s,
                     served_by_profile_id: served_by,
+                    section_signals,
                 },
                 None => BrainSignal::Irrelevant,
             }
@@ -169,6 +178,7 @@ mod tests {
                 target_id,
                 signal,
                 served_by_profile_id,
+                ..
             } => {
                 assert_eq!(target_id, id);
                 assert_eq!(signal, FeedbackSignal::Useful);
@@ -191,6 +201,7 @@ mod tests {
                 target_id,
                 signal,
                 served_by_profile_id,
+                ..
             } => {
                 assert_eq!(target_id, id);
                 assert_eq!(signal, FeedbackSignal::NotUseful);
@@ -257,6 +268,7 @@ mod tests {
             target_id: id,
             signal: FeedbackSignal::NotUseful,
             served_by_profile_id: None,
+            section_signals: None,
         };
         assert_eq!(entity_signal(&sig), Some((id, false)));
     }
@@ -268,6 +280,7 @@ mod tests {
             target_id: id,
             signal: FeedbackSignal::Wrong,
             served_by_profile_id: None,
+            section_signals: None,
         };
         assert_eq!(entity_signal(&sig), Some((id, false)));
     }
@@ -305,6 +318,48 @@ mod tests {
                 assert_eq!(target_id, id);
             }
             other => panic!("expected NoteAccessed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feedback_with_section_signals() {
+        use crate::state::SectionType;
+        let id = Uuid::new_v4();
+        let mut e = make_event("brain.feedback", EventOutcome::Success, Some(id));
+        e.payload = serde_json::json!({
+            "signal": "useful",
+            "section_signals": {
+                "overview": "useful",
+                "formalism": "not_useful",
+                "examples": "wrong"
+            }
+        });
+        match interpret(&e) {
+            BrainSignal::Feedback {
+                section_signals, ..
+            } => {
+                let ss = section_signals.expect("section_signals should be parsed");
+                assert_eq!(ss.len(), 3);
+                assert_eq!(ss[&SectionType::Overview], FeedbackSignal::Useful);
+                assert_eq!(ss[&SectionType::Formalism], FeedbackSignal::NotUseful);
+                assert_eq!(ss[&SectionType::Examples], FeedbackSignal::Wrong);
+            }
+            other => panic!("expected Feedback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feedback_without_section_signals_is_none() {
+        let id = Uuid::new_v4();
+        let mut e = make_event("brain.feedback", EventOutcome::Success, Some(id));
+        e.payload = serde_json::json!({"signal": "useful"});
+        match interpret(&e) {
+            BrainSignal::Feedback {
+                section_signals, ..
+            } => {
+                assert!(section_signals.is_none());
+            }
+            other => panic!("expected Feedback, got {other:?}"),
         }
     }
 }

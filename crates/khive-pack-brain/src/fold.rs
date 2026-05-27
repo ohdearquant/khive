@@ -2,7 +2,7 @@ use khive_fold::{Fold, FoldContext};
 use khive_storage::event::Event;
 
 use crate::event::{entity_signal, interpret, is_recall_positive, BrainSignal, FeedbackSignal};
-use crate::state::{BalancedRecallState, BetaPosterior};
+use crate::state::{BalancedRecallState, BetaPosterior, SectionPosteriorState, DEFAULT_ESS_CAP};
 
 /// Fold for the `BalancedRecallProfile` state (ADR-032 §5a).
 ///
@@ -101,6 +101,76 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
     }
 
     fn finalize(&self, state: BalancedRecallState, _context: &FoldContext) -> BalancedRecallState {
+        state
+    }
+}
+
+/// Fold for section posteriors (ADR-048 Phase 1).
+///
+/// Only processes Feedback events that carry section_signals.
+/// Update rules: useful → alpha += 1, not_useful → beta += 1, wrong → beta += 2.
+/// ESS cap applied per section after each update.
+/// Exploration epoch decrements once per feedback event (floored at 0).
+pub struct SectionPosteriorFold;
+
+impl SectionPosteriorFold {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SectionPosteriorFold {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fold<Event, SectionPosteriorState> for SectionPosteriorFold {
+    fn init(&self, _context: &FoldContext) -> SectionPosteriorState {
+        SectionPosteriorState::new()
+    }
+
+    fn reduce(
+        &self,
+        mut state: SectionPosteriorState,
+        event: &Event,
+        _ctx: &FoldContext,
+    ) -> SectionPosteriorState {
+        let signal = interpret(event);
+
+        if let BrainSignal::Feedback {
+            section_signals: Some(ref signals),
+            ..
+        } = signal
+        {
+            state.total_events += 1;
+
+            for (section_type, feedback_signal) in signals {
+                if let Some(posterior) = state.posteriors.get_mut(section_type) {
+                    match feedback_signal {
+                        FeedbackSignal::Useful => posterior.alpha += 1.0,
+                        FeedbackSignal::NotUseful => posterior.beta += 1.0,
+                        FeedbackSignal::Wrong => posterior.beta += 2.0,
+                    }
+                    if let Some(prior) = state.priors.get(section_type) {
+                        posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP);
+                    }
+                }
+            }
+
+            if state.exploration_epoch > 0 {
+                state.exploration_epoch -= 1;
+            }
+        }
+
+        state
+    }
+
+    fn finalize(
+        &self,
+        state: SectionPosteriorState,
+        _context: &FoldContext,
+    ) -> SectionPosteriorState {
         state
     }
 }
@@ -307,5 +377,165 @@ mod tests {
             (state.salience.beta - (sal_beta_prior + 1.0)).abs() < 1e-12,
             "not_useful feedback must increment salience.beta"
         );
+    }
+
+    // ── SectionPosteriorFold tests ───────────────────────────────────────────
+
+    use crate::state::SectionType as ST;
+
+    fn make_section_feedback_event(section_signals: serde_json::Value) -> Event {
+        let id = Uuid::new_v4();
+        let mut e = make_event("brain.feedback", EventOutcome::Success, Some(id));
+        e.payload = serde_json::json!({
+            "signal": "useful",
+            "section_signals": section_signals
+        });
+        e
+    }
+
+    #[test]
+    fn section_fold_useful_increments_alpha() {
+        let fold = SectionPosteriorFold::new();
+        let ctx = FoldContext::new();
+        let state = fold.init(&ctx);
+
+        let alpha_before = state.posteriors[&ST::Overview].alpha;
+
+        let event = make_section_feedback_event(serde_json::json!({
+            "overview": "useful"
+        }));
+        let state = fold.reduce(state, &event, &ctx);
+
+        assert!(
+            (state.posteriors[&ST::Overview].alpha - (alpha_before + 1.0)).abs() < 1e-12,
+            "useful must increment alpha"
+        );
+    }
+
+    #[test]
+    fn section_fold_not_useful_increments_beta() {
+        let fold = SectionPosteriorFold::new();
+        let ctx = FoldContext::new();
+        let state = fold.init(&ctx);
+
+        let beta_before = state.posteriors[&ST::Formalism].beta;
+
+        let event = make_section_feedback_event(serde_json::json!({
+            "formalism": "not_useful"
+        }));
+        let state = fold.reduce(state, &event, &ctx);
+
+        assert!(
+            (state.posteriors[&ST::Formalism].beta - (beta_before + 1.0)).abs() < 1e-12,
+            "not_useful must increment beta by 1"
+        );
+    }
+
+    #[test]
+    fn section_fold_wrong_increments_beta_by_two() {
+        let fold = SectionPosteriorFold::new();
+        let ctx = FoldContext::new();
+        let state = fold.init(&ctx);
+
+        let beta_before = state.posteriors[&ST::Examples].beta;
+
+        let event = make_section_feedback_event(serde_json::json!({
+            "examples": "wrong"
+        }));
+        let state = fold.reduce(state, &event, &ctx);
+
+        assert!(
+            (state.posteriors[&ST::Examples].beta - (beta_before + 2.0)).abs() < 1e-12,
+            "wrong must increment beta by 2"
+        );
+    }
+
+    #[test]
+    fn section_fold_no_section_signals_is_noop() {
+        let fold = SectionPosteriorFold::new();
+        let ctx = FoldContext::new();
+        let state = fold.init(&ctx);
+        let total_before = state.total_events;
+
+        // Feedback without section_signals
+        let id = Uuid::new_v4();
+        let mut e = make_event("brain.feedback", EventOutcome::Success, Some(id));
+        e.payload = serde_json::json!({"signal": "useful"});
+        let state = fold.reduce(state, &e, &ctx);
+
+        assert_eq!(
+            state.total_events, total_before,
+            "no section_signals should be noop"
+        );
+    }
+
+    #[test]
+    fn section_fold_epoch_decrements() {
+        let fold = SectionPosteriorFold::new();
+        let ctx = FoldContext::new();
+        let state = fold.init(&ctx);
+        let epoch_before = state.exploration_epoch;
+
+        let event = make_section_feedback_event(serde_json::json!({
+            "overview": "useful"
+        }));
+        let state = fold.reduce(state, &event, &ctx);
+
+        assert_eq!(state.exploration_epoch, epoch_before - 1);
+    }
+
+    #[test]
+    fn section_fold_epoch_floors_at_zero() {
+        let fold = SectionPosteriorFold::new();
+        let ctx = FoldContext::new();
+        let mut state = fold.init(&ctx);
+        state.exploration_epoch = 0;
+
+        let event = make_section_feedback_event(serde_json::json!({
+            "overview": "useful"
+        }));
+        let state = fold.reduce(state, &event, &ctx);
+
+        assert_eq!(state.exploration_epoch, 0, "epoch must floor at 0");
+    }
+
+    #[test]
+    fn section_fold_deterministic_replay() {
+        let fold = SectionPosteriorFold::new();
+        let ctx = FoldContext::new();
+
+        let events = vec![
+            make_section_feedback_event(
+                serde_json::json!({"overview": "useful", "formalism": "not_useful"}),
+            ),
+            make_section_feedback_event(serde_json::json!({"examples": "wrong"})),
+            make_section_feedback_event(serde_json::json!({"overview": "useful"})),
+        ];
+
+        let mut s1 = fold.init(&ctx);
+        for e in &events {
+            s1 = fold.reduce(s1, e, &ctx);
+        }
+
+        let mut s2 = fold.init(&ctx);
+        for e in &events {
+            s2 = fold.reduce(s2, e, &ctx);
+        }
+
+        let snap1 = s1.to_snapshot();
+        let snap2 = s2.to_snapshot();
+        assert_eq!(snap1.total_events, snap2.total_events);
+        for st in ST::all() {
+            assert!(
+                (snap1.posteriors[st].alpha - snap2.posteriors[st].alpha).abs() < 1e-12,
+                "replay alpha mismatch for {:?}",
+                st
+            );
+            assert!(
+                (snap1.posteriors[st].beta - snap2.posteriors[st].beta).abs() < 1e-12,
+                "replay beta mismatch for {:?}",
+                st
+            );
+        }
     }
 }

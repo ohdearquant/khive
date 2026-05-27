@@ -511,6 +511,32 @@ const V19_KNOWLEDGE_ATOMS_AND_DOMAINS: &str = "\
     END;\
 ";
 
+// V20: brain pack — profile snapshots and event log tables (ADR-048 Phase 1).
+//
+// brain_profile_snapshots stores the full serialised profile state keyed by
+// (profile_id, namespace). brain_event_log records every mutation event for
+// audit and replay; the index on (profile_id, namespace, created_at) supports
+// efficient time-ordered scans.
+const V20_BRAIN_PROFILE_PERSISTENCE: &str = "\
+    CREATE TABLE IF NOT EXISTS brain_profile_snapshots (\
+        profile_id    TEXT NOT NULL,\
+        namespace     TEXT NOT NULL DEFAULT 'default',\
+        snapshot_json TEXT NOT NULL,\
+        updated_at    INTEGER NOT NULL,\
+        PRIMARY KEY (profile_id, namespace)\
+    );\
+    CREATE TABLE IF NOT EXISTS brain_event_log (\
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,\
+        profile_id TEXT NOT NULL,\
+        namespace  TEXT NOT NULL DEFAULT 'default',\
+        event_kind TEXT NOT NULL,\
+        payload    TEXT NOT NULL,\
+        created_at INTEGER NOT NULL\
+    );\
+    CREATE INDEX IF NOT EXISTS idx_brain_events_profile \
+        ON brain_event_log(profile_id, namespace, created_at);\
+";
+
 // V21: knowledge_sections — section-typed content rows for knowledge atoms.
 //
 // Each row holds one section (e.g. "overview", "formalism") for a given atom.
@@ -690,13 +716,10 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "knowledge_atoms_and_domains",
         up: V19_KNOWLEDGE_ATOMS_AND_DOMAINS,
     },
-    // V20: reserved for brain section posteriors (PR #505 — brain persistence).
-    // This no-op placeholder keeps the migration sequence contiguous so that
-    // feat/adr048-phase2 can safely add V21 without a gap after PR #505 merges.
     VersionedMigration {
         version: 20,
-        name: "reserved_brain_section_posteriors",
-        up: "SELECT 1;",
+        name: "brain_profile_persistence",
+        up: V20_BRAIN_PROFILE_PERSISTENCE,
     },
     // V21: knowledge_sections table (ADR-048 Phase 2).
     // Stores section-typed content for knowledge atoms: 10-value SectionType enum,
@@ -1699,6 +1722,25 @@ mod tests {
             assert!(exists, "V15 must create index {idx}");
         }
 
+        // Verify V20 created brain_profile_snapshots and brain_event_log tables.
+        let snap_tbl: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='brain_profile_snapshots'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(snap_tbl, 1, "V20 must create brain_profile_snapshots table");
+
+        let log_tbl: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='brain_event_log'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(log_tbl, 1, "V20 must create brain_event_log table");
+
         // Verify V21 created the knowledge_sections table.
         let sections_tbl: i64 = conn
             .query_row(
@@ -1878,7 +1920,7 @@ mod tests {
         // V17 is a no-op when no old-schema vec0 tables exist;
         // V18 adds 'applying' to proposals_open status CHECK;
         // V19 creates knowledge_atoms/knowledge_domains tables;
-        // V20 is a no-op placeholder (reserved for brain section posteriors);
+        // V20 creates brain_profile_snapshots and brain_event_log tables;
         // V21 creates knowledge_sections table (ADR-048 Phase 2).
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
         assert_eq!(version, 21);

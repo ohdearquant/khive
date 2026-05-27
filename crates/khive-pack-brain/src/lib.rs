@@ -1,5 +1,7 @@
 pub mod event;
 pub mod fold;
+pub mod persist;
+pub mod section;
 pub mod state;
 pub mod tunable;
 
@@ -20,8 +22,11 @@ use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
 use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
-use crate::fold::BalancedRecallFold;
-use crate::state::{BrainState, ProfileBinding, ProfileLifecycle, ProfileRecord};
+use crate::fold::{BalancedRecallFold, SectionPosteriorFold};
+use crate::section::derive_deterministic_weights;
+use crate::state::{
+    BrainState, ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState, SectionType,
+};
 
 const ENTITY_CACHE_CAPACITY: usize = 10_000;
 
@@ -34,7 +39,7 @@ const ENTITY_CACHE_CAPACITY: usize = 10_000;
 /// so the record is never stale regardless of which path updated the state.
 /// Fix #295: also called from `handle_reset` so the profile record reflects
 /// restored domain-informed priors immediately after reset.
-fn sync_balanced_recall_record(state: &mut BrainState) {
+pub(crate) fn sync_balanced_recall_record(state: &mut BrainState) {
     let total_ev = state.balanced_recall.total_events;
     let snap_val = serde_json::to_value(state.balanced_recall.to_snapshot()).ok();
     if let Some(record) = state.profiles.get_mut("balanced-recall-v1") {
@@ -207,6 +212,12 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
                 required: false,
                 description: "Profile ID that served the result being rated. Recorded in the event payload.",
             },
+            ParamDef {
+                name: "section_signals",
+                param_type: "object",
+                required: false,
+                description: "Per-section feedback signals: {\"section_name\": \"useful\"|\"not_useful\"|\"wrong\"}. For knowledge_compose profiles.",
+            },
         ],
     },
     // ── Declaration verbs ─────────────────────────────────────────────────
@@ -336,6 +347,12 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
                 required: false,
                 description: "Operation kind this profile targets (e.g. \"recall\"). Default \"recall\".",
             },
+            ParamDef {
+                name: "seed_priors",
+                param_type: "object",
+                required: false,
+                description: "Seed priors object. For knowledge_compose: {\"section_posteriors\": {\"overview\": {\"alpha\": 2.0, \"beta\": 2.0}, ...}}. For recall: {\"relevance\": {\"alpha\": 7.0, \"beta\": 3.0}, ...}.",
+            },
         ],
     },
     // ── Legacy / internal ─────────────────────────────────────────────────
@@ -380,6 +397,10 @@ pub struct BrainPack {
     state: Mutex<BrainState>,
     /// Fold for the built-in `balanced-recall-v1` profile.
     fold: BalancedRecallFold,
+    /// Fold for per-profile section posteriors (ADR-048 Phase 1).
+    section_fold: SectionPosteriorFold,
+    /// Tracks which namespaces are loaded from DB and dirty event counts.
+    persistence: Mutex<persist::PersistenceTracker>,
 }
 
 impl Pack for BrainPack {
@@ -393,12 +414,28 @@ impl Pack for BrainPack {
 impl BrainPack {
     pub fn new(runtime: KhiveRuntime) -> Self {
         let fold = BalancedRecallFold::new(ENTITY_CACHE_CAPACITY);
+        let section_fold = SectionPosteriorFold::new();
         let state = BrainState::new(ENTITY_CACHE_CAPACITY);
         Self {
             runtime,
             state: Mutex::new(state),
             fold,
+            section_fold,
+            persistence: Mutex::new(persist::PersistenceTracker::new()),
         }
+    }
+
+    async fn ensure_loaded(&self, token: &NamespaceToken) -> Result<(), RuntimeError> {
+        persist::ensure_loaded(
+            &self.runtime,
+            token,
+            &self.persistence,
+            &self.state,
+            &self.fold,
+            &self.section_fold,
+            ENTITY_CACHE_CAPACITY,
+        )
+        .await
     }
 
     /// Public snapshot of the current `BrainState`.
@@ -612,6 +649,30 @@ impl BrainPack {
             .get(&profile_id)
             .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?;
 
+        // Build per-section posterior summary for the response (ADR-048 §Phase1).
+        let section_summary = if let Some(ss) = state.section_states.get(&profile_id) {
+            let weights = derive_deterministic_weights(ss);
+            let mut sections_json: serde_json::Map<String, Value> =
+                serde_json::Map::with_capacity(ss.posteriors.len());
+            for (section, posterior) in &ss.posteriors {
+                let w = weights.get(section).copied().unwrap_or(0.0);
+                sections_json.insert(
+                    section.as_str().to_owned(),
+                    json!({
+                        "alpha": posterior.alpha,
+                        "beta": posterior.beta,
+                        "mean": posterior.mean(),
+                        "variance": posterior.variance(),
+                        "ess": posterior.effective_sample_size(),
+                        "weight": w,
+                    }),
+                );
+            }
+            Value::Object(sections_json)
+        } else {
+            Value::Null
+        };
+
         Ok(json!({
             "id": record.id,
             "description": record.description,
@@ -622,6 +683,7 @@ impl BrainPack {
             "exploration_epoch": record.exploration_epoch,
             "created_at": record.created_at,
             "state_snapshot": record.state_snapshot,
+            "section_posteriors": section_summary,
         }))
     }
 
@@ -799,6 +861,7 @@ impl BrainPack {
             target_id: String,
             signal: String,
             served_by_profile_id: Option<String>,
+            section_signals: Option<serde_json::Value>,
         }
         let p: FeedbackParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
@@ -862,6 +925,9 @@ impl BrainPack {
         if let Some(ref profile_id) = p.served_by_profile_id {
             data["served_by_profile_id"] = json!(profile_id);
         }
+        if let Some(ref ss) = p.section_signals {
+            data["section_signals"] = ss.clone();
+        }
 
         let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
         let event = Event::new(
@@ -881,50 +947,70 @@ impl BrainPack {
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        let ctx = FoldContext::new();
-        let mut state = self.state.lock().unwrap();
-
-        // Route feedback to the served profile's state, or to the built-in default.
-        let serving_profile = p
+        let serving_profile_owned = p
             .served_by_profile_id
             .as_deref()
-            .unwrap_or("balanced-recall-v1");
+            .unwrap_or("balanced-recall-v1")
+            .to_string();
 
-        if serving_profile == "balanced-recall-v1" {
-            // Update the built-in balanced-recall state.
-            let current_recall = std::mem::replace(
-                &mut state.balanced_recall,
-                crate::state::BalancedRecallState::new(0),
-            );
-            let updated = self.fold.reduce(current_recall, &event, &ctx);
-            state.balanced_recall = updated;
-            // Fix #356 (MAJ-003): sync profile record metadata via shared helper.
-            sync_balanced_recall_record(&mut state);
-        } else if state.profile_states.contains_key(serving_profile) {
-            // Update the user-created profile's own state.
-            let current = state
-                .profile_states
-                .remove(serving_profile)
-                .expect("key checked above");
-            let updated = self.fold.reduce(current, &event, &ctx);
-            let snap = serde_json::to_value(updated.to_snapshot()).ok();
-            let total = updated.total_events;
-            state
-                .profile_states
-                .insert(serving_profile.to_string(), updated);
-            if let Some(record) = state.profiles.get_mut(serving_profile) {
-                record.total_events = total;
-                record.state_snapshot = snap;
+        {
+            let ctx = FoldContext::new();
+            let mut state = self.state.lock().unwrap();
+            let serving_profile = serving_profile_owned.as_str();
+
+            if serving_profile == "balanced-recall-v1" {
+                let current_recall = std::mem::replace(
+                    &mut state.balanced_recall,
+                    crate::state::BalancedRecallState::new(0),
+                );
+                let updated = self.fold.reduce(current_recall, &event, &ctx);
+                state.balanced_recall = updated;
+                sync_balanced_recall_record(&mut state);
+            } else if state.profile_states.contains_key(serving_profile) {
+                let current = state
+                    .profile_states
+                    .remove(serving_profile)
+                    .expect("key checked above");
+                let updated = self.fold.reduce(current, &event, &ctx);
+                let snap = serde_json::to_value(updated.to_snapshot()).ok();
+                let total = updated.total_events;
+                state
+                    .profile_states
+                    .insert(serving_profile.to_string(), updated);
+                if let Some(record) = state.profiles.get_mut(serving_profile) {
+                    record.total_events = total;
+                    record.state_snapshot = snap;
+                }
+            } else {
+                let current_recall = std::mem::replace(
+                    &mut state.balanced_recall,
+                    crate::state::BalancedRecallState::new(0),
+                );
+                let updated = self.fold.reduce(current_recall, &event, &ctx);
+                state.balanced_recall = updated;
+                sync_balanced_recall_record(&mut state);
             }
-        } else {
-            // Profile exists in registry but has no live state — fall back to built-in.
-            let current_recall = std::mem::replace(
-                &mut state.balanced_recall,
-                crate::state::BalancedRecallState::new(0),
-            );
-            let updated = self.fold.reduce(current_recall, &event, &ctx);
-            state.balanced_recall = updated;
-            sync_balanced_recall_record(&mut state);
+
+            if let Some(section_state) = state.section_states.remove(serving_profile) {
+                let updated = self.section_fold.reduce(section_state, &event, &ctx);
+                state
+                    .section_states
+                    .insert(serving_profile.to_string(), updated);
+            }
+        }
+
+        // Persist feedback to brain_event_log; batch-upsert snapshot when dirty threshold reached.
+        if let Err(e) = persist::persist_after_feedback(
+            &self.runtime,
+            token,
+            &self.persistence,
+            &self.state,
+            &event,
+            &serving_profile_owned,
+        )
+        .await
+        {
+            eprintln!("[brain] persistence failed (non-fatal): {e}");
         }
 
         Ok(json!({
@@ -1113,11 +1199,13 @@ impl BrainPack {
 
     async fn handle_create_profile(&self, params: Value) -> Result<Value, RuntimeError> {
         // H1: allow external agents to create new profiles via MCP.
+        // seed_priors: optional object for seeding section priors, or null for defaults.
         #[derive(Deserialize)]
         struct CreateProfileParams {
             name: String,
             description: Option<String>,
             consumer_kind: Option<String>,
+            seed_priors: Option<serde_json::Value>,
         }
         let p: CreateProfileParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
@@ -1182,8 +1270,45 @@ impl BrainPack {
             exploration_epoch: 0,
         };
 
+        // Seed section posteriors: parse explicit section_posteriors object if provided,
+        // else use default informative priors from ADR-048 §5.
+        let section_state = if let Some(ref seed) = p.seed_priors {
+            if let Some(sp_obj) = seed.get("section_posteriors").and_then(|v| v.as_object()) {
+                let mut priors = std::collections::HashMap::new();
+                for (key, val) in sp_obj {
+                    let st: SectionType = key.parse().map_err(|_| {
+                        RuntimeError::InvalidInput(format!("unknown section type: {key:?}"))
+                    })?;
+                    let alpha = val.get("alpha").and_then(|v| v.as_f64()).ok_or_else(|| {
+                        RuntimeError::InvalidInput(format!(
+                            "missing or invalid alpha for section {key:?}"
+                        ))
+                    })?;
+                    let beta = val.get("beta").and_then(|v| v.as_f64()).ok_or_else(|| {
+                        RuntimeError::InvalidInput(format!(
+                            "missing or invalid beta for section {key:?}"
+                        ))
+                    })?;
+                    if alpha <= 0.0 || beta <= 0.0 {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "alpha and beta must be positive for section {key:?}; got alpha={alpha}, beta={beta}"
+                        )));
+                    }
+                    priors.insert(st, crate::state::BetaPosterior::new(alpha, beta));
+                }
+                SectionPosteriorState::from_priors(priors)
+            } else {
+                return Err(RuntimeError::InvalidInput(
+                    "seed_priors must contain a 'section_posteriors' object".into(),
+                ));
+            }
+        } else {
+            SectionPosteriorState::new()
+        };
+
         state.profiles.insert(p_name.clone(), record);
         state.profile_states.insert(p_name.clone(), ps);
+        state.section_states.insert(p_name.clone(), section_state);
 
         Ok(json!({
             "created": true,
@@ -1246,6 +1371,7 @@ impl PackRuntime for BrainPack {
         _registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
+        self.ensure_loaded(token).await?;
         match verb {
             // Assertive
             "brain.state" => self.handle_state(params).await,
