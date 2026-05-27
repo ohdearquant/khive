@@ -464,15 +464,15 @@ shared knowledge graph.
 
 ### Rule: KG uses shared namespace, scoped packs use actor namespace
 
-| Pack layer | Namespace | Rationale |
-|---|---|---|
+| Pack layer                      | Namespace                 | Rationale                                             |
+| ------------------------------- | ------------------------- | ----------------------------------------------------- |
 | **KG** (entities, edges, notes) | `local` (default, shared) | One "LoRA" entity — all projects link to it via edges |
-| **Memory** (remember/recall) | `lambda:{project}` | Scoped episodic/semantic memory per agent |
-| **GTD** (assign/next/complete) | `lambda:{project}` | Scoped task queues per orchestrator |
-| **Comm** (send/inbox) | `lambda:{project}` | Scoped messaging between agents |
-| **Brain** (profiles/feedback) | `lambda:{project}` | Scoped priors per agent context |
-| **Schedule** (agenda/remind) | `lambda:{project}` | Scoped schedules per agent |
-| **Knowledge** (learn/cite) | `local` (shared) | Extends KG — same shared namespace |
+| **Memory** (remember/recall)    | `lambda:{project}`        | Scoped episodic/semantic memory per agent             |
+| **GTD** (assign/next/complete)  | `lambda:{project}`        | Scoped task queues per orchestrator                   |
+| **Comm** (send/inbox)           | `lambda:{project}`        | Scoped messaging between agents                       |
+| **Brain** (profiles/feedback)   | `lambda:{project}`        | Scoped priors per agent context                       |
+| **Schedule** (agenda/remind)    | `lambda:{project}`        | Scoped schedules per agent                            |
+| **Knowledge** (learn/cite)      | `local` (shared)          | Extends KG — same shared namespace                    |
 
 **Invariant**: `create`, `link`, `search`, `list`, `get`, `neighbors`, `traverse`, `query`,
 `knowledge.learn`, `knowledge.cite` MUST use the default shared namespace. Agents MUST NOT
