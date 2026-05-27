@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use khive_runtime::{
     curation::{EntityDedupMergePolicy, EntityPatch},
-    KhiveRuntime, NamespaceToken, RuntimeError,
+    KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::PageRequest;
 use khive_storage::{EdgeRelation, EventFilter};
@@ -61,6 +61,7 @@ impl ProposalApplyWorker {
         &self,
         token: &NamespaceToken,
         proposal_id: Uuid,
+        registry: &VerbRegistry,
     ) -> Result<(), RuntimeError> {
         // Load current projection row.
         let row = match self.projection.get_proposal_row(token, proposal_id).await? {
@@ -108,7 +109,7 @@ impl ProposalApplyWorker {
         }
 
         // Apply the changeset — we exclusively own the 'applying' state now.
-        let apply_result = self.apply_changeset(token, &changeset).await;
+        let apply_result = self.apply_changeset(token, &changeset, registry).await;
 
         match apply_result {
             Ok(created_records) => {
@@ -217,6 +218,7 @@ impl ProposalApplyWorker {
         &'a self,
         token: &'a NamespaceToken,
         changeset: &'a ProposalChangeset,
+        registry: &'a VerbRegistry,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<Uuid>, RuntimeError>> + Send + 'a>,
     > {
@@ -241,7 +243,9 @@ impl ProposalApplyWorker {
                         .await?;
                     Ok(vec![edge_id])
                 }
-                ProposalChangeset::AddNote { note } => self.apply_add_note(token, note).await,
+                ProposalChangeset::AddNote { note } => {
+                    self.apply_add_note(token, note, registry).await
+                }
                 ProposalChangeset::MergeEntities { into, from } => {
                     self.apply_merge_entities(token, *into, *from).await?;
                     Ok(vec![])
@@ -253,7 +257,7 @@ impl ProposalApplyWorker {
                 ProposalChangeset::Compound { steps } => {
                     let mut all_created = Vec::new();
                     for step in steps {
-                        let created = self.apply_changeset(token, step).await?;
+                        let created = self.apply_changeset(token, step, registry).await?;
                         all_created.extend(created);
                     }
                     Ok(all_created)
@@ -348,16 +352,25 @@ impl ProposalApplyWorker {
     }
 
     /// Apply `AddNote`: create the note from the structured draft.
+    ///
+    /// C3: Validate note kind against all loaded pack vocabularies before
+    /// creating the note.  The normal `create` path runs this validation via
+    /// `canonical_note_kind`; the apply worker must enforce the same invariant
+    /// so proposals cannot bypass pack note-kind validation (Issue #478).
     async fn apply_add_note(
         &self,
         token: &NamespaceToken,
         draft: &NoteDraft,
+        registry: &VerbRegistry,
     ) -> Result<Vec<Uuid>, RuntimeError> {
+        let kind = draft.kind.as_str();
+        // Validate note kind against registry (base kg kinds + all loaded pack kinds).
+        let canonical_kind = crate::handlers::canonical_note_kind(kind, registry)?;
         let note = self
             .runtime
             .create_note(
                 token,
-                draft.kind.as_str(),
+                &canonical_kind,
                 draft.name.as_deref(),
                 draft.content.as_str(),
                 None,
@@ -492,15 +505,21 @@ impl ProposalApplyWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_runtime::{KhiveRuntime, Namespace};
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
     use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
-    use khive_types::{Id128, ProposalChangeset, ProposalCreatedPayload};
+    use khive_types::{Id128, NoteDraft, ProposalChangeset, ProposalCreatedPayload};
     use uuid::Uuid;
 
     fn setup() -> (KhiveRuntime, NamespaceToken) {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let tok = rt.authorize(Namespace::local());
         (rt, tok)
+    }
+
+    fn build_registry(rt: &KhiveRuntime) -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(crate::KgPack::new(rt.clone()));
+        builder.build().expect("registry build")
     }
 
     async fn ensure_schema(rt: &KhiveRuntime) {
@@ -623,9 +642,10 @@ mod tests {
         // Seed the projection row in 'approved' state (1 approve, 0 rejects).
         insert_projection_row(&rt, &tok, proposal_id, "approved").await;
 
+        let registry = build_registry(&rt);
         let worker = ProposalApplyWorker::new(rt.clone());
         worker
-            .maybe_apply(&tok, proposal_id)
+            .maybe_apply(&tok, proposal_id, &registry)
             .await
             .expect("maybe_apply must succeed");
 
@@ -687,9 +707,10 @@ mod tests {
         // Projection row is 'open' — should not apply.
         insert_projection_row(&rt, &tok, proposal_id, "open").await;
 
+        let registry = build_registry(&rt);
         let worker = ProposalApplyWorker::new(rt.clone());
         worker
-            .maybe_apply(&tok, proposal_id)
+            .maybe_apply(&tok, proposal_id, &registry)
             .await
             .expect("maybe_apply must succeed without error");
 
@@ -739,9 +760,10 @@ mod tests {
         seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
         insert_projection_row(&rt, &tok, proposal_id, "approved").await;
 
+        let registry = build_registry(&rt);
         let worker = ProposalApplyWorker::new(rt.clone());
         worker
-            .maybe_apply(&tok, proposal_id)
+            .maybe_apply(&tok, proposal_id, &registry)
             .await
             .expect("maybe_apply itself must succeed (errors emitted as ProposalApplied{Failed})");
 
@@ -806,9 +828,10 @@ mod tests {
         // before the apply worker runs.
         insert_projection_row(&rt, &tok, proposal_id, "withdrawn").await;
 
+        let registry = build_registry(&rt);
         let worker = ProposalApplyWorker::new(rt.clone());
         worker
-            .maybe_apply(&tok, proposal_id)
+            .maybe_apply(&tok, proposal_id, &registry)
             .await
             .expect("maybe_apply must succeed without error");
 
@@ -842,6 +865,82 @@ mod tests {
         assert!(
             !entities.iter().any(|e| e.name == "ShouldNotExist"),
             "H2: KG must not be mutated when proposal was withdrawn before apply"
+        );
+    }
+
+    /// C3 regression: apply worker must reject proposals whose AddNote changeset
+    /// carries an invalid note kind.  Direct `create(kind="badnote")` correctly
+    /// errors; the proposal apply path must enforce the same invariant so that
+    /// pack-owned note kinds (memory, task, message, scheduled_event) cannot be
+    /// bypassed via the proposal mechanism when their owning pack is not loaded.
+    #[tokio::test]
+    async fn apply_worker_rejects_invalid_note_kind() {
+        let (rt, tok) = setup();
+        ensure_schema(&rt).await;
+
+        let proposal_id = Uuid::new_v4();
+        let changeset = ProposalChangeset::AddNote {
+            note: NoteDraft {
+                kind: "invalidnotekind".to_string(),
+                name: Some("BadNote".to_string()),
+                content: "should fail".to_string(),
+                properties: None,
+            },
+        };
+
+        seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+        insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+        let registry = build_registry(&rt);
+        let worker = ProposalApplyWorker::new(rt.clone());
+        worker
+            .maybe_apply(&tok, proposal_id, &registry)
+            .await
+            .expect("maybe_apply itself must succeed (errors emitted as ProposalApplied{Failed})");
+
+        // The apply must have emitted a ProposalApplied{Failed} event, not success.
+        let event_store = rt.events(&tok).expect("event store");
+        let applied_events = event_store
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::ProposalApplied],
+                    payload_proposal_id: Some(proposal_id),
+                    ..Default::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("query events");
+
+        assert_eq!(
+            applied_events.items.len(),
+            1,
+            "C3: ProposalApplied event must be emitted"
+        );
+
+        // Verify no note with that name was created.
+        let notes = rt
+            .notes(&tok)
+            .expect("notes store")
+            .query_notes(
+                tok.namespace().as_str(),
+                None,
+                PageRequest {
+                    offset: 0,
+                    limit: 100,
+                },
+            )
+            .await
+            .expect("query_notes");
+        assert!(
+            !notes
+                .items
+                .iter()
+                .any(|n| n.name.as_deref() == Some("BadNote")),
+            "C3: note with invalid kind must not be created in the KG"
         );
     }
 }

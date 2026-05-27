@@ -656,7 +656,7 @@ impl PackRuntime for KgPack {
             "traverse" => self.handle_traverse(token, params).await,
             "query" => self.handle_query(token, params).await,
             "propose" => self.handle_propose(token, params).await,
-            "review" => self.handle_review(token, params).await,
+            "review" => self.handle_review(token, params, registry).await,
             "withdraw" => self.handle_withdraw(token, params).await,
             "verbs" => handle_verbs(params, registry),
             _ => Err(RuntimeError::InvalidInput(format!(

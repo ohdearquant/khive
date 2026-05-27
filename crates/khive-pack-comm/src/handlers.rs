@@ -82,17 +82,27 @@ async fn dual_write_message(
     thread_id: Option<&str>,
     sent_at: &str,
 ) -> Result<Note, RuntimeError> {
-    let is_self_send = from == to.trim();
-
-    let recipient_token: Option<(Namespace, NamespaceToken)> = if is_self_send {
-        None
-    } else {
-        let recipient_ns = Namespace::parse(to.trim()).map_err(|e| {
-            RuntimeError::InvalidInput(format!("send: invalid recipient namespace {to:?}: {e}"))
-        })?;
-        let tok = runtime.authorize(recipient_ns.clone());
-        Some((recipient_ns, tok))
-    };
+    // ADR-040 §cross-namespace-messaging: cross-namespace delivery is DENIED
+    // until ADR-018 ACL policy is specified. This prevents unauthorized writes
+    // into arbitrary recipient namespaces (issue #481).
+    //
+    // The recipient namespace must equal the caller namespace. Sending to a
+    // different namespace would bypass the recipient's authorization gate, which
+    // is unspecified until ADR-018 is implemented.
+    let recipient_ns_str = to.trim();
+    if from != recipient_ns_str {
+        // Validate the recipient namespace string format before returning the
+        // denial — so callers get InvalidInput for malformed strings rather than
+        // a misleading CrossNamespaceWrite.
+        if let Err(e) = Namespace::parse(recipient_ns_str) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "send: invalid recipient namespace {to:?}: {e}"
+            )));
+        }
+        return Err(RuntimeError::CrossNamespaceWrite {
+            namespace: recipient_ns_str.to_string(),
+        });
+    }
 
     let outbound_props = json!({
         "from": from,
@@ -147,14 +157,9 @@ async fn dual_write_message(
     }
 
     {
-        let inbound_tok: &NamespaceToken = if is_self_send {
-            caller_token
-        } else {
-            match recipient_token.as_ref() {
-                Some((_, tok)) => tok,
-                None => unreachable!("non-self-send always has recipient_token"),
-            }
-        };
+        // Inbound note lands in the caller's own namespace: cross-namespace send is
+        // denied earlier in this function, so sender and recipient are always equal.
+        let inbound_tok: &NamespaceToken = caller_token;
 
         let inbound_props = json!({
             "from": from,

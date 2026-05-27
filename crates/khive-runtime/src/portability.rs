@@ -259,7 +259,7 @@ impl KhiveRuntime {
         for ee in &archive.edges {
             let source_ok = match self.get_entity(token, ee.source).await {
                 Ok(_) => true,
-                Err(RuntimeError::NotFound(_) | RuntimeError::NamespaceMismatch { .. }) => false,
+                Err(RuntimeError::NotFound(_)) => false,
                 Err(e) => return Err(e),
             };
             if !source_ok {
@@ -274,7 +274,7 @@ impl KhiveRuntime {
             }
             let target_ok = match self.get_entity(token, ee.target).await {
                 Ok(_) => true,
-                Err(RuntimeError::NotFound(_) | RuntimeError::NamespaceMismatch { .. }) => false,
+                Err(RuntimeError::NotFound(_)) => false,
                 Err(e) => return Err(e),
             };
             if !target_ok {
