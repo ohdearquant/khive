@@ -10,6 +10,7 @@
 //! - `kg`      — KG validation, init, hook management (ADR-034, ADR-035)
 //! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check (ADR-043)
 //! - `vector`  — vector store capabilities and orphan sweep (ADR-044)
+//! - `reindex` — rebuild embedding vectors for entities and notes
 //! - `backend` — inspect registered backends (`list`, `info <name>`)
 //!
 //! All subcommands emit JSON on stdout by default for easy piping/parsing.
@@ -21,7 +22,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use khive_runtime::{BackendId, KhiveRuntime, RuntimeConfig};
-use kkernel::{coordinator::BackendRegistry, engine, kg, pack_introspect, sync, vector};
+use kkernel::{coordinator::BackendRegistry, engine, kg, pack_introspect, reindex, sync, vector};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -58,6 +59,9 @@ enum Command {
     /// Vector store capabilities and orphan sweep (ADR-044).
     #[command(subcommand)]
     Vector(vector::VectorCommand),
+
+    /// Re-embed all entities and notes using the configured embedding model.
+    Reindex(reindex::ReindexArgs),
 
     /// Inspect registered backends (ADR-009, ADR-028).
     #[command(subcommand)]
@@ -135,6 +139,7 @@ async fn main() -> Result<()> {
         Command::Kg(k) => kg::run_kg(k),
         Command::Engine(e) => engine::run_engine(e),
         Command::Vector(v) => vector::run_vector(v),
+        Command::Reindex(r) => reindex::run_reindex(r).await,
         Command::Backend(b) => cmd_backend(b),
     }
 }

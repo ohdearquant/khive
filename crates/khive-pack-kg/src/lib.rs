@@ -80,7 +80,6 @@ impl Pack for KgPack {
 //
 //   Packs with confirmed Subhandler entries as of this audit:
 //   - pack-memory: recall_embed, recall_candidates, recall_fuse, recall_rerank, recall_score
-//   - pack-knowledge: knowledge.reindex
 //   - pack-brain: brain.state, brain.config, brain.events, brain.emit (deprecated)
 static KG_HANDLERS: [HandlerDef; 16] = [
     // Commissive: commits an entity or note to the namespace
