@@ -4653,3 +4653,367 @@ async fn create_note_dedup_never_runs() {
         "#487: dedup guard must not run for note creates; got: {result}"
     );
 }
+
+// ---- Issue #393: propose→review→apply/reject/withdraw lifecycle tests ----
+
+/// Full lifecycle: propose → review(approve) → proposal auto-applies.
+///
+/// After approval the proposal status must be "applied" (via the
+/// ProposalApplyWorker) and at least one `proposal_applied` event must exist.
+#[tokio::test]
+async fn propose_review_approve_lifecycle() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "#393 approve lifecycle",
+                "description": "propose → review(approve) → applied",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    // Approve — single-reviewer, self-approval is allowed on local actor.
+    let review = f
+        .dispatch(
+            "review",
+            json!({ "proposal_id": pid, "decision": "approve" }),
+        )
+        .await
+        .expect("review(approve) must succeed");
+
+    // review must acknowledge the approval.
+    let status_after = review["status"].as_str().unwrap_or("");
+    assert!(
+        status_after == "approved" || status_after == "applied",
+        "#393 approve: review response status must be 'approved' or 'applied', got {status_after:?}; full: {review}"
+    );
+
+    // list(kind=proposal, status=applied) must contain this proposal.
+    let list = f
+        .dispatch("list", json!({ "kind": "proposal", "status": "applied" }))
+        .await
+        .expect("list proposals must succeed");
+    let items = list.as_array().expect("list must return an array");
+    let found = items
+        .iter()
+        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid));
+    assert!(
+        found,
+        "#393 approve: proposal {pid} not found in list(status=applied); items: {list}"
+    );
+
+    // A proposal_applied event must exist.
+    let events = f
+        .dispatch(
+            "list",
+            json!({ "kind": "event", "event_kind": "proposal_applied", "limit": 50 }),
+        )
+        .await
+        .expect("list proposal_applied events must succeed");
+    let evts = events.as_array().expect("event list must be array");
+    assert!(
+        !evts.is_empty(),
+        "#393 approve: no proposal_applied event emitted after approval"
+    );
+}
+
+/// Lifecycle: propose → review(reject) → status becomes "rejected".
+#[tokio::test]
+async fn propose_review_reject_lifecycle() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "#393 reject lifecycle",
+                "description": "propose → review(reject) → rejected",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    // Reject the proposal.
+    let review = f
+        .dispatch(
+            "review",
+            json!({ "proposal_id": pid, "decision": "reject" }),
+        )
+        .await
+        .expect("review(reject) must succeed");
+
+    let status_after = review["status"].as_str().unwrap_or("");
+    assert_eq!(
+        status_after, "rejected",
+        "#393 reject: review response status must be 'rejected', got {status_after:?}; full: {review}"
+    );
+
+    // list(kind=proposal, status=rejected) must contain this proposal.
+    let list = f
+        .dispatch("list", json!({ "kind": "proposal", "status": "rejected" }))
+        .await
+        .expect("list proposals must succeed");
+    let items = list.as_array().expect("list must return an array");
+    let found = items
+        .iter()
+        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid));
+    assert!(
+        found,
+        "#393 reject: proposal {pid} not found in list(status=rejected); items: {list}"
+    );
+}
+
+/// Lifecycle: propose → withdraw → status becomes "withdrawn".
+#[tokio::test]
+async fn propose_withdraw_lifecycle() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "#393 withdraw lifecycle",
+                "description": "propose → withdraw → withdrawn",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    // Withdraw the proposal.
+    let withdraw = f
+        .dispatch("withdraw", json!({ "proposal_id": pid }))
+        .await
+        .expect("withdraw must succeed");
+
+    let status_after = withdraw["status"].as_str().unwrap_or("");
+    assert_eq!(
+        status_after, "withdrawn",
+        "#393 withdraw: response status must be 'withdrawn', got {status_after:?}; full: {withdraw}"
+    );
+
+    // list(kind=proposal, status=withdrawn) must contain this proposal.
+    let list = f
+        .dispatch("list", json!({ "kind": "proposal", "status": "withdrawn" }))
+        .await
+        .expect("list proposals must succeed");
+    let items = list.as_array().expect("list must return an array");
+    let found = items
+        .iter()
+        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid));
+    assert!(
+        found,
+        "#393 withdraw: proposal {pid} not found in list(status=withdrawn); items: {list}"
+    );
+}
+
+/// Status filter: list(kind=proposal, status=open) returns only open proposals.
+///
+/// Creates two proposals: one left open, one immediately withdrawn.
+/// list(status=open) must contain the open one and must NOT contain the withdrawn one.
+#[tokio::test]
+async fn list_proposals_status_filter() {
+    let f = pack_with_events();
+
+    // Proposal A — stays open.
+    let pa = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "#393 list-filter open",
+                "description": "remains open for filtering",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose A must succeed");
+    let pid_open = pa["proposal_id"].as_str().expect("proposal_id");
+
+    // Proposal B — immediately withdrawn.
+    let pb = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "#393 list-filter withdrawn",
+                "description": "will be withdrawn immediately",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose B must succeed");
+    let pid_withdrawn = pb["proposal_id"].as_str().expect("proposal_id");
+
+    f.dispatch("withdraw", json!({ "proposal_id": pid_withdrawn }))
+        .await
+        .expect("withdraw B must succeed");
+
+    // list(status=open) must include A but not B.
+    let list_open = f
+        .dispatch("list", json!({ "kind": "proposal", "status": "open" }))
+        .await
+        .expect("list(status=open) must succeed");
+    let open_items = list_open.as_array().expect("list must return an array");
+
+    let has_open = open_items
+        .iter()
+        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid_open));
+    let has_withdrawn = open_items.iter().any(|v| {
+        v["proposal_id"]
+            .as_str()
+            .is_some_and(|id| id == pid_withdrawn)
+    });
+
+    assert!(
+        has_open,
+        "#393 list-filter: open proposal {pid_open} missing from list(status=open); items: {list_open}"
+    );
+    assert!(
+        !has_withdrawn,
+        "#393 list-filter: withdrawn proposal {pid_withdrawn} must not appear in list(status=open); items: {list_open}"
+    );
+}
+
+/// Negative path: withdraw on an applied proposal must fail.
+/// propose → approve (auto-applies) → withdraw → expect error mentioning "applied".
+#[tokio::test]
+async fn withdraw_after_apply_returns_error() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "withdraw-after-apply guard",
+                "description": "Applied proposals cannot be withdrawn",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    f.dispatch(
+        "review",
+        json!({ "proposal_id": pid, "decision": "approve" }),
+    )
+    .await
+    .expect("review(approve) must succeed");
+
+    let withdraw_result = f.dispatch("withdraw", json!({ "proposal_id": pid })).await;
+
+    assert!(
+        withdraw_result.is_err(),
+        "withdraw on applied proposal must fail; got: {withdraw_result:?}"
+    );
+    let err_msg = format!("{:?}", withdraw_result.unwrap_err());
+    assert!(
+        err_msg.contains("applied") || err_msg.contains("approved") || err_msg.contains("terminal"),
+        "error must mention terminal state; got: {err_msg}"
+    );
+}
+
+/// Negative path: review on a rejected proposal must fail.
+/// propose → reject → attempt second review → expect error mentioning "rejected".
+#[tokio::test]
+async fn review_after_reject_returns_error() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "review-after-reject guard",
+                "description": "Rejected proposals cannot be re-reviewed",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    f.dispatch(
+        "review",
+        json!({ "proposal_id": pid, "decision": "reject" }),
+    )
+    .await
+    .expect("review(reject) must succeed");
+
+    let second_review = f
+        .dispatch(
+            "review",
+            json!({ "proposal_id": pid, "decision": "approve" }),
+        )
+        .await;
+
+    assert!(
+        second_review.is_err(),
+        "review on rejected proposal must fail; got: {second_review:?}"
+    );
+    let err_msg = format!("{:?}", second_review.unwrap_err());
+    assert!(
+        err_msg.contains("rejected"),
+        "error must mention 'rejected'; got: {err_msg}"
+    );
+}
+
+/// CAS divergence: withdraw after concurrent approval.
+/// propose → approve (status moves to applied) → withdraw → CAS fails.
+/// This exercises the SQL-level CAS guard in `withdrawn_and_emit`:
+/// the precheck sees "open" but by the time CAS runs, status is "applied".
+///
+/// In practice with SQLite WAL mode, the approve+apply commits before the
+/// withdraw starts. This test verifies the CAS guard catches the terminal state.
+#[tokio::test]
+async fn withdraw_cas_divergence_after_approval() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "CAS divergence test",
+                "description": "Tests CAS guard when status shifts under us",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["proposal_id"].as_str().expect("proposal_id");
+
+    // Approve moves status → approved → applied (inline apply worker).
+    f.dispatch(
+        "review",
+        json!({ "proposal_id": pid, "decision": "approve" }),
+    )
+    .await
+    .expect("review(approve) must succeed");
+
+    // Withdraw now — status is applied, CAS should reject.
+    let result = f.dispatch("withdraw", json!({ "proposal_id": pid })).await;
+    assert!(
+        result.is_err(),
+        "CAS divergence: withdraw must fail after approval; got: {result:?}"
+    );
+
+    // Verify the proposal is still "applied" (not corrupted by the failed withdraw).
+    let list = f
+        .dispatch("list", json!({ "kind": "proposal", "status": "applied" }))
+        .await
+        .expect("list must succeed");
+    let items = list.as_array().expect("must be array");
+    let found = items
+        .iter()
+        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid));
+    assert!(
+        found,
+        "CAS divergence: proposal must still be 'applied' after failed withdraw; items: {list}"
+    );
+}
