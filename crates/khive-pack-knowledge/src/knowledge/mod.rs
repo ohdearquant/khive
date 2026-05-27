@@ -30,8 +30,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::knowledge::schema::{
-    Atom, DeleteAtomsParams, Domain, FoldCandidate, FoldParams, GetParams, IndexParams, ListParams,
-    SearchParams, UpsertAtomsParams, UpsertDomainsParams,
+    Atom, DeleteAtomsParams, Domain, EditParams, FoldCandidate, FoldParams, GetParams,
+    ImportParams, IndexParams, ListParams, SearchParams, Section, SectionType, UpsertAtomsParams,
+    UpsertDomainsParams,
 };
 
 // ─── TF-IDF weight defaults ───────────────────────────────────────────────────
@@ -1647,4 +1648,436 @@ fn atom_embed_text(atom: &Atom) -> String {
         parts.push(&atom.content);
     }
     parts.join("\n\n")
+}
+
+// ─── section helpers ──────────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
+    let id: Uuid = row_str(row, "id")?.parse().ok()?;
+    let st_str = row_str(row, "section_type")?;
+    let section_type = SectionType::from_str_loose(&st_str)?;
+    Some(Section {
+        id,
+        atom_id: row_str(row, "atom_id")?,
+        namespace: row_str(row, "namespace")?,
+        section_type,
+        heading: row_str(row, "heading").unwrap_or_default(),
+        content: row_str(row, "content").unwrap_or_default(),
+        tokens: row_i64(row, "tokens").unwrap_or(0),
+        sort_order: row_i64(row, "sort_order").unwrap_or(0),
+        created_at: row_i64(row, "created_at").unwrap_or(0),
+        updated_at: row_i64(row, "updated_at").unwrap_or(0),
+    })
+}
+
+#[allow(dead_code)]
+fn section_to_json(s: &Section) -> Value {
+    json!({
+        "id": s.id.to_string(),
+        "atom_id": s.atom_id,
+        "namespace": s.namespace,
+        "section_type": s.section_type.as_str(),
+        "heading": s.heading,
+        "content": s.content,
+        "tokens": s.tokens,
+        "sort_order": s.sort_order,
+        "created_at": s.created_at,
+        "updated_at": s.updated_at,
+    })
+}
+
+/// Naive token count: whitespace-split word count.
+fn count_tokens(text: &str) -> i64 {
+    text.split_whitespace().count() as i64
+}
+
+/// Parse a SectionUpdate's `section_type` field into a `SectionType` enum,
+/// returning a descriptive error on unknown values.
+fn parse_section_type(s: &str) -> Result<SectionType, RuntimeError> {
+    SectionType::from_str_loose(s).ok_or_else(|| {
+        RuntimeError::InvalidInput(format!(
+            "unknown section_type {s:?}; valid values: {}",
+            SectionType::NAMES.join(", ")
+        ))
+    })
+}
+
+impl KnowledgeHandlers {
+    // ── edit ─────────────────────────────────────────────────────────────────
+
+    /// Upsert sections for a knowledge atom without touching sibling sections.
+    ///
+    /// Each (atom_id, section_type) pair is upserted atomically using SQLite's
+    /// `INSERT OR REPLACE` semantics backed by the UNIQUE(atom_id, section_type)
+    /// constraint. Sections not named in the call are left untouched.
+    pub(crate) async fn edit(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: EditParams = deser(params)?;
+        if p.sections.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "sections must not be empty".into(),
+            ));
+        }
+
+        let ns = token.namespace().as_str().to_owned();
+        let sql = runtime.sql();
+
+        // Resolve the atom (by UUID or slug).
+        let atom_id = {
+            let mut reader = sql
+                .reader()
+                .await
+                .map_err(|e| sql_err("edit atom reader", e))?;
+            let id = p.id.trim().to_string();
+            let row = if id.parse::<Uuid>().is_ok() {
+                reader
+                    .query_row(SqlStatement {
+                        sql: "SELECT id FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                        params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
+                        label: None,
+                    })
+                    .await
+                    .map_err(|e| sql_err("edit atom lookup by id", e))?
+            } else {
+                reader
+                    .query_row(SqlStatement {
+                        sql: "SELECT id FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                        params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
+                        label: None,
+                    })
+                    .await
+                    .map_err(|e| sql_err("edit atom lookup by slug", e))?
+            };
+            row.and_then(|r| row_str(&r, "id"))
+                .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {:?}", p.id)))?
+        };
+
+        let now = now_us();
+        let mut upserted = 0usize;
+        let mut section_results: Vec<Value> = Vec::with_capacity(p.sections.len());
+
+        for su in &p.sections {
+            let stype = parse_section_type(&su.section_type)?;
+            let heading = su.heading.as_deref().unwrap_or(stype.as_str()).to_string();
+            let tokens = count_tokens(&su.content);
+            let sort_order = su.sort_order.unwrap_or_else(|| {
+                SectionType::ALL
+                    .iter()
+                    .position(|&t| t == stype)
+                    .unwrap_or(9) as i64
+            });
+
+            // Fetch the existing section id if it exists (for stable IDs on re-edit).
+            let mut reader = sql
+                .reader()
+                .await
+                .map_err(|e| sql_err("edit section reader", e))?;
+            let existing_id = reader
+                .query_row(SqlStatement {
+                    sql: "SELECT id FROM knowledge_sections WHERE atom_id = ?1 AND section_type = ?2 LIMIT 1".into(),
+                    params: vec![
+                        SqlValue::Text(atom_id.clone()),
+                        SqlValue::Text(stype.as_str().to_string()),
+                    ],
+                    label: None,
+                })
+                .await
+                .map_err(|e| sql_err("edit section lookup", e))?
+                .and_then(|r| row_str(&r, "id"));
+
+            let section_id = existing_id.unwrap_or_else(new_id);
+
+            let mut writer = sql
+                .writer()
+                .await
+                .map_err(|e| sql_err("edit section writer", e))?;
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO knowledge_sections \
+                          (id, atom_id, namespace, section_type, heading, content, tokens, sort_order, created_at, updated_at) \
+                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                          ON CONFLICT(atom_id, section_type) DO UPDATE SET \
+                            heading=excluded.heading, \
+                            content=excluded.content, \
+                            tokens=excluded.tokens, \
+                            sort_order=excluded.sort_order, \
+                            embedding=NULL, \
+                            updated_at=excluded.updated_at"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(section_id.clone()),
+                        SqlValue::Text(atom_id.clone()),
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Text(stype.as_str().to_string()),
+                        SqlValue::Text(heading.clone()),
+                        SqlValue::Text(su.content.clone()),
+                        SqlValue::Integer(tokens),
+                        SqlValue::Integer(sort_order),
+                        SqlValue::Integer(now),
+                        SqlValue::Integer(now),
+                    ],
+                    label: None,
+                })
+                .await
+                .map_err(|e| sql_err("edit section upsert", e))?;
+
+            upserted += 1;
+            section_results.push(json!({
+                "id": section_id,
+                "atom_id": atom_id,
+                "section_type": stype.as_str(),
+                "heading": heading,
+                "tokens": tokens,
+            }));
+        }
+
+        Ok(json!({
+            "atom_id": atom_id,
+            "upserted": upserted,
+            "sections": section_results,
+        }))
+    }
+
+    // ── import ────────────────────────────────────────────────────────────────
+
+    /// Ingest a markdown file (or directory of markdown files) into the knowledge corpus.
+    ///
+    /// Parses the markdown into section-typed atoms using the atlas heading normalization
+    /// map in `SectionType::from_str_loose`. Each `## Heading` creates one section of
+    /// the detected type; content before the first `##` heading becomes the atom's
+    /// `content` field (flat body).
+    ///
+    /// The atom slug is derived from the file stem (lower-kebab). If an atom with that
+    /// slug already exists it is updated (upsert semantics). Sections are upserted
+    /// individually, so re-importing a file only changes sections whose content changed.
+    pub(crate) async fn import(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: ImportParams = deser(params)?;
+        let path_str = p.path.trim().to_string();
+        if path_str.is_empty() {
+            return Err(RuntimeError::InvalidInput("path must not be empty".into()));
+        }
+
+        let chunk_strategy = p
+            .chunk_strategy
+            .as_deref()
+            .unwrap_or("section")
+            .to_ascii_lowercase();
+        if !["section", "atom"].contains(&chunk_strategy.as_str()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "unknown chunk_strategy {:?}; valid: section | atom",
+                chunk_strategy
+            )));
+        }
+        let format = p.format.as_deref().unwrap_or("atlas_md");
+        if format != "atlas_md" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "unknown format {format:?}; only \"atlas_md\" is supported"
+            )));
+        }
+
+        let md_path = std::path::Path::new(&path_str);
+        if !md_path.exists() {
+            return Err(RuntimeError::NotFound(format!(
+                "path does not exist: {path_str:?}"
+            )));
+        }
+
+        // Collect markdown files to import.
+        let files: Vec<std::path::PathBuf> = if md_path.is_file() {
+            vec![md_path.to_path_buf()]
+        } else if md_path.is_dir() {
+            let mut v = Vec::new();
+            collect_md_files(md_path, &mut v);
+            v
+        } else {
+            return Err(RuntimeError::InvalidInput(format!(
+                "path is not a file or directory: {path_str:?}"
+            )));
+        };
+
+        if files.is_empty() {
+            return Ok(json!({
+                "imported_atoms": 0,
+                "imported_sections": 0,
+                "files_processed": 0,
+            }));
+        }
+
+        let mut imported_atoms = 0usize;
+        let mut imported_sections = 0usize;
+
+        for file in &files {
+            let content = std::fs::read_to_string(file)
+                .map_err(|e| RuntimeError::Internal(format!("failed to read {:?}: {e}", file)))?;
+
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+            let slug = to_slug(stem);
+
+            let (atom_name, atom_body, sections) = parse_atlas_md(&content);
+            let name = if atom_name.is_empty() {
+                slug.replace('-', " ")
+            } else {
+                atom_name
+            };
+
+            // Upsert the atom.
+            let upsert_params = serde_json::json!({
+                "atoms": [{
+                    "slug": slug,
+                    "name": name,
+                    "content": atom_body,
+                }]
+            });
+            KnowledgeHandlers::upsert_atoms(runtime, token, upsert_params).await?;
+            imported_atoms += 1;
+
+            // Upsert sections (if chunk_strategy == "section").
+            if chunk_strategy == "section" && !sections.is_empty() {
+                let section_updates: Vec<Value> = sections
+                    .iter()
+                    .map(|(stype, heading, body)| {
+                        json!({
+                            "section_type": stype.as_str(),
+                            "heading": heading,
+                            "content": body,
+                        })
+                    })
+                    .collect();
+                let edit_params = json!({
+                    "id": slug,
+                    "sections": section_updates,
+                });
+                let result = KnowledgeHandlers::edit(runtime, token, edit_params).await?;
+                if let Some(n) = result.get("upserted").and_then(|v| v.as_u64()) {
+                    imported_sections += n as usize;
+                }
+            }
+        }
+
+        Ok(json!({
+            "imported_atoms": imported_atoms,
+            "imported_sections": imported_sections,
+            "files_processed": files.len(),
+        }))
+    }
+}
+
+// ─── markdown parsing helpers ─────────────────────────────────────────────────
+
+/// Collect all `.md` files recursively under `dir`.
+fn collect_md_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_md_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// Convert a file stem to a URL-safe slug.
+///
+/// Lower-cases the stem and replaces spaces and underscores with hyphens,
+/// keeping alphanumeric characters and hyphens.
+fn to_slug(stem: &str) -> String {
+    stem.to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Parse atlas-format markdown into (title, pre-section body, sections).
+///
+/// Atlas markdown structure:
+/// ```text
+/// # Title
+///
+/// Optional introductory text that becomes the atom body.
+///
+/// ## Section Heading
+///
+/// Section content...
+///
+/// ## Another Section
+///
+/// More content...
+/// ```
+///
+/// Returns `(name, atom_body, Vec<(SectionType, heading, content)>)`.
+/// `name` is the `# Title` text (empty if absent).
+/// `atom_body` is text before the first `##` heading.
+/// Each tuple in the vec is `(SectionType, heading_text, body_text)`.
+/// Headings that don't map to a `SectionType` are classified as `Other`.
+fn parse_atlas_md(content: &str) -> (String, String, Vec<(SectionType, String, String)>) {
+    let mut name = String::new();
+    let mut pre_body = String::new();
+    let mut sections: Vec<(SectionType, String, String)> = Vec::new();
+
+    // State: None = pre-first-heading, Some(idx) = inside section at index
+    let mut in_pre = true;
+    let mut current_heading: Option<(SectionType, String)> = None;
+    let mut current_body = String::new();
+
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("# ") {
+            if name.is_empty() {
+                // Document title.
+                name = rest.trim().to_string();
+                in_pre = true;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("## ") {
+            // Save the previous section (if any).
+            if let Some((stype, heading)) = current_heading.take() {
+                sections.push((stype, heading, current_body.trim_end().to_string()));
+                current_body.clear();
+            } else if in_pre {
+                // The pre-section body ends here.
+                pre_body = current_body.trim_end().to_string();
+                current_body.clear();
+                in_pre = false;
+            }
+            let heading_text = rest.trim().to_string();
+            let stype = SectionType::from_str_loose(&heading_text).unwrap_or(SectionType::Other);
+            current_heading = Some((stype, heading_text));
+            continue;
+        }
+        // Accumulate content.
+        current_body.push_str(line);
+        current_body.push('\n');
+    }
+
+    // Flush the last section or pre-body.
+    if let Some((stype, heading)) = current_heading {
+        sections.push((stype, heading, current_body.trim_end().to_string()));
+    } else {
+        pre_body = current_body.trim_end().to_string();
+    }
+
+    (name, pre_body, sections)
 }
