@@ -187,7 +187,13 @@ impl Default for RuntimeConfig {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| {
                 vec![
-                    "kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge",
+                    "kg",
+                    "gtd",
+                    "memory",
+                    "brain",
+                    "comm",
+                    "schedule",
+                    "knowledge",
                 ]
                 .into_iter()
                 .map(String::from)
@@ -452,7 +458,12 @@ impl KhiveRuntime {
     /// denial.
     pub fn authorize(&self, ns: Namespace) -> RuntimeResult<NamespaceToken> {
         let actor = ActorRef::anonymous();
-        let req = GateRequest::new(actor.clone(), ns.clone(), "authorize", serde_json::Value::Null);
+        let req = GateRequest::new(
+            actor.clone(),
+            ns.clone(),
+            "authorize",
+            serde_json::Value::Null,
+        );
         match self.config.gate.check(&req) {
             Ok(ref decision) if decision.is_allow() => {
                 Ok(NamespaceToken::mint_authorized(ns, actor))

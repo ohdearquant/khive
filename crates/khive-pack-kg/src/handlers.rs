@@ -1405,8 +1405,7 @@ impl KgPack {
                 let tags = p.tags.unwrap_or_default();
                 // Issue #345: validate entity_type against the registry before
                 // persisting.  Returns the canonical type name (or None).
-                let validated_type =
-                    validate_entity_type(&canonical, p.entity_type.as_deref())?;
+                let validated_type = validate_entity_type(&canonical, p.entity_type.as_deref())?;
                 let entity = self
                     .runtime
                     .create_entity(
@@ -3338,7 +3337,10 @@ impl KgPack {
         // Issue #395: actor-scoped listing prevents cross-actor visibility of
         // draft proposals.  Default to the caller's own actor when no `actor`
         // filter is provided.  Pass `actor="*"` to see all actors (reviewers).
-        let actor_filter = p.actor.as_deref().unwrap_or_else(|| token.actor().id.as_str());
+        let actor_filter = p
+            .actor
+            .as_deref()
+            .unwrap_or_else(|| token.actor().id.as_str());
         if actor_filter != "*" {
             sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
             sql_params.push(SqlValue::Text(actor_filter.to_owned()));

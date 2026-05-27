@@ -1896,7 +1896,9 @@ async fn next_resolves_deps_older_than_500_task_window() {
     use serde_json::json;
 
     let runtime = rt();
-    let token = runtime.authorize(khive_runtime::Namespace::local()).unwrap();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
     let note_store = runtime.notes(&token).expect("note store");
 
     // Create a blocker task with `done` status directly in storage, timestamped

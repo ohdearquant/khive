@@ -216,11 +216,7 @@ impl EntityTypeRegistry {
     /// Derive a registry that includes all built-in subtypes plus the
     /// caller-supplied extras (used by packs that extend the vocabulary).
     pub fn with_extra(extra: impl IntoIterator<Item = EntityTypeDef>) -> Self {
-        let defs: Vec<EntityTypeDef> = BUILTIN_DEFS
-            .iter()
-            .cloned()
-            .chain(extra)
-            .collect();
+        let defs: Vec<EntityTypeDef> = BUILTIN_DEFS.iter().cloned().chain(extra).collect();
         Self::new(defs)
     }
 

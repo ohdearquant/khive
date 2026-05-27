@@ -4679,7 +4679,10 @@ async fn propose_review_approve_lifecycle() {
 
     // Approve — single-reviewer, self-approval is allowed on local actor.
     let review = f
-        .dispatch("review", json!({ "proposal_id": pid, "decision": "approve" }))
+        .dispatch(
+            "review",
+            json!({ "proposal_id": pid, "decision": "approve" }),
+        )
         .await
         .expect("review(approve) must succeed");
 
@@ -4739,7 +4742,10 @@ async fn propose_review_reject_lifecycle() {
 
     // Reject the proposal.
     let review = f
-        .dispatch("review", json!({ "proposal_id": pid, "decision": "reject" }))
+        .dispatch(
+            "review",
+            json!({ "proposal_id": pid, "decision": "reject" }),
+        )
         .await
         .expect("review(reject) must succeed");
 
@@ -4859,9 +4865,11 @@ async fn list_proposals_status_filter() {
     let has_open = open_items
         .iter()
         .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid_open));
-    let has_withdrawn = open_items
-        .iter()
-        .any(|v| v["proposal_id"].as_str().is_some_and(|id| id == pid_withdrawn));
+    let has_withdrawn = open_items.iter().any(|v| {
+        v["proposal_id"]
+            .as_str()
+            .is_some_and(|id| id == pid_withdrawn)
+    });
 
     assert!(
         has_open,
