@@ -12,6 +12,7 @@ members = [
     "khive-fusion",
     "khive-bm25",
     "khive-hnsw",
+    "khive-vamana",
     "khive-runtime",
     "khive-request",
     "khive-pack-kg",
