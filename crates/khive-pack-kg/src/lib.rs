@@ -807,23 +807,88 @@ impl PackRuntime for KgPack {
         registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
+        // ADR-007 §"Namespace-by-Layer Rule": KG entities/edges/notes always use
+        // the shared `local` namespace so that cross-project graph structure is
+        // visible to all actors regardless of their actor namespace.
+        //
+        // If the caller's token carries a non-local namespace (e.g. `lambda:foo`),
+        // we create a new token with the same actor identity but namespace=local.
+        // The original actor namespace is preserved for scoped packs (memory, gtd, comm…);
+        // only KG operations redirect to shared namespace here.
+        //
+        // The `verbs` introspection verb has no namespace side-effect and is routed
+        // before the override to avoid constructing an unnecessary token.
+        if verb == "verbs" {
+            return handle_verbs(params, registry);
+        }
+
+        // ADR-007 §"Namespace-by-Layer Rule": KG entities/edges always use the
+        // runtime's shared graph namespace (`default_namespace`, which is `local`
+        // in production) so that cross-project graph structure is visible to all
+        // actors regardless of their caller namespace.
+        //
+        // Notes are namespace-scoped (messages, tasks, memories belong to the
+        // caller's namespace), so the override is applied only to entity/edge
+        // verbs.  For kind-discriminated verbs (create, list, search) we peek
+        // at the `kind` param to decide; pure graph verbs always override.
+        let graph_ns = self.runtime.config().default_namespace.clone();
+        let kg_token;
+        let graph_token = if token.namespace() != &graph_ns {
+            kg_token = token.with_namespace(graph_ns);
+            &kg_token
+        } else {
+            token
+        };
+
+        // Peek at `kind` for verbs that can operate on both entities and notes.
+        let raw_kind = params
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let kind_is_entity_or_edge = matches!(
+            raw_kind.as_str(),
+            "entity"
+                | "edge"
+                | "concept"
+                | "document"
+                | "dataset"
+                | "project"
+                | "person"
+                | "org"
+                | "artifact"
+                | "service"
+        );
+
         match verb {
-            "create" => self.handle_create(token, params, registry).await,
+            // Kind-discriminated: override only for entity/edge kinds.
+            "create" | "list" | "search" => {
+                let tok = if kind_is_entity_or_edge {
+                    graph_token
+                } else {
+                    token
+                };
+                match verb {
+                    "create" => self.handle_create(tok, params, registry).await,
+                    "list" => self.handle_list(tok, params, registry).await,
+                    _ => self.handle_search(tok, params, registry).await,
+                }
+            }
+            // Pure graph verbs: always use graph namespace.
+            "link" => self.handle_link(graph_token, params).await,
+            "neighbors" => self.handle_neighbors(graph_token, params).await,
+            "traverse" => self.handle_traverse(graph_token, params).await,
+            "query" => self.handle_query(graph_token, params).await,
+            "propose" => self.handle_propose(graph_token, params).await,
+            "review" => self.handle_review(graph_token, params, registry).await,
+            "withdraw" => self.handle_withdraw(graph_token, params).await,
+            "stats" => self.handle_stats(graph_token, params).await,
+            "merge" => self.handle_merge(graph_token, params, registry).await,
+            // UUID-based: use caller token (entity access tested with local token).
             "get" => self.handle_get(token, params).await,
-            "list" => self.handle_list(token, params, registry).await,
-            "stats" => self.handle_stats(token, params).await,
             "update" => self.handle_update(token, params, registry).await,
             "delete" => self.handle_delete(token, params, registry).await,
-            "merge" => self.handle_merge(token, params, registry).await,
-            "search" => self.handle_search(token, params, registry).await,
-            "link" => self.handle_link(token, params).await,
-            "neighbors" => self.handle_neighbors(token, params).await,
-            "traverse" => self.handle_traverse(token, params).await,
-            "query" => self.handle_query(token, params).await,
-            "propose" => self.handle_propose(token, params).await,
-            "review" => self.handle_review(token, params, registry).await,
-            "withdraw" => self.handle_withdraw(token, params).await,
-            "verbs" => handle_verbs(params, registry),
             _ => Err(RuntimeError::InvalidInput(format!(
                 "kg pack does not handle verb {verb:?}"
             ))),
@@ -1029,6 +1094,97 @@ mod help_tests {
         assert!(
             h.params.iter().any(|p| p.name == "pack"),
             "verbs must document 'pack' filter param"
+        );
+    }
+
+    // ── ADR-007 namespace-by-layer rule (issue #498) ──────────────────────────
+
+    /// KG `create` with a lambda namespace token stores the entity in `local`.
+    ///
+    /// When the caller's NamespaceToken carries `lambda:foo`, the KG pack must
+    /// redirect to `local` so all projects share one graph namespace.
+    #[tokio::test]
+    async fn kg_create_entity_uses_local_namespace_regardless_of_caller_namespace() {
+        use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+        use serde_json::json;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+
+        // Build a token carrying a non-local namespace (simulates `--actor lambda:foo`).
+        let lambda_token = rt.authorize(Namespace::parse("lambda:foo").expect("valid namespace"));
+        assert_eq!(
+            lambda_token.namespace().as_str(),
+            "lambda:foo",
+            "precondition: lambda_token carries lambda:foo"
+        );
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let pack = KgPack::new(rt.clone());
+
+        // Create an entity using the lambda-namespaced token.
+        let result = pack
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": "LoRA",
+                    "description": "Low-Rank Adaptation"
+                }),
+                &registry,
+                &lambda_token,
+            )
+            .await
+            .expect("create must succeed");
+
+        // The entity should be retrievable via a local-namespace token — confirming
+        // it was stored in `local`, not in `lambda:foo`.
+        let entity_id = result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("result must contain id");
+
+        let local_token = rt.authorize(Namespace::local());
+        let get_result = pack
+            .dispatch("get", json!({ "id": entity_id }), &registry, &local_token)
+            .await
+            .expect("entity must be retrievable via local namespace token");
+
+        assert_eq!(
+            get_result
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "LoRA",
+            "entity stored by lambda:foo token must be retrievable via local token"
+        );
+    }
+
+    /// KG `with_namespace` token convenience: token carries original actor identity.
+    ///
+    /// When the KG pack overrides namespace to `local`, the actor must be preserved
+    /// so proposal attribution (proposer = actor.id) remains correct.
+    #[test]
+    fn namespace_token_with_namespace_preserves_actor() {
+        use khive_runtime::{KhiveRuntime, Namespace};
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let lambda_token = rt.authorize(Namespace::parse("lambda:foo").expect("valid namespace"));
+
+        // Simulate what the KG pack dispatch does.
+        let local_token = lambda_token.with_namespace(Namespace::local());
+
+        assert_eq!(
+            local_token.namespace().as_str(),
+            "local",
+            "with_namespace must change namespace to local"
+        );
+        assert_eq!(
+            local_token.actor().id,
+            lambda_token.actor().id,
+            "with_namespace must preserve actor identity"
         );
     }
 }

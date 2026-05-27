@@ -107,6 +107,15 @@ impl NamespaceToken {
     pub fn actor(&self) -> &ActorRef {
         &self.actor
     }
+
+    /// Return a new token with the same actor but a different namespace.
+    ///
+    /// Used by packs that apply a namespace policy (e.g. ADR-007 §"Namespace-by-Layer
+    /// Rule": KG pack overrides the caller's namespace to `Namespace::local()` so
+    /// that entity/edge/note records always land in the shared graph).
+    pub fn with_namespace(&self, ns: Namespace) -> Self {
+        Self::mint_authorized(ns, self.actor.clone())
+    }
 }
 
 // ---- RuntimeConfig ----
