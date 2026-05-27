@@ -2013,7 +2013,7 @@ fn to_slug(stem: &str) -> String {
 /// Parse atlas-format markdown into (title, pre-section body, sections).
 ///
 /// Atlas markdown structure:
-/// ```
+/// ```text
 /// # Title
 ///
 /// Optional introductory text that becomes the atom body.
