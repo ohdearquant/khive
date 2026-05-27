@@ -124,11 +124,18 @@ impl KnowledgePack {
                         "name must not be empty (provide 'name' or 'content')".to_string(),
                     ));
                 }
-                // Truncate at last whitespace boundary <= 60 chars.
-                if src.len() <= 60 {
+                // Truncate at last whitespace boundary <= 60 chars (char-boundary safe).
+                if src.chars().count() <= 60 {
                     src.clone()
                 } else {
-                    let boundary = src[..60].rfind(char::is_whitespace).unwrap_or(60);
+                    let byte_limit = src
+                        .char_indices()
+                        .nth(60)
+                        .map(|(i, _)| i)
+                        .unwrap_or(src.len());
+                    let boundary = src[..byte_limit]
+                        .rfind(char::is_whitespace)
+                        .unwrap_or(byte_limit);
                     src[..boundary].trim_end().to_string()
                 }
             }
