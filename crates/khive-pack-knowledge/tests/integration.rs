@@ -120,15 +120,81 @@ async fn learn_rejects_empty_name() {
 }
 
 #[tokio::test]
-async fn learn_rejects_missing_name() {
+async fn learn_rejects_missing_name_and_content() {
     let f = pack(rt());
     let err = f
         .dispatch("knowledge.learn", json!({ "domain": "attention" }))
         .await
         .unwrap_err();
     let msg = err.to_string();
-    // serde deserialization error: missing field `name`
-    assert!(!msg.is_empty(), "expected error for missing name");
+    // Neither name nor content supplied — handler returns a descriptive error.
+    assert!(
+        msg.contains("name must not be empty"),
+        "expected descriptive error, got: {msg}"
+    );
+}
+
+// ── learn content-alias (issue #488) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn learn_content_without_name_auto_generates_name() {
+    let f = pack(rt());
+    // Agent-style call: only `content` provided, no explicit `name`.
+    let resp = f
+        .dispatch(
+            "knowledge.learn",
+            json!({ "content": "Some long description about X that keeps going and going beyond sixty characters easily" }),
+        )
+        .await
+        .expect("learn with content only should succeed");
+
+    assert_eq!(resp["kind"], "concept");
+    let name = resp["name"].as_str().expect("name present");
+    assert!(!name.is_empty(), "auto-generated name must not be empty");
+    assert!(
+        name.len() <= 60,
+        "auto-generated name must be <= 60 chars, got: {name:?}"
+    );
+    // Description is populated from `content`.
+    let desc = resp["description"].as_str().expect("description present");
+    assert!(
+        desc.contains("Some long description"),
+        "description should contain content: {desc:?}"
+    );
+}
+
+#[tokio::test]
+async fn learn_content_alias_maps_to_description() {
+    let f = pack(rt());
+    // When both `name` and `content` are provided, content becomes the description.
+    let resp = f
+        .dispatch(
+            "knowledge.learn",
+            json!({
+                "name": "GQA",
+                "content": "Grouped-Query Attention mechanism"
+            }),
+        )
+        .await
+        .expect("learn with name + content");
+
+    assert_eq!(resp["name"], "GQA");
+    assert_eq!(resp["description"], "Grouped-Query Attention mechanism");
+}
+
+#[tokio::test]
+async fn learn_short_content_uses_full_text_as_name() {
+    let f = pack(rt());
+    let resp = f
+        .dispatch(
+            "knowledge.learn",
+            json!({ "content": "Speculative Decoding" }),
+        )
+        .await
+        .expect("learn short content");
+
+    assert_eq!(resp["name"], "Speculative Decoding");
+    assert_eq!(resp["description"], "Speculative Decoding");
 }
 
 // ── cite verb ─────────────────────────────────────────────────────────────────
@@ -324,7 +390,11 @@ async fn topic_respects_limit() {
         .expect("topic ok");
 
     let items = resp["items"].as_array().expect("items array");
-    assert!(items.len() <= 2, "expected ≤ 2 items, got: {}", items.len());
+    assert!(
+        items.len() <= 2,
+        "expected <= 2 items, got: {}",
+        items.len()
+    );
 }
 
 // ── H1 regression: case-insensitive domain filter (ADR-047 §91) ──────────────

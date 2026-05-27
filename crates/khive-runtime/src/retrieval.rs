@@ -34,8 +34,14 @@ pub enum SearchSource {
     Both,
 }
 
-/// RRF constant from the original paper. Controls how strongly top ranks dominate.
-const RRF_K: usize = 60;
+/// RRF constant. Controls how strongly top ranks dominate.
+///
+/// The original paper uses k=60 for large-scale document retrieval. For a knowledge
+/// graph with tens to thousands of entities, k=60 over-compresses scores into a
+/// narrow band (rank 1 ≈ 0.016, rank 10 ≈ 0.014, spread ≈ 0.002). k=10 produces
+/// rank 1 ≈ 0.091, rank 10 ≈ 0.050, spread ≈ 0.041 — 20× better discrimination,
+/// making dedup-before-create reliable at graph sizes of 50–2700 entities.
+const RRF_K: usize = 10;
 
 /// Candidates pulled per path before fusion. Higher = better recall, more work.
 const CANDIDATE_MULTIPLIER: u32 = 4;
@@ -211,7 +217,7 @@ impl KhiveRuntime {
 
         // Fuse without truncating: keep the full candidate pool through the
         // alive/kind filter so right-kind hits below rank `limit` aren't lost.
-        let mut fused = rrf_fuse(text_hits, vector_hits, candidates as usize);
+        let mut fused = rrf_fuse(text_hits, vector_hits, candidates as usize, query_text);
 
         // Filter to alive entities (and optionally to a specific kind). A single
         // query fetches all alive IDs that match the kind constraint from the
@@ -323,13 +329,22 @@ impl KhiveRuntime {
     }
 }
 
-/// Fuse text + vector hits with Reciprocal Rank Fusion (k=60).
+/// Score bonus applied when an entity's title is an exact case-insensitive match for
+/// the query. Dominates RRF scores (~0.09–0.18 range with k=10) so that an exact
+/// name match always ranks above any partial or semantic match.
+const EXACT_MATCH_BOOST: f64 = 0.5;
+
+/// Fuse text + vector hits with Reciprocal Rank Fusion (k=10).
 ///
-/// Hits in both lists get RRF scores summed. Sort by fused score, take top-`limit`.
+/// Hits in both lists get RRF scores summed. If `query_text` exactly matches
+/// (case-insensitive) an entity's title from the text hits, a bonus of
+/// `EXACT_MATCH_BOOST` is added to ensure exact-name matches dominate.
+/// Sort by fused score, take top-`limit`.
 fn rrf_fuse(
     text_hits: Vec<TextSearchHit>,
     vector_hits: Vec<VectorSearchHit>,
     limit: usize,
+    query_text: &str,
 ) -> Vec<SearchHit> {
     #[derive(Default)]
     struct Bucket {
@@ -341,6 +356,7 @@ fn rrf_fuse(
 
     let mut buckets: HashMap<Uuid, Bucket> = HashMap::new();
 
+    let query_lower = query_text.to_lowercase();
     for (i, hit) in text_hits.into_iter().enumerate() {
         let rank = i + 1; // RRF is 1-indexed
         let entry = buckets.entry(hit.subject_id).or_default();
@@ -350,6 +366,12 @@ fn rrf_fuse(
             _ => SearchSource::Text,
         });
         if entry.title.is_none() {
+            // Apply exact-match boost before storing the title so we only check once.
+            if let Some(ref title) = hit.title {
+                if title.to_lowercase() == query_lower {
+                    entry.score = entry.score + DeterministicScore::from_f64(EXACT_MATCH_BOOST);
+                }
+            }
             entry.title = hit.title;
         }
         if entry.snippet.is_none() {
@@ -414,7 +436,7 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let text = vec![text_hit(a, 1, "A"), text_hit(b, 2, "B")];
-        let hits = rrf_fuse(text, vec![], 10);
+        let hits = rrf_fuse(text, vec![], 10, "query");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].entity_id, a);
         assert_eq!(hits[0].source, SearchSource::Text);
@@ -424,7 +446,7 @@ mod tests {
     #[test]
     fn rrf_fuse_vector_only() {
         let a = Uuid::new_v4();
-        let hits = rrf_fuse(vec![], vec![vector_hit(a, 1)], 10);
+        let hits = rrf_fuse(vec![], vec![vector_hit(a, 1)], 10, "query");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source, SearchSource::Vector);
         assert!(hits[0].title.is_none());
@@ -435,7 +457,7 @@ mod tests {
         let id = Uuid::new_v4();
         let text = vec![text_hit(id, 1, "A")];
         let vec = vec![vector_hit(id, 1)];
-        let hits = rrf_fuse(text, vec, 10);
+        let hits = rrf_fuse(text, vec, 10, "query");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source, SearchSource::Both);
     }
@@ -445,21 +467,61 @@ mod tests {
         let hits: Vec<TextSearchHit> = (0..20)
             .map(|i| text_hit(Uuid::new_v4(), i + 1, "x"))
             .collect();
-        let fused = rrf_fuse(hits, vec![], 5);
+        let fused = rrf_fuse(hits, vec![], 5, "query");
         assert_eq!(fused.len(), 5);
     }
 
     #[test]
     fn rrf_fuse_orders_higher_score_first() {
-        // Same UUID in both lists at rank 1 → score 2/(60+1). Different UUIDs → 1/(60+1) each.
+        // Same UUID in both lists at rank 1 → score 2/(10+1). Different UUIDs → 1/(10+1) each.
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let text = vec![text_hit(a, 1, "A")];
         let vec = vec![vector_hit(a, 1), vector_hit(b, 2)];
-        let hits = rrf_fuse(text, vec, 10);
+        let hits = rrf_fuse(text, vec, 10, "query");
         assert_eq!(hits[0].entity_id, a);
         assert_eq!(hits[0].source, SearchSource::Both);
         assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn rrf_fuse_k10_score_spread_exceeds_threshold() {
+        // With k=10: rank 1 → 1/11 ≈ 0.0909, rank 10 → 1/20 = 0.0500.
+        // Spread ≈ 0.041, well above the 0.03 minimum required for reliable dedup.
+        let ids: Vec<Uuid> = (0..10).map(|_| Uuid::new_v4()).collect();
+        let text: Vec<TextSearchHit> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| text_hit(id, (i + 1) as u32, "x"))
+            .collect();
+        let hits = rrf_fuse(text, vec![], 10, "query");
+        assert_eq!(hits.len(), 10);
+        let top_score = hits[0].score.to_f64();
+        let bottom_score = hits[9].score.to_f64();
+        let spread = top_score - bottom_score;
+        assert!(
+            spread >= 0.03,
+            "score spread {spread:.4} between rank 1 and rank 10 must be ≥ 0.03 (was {spread:.4})"
+        );
+    }
+
+    #[test]
+    fn rrf_fuse_exact_match_boost_elevates_score() {
+        // An entity whose title exactly matches the query should receive a score
+        // significantly above a non-matching entity ranked first by text search.
+        let exact_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        // other_id ranks 1 in text, exact_id ranks 2 — but exact_id matches query.
+        let text = vec![
+            text_hit(other_id, 1, "something else"),
+            text_hit(exact_id, 2, "FlashAttention"),
+        ];
+        let hits = rrf_fuse(text, vec![], 10, "flashattention");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].entity_id, exact_id,
+            "exact match must rank first despite being rank-2 in raw text search"
+        );
     }
 
     // ---- embed_batch tests ----

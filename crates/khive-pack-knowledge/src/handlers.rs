@@ -57,10 +57,13 @@ pub(crate) async fn resolve_uuid(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LearnParams {
-    /// Name of the concept.
-    name: String,
-    /// Optional free-text description.
+    /// Name of the concept.  Optional: when absent and `content` is supplied,
+    /// a name is auto-generated from the first ~60 chars of `content`.
     #[serde(default)]
+    name: Option<String>,
+    /// Optional free-text description.  Also accepted as `content` to match
+    /// the `memory.remember` param shape (agent-UX consistency — issue #488).
+    #[serde(default, alias = "content")]
     description: Option<String>,
     /// Research domain (e.g. "attention", "inference").
     #[serde(default)]
@@ -108,12 +111,35 @@ impl KnowledgePack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: LearnParams = deser(params)?;
-        let name = p.name.trim().to_string();
-        if name.is_empty() {
-            return Err(RuntimeError::InvalidInput(
-                "name must not be empty".to_string(),
-            ));
-        }
+
+        // Resolve name: explicit `name` wins; otherwise auto-generate from `content`
+        // (the `description` field).  Truncate at the last word boundary before 60
+        // chars so the generated name is readable — issue #488.
+        let name = match p.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(n) => n.to_string(),
+            None => {
+                let src = p.description.as_deref().unwrap_or("").trim().to_string();
+                if src.is_empty() {
+                    return Err(RuntimeError::InvalidInput(
+                        "name must not be empty (provide 'name' or 'content')".to_string(),
+                    ));
+                }
+                // Truncate at last whitespace boundary <= 60 chars (char-boundary safe).
+                if src.chars().count() <= 60 {
+                    src.clone()
+                } else {
+                    let byte_limit = src
+                        .char_indices()
+                        .nth(60)
+                        .map(|(i, _)| i)
+                        .unwrap_or(src.len());
+                    let boundary = src[..byte_limit]
+                        .rfind(char::is_whitespace)
+                        .unwrap_or(byte_limit);
+                    src[..boundary].trim_end().to_string()
+                }
+            }
+        };
 
         // Normalise the domain once (trim + lowercase) and use the same value
         // for properties.domain, the promoted tag, and the response — ADR-047 §91

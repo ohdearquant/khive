@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use khive_runtime::{
     micros_to_iso, ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy,
-    EntityPatch, KhiveRuntime, LinkSpec, MergeSummary, NamespaceToken, NotePatch, RuntimeError,
-    VerbRegistry,
+    EntityPatch, KhiveRuntime, LinkSpec, MergeSummary, NamespaceToken, NotePatch, QueryResult,
+    RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{
     Direction, NeighborQuery, PageRequest, TraversalOptions, TraversalRequest,
@@ -194,6 +194,18 @@ fn reconcile_specific(
 
 // ---- Param structs (serde-only, no rmcp dependency) ----
 
+/// One edge to attach immediately after record creation (issue #489 — create_linked convenience).
+///
+/// After the record is created its UUID becomes the edge source. Each spec is attempted via
+/// `runtime.link(source=new_id, target=target_id, relation, weight)`. Individual failures are
+/// collected and returned; the record creation is NOT rolled back.
+#[derive(Deserialize)]
+struct EdgeSpec {
+    target_id: String,
+    relation: String,
+    weight: Option<f64>,
+}
+
 #[derive(Deserialize)]
 struct CreateParams {
     kind: String,
@@ -205,6 +217,12 @@ struct CreateParams {
     annotates: Option<Vec<String>>,
     properties: Option<Value>,
     tags: Option<Vec<String>>,
+    // Issue #487: opt-out of post-create similarity check (e.g. bulk imports).
+    skip_dedup_check: Option<bool>,
+    /// Optional edges to attach immediately after creation (issue #489).
+    /// Each entry creates a `link(source=<new_id>, target=target_id, relation=...)`.
+    /// Edge failures are collected and returned; record creation is never rolled back.
+    edges: Option<Vec<EdgeSpec>>,
 }
 
 // ue-errors C1: deny_unknown_fields on param structs that are deserialized
@@ -659,6 +677,109 @@ fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
     })
 }
 
+/// Return the valid edge relations for an entity→entity endpoint pair (issue #486).
+///
+/// Encodes the ADR-002 base allowlist for UX error enrichment — not for
+/// enforcement. `"*"` as `src_kind` means "any source entity kind".
+/// Returns an empty vec when no base-contract relations exist for the pair.
+pub(crate) fn valid_relations_for_entity_pair(src_kind: &str, tgt_kind: &str) -> Vec<&'static str> {
+    const RULES: &[(&str, &str, &str)] = &[
+        ("concept", "contains", "concept"),
+        ("project", "contains", "project"),
+        ("project", "contains", "artifact"),
+        ("org", "contains", "project"),
+        ("org", "contains", "service"),
+        ("concept", "part_of", "concept"),
+        ("project", "part_of", "project"),
+        ("project", "part_of", "org"),
+        ("*", "instance_of", "concept"),
+        ("service", "instance_of", "project"),
+        ("concept", "extends", "concept"),
+        ("concept", "variant_of", "concept"),
+        ("artifact", "variant_of", "artifact"),
+        ("concept", "introduced_by", "document"),
+        ("concept", "introduced_by", "person"),
+        ("artifact", "introduced_by", "document"),
+        ("artifact", "derived_from", "dataset"),
+        ("artifact", "derived_from", "document"),
+        ("artifact", "derived_from", "project"),
+        ("artifact", "derived_from", "artifact"),
+        ("document", "precedes", "document"),
+        ("dataset", "precedes", "dataset"),
+        ("artifact", "precedes", "artifact"),
+        ("service", "precedes", "service"),
+        ("project", "precedes", "project"),
+        ("project", "depends_on", "project"),
+        ("service", "depends_on", "project"),
+        ("service", "depends_on", "service"),
+        ("service", "depends_on", "artifact"),
+        ("service", "depends_on", "dataset"),
+        ("artifact", "depends_on", "project"),
+        ("artifact", "depends_on", "service"),
+        ("concept", "enables", "concept"),
+        ("service", "enables", "concept"),
+        ("dataset", "enables", "concept"),
+        ("project", "implements", "concept"),
+        ("service", "implements", "concept"),
+        ("concept", "competes_with", "concept"),
+        ("project", "competes_with", "project"),
+        ("service", "competes_with", "service"),
+        ("concept", "composed_with", "concept"),
+        ("project", "composed_with", "project"),
+        ("concept", "supersedes", "concept"),
+        ("document", "supersedes", "document"),
+        ("artifact", "supersedes", "artifact"),
+        ("service", "supersedes", "service"),
+        ("dataset", "supersedes", "dataset"),
+    ];
+    let mut relations: Vec<&'static str> = RULES
+        .iter()
+        .filter(|(src, _rel, tgt)| (*src == "*" || *src == src_kind) && *tgt == tgt_kind)
+        .map(|(_src, rel, _tgt)| *rel)
+        .collect();
+    relations.sort_unstable();
+    relations.dedup();
+    relations
+}
+
+/// Enrich an "not in allowlist" error with the list of valid relations (issue #486).
+///
+/// Called when `runtime.link()` returns `InvalidInput` containing the
+/// "not in the ADR-002 base endpoint allowlist" sentinel. Fetches entity kinds
+/// and appends valid relations. Returns the original message on lookup failure.
+pub(crate) async fn enrich_allowlist_error(
+    original: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: EdgeRelation,
+) -> String {
+    let src_kind = match runtime.get_entity(token, source_id).await {
+        Ok(e) => e.kind,
+        Err(_) => return original.to_string(),
+    };
+    let tgt_kind = match runtime.get_entity(token, target_id).await {
+        Ok(e) => e.kind,
+        Err(_) => return original.to_string(),
+    };
+    let valid = valid_relations_for_entity_pair(&src_kind, &tgt_kind);
+    if valid.is_empty() {
+        format!(
+            "Invalid relation {:?} for {src_kind}\u{2192}{tgt_kind}. \
+             No valid relations exist for {src_kind}\u{2192}{tgt_kind} in the current edge rules.",
+            relation.as_str()
+        )
+    } else {
+        format!(
+            "Invalid relation {:?} for {src_kind}\u{2192}{tgt_kind}. \
+             Valid relations: {}",
+            relation.as_str(),
+            valid.join(", ")
+        )
+    }
+}
+
 const IMMUTABLE_EVENT_MSG: &str = "events are immutable — create/update/delete are not permitted";
 
 fn immutable_event_error() -> RuntimeError {
@@ -1007,6 +1128,43 @@ fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Er
     Ok(Some(Option::deserialize(d)?))
 }
 
+// ---- Query result rendering (#286) ----
+
+fn sql_value_to_json(value: SqlValue) -> Value {
+    match value {
+        SqlValue::Null => Value::Null,
+        SqlValue::Bool(v) => json!(v),
+        SqlValue::Integer(v) => json!(v),
+        SqlValue::Float(v) => json!(v),
+        SqlValue::Text(v) => json!(v),
+        SqlValue::Blob(v) => json!(v),
+        SqlValue::Json(v) => v,
+        SqlValue::Uuid(v) => json!(v.to_string()),
+        SqlValue::Timestamp(v) => json!(v.to_rfc3339()),
+    }
+}
+
+fn render_query_result(result: QueryResult) -> Value {
+    let rows = result
+        .rows
+        .into_iter()
+        .map(|row| {
+            let mut obj = serde_json::Map::new();
+            for col in row.columns {
+                obj.insert(col.name, sql_value_to_json(col.value));
+            }
+            Value::Object(obj)
+        })
+        .collect::<Vec<_>>();
+
+    let mut out = serde_json::Map::new();
+    out.insert("rows".to_string(), Value::Array(rows));
+    if !result.warnings.is_empty() {
+        out.insert("warnings".to_string(), json!(result.warnings));
+    }
+    Value::Object(out)
+}
+
 // ---- Handler implementations ----
 
 impl KgPack {
@@ -1070,6 +1228,10 @@ impl KgPack {
             "properties",
             "salience",
             "annotates",
+            // Dedup guard opt-out (issue #487)
+            "skip_dedup_check",
+            // Linked-edge batch attachment (issue #489)
+            "edges",
             // GTD pack user params (create(kind="task", ...))
             "title",
             "priority",
@@ -1180,8 +1342,22 @@ impl KgPack {
         }
 
         let p: CreateParams = deser(params.clone())?;
+        let skip_dedup = p.skip_dedup_check.unwrap_or(false);
 
-        let (response, new_id) = match p.kind.as_str() {
+        // Capture entity name + kind before the match consumes `p`; only
+        // needed for entity creates with the dedup guard active.
+        let dedup_name: Option<String> = if !skip_dedup && p.kind == "entity" {
+            p.name.clone()
+        } else {
+            None
+        };
+        let dedup_kind: Option<String> = if !skip_dedup && p.kind == "entity" {
+            sub_kind.clone()
+        } else {
+            None
+        };
+
+        let (mut response, new_id) = match p.kind.as_str() {
             "entity" => {
                 let canonical = sub_kind.clone().expect("entity_kind canonicalized above");
                 let name = p.name.ok_or_else(|| {
@@ -1250,6 +1426,139 @@ impl KgPack {
                     error = %e,
                     "kind hook after_create failed (storage write already committed)"
                 );
+            }
+        }
+
+        // Issue #487: advisory dedup guard. After a successful entity create,
+        // run a lightweight FTS-only name search to surface similar existing
+        // entities. Advisory only — the entity is already committed. Notes are
+        // excluded (dedup is meaningful for named entities only).
+        if let (Some(ref name), Some(ref kind)) = (&dedup_name, &dedup_kind) {
+            const DEDUP_LIMIT: u32 = 3;
+            const DEDUP_SCORE_THRESHOLD: f64 = 0.1;
+            // +1 so we can discard the just-created entity and still return
+            // up to DEDUP_LIMIT results.
+            match self
+                .runtime
+                .hybrid_search(
+                    token,
+                    name,
+                    None,
+                    DEDUP_LIMIT + 1,
+                    Some(kind.as_str()),
+                    None,
+                )
+                .await
+            {
+                Ok(hits) => {
+                    let similar: Vec<Value> = hits
+                        .into_iter()
+                        .filter(|h| {
+                            h.entity_id != new_id && h.score.to_f64() >= DEDUP_SCORE_THRESHOLD
+                        })
+                        .take(DEDUP_LIMIT as usize)
+                        .map(|h| {
+                            json!({
+                                "id": h.entity_id.to_string(),
+                                "name": h.title,
+                                "score": h.score.to_f64(),
+                            })
+                        })
+                        .collect();
+                    if !similar.is_empty() {
+                        if let Some(obj) = response.as_object_mut() {
+                            obj.insert("similar_existing".to_string(), json!(similar));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Advisory only — log and continue; the entity is already created.
+                    tracing::warn!(
+                        id = %new_id,
+                        error = %e,
+                        "dedup similarity search failed (entity already created)"
+                    );
+                }
+            }
+        }
+
+        // Issue #489 — create_linked convenience: attach edges in one round-trip.
+        //
+        // Process each EdgeSpec using the same validation path as `handle_link`.
+        // Failures are collected per-edge; the entity creation is already committed
+        // and is never rolled back (partial success is the specified behaviour).
+        if let Some(edge_specs) = p.edges {
+            if !edge_specs.is_empty() {
+                let mut edge_results: Vec<Value> = Vec::with_capacity(edge_specs.len());
+                let mut edge_errors: Vec<Value> = Vec::with_capacity(edge_specs.len());
+                for (idx, spec) in edge_specs.into_iter().enumerate() {
+                    let target =
+                        match resolve_uuid_async(&spec.target_id, &self.runtime, token).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                edge_errors.push(json!({
+                                    "index": idx,
+                                    "target_id": spec.target_id,
+                                    "error": format!("{e}"),
+                                }));
+                                continue;
+                            }
+                        };
+                    let relation = match parse_relation(&spec.relation) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            edge_errors.push(json!({
+                                "index": idx,
+                                "target_id": spec.target_id,
+                                "relation": spec.relation,
+                                "error": format!("{e}"),
+                            }));
+                            continue;
+                        }
+                    };
+                    let weight = spec.weight.unwrap_or(1.0).clamp(0.0, 1.0);
+                    // Symmetric relations use canonical (lower-UUID-first) order.
+                    let (source, target) = if relation.is_symmetric() && target < new_id {
+                        (target, new_id)
+                    } else {
+                        (new_id, target)
+                    };
+                    match self
+                        .runtime
+                        .link(token, source, target, relation, weight, None)
+                        .await
+                    {
+                        Ok(edge) => match to_json(&edge) {
+                            Ok(v) => edge_results.push(v),
+                            Err(e) => edge_errors.push(json!({
+                                "index": idx,
+                                "error": format!("serialize: {e}"),
+                            })),
+                        },
+                        Err(e) => {
+                            edge_errors.push(json!({
+                                "index": idx,
+                                "target_id": spec.target_id,
+                                "relation": spec.relation,
+                                "error": format!("{e}"),
+                            }));
+                        }
+                    }
+                }
+                // Augment the response object with edge results.
+                let mut out = match response {
+                    Value::Object(map) => map,
+                    other => {
+                        let mut m = serde_json::Map::new();
+                        m.insert("entity".to_string(), other);
+                        m
+                    }
+                };
+                out.insert("edges".to_string(), Value::Array(edge_results));
+                if !edge_errors.is_empty() {
+                    out.insert("edge_errors".to_string(), Value::Array(edge_errors));
+                }
+                return Ok(Value::Object(out));
             }
         }
 
@@ -2353,10 +2662,22 @@ impl KgPack {
         let relation = parse_relation(&relation_str)?;
         let metadata = merge_entry_metadata(p.metadata, p.dependency_kind)?;
 
-        let edge = self
+        let edge = match self
             .runtime
             .link(token, source, target, relation, weight, metadata)
-            .await?;
+            .await
+        {
+            Ok(e) => e,
+            Err(RuntimeError::InvalidInput(ref msg))
+                if msg.contains("not in the ADR-002 base endpoint allowlist") =>
+            {
+                let enriched =
+                    enrich_allowlist_error(msg, &self.runtime, token, source, target, relation)
+                        .await;
+                return Err(RuntimeError::InvalidInput(enriched));
+            }
+            Err(e) => return Err(e),
+        };
         let mut raw = to_json(&edge)?;
         // K-C1: for symmetric relations the runtime stores a canonical (lower-UUID-first)
         // endpoint order. Restore the caller's original positions in the response so the
@@ -2444,7 +2765,7 @@ impl KgPack {
     ) -> Result<Value, RuntimeError> {
         let p: QueryParams = deser(params)?;
         let result = self.runtime.query_with_metadata(token, &p.query).await?;
-        to_json(&result)
+        Ok(render_query_result(result))
     }
 
     // ---- Proposal verbs (ADR-046) ----
@@ -3210,7 +3531,7 @@ mod tests {
         assert_eq!(
             handlers.len(),
             15,
-            "kg pack must expose 15 handlers (was 14, +1 for verbs introspection — H5)"
+            "kg pack must expose 15 handlers"
         );
         let names: Vec<&str> = handlers.iter().map(|h| h.name).collect();
         assert!(names.contains(&"propose"), "propose must be in KG_HANDLERS");
@@ -3477,5 +3798,90 @@ mod tests {
                 "each element's created_at must be ISO string"
             );
         }
+    }
+
+    // ---- Issue #486: link endpoint validation should suggest valid relations ----
+
+    // Unit test: valid_relations_for_entity_pair returns expected relations for known pairs.
+    #[test]
+    fn valid_relations_concept_to_concept_includes_extends() {
+        use super::valid_relations_for_entity_pair;
+        let rels = valid_relations_for_entity_pair("concept", "concept");
+        assert!(
+            rels.contains(&"extends"),
+            "#486: concept->concept must include extends; got: {rels:?}"
+        );
+        assert!(
+            rels.contains(&"competes_with"),
+            "#486: concept->concept must include competes_with; got: {rels:?}"
+        );
+        assert!(
+            rels.contains(&"composed_with"),
+            "#486: concept->concept must include composed_with; got: {rels:?}"
+        );
+        assert!(
+            rels.contains(&"instance_of"),
+            "#486: concept->concept must include instance_of (wildcard src); got: {rels:?}"
+        );
+    }
+
+    // Unit test: unsupported endpoint pair returns empty vec (not a panic).
+    #[test]
+    fn valid_relations_unsupported_pair_returns_empty() {
+        use super::valid_relations_for_entity_pair;
+        let rels = valid_relations_for_entity_pair("person", "dataset");
+        assert!(
+            rels.is_empty(),
+            "#486: person->dataset has no base-contract relations; got: {rels:?}"
+        );
+    }
+
+    // Integration test: link with invalid relation returns error containing valid relations.
+    #[tokio::test]
+    async fn link_invalid_relation_error_suggests_valid_relations() {
+        use crate::KgPack;
+        use khive_runtime::KhiveRuntime;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(khive_runtime::Namespace::local());
+
+        let src_val = rt
+            .create_entity(&token, "concept", None, "ConceptA", None, None, vec![])
+            .await
+            .expect("create source entity");
+        let tgt_val = rt
+            .create_entity(&token, "concept", None, "ConceptB", None, None, vec![])
+            .await
+            .expect("create target entity");
+
+        let pack = KgPack::new(rt.clone());
+
+        // "depends_on" is a valid relation string but NOT in the concept->concept allowlist.
+        let params = json!({
+            "source_id": src_val.id.to_string(),
+            "target_id": tgt_val.id.to_string(),
+            "relation": "depends_on",
+        });
+        let result = pack.handle_link(&token, params).await;
+        assert!(
+            result.is_err(),
+            "#486: depends_on on concept->concept should fail"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        // The enriched error must mention valid relations.
+        assert!(
+            err_msg.contains("Valid relations:"),
+            "#486: error must contain 'Valid relations:'; got: {err_msg}"
+        );
+        // concept->concept includes extends; verify it appears in the suggestion.
+        assert!(
+            err_msg.contains("extends"),
+            "#486: valid relations for concept->concept must include 'extends'; got: {err_msg}"
+        );
+        // The error should name the endpoint kinds.
+        assert!(
+            err_msg.contains("concept"),
+            "#486: error must mention endpoint kinds; got: {err_msg}"
+        );
     }
 }
