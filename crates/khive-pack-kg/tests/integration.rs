@@ -55,7 +55,7 @@ impl Clone for Fixture {
 
 fn pack_with_events() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let tok = rt.authorize(khive_runtime::Namespace::local());
+    let tok = rt.authorize(khive_runtime::Namespace::local()).unwrap();
     let event_store = rt.events(&tok).expect("event store must be available");
     let mut builder = VerbRegistryBuilder::new();
     builder.with_event_store(event_store);
@@ -4063,7 +4063,7 @@ async fn proposal_applied_event_applied_at_is_iso8601_string() {
 #[tokio::test]
 async fn note_expires_at_is_normalized_to_iso8601() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
-    let tok = rt.authorize(khive_runtime::Namespace::local());
+    let tok = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
     // Insert a note with expires_at set to a concrete microsecond value.
     // 2025-01-01T00:00:00Z = 1735689600 seconds → 1_735_689_600_000_000 µs

@@ -438,7 +438,13 @@ impl SubstrateCoordinator {
         // Single-backend shortcut: avoid tokio::spawn overhead.
         if entries.len() == 1 {
             let (backend_id, runtime) = &entries[0];
-            let token = runtime.authorize(namespace.clone()).unwrap();
+            let token = match runtime.authorize(namespace.clone()) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "locate: authorization denied for namespace");
+                    return None;
+                }
+            };
             let ns_str = namespace.as_str().to_string();
 
             // Entity probe.
@@ -484,7 +490,13 @@ impl SubstrateCoordinator {
             let ns = ns_clone.clone();
             let locator = Arc::clone(&locator);
             let handle = tokio::spawn(async move {
-                let token = runtime.authorize(ns.clone()).unwrap();
+                let token = match runtime.authorize(ns.clone()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "locate: authorization denied for namespace");
+                        return None;
+                    }
+                };
                 let ns_str = ns.as_str().to_string();
 
                 // Entity probe.
@@ -571,7 +583,18 @@ impl SubstrateCoordinator {
         // Single-backend shortcut.
         if entries.len() == 1 {
             let (backend_id, runtime) = &entries[0];
-            let token = runtime.authorize(namespace.clone()).unwrap();
+            let token = match runtime.authorize(namespace.clone()) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "fan_out_search: authorization denied for namespace");
+                    let backend_result = BackendSearchResult {
+                        backend_id: backend_id.clone(),
+                        hits: vec![],
+                        error: Some(e.to_string()),
+                    };
+                    return (vec![], vec![backend_result]);
+                }
+            };
             match runtime
                 .hybrid_search(&token, query, None, limit, None, None)
                 .await
@@ -622,7 +645,13 @@ impl SubstrateCoordinator {
                         )),
                     );
                 }
-                let token = runtime.authorize(ns).unwrap();
+                let token = match runtime.authorize(ns) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "fan_out_search: authorization denied for namespace");
+                        return (backend_id, Err(e));
+                    }
+                };
                 let result = runtime
                     .hybrid_search(&token, &q, None, limit, None, None)
                     .await;

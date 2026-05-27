@@ -1348,7 +1348,7 @@ mod tests {
                 "brain.unknown",
                 json!({}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap_err();
@@ -1371,7 +1371,7 @@ mod tests {
                 "brain.reset",
                 json!({"profile_id": "balanced-recall-v1"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap();
@@ -1390,7 +1390,7 @@ mod tests {
                 "brain.reset",
                 json!({}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .expect("reset with no args must succeed (defaults to balanced-recall-v1)");
@@ -1407,7 +1407,7 @@ mod tests {
                 "brain.reset",
                 json!({"profile_id": "ghost-profile"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap_err();
@@ -1421,7 +1421,7 @@ mod tests {
     async fn dispatch_reset_archived_profile_returns_invalid_input() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Archive the profile via the lifecycle DAG
         pack.dispatch(
@@ -1470,7 +1470,7 @@ mod tests {
                 "brain.feedback",
                 json!({"target_id": target, "signal": "bad_signal"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap_err();
@@ -1497,7 +1497,7 @@ mod tests {
                 "brain.state",
                 json!({}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap();
@@ -1518,7 +1518,7 @@ mod tests {
                 "brain.profiles",
                 json!({}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap();
@@ -1536,7 +1536,7 @@ mod tests {
                 "brain.profiles",
                 json!({"lifecycle": "active"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap();
@@ -1555,7 +1555,7 @@ mod tests {
                 "brain.profile",
                 json!({"id": "balanced-recall-v1"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap();
@@ -1573,7 +1573,7 @@ mod tests {
                 "brain.profile",
                 json!({"id": "nonexistent"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap_err();
@@ -1589,7 +1589,7 @@ mod tests {
                 "brain.resolve",
                 json!({"consumer_kind": "recall"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap();
@@ -1600,7 +1600,7 @@ mod tests {
     async fn dispatch_activate_and_deactivate_profile() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Deactivate the default profile
         let result = pack
@@ -1643,7 +1643,7 @@ mod tests {
     async fn dispatch_archive_profile() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Lifecycle DAG requires active → inactive before archiving.
         pack.dispatch(
@@ -1676,7 +1676,7 @@ mod tests {
                 "brain.activate",
                 json!({"profile_id": "ghost-profile"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap_err();
@@ -1687,7 +1687,7 @@ mod tests {
     async fn dispatch_bind_and_resolve_explicit_binding() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Bind balanced-recall-v1 for actor "agent-x"
         let result = pack
@@ -1728,7 +1728,7 @@ mod tests {
                 "brain.bind",
                 json!({"profile_id": "ghost", "consumer_kind": "recall"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap_err();
@@ -1739,7 +1739,7 @@ mod tests {
     async fn dispatch_unbind_removes_binding() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Add a binding
         pack.dispatch(
@@ -1773,7 +1773,7 @@ mod tests {
     async fn ue5_h1_invalid_lifecycle_error_lists_only_public_states() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let err = pack
             .dispatch(
@@ -1816,7 +1816,7 @@ mod tests {
     async fn ue5_h1_internal_lifecycle_values_rejected() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         for internal_state in ["defined", "registered"] {
             let err = pack
@@ -1845,7 +1845,7 @@ mod tests {
     async fn b_c1_archived_activate_is_rejected() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Deactivate first (active → inactive), then archive (inactive → archived)
         pack.dispatch(
@@ -1889,7 +1889,7 @@ mod tests {
     async fn b_c1_archived_deactivate_is_rejected() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Get to archived via active → inactive → archived
         pack.dispatch(
@@ -1929,7 +1929,7 @@ mod tests {
     async fn b_c1_active_to_archived_direct_is_rejected() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Profile starts active — direct archive must fail (must go through inactive)
         let err = pack
@@ -1955,7 +1955,7 @@ mod tests {
     async fn b_c1_inactive_to_archived_is_permitted() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // active → inactive → archived: legal path
         pack.dispatch(
@@ -1988,7 +1988,7 @@ mod tests {
     async fn dispatch_unbind_uses_and_not_or() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // binding 1: ns=A, profile=P1 (the one we want to remove)
         pack.dispatch(
@@ -2045,7 +2045,7 @@ mod tests {
                 "brain.config",
                 json!({}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap();
@@ -2064,7 +2064,7 @@ mod tests {
                 "brain.config",
                 json!({"parameter": "recall::relevance_weight"}),
                 &registry,
-                &rt.authorize(Namespace::local()),
+                &rt.authorize(Namespace::local()).unwrap(),
             )
             .await
             .unwrap();
@@ -2090,7 +2090,7 @@ mod tests {
     async fn test_356_profile_record_total_events_synced_after_feedback() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
         let target = create_test_entity(&rt, &token).await;
 
         // Part A: handle_feedback path.
@@ -2188,7 +2188,7 @@ mod tests {
     async fn test_357_feedback_no_double_count() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
         let target = create_test_entity(&rt, &token).await;
 
         // Step 1: handle_feedback path — folds once, total_events becomes 1.
@@ -2249,7 +2249,7 @@ mod tests {
     async fn test_295_reset_restores_domain_priors_not_uniform() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Step 1: accumulate state via hook-only updates (no handle_feedback).
         // This simulates the common case where brain observes external pack
@@ -2415,7 +2415,7 @@ mod tests {
     async fn brain_reset_rejects_unknown_kwargs() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
         let err = pack
             .dispatch(
                 "brain.reset",
@@ -2442,7 +2442,7 @@ mod tests {
     async fn brain_reset_accepts_empty_params() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
         let result = pack
             .dispatch("brain.reset", json!({}), &registry, &token)
             .await
@@ -2564,7 +2564,7 @@ mod tests {
     async fn w4_c2_unbind_no_filter_is_rejected() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Add a binding so there is something to accidentally wipe.
         pack.dispatch(
@@ -2602,7 +2602,7 @@ mod tests {
     async fn w4_c3_bind_archived_profile_is_rejected() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Archive the only profile.
         pack.dispatch(
@@ -2646,7 +2646,7 @@ mod tests {
     async fn w4_c3_resolve_skips_archived_binding() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Force a binding directly into state (bypassing handle_bind guard) to simulate
         // a pre-existing binding that was created before the profile was archived.
@@ -2689,7 +2689,7 @@ mod tests {
     async fn w4_c4_feedback_rejects_nonexistent_target() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let err = pack
             .dispatch(
@@ -2711,7 +2711,7 @@ mod tests {
     async fn w4_c4_feedback_rejects_nonexistent_profile() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Create a real entity for the valid target_id.
         let target = create_test_entity(&rt, &token).await;
@@ -2736,7 +2736,7 @@ mod tests {
     async fn w4_c4_feedback_accepts_valid_target_and_profile() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let target = create_test_entity(&rt, &token).await;
 
@@ -2758,7 +2758,7 @@ mod tests {
     async fn w4_h1_create_profile_creates_new_profile() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let result = pack
             .dispatch(
@@ -2796,7 +2796,7 @@ mod tests {
     async fn w4_h1_create_profile_duplicate_rejected() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let err = pack
             .dispatch(
@@ -2818,7 +2818,7 @@ mod tests {
     async fn w4_h2_bindings_lists_rows() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Initially empty.
         let result = pack
@@ -2853,7 +2853,7 @@ mod tests {
     async fn w4_h2_bindings_filtered() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         pack.dispatch("brain.bind", json!({"profile_id": "balanced-recall-v1", "actor": "agent-1", "consumer_kind": "recall"}), &registry, &token).await.unwrap();
         pack.dispatch("brain.bind", json!({"profile_id": "balanced-recall-v1", "actor": "agent-2", "consumer_kind": "search"}), &registry, &token).await.unwrap();
@@ -2876,7 +2876,7 @@ mod tests {
     async fn w4_h3_resolve_returns_both_requested_and_matched_kind() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Install a wildcard binding (consumer_kind = "*").
         pack.dispatch(
@@ -2917,7 +2917,7 @@ mod tests {
     async fn w4_h3_resolve_exact_match_returns_exact_kind() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Default fallback (no binding) uses profile's consumer_kind.
         let result = pack
@@ -2938,7 +2938,7 @@ mod tests {
     async fn r2_archived_exact_binding_defers_to_live_wildcard() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Create a second live profile.
         pack.dispatch(
@@ -3009,7 +3009,7 @@ mod tests {
     async fn r2_feedback_rejects_archived_served_by_profile() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let target = create_test_entity(&rt, &token).await;
 
@@ -3059,7 +3059,7 @@ mod tests {
     async fn r2_create_profile_rejects_empty_consumer_kind() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let err = pack
             .dispatch(
@@ -3080,7 +3080,7 @@ mod tests {
     async fn r2_create_profile_rejects_wildcard_consumer_kind() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let err = pack
             .dispatch(
@@ -3105,7 +3105,7 @@ mod tests {
     async fn r2_create_profile_rejects_whitespace_consumer_kind() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let err = pack
             .dispatch(
@@ -3127,7 +3127,7 @@ mod tests {
     async fn r2_bindings_and_semantics_multi_filter() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Create two extra profiles for variety.
         for name in ["alpha-v1", "beta-v1"] {
@@ -3235,7 +3235,7 @@ mod tests {
     async fn r2_user_profile_reset_mutates_posteriors() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let target = create_test_entity(&rt, &token).await;
 
@@ -3354,7 +3354,7 @@ mod tests {
     async fn r2_user_profile_feedback_routes_to_profile_state() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let target = create_test_entity(&rt, &token).await;
 
@@ -3416,7 +3416,7 @@ mod tests {
     async fn w4_h4_profile_accepts_profile_id_and_id_alias() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Canonical arg.
         let r1 = pack
@@ -3451,7 +3451,7 @@ mod tests {
     async fn r3_feedback_default_profile_archived_rejected() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         let target = create_test_entity(&rt, &token).await;
 
@@ -3554,7 +3554,7 @@ mod tests {
     async fn r3_create_profile_id_grammar_enforced() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
 
         // Whitespace-only name must be rejected.
         let err = pack
@@ -3642,7 +3642,7 @@ mod tests {
     async fn test_289_feedback_event_records_nonzero_duration() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
-        let token = rt.authorize(Namespace::local());
+        let token = rt.authorize(Namespace::local()).unwrap();
         let target = create_test_entity(&rt, &token).await;
 
         let result = pack
