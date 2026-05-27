@@ -156,8 +156,8 @@ request(ops="[v1(...), v2(...), v3(...)]")
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 ```
 
-Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default is
-`kg` only.
+Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
+loads all 7 production packs: kg, gtd, memory, brain, comm, schedule, knowledge.
 
 ### KG pack verbs (11 — ADR-017)
 
@@ -276,6 +276,10 @@ make fmt-check  # verify without modifying
 
 # Build release binary
 make build      # cargo build --workspace --release
+
+# Build + install locally (ALWAYS use this after code changes)
+make local      # build release khive-mcp → kill stale → codesign → install to ~/.cargo/bin/
+                # then /mcp in Claude Code to reconnect
 
 # Publish to crates.io
 make publish-dry  # dry run — validates all workspace crates

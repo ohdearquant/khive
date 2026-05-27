@@ -180,12 +180,19 @@ impl Default for RuntimeConfig {
         let additional_embedding_models = std::env::var("KHIVE_ADDITIONAL_EMBEDDING_MODELS")
             .ok()
             .map(|s| parse_embedding_model_list(&s))
-            .unwrap_or_default();
+            .unwrap_or_else(|| vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2]);
         let packs = std::env::var("KHIVE_PACKS")
             .ok()
             .map(|s| parse_pack_list(&s))
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec!["kg".to_string()]);
+            .unwrap_or_else(|| {
+                vec![
+                    "kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
+            });
         Self {
             db_path,
             default_namespace: Namespace::local(),
@@ -853,14 +860,21 @@ mod tests {
     }
 
     #[test]
-    fn default_config_packs_falls_back_to_kg() {
+    fn default_config_packs_loads_all_production_packs() {
         let prior = std::env::var("KHIVE_PACKS").ok();
         // SAFETY: test function runs single-threaded; no other threads read or write KHIVE_PACKS.
         unsafe {
             std::env::remove_var("KHIVE_PACKS");
         }
         let cfg = RuntimeConfig::default();
-        assert_eq!(cfg.packs, vec!["kg".to_string()]);
+        assert!(cfg.packs.contains(&"kg".to_string()));
+        assert!(cfg.packs.contains(&"gtd".to_string()));
+        assert!(cfg.packs.contains(&"memory".to_string()));
+        assert!(cfg.packs.contains(&"brain".to_string()));
+        assert!(cfg.packs.contains(&"comm".to_string()));
+        assert!(cfg.packs.contains(&"schedule".to_string()));
+        assert!(cfg.packs.contains(&"knowledge".to_string()));
+        assert_eq!(cfg.packs.len(), 7);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {
