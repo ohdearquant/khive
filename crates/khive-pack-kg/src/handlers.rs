@@ -275,6 +275,10 @@ struct ListParams {
     selected: Option<Vec<String>>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StatsParams {}
+
 // ue-errors C1: deny_unknown_fields rejects typos like `nonexistent_field="x"`
 // at deserialization.  All cross-substrate fields (entity, note, edge paths)
 // remain valid because they are declared on the struct.
@@ -3332,6 +3336,29 @@ impl KgPack {
             .collect();
 
         to_json(&items)
+    }
+
+    pub(crate) async fn handle_stats(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let _p: StatsParams = deser(params)?;
+        let entities = self.runtime.count_entities(token, None).await?;
+        let edges = self
+            .runtime
+            .count_edges(token, EdgeListFilter::default())
+            .await?;
+        let notes = self
+            .runtime
+            .notes(token)?
+            .count_notes(token.namespace().as_str(), None)
+            .await?;
+        Ok(json!({
+            "entities": entities,
+            "edges": edges,
+            "notes": notes,
+        }))
     }
 }
 
