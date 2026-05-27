@@ -626,7 +626,7 @@ pub(crate) fn vec_model_key(model: EmbeddingModel) -> String {
     sanitize_key(&model.to_string())
 }
 
-fn sanitize_key(s: &str) -> String {
+pub(crate) fn sanitize_key(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()

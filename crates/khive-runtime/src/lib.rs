@@ -51,9 +51,9 @@ pub use khive_gate::{
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use objectives::{
-    DecayAwareSalienceObjective, GraphProximityObjective, NoteCandidate, RerankerObjective,
-    RetrievalCandidate, RrfFusionObjective, TemporalRecencyObjective, TextRelevanceObjective,
-    VectorSimilarityObjective,
+    AmplifiedDecayAwareSalienceObjective, DecayAwareSalienceObjective, GraphProximityObjective,
+    MemoryRecallPipeline, NoteCandidate, RerankerObjective, RetrievalCandidate, RrfFusionObjective,
+    TemporalRecencyObjective, TextRelevanceObjective, VectorSimilarityObjective,
 };
 pub use operations::{LinkSpec, NoteSearchHit, QueryResult, Resolved};
 pub use pack::{

@@ -167,6 +167,12 @@ pub struct NoteCandidate {
     pub decay_factor: f64,
     /// Age of the note in days at query time.
     pub age_days: f64,
+    /// Salience after applying the configured `DecayModel` (pre-computed by the caller).
+    ///
+    /// The caller must set this to `DecayModel::apply(salience, age_days, decay_factor, half_life)`
+    /// so that objectives respect the configured decay model variant rather than
+    /// always applying exponential decay. When not set, defaults to 0.0.
+    pub effective_salience: f64,
     /// Per-reranker scores populated by the rerank stage.
     /// Keyed by reranker name (e.g. "cross_encoder", "salience", "graph_proximity").
     pub rerank_scores: HashMap<String, f64>,
@@ -220,6 +226,51 @@ impl Objective<NoteCandidate> for DecayAwareSalienceObjective {
 
     fn name(&self) -> &str {
         "DecayAwareSalienceObjective"
+    }
+}
+
+// ── AmplifiedDecayAwareSalienceObjective ─────────────────────────────────────
+
+/// Scores a `NoteCandidate` by salience with exponential decay and a non-linear
+/// amplification exponent applied after decay.
+///
+/// Formula: `(salience * exp(-decay_factor * age_days)) ^ alpha`
+///
+/// With `alpha > 1.0`, high-salience memories rank more clearly above low-salience
+/// ones when relevance is similar. At `alpha = 1.5` (the memory-recall default),
+/// salience 0.9 → 0.854 and salience 0.3 → 0.164 — a ~5.2× spread vs the ~3× linear
+/// spread. Keep `alpha ≤ 2.0`; values above 2 compress near-zero salience toward 0.
+///
+/// Used by the memory recall pipeline (ADR-033 §4) to make salience a meaningful
+/// tiebreaker without dominating relevance at the default weight of 0.20.
+pub struct AmplifiedDecayAwareSalienceObjective {
+    /// Power applied to the decayed salience value. Must be > 0.
+    pub alpha: f64,
+}
+
+impl AmplifiedDecayAwareSalienceObjective {
+    /// Create with the given amplification exponent.
+    pub fn new(alpha: f64) -> Self {
+        Self { alpha }
+    }
+
+    /// Default memory alpha from the memory recall handler: 1.5.
+    pub fn default_memory() -> Self {
+        Self::new(1.5)
+    }
+}
+
+impl Objective<NoteCandidate> for AmplifiedDecayAwareSalienceObjective {
+    #[inline]
+    fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
+        // Use the pre-computed effective_salience which was produced by the caller
+        // via DecayModel::apply(). This respects all four DecayModel variants
+        // (Exponential, Hyperbolic, PowerLaw, None) instead of hardcoding exponential.
+        candidate.effective_salience.powf(self.alpha)
+    }
+
+    fn name(&self) -> &str {
+        "AmplifiedDecayAwareSalienceObjective"
     }
 }
 
@@ -299,6 +350,66 @@ impl Objective<NoteCandidate> for RerankerObjective {
     }
 }
 
+// ── MemoryRecallPipeline ──────────────────────────────────────────────────────
+
+/// Composable scoring pipeline for memory recall candidates.
+///
+/// Wraps a `WeightedObjective<NoteCandidate>` with the three standard memory
+/// scoring components (RRF relevance, amplified salience, temporal recency)
+/// weighted by the recall config parameters. Pack code uses this type to avoid
+/// a direct dependency on `khive-fold`.
+///
+/// See ADR-033 §4.
+pub struct MemoryRecallPipeline {
+    pipeline: khive_fold::WeightedObjective<NoteCandidate>,
+}
+
+impl MemoryRecallPipeline {
+    /// Build a pipeline from explicit component weights and temporal half-life.
+    ///
+    /// `relevance_weight`, `salience_weight`, `temporal_weight` correspond to
+    /// `RecallConfig`'s three weight fields. `half_life_days` drives
+    /// `TemporalRecencyObjective`. `salience_alpha` is the amplification exponent
+    /// for `AmplifiedDecayAwareSalienceObjective` (default 1.5).
+    pub fn new(
+        relevance_weight: f64,
+        salience_weight: f64,
+        temporal_weight: f64,
+        half_life_days: f64,
+        salience_alpha: f64,
+    ) -> Self {
+        use khive_fold::WeightedObjective;
+        let pipeline = WeightedObjective::<NoteCandidate>::new()
+            .add(Box::new(RrfFusionObjective), relevance_weight)
+            .add(
+                Box::new(AmplifiedDecayAwareSalienceObjective::new(salience_alpha)),
+                salience_weight,
+            )
+            .add(
+                Box::new(TemporalRecencyObjective { half_life_days }),
+                temporal_weight,
+            );
+        Self { pipeline }
+    }
+
+    /// Build a pipeline using the standard memory recall defaults from ADR-033.
+    ///
+    /// Weights: relevance=0.70, salience=0.20, temporal=0.10; half_life=30 days; alpha=1.5.
+    pub fn default_memory() -> Self {
+        Self::new(0.70, 0.20, 0.10, 30.0, 1.5)
+    }
+
+    /// Score a `NoteCandidate` through the pipeline.
+    ///
+    /// The result is in [0.0, 1.0]. The `NoteCandidate.rrf_score` field should
+    /// carry the pre-normalized relevance (output of `normalize_relevance` / `RrfFusionObjective`).
+    pub fn score(&self, candidate: &NoteCandidate) -> f64 {
+        let ctx = ObjectiveContext::new();
+        use khive_fold::objective::Objective;
+        self.pipeline.score(candidate, &ctx).clamp(0.0, 1.0)
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -333,12 +444,15 @@ mod tests {
         decay_factor: f64,
         age_days: f64,
     ) -> NoteCandidate {
+        // For tests, compute effective_salience using the default Exponential formula.
+        let effective_salience = salience * (-decay_factor * age_days).exp();
         NoteCandidate {
             id: Uuid::new_v4(),
             rrf_score: rrf,
             salience,
             decay_factor,
             age_days,
+            effective_salience,
             rerank_scores: HashMap::new(),
         }
     }
@@ -532,6 +646,7 @@ mod tests {
             salience: 0.5,
             decay_factor: 0.01,
             age_days: 0.0,
+            effective_salience: 0.5,
             rerank_scores: HashMap::new(),
         };
         assert_eq!(c.id(), id);
@@ -658,6 +773,7 @@ mod tests {
             salience: 0.8,
             decay_factor: 0.01,
             age_days: 0.0,
+            effective_salience: 0.8, // age=0, so effective_salience == salience
             rerank_scores: HashMap::new(),
         };
         let pipeline = WeightedObjective::<NoteCandidate>::new()
