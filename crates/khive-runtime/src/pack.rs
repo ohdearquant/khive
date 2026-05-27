@@ -736,7 +736,7 @@ impl VerbRegistry {
                         tracing::warn!(error = %e, "failed to serialize AuditEvent for EventStore");
                         serde_json::Value::Null
                     });
-                    let storage_event = Event::new(
+                    let mut storage_event = Event::new(
                         gate_req.namespace.as_str(),
                         verb,
                         EventKind::Audit,
@@ -745,6 +745,9 @@ impl VerbRegistry {
                     )
                     .with_outcome(outcome)
                     .with_payload(audit_data);
+                    if let Some(target_id) = target_id_from_args(&gate_req.args) {
+                        storage_event = storage_event.with_target(target_id);
+                    }
                     if let Err(store_err) = store.append_event(storage_event).await {
                         tracing::warn!(
                             verb,
@@ -1249,6 +1252,12 @@ impl PackRegistry {
 
         Ok(())
     }
+}
+
+fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
+    args.get("target_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<uuid::Uuid>().ok())
 }
 
 #[cfg(test)]
@@ -2846,6 +2855,41 @@ mod tests {
             payload_json["obligations"],
             serde_json::Value::Array(Vec::new()),
             "obligations must be [] on AllowAllGate (wire-shape rule ADR-033)"
+        );
+    }
+
+    // #282: registry audit event must carry target_id when dispatch params include it.
+    #[tokio::test]
+    async fn audit_event_threads_target_id_from_dispatch_args() {
+        let store = Arc::new(MemoryEventStore::default());
+        let target = uuid::Uuid::new_v4();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        builder.with_default_namespace("test-ns");
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch(
+            "create",
+            serde_json::json!({"namespace": "test-ns", "target_id": target}),
+        )
+        .await
+        .unwrap();
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items[0].target_id,
+            Some(target),
+            "#282: audit event must carry target_id from dispatch params"
         );
     }
 }

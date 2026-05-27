@@ -3,7 +3,7 @@ pub mod fold;
 pub mod state;
 pub mod tunable;
 
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -791,6 +791,8 @@ impl BrainPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        let feedback_start = Instant::now();
+
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct FeedbackParams {
@@ -861,6 +863,7 @@ impl BrainPack {
             data["served_by_profile_id"] = json!(profile_id);
         }
 
+        let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
         let event = Event::new(
             token.namespace().as_str().to_string(),
             "brain.feedback",
@@ -869,7 +872,8 @@ impl BrainPack {
             "brain",
         )
         .with_target(target)
-        .with_payload(data);
+        .with_payload(data)
+        .with_duration_us(duration_us);
 
         let store = self.runtime.events(token)?;
         store
@@ -2173,40 +2177,61 @@ mod tests {
     }
 
     // #357 (MAJ-004): brain.feedback must NOT double-count total_events.
-    // The dispatch hook fires for brain.feedback — it must be skipped so the
-    // fold.reduce in handle_feedback is the single source of truth.
+    //
+    // The double-count path: VerbRegistry::dispatch calls the registered pack
+    // handler (handle_feedback folds once) and then calls on_dispatch on every
+    // registered hook — including BrainPack itself.  Without the brain.* guard
+    // in on_dispatch, the hook fires a second fold.reduce, making total_events
+    // == 2.  This test replicates that exact sequence so the test FAILS if the
+    // guard is absent.
     #[tokio::test]
     async fn test_357_feedback_no_double_count() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let brain = std::sync::Arc::new(BrainPack::new(rt.clone()));
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
         let token = rt.authorize(Namespace::local());
-
-        // Create a real entity so C4 target_id validation passes.
         let target = create_test_entity(&rt, &token).await;
 
-        // Build a registry WITH the hook so we can trigger the double-count path.
-        let mut builder = VerbRegistryBuilder::new();
-        let hook: std::sync::Arc<dyn DispatchHook> = brain.clone();
-        builder.with_dispatch_hook(hook);
-        let registry = builder.build().expect("registry builds");
+        // Step 1: handle_feedback path — folds once, total_events becomes 1.
+        pack.dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": "useful"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
 
-        // Dispatch brain.feedback through the registry (hook is registered).
-        brain
-            .dispatch(
-                "brain.feedback",
-                json!({"target_id": target, "signal": "useful"}),
-                &registry,
-                &token,
-            )
-            .await
-            .unwrap();
-
-        let snap = brain.snapshot();
         assert_eq!(
-            snap.balanced_recall.total_events, 1,
-            "#357: total_events must be 1 after one brain.feedback call, got {} \
-             (double-count if 2)",
-            snap.balanced_recall.total_events
+            pack.snapshot().balanced_recall.total_events,
+            1,
+            "#357 pre-hook: handle_feedback must fold exactly once"
+        );
+
+        // Step 2: simulate the registry post-dispatch hook call with a brain.*
+        // verb.  This is exactly what VerbRegistry::dispatch does after a
+        // successful handler return.  The guard in on_dispatch must return
+        // early here — without it, fold.reduce fires again → total_events = 2.
+        let hook_event = {
+            use khive_types::{EventKind, SubstrateKind};
+            khive_storage::event::Event::new(
+                "local",
+                "brain.feedback",
+                EventKind::FeedbackExplicit,
+                SubstrateKind::Event,
+                "brain",
+            )
+        };
+        let hook_view = khive_runtime::EventView {
+            event: hook_event,
+            observations: Vec::new(),
+        };
+        pack.on_dispatch(&hook_view).await;
+
+        assert_eq!(
+            pack.snapshot().balanced_recall.total_events,
+            1,
+            "#357: total_events must remain 1 after on_dispatch(brain.feedback); \
+             guard absent if this reads 2"
         );
     }
 
@@ -3610,6 +3635,43 @@ mod tests {
         )
         .await
         .expect("r3-3: valid alphanumeric-hyphen name must succeed");
+    }
+
+    // #289: feedback event must record a non-zero duration_us.
+    #[tokio::test]
+    async fn test_289_feedback_event_records_nonzero_duration() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local());
+        let target = create_test_entity(&rt, &token).await;
+
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": "useful"}),
+                &registry,
+                &token,
+            )
+            .await
+            .unwrap();
+        let event_id = result["event_id"].as_str().unwrap().to_string();
+
+        let log = pack
+            .dispatch("brain.events", json!({"limit": 100}), &registry, &token)
+            .await
+            .unwrap();
+        let event = log["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"].as_str() == Some(event_id.as_str()))
+            .expect("#289: feedback event must appear in brain.events");
+
+        assert!(
+            event["duration_us"].as_i64().unwrap() > 0,
+            "#289: feedback event duration_us must be non-zero, got {}",
+            event["duration_us"]
+        );
     }
 }
 
