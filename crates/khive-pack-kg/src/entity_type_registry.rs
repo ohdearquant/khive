@@ -46,7 +46,7 @@ pub struct EntityTypeDef {
 ///
 /// Ordered by kind so it is easy to scan visually.
 static BUILTIN_DEFS: &[EntityTypeDef] = &[
-    // Document
+    // ── Document ────────────────────────────────────────────────────────────
     EntityTypeDef {
         kind: EntityKind::Document,
         type_name: "paper",
@@ -59,15 +59,30 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     EntityTypeDef {
         kind: EntityKind::Document,
+        type_name: "blog_post",
+        aliases: &["blog"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "book",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
         type_name: "specification",
         aliases: &["spec"],
     },
     EntityTypeDef {
         kind: EntityKind::Document,
-        type_name: "standard",
+        type_name: "documentation",
+        aliases: &["docs"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "thesis",
         aliases: &[],
     },
-    // Concept
+    // ── Concept ─────────────────────────────────────────────────────────────
     EntityTypeDef {
         kind: EntityKind::Concept,
         type_name: "algorithm",
@@ -85,17 +100,14 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     EntityTypeDef {
         kind: EntityKind::Concept,
-        type_name: "model",
-        aliases: &[],
+        // ADR-001: "model" is the alias; canonical name is "model_family"
+        // to distinguish from a Dataset or Artifact trained model instance.
+        type_name: "model_family",
+        aliases: &["model"],
     },
     EntityTypeDef {
         kind: EntityKind::Concept,
-        type_name: "benchmark",
-        aliases: &[],
-    },
-    EntityTypeDef {
-        kind: EntityKind::Concept,
-        type_name: "dataset_concept",
+        type_name: "theory",
         aliases: &[],
     },
     EntityTypeDef {
@@ -103,12 +115,62 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         type_name: "research_gap",
         aliases: &["gap"],
     },
-    // Project
     EntityTypeDef {
-        kind: EntityKind::Project,
-        type_name: "tool",
+        kind: EntityKind::Concept,
+        type_name: "design_pattern",
+        aliases: &["pattern"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "mathematical_operation",
+        aliases: &["math_op"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "metric",
         aliases: &[],
     },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "objective",
+        aliases: &["loss"],
+    },
+    // ── Dataset ──────────────────────────────────────────────────────────────
+    // ADR-001: benchmark belongs to Dataset, not Concept.
+    EntityTypeDef {
+        kind: EntityKind::Dataset,
+        type_name: "benchmark",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Dataset,
+        type_name: "corpus",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Dataset,
+        type_name: "training_set",
+        aliases: &["train_set"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Dataset,
+        type_name: "evaluation_set",
+        aliases: &["eval_set"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Dataset,
+        type_name: "test_set",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Dataset,
+        type_name: "synthetic_dataset",
+        aliases: &["synthetic"],
+    },
+    // ── Project ─────────────────────────────────────────────────────────────
+    // ADR-001 Project subtypes: library, framework, tool, application, repository.
+    // "service" and "svc" are removed — EntityKind::Service handles running
+    // instances; a service codebase repo is Project + application or tool.
     EntityTypeDef {
         kind: EntityKind::Project,
         type_name: "library",
@@ -116,15 +178,30 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     EntityTypeDef {
         kind: EntityKind::Project,
-        type_name: "crate",
+        type_name: "framework",
         aliases: &[],
     },
     EntityTypeDef {
         kind: EntityKind::Project,
-        type_name: "service",
-        aliases: &["svc"],
+        type_name: "tool",
+        aliases: &[],
     },
-    // Org
+    EntityTypeDef {
+        kind: EntityKind::Project,
+        type_name: "application",
+        aliases: &["app"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Project,
+        type_name: "repository",
+        aliases: &["repo"],
+    },
+    // ── Org ──────────────────────────────────────────────────────────────────
+    EntityTypeDef {
+        kind: EntityKind::Org,
+        type_name: "academic_institution",
+        aliases: &["university", "uni"],
+    },
     EntityTypeDef {
         kind: EntityKind::Org,
         type_name: "company",
@@ -132,15 +209,30 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     EntityTypeDef {
         kind: EntityKind::Org,
-        type_name: "university",
-        aliases: &["uni"],
+        type_name: "research_lab",
+        aliases: &["lab"],
     },
     EntityTypeDef {
         kind: EntityKind::Org,
-        type_name: "lab",
+        type_name: "nonprofit",
         aliases: &[],
     },
-    // Artifact
+    EntityTypeDef {
+        kind: EntityKind::Org,
+        type_name: "government_agency",
+        aliases: &["gov_agency"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Org,
+        type_name: "consortium",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Org,
+        type_name: "standards_body",
+        aliases: &[],
+    },
+    // ── Artifact ─────────────────────────────────────────────────────────────
     EntityTypeDef {
         kind: EntityKind::Artifact,
         type_name: "checkpoint",
@@ -148,17 +240,68 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     EntityTypeDef {
         kind: EntityKind::Artifact,
-        type_name: "config",
+        type_name: "snapshot",
         aliases: &[],
     },
     EntityTypeDef {
         kind: EntityKind::Artifact,
-        type_name: "schema",
+        type_name: "export",
         aliases: &[],
     },
-    // Service — no standard subtypes; packs may extend.
-    // Person  — no standard subtypes.
-    // Dataset — no standard subtypes.
+    EntityTypeDef {
+        kind: EntityKind::Artifact,
+        type_name: "embedding_index",
+        aliases: &["embed_index"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Artifact,
+        type_name: "state_bundle",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Artifact,
+        type_name: "profile",
+        aliases: &[],
+    },
+    // ── Service ──────────────────────────────────────────────────────────────
+    // ADR-001 Service subtypes: inference_engine, retrieval_engine,
+    // embedding_engine, api, database, search_engine, mcp_server.
+    EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "inference_engine",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "retrieval_engine",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "embedding_engine",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "api",
+        aliases: &["endpoint"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "database",
+        aliases: &["db"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "search_engine",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Service,
+        type_name: "mcp_server",
+        aliases: &["mcp"],
+    },
+    // Person  — no standard subtypes (roles are metadata, not subtypes per ADR-001).
 ];
 
 /// Resolved output of [`EntityTypeRegistry::resolve`].
@@ -458,15 +601,80 @@ mod tests {
 
     #[test]
     fn with_extra_adds_subtypes() {
+        // Use a pack-specific subtype that is NOT in BUILTIN_DEFS.
         let r = EntityTypeRegistry::with_extra([EntityTypeDef {
             kind: EntityKind::Service,
-            type_name: "api",
-            aliases: &["endpoint"],
+            type_name: "grpc_service",
+            aliases: &["grpc"],
         }]);
         let res = r
-            .resolve(EntityKind::Service, Some("endpoint"))
-            .expect("endpoint alias for api");
+            .resolve(EntityKind::Service, Some("grpc"))
+            .expect("grpc alias for grpc_service");
+        assert_eq!(res.entity_type.as_deref(), Some("grpc_service"));
+    }
+
+    #[test]
+    fn service_api_is_builtin() {
+        // F1 fix: Service subtypes are now in BUILTIN_DEFS; "api"/"endpoint" must
+        // resolve without any pack extension.
+        let r = reg();
+        let res = r
+            .resolve(EntityKind::Service, Some("api"))
+            .expect("api is a built-in Service subtype");
         assert_eq!(res.entity_type.as_deref(), Some("api"));
+        let res2 = r
+            .resolve(EntityKind::Service, Some("endpoint"))
+            .expect("endpoint is an alias for api");
+        assert_eq!(res2.entity_type.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn service_mcp_server_is_builtin() {
+        let r = reg();
+        let res = r
+            .resolve(EntityKind::Service, Some("mcp_server"))
+            .expect("mcp_server is a built-in Service subtype");
+        assert_eq!(res.entity_type.as_deref(), Some("mcp_server"));
+        let res2 = r
+            .resolve(EntityKind::Service, Some("mcp"))
+            .expect("mcp is an alias for mcp_server");
+        assert_eq!(res2.entity_type.as_deref(), Some("mcp_server"));
+    }
+
+    #[test]
+    fn project_has_no_service_subtype() {
+        // F1 fix: "service"/"svc" must no longer resolve under Project.
+        let r = reg();
+        r.resolve(EntityKind::Project, Some("service"))
+            .expect_err("service must not be a Project subtype");
+        r.resolve(EntityKind::Project, Some("svc"))
+            .expect_err("svc must not be a Project subtype");
+    }
+
+    #[test]
+    fn benchmark_is_dataset_not_concept() {
+        // F3 fix: benchmark moved from Concept to Dataset per ADR-001.
+        let r = reg();
+        let res = r
+            .resolve(EntityKind::Dataset, Some("benchmark"))
+            .expect("benchmark is a valid Dataset subtype");
+        assert_eq!(res.entity_type.as_deref(), Some("benchmark"));
+        r.resolve(EntityKind::Concept, Some("benchmark"))
+            .expect_err("benchmark must not be a Concept subtype");
+    }
+
+    #[test]
+    fn model_alias_resolves_to_model_family() {
+        // F3 fix: "model" is an alias for "model_family" per ADR-001.
+        let r = reg();
+        let res = r
+            .resolve(EntityKind::Concept, Some("model"))
+            .expect("model is an alias for model_family");
+        assert_eq!(res.entity_type.as_deref(), Some("model_family"));
+        let res2 = r
+            .resolve(EntityKind::Concept, Some("model_family"))
+            .expect("model_family is the canonical name");
+        assert_eq!(res2.entity_type.as_deref(), Some("model_family"));
     }
 
     // ── Case insensitivity ───────────────────────────────────────────────────

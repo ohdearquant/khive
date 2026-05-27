@@ -3328,23 +3328,28 @@ impl KgPack {
             param_idx += 1;
         }
 
+        // Issue #395: actor-scoped listing prevents cross-actor visibility of
+        // draft proposals.  Default to the caller's own actor when no `actor`
+        // filter is provided.  Pass `actor="*"` to see all actors (reviewers).
+        //
+        // When an explicit `proposer` param is supplied we honour that value
+        // directly and skip the actor default — applying both would produce a
+        // contradictory double-filter (`AND proposer = 'alice' AND proposer =
+        // '<caller_id>'`) that silently returns zero rows.
         if let Some(proposer) = &p.proposer {
             sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
             sql_params.push(SqlValue::Text(proposer.clone()));
             param_idx += 1;
-        }
-
-        // Issue #395: actor-scoped listing prevents cross-actor visibility of
-        // draft proposals.  Default to the caller's own actor when no `actor`
-        // filter is provided.  Pass `actor="*"` to see all actors (reviewers).
-        let actor_filter = p
-            .actor
-            .as_deref()
-            .unwrap_or_else(|| token.actor().id.as_str());
-        if actor_filter != "*" {
-            sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
-            sql_params.push(SqlValue::Text(actor_filter.to_owned()));
-            param_idx += 1;
+        } else {
+            let actor_filter = p
+                .actor
+                .as_deref()
+                .unwrap_or_else(|| token.actor().id.as_str());
+            if actor_filter != "*" {
+                sql_str.push_str(&format!(" AND proposer = ?{param_idx}"));
+                sql_params.push(SqlValue::Text(actor_filter.to_owned()));
+                param_idx += 1;
+            }
         }
 
         sql_str.push_str(&format!(

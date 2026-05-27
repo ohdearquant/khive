@@ -1111,7 +1111,9 @@ mod help_tests {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
 
         // Build a token carrying a non-local namespace (simulates `--actor lambda:foo`).
-        let lambda_token = rt.authorize(Namespace::parse("lambda:foo").expect("valid namespace"));
+        let lambda_token = rt
+            .authorize(Namespace::parse("lambda:foo").expect("valid namespace"))
+            .unwrap();
         assert_eq!(
             lambda_token.namespace().as_str(),
             "lambda:foo",
@@ -1146,7 +1148,7 @@ mod help_tests {
             .and_then(|v| v.as_str())
             .expect("result must contain id");
 
-        let local_token = rt.authorize(Namespace::local());
+        let local_token = rt.authorize(Namespace::local()).unwrap();
         let get_result = pack
             .dispatch("get", json!({ "id": entity_id }), &registry, &local_token)
             .await
@@ -1171,7 +1173,9 @@ mod help_tests {
         use khive_runtime::{KhiveRuntime, Namespace};
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let lambda_token = rt.authorize(Namespace::parse("lambda:foo").expect("valid namespace"));
+        let lambda_token = rt
+            .authorize(Namespace::parse("lambda:foo").expect("valid namespace"))
+            .unwrap();
 
         // Simulate what the KG pack dispatch does.
         let local_token = lambda_token.with_namespace(Namespace::local());
