@@ -289,25 +289,6 @@ pub(crate) struct IndexParams {
     pub insert_only: Option<bool>,
 }
 
-// ── reindex ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, Default)]
-pub(crate) struct ReindexParams {
-    /// Embedding model name. Uses the runtime default when omitted.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Vectors per embedding batch (default 100, max 500).
-    #[serde(default)]
-    pub batch_size: Option<usize>,
-    /// Drop all existing vectors before reindexing (default true).
-    #[serde(default = "default_true")]
-    pub drop_existing: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
 // ── fold ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

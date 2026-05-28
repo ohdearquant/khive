@@ -9,12 +9,14 @@
 //! - [`kg`] — KG validation, init, and hook management (ADR-034, ADR-035).
 //! - [`engine`] — embedding model lifecycle management (ADR-043).
 //! - [`vector`] — vector store introspection and orphan sweep (ADR-044).
+//! - [`reindex`] — rebuild embedding vectors for entities and notes.
 //! - [`coordinator`] — SubstrateCoordinator for cross-backend dispatch (ADR-029).
 
 pub mod coordinator;
 pub mod engine;
 pub mod kg;
 pub mod pack_introspect;
+pub mod reindex;
 pub mod sync;
 pub mod vector;
 
