@@ -34,10 +34,12 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
+use crate::knowledge::vamana;
 use crate::knowledge::KnowledgeHandlers;
 
 pub struct KnowledgePack {
     pub(crate) runtime: KhiveRuntime,
+    pub(crate) ann: vamana::SharedAnn,
 }
 
 impl Pack for KnowledgePack {
@@ -162,6 +164,12 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 14] = [
                 param_type: "boolean",
                 required: false,
                 description: "Skip delete-then-insert (faster for fresh corpus backfill)",
+            },
+            ParamDef {
+                name: "rebuild_ann",
+                param_type: "boolean",
+                required: false,
+                description: "Rebuild in-memory Vamana ANN index from embeddings (default false)",
             },
         ],
     },
@@ -413,7 +421,10 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 14] = [
 
 impl KnowledgePack {
     pub fn new(runtime: KhiveRuntime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            ann: vamana::new_shared(),
+        }
     }
 }
 
@@ -480,9 +491,13 @@ impl PackRuntime for KnowledgePack {
                 KnowledgeHandlers::delete_atoms(&self.runtime, token, params).await
             }
             "knowledge.stats" => KnowledgeHandlers::stats(&self.runtime, token, params).await,
-            "knowledge.index" => KnowledgeHandlers::index(&self.runtime, token, params).await,
+            "knowledge.index" => {
+                KnowledgeHandlers::index(&self.runtime, token, params, &self.ann).await
+            }
             "knowledge.fold" => KnowledgeHandlers::fold(&self.runtime, token, params).await,
-            "knowledge.search" => KnowledgeHandlers::search(&self.runtime, token, params).await,
+            "knowledge.search" => {
+                KnowledgeHandlers::search(&self.runtime, token, params, &self.ann).await
+            }
             // section tier
             "knowledge.edit" => KnowledgeHandlers::edit(&self.runtime, token, params).await,
             "knowledge.import" => KnowledgeHandlers::import(&self.runtime, token, params).await,

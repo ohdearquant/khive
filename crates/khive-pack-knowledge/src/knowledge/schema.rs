@@ -287,6 +287,8 @@ pub(crate) struct IndexParams {
     pub batch_size: Option<usize>,
     #[serde(default)]
     pub insert_only: Option<bool>,
+    #[serde(default)]
+    pub rebuild_ann: Option<bool>,
 }
 
 // ── fold ─────────────────────────────────────────────────────────────────────
