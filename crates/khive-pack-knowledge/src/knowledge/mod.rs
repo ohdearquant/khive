@@ -25,15 +25,16 @@ use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 use khive_fold::{GreedySelector, Selector, SelectorInput, SelectorWeights};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_score::DeterministicScore;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::SubstrateKind;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::knowledge::schema::{
-    Atom, DeleteAtomsParams, Domain, EditParams, FoldCandidate, FoldParams, GetParams,
-    ImportParams, IndexParams, ListParams, SearchParams, Section, SectionType, UpsertAtomsParams,
-    UpsertDomainsParams,
+    AdjudicateParams, Atom, ChallengeParams, DeleteAtomsParams, Domain, EditParams, FoldCandidate,
+    FoldParams, GetParams, ImportParams, IndexParams, ListParams, SearchParams, Section,
+    SectionType, UpsertAtomsParams, UpsertDomainsParams,
 };
 
 // ─── TF-IDF weight defaults ───────────────────────────────────────────────────
@@ -119,6 +120,9 @@ fn atom_from_row(row: &khive_storage::types::SqlRow) -> Option<Atom> {
         content: row_str(row, "content").unwrap_or_default(),
         tags: row_str(row, "tags").unwrap_or_else(|| "[]".into()),
         properties: row_str(row, "properties"),
+        status: row_str(row, "status"),
+        source_uri: row_str(row, "source_uri"),
+        source_type: row_str(row, "source_type"),
         finalized: row_bool(row, "finalized"),
         created_at: row_i64(row, "created_at").unwrap_or(0),
         updated_at: row_i64(row, "updated_at").unwrap_or(0),
@@ -152,6 +156,9 @@ fn atom_to_json(atom: &Atom) -> Value {
         "content": atom.content,
         "tags": serde_json::from_str::<Value>(&atom.tags).unwrap_or(Value::Array(vec![])),
         "properties": atom.properties.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "status": atom.status,
+        "source_uri": atom.source_uri,
+        "source_type": atom.source_type,
         "finalized": atom.finalized,
         "kind": "atom",
         "created_at": atom.created_at,
@@ -218,6 +225,16 @@ impl KnowledgeHandlers {
                 .properties
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_default());
+            let source_uri = atom_in
+                .source_uri
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let source_type = atom_in
+                .source_type
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
 
             // Check if slug already exists.
             let mut reader = sql
@@ -243,16 +260,23 @@ impl KnowledgeHandlers {
                 })?;
                 writer
                     .execute(SqlStatement {
-                        sql: "UPDATE knowledge_atoms SET name=?1, description=?2, content=?3, tags=?4, properties=?5, finalized=?6, updated_at=?7 WHERE id=?8".into(),
+                        // Promote draft -> reviewed when this upsert finalizes the atom, mirroring
+                        // the V22 backfill (finalized=1 => reviewed). Never demote an already
+                        // reviewed/verified row, and leave status untouched when not finalizing
+                        // (codex #527 round 2). ?8 (finalized) is reused in the CASE.
+                        sql: "UPDATE knowledge_atoms SET name=?1, description=?2, content=?3, tags=?4, properties=?5, source_uri=?6, source_type=?7, finalized=?8, status = CASE WHEN ?8 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?9 WHERE id=?10 AND namespace=?11".into(),
                         params: vec![
                             SqlValue::Text(atom_in.name.clone()),
                             atom_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
                             SqlValue::Text(content.clone()),
                             SqlValue::Text(tags_json.clone()),
                             props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
+                            source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                            source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
                             SqlValue::Integer(atom_in.finalized.unwrap_or(false) as i64),
                             SqlValue::Integer(now),
                             SqlValue::Text(id),
+                            SqlValue::Text(ns.clone()),
                         ],
                         label: None,
                     })
@@ -263,7 +287,7 @@ impl KnowledgeHandlers {
                 let id = new_id();
                 writer
                     .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, content, tags, properties, finalized, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)".into(),
+                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, content, tags, properties, source_uri, source_type, status, finalized, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)".into(),
                         params: vec![
                             SqlValue::Text(id),
                             SqlValue::Text(ns.clone()),
@@ -273,6 +297,11 @@ impl KnowledgeHandlers {
                             SqlValue::Text(content.clone()),
                             SqlValue::Text(tags_json.clone()),
                             props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
+                            source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                            source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                            // status mirrors the lifecycle backfill (finalized => reviewed) so a
+                            // freshly-finalized atom is never left at the 'draft' default (codex #527).
+                            SqlValue::Text(if atom_in.finalized.unwrap_or(false) { "reviewed" } else { "draft" }.to_string()),
                             SqlValue::Integer(atom_in.finalized.unwrap_or(false) as i64),
                             SqlValue::Integer(now),
                             SqlValue::Integer(now),
@@ -363,7 +392,7 @@ impl KnowledgeHandlers {
                 })?;
                 writer
                     .execute(SqlStatement {
-                        sql: "UPDATE knowledge_domains SET name=?1, description=?2, tags=?3, members=?4, updated_at=?5 WHERE id=?6".into(),
+                        sql: "UPDATE knowledge_domains SET name=?1, description=?2, tags=?3, members=?4, updated_at=?5 WHERE id=?6 AND namespace=?7".into(),
                         params: vec![
                             SqlValue::Text(name.clone()),
                             domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
@@ -371,6 +400,7 @@ impl KnowledgeHandlers {
                             SqlValue::Text(members_json.clone()),
                             SqlValue::Integer(now),
                             SqlValue::Text(id.clone()),
+                            SqlValue::Text(ns.clone()),
                         ],
                         label: None,
                     })
@@ -379,9 +409,9 @@ impl KnowledgeHandlers {
                 // Dual-write: sync the mirror atom in knowledge_atoms for FTS.
                 writer
                     .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, content, tags, properties, finalized, created_at, updated_at) \
-                              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10) \
-                              ON CONFLICT(namespace, slug) DO UPDATE SET name=?4, description=?5, content=?6, tags=?7, properties=?8, updated_at=?10".into(),
+                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, content, tags, properties, status, finalized, created_at, updated_at) \
+                              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'reviewed',1,?9,?10) \
+                              ON CONFLICT(namespace, slug) DO UPDATE SET name=?4, description=?5, content=?6, tags=?7, properties=?8, status='reviewed', updated_at=?10".into(),
                         params: vec![
                             SqlValue::Text(id),
                             SqlValue::Text(ns.clone()),
@@ -422,8 +452,8 @@ impl KnowledgeHandlers {
                 // Dual-write: mirror atom in knowledge_atoms for FTS indexing.
                 writer
                     .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, content, tags, properties, finalized, created_at, updated_at) \
-                              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10)".into(),
+                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, description, content, tags, properties, status, finalized, created_at, updated_at) \
+                              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'reviewed',1,?9,?10)".into(),
                         params: vec![
                             SqlValue::Text(id),
                             SqlValue::Text(ns.clone()),
@@ -585,26 +615,43 @@ impl KnowledgeHandlers {
                 Ok(json!({ "results": items, "total": total, "limit": limit, "offset": offset }))
             }
             Some("atom") | None => {
-                let sql_str = "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%' ORDER BY created_at DESC LIMIT ?2 OFFSET ?3";
-                let count_sql = "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'";
+                let requested_statuses = status_values(p.status.as_ref());
+                let (data_status_clause, data_status_params) =
+                    status_sql_clause(&requested_statuses, p.exclude_status.as_deref(), 4);
+                let (count_status_clause, count_status_params) =
+                    status_sql_clause(&requested_statuses, p.exclude_status.as_deref(), 2);
+
+                let sql_str = format!(
+                    "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{} ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                    data_status_clause
+                );
+                let count_sql = format!(
+                    "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{}",
+                    count_status_clause
+                );
+
+                let mut row_params = vec![
+                    SqlValue::Text(ns.clone()),
+                    SqlValue::Integer(limit),
+                    SqlValue::Integer(offset),
+                ];
+                row_params.extend(data_status_params);
 
                 let rows = reader
                     .query_all(SqlStatement {
-                        sql: sql_str.into(),
-                        params: vec![
-                            SqlValue::Text(ns.clone()),
-                            SqlValue::Integer(limit),
-                            SqlValue::Integer(offset),
-                        ],
+                        sql: sql_str,
+                        params: row_params,
                         label: None,
                     })
                     .await
                     .map_err(|e| sql_err("list atoms", e))?;
 
+                let mut count_params = vec![SqlValue::Text(ns)];
+                count_params.extend(count_status_params);
                 let total_row = reader
                     .query_scalar(SqlStatement {
-                        sql: count_sql.into(),
-                        params: vec![SqlValue::Text(ns)],
+                        sql: count_sql,
+                        params: count_params,
                         label: None,
                     })
                     .await
@@ -945,15 +992,16 @@ impl KnowledgeHandlers {
                 score: c.score,
                 size: c.size,
                 category: c.category.clone(),
+                information_gain: c.information_gain,
                 content: c,
-                information_gain: None,
             })
             .collect();
 
         let weights = SelectorWeights {
             min_score: p.min_score.unwrap_or(0.0),
             category_weights: p.category_weights.unwrap_or_default().into_iter().collect(),
-            ..Default::default()
+            diversity_bias: p.diversity_bias.unwrap_or(0.0),
+            epistemic_weight: p.epistemic_weight.unwrap_or(0.0),
         };
 
         let output = GreedySelector
@@ -1013,6 +1061,8 @@ impl KnowledgeHandlers {
             .count();
 
         let ns = token.namespace().as_str().to_owned();
+        let requested_statuses = status_values(p.status.as_ref());
+        let include_deprecated = explicitly_requested_status(&requested_statuses, "deprecated");
 
         let ctx = SearchCtx {
             runtime,
@@ -1022,6 +1072,8 @@ impl KnowledgeHandlers {
             min_score,
             w: &w,
             fetch_limit,
+            statuses: &requested_statuses,
+            exclude_status: p.exclude_status.as_deref(),
         };
 
         let mut hits = if do_decompose && non_stop_count >= decompose_threshold {
@@ -1046,10 +1098,10 @@ impl KnowledgeHandlers {
 
         if do_rerank && !hits.is_empty() {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
-            hits.truncate(limit);
-        } else {
-            hits.truncate(limit);
         }
+
+        apply_status_multipliers(&mut hits, include_deprecated);
+        hits.truncate(limit);
 
         let results: Vec<Value> = hits
             .iter()
@@ -1060,6 +1112,7 @@ impl KnowledgeHandlers {
                     "name": h.name,
                     "description": h.description,
                     "tags": h.tags,
+                    "status": h.status,
                     "finalized": h.finalized,
                     "kind": if h.is_domain { "domain" } else { "atom" },
                     "score": h.score,
@@ -1124,6 +1177,7 @@ struct ScoredHit {
     tags: Option<String>,
     finalized: bool,
     is_domain: bool,
+    status: Option<String>,
     score: f32,
 }
 
@@ -1131,93 +1185,242 @@ struct ScoredHit {
 
 const RRF_K: usize = 60;
 
-/// Fuse FTS and ANN results using symmetric Reciprocal Rank Fusion.
-///
-/// Both sources are converted to rank-based scores: `1/(k + rank)`.
-/// Documents appearing in both get the sum of their RRF contributions.
 fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_score: f32) {
-    // Build FTS rank map (1-indexed by current score order, which is pre-sorted)
-    let mut fts_ranks: HashMap<String, usize> = HashMap::new();
-    for (rank, hit) in fts_hits.iter().enumerate() {
-        fts_ranks.insert(hit.id.clone(), rank + 1);
-    }
+    let drained: Vec<ScoredHit> = std::mem::take(fts_hits);
 
-    // Build ANN rank map
-    let ann_ranks: HashMap<String, usize> = ann_hits
+    let fts_source: Vec<(String, DeterministicScore)> = drained
         .iter()
-        .enumerate()
-        .map(|(rank, (uuid, _))| (uuid.to_string(), rank + 1))
+        .map(|hit| (hit.id.clone(), DeterministicScore::from_f32(hit.score)))
+        .collect();
+    let mut by_id: HashMap<String, ScoredHit> = drained
+        .into_iter()
+        .map(|hit| (hit.id.clone(), hit))
+        .collect();
+    let ann_source: Vec<(String, DeterministicScore)> = ann_hits
+        .iter()
+        .map(|(uuid, score)| (uuid.to_string(), DeterministicScore::from_f32(*score)))
         .collect();
 
-    // Rescore FTS hits with symmetric RRF
-    for hit in fts_hits.iter_mut() {
-        let fts_rrf = fts_ranks
-            .get(&hit.id)
-            .map(|&r| 1.0 / (RRF_K + r) as f32)
-            .unwrap_or(0.0);
-        let ann_rrf = ann_ranks
-            .get(&hit.id)
-            .map(|&r| 1.0 / (RRF_K + r) as f32)
-            .unwrap_or(0.0);
-        hit.score = fts_rrf + ann_rrf;
-    }
+    let fused = khive_fusion::reciprocal_rank_fusion(vec![fts_source, ann_source], RRF_K);
 
-    // Inject ANN-only hits
-    let existing: HashSet<String> = fts_ranks.keys().cloned().collect();
-    for (rank, (uuid, _cosine)) in ann_hits.iter().enumerate() {
-        let id_str = uuid.to_string();
-        if existing.contains(&id_str) {
+    for (id, fused_score) in fused {
+        let score = fused_score.to_f64() as f32;
+        if score < min_score {
             continue;
         }
-        let rrf_score = 1.0 / (RRF_K + rank + 1) as f32;
-        if rrf_score < min_score {
-            continue;
+
+        if let Some(mut hit) = by_id.remove(&id) {
+            hit.score = score;
+            fts_hits.push(hit);
+        } else {
+            fts_hits.push(ScoredHit {
+                id,
+                slug: String::new(),
+                name: String::new(),
+                description: None,
+                tags: None,
+                finalized: false,
+                is_domain: false,
+                status: None,
+                score,
+            });
         }
-        fts_hits.push(ScoredHit {
-            id: id_str,
-            slug: String::new(),
-            name: String::new(),
-            description: None,
-            tags: None,
-            finalized: false,
-            is_domain: false,
-            score: rrf_score,
-        });
+    }
+}
+
+async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<ScoredHit>) {
+    let ids: Vec<String> = hits
+        .iter()
+        .filter(|hit| hit.slug.is_empty())
+        .map(|hit| hit.id.clone())
+        .collect();
+    if ids.is_empty() {
+        return;
     }
 
-    fts_hits.sort_by(|a, b| {
+    let sql = runtime.sql();
+    let mut reader = match sql.reader().await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let placeholders = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(ids.iter().cloned().map(SqlValue::Text));
+
+    let atom_rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT id, slug, name, description, tags, finalized, status FROM knowledge_atoms WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
+            ),
+            params,
+            label: None,
+        })
+        .await
+        .unwrap_or_default();
+
+    let mut atom_rows_by_id: HashMap<String, khive_storage::types::SqlRow> = HashMap::new();
+    for row in atom_rows {
+        if let Some(id) = row_str(&row, "id") {
+            atom_rows_by_id.insert(id, row);
+        }
+    }
+
+    for hit in hits.iter_mut().filter(|hit| hit.slug.is_empty()) {
+        if let Some(row) = atom_rows_by_id.get(&hit.id) {
+            hit.slug = row_str(row, "slug").unwrap_or_default();
+            hit.name = row_str(row, "name").unwrap_or_default();
+            hit.description = row_str(row, "description");
+            hit.tags = row_str(row, "tags");
+            hit.finalized = row_bool(row, "finalized");
+            hit.status = row_str(row, "status");
+            let tags_arr: Vec<String> = hit
+                .tags
+                .as_deref()
+                .and_then(|tags| serde_json::from_str(tags).ok())
+                .unwrap_or_default();
+            hit.is_domain = tags_arr.iter().any(|t| t == "type:domain");
+        }
+    }
+
+    let missing_ids: Vec<String> = hits
+        .iter()
+        .filter(|hit| hit.slug.is_empty())
+        .map(|hit| hit.id.clone())
+        .collect();
+    if missing_ids.is_empty() {
+        return;
+    }
+
+    let placeholders = missing_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = vec![SqlValue::Text(ns.to_owned())];
+    params.extend(missing_ids.iter().cloned().map(SqlValue::Text));
+
+    let domain_rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT id, slug, name, description, tags FROM knowledge_domains WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
+            ),
+            params,
+            label: None,
+        })
+        .await
+        .unwrap_or_default();
+
+    let mut domain_rows_by_id: HashMap<String, khive_storage::types::SqlRow> = HashMap::new();
+    for row in domain_rows {
+        if let Some(id) = row_str(&row, "id") {
+            domain_rows_by_id.insert(id, row);
+        }
+    }
+
+    for hit in hits.iter_mut().filter(|hit| hit.slug.is_empty()) {
+        if let Some(row) = domain_rows_by_id.get(&hit.id) {
+            hit.slug = row_str(row, "slug").unwrap_or_default();
+            hit.name = row_str(row, "name").unwrap_or_default();
+            hit.description = row_str(row, "description");
+            hit.tags = row_str(row, "tags");
+            hit.finalized = false;
+            hit.is_domain = true;
+        }
+    }
+
+    hits.retain(|hit| !hit.slug.is_empty());
+}
+
+// ─── status helpers (W5) ─────────────────────────────────────────────────────
+
+fn status_values(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(s)) => {
+            let s = s.trim();
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.to_string()]
+            }
+        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn status_sql_clause(
+    statuses: &[String],
+    exclude_status: Option<&str>,
+    first_param: usize,
+) -> (String, Vec<SqlValue>) {
+    if !statuses.is_empty() {
+        let placeholders = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", first_param + i))
+            .collect::<Vec<_>>()
+            .join(",");
+        let clause = if statuses.len() == 1 {
+            format!(" AND status = ?{first_param}")
+        } else {
+            format!(" AND status IN ({placeholders})")
+        };
+        let params = statuses.iter().cloned().map(SqlValue::Text).collect();
+        return (clause, params);
+    }
+
+    if let Some(status) = exclude_status.map(str::trim).filter(|s| !s.is_empty()) {
+        return (
+            format!(" AND (status IS NULL OR status != ?{first_param})"),
+            vec![SqlValue::Text(status.to_string())],
+        );
+    }
+
+    (
+        " AND (status IS NULL OR status != 'deprecated')".to_string(),
+        Vec::new(),
+    )
+}
+
+fn explicitly_requested_status(statuses: &[String], status: &str) -> bool {
+    statuses.iter().any(|s| s == status)
+}
+
+fn status_multiplier(status: Option<&str>) -> f32 {
+    match status.unwrap_or("reviewed") {
+        "verified" => 1.2,
+        "reviewed" => 1.0,
+        "draft" => 0.8,
+        "deprecated" => 0.0,
+        _ => 1.0,
+    }
+}
+
+fn apply_status_multipliers(hits: &mut Vec<ScoredHit>, include_deprecated: bool) {
+    hits.retain_mut(|hit| {
+        let multiplier = status_multiplier(hit.status.as_deref());
+        hit.score *= multiplier;
+        include_deprecated || multiplier > 0.0
+    });
+    hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.slug.cmp(&b.slug))
     });
-}
-
-/// Hydrate ANN-only hits (empty slug/name) from the database.
-async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut [ScoredHit]) {
-    let sql = runtime.sql();
-    for hit in hits.iter_mut() {
-        if !hit.slug.is_empty() {
-            continue;
-        }
-        let mut reader = match sql.reader().await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let row = reader
-            .query_row(SqlStatement {
-                sql: "SELECT slug, name, description, tags, finalized FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
-                params: vec![SqlValue::Text(hit.id.clone()), SqlValue::Text(ns.to_owned())],
-                label: None,
-            })
-            .await;
-        if let Ok(Some(r)) = row {
-            hit.slug = row_str(&r, "slug").unwrap_or_default();
-            hit.name = row_str(&r, "name").unwrap_or_default();
-            hit.description = row_str(&r, "description");
-            hit.tags = row_str(&r, "tags");
-            hit.finalized = row_bool(&r, "finalized");
-        }
-    }
 }
 
 // ─── candidate (tokenized) ───────────────────────────────────────────────────
@@ -1228,6 +1431,7 @@ struct Candidate {
     name_raw: String,
     description_raw: Option<String>,
     tags_raw: Option<String>,
+    status_raw: Option<String>,
     finalized: bool,
     is_domain: bool,
     name: Vec<String>,
@@ -1257,6 +1461,7 @@ fn load_candidates_from_atoms(atoms: &[Atom], type_filter: Option<&str>) -> Vec<
                 name_raw: atom.name.clone(),
                 description_raw: atom.description.clone(),
                 tags_raw: Some(tags_str.clone()),
+                status_raw: atom.status.clone(),
                 finalized: atom.finalized,
                 is_domain,
                 name: matching::tokenize_field(&atom.name),
@@ -1439,6 +1644,8 @@ async fn fetch_fts_candidates(
     ns: &str,
     raw_query: &str,
     type_filter: Option<&str>,
+    statuses: &[String],
+    exclude_status: Option<&str>,
     fetch_limit: usize,
 ) -> Result<Vec<Atom>, RuntimeError> {
     let sql = runtime.sql();
@@ -1463,13 +1670,21 @@ async fn fetch_fts_candidates(
 
     if fts_rows.is_empty() {
         // FTS returned nothing — fall back to full scan (small corpora) capped at CANDIDATE_POOL.
+        let (status_clause, status_params) = status_sql_clause(statuses, exclude_status, 3);
+        let sql_str = format!(
+            "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL{} ORDER BY created_at DESC LIMIT ?2",
+            status_clause
+        );
+        let mut params = vec![
+            SqlValue::Text(ns.to_owned()),
+            SqlValue::Integer(CANDIDATE_POOL as i64),
+        ];
+        params.extend(status_params);
+
         let rows = reader
             .query_all(SqlStatement {
-                sql: "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?2".into(),
-                params: vec![
-                    SqlValue::Text(ns.to_owned()),
-                    SqlValue::Integer(CANDIDATE_POOL as i64),
-                ],
+                sql: sql_str,
+                params,
                 label: None,
             })
             .await
@@ -1499,13 +1714,15 @@ async fn fetch_fts_candidates(
         .collect::<Vec<_>>()
         .join(",");
 
+    let (status_clause, status_params) = status_sql_clause(statuses, exclude_status, ids.len() + 2);
     let mut params: Vec<SqlValue> = vec![SqlValue::Text(ns.to_owned())];
     params.extend(ids.iter().map(|id| SqlValue::Text(id.clone())));
+    params.extend(status_params);
 
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
+                "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL{status_clause}"
             ),
             params,
             label: None,
@@ -1526,6 +1743,8 @@ struct SearchCtx<'a> {
     min_score: f32,
     w: &'a Weights,
     fetch_limit: usize,
+    statuses: &'a [String],
+    exclude_status: Option<&'a str>,
 }
 
 // ─── core single-pass search ──────────────────────────────────────────────────
@@ -1570,7 +1789,16 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>,
     // fall through to exact-name-bonus-only scoring rather than returning early.
     let terms_only_exact = terms.is_empty();
 
-    let atoms = fetch_fts_candidates(runtime, ns, &raw_query, type_filter, CANDIDATE_POOL).await?;
+    let atoms = fetch_fts_candidates(
+        runtime,
+        ns,
+        &raw_query,
+        type_filter,
+        ctx.statuses,
+        ctx.exclude_status,
+        CANDIDATE_POOL,
+    )
+    .await?;
     if atoms.is_empty() {
         return Ok(Vec::new());
     }
@@ -1617,6 +1845,7 @@ async fn search_core(ctx: &SearchCtx<'_>, query: &str) -> Result<Vec<ScoredHit>,
             name: cand.name_raw.clone(),
             description: cand.description_raw.clone(),
             tags: cand.tags_raw.clone(),
+            status: cand.status_raw.clone(),
             finalized: cand.finalized,
             is_domain: cand.is_domain,
             score,
@@ -1650,6 +1879,8 @@ async fn search_decomposed(
         min_score: 0.0,
         w: ctx.w,
         fetch_limit: sub_limit,
+        statuses: ctx.statuses,
+        exclude_status: ctx.exclude_status,
     };
     let s1 = search_core(&sub_ctx1, &sub_q1).await?;
     let s2 = search_core(&sub_ctx1, &sub_q2).await?;
@@ -1844,6 +2075,40 @@ fn parse_section_type(s: &str) -> Result<SectionType, RuntimeError> {
     })
 }
 
+async fn resolve_atom_id(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    id_or_slug: &str,
+) -> Result<String, RuntimeError> {
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("resolve_atom_id reader", e))?;
+    let id = id_or_slug.trim().to_string();
+    let row = if id.parse::<Uuid>().is_ok() {
+        reader
+            .query_row(SqlStatement {
+                sql: "SELECT id FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("resolve_atom_id by id", e))?
+    } else {
+        reader
+            .query_row(SqlStatement {
+                sql: "SELECT id FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("resolve_atom_id by slug", e))?
+    };
+    row.and_then(|r| row_str(&r, "id"))
+        .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {id:?}")))
+}
+
 impl KnowledgeHandlers {
     // ── edit ─────────────────────────────────────────────────────────────────
 
@@ -1912,14 +2177,14 @@ impl KnowledgeHandlers {
                     .unwrap_or(9) as i64
             });
 
-            // Fetch the existing section id if it exists (for stable IDs on re-edit).
+            // Fetch the existing section id (and status) if it exists (for stable IDs on re-edit).
             let mut reader = sql
                 .reader()
                 .await
                 .map_err(|e| sql_err("edit section reader", e))?;
-            let existing_id = reader
+            let existing_section = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id FROM knowledge_sections WHERE atom_id = ?1 AND section_type = ?2 LIMIT 1".into(),
+                    sql: "SELECT id, status FROM knowledge_sections WHERE atom_id = ?1 AND section_type = ?2 LIMIT 1".into(),
                     params: vec![
                         SqlValue::Text(atom_id.clone()),
                         SqlValue::Text(stype.as_str().to_string()),
@@ -1927,10 +2192,17 @@ impl KnowledgeHandlers {
                     label: None,
                 })
                 .await
-                .map_err(|e| sql_err("edit section lookup", e))?
-                .and_then(|r| row_str(&r, "id"));
+                .map_err(|e| sql_err("edit section lookup", e))?;
 
-            let section_id = existing_id.unwrap_or_else(new_id);
+            let was_verified = existing_section
+                .as_ref()
+                .and_then(|r| row_str(r, "status"))
+                .as_deref()
+                == Some("verified");
+            let section_id = existing_section
+                .as_ref()
+                .and_then(|r| row_str(r, "id"))
+                .unwrap_or_else(new_id);
 
             let mut writer = sql
                 .writer()
@@ -1965,6 +2237,20 @@ impl KnowledgeHandlers {
                 })
                 .await
                 .map_err(|e| sql_err("edit section upsert", e))?;
+
+            if was_verified {
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE knowledge_sections SET status='reviewed' WHERE atom_id=?1 AND section_type=?2 AND status='verified'".into(),
+                        params: vec![
+                            SqlValue::Text(atom_id.clone()),
+                            SqlValue::Text(stype.as_str().to_string()),
+                        ],
+                        label: None,
+                    })
+                    .await
+                    .map_err(|e| sql_err("edit section status transition", e))?;
+            }
 
             upserted += 1;
             section_results.push(json!({
@@ -2073,11 +2359,31 @@ impl KnowledgeHandlers {
             };
 
             // Upsert the atom.
+            let atlas_id = extract_atlas_id(&content);
+            let citation_count = sections
+                .iter()
+                .filter(|(stype, _, _)| *stype == SectionType::References)
+                .map(|(_, _, body)| body.lines().filter(|line| !line.trim().is_empty()).count())
+                .sum::<usize>();
+            let source_uri = atlas_id.as_ref().map(|id| format!("atlas:{id}"));
+            let source_type = if citation_count > 0 {
+                "paper"
+            } else {
+                "imported"
+            };
+            let mut properties = serde_json::Map::new();
+            if let Some(ref id) = atlas_id {
+                properties.insert("atlas_id".to_string(), Value::String(id.clone()));
+            }
+
             let upsert_params = serde_json::json!({
                 "atoms": [{
                     "slug": slug,
                     "name": name,
                     "content": atom_body,
+                    "properties": Value::Object(properties),
+                    "source_uri": source_uri,
+                    "source_type": source_type,
                 }]
             });
             KnowledgeHandlers::upsert_atoms(runtime, token, upsert_params).await?;
@@ -2110,6 +2416,134 @@ impl KnowledgeHandlers {
             "imported_atoms": imported_atoms,
             "imported_sections": imported_sections,
             "files_processed": files.len(),
+        }))
+    }
+
+    // ── challenge ─────────────────────────────────────────────────────────────
+
+    pub(crate) async fn challenge(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: ChallengeParams = deser(params)?;
+        let ns = token.namespace().as_str().to_owned();
+        let sql = runtime.sql();
+
+        let atom_id = resolve_atom_id(runtime, &ns, &p.atom_id).await?;
+        let stype = parse_section_type(&p.section_type)?;
+
+        let mut writer = sql
+            .writer()
+            .await
+            .map_err(|e| sql_err("challenge writer", e))?;
+
+        let affected = writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_sections SET status='disputed' WHERE atom_id=?1 AND section_type=?2 AND status NOT IN ('disputed','deprecated')".into(),
+                params: vec![
+                    SqlValue::Text(atom_id.clone()),
+                    SqlValue::Text(stype.as_str().to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("challenge section status", e))?;
+
+        if affected == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "section not found, already disputed, or deprecated".into(),
+            ));
+        }
+
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{}'),'$.dispute_count',coalesce(json_extract(properties,'$.dispute_count'),0)+1) WHERE id=?1 AND namespace=?2".into(),
+                params: vec![
+                    SqlValue::Text(atom_id.clone()),
+                    SqlValue::Text(ns.clone()),
+                ],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("challenge dispute_count increment", e))?;
+
+        Ok(json!({
+            "atom_id": atom_id,
+            "section_type": stype.as_str(),
+            "reason": p.reason,
+        }))
+    }
+
+    // ── adjudicate ────────────────────────────────────────────────────────────
+
+    pub(crate) async fn adjudicate(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: AdjudicateParams = deser(params)?;
+        let ns = token.namespace().as_str().to_owned();
+        let sql = runtime.sql();
+
+        let resolution = p.resolution.trim().to_ascii_lowercase();
+        if resolution != "accept" && resolution != "reject" {
+            return Err(RuntimeError::InvalidInput(
+                "resolution must be \"accept\" or \"reject\"".into(),
+            ));
+        }
+
+        let atom_id = resolve_atom_id(runtime, &ns, &p.atom_id).await?;
+        let stype = parse_section_type(&p.section_type)?;
+
+        let new_status = if resolution == "accept" {
+            "verified"
+        } else {
+            "reviewed"
+        };
+
+        let mut writer = sql
+            .writer()
+            .await
+            .map_err(|e| sql_err("adjudicate writer", e))?;
+
+        let affected = writer
+            .execute(SqlStatement {
+                sql: format!(
+                    "UPDATE knowledge_sections SET status='{new_status}' WHERE atom_id=?1 AND section_type=?2 AND status='disputed'"
+                ),
+                params: vec![
+                    SqlValue::Text(atom_id.clone()),
+                    SqlValue::Text(stype.as_str().to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("adjudicate section status", e))?;
+
+        if affected == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "section not found or not in disputed state".into(),
+            ));
+        }
+
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{}'),'$.dispute_count',CASE WHEN coalesce(json_extract(properties,'$.dispute_count'),0) > 0 THEN coalesce(json_extract(properties,'$.dispute_count'),0)-1 ELSE 0 END) WHERE id=?1 AND namespace=?2".into(),
+                params: vec![
+                    SqlValue::Text(atom_id.clone()),
+                    SqlValue::Text(ns.clone()),
+                ],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("adjudicate dispute_count decrement", e))?;
+
+        Ok(json!({
+            "atom_id": atom_id,
+            "section_type": stype.as_str(),
+            "resolution": resolution,
+            "new_status": new_status,
         }))
     }
 }
@@ -2173,6 +2607,18 @@ fn to_slug(stem: &str) -> String {
 /// `atom_body` is text before the first `##` heading.
 /// Each tuple in the vec is `(SectionType, heading_text, body_text)`.
 /// Headings that don't map to a `SectionType` are classified as `Other`.
+fn extract_atlas_id(content: &str) -> Option<String> {
+    content.lines().take(32).find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("atlas_id:")
+            .or_else(|| trimmed.strip_prefix("atlas-id:"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
 fn parse_atlas_md(content: &str) -> (String, String, Vec<(SectionType, String, String)>) {
     let mut name = String::new();
     let mut pre_body = String::new();

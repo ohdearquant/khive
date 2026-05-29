@@ -50,7 +50,7 @@ impl Pack for KnowledgePack {
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
-static KNOWLEDGE_HANDLERS: [HandlerDef; 14] = [
+static KNOWLEDGE_HANDLERS: [HandlerDef; 16] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
@@ -332,6 +332,59 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 14] = [
             },
         ],
     },
+    // ── section review tier (ADR-049) ────────────────────────────────────────
+    HandlerDef {
+        name: "knowledge.challenge",
+        description: "Mark a section as disputed and increment atom dispute_count",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "atom_id",
+                param_type: "string",
+                required: true,
+                description: "Atom UUID or slug",
+            },
+            ParamDef {
+                name: "section_type",
+                param_type: "string",
+                required: true,
+                description: "Section type to challenge",
+            },
+            ParamDef {
+                name: "reason",
+                param_type: "string",
+                required: false,
+                description: "Optional challenge reason",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "knowledge.adjudicate",
+        description: "Resolve a disputed section and decrement atom dispute_count",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "atom_id",
+                param_type: "string",
+                required: true,
+                description: "Atom UUID or slug",
+            },
+            ParamDef {
+                name: "section_type",
+                param_type: "string",
+                required: true,
+                description: "Section type to adjudicate",
+            },
+            ParamDef {
+                name: "resolution",
+                param_type: "string",
+                required: true,
+                description: "\"accept\" (mark verified) or \"reject\" (mark reviewed)",
+            },
+        ],
+    },
     // ── concept tier (KG sugar) ───────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.learn",
@@ -501,6 +554,12 @@ impl PackRuntime for KnowledgePack {
             // section tier
             "knowledge.edit" => KnowledgeHandlers::edit(&self.runtime, token, params).await,
             "knowledge.import" => KnowledgeHandlers::import(&self.runtime, token, params).await,
+            "knowledge.challenge" => {
+                KnowledgeHandlers::challenge(&self.runtime, token, params).await
+            }
+            "knowledge.adjudicate" => {
+                KnowledgeHandlers::adjudicate(&self.runtime, token, params).await
+            }
             // concept tier
             "knowledge.learn" => self.handle_learn(token, params).await,
             "knowledge.cite" => self.handle_cite(token, params).await,

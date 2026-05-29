@@ -170,6 +170,9 @@ pub(crate) struct Atom {
     pub tags: String,
     /// JSON object string
     pub properties: Option<String>,
+    pub status: Option<String>,
+    pub source_uri: Option<String>,
+    pub source_type: Option<String>,
     pub finalized: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -219,6 +222,10 @@ pub(crate) struct AtomInput {
     pub properties: Option<Value>,
     #[serde(default)]
     pub finalized: Option<bool>,
+    #[serde(default)]
+    pub source_uri: Option<String>,
+    #[serde(default)]
+    pub source_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +272,10 @@ pub(crate) struct ListParams {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: Option<usize>,
+    #[serde(default)]
+    pub status: Option<Value>,
+    #[serde(default)]
+    pub exclude_status: Option<String>,
 }
 
 // ── delete_atoms ──────────────────────────────────────────────────────────────
@@ -301,6 +312,10 @@ pub(crate) struct FoldParams {
     pub min_score: Option<f32>,
     #[serde(default)]
     pub category_weights: Option<std::collections::BTreeMap<String, f32>>,
+    #[serde(default)]
+    pub diversity_bias: Option<f32>,
+    #[serde(default)]
+    pub epistemic_weight: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -312,6 +327,8 @@ pub(crate) struct FoldCandidate {
     pub content: Option<Value>,
     #[serde(default)]
     pub category: Option<String>,
+    #[serde(default)]
+    pub information_gain: Option<f32>,
 }
 
 // ── search ────────────────────────────────────────────────────────────────────
@@ -321,6 +338,10 @@ pub(crate) struct SearchParams {
     pub query: String,
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
+    #[serde(default)]
+    pub status: Option<Value>,
+    #[serde(default)]
+    pub exclude_status: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
@@ -377,6 +398,29 @@ pub(crate) struct EditParams {
     pub id: String,
     /// Sections to upsert.  Must not be empty.
     pub sections: Vec<SectionUpdate>,
+}
+
+// ── challenge / adjudicate ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ChallengeParams {
+    /// Atom UUID or slug.
+    pub atom_id: String,
+    /// Section type to challenge.
+    pub section_type: String,
+    /// Optional challenge reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AdjudicateParams {
+    /// Atom UUID or slug.
+    pub atom_id: String,
+    /// Section type to adjudicate.
+    pub section_type: String,
+    /// Resolution: "accept" (keep disputed, mark reviewed) or "reject" (revert to reviewed).
+    pub resolution: String,
 }
 
 // ── import ────────────────────────────────────────────────────────────────────
