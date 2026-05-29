@@ -300,10 +300,12 @@ impl VerbRegistryBuilder {
         self
     }
 
-    /// Set the authorization gate consulted on every dispatch (ADR-029).
+    /// Set the authorization gate consulted on every dispatch (ADR-018).
     ///
-    /// Defaults to `AllowAllGate` if not set. In v0.2 the gate is **advisory** —
-    /// deny decisions are logged via `tracing::warn!` but do not block dispatch.
+    /// Defaults to `AllowAllGate` if not set. `Deny` is authoritative — a deny
+    /// decision aborts dispatch with `RuntimeError::PermissionDenied`. Gate
+    /// infrastructure errors fail open (logged via `tracing::warn!`, dispatch
+    /// proceeds).
     pub fn with_gate(&mut self, gate: GateRef) -> &mut Self {
         self.gate = gate;
         self

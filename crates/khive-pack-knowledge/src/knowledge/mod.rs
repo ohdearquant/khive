@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use crate::knowledge::schema::{
     Atom, DeleteAtomsParams, Domain, EditParams, FoldCandidate, FoldParams, GetParams,
-    ImportParams, IndexParams, ListParams, SearchParams, Section, SectionType,
-    UpsertAtomsParams, UpsertDomainsParams,
+    ImportParams, IndexParams, ListParams, SearchParams, Section, SectionType, UpsertAtomsParams,
+    UpsertDomainsParams,
 };
 
 // ─── TF-IDF weight defaults ───────────────────────────────────────────────────
@@ -1073,7 +1073,6 @@ impl KnowledgeHandlers {
             "data": { "results": results, "count": count },
         }))
     }
-
 }
 
 // ─── TF-IDF weight container ─────────────────────────────────────────────────

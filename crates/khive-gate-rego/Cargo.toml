@@ -9,6 +9,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Rego (Open Policy Agent) backend for khive-gate, powered by regorus."
+readme = "README.md"
 
 [dependencies]
 khive-gate = { version = "0.2.2", path = "../khive-gate" }

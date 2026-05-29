@@ -112,9 +112,10 @@ impl GateRequest {
 
 /// Side-effects a policy may attach to an `Allow` decision.
 ///
-/// v0 obligations are **advisory** — the dispatcher SHOULD log them but is
-/// not required to enforce. Enforcement (real rate limiting, hard audit
-/// writes) is a follow-up.
+/// v0 obligation handling is intentionally narrow:
+/// - `Audit` obligations are persisted inside the dispatch `AuditEvent` when an
+///   `EventStore` is wired; otherwise they are emitted through tracing only.
+/// - `RateLimit` and `Custom` obligations are NOT enforced in v0.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Obligation {
@@ -211,9 +212,9 @@ pub trait Gate: Send + Sync + std::fmt::Debug {
 /// are stable. Adding fields is non-breaking; removing or renaming requires a
 /// new ADR.
 ///
-/// In v0.2 events are emitted via `tracing::info!` as structured JSON. The
-/// `EventStore` write path is deferred to v0.3 when the `VerbRegistry` gains
-/// a runtime handle (see ADR-033 §"Implementation Status").
+/// Events are emitted via `tracing::info!` as structured JSON. When the
+/// dispatch registry is configured with an `EventStore`, the same envelope is
+/// also persisted as an audit event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// Wall-clock timestamp of the gate check (UTC, RFC3339 in JSON).

@@ -82,9 +82,9 @@ const INLINE_POLICY_NAME: &str = "inline.rego";
 /// the default `data.khive.gate.decision` package.
 ///
 /// The engine is held behind a `Mutex` because `regorus::Engine::eval_rule`
-/// requires `&mut self`. This serializes evaluations on the dispatch hot
-/// path — acceptable while the gate is advisory (ADR-029 v0.2); revisit
-/// when enforcement lands (v0.3) and contention shows up.
+/// requires `&mut self`. This serializes evaluations on the dispatch hot path;
+/// revisit (compiled policy / engine pool) if hard-enforcement workloads show
+/// contention (ADR-018).
 pub struct RegoGate {
     engine: Mutex<regorus::Engine>,
     entrypoint: String,
