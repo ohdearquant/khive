@@ -5,4 +5,4 @@
 //! function so the `kkernel` binary CLI layer can call them with minimal
 //! indirection.
 
-pub use khive_vcs::sync::{run_sync, SyncReport};
+pub use khive_vcs::sync::{run_sync, run_sync_remote, RemoteConfig, RemoteSyncReport, SyncReport};

@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
     match args.command {
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
-        Command::Kg(k) => kg::run_kg(k),
+        Command::Kg(k) => kg::run_kg(k).await,
         Command::Engine(e) => engine::run_engine(e),
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,

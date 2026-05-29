@@ -17,6 +17,7 @@ khive-db = { version = "0.2.2", path = "../khive-db" }
 khive-storage = { version = "0.2.2", path = "../khive-storage" }
 khive-types = { version = "0.2.2", path = "../khive-types" }
 khive-vcs = { version = "0.2.2", path = "../khive-vcs" }
+khive-vcs-adapters = { version = "0.2.2", path = "../khive-vcs-adapters" }
 khive-pack-kg = { version = "0.2.2", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.2.2", path = "../khive-pack-gtd" }
 khive-pack-memory = { version = "0.2.2", path = "../khive-pack-memory" }
