@@ -244,6 +244,12 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
+    // Invalidate Vamana snapshots so the next warm-load triggers a rebuild
+    // against the freshly re-embedded vectors.
+    if let Err(e) = invalidate_vamana_snapshots(&rt, &ns_str).await {
+        tracing::warn!(error = %e, "failed to invalidate Vamana snapshots after reindex");
+    }
+
     let report = ReindexReport {
         entities_processed,
         notes_processed,
@@ -254,6 +260,44 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
 
     print_report(&report, args.human);
     Ok(())
+}
+
+async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyhow::Result<()> {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    let pattern = format!("{namespace}::vamana::%");
+    let sql = rt.sql();
+    let mut writer = sql
+        .writer()
+        .await
+        .context("open SQL writer for Vamana snapshot invalidation")?;
+
+    match writer
+        .execute(SqlStatement {
+            sql: "DELETE FROM retrieval_snapshots WHERE namespace LIKE ?1".into(),
+            params: vec![SqlValue::Text(pattern)],
+            label: Some("invalidate_vamana_snapshots".into()),
+        })
+        .await
+    {
+        Ok(deleted) => {
+            tracing::info!(
+                deleted,
+                namespace,
+                "invalidated Vamana snapshots after reindex"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no such table") {
+                tracing::debug!("retrieval_snapshots absent; no Vamana snapshots to invalidate");
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("{e}"))
+            }
+        }
+    }
 }
 
 fn truncate_text(t: &str) -> String {
@@ -283,5 +327,93 @@ fn print_report(report: &ReindexReport, human: bool) {
     } else {
         let json = serde_json::to_string(report).expect("serialize ReindexReport");
         println!("{json}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    #[tokio::test]
+    async fn test_reindex_invalidates_vamana_snapshots() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let sql = rt.sql();
+
+        // Create retrieval_snapshots table and seed rows.
+        let mut w = sql.writer().await.expect("writer");
+        w.execute_script(
+            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
+             namespace TEXT NOT NULL, \
+             index_type TEXT NOT NULL, \
+             snapshot BLOB NOT NULL, \
+             created_at INTEGER NOT NULL, \
+             PRIMARY KEY (namespace, index_type));"
+                .into(),
+        )
+        .await
+        .expect("create table");
+
+        for (ns, idx_type) in &[
+            ("local::vamana::model-a", "vamana"),
+            ("local::vamana::model-b", "vamana"),
+            ("other::vamana::model-a", "vamana"),
+            ("local::hnsw::model-a", "hnsw"),
+        ] {
+            w.execute(SqlStatement {
+                sql: "INSERT INTO retrieval_snapshots \
+                      (namespace, index_type, snapshot, created_at) \
+                      VALUES (?1, ?2, ?3, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ns.to_string()),
+                    SqlValue::Text(idx_type.to_string()),
+                    SqlValue::Blob(b"{}".to_vec()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert row");
+        }
+        drop(w);
+
+        invalidate_vamana_snapshots(&rt, "local")
+            .await
+            .expect("invalidate");
+
+        let mut r = sql.reader().await.expect("reader");
+        let rows = r
+            .query_all(SqlStatement {
+                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query");
+
+        let remaining: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("namespace") {
+                Some(SqlValue::Text(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            remaining.contains(&"other::vamana::model-a".to_string()),
+            "other namespace must survive: {remaining:?}"
+        );
+        assert!(
+            remaining.contains(&"local::hnsw::model-a".to_string()),
+            "HNSW rows must survive: {remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&"local::vamana::model-a".to_string()),
+            "local vamana model-a must be deleted: {remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&"local::vamana::model-b".to_string()),
+            "local vamana model-b must be deleted: {remaining:?}"
+        );
     }
 }

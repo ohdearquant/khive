@@ -943,11 +943,29 @@ impl KnowledgeHandlers {
             indexed += staged.len();
         }
 
+        // Any vector write invalidates the existing snapshot — the corpus has changed.
+        // If rebuild_ann=true a fresh snapshot is persisted below; if false, ensure_ann
+        // rebuilds lazily on the next search call.
+        if indexed > 0 {
+            vamana::invalidate_snapshot(runtime, &ns).await;
+            *ann.write().await = None;
+        }
+
         let mut ann_count: Option<usize> = None;
-        if rebuild_ann && !ann_vectors.is_empty() && ann_dim > 0 {
+        let is_full_corpus = p.ids.is_none();
+        if rebuild_ann && is_full_corpus && !ann_vectors.is_empty() && ann_dim > 0 {
             match vamana::AnnBridge::build(ann_vectors, ann_dim, ann_ids) {
                 Ok(bridge) => {
                     ann_count = Some(bridge.num_vectors());
+                    let model_name = runtime.default_embedder_name();
+                    if let Some(fp) = vamana::compute_fingerprint(runtime, token, model_name).await
+                    {
+                        if let Err(e) =
+                            vamana::persist_snapshot(runtime, &ns, model_name, &bridge, fp).await
+                        {
+                            tracing::error!(error = %e, "failed to persist Vamana snapshot");
+                        }
+                    }
                     let mut guard = ann.write().await;
                     *guard = Some(bridge);
                 }
@@ -1081,6 +1099,9 @@ impl KnowledgeHandlers {
         } else {
             search_core(&ctx, &raw_query).await?
         };
+
+        // Warm-load Vamana ANN from snapshot or corpus scan (no-op if already loaded).
+        vamana::ensure_ann(runtime, token, ann).await;
 
         // ANN parallel signal: embed query, search Vamana, fuse via RRF
         let ann_guard = ann.read().await;

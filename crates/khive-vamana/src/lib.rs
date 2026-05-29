@@ -22,7 +22,10 @@ pub mod index;
 pub use config::VamanaConfig;
 pub use error::{Result, VamanaError};
 pub use graph::{GreedySearchResult, VamanaGraph, VisitedSet};
-pub use index::VamanaIndex;
+pub use index::{
+    CorpusFingerprint, VamanaIndex, VamanaIndexSnapshot, VamanaSnapshot, VAMANA_SNAPSHOT_FORMAT,
+    VAMANA_SNAPSHOT_VERSION,
+};
 
 pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<VamanaIndex> {
     VamanaIndex::build(vectors, config)

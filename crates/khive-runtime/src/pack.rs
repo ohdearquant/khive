@@ -191,6 +191,18 @@ pub trait PackRuntime: Send + Sync {
     /// use built-in lattice models do not need to override this method.
     fn register_embedders(&self, _runtime: &KhiveRuntime) {}
 
+    /// Warm up any in-memory state from persisted snapshots (optional).
+    ///
+    /// Called by the transport after all packs are registered but before
+    /// serving the first request, giving packs a chance to pre-load expensive
+    /// in-memory structures (e.g. ANN indexes) so that the first query does
+    /// not incur rebuild latency.
+    ///
+    /// The default no-op is correct for all packs that have no warm-start
+    /// state. Packs that override this must make it idempotent and infallible:
+    /// any errors are logged internally, not propagated to the caller.
+    async fn warm(&self) {}
+
     /// Dispatch a verb call. Returns serialized JSON response.
     ///
     /// The `registry` parameter gives the handler access to the merged

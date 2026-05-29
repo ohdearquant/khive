@@ -523,6 +523,10 @@ impl PackRuntime for KnowledgePack {
         <KnowledgePack as Pack>::REQUIRES
     }
 
+    async fn warm(&self) {
+        knowledge::vamana::warm_known_snapshots(&self.runtime, &self.ann).await;
+    }
+
     async fn dispatch(
         &self,
         verb: &str,

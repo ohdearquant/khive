@@ -6,6 +6,7 @@ use std::{
 use bytemuck::cast_slice;
 use memmap2::MmapOptions;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::VamanaConfig,
@@ -16,6 +17,50 @@ use crate::{
 
 const METADATA_MAGIC: &[u8; 8] = b"KHVVAMM1";
 const GRAPH_MAGIC: &[u8; 8] = b"KHVVAMG1";
+
+pub const VAMANA_SNAPSHOT_FORMAT: &str = "khive-vamana-index";
+pub const VAMANA_SNAPSHOT_VERSION: u32 = 1;
+
+/// Corpus identity check stored inside a `VamanaSnapshot`.
+///
+/// A snapshot is accepted only when these values match the current vector store.
+/// `kkernel reindex` actively deletes snapshots after re-embedding, giving a
+/// second line of defence against serving stale ANN results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusFingerprint {
+    pub vector_count: u64,
+    pub dimensions: u32,
+}
+
+/// Serialisable graph payload stored inside `VamanaSnapshot`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VamanaIndexSnapshot {
+    pub num_vectors: u64,
+    pub dimensions: u32,
+    pub max_degree: u32,
+    pub search_list_size: u32,
+    pub alpha: f64,
+    pub medoid: u32,
+    pub adjacency: Vec<Vec<u32>>,
+    pub vectors: Vec<f32>,
+}
+
+/// Self-validating snapshot of a `VamanaIndex`.
+///
+/// Persisted via `RetrievalPersistence` / `retrieval_snapshots` SQLite BLOB.
+/// The `fingerprint` field must match the live vector corpus before the snapshot
+/// is installed into memory; a mismatch causes a silent rebuild.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VamanaSnapshot {
+    pub format: String,
+    pub version: u32,
+    pub namespace: String,
+    pub model: String,
+    pub fingerprint: CorpusFingerprint,
+    pub index: VamanaIndexSnapshot,
+    /// u32 node-id → external UUID string mapping preserved for `AnnBridge`.
+    pub external_ids: Vec<String>,
+}
 
 enum VectorStorage {
     Owned(Vec<f32>),
@@ -207,6 +252,133 @@ impl VamanaIndex {
             .sum();
 
         Ok(total_recall / num_queries as f64)
+    }
+
+    /// Serialise this index into a self-validating `VamanaSnapshot`.
+    ///
+    /// `external_ids` must have the same length as `self.num_vectors()`.
+    pub fn to_snapshot(
+        &self,
+        namespace: impl Into<String>,
+        model: impl Into<String>,
+        fingerprint: CorpusFingerprint,
+        external_ids: Vec<String>,
+    ) -> Result<VamanaSnapshot> {
+        if external_ids.len() != self.num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "external_ids length {} != num_vectors {}",
+                external_ids.len(),
+                self.num_vectors
+            )));
+        }
+        Ok(VamanaSnapshot {
+            format: VAMANA_SNAPSHOT_FORMAT.to_string(),
+            version: VAMANA_SNAPSHOT_VERSION,
+            namespace: namespace.into(),
+            model: model.into(),
+            fingerprint,
+            index: VamanaIndexSnapshot {
+                num_vectors: self.num_vectors as u64,
+                dimensions: self.dimensions as u32,
+                max_degree: self.config.max_degree as u32,
+                search_list_size: self.config.search_list_size as u32,
+                alpha: self.config.alpha,
+                medoid: self.graph.medoid(),
+                adjacency: self.graph.adjacency().to_vec(),
+                vectors: self.vectors()?.to_vec(),
+            },
+            external_ids,
+        })
+    }
+
+    /// Reconstruct a `VamanaIndex` from a `VamanaSnapshot`.
+    ///
+    /// Returns `VamanaError::InvalidFormat` for any structural inconsistency.
+    /// The caller is responsible for fingerprint validation before calling this.
+    pub fn from_snapshot(snapshot: &VamanaSnapshot) -> Result<Self> {
+        if snapshot.format != VAMANA_SNAPSHOT_FORMAT {
+            return Err(VamanaError::invalid_format(format!(
+                "unsupported Vamana snapshot format: {}",
+                snapshot.format
+            )));
+        }
+        if snapshot.version != VAMANA_SNAPSHOT_VERSION {
+            return Err(VamanaError::invalid_format(format!(
+                "unsupported Vamana snapshot version: {}",
+                snapshot.version
+            )));
+        }
+        let ix = &snapshot.index;
+        let num_vectors = usize::try_from(ix.num_vectors)
+            .map_err(|_| VamanaError::invalid_format("num_vectors overflow".into()))?;
+        let dimensions = usize::try_from(ix.dimensions)
+            .map_err(|_| VamanaError::invalid_format("dimensions overflow".into()))?;
+        let max_degree = usize::try_from(ix.max_degree)
+            .map_err(|_| VamanaError::invalid_format("max_degree overflow".into()))?;
+        let search_list_size = usize::try_from(ix.search_list_size)
+            .map_err(|_| VamanaError::invalid_format("search_list_size overflow".into()))?;
+
+        if snapshot.external_ids.len() != num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "external_ids length {} != num_vectors {}",
+                snapshot.external_ids.len(),
+                num_vectors
+            )));
+        }
+        if ix.adjacency.len() != num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "adjacency length {} != num_vectors {}",
+                ix.adjacency.len(),
+                num_vectors
+            )));
+        }
+        let expected_floats = num_vectors
+            .checked_mul(dimensions)
+            .ok_or_else(|| VamanaError::invalid_format("snapshot vector length overflow".into()))?;
+        if ix.vectors.len() != expected_floats {
+            return Err(VamanaError::invalid_format(
+                "snapshot vector data length mismatch".into(),
+            ));
+        }
+
+        let config = VamanaConfig {
+            dimensions,
+            max_degree,
+            search_list_size,
+            alpha: ix.alpha,
+        };
+        config.validate()?;
+
+        let mut graph = VamanaGraph::new(num_vectors, ix.medoid)?;
+        for (node, neighbors) in ix.adjacency.iter().enumerate() {
+            if neighbors.len() > max_degree {
+                return Err(VamanaError::invalid_format(format!(
+                    "node {node} degree {} exceeds max_degree {max_degree}",
+                    neighbors.len()
+                )));
+            }
+            for &nb in neighbors {
+                if nb as usize >= num_vectors {
+                    return Err(VamanaError::invalid_format(format!(
+                        "neighbor {nb} >= num_vectors {num_vectors}"
+                    )));
+                }
+                if nb as usize == node {
+                    return Err(VamanaError::invalid_format(format!(
+                        "self-loop at node {node}"
+                    )));
+                }
+            }
+            graph.adjacency_mut_for_load()[node] = neighbors.clone();
+        }
+
+        Ok(Self {
+            vectors: VectorStorage::Owned(ix.vectors.clone()),
+            graph,
+            config,
+            num_vectors,
+            dimensions,
+        })
     }
 
     pub fn graph(&self) -> &VamanaGraph {
@@ -651,7 +823,105 @@ mod tests {
         let results = loaded.search(&query, 3).unwrap();
         assert!(!results.is_empty());
     }
-}
+
+    #[test]
+    fn test_vamana_snapshot_roundtrip() {
+        let vectors = rand_unit_vectors(8, 4, 42);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(3)
+            .with_search_list_size(6);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+
+        let fp = CorpusFingerprint {
+            vector_count: 8,
+            dimensions: 4,
+        };
+        let ext_ids: Vec<String> = (0..8).map(|i| format!("id-{i}")).collect();
+        let snapshot = idx.to_snapshot("ns", "model", fp, ext_ids.clone()).unwrap();
+
+        assert_eq!(snapshot.format, VAMANA_SNAPSHOT_FORMAT);
+        assert_eq!(snapshot.version, VAMANA_SNAPSHOT_VERSION);
+        assert_eq!(snapshot.external_ids, ext_ids);
+        assert_eq!(snapshot.fingerprint, fp);
+
+        let restored = VamanaIndex::from_snapshot(&snapshot).unwrap();
+
+        let query = rand_unit_vectors(1, 4, 99);
+        let r1 = idx.search(&query, 3).unwrap();
+        let r2 = restored.search(&query, 3).unwrap();
+        assert_eq!(r1, r2, "snapshot roundtrip must preserve search results");
+    }
+
+    #[test]
+    fn test_vamana_snapshot_rejects_bad_format() {
+        let vectors = rand_unit_vectors(4, 4, 1);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(3)
+            .with_search_list_size(6);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let fp = CorpusFingerprint {
+            vector_count: 4,
+            dimensions: 4,
+        };
+        let ext_ids: Vec<String> = (0..4).map(|i| format!("id-{i}")).collect();
+        let mut snapshot = idx.to_snapshot("ns", "model", fp, ext_ids).unwrap();
+
+        snapshot.format = "bad-format".to_string();
+        assert!(matches!(
+            VamanaIndex::from_snapshot(&snapshot),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_vamana_snapshot_rejects_id_count_mismatch() {
+        let vectors = rand_unit_vectors(4, 4, 2);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(3)
+            .with_search_list_size(6);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+        let fp = CorpusFingerprint {
+            vector_count: 4,
+            dimensions: 4,
+        };
+        let result = idx.to_snapshot("ns", "model", fp, vec!["only-one".into()]);
+        assert!(matches!(result, Err(VamanaError::InvalidFormat { .. })));
+    }
+
+    #[test]
+    fn test_vamana_stale_snapshot_rejected_by_fingerprint() {
+        let vectors = rand_unit_vectors(8, 4, 42);
+        let cfg = VamanaConfig::with_dimensions(4)
+            .with_max_degree(3)
+            .with_search_list_size(6);
+        let idx = VamanaIndex::build(&vectors, cfg).unwrap();
+
+        let fp_at_build = CorpusFingerprint {
+            vector_count: 8,
+            dimensions: 4,
+        };
+        let ext_ids: Vec<String> = (0..8).map(|i| format!("id-{i}")).collect();
+        let snapshot = idx
+            .to_snapshot("ns", "model", fp_at_build, ext_ids)
+            .unwrap();
+
+        // Corpus change: two vectors added after the snapshot was written.
+        let fp_after_change = CorpusFingerprint {
+            vector_count: 10,
+            dimensions: 4,
+        };
+
+        // Stale detection: fingerprints must not match.
+        assert_ne!(
+            snapshot.fingerprint, fp_after_change,
+            "stale snapshot must be detected by fingerprint mismatch"
+        );
+        assert_eq!(
+            snapshot.fingerprint, fp_at_build,
+            "snapshot fingerprint must equal the build-time fingerprint"
+        );
+    }
+} // end mod tests
 
 // ---- tempfile dependency shim ----
 // The tempfile crate is used only in tests. Declare it as a dev-dependency below.
