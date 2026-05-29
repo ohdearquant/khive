@@ -14,6 +14,7 @@ description = "Composable Service API: entity/note CRUD, graph traversal, hybrid
 khive-types = { version = "0.2.2", path = "../khive-types", features = ["serde"] }
 khive-storage = { version = "0.2.2", path = "../khive-storage" }
 khive-score = { version = "0.2.2", path = "../khive-score" }
+khive-fusion = { version = "0.2.2", path = "../khive-fusion" }
 khive-fold = { version = "0.2.2", path = "../khive-fold" }
 khive-db = { version = "0.2.2", path = "../khive-db", features = ["vectors"] }
 khive-query = { version = "0.2.2", path = "../khive-query" }

@@ -140,7 +140,7 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 name: "fusion_strategy",
                 param_type: "string",
                 required: false,
-                description: "Fusion strategy: \"rrf\" | \"weighted\" | \"union\". Weighted values come from pack config.",
+                description: "Fusion strategy: \"rrf\" | \"weighted\" | \"union\" | \"vector_only\" | \"keyword_only\". Weighted values come from pack config.",
             },
             ParamDef {
                 name: "embedding_model",

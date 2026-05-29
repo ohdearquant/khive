@@ -1219,7 +1219,7 @@ async fn test_recall_fusion_strategy_override() {
         .expect("remember succeeds");
 
     // Each valid strategy must succeed and return an array
-    for strategy in &["rrf", "weighted", "union"] {
+    for strategy in &["rrf", "weighted", "union", "vector_only", "keyword_only"] {
         let result = registry
             .dispatch(
                 "memory.recall",
@@ -1249,7 +1249,11 @@ async fn test_recall_fusion_strategy_override() {
     assert!(err.is_err(), "invalid fusion_strategy must return an error");
     let msg = err.unwrap_err().to_string();
     assert!(
-        msg.contains("rrf") && msg.contains("weighted") && msg.contains("union"),
+        msg.contains("rrf")
+            && msg.contains("weighted")
+            && msg.contains("union")
+            && msg.contains("vector_only")
+            && msg.contains("keyword_only"),
         "error message must list valid strategies, got: {msg}"
     );
 }

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use khive_runtime::{FusionStrategy, RuntimeError};
+use khive_fusion::FusionStrategy;
+use khive_runtime::RuntimeError;
 
 /// Error returned when `min_score` is outside the accepted dual-scale range.
 #[derive(Debug, Clone)]

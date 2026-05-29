@@ -1,11 +1,10 @@
 //! Fusion strategies for combining ranked result lists.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use khive_score::{rrf_score, DeterministicScore};
+use khive_score::DeterministicScore;
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
 };
@@ -16,28 +15,9 @@ use crate::error::RuntimeResult;
 use crate::retrieval::{SearchHit, SearchSource};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+pub use khive_fusion::FusionStrategy;
+
 const CANDIDATE_MULTIPLIER: u32 = 4;
-
-/// Strategy for fusing ranked result lists from multiple retrieval sources.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FusionStrategy {
-    /// Reciprocal Rank Fusion. Uses only ranks; robust to different score scales.
-    Rrf { k: usize },
-    /// Weighted linear combination. Min-max normalizes each source to [0,1] first.
-    /// Weights are normalized to sum to 1.0; negatives clamped to 0; all-zero falls back to equal.
-    Weighted { weights: Vec<f64> },
-    /// Take all hits; keep the max score per entity_id.
-    Union,
-    /// Drop text hits; return vector hits only.
-    VectorOnly,
-}
-
-impl Default for FusionStrategy {
-    fn default() -> Self {
-        Self::Rrf { k: 60 }
-    }
-}
 
 /// Fuse text and vector hits using the given strategy, returning at most `limit` results.
 pub fn fuse_with_strategy(
@@ -47,12 +27,103 @@ pub fn fuse_with_strategy(
     limit: usize,
 ) -> Vec<SearchHit> {
     match strategy {
-        FusionStrategy::Rrf { k } => rrf_fuse_k(text_hits, vector_hits, *k, limit),
-        FusionStrategy::Weighted { weights } => {
-            weighted_fuse(text_hits, vector_hits, weights, limit)
+        FusionStrategy::VectorOnly => fuse_sources(Vec::new(), vector_hits, strategy, limit),
+        FusionStrategy::KeywordOnly => fuse_sources(text_hits, Vec::new(), strategy, limit),
+        FusionStrategy::Rrf { .. } | FusionStrategy::Weighted { .. } | FusionStrategy::Union => {
+            fuse_sources(text_hits, vector_hits, strategy, limit)
         }
-        FusionStrategy::Union => union_fuse(text_hits, vector_hits, limit),
-        FusionStrategy::VectorOnly => vector_only(vector_hits, limit),
+    }
+}
+
+/// RRF convenience wrapper used by operations.rs (k=60 note search path).
+pub(crate) fn rrf_fuse_k(
+    text_hits: Vec<TextSearchHit>,
+    vector_hits: Vec<VectorSearchHit>,
+    k: usize,
+    limit: usize,
+) -> Vec<SearchHit> {
+    fuse_with_strategy(text_hits, vector_hits, &FusionStrategy::Rrf { k }, limit)
+}
+
+fn fuse_sources(
+    text_hits: Vec<TextSearchHit>,
+    vector_hits: Vec<VectorSearchHit>,
+    strategy: &FusionStrategy,
+    limit: usize,
+) -> Vec<SearchHit> {
+    let mut metadata: HashMap<Uuid, SearchHit> =
+        HashMap::with_capacity(text_hits.len() + vector_hits.len());
+
+    let text_source: Vec<(Uuid, DeterministicScore)> = text_hits
+        .into_iter()
+        .map(|h| {
+            let hit = SearchHit {
+                entity_id: h.subject_id,
+                score: h.score,
+                source: SearchSource::Text,
+                title: h.title,
+                snippet: h.snippet,
+            };
+            let id = hit.entity_id;
+            let score = hit.score;
+            merge_metadata(&mut metadata, hit);
+            (id, score)
+        })
+        .collect();
+
+    let vector_source: Vec<(Uuid, DeterministicScore)> = vector_hits
+        .into_iter()
+        .map(|h| {
+            let hit = SearchHit {
+                entity_id: h.subject_id,
+                score: h.score,
+                source: SearchSource::Vector,
+                title: None,
+                snippet: None,
+            };
+            let id = hit.entity_id;
+            let score = hit.score;
+            merge_metadata(&mut metadata, hit);
+            (id, score)
+        })
+        .collect();
+
+    khive_fusion::fuse(vec![text_source, vector_source], strategy, limit)
+        .into_iter()
+        .filter_map(|(id, score)| {
+            let mut hit = metadata.remove(&id)?;
+            hit.score = score;
+            Some(hit)
+        })
+        .collect()
+}
+
+fn merge_metadata(metadata: &mut HashMap<Uuid, SearchHit>, hit: SearchHit) {
+    match metadata.entry(hit.entity_id) {
+        Entry::Occupied(mut entry) => {
+            let existing = entry.get_mut();
+            existing.source = merge_sources(existing.source, hit.source);
+            if existing.title.is_none() {
+                existing.title = hit.title;
+            }
+            if existing.snippet.is_none() {
+                existing.snippet = hit.snippet;
+            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(hit);
+        }
+    }
+}
+
+fn merge_sources(left: SearchSource, right: SearchSource) -> SearchSource {
+    match (left, right) {
+        (SearchSource::Both, _) | (_, SearchSource::Both) => SearchSource::Both,
+        (SearchSource::Text, SearchSource::Vector) | (SearchSource::Vector, SearchSource::Text) => {
+            SearchSource::Both
+        }
+        (SearchSource::Text, SearchSource::Text) => SearchSource::Text,
+        (SearchSource::Vector, SearchSource::Vector) => SearchSource::Vector,
     }
 }
 
@@ -122,234 +193,6 @@ impl KhiveRuntime {
 
         Ok(fused)
     }
-}
-
-fn rrf_fuse_k(
-    text_hits: Vec<TextSearchHit>,
-    vector_hits: Vec<VectorSearchHit>,
-    k: usize,
-    limit: usize,
-) -> Vec<SearchHit> {
-    #[derive(Default)]
-    struct Bucket {
-        score: DeterministicScore,
-        source: Option<SearchSource>,
-        title: Option<String>,
-        snippet: Option<String>,
-    }
-
-    let mut buckets: HashMap<Uuid, Bucket> = HashMap::new();
-
-    for (i, hit) in text_hits.into_iter().enumerate() {
-        let entry = buckets.entry(hit.subject_id).or_default();
-        entry.score = entry.score + rrf_score(i + 1, k);
-        entry.source = Some(match entry.source {
-            Some(SearchSource::Vector) => SearchSource::Both,
-            _ => SearchSource::Text,
-        });
-        if entry.title.is_none() {
-            entry.title = hit.title;
-        }
-        if entry.snippet.is_none() {
-            entry.snippet = hit.snippet;
-        }
-    }
-
-    for (i, hit) in vector_hits.into_iter().enumerate() {
-        let entry = buckets.entry(hit.subject_id).or_default();
-        entry.score = entry.score + rrf_score(i + 1, k);
-        entry.source = Some(match entry.source {
-            Some(SearchSource::Text) => SearchSource::Both,
-            _ => SearchSource::Vector,
-        });
-    }
-
-    let mut hits: Vec<SearchHit> = buckets
-        .into_iter()
-        .map(|(id, b)| SearchHit {
-            entity_id: id,
-            score: b.score,
-            source: b.source.expect("each bucket gets a source"),
-            title: b.title,
-            snippet: b.snippet,
-        })
-        .collect();
-
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.entity_id.cmp(&b.entity_id)));
-    hits.truncate(limit);
-    hits
-}
-
-fn weighted_fuse(
-    text_hits: Vec<TextSearchHit>,
-    vector_hits: Vec<VectorSearchHit>,
-    weights: &[f64],
-    limit: usize,
-) -> Vec<SearchHit> {
-    // Normalize: clamp negatives to 0, fall back to equal if all zero.
-    let w0 = weights.first().copied().unwrap_or(0.0).max(0.0);
-    let w1 = weights.get(1).copied().unwrap_or(0.0).max(0.0);
-    let total = w0 + w1;
-    let (nw0, nw1) = if total <= 0.0 {
-        (0.5, 0.5)
-    } else {
-        (w0 / total, w1 / total)
-    };
-
-    // Collect metadata from text hits before consuming them for scores.
-    let mut meta: HashMap<Uuid, (Option<String>, Option<String>)> = HashMap::new();
-    let text_scores: Vec<(Uuid, f64)> = text_hits
-        .into_iter()
-        .map(|h| {
-            meta.entry(h.subject_id)
-                .or_insert_with(|| (h.title, h.snippet));
-            (h.subject_id, h.score.to_f64())
-        })
-        .collect();
-
-    let vector_scores: Vec<(Uuid, f64)> = vector_hits
-        .into_iter()
-        .map(|h| (h.subject_id, h.score.to_f64()))
-        .collect();
-
-    // Per-source min-max normalize to [0, 1].
-    let text_norm = min_max_normalize(&text_scores);
-    let vector_norm = min_max_normalize(&vector_scores);
-
-    let mut combined: HashMap<Uuid, f64> = HashMap::new();
-    for (id, s) in &text_norm {
-        *combined.entry(*id).or_insert(0.0) += s * nw0;
-    }
-    for (id, s) in &vector_norm {
-        *combined.entry(*id).or_insert(0.0) += s * nw1;
-    }
-
-    let mut hits: Vec<SearchHit> = combined
-        .into_iter()
-        .map(|(id, score)| {
-            let (title, snippet) = meta.get(&id).cloned().unwrap_or_default();
-            let source = match (
-                text_norm.iter().any(|(i, _)| *i == id),
-                vector_norm.iter().any(|(i, _)| *i == id),
-            ) {
-                (true, true) => SearchSource::Both,
-                (true, false) => SearchSource::Text,
-                _ => SearchSource::Vector,
-            };
-            SearchHit {
-                entity_id: id,
-                score: DeterministicScore::from_f64(score),
-                source,
-                title,
-                snippet,
-            }
-        })
-        .collect();
-
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.entity_id.cmp(&b.entity_id)));
-    hits.truncate(limit);
-    hits
-}
-
-fn min_max_normalize(scores: &[(Uuid, f64)]) -> Vec<(Uuid, f64)> {
-    if scores.is_empty() {
-        return Vec::new();
-    }
-    let min = scores.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
-    let max = scores
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let span = max - min;
-    if span <= f64::EPSILON {
-        return scores.iter().map(|(id, _)| (*id, 1.0)).collect();
-    }
-    scores
-        .iter()
-        .map(|(id, s)| (*id, (s - min) / span))
-        .collect()
-}
-
-fn union_fuse(
-    text_hits: Vec<TextSearchHit>,
-    vector_hits: Vec<VectorSearchHit>,
-    limit: usize,
-) -> Vec<SearchHit> {
-    struct Bucket {
-        score: DeterministicScore,
-        source: SearchSource,
-        title: Option<String>,
-        snippet: Option<String>,
-    }
-
-    let mut buckets: HashMap<Uuid, Bucket> = HashMap::new();
-
-    for hit in text_hits {
-        let entry = buckets.entry(hit.subject_id).or_insert_with(|| Bucket {
-            score: DeterministicScore::ZERO,
-            source: SearchSource::Text,
-            title: None,
-            snippet: None,
-        });
-        if hit.score > entry.score {
-            entry.score = hit.score;
-        }
-        if entry.title.is_none() {
-            entry.title = hit.title;
-        }
-        if entry.snippet.is_none() {
-            entry.snippet = hit.snippet;
-        }
-        if entry.source == SearchSource::Vector {
-            entry.source = SearchSource::Both;
-        }
-    }
-
-    for hit in vector_hits {
-        let entry = buckets.entry(hit.subject_id).or_insert_with(|| Bucket {
-            score: DeterministicScore::ZERO,
-            source: SearchSource::Vector,
-            title: None,
-            snippet: None,
-        });
-        if hit.score > entry.score {
-            entry.score = hit.score;
-        }
-        if entry.source == SearchSource::Text {
-            entry.source = SearchSource::Both;
-        }
-    }
-
-    let mut hits: Vec<SearchHit> = buckets
-        .into_iter()
-        .map(|(id, b)| SearchHit {
-            entity_id: id,
-            score: b.score,
-            source: b.source,
-            title: b.title,
-            snippet: b.snippet,
-        })
-        .collect();
-
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.entity_id.cmp(&b.entity_id)));
-    hits.truncate(limit);
-    hits
-}
-
-fn vector_only(vector_hits: Vec<VectorSearchHit>, limit: usize) -> Vec<SearchHit> {
-    let mut hits: Vec<SearchHit> = vector_hits
-        .into_iter()
-        .map(|h| SearchHit {
-            entity_id: h.subject_id,
-            score: h.score,
-            source: SearchSource::Vector,
-            title: None,
-            snippet: None,
-        })
-        .collect();
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.entity_id.cmp(&b.entity_id)));
-    hits.truncate(limit);
-    hits
 }
 
 #[cfg(test)]

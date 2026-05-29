@@ -6,7 +6,7 @@ use std::str::FromStr;
 use serde::Serialize;
 use uuid::Uuid;
 
-use khive_score::{rrf_score, DeterministicScore};
+use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page,
@@ -1369,33 +1369,15 @@ impl KhiveRuntime {
             vec![]
         };
 
-        // RRF fusion.
-        #[derive(Default)]
-        struct Bucket {
-            score: DeterministicScore,
-            title: Option<String>,
-            snippet: Option<String>,
-        }
+        // Keep the full text∪vector union through RRF — salience weighting and
+        // soft-delete/kind filtering happen *after* this, and the final
+        // `hits.truncate(limit)` is the only result-limiting cut. Truncating to
+        // `candidates` here would drop a high-salience note ranked just outside
+        // the raw RRF cutoff before salience ever applied (codex #526).
+        let fuse_k = text_hits.len() + vector_hits.len();
+        let fused = crate::fusion::rrf_fuse_k(text_hits, vector_hits, RRF_K, fuse_k);
 
-        let mut buckets: HashMap<Uuid, Bucket> = HashMap::new();
-        for (i, hit) in text_hits.into_iter().enumerate() {
-            let rank = i + 1;
-            let entry = buckets.entry(hit.subject_id).or_default();
-            entry.score = entry.score + rrf_score(rank, RRF_K);
-            if entry.title.is_none() {
-                entry.title = hit.title;
-            }
-            if entry.snippet.is_none() {
-                entry.snippet = hit.snippet;
-            }
-        }
-        for (i, hit) in vector_hits.into_iter().enumerate() {
-            let rank = i + 1;
-            let entry = buckets.entry(hit.subject_id).or_default();
-            entry.score = entry.score + rrf_score(rank, RRF_K);
-        }
-
-        let candidate_ids: Vec<Uuid> = buckets.keys().copied().collect();
+        let candidate_ids: Vec<Uuid> = fused.iter().map(|hit| hit.entity_id).collect();
         if candidate_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -1403,7 +1385,7 @@ impl KhiveRuntime {
         // Fetch each candidate note individually to get salience and apply
         // soft-delete + (optional) kind filtering. Notes whose `kind` doesn't
         // match `note_kind` are dropped post-fetch — they're a small set
-        // bounded by `candidates`, so the extra read is cheap.
+        // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
         let note_store = self.notes(token)?;
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
@@ -1446,18 +1428,18 @@ impl KhiveRuntime {
         }
 
         // Apply salience weighting and collect final hits.
-        let mut hits: Vec<NoteSearchHit> = buckets
+        let mut hits: Vec<NoteSearchHit> = fused
             .into_iter()
-            .filter_map(|(id, bucket)| {
-                let note = alive_notes.get(&id)?;
+            .filter_map(|hit| {
+                let note = alive_notes.get(&hit.entity_id)?;
                 let salience = note.salience.unwrap_or(0.5);
                 let weight = 0.5 + 0.5 * salience;
-                let weighted = DeterministicScore::from_f64(bucket.score.to_f64() * weight);
+                let weighted = DeterministicScore::from_f64(hit.score.to_f64() * weight);
                 Some(NoteSearchHit {
-                    note_id: id,
+                    note_id: hit.entity_id,
                     score: weighted,
-                    title: bucket.title.or_else(|| note_title(note)),
-                    snippet: bucket.snippet.or_else(|| note_snippet(note)),
+                    title: hit.title.or_else(|| note_title(note)),
+                    snippet: hit.snippet.or_else(|| note_snippet(note)),
                 })
             })
             .collect();

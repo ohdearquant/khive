@@ -705,6 +705,7 @@ const EXACT_MATCH_BOOST: f64 = 0.5;
 
 /// Fuse text + vector hits with Reciprocal Rank Fusion (k=10).
 ///
+/// Entity search stays local because it uses k=10 plus exact-match boosting.
 /// Hits in both lists get RRF scores summed. If `query_text` exactly matches
 /// (case-insensitive) an entity's title from the text hits, a bonus of
 /// `EXACT_MATCH_BOOST` is added to ensure exact-name matches dominate.

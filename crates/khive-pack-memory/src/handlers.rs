@@ -4,12 +4,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_retrieval::{
-    fuse_search_results, FusionStrategy as RetrievalFusionStrategy, HybridConfig,
-};
+use khive_fusion::FusionStrategy;
+use khive_retrieval::{fuse_search_results, HybridConfig};
 use khive_runtime::{
-    micros_to_iso, FusionStrategy as RuntimeFusionStrategy, MemoryRecallPipeline, NamespaceToken,
-    NoteCandidate, RuntimeError, SearchHit, SearchSource, VerbRegistry,
+    micros_to_iso, MemoryRecallPipeline, NamespaceToken, NoteCandidate, RuntimeError, SearchHit,
+    SearchSource, VerbRegistry,
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{
@@ -44,15 +43,17 @@ fn validate_memory_type(mt: &str) -> Result<(), RuntimeError> {
     }
 }
 
-fn parse_fusion_strategy_str(s: &str) -> Result<RuntimeFusionStrategy, RuntimeError> {
+fn parse_fusion_strategy_str(s: &str) -> Result<FusionStrategy, RuntimeError> {
     match s {
-        "rrf" => Ok(RuntimeFusionStrategy::Rrf { k: 60 }),
-        "weighted" => Ok(RuntimeFusionStrategy::Weighted {
+        "rrf" => Ok(FusionStrategy::Rrf { k: 60 }),
+        "weighted" => Ok(FusionStrategy::Weighted {
             weights: vec![0.3, 0.7],
         }),
-        "union" => Ok(RuntimeFusionStrategy::Union),
+        "union" => Ok(FusionStrategy::Union),
+        "vector_only" => Ok(FusionStrategy::VectorOnly),
+        "keyword_only" => Ok(FusionStrategy::KeywordOnly),
         other => Err(RuntimeError::InvalidInput(format!(
-            "invalid fusion_strategy {other:?}: must be one of \"rrf\", \"weighted\", \"union\""
+            "invalid fusion_strategy {other:?}: must be one of \"rrf\", \"weighted\", \"union\", \"vector_only\", \"keyword_only\""
         ))),
     }
 }
@@ -146,9 +147,9 @@ impl RecallParams {
 /// ensuring the composite score displayed to callers stays in [0,1] (CC-5).
 ///
 /// Weighted and union scores are already in [0,1] and pass through unchanged.
-fn normalize_relevance(raw: f64, strategy: &khive_runtime::FusionStrategy) -> f64 {
+fn normalize_relevance(raw: f64, strategy: &FusionStrategy) -> f64 {
     match strategy {
-        khive_runtime::FusionStrategy::Rrf { k } => (raw * (*k as f64 + 1.0)).min(1.0),
+        FusionStrategy::Rrf { k } => (raw * (*k as f64 + 1.0)).min(1.0),
         _ => raw,
     }
 }
@@ -297,23 +298,12 @@ struct CandidateMeta {
     snippet: Option<String>,
 }
 
-fn to_retrieval_fusion_strategy(strategy: &RuntimeFusionStrategy) -> RetrievalFusionStrategy {
-    match strategy {
-        RuntimeFusionStrategy::Rrf { k } => RetrievalFusionStrategy::Rrf { k: *k },
-        RuntimeFusionStrategy::Weighted { .. } => RetrievalFusionStrategy::Weighted {
-            weights: Vec::new(),
-        },
-        RuntimeFusionStrategy::Union => RetrievalFusionStrategy::Union,
-        RuntimeFusionStrategy::VectorOnly => RetrievalFusionStrategy::VectorOnly,
-    }
-}
-
-fn retrieval_hybrid_config(strategy: &RuntimeFusionStrategy, limit: usize) -> HybridConfig {
+fn retrieval_hybrid_config(strategy: &FusionStrategy, limit: usize) -> HybridConfig {
     let mut config = HybridConfig::new(limit)
         .with_pool_size(limit)
-        .with_fusion_strategy(to_retrieval_fusion_strategy(strategy));
+        .with_fusion_strategy(strategy.clone());
 
-    if let RuntimeFusionStrategy::Weighted { weights } = strategy {
+    if let FusionStrategy::Weighted { weights } = strategy {
         // Source layout passed to fuse_search_results is [vector, text] — see
         // fuse_candidates(). weights[0] maps to the first source (vector) and
         // weights[1] to the second source (text). HybridConfig fields:
@@ -408,8 +398,9 @@ fn fuse_candidates(
         })
         .collect();
 
-    let vector_only = matches!(&cfg.fuse_strategy, RuntimeFusionStrategy::VectorOnly);
-    let is_weighted = matches!(&cfg.fuse_strategy, RuntimeFusionStrategy::Weighted { .. });
+    let vector_only = matches!(&cfg.fuse_strategy, FusionStrategy::VectorOnly);
+    let keyword_only = matches!(&cfg.fuse_strategy, FusionStrategy::KeywordOnly);
+    let is_weighted = matches!(&cfg.fuse_strategy, FusionStrategy::Weighted { .. });
 
     // Assemble ordered source list passed to fuse_search_results.
     //
@@ -436,6 +427,8 @@ fn fuse_candidates(
     let sources: Vec<Vec<_>> = if vector_only {
         // VectorOnly: pass per-model sources as-is (no text).
         vector_sources
+    } else if keyword_only {
+        vec![text_source]
     } else if is_weighted && vector_sources.len() > 1 {
         // Weighted + N > 1 vector models: combine into one vector source so
         // the 2-source [vector, text] layout is preserved. Union (max-score)
@@ -465,6 +458,8 @@ fn fuse_candidates(
             let m = meta.remove(&id).unwrap_or_default();
             let (source, title, snippet) = if vector_only {
                 (SearchSource::Vector, None, None)
+            } else if keyword_only {
+                (SearchSource::Text, m.title, m.snippet)
             } else {
                 (source_from_meta(&m), m.title, m.snippet)
             };
@@ -879,10 +874,10 @@ impl MemoryPack {
             // "weighted" in the request means "use weighted fusion" — the actual
             // weight values come from pack config, not the request (ADR-033 §6.1).
             if let (
-                RuntimeFusionStrategy::Weighted {
+                FusionStrategy::Weighted {
                     weights: ref mut new_w,
                 },
-                RuntimeFusionStrategy::Weighted {
+                FusionStrategy::Weighted {
                     weights: ref existing_w,
                 },
             ) = (&mut new_strategy, &cfg.fuse_strategy)
@@ -986,7 +981,7 @@ impl MemoryPack {
             .iter()
             .map(|h| (h.entity_id, h.score.to_f64() as f32))
             .collect();
-        let is_rrf = matches!(&cfg.fuse_strategy, RuntimeFusionStrategy::Rrf { .. });
+        let is_rrf = matches!(&cfg.fuse_strategy, FusionStrategy::Rrf { .. });
         let normalized_relevance: HashMap<Uuid, f32> = if is_rrf {
             normalize_rrf_scores(fused_pairs, &scoring_cfg)
         } else {
@@ -1817,11 +1812,9 @@ mod tests {
 
     #[test]
     fn test_weighted_strategy_preserves_pack_weights() {
-        use khive_runtime::FusionStrategy as RuntimeFusionStrategy;
-
         // Pack config has custom weighted weights [0.8, 0.2]
         let base = RecallConfig {
-            fuse_strategy: RuntimeFusionStrategy::Weighted {
+            fuse_strategy: FusionStrategy::Weighted {
                 weights: vec![0.8, 0.2],
             },
             ..RecallConfig::default()
@@ -1849,10 +1842,10 @@ mod tests {
         if let Some(ref fs) = p.fusion_strategy {
             let mut new_strategy = parse_fusion_strategy_str(fs).unwrap();
             if let (
-                RuntimeFusionStrategy::Weighted {
+                FusionStrategy::Weighted {
                     weights: ref mut new_w,
                 },
-                RuntimeFusionStrategy::Weighted {
+                FusionStrategy::Weighted {
                     weights: ref existing_w,
                 },
             ) = (&mut new_strategy, &cfg.fuse_strategy)
@@ -1863,7 +1856,7 @@ mod tests {
         }
 
         match cfg.fuse_strategy {
-            RuntimeFusionStrategy::Weighted { weights } => {
+            FusionStrategy::Weighted { weights } => {
                 assert_eq!(
                     weights,
                     vec![0.8, 0.2],
@@ -1880,7 +1873,6 @@ mod tests {
         // affects fusion output, not just validation. Uses a deterministic fixture
         // where rank-based (RRF) and score-based (Weighted) fusion must rank
         // differently.
-        use khive_runtime::FusionStrategy as RuntimeFusionStrategy;
         use khive_storage::types::{TextSearchHit, VectorSearchHit};
         use std::collections::HashSet;
         use uuid::Uuid;
@@ -1926,7 +1918,7 @@ mod tests {
             cjk_routed: false,
         };
         let cfg_rrf = RecallConfig {
-            fuse_strategy: RuntimeFusionStrategy::Rrf { k: 60 },
+            fuse_strategy: FusionStrategy::Rrf { k: 60 },
             ..RecallConfig::default()
         };
         let rrf_results = fuse_candidates(&candidates_rrf, &memory_ids, &cfg_rrf, 10);
@@ -1955,7 +1947,7 @@ mod tests {
         //
         // C leading in Weighted but not in RRF means the orderings differ.
         let cfg_weighted = RecallConfig {
-            fuse_strategy: RuntimeFusionStrategy::Weighted {
+            fuse_strategy: FusionStrategy::Weighted {
                 weights: vec![0.9, 0.1], // [vector=0.9, text=0.1]
             },
             ..RecallConfig::default()
@@ -1990,7 +1982,7 @@ mod tests {
         // total = w_r*relevance + w_s*amplified_salience + w_t*temporal
         // where amplified_salience = effective_salience ^ SALIENCE_AMPLIFIER_ALPHA
         let cfg = RecallConfig {
-            fuse_strategy: khive_runtime::FusionStrategy::Weighted {
+            fuse_strategy: FusionStrategy::Weighted {
                 weights: vec![0.3, 0.7],
             },
             ..RecallConfig::default()
@@ -2022,7 +2014,7 @@ mod tests {
         // in the same [0, 1] range as weighted/union fusion outputs.
         // Use an explicit RRF config — the default changed to Weighted (CC-6).
         let cfg = RecallConfig {
-            fuse_strategy: khive_runtime::FusionStrategy::Rrf { k: 60 },
+            fuse_strategy: FusionStrategy::Rrf { k: 60 },
             ..RecallConfig::default()
         };
         let raw_rrf_rank1 = 1.0 / 61.0;
@@ -2042,7 +2034,7 @@ mod tests {
         // by (k+1)=61 gave relevance=2.0, which inflated the composite total
         // beyond 1.0. After the fix, relevance is clamped to 1.0.
         let cfg = RecallConfig {
-            fuse_strategy: khive_runtime::FusionStrategy::Rrf { k: 60 },
+            fuse_strategy: FusionStrategy::Rrf { k: 60 },
             ..RecallConfig::default()
         };
         let raw_rrf_two_sources = 2.0 / 61.0; // rank-1 in both vector and text
@@ -2110,7 +2102,7 @@ mod tests {
             relevance_weight: 1.0,
             salience_weight: 0.0,
             temporal_weight: 0.0,
-            fuse_strategy: khive_runtime::FusionStrategy::Weighted {
+            fuse_strategy: FusionStrategy::Weighted {
                 weights: vec![0.5, 0.5],
             },
             ..RecallConfig::default()
@@ -2277,7 +2269,7 @@ mod tests {
         // salience contribution difference is only 0.20*(0.9-0.3)=0.12, which
         // is easily swamped when relevance differs even slightly.
         let cfg = RecallConfig {
-            fuse_strategy: khive_runtime::FusionStrategy::Weighted {
+            fuse_strategy: FusionStrategy::Weighted {
                 weights: vec![0.5, 0.5],
             },
             ..RecallConfig::default()
@@ -2414,12 +2406,12 @@ mod tests {
         // After fix, scores are always in [0, 1] for any valid input.
         let cfgs = [
             RecallConfig {
-                fuse_strategy: khive_runtime::FusionStrategy::Rrf { k: 60 },
+                fuse_strategy: FusionStrategy::Rrf { k: 60 },
                 ..RecallConfig::default()
             },
             RecallConfig::default(), // Weighted
             RecallConfig {
-                fuse_strategy: khive_runtime::FusionStrategy::Union,
+                fuse_strategy: FusionStrategy::Union,
                 ..RecallConfig::default()
             },
         ];
@@ -2448,10 +2440,7 @@ mod tests {
         // dominate the salience contribution entirely.
         let cfg = RecallConfig::default();
         assert!(
-            matches!(
-                cfg.fuse_strategy,
-                khive_runtime::FusionStrategy::Weighted { .. }
-            ),
+            matches!(cfg.fuse_strategy, FusionStrategy::Weighted { .. }),
             "default fuse_strategy must be Weighted (CC-6), got {:?}",
             cfg.fuse_strategy
         );
