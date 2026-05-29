@@ -13,6 +13,7 @@ description = "KG verb pack — entity/note CRUD, graph traversal, hybrid search
 [dependencies]
 khive-types = { version = "0.2.2", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.2.2", path = "../khive-runtime" }
+khive-query = { version = "0.2.2", path = "../khive-query" }
 inventory = { workspace = true }
 khive-storage = { version = "0.2.2", path = "../khive-storage" }
 async-trait = { workspace = true }

@@ -437,10 +437,15 @@ struct TraverseParams {
     include_roots: Option<bool>,
 }
 
+// Prevents unbounded result sets.
+const HARD_CAP: usize = 10_000;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QueryParams {
     query: String,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 // ---- Proposal param structs (ADR-046) ----
@@ -2838,7 +2843,14 @@ impl KgPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: QueryParams = deser(params)?;
-        let result = self.runtime.query_with_metadata(token, &p.query).await?;
+        let opts = khive_query::CompileOptions {
+            max_limit: p.limit.unwrap_or(500).min(HARD_CAP),
+            ..Default::default()
+        };
+        let result = self
+            .runtime
+            .query_with_metadata(token, &p.query, opts)
+            .await?;
         Ok(render_query_result(result))
     }
 

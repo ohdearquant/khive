@@ -573,15 +573,23 @@ static KG_HANDLERS: [HandlerDef; 16] = [
     // Assertive: retrieves pattern-matched results
     HandlerDef {
         name: "query",
-        description: "GQL pattern matching",
+        description: "GQL pattern matching. When a traversal mixes fixed-length and variable-length chains, split it into separate query() calls.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[ParamDef {
-            name: "query",
-            param_type: "string",
-            required: true,
-            description: "GQL pattern query string.",
-        }],
+        params: &[
+            ParamDef {
+                name: "query",
+                param_type: "string",
+                required: true,
+                description: "GQL pattern query string. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls, one for the fixed-length portion and one for the variable-length portion.",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum rows returned (default 500, hard cap 10 000).",
+            },
+        ],
     },
     // Commissive: commits a proposal to the namespace event log (ADR-046)
     HandlerDef {
@@ -1189,5 +1197,32 @@ mod help_tests {
             lambda_token.actor().id,
             "with_namespace must preserve actor identity"
         );
+    }
+
+    #[test]
+    fn query_help_documents_mixed_variable_chain_limitation() {
+        let h = find_handler("query");
+        assert!(
+            h.description
+                .contains("mixes fixed-length and variable-length"),
+            "query help must document mixed fixed/variable traversal limitation"
+        );
+        let query_param = h
+            .params
+            .iter()
+            .find(|p| p.name == "query")
+            .expect("query param documented");
+        assert!(
+            query_param
+                .description
+                .contains("split them into separate query() calls"),
+            "query param help must document split-query workaround"
+        );
+        let limit_param = h
+            .params
+            .iter()
+            .find(|p| p.name == "limit")
+            .expect("limit param must be documented in query handler metadata");
+        assert!(!limit_param.required, "limit must be optional");
     }
 }

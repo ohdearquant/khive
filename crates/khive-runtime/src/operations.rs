@@ -1683,7 +1683,10 @@ impl KhiveRuntime {
     /// GQL syntax: `MATCH (a:concept)-[e:extends]->(b) RETURN a, b LIMIT 10`
     /// SPARQL syntax: `SELECT ?a WHERE { ?a :kind "concept" . }`
     pub async fn query(&self, token: &NamespaceToken, query: &str) -> RuntimeResult<Vec<SqlRow>> {
-        Ok(self.query_with_metadata(token, query).await?.rows)
+        Ok(self
+            .query_with_metadata(token, query, khive_query::CompileOptions::default())
+            .await?
+            .rows)
     }
 
     /// Execute a GQL/SPARQL query, returning rows and any validation warnings.
@@ -1691,16 +1694,14 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         query: &str,
+        mut opts: khive_query::CompileOptions,
     ) -> RuntimeResult<QueryResult> {
         use khive_query::QueryValue;
         use khive_storage::types::SqlValue;
 
         let ns = token.namespace().as_str();
         let ast = khive_query::parse_auto(query)?;
-        let opts = khive_query::CompileOptions {
-            scopes: vec![ns.to_string()],
-            ..Default::default()
-        };
+        opts.scopes = vec![ns.to_string()];
         let compiled = khive_query::compile(&ast, &opts)?;
         let warnings = compiled.warnings;
 

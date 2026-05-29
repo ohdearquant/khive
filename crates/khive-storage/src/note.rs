@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, StorageResult};
+use crate::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, SqlValue, StorageResult};
 
 /// A storage-level note record. Flat, SQL-friendly representation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,6 +70,53 @@ impl Note {
     }
 }
 
+/// Sort direction for filtered note queries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// Comparison operator for a [`PropertyFilter`] on a JSON path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterOp {
+    Eq,
+    /// Matches rows where the JSON field equals the value OR the field is absent/NULL.
+    /// Used for properties that may be missing in legacy rows (e.g. `$.read`).
+    EqOrMissing,
+    Ne,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+/// A single `json_extract(properties, '$.field') op value` predicate.
+///
+/// Callers import this as `khive_storage::note::PropertyFilter` to avoid
+/// collision with the vector-metadata `PropertyFilter` in `khive_storage::types`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PropertyFilter {
+    pub json_path: String,
+    pub op: FilterOp,
+    pub value: SqlValue,
+}
+
+/// Filter + sort options for [`NoteStore::query_notes_filtered`].
+///
+/// Designed for general property-based filtering on any JSON field, not
+/// schedule-specific, so D9 and future packs can reuse the same API.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NoteFilter {
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub property_filters: Vec<PropertyFilter>,
+    /// `(json_path, direction)` — `None` defaults to `created_at DESC`.
+    pub order_by: Option<(String, SortDir)>,
+}
+
 #[async_trait]
 pub trait NoteStore: Send + Sync + 'static {
     async fn upsert_note(&self, note: Note) -> StorageResult<()>;
@@ -80,6 +127,12 @@ pub trait NoteStore: Send + Sync + 'static {
         &self,
         namespace: &str,
         kind: Option<&str>,
+        page: PageRequest,
+    ) -> StorageResult<Page<Note>>;
+    async fn query_notes_filtered(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
     async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;

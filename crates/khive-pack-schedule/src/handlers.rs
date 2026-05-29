@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::note::Note;
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
+use khive_storage::types::{PageRequest, SqlValue};
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
@@ -320,42 +321,40 @@ pub(crate) async fn handle_agenda(
         None => None,
     };
 
-    // Page through all scheduled_event notes until we have `limit` valid
-    // events or the result set is exhausted (H2 fix). A bounded prefetch
-    // could hide valid events behind many corrupt legacy rows — iterating
-    // until exhaustion guarantees correctness at the cost of extra fetches
-    // on large data sets with corrupt rows at the front (rare in practice).
-    //
-    // Performance follow-up: the schema_plan declares idx_schedule_trigger on
-    // json_extract(properties, '$.trigger_at') (ADR-040), but the current
-    // runtime list_notes path orders by created_at DESC and applies trigger_at
-    // sorting in-memory — the index is provisioned for a future schedule-
-    // specific storage query that filters pending notes and orders/ranges by
-    // trigger_at directly. Tracked as a follow-up issue.
+    // Push kind + status filter into SQL so SQLite can use idx_schedule_trigger
+    // (declared in lib.rs on json_extract(properties,'$.trigger_at')).
+    // The RFC3339 from/to window comparison and the Rust sort by parsed DateTime<Utc>
+    // are kept in Rust to preserve timezone-correct ordering and handle corrupt legacy rows.
+    let store = runtime.notes(token)?;
+    let namespace = token.namespace().as_str();
+    let filter = NoteFilter {
+        kind: Some("scheduled_event".to_string()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.status".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text("pending".to_string()),
+        }],
+        order_by: Some(("$.trigger_at".to_string(), SortDir::Asc)),
+    };
+
     const PAGE_SIZE: u32 = 200;
     let mut offset: u32 = 0;
     let mut events: Vec<(DateTime<Utc>, Value)> = Vec::new();
 
     loop {
-        let page = runtime
-            .list_notes(token, Some("scheduled_event"), PAGE_SIZE, offset)
+        let page = store
+            .query_notes_filtered(
+                namespace,
+                &filter,
+                PageRequest {
+                    limit: PAGE_SIZE,
+                    offset: offset.into(),
+                },
+            )
             .await?;
-        let page_len = page.len() as u32;
+        let page_len = page.items.len() as u32;
 
-        for n in &page {
-            if n.deleted_at.is_some() {
-                continue;
-            }
-            let status = n
-                .properties
-                .as_ref()
-                .and_then(|p| p.get("status"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if status != "pending" {
-                continue;
-            }
-
+        for n in &page.items {
             // Parse trigger_at as an instant. Skip rows with unparseable
             // trigger_at — these are legacy corrupt rows (H1, H2).
             let trigger_at_str = n

@@ -1901,3 +1901,60 @@ async fn test_thread_sort_is_not_a_noop_issue_485() {
         "#485: thread must return in chronological order"
     );
 }
+
+// ── schema_plan regression: CommPack declares ADR-040 message indexes ─────────
+
+#[tokio::test]
+async fn comm_pack_exposes_non_empty_schema_plan() {
+    use khive_runtime::PackRuntime;
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = CommPack::new(runtime);
+    let plan = pack.schema_plan();
+
+    assert!(
+        !plan.is_empty(),
+        "CommPack must return a non-empty SchemaPlan"
+    );
+    assert_eq!(plan.pack, "comm", "SchemaPlan.pack must be 'comm'");
+    assert!(
+        !plan.statements.is_empty(),
+        "schema plan must have at least one DDL statement"
+    );
+
+    let combined = plan.statements.join(" ");
+    assert!(
+        combined.contains("idx_comm_message_direction"),
+        "schema plan must declare idx_comm_message_direction; got: {combined}"
+    );
+    assert!(
+        combined.contains("idx_comm_message_thread"),
+        "schema plan must declare idx_comm_message_thread; got: {combined}"
+    );
+    assert!(
+        combined.contains("CREATE INDEX IF NOT EXISTS"),
+        "schema plan DDL must be idempotent; got: {combined}"
+    );
+    assert!(
+        combined.contains("'message'"),
+        "schema plan indexes must be scoped to kind='message'; got: {combined}"
+    );
+}
+
+#[tokio::test]
+async fn verb_registry_aggregates_comm_schema_plan() {
+    let (registry, _rt) = build_registry();
+    let plans = registry.all_schema_plans();
+    assert!(
+        plans.iter().any(|p| p.pack == "comm"),
+        "registry must expose comm schema plan; got packs: {:?}",
+        plans.iter().map(|p| p.pack).collect::<Vec<_>>()
+    );
+    let comm_plan = plans
+        .iter()
+        .find(|p| p.pack == "comm")
+        .expect("comm plan present");
+    assert!(
+        !comm_plan.is_empty(),
+        "comm schema plan must have DDL statements"
+    );
+}

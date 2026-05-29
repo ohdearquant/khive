@@ -5,8 +5,24 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
 use khive_types::{HandlerDef, Pack, ParamDef, Visibility};
+
+/// Pack-auxiliary indexes for comm inbox and thread queries (ADR-040).
+///
+/// Both are partial indexes scoped to `kind = 'message'` notes.
+/// The inbox index covers direction + read-status for efficient unread filtering.
+/// The thread index covers thread_id for efficient thread retrieval.
+/// Statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 2] = [
+    "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
+        ON notes(namespace, json_extract(properties, '$.direction'), \
+        json_extract(properties, '$.read'), created_at DESC) \
+        WHERE kind = 'message'",
+    "CREATE INDEX IF NOT EXISTS idx_comm_message_thread \
+        ON notes(namespace, json_extract(properties, '$.thread_id'), created_at DESC) \
+        WHERE kind = 'message'",
+];
 
 pub struct CommPack {
     runtime: KhiveRuntime,
@@ -168,6 +184,13 @@ impl PackRuntime for CommPack {
     }
     fn requires(&self) -> &'static [&'static str] {
         <CommPack as Pack>::REQUIRES
+    }
+
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "comm",
+            statements: &COMM_SCHEMA_PLAN_STMTS,
+        }
     }
 
     async fn dispatch(

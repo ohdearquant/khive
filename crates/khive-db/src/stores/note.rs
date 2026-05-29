@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
-use khive_storage::note::Note;
-use khive_storage::types::{BatchWriteSummary, DeleteMode, Page, PageRequest};
+use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
+use khive_storage::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, SqlValue};
 use khive_storage::NoteStore;
 use khive_storage::StorageCapability;
 
@@ -175,6 +175,86 @@ fn build_note_where(
 
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     (clause, params)
+}
+
+/// Validate that a json_path is safe to interpolate into SQL.
+/// Accepts only `$.field` or `$.field.subfield` paths with alphanumeric/underscore segments.
+fn validate_json_path(path: &str) -> Result<(), StorageError> {
+    let valid = path.starts_with("$.")
+        && path[2..].split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: "query_notes_filtered".into(),
+            message: format!("invalid JSON path for note filter: {path:?}"),
+        })
+    }
+}
+
+fn json_extract_expr(path: &str) -> String {
+    format!("json_extract(properties, '{path}')")
+}
+
+fn sql_value_param(value: &SqlValue) -> Result<Box<dyn rusqlite::types::ToSql>, rusqlite::Error> {
+    Ok(match value {
+        SqlValue::Null => Box::new(Option::<String>::None),
+        SqlValue::Bool(v) => Box::new(*v as i64),
+        SqlValue::Integer(v) => Box::new(*v),
+        SqlValue::Float(v) => Box::new(*v),
+        SqlValue::Text(v) => Box::new(v.clone()),
+        SqlValue::Blob(v) => Box::new(v.clone()),
+        SqlValue::Json(v) => Box::new(
+            serde_json::to_string(v)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+        ),
+        SqlValue::Uuid(v) => Box::new(v.to_string()),
+        SqlValue::Timestamp(v) => Box::new(v.timestamp_micros()),
+    })
+}
+
+fn build_note_filter_where(
+    namespace: &str,
+    filter: &NoteFilter,
+) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>), rusqlite::Error> {
+    let mut conditions = vec![
+        "namespace = ?1".to_string(),
+        "deleted_at IS NULL".to_string(),
+    ];
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(namespace.to_string())];
+
+    if let Some(kind) = &filter.kind {
+        params.push(Box::new(kind.clone()));
+        conditions.push(format!("kind = ?{}", params.len()));
+    }
+
+    for pf in &filter.property_filters {
+        let expr = json_extract_expr(&pf.json_path);
+        if matches!(pf.op, FilterOp::EqOrMissing) {
+            params.push(sql_value_param(&pf.value)?);
+            conditions.push(format!(
+                "({expr} = ?{n} OR {expr} IS NULL)",
+                n = params.len()
+            ));
+            continue;
+        }
+        let op = match pf.op {
+            FilterOp::Eq => "=",
+            FilterOp::Ne => "!=",
+            FilterOp::Lt => "<",
+            FilterOp::Lte => "<=",
+            FilterOp::Gt => ">",
+            FilterOp::Gte => ">=",
+            FilterOp::EqOrMissing => unreachable!(),
+        };
+        params.push(sql_value_param(&pf.value)?);
+        conditions.push(format!("{expr} {op} ?{}", params.len()));
+    }
+
+    Ok((format!(" WHERE {}", conditions.join(" AND ")), params))
 }
 
 // =============================================================================
@@ -389,6 +469,75 @@ impl NoteStore for SqlNoteStore {
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
                  FROM notes{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+                where_sql, limit_idx, offset_idx,
+            );
+
+            let mut stmt = conn.prepare(&data_sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                data_params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), read_note)?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+
+            Ok(Page {
+                items,
+                total: Some(total as u64),
+            })
+        })
+        .await
+    }
+
+    async fn query_notes_filtered(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        page: PageRequest,
+    ) -> Result<Page<Note>, StorageError> {
+        // Validate paths before entering spawn_blocking (closures return rusqlite::Error).
+        for pf in &filter.property_filters {
+            validate_json_path(&pf.json_path)?;
+        }
+        if let Some((path, _)) = &filter.order_by {
+            validate_json_path(path)?;
+        }
+
+        let namespace = namespace.to_string();
+        let filter = filter.clone();
+
+        self.with_reader("query_notes_filtered", move |conn| {
+            let (count_sql, count_params) = build_note_filter_where(&namespace, &filter)?;
+            let total: i64 = {
+                let sql = format!("SELECT COUNT(*) FROM notes{}", count_sql);
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    count_params.iter().map(|p| p.as_ref()).collect();
+                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
+            };
+
+            let (where_sql, mut data_params) = build_note_filter_where(&namespace, &filter)?;
+            data_params.push(Box::new(page.limit as i64));
+            data_params.push(Box::new(page.offset as i64));
+
+            let order_clause = match &filter.order_by {
+                Some((path, dir)) => {
+                    let dir_str = match dir {
+                        SortDir::Asc => "ASC",
+                        SortDir::Desc => "DESC",
+                    };
+                    format!(" ORDER BY {} {dir_str}", json_extract_expr(path))
+                }
+                None => " ORDER BY created_at DESC".to_string(),
+            };
+
+            let limit_idx = data_params.len() - 1;
+            let offset_idx = data_params.len();
+            let data_sql = format!(
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
+                 expires_at, properties, created_at, updated_at, deleted_at \
+                 FROM notes{}{order_clause} LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
 
@@ -638,5 +787,179 @@ mod tests {
         store.upsert_note(note).await.unwrap();
         let fetched = store.get_note(id).await.unwrap().unwrap();
         assert_eq!(fetched.status, "active");
+    }
+
+    // -- query_notes_filtered tests --
+
+    fn make_note_with_props(
+        namespace: &str,
+        kind: &str,
+        content: &str,
+        props: serde_json::Value,
+    ) -> Note {
+        Note::new(namespace, kind, content).with_properties(props)
+    }
+
+    #[tokio::test]
+    async fn test_filtered_namespace_and_kind_isolation() {
+        let store = setup_memory_store();
+        use khive_storage::note::PropertyFilter as NotePropFilter;
+        use khive_storage::note::{FilterOp, NoteFilter};
+        use khive_storage::types::{PageRequest, SqlValue};
+
+        // Insert "scheduled_event" with status=pending in ns1
+        let n1 = make_note_with_props(
+            "ns1",
+            "scheduled_event",
+            "event1",
+            serde_json::json!({"status": "pending", "trigger_at": "2027-01-01T00:00:00Z"}),
+        );
+        let n2 = make_note_with_props(
+            "ns1",
+            "scheduled_event",
+            "event2",
+            serde_json::json!({"status": "done", "trigger_at": "2027-01-02T00:00:00Z"}),
+        );
+        let n3 = make_note_with_props(
+            "ns2",
+            "scheduled_event",
+            "event3",
+            serde_json::json!({"status": "pending", "trigger_at": "2027-01-03T00:00:00Z"}),
+        );
+        store.upsert_note(n1).await.unwrap();
+        store.upsert_note(n2).await.unwrap();
+        store.upsert_note(n3).await.unwrap();
+
+        let filter = NoteFilter {
+            kind: Some("scheduled_event".to_string()),
+            property_filters: vec![NotePropFilter {
+                json_path: "$.status".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("pending".to_string()),
+            }],
+            order_by: None,
+        };
+
+        let page = store
+            .query_notes_filtered("ns1", &filter, PageRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "only the pending ns1 event should appear"
+        );
+        assert_eq!(page.items[0].content, "event1");
+        assert_eq!(page.total, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_filtered_order_by_json_path_asc() {
+        let store = setup_memory_store();
+        use khive_storage::note::PropertyFilter as NotePropFilter;
+        use khive_storage::note::{FilterOp, NoteFilter, SortDir};
+        use khive_storage::types::{PageRequest, SqlValue};
+
+        // Insert in reverse order — filter should return ascending by trigger_at.
+        let n3 = make_note_with_props(
+            "ns1",
+            "scheduled_event",
+            "third",
+            serde_json::json!({"status": "pending", "trigger_at": "2027-01-03T00:00:00Z"}),
+        );
+        let n1 = make_note_with_props(
+            "ns1",
+            "scheduled_event",
+            "first",
+            serde_json::json!({"status": "pending", "trigger_at": "2027-01-01T00:00:00Z"}),
+        );
+        let n2 = make_note_with_props(
+            "ns1",
+            "scheduled_event",
+            "second",
+            serde_json::json!({"status": "pending", "trigger_at": "2027-01-02T00:00:00Z"}),
+        );
+        store.upsert_note(n3).await.unwrap();
+        store.upsert_note(n1).await.unwrap();
+        store.upsert_note(n2).await.unwrap();
+
+        let filter = NoteFilter {
+            kind: Some("scheduled_event".to_string()),
+            property_filters: vec![NotePropFilter {
+                json_path: "$.status".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("pending".to_string()),
+            }],
+            order_by: Some(("$.trigger_at".to_string(), SortDir::Asc)),
+        };
+
+        let page = store
+            .query_notes_filtered("ns1", &filter, PageRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 3);
+        assert_eq!(page.items[0].content, "first");
+        assert_eq!(page.items[1].content, "second");
+        assert_eq!(page.items[2].content, "third");
+    }
+
+    #[tokio::test]
+    async fn test_filtered_soft_deleted_excluded() {
+        let store = setup_memory_store();
+        use khive_storage::note::PropertyFilter as NotePropFilter;
+        use khive_storage::note::{FilterOp, NoteFilter};
+        use khive_storage::types::{DeleteMode, PageRequest, SqlValue};
+
+        let n = make_note_with_props(
+            "ns1",
+            "scheduled_event",
+            "to_delete",
+            serde_json::json!({"status": "pending"}),
+        );
+        let id = n.id;
+        store.upsert_note(n).await.unwrap();
+        store.delete_note(id, DeleteMode::Soft).await.unwrap();
+
+        let filter = NoteFilter {
+            kind: Some("scheduled_event".to_string()),
+            property_filters: vec![NotePropFilter {
+                json_path: "$.status".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("pending".to_string()),
+            }],
+            order_by: None,
+        };
+
+        let page = store
+            .query_notes_filtered("ns1", &filter, PageRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 0, "soft-deleted rows must not appear");
+    }
+
+    #[tokio::test]
+    async fn test_filtered_invalid_json_path_rejected() {
+        let store = setup_memory_store();
+        use khive_storage::note::PropertyFilter as NotePropFilter;
+        use khive_storage::note::{FilterOp, NoteFilter};
+        use khive_storage::types::{PageRequest, SqlValue};
+
+        let filter = NoteFilter {
+            kind: None,
+            property_filters: vec![NotePropFilter {
+                json_path: "DROP TABLE notes".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("x".to_string()),
+            }],
+            order_by: None,
+        };
+
+        let result = store
+            .query_notes_filtered("ns1", &filter, PageRequest::default())
+            .await;
+        assert!(
+            result.is_err(),
+            "invalid json_path must be rejected before SQL"
+        );
     }
 }

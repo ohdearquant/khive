@@ -29,10 +29,12 @@ members = [
     "kkernel",
     "khive-retrieval",
 ]
-# khive-merge removed — the custom three-way merge engine was superseded for v1
-# by git's line merge on sorted NDJSON (ADR-010, ADR-020). The conflict taxonomy
-# from ADR-043 is retained for a future conflict-resolution ADR; the crate is
-# excluded until that work is scoped.
+# khive-merge is forward-deployed v2 infrastructure (ADR-043), not removed or
+# superseded. It is excluded from workspace members because it is ahead of the
+# restructured khive-vcs crate until ADR-043 integration lands. The v1 merge path
+# remains git line-merge on sorted NDJSON (ADR-010, ADR-020); ADR-043's conflict
+# taxonomy and semantic merge are retained for v2. Keep the crate directory and
+# keep this exclusion from members.
 
 [workspace.package]
 version = "0.2.2"

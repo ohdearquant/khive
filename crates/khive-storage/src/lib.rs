@@ -30,7 +30,7 @@ pub use event::{
     Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
 };
 pub use graph::GraphStore;
-pub use note::{Note, NoteStore};
+pub use note::{FilterOp, Note, NoteFilter, NoteStore, SortDir};
 pub use sparse::SparseStore;
 pub use sql::{SqlAccess, SqlReader, SqlTransaction, SqlWriter};
 pub use text::TextSearch;

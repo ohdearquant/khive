@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
-use khive_storage::note::Note;
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
+use khive_storage::types::{PageRequest, SqlValue};
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
@@ -321,50 +322,42 @@ pub(crate) async fn handle_inbox(
         }
     };
 
-    const PAGE_SIZE: u32 = 200;
-    let mut messages: Vec<Value> = Vec::with_capacity(limit);
-    let mut db_offset: u32 = 0;
-
-    loop {
-        let page = runtime
-            .list_notes(token, Some("message"), PAGE_SIZE, db_offset)
-            .await?;
-        let fetched = page.len();
-
-        for n in page {
-            if n.deleted_at.is_some() {
-                continue;
-            }
-            let props = n.properties.as_ref();
-            let direction = props
-                .and_then(|p| p.get("direction"))
-                .and_then(Value::as_str);
-            if direction != Some("inbound") {
-                continue;
-            }
-            let read = props
-                .and_then(|p| p.get("read"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let passes = match status {
-                "unread" => !read,
-                "read" => read,
-                _ => true,
-            };
-            if passes {
-                messages.push(note_to_message_json(&n));
-                if messages.len() == limit {
-                    break;
-                }
-            }
-        }
-
-        if messages.len() == limit || (fetched as u32) < PAGE_SIZE {
-            break;
-        }
-        db_offset += PAGE_SIZE;
+    // Push direction + read-status filters into SQL so idx_comm_message_direction is usable.
+    let mut property_filters = vec![PropertyFilter {
+        json_path: "$.direction".to_string(),
+        op: FilterOp::Eq,
+        value: SqlValue::Text("inbound".to_string()),
+    }];
+    match status {
+        "unread" => property_filters.push(PropertyFilter {
+            json_path: "$.read".to_string(),
+            op: FilterOp::EqOrMissing,
+            value: SqlValue::Bool(false),
+        }),
+        "read" => property_filters.push(PropertyFilter {
+            json_path: "$.read".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Bool(true),
+        }),
+        _ => {} // "all" — no read-status filter
     }
-
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters,
+        order_by: None, // preserves existing created_at DESC ordering
+    };
+    let page = runtime
+        .notes(token)?
+        .query_notes_filtered(
+            token.namespace().as_str(),
+            &filter,
+            PageRequest {
+                limit: limit as u32,
+                offset: 0,
+            },
+        )
+        .await?;
+    let messages: Vec<Value> = page.items.iter().map(note_to_message_json).collect();
     let count = messages.len();
     Ok(json!({ "messages": messages, "count": count }))
 }
@@ -620,23 +613,38 @@ pub(crate) async fn handle_thread(
 
     let canonical_short = &canonical_thread_id[..8];
 
-    // Paginated scan: collect up to `limit` matching messages without a fixed
-    // prefetch cap.  Sorting happens after collection because DB ordering is by
-    // `created_at DESC`; we need ascending for thread display.
+    // Paginated scan over kind=message notes (SQL handles deleted_at IS NULL).
+    // Thread matching is preserved exactly in Rust to cover all 4 cases:
+    // (a) own UUID == canonical_thread_id (the root note itself)
+    // (b) properties.thread_id == canonical_thread_id (exact UUID reply)
+    // (c) properties.thread_id == canonical_short (legacy 8-char stored value)
+    // (d) properties.thread_id[..8] == canonical_short (legacy prefix)
+    // Sorting happens after collection because SQL orders by created_at DESC;
+    // thread display requires chronological ascending order.
+    let thread_store = runtime.notes(token)?;
+    let thread_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![],
+        order_by: None,
+    };
     const PAGE_SIZE: u32 = 200;
     let mut messages: Vec<Value> = Vec::new();
     let mut db_offset: u32 = 0;
 
     loop {
-        let page = runtime
-            .list_notes(token, Some("message"), PAGE_SIZE, db_offset)
+        let page = thread_store
+            .query_notes_filtered(
+                token.namespace().as_str(),
+                &thread_filter,
+                PageRequest {
+                    limit: PAGE_SIZE,
+                    offset: db_offset.into(),
+                },
+            )
             .await?;
-        let fetched = page.len();
+        let fetched = page.items.len() as u32;
 
-        for n in page {
-            if n.deleted_at.is_some() {
-                continue;
-            }
+        for n in &page.items {
             let props = n.properties.as_ref();
 
             // A message belongs to this thread if:
@@ -664,11 +672,11 @@ pub(crate) async fn handle_thread(
             };
 
             if matches {
-                messages.push(note_to_message_json(&n));
+                messages.push(note_to_message_json(n));
             }
         }
 
-        if (fetched as u32) < PAGE_SIZE {
+        if fetched < PAGE_SIZE {
             break;
         }
         db_offset += PAGE_SIZE;
