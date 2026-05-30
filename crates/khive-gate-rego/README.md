@@ -116,8 +116,6 @@ Per [ADR-018](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-018-au
 - `khive-gate` (Apache-2.0) — the public `Gate` trait, `AllowAllGate` default, and the
   `AuditEvent` contract.
 - **`khive-gate-rego` (Apache-2.0)** — this crate; the OSS reference Rego backend.
-- `LionGate<G>` (khive-cloud, BUSL) — wraps any `Gate` with lion-core capability
-  witnesses for verifiable enforcement.
 
 ## License
 
