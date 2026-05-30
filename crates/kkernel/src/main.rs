@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
         Command::Kg(k) => kg::run_kg(k).await,
-        Command::Engine(e) => engine::run_engine(e),
+        Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,
         Command::Backend(b) => cmd_backend(b),

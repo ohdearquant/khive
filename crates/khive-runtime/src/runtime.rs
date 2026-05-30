@@ -282,6 +282,30 @@ impl KhiveRuntime {
         })
     }
 
+    /// Open a runtime for read-only inspection (no model registration, no DB creation).
+    ///
+    /// Runs migrations (idempotent) but skips `register_configured_embedding_models`,
+    /// so `engine list` / `engine status` cannot mutate the registry as a side effect.
+    /// Returns `None` when `db_path` is `None` and the default DB does not exist.
+    pub fn new_readonly(config: RuntimeConfig) -> RuntimeResult<Self> {
+        let backend = match &config.db_path {
+            Some(path) => StorageBackend::sqlite(path)?,
+            None => StorageBackend::memory()?,
+        };
+        {
+            let mut writer = backend.pool().try_writer()?;
+            khive_db::run_migrations(writer.conn_mut())?;
+        }
+        let (registry, default_embedder_name) = build_embedder_registry(&config);
+        Ok(Self {
+            backend: Arc::new(backend),
+            config,
+            embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
+            default_embedder_name,
+            edge_rules: Arc::new(RwLock::new(Vec::new())),
+        })
+    }
+
     /// Construct a runtime from an already-opened backend (ADR-028 boot path).
     ///
     /// This is the preferred constructor for multi-backend deployments. The caller
@@ -626,6 +650,110 @@ impl KhiveRuntime {
                 std::any::type_name::<dyn crate::embedder_registry::EmbedderProvider>()
             );
         }
+    }
+
+    /// List registered embedding models via `SqlAccess`, routing through the
+    /// existing connection pool rather than opening a fresh `Connection` per call.
+    ///
+    /// Optionally filter by `engine_name`. Returns an empty vec when the
+    /// `_embedding_models` table does not yet exist (e.g. no migrations have run
+    /// or no models have been registered). All other SQL errors are propagated.
+    pub async fn list_embedding_models(
+        &self,
+        engine_filter: Option<&str>,
+    ) -> RuntimeResult<Vec<khive_db::EmbeddingModelRegistryRecord>> {
+        use khive_storage::{SqlStatement, SqlValue};
+
+        let (sql_text, params) = if let Some(engine) = engine_filter {
+            (
+                "SELECT engine_name, model_id, key_version, dim, status, \
+                 activated_at, superseded_at \
+                 FROM _embedding_models WHERE engine_name = ?1 \
+                 ORDER BY engine_name, activated_at IS NULL, activated_at"
+                    .to_string(),
+                vec![SqlValue::Text(engine.to_string())],
+            )
+        } else {
+            (
+                "SELECT engine_name, model_id, key_version, dim, status, \
+                 activated_at, superseded_at \
+                 FROM _embedding_models \
+                 ORDER BY engine_name, activated_at IS NULL, activated_at"
+                    .to_string(),
+                vec![],
+            )
+        };
+
+        let stmt = SqlStatement {
+            sql: sql_text,
+            params,
+            label: Some("list_embedding_models".into()),
+        };
+
+        let mut reader = self
+            .sql()
+            .reader()
+            .await
+            .map_err(crate::RuntimeError::Storage)?;
+
+        let rows = match reader.query_all(stmt).await {
+            Ok(rows) => rows,
+            Err(e) if e.to_string().contains("no such table: _embedding_models") => {
+                return Ok(Vec::new())
+            }
+            Err(e) => return Err(crate::RuntimeError::Storage(e)),
+        };
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            macro_rules! required_text {
+                ($col:expr) => {
+                    match row.get($col) {
+                        Some(SqlValue::Text(s)) => s.clone(),
+                        other => {
+                            tracing::warn!(column = $col, value = ?other, "skipping registry row: unexpected type");
+                            continue;
+                        }
+                    }
+                };
+            }
+            let engine_name = required_text!("engine_name");
+            let model_id = required_text!("model_id");
+            let key_version = required_text!("key_version");
+            let dimensions = match row.get("dim") {
+                Some(SqlValue::Integer(n)) => match u32::try_from(*n) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        tracing::warn!(dim = n, "skipping registry row: dim out of u32 range");
+                        continue;
+                    }
+                },
+                other => {
+                    tracing::warn!(column = "dim", value = ?other, "skipping registry row: unexpected type");
+                    continue;
+                }
+            };
+            let status = required_text!("status");
+            let activated_at = match row.get("activated_at") {
+                Some(SqlValue::Integer(n)) => Some(*n),
+                _ => None,
+            };
+            let superseded_at = match row.get("superseded_at") {
+                Some(SqlValue::Integer(n)) => Some(*n),
+                _ => None,
+            };
+            records.push(khive_db::EmbeddingModelRegistryRecord {
+                engine_name,
+                model_id,
+                key_version,
+                dimensions,
+                status,
+                activated_at,
+                superseded_at,
+            });
+        }
+
+        Ok(records)
     }
 }
 
@@ -1050,5 +1178,78 @@ mod tests {
         let result = runtime_config_from_khive_config(&cfg, base);
         assert_eq!(result.default_namespace.as_str(), "lambda:test");
         assert!(result.embedding_model.is_some());
+    }
+
+    // ---- list_embedding_models tests ----
+
+    #[tokio::test]
+    async fn list_embedding_models_returns_empty_when_table_absent() {
+        // A brand-new in-memory runtime has migrations applied, so _embedding_models
+        // IS created. But with no rows inserted, the result must be empty.
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let records = rt
+            .list_embedding_models(None)
+            .await
+            .expect("list ok on empty table");
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_embedding_models_returns_row_after_insert() {
+        use khive_storage::{SqlStatement, SqlValue};
+
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let sql = rt.sql();
+
+        let now = 1_000_000i64;
+        let id = uuid::Uuid::new_v4();
+        let canonical_key = b"test_engine:test-model-v1:v1:384".to_vec();
+
+        let mut writer = sql.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO _embedding_models \
+                      (id, engine_name, model_id, key_version, dim, output_dim, status, \
+                       activated_at, superseded_at, superseded_by, canonical_key, created_at) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?8, ?9)"
+                    .into(),
+                params: vec![
+                    SqlValue::Blob(id.as_bytes().to_vec()),
+                    SqlValue::Text("test_engine".into()),
+                    SqlValue::Text("test-model-v1".into()),
+                    SqlValue::Text("v1".into()),
+                    SqlValue::Integer(384),
+                    SqlValue::Text("active".into()),
+                    SqlValue::Integer(now),
+                    SqlValue::Blob(canonical_key),
+                    SqlValue::Integer(now),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert row");
+        drop(writer);
+
+        let records = rt.list_embedding_models(None).await.expect("list ok");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].engine_name, "test_engine");
+        assert_eq!(records[0].model_id, "test-model-v1");
+        assert_eq!(records[0].key_version, "v1");
+        assert_eq!(records[0].dimensions, 384);
+        assert_eq!(records[0].status, "active");
+
+        // engine filter — match
+        let filtered = rt
+            .list_embedding_models(Some("test_engine"))
+            .await
+            .expect("filter ok");
+        assert_eq!(filtered.len(), 1);
+
+        // engine filter — no match
+        let no_match = rt
+            .list_embedding_models(Some("other_engine"))
+            .await
+            .expect("no-match ok");
+        assert!(no_match.is_empty());
     }
 }
