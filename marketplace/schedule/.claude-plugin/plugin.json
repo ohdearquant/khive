@@ -1,0 +1,13 @@
+{
+  "name": "schedule",
+  "description": "Time-based scheduling for khive — set reminders, schedule future verb dispatches, view agenda, and cancel events.",
+  "version": "0.2.2",
+  "author": {
+    "name": "Ocean (HaiyangLi)",
+    "url": "https://github.com/ohdearquant"
+  },
+  "homepage": "https://github.com/ohdearquant/khive",
+  "repository": "https://github.com/ohdearquant/khive",
+  "license": "Apache-2.0",
+  "keywords": ["schedule", "reminders", "cron", "agenda", "time", "automation", "mcp"]
+}
