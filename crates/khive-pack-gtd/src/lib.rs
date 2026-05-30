@@ -114,16 +114,23 @@ static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
 /// `gtd_lifecycle_audit` records every `transition` (and `complete`) invocation
 /// for replay and compliance auditing.  The table is idempotent (`CREATE TABLE
 /// IF NOT EXISTS`) and is NOT part of the core versioned migration chain.
-pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
+pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 3] = [
     "CREATE TABLE IF NOT EXISTS gtd_lifecycle_audit (\
         note_id    TEXT NOT NULL,\
         from_state TEXT NOT NULL,\
         to_state   TEXT NOT NULL,\
         note       TEXT,\
-        at         INTEGER NOT NULL\
+        at         INTEGER NOT NULL,\
+        namespace  TEXT\
     )",
     "CREATE INDEX IF NOT EXISTS idx_gtd_audit_note \
         ON gtd_lifecycle_audit(note_id, at DESC)",
+    // Idempotent migration for existing DBs that predate the namespace column.
+    // SQLite ALTER TABLE ADD COLUMN fails with "duplicate column name" if the
+    // column already exists; ensure_audit_schema swallows that specific error.
+    // The column is nullable so legacy rows get NULL (unknown) rather than a
+    // false 'default' attribution. New inserts always supply a concrete namespace.
+    "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT",
 ];
 
 // ADR-025: Illocutionary classification (Searle 1976)

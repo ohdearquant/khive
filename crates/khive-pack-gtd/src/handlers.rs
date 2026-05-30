@@ -33,15 +33,18 @@ use crate::GtdPack;
 /// in-memory database that needs its own schema bootstrap.  In production the
 /// DDL is idempotent and cheap (SQLite skips `IF NOT EXISTS` tables instantly).
 async fn ensure_audit_schema(runtime: &KhiveRuntime) {
-    let script = crate::GTD_SCHEMA_PLAN_STMTS.join(";");
-    match runtime.sql().writer().await {
-        Ok(mut w) => {
-            if let Err(e) = w.execute_script(script).await {
-                tracing::warn!(error = %e, "gtd: failed to apply lifecycle_audit schema (non-fatal)");
+    let Ok(mut w) = runtime.sql().writer().await else {
+        tracing::warn!("gtd: failed to acquire SQL writer for audit schema (non-fatal)");
+        return;
+    };
+    for stmt in &crate::GTD_SCHEMA_PLAN_STMTS {
+        if let Err(e) = w.execute_script(stmt.to_string()).await {
+            // Swallow "duplicate column name" from the idempotent ALTER on existing DBs.
+            let msg = e.to_string();
+            if msg.contains("duplicate column name") {
+                continue;
             }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "gtd: failed to acquire SQL writer for audit schema (non-fatal)");
+            tracing::warn!(error = %e, stmt, "gtd: failed to apply lifecycle_audit schema stmt (non-fatal)");
         }
     }
 }
@@ -56,11 +59,13 @@ async fn write_audit_record(
     from: &str,
     to: &str,
     transition_note: Option<&str>,
+    namespace: &str,
 ) {
     let now = Utc::now().timestamp_micros();
     let stmt = SqlStatement {
-        sql: "INSERT INTO gtd_lifecycle_audit (note_id, from_state, to_state, note, at) \
-              VALUES (?1, ?2, ?3, ?4, ?5)"
+        sql: "INSERT INTO gtd_lifecycle_audit \
+              (note_id, from_state, to_state, note, at, namespace) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
             .into(),
         params: vec![
             SqlValue::Text(note_id.as_hyphenated().to_string()),
@@ -71,6 +76,7 @@ async fn write_audit_record(
                 None => SqlValue::Null,
             },
             SqlValue::Integer(now),
+            SqlValue::Text(namespace.to_string()),
         ],
         label: Some("gtd_audit".into()),
     };
@@ -757,7 +763,15 @@ impl GtdPack {
 
         // ADR-019: write lifecycle audit record (best-effort).
         ensure_audit_schema(self.runtime()).await;
-        write_audit_record(self.runtime(), note.id, &current, target, None).await;
+        write_audit_record(
+            self.runtime(),
+            note.id,
+            &current,
+            target,
+            None,
+            token.namespace().as_str(),
+        )
+        .await;
 
         Ok(json!({
             "completed": true,
@@ -933,7 +947,15 @@ impl GtdPack {
 
         // ADR-019 + ADR-101: write lifecycle audit record (best-effort).
         ensure_audit_schema(self.runtime()).await;
-        write_audit_record(self.runtime(), note.id, &current, target, p.note.as_deref()).await;
+        write_audit_record(
+            self.runtime(),
+            note.id,
+            &current,
+            target,
+            p.note.as_deref(),
+            token.namespace().as_str(),
+        )
+        .await;
 
         let task = render_task(&note);
         Ok(json!({
