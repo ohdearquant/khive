@@ -5,6 +5,7 @@
 //! pack verb — it operates on the raw runtime stores regardless of which packs
 //! are loaded.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -13,6 +14,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_storage::error::StorageError;
+use khive_storage::VectorStore;
 use khive_types::SubstrateKind;
 
 const MAX_EMBED_BYTES: usize = 32_768;
@@ -51,6 +54,25 @@ struct ReindexReport {
     model_used: Option<String>,
     elapsed_ms: u64,
     errors_skipped: u64,
+}
+
+/// Return the subset of `ids` that do NOT already have an embedding in `vectors`
+/// for the given `namespace`. When `batch_exists` is unsupported (e.g. a custom
+/// backend), conservatively returns all IDs so every record gets embedded.
+async fn filter_unembedded(
+    vectors: &dyn VectorStore,
+    ids: &[Uuid],
+    namespace: &str,
+) -> Result<Vec<Uuid>> {
+    match vectors.batch_exists(ids, namespace).await {
+        Ok(existing) => Ok(ids
+            .iter()
+            .filter(|id| !existing.contains(id))
+            .copied()
+            .collect()),
+        Err(StorageError::Unsupported { .. }) => Ok(ids.to_vec()),
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
 }
 
 pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
@@ -118,45 +140,65 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         }
 
         if !staged.is_empty() {
-            let texts: Vec<String> = staged.iter().map(|(_, t)| truncate_text(t)).collect();
-
-            match rt.embed_batch_with_model(&model_name, &texts).await {
-                Ok(embeddings) if embeddings.len() == staged.len() => {
-                    match rt.vectors_for_model(&token, &model_name) {
-                        Ok(vectors) => {
-                            for ((id, _), emb) in staged.iter().zip(embeddings.iter()) {
-                                if drop_existing {
-                                    let _ = vectors.delete(*id).await;
-                                }
-                                if let Err(e) = vectors
-                                    .insert(
-                                        *id,
-                                        SubstrateKind::Entity,
-                                        &ns_str,
-                                        "entity.body",
-                                        vec![emb.clone()],
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(entity_id = %id, error = %e, "entity vector insert failed");
-                                    errors_skipped += 1;
-                                }
-                            }
-                            entities_processed += staged.len() as u64;
+            // When keeping existing vectors, skip IDs that already have embeddings.
+            if !drop_existing {
+                if let Ok(vectors) = rt.vectors_for_model(&token, &model_name) {
+                    let all_ids: Vec<Uuid> = staged.iter().map(|(id, _)| *id).collect();
+                    match filter_unembedded(vectors.as_ref(), &all_ids, &ns_str).await {
+                        Ok(unembedded) => {
+                            let keep: HashSet<Uuid> = unembedded.into_iter().collect();
+                            staged.retain(|(id, _)| keep.contains(id));
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "failed to get vector store for model");
+                            tracing::error!(error = %e, "filter_unembedded failed; skipping entity batch to honour --keep-existing");
                             errors_skipped += staged.len() as u64;
+                            staged.clear();
                         }
                     }
                 }
-                Ok(_) => {
-                    tracing::warn!("embedding count mismatch for entity batch");
-                    errors_skipped += staged.len() as u64;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "entity embed_batch failed");
-                    errors_skipped += staged.len() as u64;
+            }
+
+            if !staged.is_empty() {
+                let texts: Vec<String> = staged.iter().map(|(_, t)| truncate_text(t)).collect();
+
+                match rt.embed_batch_with_model(&model_name, &texts).await {
+                    Ok(embeddings) if embeddings.len() == staged.len() => {
+                        match rt.vectors_for_model(&token, &model_name) {
+                            Ok(vectors) => {
+                                for ((id, _), emb) in staged.iter().zip(embeddings.iter()) {
+                                    if drop_existing {
+                                        let _ = vectors.delete(*id).await;
+                                    }
+                                    if let Err(e) = vectors
+                                        .insert(
+                                            *id,
+                                            SubstrateKind::Entity,
+                                            &ns_str,
+                                            "entity.body",
+                                            vec![emb.clone()],
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(entity_id = %id, error = %e, "entity vector insert failed");
+                                        errors_skipped += 1;
+                                    }
+                                }
+                                entities_processed += staged.len() as u64;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to get vector store for model");
+                                errors_skipped += staged.len() as u64;
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!("embedding count mismatch for entity batch");
+                        errors_skipped += staged.len() as u64;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "entity embed_batch failed");
+                        errors_skipped += staged.len() as u64;
+                    }
                 }
             }
         }
@@ -193,45 +235,65 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         }
 
         if !staged.is_empty() {
-            let texts: Vec<String> = staged.iter().map(|(_, t)| truncate_text(t)).collect();
-
-            match rt.embed_batch_with_model(&model_name, &texts).await {
-                Ok(embeddings) if embeddings.len() == staged.len() => {
-                    match rt.vectors_for_model(&token, &model_name) {
-                        Ok(vectors) => {
-                            for ((id, _), emb) in staged.iter().zip(embeddings.iter()) {
-                                if drop_existing {
-                                    let _ = vectors.delete(*id).await;
-                                }
-                                if let Err(e) = vectors
-                                    .insert(
-                                        *id,
-                                        SubstrateKind::Note,
-                                        &ns_str,
-                                        "note.content",
-                                        vec![emb.clone()],
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(note_id = %id, error = %e, "note vector insert failed");
-                                    errors_skipped += 1;
-                                }
-                            }
-                            notes_processed += staged.len() as u64;
+            // When keeping existing vectors, skip IDs that already have embeddings.
+            if !drop_existing {
+                if let Ok(vectors) = rt.vectors_for_model(&token, &model_name) {
+                    let all_ids: Vec<Uuid> = staged.iter().map(|(id, _)| *id).collect();
+                    match filter_unembedded(vectors.as_ref(), &all_ids, &ns_str).await {
+                        Ok(unembedded) => {
+                            let keep: HashSet<Uuid> = unembedded.into_iter().collect();
+                            staged.retain(|(id, _)| keep.contains(id));
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "failed to get vector store for model (notes)");
+                            tracing::error!(error = %e, "filter_unembedded failed; skipping note batch to honour --keep-existing");
                             errors_skipped += staged.len() as u64;
+                            staged.clear();
                         }
                     }
                 }
-                Ok(_) => {
-                    tracing::warn!("embedding count mismatch for note batch");
-                    errors_skipped += staged.len() as u64;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "note embed_batch failed");
-                    errors_skipped += staged.len() as u64;
+            }
+
+            if !staged.is_empty() {
+                let texts: Vec<String> = staged.iter().map(|(_, t)| truncate_text(t)).collect();
+
+                match rt.embed_batch_with_model(&model_name, &texts).await {
+                    Ok(embeddings) if embeddings.len() == staged.len() => {
+                        match rt.vectors_for_model(&token, &model_name) {
+                            Ok(vectors) => {
+                                for ((id, _), emb) in staged.iter().zip(embeddings.iter()) {
+                                    if drop_existing {
+                                        let _ = vectors.delete(*id).await;
+                                    }
+                                    if let Err(e) = vectors
+                                        .insert(
+                                            *id,
+                                            SubstrateKind::Note,
+                                            &ns_str,
+                                            "note.content",
+                                            vec![emb.clone()],
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(note_id = %id, error = %e, "note vector insert failed");
+                                        errors_skipped += 1;
+                                    }
+                                }
+                                notes_processed += staged.len() as u64;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to get vector store for model (notes)");
+                                errors_skipped += staged.len() as u64;
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!("embedding count mismatch for note batch");
+                        errors_skipped += staged.len() as u64;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "note embed_batch failed");
+                        errors_skipped += staged.len() as u64;
+                    }
                 }
             }
         }

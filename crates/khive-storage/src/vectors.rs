@@ -1,5 +1,6 @@
 //! Vector embedding storage and similarity search capability (ADR-024, ADR-041).
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
@@ -134,6 +135,21 @@ pub trait VectorStore: Send + Sync + 'static {
             capability: StorageCapability::Vectors,
             operation: "orphan_sweep".into(),
             message: "this backend does not support orphan sweep".into(),
+        })
+    }
+
+    /// Check which of the given subject IDs already have embeddings in this store
+    /// for the specified namespace.
+    ///
+    /// Returns a [`HashSet`] of IDs that are present. IDs not in the returned set
+    /// have no embedding. Default returns [`StorageError::Unsupported`]; backends
+    /// that support fast bulk existence checks should override this method.
+    async fn batch_exists(&self, ids: &[Uuid], namespace: &str) -> StorageResult<HashSet<Uuid>> {
+        let _ = (ids, namespace);
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Vectors,
+            operation: "batch_exists".into(),
+            message: "this backend does not support batch existence checks".into(),
         })
     }
 }

@@ -7,6 +7,7 @@
 //!
 //! sqlite-vec expects embeddings as contiguous little-endian f32 bytes.
 
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -503,6 +504,57 @@ impl VectorStore for SqliteVecStore {
         self.info().await
     }
 
+    async fn batch_exists(
+        &self,
+        ids: &[Uuid],
+        namespace: &str,
+    ) -> Result<HashSet<Uuid>, StorageError> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let table = self.table_name.clone();
+        let namespace = namespace.to_string();
+        let model = self.embedding_model.clone();
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+
+        self.with_reader("vec_batch_exists", move |conn| {
+            let mut found = HashSet::new();
+
+            for chunk in id_strings.chunks(400) {
+                // ?1 = namespace, ?2 = embedding_model, ?3.. = subject IDs.
+                let placeholders: String = (0..chunk.len())
+                    .map(|i| format!("?{}", i + 3))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let sql = format!(
+                    "SELECT subject_id FROM {} WHERE namespace = ?1 \
+                     AND embedding_model = ?2 AND subject_id IN ({})",
+                    table, placeholders
+                );
+
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.raw_bind_parameter(1, namespace.as_str())?;
+                stmt.raw_bind_parameter(2, model.as_str())?;
+                for (i, id_str) in chunk.iter().enumerate() {
+                    stmt.raw_bind_parameter(i + 3, id_str.as_str())?;
+                }
+
+                let mut rows = stmt.raw_query();
+                while let Some(row) = rows.next()? {
+                    let id_str: String = row.get(0)?;
+                    if let Ok(uuid) = Uuid::parse_str(&id_str) {
+                        found.insert(uuid);
+                    }
+                }
+            }
+
+            Ok(found)
+        })
+        .await
+    }
+
     fn capabilities(&self) -> &'static VectorStoreCapabilities {
         static SQLITE_VEC_CAPABILITIES: OnceLock<VectorStoreCapabilities> = OnceLock::new();
         SQLITE_VEC_CAPABILITIES.get_or_init(|| VectorStoreCapabilities {
@@ -626,6 +678,155 @@ impl SqliteVecStore {
             Ok(all_hits)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod batch_exists_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use khive_types::SubstrateKind;
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn make_vec_pool() -> Arc<crate::pool::ConnectionPool> {
+        use crate::pool::{ConnectionPool, PoolConfig};
+        crate::extension::ensure_extensions_loaded();
+        let config = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        Arc::new(ConnectionPool::new(config).expect("in-memory pool"))
+    }
+
+    fn create_vec_table(pool: &Arc<crate::pool::ConnectionPool>, model_key: &str, dims: usize) {
+        let writer = pool.try_writer().expect("pool writer");
+        let ddl = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
+             subject_id TEXT PRIMARY KEY, \
+             namespace TEXT NOT NULL, \
+             kind TEXT NOT NULL, \
+             field TEXT NOT NULL, \
+             embedding_model TEXT NOT NULL, \
+             embedding float[{}] distance_metric=cosine)",
+            model_key, dims
+        );
+        writer.conn().execute_batch(&ddl).expect("create vec table");
+    }
+
+    /// Valid (underscored) model key: batch_exists returns the exact set of IDs
+    /// that have embeddings and excludes IDs that were never inserted.
+    #[tokio::test]
+    async fn batch_exists_returns_correct_set_for_underscored_model_key() {
+        let pool = make_vec_pool();
+        let model_key = "all_minilm_l6_v2";
+        let dims = 4;
+        let ns = "ns:test";
+
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns.to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id_absent = Uuid::new_v4();
+
+        store
+            .insert(
+                id1,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec![0.1, 0.2, 0.3, 0.4]],
+            )
+            .await
+            .expect("insert id1");
+        store
+            .insert(
+                id2,
+                SubstrateKind::Entity,
+                ns,
+                "body",
+                vec![vec![0.5, 0.6, 0.7, 0.8]],
+            )
+            .await
+            .expect("insert id2");
+
+        let exists = store
+            .batch_exists(&[id1, id2, id_absent], ns)
+            .await
+            .expect("batch_exists");
+
+        assert!(exists.contains(&id1), "id1 must be found");
+        assert!(exists.contains(&id2), "id2 must be found");
+        assert!(
+            !exists.contains(&id_absent),
+            "absent id must not be returned"
+        );
+        assert_eq!(exists.len(), 2);
+    }
+
+    /// Empty input must return an empty set without hitting the DB.
+    #[tokio::test]
+    async fn batch_exists_empty_ids_returns_empty_set() {
+        let pool = make_vec_pool();
+        let model_key = "empty_test_model";
+        create_vec_table(&pool, model_key, 4);
+
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            4,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let exists: HashSet<Uuid> = store
+            .batch_exists(&[], "ns:test")
+            .await
+            .expect("batch_exists");
+        assert!(exists.is_empty());
+    }
+
+    /// Hyphenated model_key must be rejected at SqliteVecStore::new(), preventing
+    /// any table-name divergence between the store and a hand-rolled sanitizer.
+    #[test]
+    fn hyphenated_model_key_is_rejected_at_construction() {
+        use crate::pool::{ConnectionPool, PoolConfig};
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                ..PoolConfig::default()
+            })
+            .expect("pool"),
+        );
+
+        let result = SqliteVecStore::new(
+            pool,
+            false,
+            "all-minilm-l6-v2".to_string(),
+            "all-minilm-l6-v2".to_string(),
+            4,
+            "ns:test".to_string(),
+        );
+
+        assert!(
+            result.is_err(),
+            "hyphenated model_key 'all-minilm-l6-v2' must be rejected; \
+             the store's table_name would differ from what a hand-rolled sanitizer produces"
+        );
     }
 }
 
