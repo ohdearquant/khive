@@ -44,14 +44,22 @@ cd "$(dirname "$0")/../crates"
 CRATES=(
     khive-types
     khive-score
+    khive-vamana
     khive-fold
     khive-storage
+    khive-bm25
+    khive-fusion
     khive-db
+    khive-hnsw
     khive-query
     khive-gate
     khive-gate-rego
     khive-runtime
     khive-request
+    khive-retrieval
+    khive-vcs
+    khive-vcs-adapters
+    # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-kg
     khive-pack-gtd
     khive-pack-brain
@@ -60,16 +68,11 @@ CRATES=(
     khive-pack-schedule
     khive-pack-knowledge
     khive-pack-template
-    khive-vcs
-    # khive-merge — forward-deployed (ADR-043), not yet compilable against
-    # restructured khive-vcs. Skipped until ADR-043 integration lands.
-    # khive-bm25/khive-fusion/khive-hnsw/khive-retrieval/khive-vcs-adapters —
-    # workspace-only crates with no reverse deps; not published until wired in.
     khive-mcp
     kkernel
 )
 
-DELAY=30  # seconds to wait for crates.io index between publishes
+DELAY=5  # seconds to wait for crates.io index between publishes
 
 for crate in "${CRATES[@]}"; do
     echo ""
