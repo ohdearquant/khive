@@ -40,3 +40,7 @@ path = "tests/integration.rs"
 [[test]]
 name = "fixes"
 path = "tests/fixes.rs"
+
+[[test]]
+name = "bench"
+path = "tests/bench.rs"

@@ -44,20 +44,20 @@ capabilities of the lore service into the pack system.
 research-concept workflows. These verbs use existing entity kinds and edge relations;
 they do not introduce new ones.
 
-| Verb                       | Tier    | Category   | Description                                             |
-| -------------------------- | ------- | ---------- | ------------------------------------------------------- |
-| `knowledge.upsert_atoms`   | Corpus  | Commissive | Bulk insert/update slug-keyed knowledge atoms           |
-| `knowledge.upsert_domains` | Corpus  | Commissive | Bulk insert/update domain groupings of atoms            |
-| `knowledge.get`            | Corpus  | Assertive  | Fetch one atom or domain by ID or slug                  |
-| `knowledge.list`           | Corpus  | Assertive  | Paginated listing of atoms or domains                   |
-| `knowledge.delete_atoms`   | Corpus  | Commissive | Soft-delete atoms by slug                               |
-| `knowledge.stats`          | Corpus  | Assertive  | Corpus statistics (counts, coverage)                    |
-| `knowledge.index`          | Corpus  | Commissive | Backfill embeddings + FTS for atoms                     |
-| `knowledge.fold`           | Corpus  | Assertive  | Budget-constrained knapsack selection (token budgeting) |
-| `knowledge.search`         | Corpus  | Assertive  | TF-IDF + optional embedding rerank over the corpus      |
-| `knowledge.learn`          | Concept | Commissive | Register a concept entity with domain promotion         |
-| `knowledge.cite`           | Concept | Commissive | Link a concept to its source paper via `introduced_by`  |
-| `knowledge.topic`          | Concept | Assertive  | List/search concepts, optionally filtered by domain     |
+| Verb                       | Tier    | Category   | Description                                                                  |
+| -------------------------- | ------- | ---------- | ---------------------------------------------------------------------------- |
+| `knowledge.upsert_atoms`   | Corpus  | Commissive | Bulk insert/update slug-keyed knowledge atoms                                |
+| `knowledge.upsert_domains` | Corpus  | Commissive | Bulk insert/update domain groupings of atoms                                 |
+| `knowledge.get`            | Corpus  | Assertive  | Fetch one atom or domain by ID or slug                                       |
+| `knowledge.list`           | Corpus  | Assertive  | Paginated listing of atoms or domains                                        |
+| `knowledge.delete_atoms`   | Corpus  | Commissive | Soft-delete atoms by slug                                                    |
+| `knowledge.stats`          | Corpus  | Assertive  | Corpus statistics (counts, coverage)                                         |
+| `knowledge.index`          | Corpus  | Commissive | Backfill embeddings + FTS for atoms                                          |
+| `knowledge.fold`           | Corpus  | Assertive  | Budget-constrained knapsack selection (token budgeting)                      |
+| `knowledge.search`         | Corpus  | Assertive  | TF-IDF + embedding rerank (default when embedder configured) over the corpus |
+| `knowledge.learn`          | Concept | Commissive | Register a concept entity with domain promotion                              |
+| `knowledge.cite`           | Concept | Commissive | Link a concept to its source paper via `introduced_by`                       |
+| `knowledge.topic`          | Concept | Assertive  | List/search concepts, optionally filtered by domain                          |
 
 ### 1a. Corpus tier schema (V19 migration)
 
@@ -163,16 +163,17 @@ exhausted. Pure computation — no database access.
 #### `knowledge.search` — TF-IDF ranked search
 
 ```
-search(query, type?, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: false, rerank_alpha?: 0.7) → {items: [...], total: N}
+search(query, type?, role?, limit?: 10, min_score?: 0.0, weights?: {}, decompose?: false, decompose_threshold?: 4, intersection_bonus?: 0.25, rerank?: true, rerank_alpha?: 0.7) → {items: [...], total: N}
 ```
 
 FTS5 recall → in-memory TF-IDF scoring across name, description, tags, and content
-fields with configurable weights. Optional features:
+fields with configurable weights. Features:
 
 - **Query decomposition**: splits long queries into sub-queries, scores each
-  independently, and bonuses items that appear across multiple sub-queries.
-- **Embedding rerank**: blends TF-IDF scores with cosine similarity against the
-  query embedding. `rerank_alpha` controls the blend (0.7 = TF-IDF dominant).
+  independently, and bonuses items that appear across multiple sub-queries. Opt in with `decompose=true`.
+- **Embedding rerank** (default when embedder configured): blends TF-IDF scores with cosine
+  similarity against the query embedding. `rerank_alpha` controls the blend (0.7 = TF-IDF dominant).
+  Disable with `rerank=false`. No-op if no embedder is configured.
 - **Role weighting**: prepends the agent role to the query for contextual scoring.
 
 ### 3. `learn` — concept registration with domain promotion

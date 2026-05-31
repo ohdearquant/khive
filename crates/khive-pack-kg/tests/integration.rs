@@ -1069,6 +1069,70 @@ async fn search_unknown_kind_returns_invalid_input() {
     );
 }
 
+// #570: FTS operator regression matrix for KG note and entity search surfaces.
+#[tokio::test]
+async fn search_operator_matrix_does_not_crash() {
+    let pack = pack();
+
+    // Seed one note and one entity for context.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "note",
+            "content": "tenant isolation operator regression anchor content",
+            "note_kind": "observation"
+        }),
+    )
+    .await
+    .expect("seed note");
+
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "name": "OperatorMatrixAnchor",
+            "entity_kind": "concept",
+            "description": "tenant isolation operator regression anchor entity"
+        }),
+    )
+    .await
+    .expect("seed entity");
+
+    // Queries to exercise — invariant: no panic, returns Ok (empty or non-empty).
+    let cases: &[&str] = &[
+        "\"tenant isolation\"",
+        "tenant AND isolation",
+        "tenant OR isolation",
+        "tenant NOT isolation",
+        "tenant NEAR(isolation, 5)",
+        "tenant*",
+        "***",
+        "tenant:isolation",
+        "tenant ^ isolation",
+        "(tenant isolation)",
+        "(\"+_~!\")",
+        "tenant:foo^bar*",
+        "multi-tenant isolation",
+        "Bob's tenant",
+    ];
+
+    for kind in &["note", "entity"] {
+        for query in cases {
+            let result = pack
+                .dispatch(
+                    "search",
+                    json!({ "kind": kind, "query": query, "limit": 5 }),
+                )
+                .await;
+            assert!(
+                result.is_ok(),
+                "#570 KG search kind={kind} query={query:?} must not crash, got: {:?}",
+                result.err()
+            );
+        }
+    }
+}
+
 // ---- Traverse ----
 
 #[tokio::test]

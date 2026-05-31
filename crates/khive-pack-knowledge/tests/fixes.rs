@@ -118,7 +118,7 @@ async fn w5_search_excludes_deprecated_by_default() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "retrieval unique xyzqwerty" }),
+            json!({ "query": "retrieval unique xyzqwerty", "rerank": false }),
         )
         .await
         .expect("search ok");
@@ -156,7 +156,7 @@ async fn w5_search_includes_deprecated_when_explicitly_requested() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "retrieval unique qwertyzyx", "status": "deprecated" }),
+            json!({ "query": "retrieval unique qwertyzyx", "status": "deprecated", "rerank": false }),
         )
         .await
         .expect("search ok");
@@ -207,7 +207,7 @@ async fn w5_status_multiplier_verified_beats_draft() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "neural network gradient learning zzzxxx" }),
+            json!({ "query": "neural network gradient learning zzzxxx", "rerank": false }),
         )
         .await
         .expect("search ok");
@@ -292,7 +292,7 @@ async fn w1_atom_with_type_domain_tag_returns_kind_domain_in_search() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "retrieval domain techniques xyzabc" }),
+            json!({ "query": "retrieval domain techniques xyzabc", "rerank": false }),
         )
         .await
         .expect("search ok");
@@ -327,7 +327,7 @@ async fn d1_upserted_domain_returns_kind_domain_in_domain_search() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "machine learning techniques domain", "type": "domain" }),
+            json!({ "query": "machine learning techniques domain", "type": "domain", "rerank": false }),
         )
         .await
         .expect("search ok");
@@ -974,7 +974,7 @@ async fn f1_fuse_ann_hits_produces_valid_scores_via_search() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "reciprocal rank fusion scoring" }),
+            json!({ "query": "reciprocal rank fusion scoring", "rerank": false }),
         )
         .await
         .expect("search ok");
@@ -994,6 +994,10 @@ async fn f1_fuse_ann_hits_produces_valid_scores_via_search() {
         assert!(
             score.is_finite(),
             "fused score must be finite, got {score} for {r:?}"
+        );
+        assert!(
+            score <= 1.0,
+            "fused score must be normalized to [0,1], got {score} for {r:?}"
         );
     }
 }
@@ -1019,7 +1023,7 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "unique sentinel zzzyyyxxx" }),
+            json!({ "query": "unique sentinel zzzyyyxxx", "rerank": false }),
         )
         .await
         .expect("search ok");
@@ -1033,6 +1037,10 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
     assert!(
         score > 0.0 && score.is_finite(),
         "RRF_K=60 score must be positive and finite: {score}"
+    );
+    assert!(
+        score <= 1.0,
+        "RRF_K=60 score must be normalized to [0,1]: {score}"
     );
 }
 
@@ -1141,10 +1149,76 @@ async fn fts_query_special_characters_do_not_crash() {
 
     for query in ["multi-tenant isolation", "Bob's tenant"] {
         let resp = f
-            .dispatch("knowledge.search", json!({ "query": query }))
+            .dispatch(
+                "knowledge.search",
+                json!({ "query": query, "rerank": false }),
+            )
             .await
             .expect("search should not crash on FTS5 special characters");
         assert_eq!(resp["status"], "ok");
+    }
+}
+
+// #570: full FTS5 operator regression matrix
+#[tokio::test]
+async fn fts_operator_matrix_does_not_crash() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [{
+                "slug": "fts-matrix-anchor",
+                "name": "FTS Matrix Anchor",
+                "description": "tenant isolation multi-concept search operator regression anchor",
+                "content": "tenant isolation operator regression matrix anchor"
+            }]
+        }),
+    )
+    .await
+    .expect("seed atom");
+
+    // Invariant: no panic + status == "ok". Empty or non-empty results both accepted.
+    let cases: &[(&str, &str)] = &[
+        // Double-quoted phrases — embedded quotes escaped by quote_fts5_phrase.
+        ("double-quoted phrase", "\"tenant isolation\""),
+        ("double-quoted embedded", "Bob \"quoted\" tenant"),
+        // Boolean operators — treated as user text inside phrase-quoted FTS5 MATCH.
+        ("boolean AND", "tenant AND isolation"),
+        ("boolean OR", "tenant OR isolation"),
+        ("boolean NOT", "tenant NOT isolation"),
+        // NEAR — must not reach FTS5 as unsafe operator syntax.
+        ("NEAR operator", "tenant NEAR(isolation, 5)"),
+        // Wildcard * — must not cause FTS5 syntax errors.
+        ("wildcard word", "tenant*"),
+        ("wildcard only", "***"),
+        // Colon : — must not produce `no such column`.
+        ("colon selector", "tenant:isolation"),
+        // Caret ^ — must be stripped before MATCH.
+        ("caret", "tenant ^ isolation"),
+        // Parentheses — must not reach FTS5 as grouping operators.
+        ("parentheses", "(tenant isolation)"),
+        // Mixed special chars.
+        ("mixed special", "(\"+_~!\")"),
+        ("mixed colon star caret", "tenant:foo^bar*"),
+        // Original regression cases (preserved for history).
+        ("hyphenated", "multi-tenant isolation"),
+        ("apostrophe", "Bob's tenant"),
+    ];
+
+    for (label, query) in cases {
+        let resp = f
+            .dispatch(
+                "knowledge.search",
+                json!({ "query": query, "rerank": false }),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!("#570 query {label} {query:?} must not crash FTS5: {err}")
+            });
+        assert_eq!(
+            resp["status"], "ok",
+            "#570 query {label} {query:?} must return status=ok, got: {resp:?}"
+        );
     }
 }
 
@@ -1227,4 +1301,225 @@ async fn stats_embedding_coverage_counts_atom_vectors() {
         (coverage - 0.5).abs() < 1e-6,
         "expected 0.5 coverage, got: {coverage}"
     );
+}
+
+// ── #523: score normalization integration ────────────────────────────────────
+
+#[tokio::test]
+async fn search_scores_are_normalized_without_rank_inversion() {
+    let f = pack(rt());
+    // Seed atoms with different relevance levels via unique content terms.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "norm-high",
+                    "name": "Normalization High",
+                    "description": "normalization unique qzxqzx alpha scoring",
+                    "content": "normalization unique qzxqzx scoring alpha gamma delta epsilon"
+                },
+                {
+                    "slug": "norm-mid",
+                    "name": "Normalization Mid",
+                    "description": "normalization unique qzxqzx beta",
+                    "content": "normalization unique qzxqzx beta scoring"
+                },
+                {
+                    "slug": "norm-low",
+                    "name": "Normalization Low",
+                    "description": "normalization unique qzxqzx",
+                    "content": "normalization qzxqzx"
+                },
+            ]
+        }),
+    )
+    .await
+    .expect("seed atoms");
+
+    // Promote high to verified (1.2× multiplier after normalization, clamped to 1.0).
+    f.sql_exec(
+        "UPDATE knowledge_atoms SET status='verified' WHERE slug=?1",
+        vec![SqlValue::Text("norm-high".into())],
+    )
+    .await;
+
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "normalization unique qzxqzx", "rerank": false }),
+        )
+        .await
+        .expect("search ok");
+
+    assert_eq!(resp["status"], "ok");
+    let results = resp["data"]["results"].as_array().expect("results");
+    assert!(
+        results.len() >= 2,
+        "expected at least 2 results: {results:?}"
+    );
+
+    // All scores must be in [0,1].
+    for r in results {
+        let score = r["score"].as_f64().expect("score");
+        assert!(
+            (0.0..=1.0).contains(&score),
+            "score {score} out of [0,1] range for result {r:?}"
+        );
+    }
+
+    // Verified (high) must outrank non-verified — ordering preserved after normalization + clamp.
+    let high = results
+        .iter()
+        .find(|r| r["slug"].as_str() == Some("norm-high"));
+    let mid = results
+        .iter()
+        .find(|r| r["slug"].as_str() == Some("norm-mid"));
+    if let (Some(h), Some(m)) = (high, mid) {
+        let hs = h["score"].as_f64().unwrap();
+        let ms = m["score"].as_f64().unwrap();
+        assert!(
+            hs >= ms,
+            "verified atom score {hs:.4} must not be less than draft score {ms:.4}"
+        );
+    }
+}
+
+// ── #561: default rerank tests ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
+    let f = pack(rt_with_default_embedder());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "rerank-a", "name": "Cosine Alpha", "description": "cosine similarity embedding rerank vector score unique uuuvvv", "content": "cosine similarity embedding rerank vector" },
+                { "slug": "rerank-b", "name": "Cosine Beta",  "description": "cosine similarity embedding rerank unique uuuvvv beta", "content": "cosine similarity embedding rerank" },
+            ]
+        }),
+    )
+    .await
+    .expect("seed atoms");
+
+    // Default (omit rerank) — should trigger embedding rerank when embedder is present.
+    let resp_default = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "cosine similarity embedding rerank unique uuuvvv" }),
+        )
+        .await
+        .expect("default rerank search ok");
+    assert_eq!(resp_default["status"], "ok");
+    let results_default = resp_default["data"]["results"].as_array().expect("results");
+    assert!(
+        !results_default.is_empty(),
+        "expected results with default rerank"
+    );
+
+    // All scores must be in [0,1].
+    for r in results_default {
+        let score = r["score"].as_f64().expect("score");
+        assert!(
+            (0.0..=1.0).contains(&score),
+            "default-rerank score {score} out of [0,1] for {r:?}"
+        );
+    }
+
+    // Explicit rerank=false — should produce different scores than default rerank.
+    let resp_norerank = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "cosine similarity embedding rerank unique uuuvvv", "rerank": false }),
+        )
+        .await
+        .expect("explicit rerank=false search ok");
+    assert_eq!(resp_norerank["status"], "ok");
+    let results_norerank = resp_norerank["data"]["results"]
+        .as_array()
+        .expect("results");
+    assert!(
+        !results_norerank.is_empty(),
+        "expected results with rerank=false"
+    );
+
+    // Scores from default rerank and rerank=false must differ (embedding blend changes scores).
+    let default_scores: Vec<f64> = results_default
+        .iter()
+        .filter_map(|r| r["score"].as_f64())
+        .collect();
+    let norerank_scores: Vec<f64> = results_norerank
+        .iter()
+        .filter_map(|r| r["score"].as_f64())
+        .collect();
+    let scores_differ = default_scores
+        .iter()
+        .zip(norerank_scores.iter())
+        .any(|(a, b)| (a - b).abs() > 1e-6);
+    assert!(
+        scores_differ,
+        "default rerank must produce different scores than rerank=false when embedder is configured"
+    );
+}
+
+#[tokio::test]
+async fn search_rerank_false_is_explicit_opt_out() {
+    let f = pack(rt_with_default_embedder());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "optout-a", "name": "Opt Out Alpha", "description": "explicit opt out rerank false test unique wwwxxx", "content": "opt out rerank test" },
+            ]
+        }),
+    )
+    .await
+    .expect("seed atom");
+
+    // Explicit rerank=false must succeed and return valid results.
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "opt out rerank false unique wwwxxx", "rerank": false }),
+        )
+        .await
+        .expect("rerank=false search ok");
+    assert_eq!(resp["status"], "ok");
+    let results = resp["data"]["results"].as_array().expect("results");
+    for r in results {
+        let score = r["score"].as_f64().expect("score");
+        assert!(
+            (0.0..=1.0).contains(&score),
+            "score {score} out of [0,1] with rerank=false"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
+    let f = pack(rt_with_default_embedder());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "decompose-guard", "name": "Decompose Guard", "description": "multi-concept search decompose tenant isolation guard", "content": "multi-concept tenant isolation decompose guard" },
+            ]
+        }),
+    )
+    .await
+    .expect("seed atom");
+
+    // Query with operator-like text, default rerank (omitted), decompose=true.
+    // Must not produce a 'no such column' FTS error.
+    let resp = f
+        .dispatch(
+            "knowledge.search",
+            json!({
+                "query": "multi-concept tenant:isolation decompose guard",
+                "decompose": true,
+            }),
+        )
+        .await
+        .expect("default rerank + decompose must not crash");
+    assert_eq!(resp["status"], "ok", "expected ok status, got: {resp:?}");
 }

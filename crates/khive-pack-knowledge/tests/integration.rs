@@ -970,7 +970,7 @@ async fn search_basic_returns_ranked_results() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "retrieval generation" }),
+            json!({ "query": "retrieval generation", "rerank": false }),
         )
         .await
         .expect("search ok");
@@ -993,7 +993,10 @@ async fn search_exact_name_bonus_surfaces_exact_match_first() {
     seed_search_corpus(&f).await;
 
     let resp = f
-        .dispatch("knowledge.search", json!({ "query": "LoRA" }))
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "LoRA", "rerank": false }),
+        )
         .await
         .expect("search ok");
 
@@ -1013,7 +1016,10 @@ async fn search_query_expansion_matches_related_form() {
     seed_search_corpus(&f).await;
 
     let resp = f
-        .dispatch("knowledge.search", json!({ "query": "agents" }))
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "agents", "rerank": false }),
+        )
         .await
         .expect("search ok");
 
@@ -1037,7 +1043,8 @@ async fn search_weight_override_changes_ranking() {
             "knowledge.search",
             json!({
                 "query": "attention",
-                "weights": { "w_tags": 50.0, "w_name": 1.0, "w_description": 0.1 }
+                "weights": { "w_tags": 50.0, "w_name": 1.0, "w_description": 0.1 },
+                "rerank": false
             }),
         )
         .await
@@ -1061,7 +1068,7 @@ async fn search_limit_is_respected() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "inference", "limit": 2 }),
+            json!({ "query": "inference", "limit": 2, "rerank": false }),
         )
         .await
         .expect("search ok");
@@ -1079,7 +1086,10 @@ async fn search_empty_corpus_returns_empty_results() {
     let f = pack(rt());
     // No atoms seeded.
     let resp = f
-        .dispatch("knowledge.search", json!({ "query": "anything" }))
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "anything", "rerank": false }),
+        )
         .await
         .expect("search ok on empty corpus");
 
@@ -1114,7 +1124,7 @@ async fn search_type_filter_returns_only_atoms() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "attention", "type": "atom" }),
+            json!({ "query": "attention", "type": "atom", "rerank": false }),
         )
         .await
         .expect("search filtered ok");
@@ -1144,7 +1154,7 @@ async fn search_type_domain_finds_upserted_domains() {
     let resp = f
         .dispatch(
             "knowledge.search",
-            json!({ "query": "retrieval", "type": "domain" }),
+            json!({ "query": "retrieval", "type": "domain", "rerank": false }),
         )
         .await
         .expect("search domain ok");

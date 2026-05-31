@@ -14,7 +14,7 @@
 //! - `stats`            — corpus statistics
 //! - `index`            — backfill embeddings + FTS for atoms
 //! - `fold`             — budget-constrained knapsack selection
-//! - `knowledge.search` — TF-IDF + optional embedding re-rank
+//! - `knowledge.search` — TF-IDF + embedding rerank (default; opt out with rerank=false)
 
 pub(crate) mod matching;
 pub(crate) mod schema;
@@ -1072,7 +1072,8 @@ impl KnowledgeHandlers {
         let do_decompose = p.decompose.unwrap_or(false);
         let decompose_threshold = p.decompose_threshold.unwrap_or(4);
         let intersection_bonus = p.intersection_bonus.unwrap_or(0.25) as f32;
-        let do_rerank = p.rerank.unwrap_or(false);
+        let requested_rerank = p.rerank.unwrap_or(true);
+        let do_rerank = requested_rerank && !runtime.default_embedder_name().is_empty();
         let rerank_alpha = p.rerank_alpha.unwrap_or(0.7) as f32;
         let fetch_limit = if do_rerank { limit * 3 } else { limit }.min(100);
 
@@ -1415,6 +1416,14 @@ struct ScoredHit {
 
 const RRF_K: usize = 60;
 
+fn normalize_rrf_score(raw: f32, source_count: usize, k: usize) -> f32 {
+    if source_count == 0 {
+        return 0.0;
+    }
+    let theoretical_max = source_count as f32 / (k as f32 + 1.0);
+    (raw / theoretical_max).clamp(0.0, 1.0)
+}
+
 fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_score: f32) {
     let drained: Vec<ScoredHit> = std::mem::take(fts_hits);
 
@@ -1431,10 +1440,12 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_sc
         .map(|(uuid, score)| (uuid.to_string(), DeterministicScore::from_f32(*score)))
         .collect();
 
+    let source_count = usize::from(!fts_source.is_empty()) + usize::from(!ann_source.is_empty());
     let fused = khive_fusion::reciprocal_rank_fusion(vec![fts_source, ann_source], RRF_K);
 
     for (id, fused_score) in fused {
-        let score = fused_score.to_f64() as f32;
+        let raw_score = fused_score.to_f64() as f32;
+        let score = normalize_rrf_score(raw_score, source_count, RRF_K);
         if score < min_score {
             continue;
         }
@@ -1642,7 +1653,10 @@ fn status_multiplier(status: Option<&str>) -> f32 {
 fn apply_status_multipliers(hits: &mut Vec<ScoredHit>, include_deprecated: bool) {
     hits.retain_mut(|hit| {
         let multiplier = status_multiplier(hit.status.as_deref());
-        hit.score *= multiplier;
+        // Squash raw score to (0,1) via monotonic s/(s+1) before applying the status
+        // multiplier so that TF-IDF scores > 1 don't saturate ranking. RRF-normalized
+        // scores (already ≤ 1) are squashed at most to 0.5, preserving relative order.
+        hit.score = (hit.score / (hit.score + 1.0) * multiplier).clamp(0.0, 1.0);
         include_deprecated || multiplier > 0.0
     });
     hits.sort_by(|a, b| {
@@ -3119,4 +3133,73 @@ fn parse_atlas_md(content: &str) -> (String, String, Vec<(SectionType, String, S
     }
 
     (name, pre_body, sections)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #523: RRF normalization must be monotonic and bounded.
+    #[test]
+    fn normalize_rrf_score_is_bounded_and_monotonic() {
+        let k = RRF_K;
+        // Single source: theoretical max = 1/(k+1).
+        let max_single = 1.0f32 / (k as f32 + 1.0);
+        let scores_single = [
+            max_single * 0.25,
+            max_single * 0.5,
+            max_single,
+            max_single * 1.5,
+        ];
+        let normed_single: Vec<f32> = scores_single
+            .iter()
+            .map(|&r| normalize_rrf_score(r, 1, k))
+            .collect();
+        // All in [0,1].
+        for &s in &normed_single {
+            assert!((0.0..=1.0).contains(&s), "score out of range: {s}");
+        }
+        // Monotonic for values under the max (clamping only at theoretical max).
+        assert!(normed_single[0] < normed_single[1]);
+        assert!(normed_single[1] < normed_single[2]);
+        // Clamped at 1.0 for values above the theoretical max.
+        assert_eq!(normed_single[3], 1.0);
+
+        // Two sources: theoretical max = 2/(k+1).
+        let max_two = 2.0f32 / (k as f32 + 1.0);
+        let scores_two = [max_two * 0.25, max_two * 0.75, max_two, max_two * 2.0];
+        let normed_two: Vec<f32> = scores_two
+            .iter()
+            .map(|&r| normalize_rrf_score(r, 2, k))
+            .collect();
+        for &s in &normed_two {
+            assert!((0.0..=1.0).contains(&s), "score out of range: {s}");
+        }
+        assert!(normed_two[0] < normed_two[1]);
+        assert!(normed_two[1] < normed_two[2]);
+        assert_eq!(normed_two[3], 1.0);
+
+        // Raw order equals normalized order for unequal inputs (no rank inversion).
+        let raw = [0.001f32, 0.005, 0.010, 0.015];
+        let normed: Vec<f32> = raw.iter().map(|&r| normalize_rrf_score(r, 1, k)).collect();
+        let raw_order: Vec<usize> = {
+            let mut idx: Vec<usize> = (0..raw.len()).collect();
+            idx.sort_by(|&a, &b| raw[b].partial_cmp(&raw[a]).unwrap());
+            idx
+        };
+        let norm_order: Vec<usize> = {
+            let mut idx: Vec<usize> = (0..normed.len()).collect();
+            idx.sort_by(|&a, &b| normed[b].partial_cmp(&normed[a]).unwrap());
+            idx
+        };
+        assert_eq!(
+            raw_order, norm_order,
+            "normalization must not invert ranking"
+        );
+    }
+
+    #[test]
+    fn normalize_rrf_score_zero_source_count_returns_zero() {
+        assert_eq!(normalize_rrf_score(0.5, 0, RRF_K), 0.0);
+    }
 }

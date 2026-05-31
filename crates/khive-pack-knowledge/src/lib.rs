@@ -11,7 +11,7 @@
 //! - `knowledge.stats`           — corpus statistics (counts, coverage)
 //! - `knowledge.index`           — backfill embeddings + FTS for atoms
 //! - `knowledge.fold`            — budget-constrained knapsack selection (token budgeting)
-//! - `knowledge.search`          — TF-IDF + optional embedding rerank over the corpus
+//! - `knowledge.search`          — TF-IDF + embedding rerank (default when embedder configured) over the corpus
 //! - `knowledge.suggest`         — orientation: ranked domain suggestions for a query
 //! - `knowledge.compose`         — orientation: markdown briefing from domains and atoms
 //!
@@ -209,7 +209,7 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
     },
     HandlerDef {
         name: "knowledge.search",
-        description: "TF-IDF ranked search over the knowledge corpus with optional embedding rerank",
+        description: "TF-IDF ranked search over the knowledge corpus with embedding rerank (default when embedder is configured)",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -271,7 +271,7 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
                 name: "rerank",
                 param_type: "boolean",
                 required: false,
-                description: "Enable embedding rerank (default false)",
+                description: "Enable embedding rerank (default true; set false to opt out; no-op if no embedder is configured)",
             },
             ParamDef {
                 name: "rerank_alpha",
@@ -579,6 +579,15 @@ impl PackRuntime for KnowledgePack {
 
     async fn warm(&self) {
         knowledge::vamana::warm_known_snapshots(&self.runtime, &self.ann).await;
+        // Pre-warm the embedding model so the first reranked knowledge.search does not
+        // pay cold model-weight load in the request path (#595). Fire-and-forget so
+        // pack warm never blocks daemon startup.
+        if !self.runtime.default_embedder_name().is_empty() {
+            let runtime = self.runtime.clone();
+            tokio::spawn(async move {
+                let _ = runtime.embed("__khive_knowledge_warm__").await;
+            });
+        }
     }
 
     async fn dispatch(

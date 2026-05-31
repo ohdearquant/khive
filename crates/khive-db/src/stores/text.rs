@@ -243,18 +243,28 @@ fn micros_to_dt(micros: i64) -> DateTime<Utc> {
 /// For Phrase mode, the caller wraps the result in double quotes.
 fn sanitize_fts5_query(query: &str) -> String {
     // Pass 1: replace grouping/separator chars with spaces to isolate tokens.
+    // Colon is included here (not in Pass 2) so that "tenant:isolation" becomes
+    // "tenant isolation" rather than "tenantisolation".
     let spaced: String = query
         .chars()
-        .map(|c| if matches!(c, '(' | ')' | ',') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '(' | ')' | ',' | ':') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
 
     // Pass 2: remove remaining FTS5 special chars and control characters.
+    // Single quote (apostrophe) is included because FTS5 Plain-mode queries treat
+    // it as a string-literal delimiter causing "syntax error near '''".
     let sanitized: String = spaced
         .chars()
         .filter(|c| {
             !matches!(
                 c,
-                '*' | '"' | '+' | '-' | ':' | '^' | '.' | '~' | '!' | '\0'
+                '*' | '"' | '\'' | '+' | '-' | '^' | '.' | '~' | '!' | '\0'
             ) && !c.is_control()
         })
         .collect();
@@ -1215,7 +1225,7 @@ mod tests {
         assert_eq!(sanitize_fts5_query("\"quoted\""), "quoted");
         assert_eq!(sanitize_fts5_query("(parens)"), "parens");
         assert_eq!(sanitize_fts5_query("a + b - c"), "a b c");
-        assert_eq!(sanitize_fts5_query("col:value"), "colvalue");
+        assert_eq!(sanitize_fts5_query("col:value"), "col value");
         assert_eq!(sanitize_fts5_query(""), "");
         assert_eq!(sanitize_fts5_query("***"), "");
         // M-C4: decimal numbers must not produce "syntax error near '.'"
@@ -1229,6 +1239,38 @@ mod tests {
         assert_eq!(sanitize_fts5_query("\"+_~!\""), "_");
         assert_eq!(sanitize_fts5_query("NEAR(smile, 5)"), "smile 5");
         assert_eq!(sanitize_fts5_query("a,b,c"), "a b c");
+        // #570: full operator-class matrix
+        // Apostrophe fix: single quote is an FTS5 string-literal delimiter in Plain mode.
+        assert_eq!(sanitize_fts5_query("Bob's tenant"), "Bobs tenant");
+        assert_eq!(
+            sanitize_fts5_query("tenant AND isolation"),
+            "tenant isolation"
+        );
+        assert_eq!(
+            sanitize_fts5_query("tenant OR isolation"),
+            "tenant isolation"
+        );
+        assert_eq!(
+            sanitize_fts5_query("tenant NOT isolation"),
+            "tenant isolation"
+        );
+        assert_eq!(
+            sanitize_fts5_query("tenant NEAR(isolation, 5)"),
+            "tenant isolation 5"
+        );
+        assert_eq!(sanitize_fts5_query("tenant:isolation"), "tenant isolation");
+        assert_eq!(
+            sanitize_fts5_query("tenant ^ isolation"),
+            "tenant isolation"
+        );
+        assert_eq!(
+            sanitize_fts5_query("(tenant isolation)"),
+            "tenant isolation"
+        );
+        // whitespace-only becomes empty
+        assert_eq!(sanitize_fts5_query("   "), "");
+        // operator-only after stripping becomes empty
+        assert_eq!(sanitize_fts5_query("AND OR NOT"), "");
     }
 
     /// H1 regression: queries with tilde (~) must not produce "fts5: syntax error near '~'".
@@ -1332,6 +1374,57 @@ mod tests {
             "version-string query must succeed, got error: {:?}",
             result2.err()
         );
+    }
+
+    /// #570: all FTS5 operator classes must not crash the generic text search surface.
+    #[tokio::test]
+    async fn test_search_with_fts_operator_matrix_does_not_crash() {
+        let store = setup_memory_store("fts_operator_matrix");
+
+        store
+            .upsert_document(make_document(
+                Uuid::new_v4(),
+                "tenant isolation",
+                "multi-tenant isolation operator regression anchor content",
+            ))
+            .await
+            .unwrap();
+
+        let cases: &[&str] = &[
+            "\"tenant isolation\"",
+            "Bob \"quoted\" tenant",
+            "tenant AND isolation",
+            "tenant OR isolation",
+            "tenant NOT isolation",
+            "tenant NEAR(isolation, 5)",
+            "tenant*",
+            "***",
+            "tenant:isolation",
+            "tenant ^ isolation",
+            "(tenant isolation)",
+            "(\"+_~!\")",
+            "tenant:foo^bar*",
+            "multi-tenant isolation",
+            "   ",
+            "",
+        ];
+
+        for query in cases {
+            let result = store
+                .search(TextSearchRequest {
+                    query: query.to_string(),
+                    mode: TextQueryMode::Plain,
+                    filter: Some(ns_filter("test_ns")),
+                    top_k: 10,
+                    snippet_chars: 64,
+                })
+                .await;
+            assert!(
+                result.is_ok(),
+                "#570 DB search query {query:?} must not crash FTS5, got: {:?}",
+                result.err()
+            );
+        }
     }
 
     #[tokio::test]
