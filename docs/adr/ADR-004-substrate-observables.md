@@ -53,7 +53,7 @@ annotation targeting, and cascade behavior.
 ```rust
 pub struct Link {
     pub id: Id128,
-    pub namespace: Namespace,
+    pub namespace: String,
     pub source: Id128,
     pub target: Id128,
     pub relation: EdgeRelation,
@@ -64,6 +64,13 @@ pub struct Link {
     pub deleted_at: Option<Timestamp>,
 }
 ```
+
+`Link` and storage `Edge` namespaces are persisted and serialized as validated
+strings, matching SQLite `TEXT` and MCP JSON. `Namespace` remains the validation
+and authorization-boundary newtype: runtime entry points parse caller-supplied
+namespace strings, mint a `NamespaceToken` at the dispatch boundary, and reject
+any explicit `LinkSpec.namespace` that does not match the authorized token before
+persisting an edge.
 
 This does not create `SubstrateKind::Edge`, an `EdgeStore` trait family, or an independent
 agent-facing edge verb surface.
@@ -124,9 +131,11 @@ pub enum FieldStorage {
 }
 ```
 
-**Phase 1**: Introduce `NoteKindSpec` as the runtime contract. Packs declare their note
-kinds with lifecycle, search profile, and field declarations. Runtime validates note
-creation against the registered spec.
+**Phase 1**: Introduce `NoteKindSpec` as a declaration and introspection contract.
+Packs may declare lifecycle, search-profile, and field metadata; the runtime collects
+those declarations for documentation and future enforcement. Current write-time
+note-kind validation is registry/handler based. Lifecycle field routing and
+`kind_status` enforcement are deferred to Phase 2 or a future schema ADR.
 
 **Phase 2**: Migrate kind-specific base Note fields (`salience`, `decay_factor`,
 `expires_at`) into declared fields. This is a separate schema migration ADR.
@@ -336,8 +345,10 @@ through `NoteKindSpec`.
 
 Both solve the same problem: closed base enum + governed pack-extensible subtype layer.
 ADR-001's EntityTypeRegistry validates entity_type at write time in the runtime layer.
-NoteKindSpec does the same for note kinds. Using the same pattern means pack authors
-learn one extension mechanism, and the runtime has one validation shape to enforce.
+NoteKindSpec mirrors that shape for note kinds as a declaration/introspection contract;
+write-time lifecycle enforcement is deferred (see Phase 1). Using the same pattern means
+pack authors learn one extension mechanism and the runtime has one declaration shape to
+collect today and one validation shape to enforce in a future phase.
 
 ### Why separate NoteStatus from kind lifecycle?
 

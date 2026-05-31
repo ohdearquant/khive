@@ -4,6 +4,15 @@
 **Date**: 2026-05-23\
 **Authors**: Ocean, lambda:khive
 
+> Relationship to ADR-030: ADR-012 is the legacy-but-live high-level retrieval
+> composition record. It governs runtime and pack-level orchestration of storage
+> capability signals, `NamespaceToken` enforcement, fusion, filtering, and alive
+> checks. ADR-030 supersedes only ADR-012's original deferral of a standalone
+> retrieval crate and assigns low-level engine/adapters ownership to
+> `khive-retrieval`. Do not read ADR-030 as replacing ADR-012's composition
+> decision while the shipped runtime still exposes and uses the ADR-012
+> composition path.
+
 ## Context
 
 khive retrieves entities, notes, and graph subsets from typed, multi-substrate storage.
@@ -37,9 +46,11 @@ The architecture must satisfy:
 ### Retrieval is composition of capability signals
 
 Retrieval in khive is the composition of one or more storage-capability signals into a
-ranked result set. There is no single "retrieval engine" crate — retrieval lives in
-`khive-runtime` as a set of composable methods that call storage traits and fuse the
-results.
+ranked result set. The live legacy composition layer remains in `khive-runtime` and
+pack handlers: it enforces `NamespaceToken` boundaries, orchestrates `VectorStore`,
+`TextSearch`, `GraphStore`, `EntityStore`, and `NoteStore` calls, applies fusion,
+and performs alive/filter checks. Low-level retrieval engines, reusable fusion/search
+traits, and storage adapters live below this layer in `khive-retrieval` per ADR-030.
 
 ```text
 Storage Capabilities (ADR-005)         Composition (khive-runtime)
@@ -486,10 +497,14 @@ tree, benchmark suite, and dependency surface (`lattice-embed`). ADR-012 is now 
 
 ## Implementation
 
-- `crates/khive-runtime/src/retrieval.rs`: `hybrid_search`, `vector_search`, `knn`,
-  `rerank`, `search_mixed`, embedding helpers (delegating to ADR-011).
-- `crates/khive-runtime/src/fusion.rs`: `FusionStrategy` enum (with `Custom`),
-  `fuse_with_strategy`, `hybrid_search_with_strategy`.
+- `crates/khive-runtime/src/retrieval.rs`: live high-level composition entry points
+  such as `hybrid_search`, `vector_search`, `knn`, `rerank`, `search_mixed`, and
+  embedding helpers.
+- `crates/khive-runtime/src/fusion.rs`: runtime strategy entry points such as
+  `FusionStrategy`, `fuse_with_strategy`, and `hybrid_search_with_strategy`.
+- `crates/khive-retrieval/src/lib.rs` and `crates/khive-retrieval/src/hybrid/searcher.rs`:
+  low-level retrieval/ranking primitives, fusion helpers, engines, and adapters
+  owned by ADR-030 and used where wired.
 - `crates/khive-runtime/src/graph_traversal.rs`: `bfs_traverse`, `shortest_path`,
   `neighbors`, `traverse`.
 - `crates/khive-runtime/src/registry.rs`: `FusionRegistry` for custom strategy

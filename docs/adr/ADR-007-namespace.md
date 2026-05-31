@@ -37,49 +37,37 @@ construct namespaces through validated factories.
 pub struct Namespace(String);
 
 impl Namespace {
+    pub const LOCAL: &'static str = "local";
+
+    pub fn parse(value: &str) -> Result<Self, NamespaceError> {
+        validate_namespace(value)?;
+        Ok(Self(String::from(value)))
+    }
+
     pub fn local() -> Self {
-        Self("local".to_owned())
-    }
-
-    pub fn project(slug: &str) -> Result<Self, NamespaceError> {
-        validate_slug(slug)?;
-        Ok(Self(format!("local:{slug}")))
-    }
-
-    pub fn tenant(id: Uuid) -> Self {
-        Self(format!("tenant:{id}"))
-    }
-
-    pub fn system(name: &str) -> Result<Self, NamespaceError> {
-        validate_slug(name)?;
-        Ok(Self(format!("system:{name}")))
-    }
-
-    pub fn parse(s: &str) -> Result<Self, NamespaceError> {
-        validate_namespace_string(s)?;
-        Ok(Self(s.to_owned()))
+        Self(String::from(Self::LOCAL))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    pub(crate) fn from_trusted_unchecked(s: String) -> Self {
-        Self(s)
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
 
-impl TryFrom<String> for Namespace {
-    type Error = NamespaceError;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Namespace::parse(&value)
-    }
-}
+impl TryFrom<String> for Namespace { /* validates through Namespace::parse */ }
+impl TryFrom<&str> for Namespace { /* validates through Namespace::parse */ }
 ```
 
-**No public `Namespace::new(String)`.** Every construction site goes through a factory that
-enforces structural invariants. `from_trusted_unchecked` is `pub(crate)` only — for
-deserialization from trusted storage where the value was validated on write.
+`Namespace` is a string-backed newtype with no public unchecked constructor. The
+shipped public construction surface is `Namespace::parse(&str)`, `Namespace::local()`,
+`TryFrom<String>`, and `TryFrom<&str>`. Earlier `project(slug)`, `tenant(id)`,
+`system(name)`, and `from_trusted_unchecked` examples are deferred sketches, not
+accepted API. Hosted deployments derive namespace strings from authenticated
+context, parse them, and mint `NamespaceToken` through runtime/gate dispatch;
+caller input never receives an unchecked namespace factory.
 
 ### No `Default`
 
@@ -194,9 +182,19 @@ impl<'a> NamespaceView<'a> {
 }
 ```
 
-All runtime and coordinator methods that read/write namespace-scoped records require
-`NamespaceToken`. Single-record ID operations still require token verification — after
-fetching by UUID, runtime compares the record's namespace to the token before returning:
+All runtime methods that read/write namespace-scoped records require `NamespaceToken`.
+In the shipped runtime, `VerbRegistry::dispatch` resolves and validates the operation
+namespace, consults the gate, mints `NamespaceToken` at the dispatch boundary, strips
+the transport `namespace` field before ordinary pack handlers, and passes
+`&NamespaceToken` into pack code. Single-record ID operations still require token
+verification after fetching by UUID.
+
+First-party packs may apply documented namespace policy by rebinding a token with
+`NamespaceToken::with_namespace`, for example KG graph verbs using the shared default
+namespace under the Namespace-by-Layer rule. This is trusted pack policy, not a
+caller-visible namespace factory.
+
+The enforcement pattern:
 
 ```rust
 // Write path
@@ -239,21 +237,14 @@ Neither dimension subsumes the other. Namespace isolation is necessary but not s
 for full isolation — a record in the correct namespace on the wrong backend is a routing
 bug. A record on the correct backend in the wrong namespace is a security bug.
 
-### Hierarchy helpers: not on the core type
+### Hierarchy helper: naming utility, not authorization
 
-`is_child_of` (the prefix-based hierarchy check) is removed from `Namespace`. It is a
-naming-convention utility, not a semantic guarantee. Leaving it on the core security type
-invites misuse as an authorization primitive:
-
-```rust
-// DANGEROUS — looks like auth, isn't
-if requested.is_child_of(&caller) { allow(); }
-```
-
-Hierarchy helpers move to a separate utility:
+The shipped namespace module exposes `has_segment_prefix(child, parent)` as a public
+helper for naming-convention checks. It is not a semantic guarantee and MUST NOT be
+used for authorization. Authorization decisions use `NamespaceToken` and gate policy.
 
 ```rust
-// namespace_path.rs — naming-convention helper, NOT authorization
+// khive-types/src/namespace.rs — naming-convention helper, NOT authorization
 pub fn has_segment_prefix(child: &Namespace, parent: &Namespace) -> bool {
     let c = child.as_str();
     let p = parent.as_str();
@@ -355,10 +346,10 @@ guesses or observes a UUID from another namespace can read that record.
 
 - `khive-types/src/namespace.rs`: `Namespace` struct with factories, `TryFrom<String>`,
   `NamespaceError`. No `Default`. No `new(String)`. No `is_child_of`.
-- `khive-runtime/src/auth.rs` (or `namespace_token.rs`): `NamespaceToken` with sealed
-  constructor, `NamespaceView` wrapper. `AuthContext` for token minting.
-- `khive-runtime/src/namespace_path.rs`: `has_segment_prefix` utility for OSS hierarchical
-  naming convention.
+- `khive-runtime/src/runtime.rs`: `NamespaceToken` with sealed constructor,
+  `NamespaceView` wrapper. Token minting via `VerbRegistry::dispatch`.
+- `khive-types/src/namespace.rs`: `has_segment_prefix` utility for OSS hierarchical
+  naming convention (lives with the `Namespace` type, not in the runtime).
 - Runtime methods: all namespace-scoped operations take `&NamespaceToken`. Read-by-ID
   methods verify `record.namespace == token.namespace()` after fetch.
 

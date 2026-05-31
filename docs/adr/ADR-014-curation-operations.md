@@ -24,10 +24,11 @@ The curation surface must satisfy:
    namespace ownership all validate before persistence. Curation goes through the
    same validation as creation.
 3. **Index consistency.** Updates that change indexed fields (name, description,
-   embedding source) update FTS5 entries inside the same SQL transaction (FTS5 is
-   in-database). Vector index updates are scheduled **post-commit** via an outbox
-   pattern; a `pending_reindex` record ensures eventual consistency. Vector queries
-   may briefly observe stale vectors after commit but never lost ones.
+   content, or other embedding source text) persist the record and then immediately
+   await reindexing in the same runtime operation. FTS5 is updated through the text
+   store, and vector storage is updated only when an embedding model is configured.
+   The shipped update path does not create an outbox or `pending_reindex` record;
+   durable retry queues are deferred to a future ADR.
 4. **Substrate-aware merge.** Merging two entities rewires their edges. Merging
    two notes rewires their `annotates` edges and `supersedes` chain. Edges
    themselves don't merge.
@@ -91,9 +92,11 @@ pub struct NotePatch {
 }
 ```
 
-For `properties`, the patch semantics are **deep-merge**: keys present in the
-patch overwrite existing keys; keys absent are preserved. To remove a property
-key, the caller must pass a `properties` JSON object reflecting the desired
+For `properties`, shipped update semantics are a top-level merge with patch values
+winning at patched keys. Top-level keys absent from the patch are preserved; if a
+patched key contains a nested object, that nested value replaces the previous value
+at the same key rather than recursively merging. To remove a property key, the
+caller must pass a complete `properties` JSON object reflecting the desired
 post-state (or use a future `unset` mechanism). For `tags`, semantics are
 **replace**: `Some(vec)` sets tags to exactly `vec`.
 
@@ -145,19 +148,10 @@ validation failure — the runtime validates before any storage call.
 ### Index consistency
 
 When `update_entity` or `update_note` changes indexed fields (name, description,
-content), the runtime re-indexes FTS5 and vector storage in the same logical
-operation. The reindex uses the authoritative namespace from the record (not the
-caller-supplied namespace) to prevent cross-namespace pollution.
-
-```text
-text_changed = name changed OR description changed OR content changed
-if text_changed:
-    text_store.upsert_document(...)
-    if embedding_model is configured:
-        vector_store.insert(id, kind, namespace, embed(body))
-```
-
-Property-only or tag-only updates skip reindexing because v1 doesn't index
+content), the runtime persists the record and then immediately re-indexes FTS5
+and vector storage in the same awaited runtime operation. The reindex uses the
+authorized namespace token for the record path to prevent cross-namespace pollution.
+Property-only or tag-only updates skip reindexing because v1 does not index
 properties or tags as FTS body content.
 
 ### `EntityDedupMergePolicy`: the entity merge strategy
@@ -227,11 +221,12 @@ pub struct MergeSummary {
 }
 ```
 
-The operation is atomic within one backend transaction. Vector re-indexing
-happens after the SQL transaction commits because embedding generation is async
-and cannot run inside `BEGIN IMMEDIATE`. If embedding fails post-commit, the
-entity is persisted but stale in the vector index; the runtime logs the failure
-and the caller can retry the reindex idempotently.
+Merge operations keep their separate transaction boundary: SQL/FTS changes happen
+inside the backend transaction, while vector re-insert for the retained record is
+awaited after the SQL transaction commits because embedding generation is async and
+cannot run inside `BEGIN IMMEDIATE`. The shipped code does not persist an outbox or
+`pending_reindex` retry record; callers may retry idempotent reindex operations when
+exposed, and durable retry is deferred.
 
 ### `merge_note` semantics
 
@@ -466,8 +461,9 @@ note of the right kind.
 - Patch semantics match agent intent; no fetch-modify-write round trips required.
 - Validation chain ensures `entity_type`, edge endpoints, and note kinds are
   always consistent after curation.
-- Index consistency: FTS5 re-indexed in-transaction; vector index updated
-  post-commit via outbox pattern (eventual consistency, no lost vectors).
+- Index consistency: FTS5 re-indexed in-transaction; vector reindex awaited after the SQL
+  transaction (no durable outbox/`pending_reindex` in shipped code; durable retry
+  deferred to a future ADR).
 - Naming clarity: `EntityDedupMergePolicy` vs `SnapshotMergeStrategy`.
 - Single-backend merge constraint is surfaced as a typed error; callers know
   exactly what's unsupported.
