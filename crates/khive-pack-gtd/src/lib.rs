@@ -184,6 +184,12 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
                 description: "UUIDs of blocking tasks.",
             },
             ParamDef {
+                name: "context_entity_id",
+                param_type: "uuid",
+                required: false,
+                description: "Full UUID of the KG entity this task concerns.",
+            },
+            ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,

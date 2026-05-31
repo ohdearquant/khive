@@ -2066,3 +2066,131 @@ async fn concurrent_complete_two_threads_one_wins_one_loses_atomic() {
         "losing complete() must fail with terminal-state or rows_affected conflict; got: {msg}"
     );
 }
+
+// ── #522 regression: complete after explicit transition to active ─────────────
+
+/// Regression for #522: assign → transition(active) → gtd.complete must succeed.
+#[tokio::test]
+async fn complete_after_transition_to_active_succeeds() {
+    let pack = pack(rt());
+    let resp = assign(&pack, json!({"title": "transition then complete"})).await;
+    let id = resp["full_id"].as_str().unwrap().to_string();
+
+    pack.dispatch("gtd.transition", json!({"id": id, "status": "active"}))
+        .await
+        .expect("transition to active must succeed");
+
+    let done = pack
+        .dispatch("gtd.complete", json!({"id": id}))
+        .await
+        .expect("complete from active after transition must succeed");
+
+    assert_eq!(done["completed"].as_bool(), Some(true));
+    assert_eq!(done["from"].as_str(), Some("active"));
+    assert_eq!(done["to"].as_str(), Some("done"));
+    assert_eq!(done["is_terminal"].as_bool(), Some(true));
+    let completed_at = done["completed_at"]
+        .as_str()
+        .expect("completed_at must be present");
+    chrono::DateTime::parse_from_rfc3339(completed_at)
+        .unwrap_or_else(|e| panic!("completed_at not RFC 3339: {completed_at} - {e}"));
+}
+
+// ── #520 regression: context_entity_id on gtd.assign ─────────────────────────
+
+/// Regression for #520: context_entity_id round-trips through assign, tasks, and get.
+#[tokio::test]
+async fn assign_context_entity_id_round_trips_through_tasks_and_get() {
+    let rt = rt();
+    let pack = pack(rt);
+
+    let entity = pack
+        .dispatch("create", json!({"kind": "concept", "name": "Context Entity"}))
+        .await
+        .expect("context entity create must succeed");
+    let context_id = entity["id"].as_str().unwrap().to_string();
+
+    let assigned = assign(
+        &pack,
+        json!({"title": "task with context", "context_entity_id": context_id}),
+    )
+    .await;
+    let task_id = assigned["full_id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        assigned["context_entity_id"].as_str(),
+        Some(context_id.as_str())
+    );
+    assert_eq!(
+        assigned["properties"]["context_entity_id"].as_str(),
+        Some(context_id.as_str())
+    );
+
+    let tasks = pack
+        .dispatch("gtd.tasks", json!({"status": "inbox"}))
+        .await
+        .expect("tasks listing must succeed");
+    let task = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["full_id"].as_str() == Some(task_id.as_str()))
+        .expect("created task must be in tasks(status=inbox)");
+    assert_eq!(task["context_entity_id"].as_str(), Some(context_id.as_str()));
+    assert_eq!(
+        task["properties"]["context_entity_id"].as_str(),
+        Some(context_id.as_str())
+    );
+
+    let got = pack
+        .dispatch("get", json!({"id": task_id}))
+        .await
+        .expect("get task must succeed");
+    assert_eq!(
+        got["properties"]["context_entity_id"].as_str(),
+        Some(context_id.as_str())
+    );
+
+    let neighbors = pack
+        .dispatch("neighbors", json!({"id": task_id, "direction": "out"}))
+        .await
+        .expect("neighbors must succeed");
+    let has_annotates_edge = neighbors
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| {
+            n.to_string().contains("annotates") && n.to_string().contains(context_id.as_str())
+        });
+    assert!(
+        has_annotates_edge,
+        "task should have an annotates edge to the context entity; neighbors: {neighbors}"
+    );
+}
+
+/// Regression for #520: malformed context_entity_id must produce a clear error.
+#[tokio::test]
+async fn assign_rejects_malformed_context_entity_id() {
+    let pack = pack(rt());
+    let err = pack
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "bad context", "context_entity_id": "not-a-uuid"}),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("context_entity_id"),
+        "error must name the bad field; got: {msg}"
+    );
+    assert!(
+        msg.contains("full UUID"),
+        "error must explain expected shape; got: {msg}"
+    );
+    assert!(
+        msg.contains("not-a-uuid"),
+        "error must echo the malformed value; got: {msg}"
+    );
+}

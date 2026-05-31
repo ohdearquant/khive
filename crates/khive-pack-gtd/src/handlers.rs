@@ -127,6 +127,8 @@ struct AssignParams {
     #[serde(default)]
     depends_on: Option<Vec<String>>,
     #[serde(default)]
+    context_entity_id: Option<String>,
+    #[serde(default)]
     tags: Option<Vec<String>>,
 }
 
@@ -221,6 +223,35 @@ pub(crate) async fn resolve_uuid(
     )))
 }
 
+/// Validate `context_entity_id`: must be a full UUID that resolves to a KG entity.
+/// Rejects short prefixes intentionally — prefix resolution would silently canonicalize
+/// a field meant to preserve an explicit, stable KG entity ID.
+async fn resolve_context_entity_id(
+    raw: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> Result<Uuid, RuntimeError> {
+    let uuid = Uuid::from_str(raw).map_err(|_| {
+        RuntimeError::InvalidInput(format!(
+            "context_entity_id must be a full UUID; got {raw:?}"
+        ))
+    })?;
+
+    match runtime.resolve(token, uuid).await? {
+        Some(Resolved::Entity(_)) => Ok(uuid),
+        Some(Resolved::Note(n)) => Err(RuntimeError::InvalidInput(format!(
+            "context_entity_id {uuid} must reference a KG entity; got note kind {:?}",
+            n.kind
+        ))),
+        Some(Resolved::Event(_)) => Err(RuntimeError::InvalidInput(format!(
+            "context_entity_id {uuid} must reference a KG entity; got event"
+        ))),
+        None => Err(RuntimeError::NotFound(format!(
+            "context_entity_id {uuid} not found in namespace"
+        ))),
+    }
+}
+
 /// Status used internally on a task. Defaults to "inbox" when missing/empty.
 fn task_status(props: Option<&Value>) -> String {
     props
@@ -267,6 +298,10 @@ fn render_task(note: &khive_storage::note::Note) -> Value {
         .to_string();
     let assignee = props.get("assignee").cloned().unwrap_or(Value::Null);
     let due = props.get("due").cloned().unwrap_or(Value::Null);
+    let context_entity_id = props
+        .get("context_entity_id")
+        .cloned()
+        .unwrap_or(Value::Null);
     let uuid_str = note.id.as_hyphenated().to_string();
     json!({
         "id": short_id(note.id),
@@ -277,6 +312,7 @@ fn render_task(note: &khive_storage::note::Note) -> Value {
         "priority": priority,
         "assignee": assignee,
         "due": due,
+        "context_entity_id": context_entity_id,
         "namespace": note.namespace,
         "created_at": ts_to_rfc(note.created_at),
         "updated_at": ts_to_rfc(note.updated_at),
@@ -492,6 +528,11 @@ impl GtdPack {
             }
         }
 
+        let context_entity_uuid = match p.context_entity_id.as_deref() {
+            Some(raw) => Some(resolve_context_entity_id(raw, self.runtime(), token).await?),
+            None => None,
+        };
+
         // Always persist priority (defaults to "p2") so listing filters can
         // match defaulted tasks via `properties.priority`. The render layer
         // already shows "p2" for unset priority, so making it explicit on
@@ -528,6 +569,9 @@ impl GtdPack {
                 .collect();
             props["depends_on"] = json!(dep_strs);
         }
+        if let Some(uuid) = context_entity_uuid.as_ref() {
+            props["context_entity_id"] = json!(uuid.as_hyphenated().to_string());
+        }
         if let Some(ref tags) = p.tags {
             props["tags"] = json!(tags);
         }
@@ -536,6 +580,7 @@ impl GtdPack {
         // when no description is supplied.
         let content = p.description.clone().unwrap_or_else(|| p.title.clone());
 
+        let annotates: Vec<Uuid> = context_entity_uuid.iter().copied().collect();
         let note = self
             .runtime()
             .create_note(
@@ -545,7 +590,7 @@ impl GtdPack {
                 &content,
                 Some(salience),
                 Some(props),
-                Vec::new(),
+                annotates,
             )
             .await?;
 
@@ -755,10 +800,18 @@ impl GtdPack {
             // Another concurrent op already transitioned this task away from `current`.
             // Re-read the actual current state to give a precise error.
             let (_, actual_now) = load_task(self.runtime(), token, &p.id).await?;
-            return Err(RuntimeError::InvalidInput(format!(
-                "task {} is in terminal state {actual_now:?}; no further transitions allowed",
-                short_id(note.id)
-            )));
+            let message = if is_terminal(&actual_now) {
+                format!(
+                    "task {} is in terminal state {actual_now:?}; no further transitions allowed",
+                    short_id(note.id)
+                )
+            } else {
+                format!(
+                    "complete: task {} changed from expected state {current:?} to {actual_now:?}; retry with fresh state",
+                    short_id(note.id)
+                )
+            };
+            return Err(RuntimeError::InvalidInput(message));
         }
 
         // ADR-019: write lifecycle audit record (best-effort).
