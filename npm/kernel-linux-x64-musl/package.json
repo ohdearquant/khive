@@ -1,6 +1,6 @@
 {
   "name": "@khive-ai/kernel-linux-x64-musl",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "khive Rust binaries for Linux x86_64 musl (Alpine etc.)",
   "license": "Apache-2.0",
   "repository": {
@@ -16,6 +16,10 @@
   "libc": [
     "musl"
   ],
+  "bin": {
+    "kkernel": "bin/kkernel",
+    "khive-mcp": "bin/khive-mcp"
+  },
   "files": [
     "bin/"
   ],

@@ -1,6 +1,6 @@
 {
   "name": "@khive-ai/kernel-win32-x64",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "khive Rust binaries for Windows x86_64",
   "license": "Apache-2.0",
   "repository": {
@@ -13,6 +13,10 @@
   "cpu": [
     "x64"
   ],
+  "bin": {
+    "kkernel": "bin/kkernel.exe",
+    "khive-mcp": "bin/khive-mcp.exe"
+  },
   "files": [
     "bin/"
   ],

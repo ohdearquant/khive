@@ -1,6 +1,6 @@
 {
   "name": "@khive-ai/kernel-darwin-x64",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "khive Rust binaries for macOS Intel (x64)",
   "license": "Apache-2.0",
   "repository": {
@@ -13,6 +13,10 @@
   "cpu": [
     "x64"
   ],
+  "bin": {
+    "kkernel": "bin/kkernel",
+    "khive-mcp": "bin/khive-mcp"
+  },
   "files": [
     "bin/"
   ],
