@@ -76,6 +76,29 @@ struct RememberParams {
     embedding_model: Option<String>,
 }
 
+/// Tag filter mode: `any` = OR, `all` = AND.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum TagMode {
+    #[default]
+    Any,
+    All,
+}
+
+fn note_matches_tags(props: Option<&Value>, expected: &[String], mode: TagMode) -> bool {
+    let Some(stored) = props
+        .and_then(|p| p.get("tags"))
+        .and_then(|tags| tags.as_array())
+    else {
+        return false;
+    };
+    let stored: HashSet<&str> = stored.iter().filter_map(Value::as_str).collect();
+    match mode {
+        TagMode::Any => expected.iter().any(|tag| stored.contains(tag.as_str())),
+        TagMode::All => expected.iter().all(|tag| stored.contains(tag.as_str())),
+    }
+}
+
 // ue-errors C1: deny_unknown_fields so typo kwargs (e.g. `min_scroe`)
 // are rejected at deserialization rather than silently dropped.
 #[derive(Deserialize)]
@@ -95,10 +118,12 @@ struct RecallParams {
     /// Include per-component score breakdown in each result.
     #[serde(default)]
     include_breakdown: Option<bool>,
-
-    /// Deprecated alias for pre-#482 clients. Prefer include_breakdown.
+    /// Filter by tag values stored in note properties.tags.
     #[serde(default)]
-    presentation: Option<String>,
+    tags: Option<Vec<String>>,
+    /// Tag match mode: "any" (OR, default) or "all" (AND).
+    #[serde(default)]
+    tag_mode: TagMode,
     /// Entity names to boost in scoring. Memories containing these names
     /// receive a 1.3× multiplier via the EntityMatch ScoreAdjustment.
     #[serde(default)]
@@ -1050,6 +1075,11 @@ impl MemoryPack {
                     continue;
                 }
             }
+            if let Some(filter_tags) = p.tags.as_ref().filter(|tags| !tags.is_empty()) {
+                if !note_matches_tags(note.properties.as_ref(), filter_tags, p.tag_mode) {
+                    continue;
+                }
+            }
             let salience = note.salience.unwrap_or(0.5);
             let decay_factor = note.decay_factor.unwrap_or(0.01);
             if salience < cfg.min_salience {
@@ -1239,17 +1269,7 @@ impl MemoryPack {
             true
         });
 
-        let legacy_breakdown = match p.presentation.as_deref() {
-            None => false,
-            Some("verbose") => true,
-            Some(other) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "memory.recall presentation={other:?} is deprecated; use include_breakdown=true"
-                )));
-            }
-        };
-        let is_verbose =
-            cfg.include_breakdown || p.include_breakdown.unwrap_or(false) || legacy_breakdown;
+        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
 
@@ -1329,6 +1349,10 @@ impl MemoryPack {
         #[derive(Deserialize)]
         struct EmbedParams {
             query: String,
+            /// When true, include full vector arrays in the response. Default false — only
+            /// model name and dimension metadata are returned to reduce response payload size.
+            #[serde(default)]
+            include_embeddings: bool,
         }
         let p: EmbedParams = deser(params)?;
 
@@ -1355,11 +1379,14 @@ impl MemoryPack {
                     if primary_embedding.is_none() || model_name == &primary_model {
                         primary_embedding = Some(vec.clone());
                     }
-                    engines.push(json!({
+                    let mut engine = json!({
                         "model": model_name,
                         "dimensions": dims,
-                        "embedding": vec,
-                    }));
+                    });
+                    if p.include_embeddings {
+                        engine["embedding"] = json!(vec);
+                    }
+                    engines.push(engine);
                 }
                 Err(e) => {
                     // Non-fatal: report the error per model so the caller knows which
@@ -1377,11 +1404,14 @@ impl MemoryPack {
         match primary_embedding {
             Some(vec) => {
                 let dims = vec.len();
-                to_json(&json!({
-                    "embedding": vec,
+                let mut response = json!({
                     "dimensions": dims,
                     "engines": engines,
-                }))
+                });
+                if p.include_embeddings {
+                    response["embedding"] = json!(vec);
+                }
+                to_json(&response)
             }
             None => {
                 // All models failed — surface the aggregate engines list so callers
@@ -1528,6 +1558,11 @@ impl MemoryPack {
                         .and_then(|props| props.get("memory_type"))
                         .and_then(|v| v.as_str());
                     if stored != Some(mt.as_str()) {
+                        return None;
+                    }
+                }
+                if let Some(filter_tags) = p.tags.as_ref().filter(|tags| !tags.is_empty()) {
+                    if !note_matches_tags(note.properties.as_ref(), filter_tags, p.tag_mode) {
                         return None;
                     }
                 }
@@ -1750,7 +1785,8 @@ mod tests {
             score_floor: None,
             embedding_model: None,
             include_breakdown: None,
-            presentation: None,
+            tags: None,
+            tag_mode: TagMode::Any,
             entity_names: None,
             full_content: None,
         };
@@ -1774,7 +1810,8 @@ mod tests {
             score_floor: None,
             embedding_model: None,
             include_breakdown: None,
-            presentation: None,
+            tags: None,
+            tag_mode: TagMode::Any,
             entity_names: None,
             full_content: None,
         };
@@ -1800,7 +1837,8 @@ mod tests {
             score_floor: None,
             embedding_model: None,
             include_breakdown: None,
-            presentation: None,
+            tags: None,
+            tag_mode: TagMode::Any,
             entity_names: None,
             full_content: None,
         };
@@ -1833,7 +1871,8 @@ mod tests {
             score_floor: None,
             embedding_model: None,
             include_breakdown: None,
-            presentation: None,
+            tags: None,
+            tag_mode: TagMode::Any,
             entity_names: None,
             full_content: None,
         };

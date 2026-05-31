@@ -1805,9 +1805,9 @@ async fn test_score_floor_portable_across_fusion_strategies() {
     );
 }
 
-/// Fix 5: presentation="verbose" includes score breakdown without changing agent-mode shape.
+/// Fix 5: include_breakdown=true includes score breakdown without changing agent-mode shape.
 #[tokio::test]
-async fn test_recall_verbose_presentation_includes_breakdown() {
+async fn test_recall_include_breakdown_flag_includes_breakdown() {
     let rt = make_runtime();
     let registry = make_registry(rt);
 
@@ -1829,23 +1829,23 @@ async fn test_recall_verbose_presentation_includes_breakdown() {
     assert!(!default_hits.is_empty(), "must have hits");
     assert!(
         default_hits[0].get("breakdown").is_none(),
-        "default presentation must NOT include breakdown"
+        "default recall must NOT include breakdown"
     );
 
-    // Verbose: breakdown present
+    // include_breakdown=true: breakdown present
     let verbose_result = registry
         .dispatch(
             "memory.recall",
-            json!({ "query": "transformer", "presentation": "verbose" }),
+            json!({ "query": "transformer", "include_breakdown": true }),
         )
         .await
-        .expect("recall verbose");
+        .expect("recall with include_breakdown=true");
 
     let verbose_hits = verbose_result.as_array().expect("array");
-    assert!(!verbose_hits.is_empty(), "verbose must have hits");
+    assert!(!verbose_hits.is_empty(), "include_breakdown=true must have hits");
     let bd = verbose_hits[0]
         .get("breakdown")
-        .expect("verbose result must include breakdown");
+        .expect("include_breakdown=true result must include breakdown");
     assert!(
         bd.get("relevance").is_some(),
         "breakdown must have relevance field; got: {bd}"
@@ -1853,6 +1853,25 @@ async fn test_recall_verbose_presentation_includes_breakdown() {
     assert!(
         bd.get("temporal").is_some(),
         "breakdown must have temporal field; got: {bd}"
+    );
+}
+
+/// #514 regression: presentation= must be rejected by deny_unknown_fields.
+#[tokio::test]
+async fn recall_presentation_alias_is_rejected_by_deny_unknown_fields() {
+    let registry = make_registry(make_runtime());
+    let err = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "transformer", "presentation": "verbose" }),
+        )
+        .await
+        .expect_err("presentation alias must be rejected");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown field") && msg.contains("presentation"),
+        "error must mention unknown field 'presentation'; got: {msg}"
     );
 }
 
@@ -2270,8 +2289,7 @@ async fn recall_candidates_text_candidates_non_empty_for_partial_match() {
 }
 
 // Issue #482: recall include_breakdown=true must include per-component breakdown.
-// Also verifies the deprecated presentation="verbose" alias still works and that
-// unknown presentation values are rejected, removing dual-meaning ambiguity.
+// presentation= was removed in #514 and is now rejected by deny_unknown_fields.
 #[tokio::test]
 async fn recall_include_breakdown_true_includes_breakdown() {
     let rt = make_runtime();
@@ -2380,5 +2398,251 @@ async fn search_kind_memory_resolves_when_memory_pack_loaded() {
         result.is_ok(),
         "search(kind=\"memory\") must succeed when memory pack is loaded; got: {:?}",
         result.err()
+    );
+}
+
+// ── #515: tag-filtered recall ─────────────────────────────────────────────────
+
+/// #515: tag filter — OR (any), AND (all), and no-filter behaviors.
+#[tokio::test]
+async fn recall_tags_filter_any_all_and_no_filter() {
+    let registry = make_registry(make_runtime());
+
+    // Store three memories with distinct tag combos.
+    let impl_khive = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "tag filter regression shared semantic target alpha",
+                "salience": 0.9,
+                "tags": ["role:implementer", "khive"]
+            }),
+        )
+        .await
+        .expect("remember impl khive");
+    let impl_khive_id = impl_khive["note_id"].as_str().unwrap().to_owned();
+
+    let critic_khive = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "tag filter regression shared semantic target beta",
+                "salience": 0.9,
+                "tags": ["role:critic", "khive"]
+            }),
+        )
+        .await
+        .expect("remember critic khive");
+    let critic_khive_id = critic_khive["note_id"].as_str().unwrap().to_owned();
+
+    let impl_rust = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "tag filter regression shared semantic target gamma",
+                "salience": 0.9,
+                "tags": ["role:implementer", "rust"]
+            }),
+        )
+        .await
+        .expect("remember impl rust");
+    let impl_rust_id = impl_rust["note_id"].as_str().unwrap().to_owned();
+
+    // no-filter: all three should appear.
+    let no_filter = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "tag filter regression shared semantic target", "limit": 20 }),
+        )
+        .await
+        .expect("recall no filter");
+    let no_filter_ids: Vec<&str> = no_filter
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["note_id"].as_str())
+        .collect();
+    assert!(
+        no_filter_ids.contains(&impl_khive_id.as_str()),
+        "no-filter must return impl+khive memory"
+    );
+    assert!(
+        no_filter_ids.contains(&critic_khive_id.as_str()),
+        "no-filter must return critic+khive memory"
+    );
+    assert!(
+        no_filter_ids.contains(&impl_rust_id.as_str()),
+        "no-filter must return impl+rust memory"
+    );
+
+    // any (OR): tags=["role:critic", "rust"] → critic_khive and impl_rust, not impl_khive.
+    let any_result = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": "tag filter regression shared semantic target",
+                "limit": 20,
+                "tags": ["role:critic", "rust"],
+                "tag_mode": "any"
+            }),
+        )
+        .await
+        .expect("recall tag any");
+    let any_ids: Vec<&str> = any_result
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["note_id"].as_str())
+        .collect();
+    assert!(
+        any_ids.contains(&critic_khive_id.as_str()),
+        "any filter must include critic+khive (has role:critic)"
+    );
+    assert!(
+        any_ids.contains(&impl_rust_id.as_str()),
+        "any filter must include impl+rust (has rust)"
+    );
+    assert!(
+        !any_ids.contains(&impl_khive_id.as_str()),
+        "any filter must exclude impl+khive (has neither role:critic nor rust)"
+    );
+
+    // all (AND): tags=["role:implementer", "khive"] → impl_khive only.
+    let all_result = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": "tag filter regression shared semantic target",
+                "limit": 20,
+                "tags": ["role:implementer", "khive"],
+                "tag_mode": "all"
+            }),
+        )
+        .await
+        .expect("recall tag all");
+    let all_ids: Vec<&str> = all_result
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["note_id"].as_str())
+        .collect();
+    assert!(
+        all_ids.contains(&impl_khive_id.as_str()),
+        "all filter must include impl+khive (has both role:implementer and khive)"
+    );
+    assert!(
+        !all_ids.contains(&critic_khive_id.as_str()),
+        "all filter must exclude critic+khive (missing role:implementer)"
+    );
+    assert!(
+        !all_ids.contains(&impl_rust_id.as_str()),
+        "all filter must exclude impl+rust (missing khive)"
+    );
+}
+
+/// #515 metadata: memory.recall handler must advertise tags and tag_mode params.
+#[test]
+fn recall_handler_metadata_advertises_tags_and_tag_mode() {
+    let recall_def = khive_pack_memory::MemoryPack::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall handler must be registered");
+
+    let param_names: Vec<&str> = recall_def.params.iter().map(|p| p.name).collect();
+    assert!(
+        param_names.contains(&"tags"),
+        "memory.recall must advertise 'tags' param; got: {param_names:?}"
+    );
+    assert!(
+        param_names.contains(&"tag_mode"),
+        "memory.recall must advertise 'tag_mode' param; got: {param_names:?}"
+    );
+}
+
+// ── #566: recall_embed vectors opt-in ────────────────────────────────────────
+
+/// #566: default recall_embed omits embedding vectors, keeps model+dimension metadata.
+#[tokio::test]
+async fn recall_embed_default_omits_embedding_vectors() {
+    const MODEL_A: &str = "embed-a";
+    const DIMS: usize = 4;
+
+    let rt = make_runtime();
+    rt.register_embedder(ConstVecProvider::new(MODEL_A, DIMS, 0.7));
+    let registry = make_registry(rt);
+
+    let result = registry
+        .dispatch(
+            "memory.recall_embed",
+            json!({ "query": "embedding metadata only" }),
+        )
+        .await
+        .expect("recall_embed default");
+
+    // Top-level embedding array must be absent.
+    assert!(
+        result.get("embedding").is_none(),
+        "default recall_embed must not include top-level embedding; got: {result}"
+    );
+    // Dimension metadata must still be present.
+    assert_eq!(
+        result["dimensions"].as_u64(),
+        Some(DIMS as u64),
+        "dimensions must be returned even without embeddings"
+    );
+    // Per-engine entry must have model and dimensions but no embedding array.
+    let engines = result["engines"].as_array().expect("engines array");
+    assert_eq!(engines.len(), 1);
+    assert_eq!(engines[0]["model"].as_str(), Some(MODEL_A));
+    assert_eq!(engines[0]["dimensions"].as_u64(), Some(DIMS as u64));
+    assert!(
+        engines[0].get("embedding").is_none(),
+        "default recall_embed must not include per-engine embedding; got: {}",
+        engines[0]
+    );
+}
+
+/// #566: include_embeddings=true returns full vector payload.
+#[tokio::test]
+async fn recall_embed_include_embeddings_returns_vectors() {
+    const MODEL_A: &str = "embed-a";
+    const DIMS: usize = 4;
+
+    let rt = make_runtime();
+    rt.register_embedder(ConstVecProvider::new(MODEL_A, DIMS, 0.7));
+    let registry = make_registry(rt);
+
+    let result = registry
+        .dispatch(
+            "memory.recall_embed",
+            json!({ "query": "embedding full payload", "include_embeddings": true }),
+        )
+        .await
+        .expect("recall_embed include embeddings");
+
+    // Top-level embedding array must be present.
+    let top_vec = result["embedding"].as_array().expect("top-level embedding array");
+    assert_eq!(top_vec.len(), DIMS, "top-level embedding length must match dims");
+    // Per-engine embedding also present.
+    let engines = result["engines"].as_array().expect("engines array");
+    assert_eq!(engines.len(), 1);
+    let engine_vec = engines[0]["embedding"]
+        .as_array()
+        .expect("per-engine embedding array");
+    assert_eq!(engine_vec.len(), DIMS, "per-engine embedding length must match dims");
+}
+
+/// #566 metadata: memory.recall_embed handler must advertise include_embeddings param.
+#[test]
+fn recall_embed_handler_metadata_advertises_include_embeddings() {
+    let embed_def = khive_pack_memory::MemoryPack::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall_embed")
+        .expect("memory.recall_embed handler must be registered");
+
+    let param_names: Vec<&str> = embed_def.params.iter().map(|p| p.name).collect();
+    assert!(
+        param_names.contains(&"include_embeddings"),
+        "memory.recall_embed must advertise 'include_embeddings' param; got: {param_names:?}"
     );
 }

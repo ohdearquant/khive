@@ -85,6 +85,12 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 required: false,
                 description: "Model name for vector embedding (must be registered). Defaults to pack-configured model.",
             },
+            ParamDef {
+                name: "tags",
+                param_type: "array",
+                required: false,
+                description: "Tag values to filter by. Matched against properties.tags on stored memories.",
+            },
         ],
     },
     // Assertive: retrieves memory notes via decay-aware ranking
@@ -166,6 +172,18 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
                 required: false,
                 description: "When false, content is truncated to 200 chars in results. Default true.",
             },
+            ParamDef {
+                name: "tags",
+                param_type: "array",
+                required: false,
+                description: "Filter results to memories whose stored tags include at least one (any) or all (all) of these values. Matched against properties.tags.",
+            },
+            ParamDef {
+                name: "tag_mode",
+                param_type: "string",
+                required: false,
+                description: "Tag filter mode: \"any\" (OR, default) or \"all\" (AND). Only applies when tags is non-empty.",
+            },
         ],
     },
     HandlerDef {
@@ -173,7 +191,12 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
         description: "Return the embedding vector used by memory recall",
         visibility: Visibility::Subhandler,
         category: VerbCategory::Assertive,
-        params: &[],
+        params: &[ParamDef {
+            name: "include_embeddings",
+            param_type: "boolean",
+            required: false,
+            description: "When true, include full embedding vector arrays in the response. Default false — only model name and dimension metadata are returned.",
+        }],
     },
     HandlerDef {
         name: "memory.recall_candidates",
