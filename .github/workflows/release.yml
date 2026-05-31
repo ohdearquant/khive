@@ -27,6 +27,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (without v prefix, e.g. 0.2.4)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -150,7 +156,11 @@ jobs:
       # Passed via env var to avoid shell-interpolation issues in node -e (MIN-3).
       - name: Extract version
         run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+          if [[ -n "${{ inputs.version }}" ]]; then
+            echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+          fi
 
       # Download all six platform artifacts into their respective directories.
       - name: Download all platform artifacts
