@@ -323,6 +323,8 @@ pub(crate) async fn handle_inbox(
     };
 
     // Push direction + read-status filters into SQL so idx_comm_message_direction is usable.
+    // Read filter uses json_type to match the old as_bool().unwrap_or(false) semantics:
+    // only JSON boolean `true` counts as read; missing/false/string/integer all count as unread.
     let mut property_filters = vec![PropertyFilter {
         json_path: "$.direction".to_string(),
         op: FilterOp::Eq,
@@ -331,13 +333,13 @@ pub(crate) async fn handle_inbox(
     match status {
         "unread" => property_filters.push(PropertyFilter {
             json_path: "$.read".to_string(),
-            op: FilterOp::EqOrMissing,
-            value: SqlValue::Bool(false),
+            op: FilterOp::JsonTypeNeMissing,
+            value: SqlValue::Text("true".to_string()),
         }),
         "read" => property_filters.push(PropertyFilter {
             json_path: "$.read".to_string(),
-            op: FilterOp::Eq,
-            value: SqlValue::Bool(true),
+            op: FilterOp::JsonTypeEq,
+            value: SqlValue::Text("true".to_string()),
         }),
         _ => {} // "all" — no read-status filter
     }
@@ -611,20 +613,17 @@ pub(crate) async fn handle_thread(
         }
     };
 
-    let canonical_short = &canonical_thread_id[..8];
-
-    // Paginated scan over kind=message notes (SQL handles deleted_at IS NULL).
-    // Thread matching is preserved exactly in Rust to cover all 4 cases:
-    // (a) own UUID == canonical_thread_id (the root note itself)
-    // (b) properties.thread_id == canonical_thread_id (exact UUID reply)
-    // (c) properties.thread_id == canonical_short (legacy 8-char stored value)
-    // (d) properties.thread_id[..8] == canonical_short (legacy prefix)
-    // Sorting happens after collection because SQL orders by created_at DESC;
-    // thread display requires chronological ascending order.
+    // Push thread_id predicate into SQL so idx_comm_message_thread can be used.
+    // The root note always has properties.thread_id == own_uuid == canonical_thread_id
+    // (patched by dual_write_message), so it is captured by the same SQL filter as replies.
     let thread_store = runtime.notes(token)?;
     let thread_filter = NoteFilter {
         kind: Some("message".to_string()),
-        property_filters: vec![],
+        property_filters: vec![PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(canonical_thread_id.clone()),
+        }],
         order_by: None,
     };
     const PAGE_SIZE: u32 = 200;
@@ -643,39 +642,9 @@ pub(crate) async fn handle_thread(
             )
             .await?;
         let fetched = page.items.len() as u32;
-
         for n in &page.items {
-            let props = n.properties.as_ref();
-
-            // A message belongs to this thread if:
-            // (a) its own UUID equals the canonical thread_id (it IS the root), or
-            // (b) its properties.thread_id equals the canonical thread_id (it is a reply).
-            let matches = {
-                let own_full = n.id.as_hyphenated().to_string();
-                if own_full == canonical_thread_id {
-                    true
-                } else {
-                    match props
-                        .and_then(|p| p.get("thread_id"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                    {
-                        Some(stored_thread) => {
-                            stored_thread == canonical_thread_id
-                                || stored_thread == canonical_short
-                                || (stored_thread.len() >= 8
-                                    && &stored_thread[..8] == canonical_short)
-                        }
-                        None => false,
-                    }
-                }
-            };
-
-            if matches {
-                messages.push(note_to_message_json(n));
-            }
+            messages.push(note_to_message_json(n));
         }
-
         if fetched < PAGE_SIZE {
             break;
         }

@@ -199,6 +199,10 @@ fn json_extract_expr(path: &str) -> String {
     format!("json_extract(properties, '{path}')")
 }
 
+fn json_type_expr(path: &str) -> String {
+    format!("json_type(properties, '{path}')")
+}
+
 fn sql_value_param(value: &SqlValue) -> Result<Box<dyn rusqlite::types::ToSql>, rusqlite::Error> {
     Ok(match value {
         SqlValue::Null => Box::new(Option::<String>::None),
@@ -232,26 +236,43 @@ fn build_note_filter_where(
     }
 
     for pf in &filter.property_filters {
-        let expr = json_extract_expr(&pf.json_path);
-        if matches!(pf.op, FilterOp::EqOrMissing) {
-            params.push(sql_value_param(&pf.value)?);
-            conditions.push(format!(
-                "({expr} = ?{n} OR {expr} IS NULL)",
-                n = params.len()
-            ));
-            continue;
+        match pf.op {
+            FilterOp::EqOrMissing => {
+                let expr = json_extract_expr(&pf.json_path);
+                params.push(sql_value_param(&pf.value)?);
+                conditions.push(format!(
+                    "({expr} = ?{n} OR {expr} IS NULL)",
+                    n = params.len()
+                ));
+            }
+            FilterOp::JsonTypeEq => {
+                let type_expr = json_type_expr(&pf.json_path);
+                params.push(sql_value_param(&pf.value)?);
+                conditions.push(format!("{type_expr} = ?{}", params.len()));
+            }
+            FilterOp::JsonTypeNeMissing => {
+                let type_expr = json_type_expr(&pf.json_path);
+                params.push(sql_value_param(&pf.value)?);
+                let n = params.len();
+                conditions.push(format!("({type_expr} IS NULL OR {type_expr} != ?{n})"));
+            }
+            _ => {
+                let expr = json_extract_expr(&pf.json_path);
+                let op = match pf.op {
+                    FilterOp::Eq => "=",
+                    FilterOp::Ne => "!=",
+                    FilterOp::Lt => "<",
+                    FilterOp::Lte => "<=",
+                    FilterOp::Gt => ">",
+                    FilterOp::Gte => ">=",
+                    FilterOp::EqOrMissing | FilterOp::JsonTypeEq | FilterOp::JsonTypeNeMissing => {
+                        unreachable!()
+                    }
+                };
+                params.push(sql_value_param(&pf.value)?);
+                conditions.push(format!("{expr} {op} ?{}", params.len()));
+            }
         }
-        let op = match pf.op {
-            FilterOp::Eq => "=",
-            FilterOp::Ne => "!=",
-            FilterOp::Lt => "<",
-            FilterOp::Lte => "<=",
-            FilterOp::Gt => ">",
-            FilterOp::Gte => ">=",
-            FilterOp::EqOrMissing => unreachable!(),
-        };
-        params.push(sql_value_param(&pf.value)?);
-        conditions.push(format!("{expr} {op} ?{}", params.len()));
     }
 
     Ok((format!(" WHERE {}", conditions.join(" AND ")), params))

@@ -10,18 +10,23 @@ use khive_types::{HandlerDef, Pack, ParamDef, Visibility};
 
 /// Pack-auxiliary indexes for comm inbox and thread queries (ADR-040).
 ///
-/// Both are partial indexes scoped to `kind = 'message'` notes.
-/// The inbox index covers direction + read-status for efficient unread filtering.
-/// The thread index covers thread_id for efficient thread retrieval.
+/// Indexes use `WHERE deleted_at IS NULL` (not `WHERE kind = 'message'`) so that
+/// SQLite's index planner can match them when queries contain the parameterized
+/// `kind = ?N` predicate emitted by `build_note_filter_where`.  A literal-value
+/// partial index (`WHERE kind = 'message'`) cannot be used for a parameterized
+/// comparison — the planner sees different predicates and falls back to a table scan.
+/// `deleted_at IS NULL` is always present in filtered queries, so the partial
+/// condition is always satisfied and the index is eligible.
+/// `kind` is included as an indexed column so the `kind = ?N` predicate is covered.
 /// Statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
 pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 2] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
-        ON notes(namespace, json_extract(properties, '$.direction'), \
+        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
-        WHERE kind = 'message'",
+        WHERE deleted_at IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_comm_message_thread \
-        ON notes(namespace, json_extract(properties, '$.thread_id'), created_at DESC) \
-        WHERE kind = 'message'",
+        ON notes(namespace, kind, json_extract(properties, '$.thread_id'), created_at DESC) \
+        WHERE deleted_at IS NULL",
 ];
 
 pub struct CommPack {

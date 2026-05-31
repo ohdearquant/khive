@@ -22,14 +22,17 @@ impl Pack for SchedulePack {
 
 /// ADR-040 §283-291: pack-auxiliary index for agenda() efficiency.
 ///
-/// A partial index on `properties.trigger_at` (JSON-extracted) scoped to
-/// `scheduled_event` notes enables efficient range scans in `agenda()`.
-/// The statement is idempotent (`CREATE INDEX IF NOT EXISTS`) and is NOT
+/// Uses `WHERE deleted_at IS NULL` instead of `WHERE kind = 'scheduled_event'` so
+/// that the parameterized `kind = ?N` predicate in `build_note_filter_where` can
+/// use this index.  A literal-value partial condition (`WHERE kind = 'scheduled_event'`)
+/// is invisible to the planner when the query uses a bound parameter for `kind`.
+/// `namespace` and `kind` are included as indexed columns for efficient namespace+kind
+/// range scans.  The statement is idempotent (`CREATE INDEX IF NOT EXISTS`) and is NOT
 /// part of the core versioned migration chain (ADR-015).
 pub(crate) static SCHEDULE_SCHEMA_PLAN_STMTS: [&str; 1] =
     ["CREATE INDEX IF NOT EXISTS idx_schedule_trigger \
-        ON notes(json_extract(properties, '$.trigger_at')) \
-        WHERE kind = 'scheduled_event'"];
+        ON notes(namespace, kind, json_extract(properties, '$.trigger_at')) \
+        WHERE deleted_at IS NULL"];
 
 static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {

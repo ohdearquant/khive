@@ -865,9 +865,11 @@ async fn schedule_pack_exposes_non_empty_schema_plan() {
         combined.contains("CREATE INDEX IF NOT EXISTS"),
         "schema plan DDL must be idempotent (CREATE INDEX IF NOT EXISTS); got: {combined}"
     );
+    // Index now uses WHERE deleted_at IS NULL so the parameterized kind = ?N
+    // predicate can use the index (literal WHERE kind = 'scheduled_event' blocks this).
     assert!(
-        combined.contains("scheduled_event"),
-        "schema plan index must be scoped to 'scheduled_event' kind; got: {combined}"
+        combined.contains("deleted_at IS NULL"),
+        "schema plan index must use WHERE deleted_at IS NULL partial condition; got: {combined}"
     );
 }
 

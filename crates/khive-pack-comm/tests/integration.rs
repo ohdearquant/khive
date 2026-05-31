@@ -1934,9 +1934,11 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
         combined.contains("CREATE INDEX IF NOT EXISTS"),
         "schema plan DDL must be idempotent; got: {combined}"
     );
+    // Indexes now use WHERE deleted_at IS NULL so the parameterized kind = ?N
+    // predicate can use the index (literal WHERE kind = 'message' blocks this).
     assert!(
-        combined.contains("'message'"),
-        "schema plan indexes must be scoped to kind='message'; got: {combined}"
+        combined.contains("deleted_at IS NULL"),
+        "schema plan indexes must use WHERE deleted_at IS NULL partial condition; got: {combined}"
     );
 }
 
@@ -1957,4 +1959,196 @@ async fn verb_registry_aggregates_comm_schema_plan() {
         !comm_plan.is_empty(),
         "comm schema plan must have DDL statements"
     );
+}
+
+/// thread isolation: comm.thread returns only messages belonging to the requested thread,
+/// not messages from other threads in the same namespace.
+#[tokio::test]
+async fn test_thread_returns_only_requested_thread_messages() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    // Send two independent root messages (thread A and thread B).
+    let msg_a = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "thread A root" }),
+        )
+        .await
+        .expect("send thread A root");
+    let thread_a_id = msg_a
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id A");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "thread B root" }),
+        )
+        .await
+        .expect("send thread B root");
+
+    // Reply to thread A.
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": thread_a_id, "content": "reply to A" }),
+        )
+        .await
+        .expect("reply to A");
+
+    // Fetch thread A — must contain exactly the root + 1 reply (the inbound copy of each).
+    // With self-send, each comm.send creates outbound + inbound, and reply creates outbound + inbound.
+    // SQL filter ensures only thread-A messages are returned.
+    let thread = registry
+        .dispatch("comm.thread", serde_json::json!({ "id": thread_a_id }))
+        .await
+        .expect("thread A fetch");
+
+    let messages = thread
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+
+    // All returned messages must have thread_id == thread_a_id.
+    for msg in messages {
+        let props = msg.get("properties").expect("has properties");
+        let stored_tid = props
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            stored_tid, thread_a_id,
+            "all thread messages must carry thread_id={thread_a_id}, got {stored_tid}"
+        );
+    }
+
+    // Must have at least 2 messages (root + reply, inbound copies).
+    assert!(
+        messages.len() >= 2,
+        "thread must contain at least root + reply; got {}",
+        messages.len()
+    );
+}
+
+/// read filter 5-case truth table: json_type-based filter matches old as_bool().unwrap_or(false).
+/// Seeds messages with $.read set to: missing, bool false, bool true, string "true", integer 1.
+/// Verifies that inbox(status=unread) and inbox(status=read) classify each case correctly.
+#[tokio::test]
+async fn test_inbox_read_filter_json_type_truth_table() {
+    use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
+    use khive_storage::types::{PageRequest, SqlValue};
+
+    let (_registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::parse("local").unwrap())
+        .unwrap();
+    let store = rt.notes(&token).expect("note store");
+
+    // Seed 5 inbound message notes directly (bypassing send) to control $.read exactly.
+    let make_msg = |read_val: serde_json::Value, label: &str| -> Note {
+        Note::new("local", "message", label).with_properties(serde_json::json!({
+            "direction": "inbound",
+            "from": "local",
+            "to": "local",
+            "thread_id": null,
+            "read": read_val,
+        }))
+    };
+
+    // missing: don't set read at all in properties
+    let note_missing = Note::new("local", "message", "read=missing").with_properties(
+        serde_json::json!({ "direction": "inbound", "from": "local", "to": "local" }),
+    );
+    let note_false = make_msg(serde_json::json!(false), "read=false");
+    let note_true = make_msg(serde_json::json!(true), "read=true");
+    let note_str_true = make_msg(serde_json::json!("true"), "read=string_true");
+    let note_int_1 = make_msg(serde_json::json!(1), "read=int_1");
+
+    store.upsert_note(note_missing).await.unwrap();
+    store.upsert_note(note_false).await.unwrap();
+    store.upsert_note(note_true).await.unwrap();
+    store.upsert_note(note_str_true).await.unwrap();
+    store.upsert_note(note_int_1).await.unwrap();
+
+    // Query unread: missing, false, "true" (string), 1 (integer) → all count as unread.
+    let unread_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            PropertyFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            },
+        ],
+        order_by: None,
+    };
+    let unread_page = store
+        .query_notes_filtered("local", &unread_filter, PageRequest::default())
+        .await
+        .unwrap();
+    let unread_contents: Vec<&str> = unread_page
+        .items
+        .iter()
+        .map(|n| n.content.as_str())
+        .collect();
+
+    assert!(
+        unread_contents.contains(&"read=missing"),
+        "missing $.read must be unread; got {unread_contents:?}"
+    );
+    assert!(
+        unread_contents.contains(&"read=false"),
+        "bool false must be unread; got {unread_contents:?}"
+    );
+    assert!(
+        unread_contents.contains(&"read=string_true"),
+        "string 'true' must be unread (not JSON bool true); got {unread_contents:?}"
+    );
+    assert!(
+        unread_contents.contains(&"read=int_1"),
+        "integer 1 must be unread (not JSON bool true); got {unread_contents:?}"
+    );
+    assert!(
+        !unread_contents.contains(&"read=true"),
+        "JSON bool true must NOT be unread; got {unread_contents:?}"
+    );
+
+    // Query read: only JSON boolean true → exactly 1 result.
+    let read_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("inbound".to_string()),
+            },
+            PropertyFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeEq,
+                value: SqlValue::Text("true".to_string()),
+            },
+        ],
+        order_by: None,
+    };
+    let read_page = store
+        .query_notes_filtered("local", &read_filter, PageRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        read_page.items.len(),
+        1,
+        "only JSON bool true must be in 'read'; got {:?}",
+        read_page
+            .items
+            .iter()
+            .map(|n| &n.content)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(read_page.items[0].content, "read=true");
 }

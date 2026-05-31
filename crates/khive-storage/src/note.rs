@@ -91,6 +91,14 @@ pub enum FilterOp {
     Lte,
     Gt,
     Gte,
+    /// Matches rows where `json_type(properties, path) = value`.
+    /// Value must be a SQLite json_type string literal: 'true', 'false', 'integer',
+    /// 'real', 'text', 'array', 'object', or 'null'.
+    JsonTypeEq,
+    /// Matches rows where the json_type is absent (NULL) OR differs from value.
+    /// Equivalent to `json_type IS NULL OR json_type != value`.
+    /// Used for unread filter: matches any `$.read` that is NOT the JSON boolean true.
+    JsonTypeNeMissing,
 }
 
 /// A single `json_extract(properties, '$.field') op value` predicate.
