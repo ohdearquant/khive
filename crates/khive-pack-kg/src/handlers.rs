@@ -1117,12 +1117,13 @@ async fn ensure_note_kind(
     id: Uuid,
     expected_kind: Option<&str>,
 ) -> Result<(), RuntimeError> {
-    let note = runtime
-        .notes(token)?
-        .get_note(id)
-        .await
-        .map_err(RuntimeError::Storage)?
-        .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+    use khive_runtime::Resolved;
+    // resolve() routes notes through ensure_namespace, so absent and foreign-namespace
+    // IDs are both returned as None — no existence or kind oracle across namespaces.
+    let note = match runtime.resolve(token, id).await? {
+        Some(Resolved::Note(note)) => note,
+        _ => return Err(RuntimeError::NotFound("not found in this namespace".into())),
+    };
     if let Some(k) = expected_kind {
         if note.kind != k {
             return Err(RuntimeError::NotFound(format!("{k} {id}")));
@@ -4011,5 +4012,37 @@ mod tests {
             err_msg.contains("concept"),
             "#486: error must mention endpoint kinds; got: {err_msg}"
         );
+    }
+
+    // ── #567 regression: ensure_note_kind must not disclose foreign note metadata ──
+
+    #[tokio::test]
+    async fn ensure_note_kind_rejects_foreign_note_before_kind_check() {
+        use super::ensure_note_kind;
+        use khive_runtime::{KhiveRuntime, RuntimeError};
+        use khive_types::Namespace;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns_a = rt.authorize(Namespace::parse("ns-a").unwrap()).unwrap();
+        let ns_b = rt.authorize(Namespace::parse("ns-b").unwrap()).unwrap();
+        let foreign = rt
+            .create_note(&ns_b, "observation", None, "foreign", None, None, vec![])
+            .await
+            .unwrap();
+
+        // All expected_kind values must yield opaque NotFound — no kind leakage.
+        for expected in [Some("observation"), Some("task"), None] {
+            let err = ensure_note_kind(&rt, &ns_a, foreign.id, expected)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RuntimeError::NotFound(_)),
+                "foreign note preflight must be NotFound, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("not found in this namespace"),
+                "error message must be opaque, got {err}"
+            );
+        }
     }
 }

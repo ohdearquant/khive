@@ -68,6 +68,10 @@ impl KhiveRuntime {
         start: Uuid,
         options: TraversalOptions,
     ) -> RuntimeResult<Vec<PathNode>> {
+        if !self.substrate_exists_in_ns(token, start).await? {
+            return Ok(Vec::new());
+        }
+
         let graph = self.graph(token)?;
         let limit = options.max_results.unwrap_or(usize::MAX);
 
@@ -139,6 +143,12 @@ impl KhiveRuntime {
         to: Uuid,
         max_depth: usize,
     ) -> RuntimeResult<Option<Vec<PathNode>>> {
+        if !self.substrate_exists_in_ns(token, from).await?
+            || !self.substrate_exists_in_ns(token, to).await?
+        {
+            return Ok(None);
+        }
+
         if from == to {
             return Ok(Some(vec![PathNode {
                 entity_id: from,

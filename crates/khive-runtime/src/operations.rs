@@ -364,7 +364,7 @@ impl KhiveRuntime {
             .get_entity(id)
             .await?
             .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
-        self.ensure_namespace(&entity.namespace, token, id)?;
+        Self::ensure_namespace(&entity.namespace, token.namespace().as_str())?;
         Ok(entity)
     }
 
@@ -397,17 +397,12 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
-    /// Enforce that `actual` matches the token's namespace.
+    /// Enforce that `record_ns` matches `caller_ns`.
     ///
     /// Returns `Err(NotFound)` when they differ — ADR-007 requires wrong-namespace
     /// and absent UUIDs to be indistinguishable externally (no existence oracle).
-    pub(crate) fn ensure_namespace(
-        &self,
-        actual: &str,
-        token: &NamespaceToken,
-        _id: Uuid,
-    ) -> RuntimeResult<()> {
-        if actual == token.namespace().as_str() {
+    pub(crate) fn ensure_namespace(record_ns: &str, caller_ns: &str) -> RuntimeResult<()> {
+        if record_ns == caller_ns {
             return Ok(());
         }
         Err(RuntimeError::NotFound("not found in this namespace".into()))
@@ -800,7 +795,7 @@ impl KhiveRuntime {
     ///
     /// Covers entity, note, event (via `resolve`) and edge (via `get_edge`).
     /// A record that exists in a different namespace returns `false` (fail-closed).
-    async fn substrate_exists_in_ns(
+    pub(crate) async fn substrate_exists_in_ns(
         &self,
         token: &NamespaceToken,
         id: Uuid,
@@ -808,7 +803,11 @@ impl KhiveRuntime {
         if self.resolve(token, id).await?.is_some() {
             return Ok(true);
         }
-        Ok(self.get_edge(token, id).await?.is_some())
+        match self.get_edge(token, id).await {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) | Err(RuntimeError::NotFound(_)) => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     /// Get immediate neighbors of a node, optionally filtered by relation type.
@@ -855,6 +854,10 @@ impl KhiveRuntime {
         node_id: Uuid,
         mut query: NeighborQuery,
     ) -> RuntimeResult<Vec<NeighborHit>> {
+        if !self.substrate_exists_in_ns(token, node_id).await? {
+            return Ok(Vec::new());
+        }
+
         query.direction =
             normalize_symmetric_direction(query.direction, query.relations.as_deref());
         let mut hits = self.graph(token)?.neighbors(node_id, query).await?;
@@ -870,12 +873,25 @@ impl KhiveRuntime {
 
     /// Traverse the graph from a set of root nodes.
     ///
+    /// Roots in a foreign namespace are silently filtered before storage expansion.
     /// Soft-deleted entity nodes are excluded from results (Fix 2).
     pub async fn traverse(
         &self,
         token: &NamespaceToken,
         request: TraversalRequest,
     ) -> RuntimeResult<Vec<GraphPath>> {
+        let mut request = request;
+        let mut visible_roots = Vec::with_capacity(request.roots.len());
+        for root in request.roots.drain(..) {
+            if self.substrate_exists_in_ns(token, root).await? {
+                visible_roots.push(root);
+            }
+        }
+        request.roots = visible_roots;
+        if request.roots.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut paths = self.graph(token)?.traverse(request).await?;
         self.enrich_path_nodes(token, &mut paths).await;
         // Filter out soft-deleted entity nodes from all path nodes (Fix 2).
@@ -1554,14 +1570,14 @@ impl KhiveRuntime {
 
         // Note: storage get_note is ID-only — verify namespace after fetch.
         if let Some(note) = self.notes(token)?.get_note(id).await? {
-            if note.namespace == ns {
+            if Self::ensure_namespace(&note.namespace, ns).is_ok() {
                 return Ok(Some(Resolved::Note(note)));
             }
         }
 
         // Event: storage get_event is ID-only — verify namespace after fetch.
         if let Some(event) = self.events(token)?.get_event(id).await? {
-            if event.namespace == ns {
+            if Self::ensure_namespace(&event.namespace, ns).is_ok() {
                 return Ok(Some(Resolved::Event(event)));
             }
         }
@@ -1590,7 +1606,7 @@ impl KhiveRuntime {
             Some(n) => n,
             None => return Ok(false),
         };
-        if note.namespace != ns {
+        if Self::ensure_namespace(&note.namespace, ns).is_err() {
             return Ok(false);
         }
         let mode = if hard {
@@ -1747,7 +1763,7 @@ impl KhiveRuntime {
             Some(e) => e,
             None => return Ok(false),
         };
-        self.ensure_namespace(&entity.namespace, token, id)?;
+        Self::ensure_namespace(&entity.namespace, token.namespace().as_str())?;
         let mode = if hard {
             DeleteMode::Hard
         } else {
@@ -1822,12 +1838,34 @@ impl KhiveRuntime {
 
     // ---- Edge CRUD operations ----
 
-    /// Fetch a single edge by id. Returns `None` if the edge does not exist.
+    /// Fetch a single edge by id, enforcing namespace isolation (ADR-007).
+    ///
+    /// Returns `Err(NotFound)` if the edge exists in a different namespace,
+    /// `Ok(None)` if no edge with that id exists at all.
     pub async fn get_edge(
         &self,
         token: &NamespaceToken,
         edge_id: Uuid,
     ) -> RuntimeResult<Option<Edge>> {
+        let mut reader = self.sql().reader().await?;
+        let record_ns = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT namespace FROM graph_edges \
+                      WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(edge_id.to_string())],
+                label: Some("get_edge_namespace".into()),
+            })
+            .await?;
+
+        let Some(SqlValue::Text(record_ns)) = record_ns else {
+            return Ok(None);
+        };
+        // ADR-007: absent and foreign-namespace IDs must be indistinguishable.
+        if Self::ensure_namespace(&record_ns, token.namespace().as_str()).is_err() {
+            return Ok(None);
+        }
+
         Ok(self.graph(token)?.get_edge(LinkId::from(edge_id)).await?)
     }
 
@@ -5574,5 +5612,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1, "upsert must not duplicate the edge row");
+    }
+
+    // ── #548 regression: cross-namespace get_edge must return None (ADR-007) ──
+
+    #[tokio::test]
+    async fn get_edge_cross_namespace_returns_none() {
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let src = rt
+            .create_entity(&ns_a, "concept", None, "Src", None, None, vec![])
+            .await
+            .unwrap();
+        let tgt = rt
+            .create_entity(&ns_a, "concept", None, "Tgt", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&ns_a, src.id, tgt.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // Visible from own namespace.
+        let ok = rt.get_edge(&ns_a, Uuid::from(edge.id)).await;
+        assert!(
+            ok.is_ok() && ok.unwrap().is_some(),
+            "edge must be visible in its own namespace"
+        );
+
+        // Foreign namespace must return None — indistinguishable from absent.
+        let result = rt.get_edge(&ns_b, Uuid::from(edge.id)).await;
+        assert!(
+            matches!(result, Ok(None)),
+            "cross-namespace get_edge must return Ok(None), got {result:?}"
+        );
+
+        // ADR-007: absent and foreign edge IDs must have identical observable shape.
+        let absent = rt.get_edge(&ns_b, Uuid::new_v4()).await;
+        match (&result, &absent) {
+            (Ok(None), Ok(None)) => {}
+            other => panic!(
+                "foreign and absent edge IDs must have identical observable shape, got {other:?}"
+            ),
+        }
+    }
+
+    // ── #568 regression: foreign traversal root must yield no expansion ───────
+
+    #[tokio::test]
+    async fn traverse_foreign_namespace_root_yields_no_expansion() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let a = rt
+            .create_entity(&ns_a, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&ns_a, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(&ns_a, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        // Traversal from ns_b using a root that belongs to ns_a must return nothing.
+        let paths = rt
+            .traverse(
+                &ns_b,
+                TraversalRequest {
+                    roots: vec![a.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        ..Default::default()
+                    },
+                    include_roots: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            paths.is_empty(),
+            "foreign traversal root must be filtered before expansion, got {paths:?}"
+        );
     }
 }

@@ -181,7 +181,7 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("entity {id}")))?;
 
-        self.ensure_namespace(&entity.namespace, token, id)?;
+        Self::ensure_namespace(&entity.namespace, token.namespace().as_str())?;
 
         let mut text_changed = false;
         let mut changed_fields: Vec<&'static str> = Vec::new();
@@ -458,9 +458,7 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
 
-        if note.namespace != token.namespace().as_str() {
-            return Err(RuntimeError::NotFound(format!("note {id}")));
-        }
+        Self::ensure_namespace(&note.namespace, token.namespace().as_str())?;
 
         let mut text_changed = false;
 
@@ -537,7 +535,19 @@ impl KhiveRuntime {
             format!("vec_{}", key)
         });
 
-        let _ = self.notes(token)?;
+        let note_store = self.notes(token)?;
+        let into_note = note_store
+            .get_note(into_id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
+        Self::ensure_namespace(&into_note.namespace, &ns)?;
+
+        let from_note = note_store
+            .get_note(from_id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
+        Self::ensure_namespace(&from_note.namespace, &ns)?;
+
         let _ = self.graph(token)?;
         let _ = self.text_for_notes(token)?;
         if self.config().embedding_model.is_some() {
@@ -2470,5 +2480,62 @@ mod tests {
         // c2 must be tombstoned.
         let c2_after = rt.entities(&tok).unwrap().get_entity(c2.id).await.unwrap();
         assert!(c2_after.is_none(), "from_entity must be tombstoned");
+    }
+
+    // ── #567 regression: cross-namespace merge_note must be denied on either ID ──
+
+    #[tokio::test]
+    async fn merge_note_cross_namespace_either_id_returns_not_found() {
+        use crate::error::RuntimeError;
+        use crate::Namespace;
+
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let into_a = rt
+            .create_note(&ns_a, "observation", None, "Into A", None, None, vec![])
+            .await
+            .unwrap();
+        let from_a = rt
+            .create_note(&ns_a, "observation", None, "From A", None, None, vec![])
+            .await
+            .unwrap();
+        let note_b = rt
+            .create_note(&ns_b, "observation", None, "Note B", None, None, vec![])
+            .await
+            .unwrap();
+
+        // foreign into_id: note_b belongs to ns_b, caller token is ns_a
+        let foreign_into = rt
+            .merge_note(
+                &ns_a,
+                note_b.id,
+                from_a.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(foreign_into, Err(RuntimeError::NotFound(_))),
+            "foreign into_id must be denied before merge, got {foreign_into:?}"
+        );
+
+        // foreign from_id: note_b belongs to ns_b, caller token is ns_a
+        let foreign_from = rt
+            .merge_note(
+                &ns_a,
+                into_a.id,
+                note_b.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(foreign_from, Err(RuntimeError::NotFound(_))),
+            "foreign from_id must be denied before merge, got {foreign_from:?}"
+        );
     }
 }

@@ -2105,7 +2105,10 @@ async fn assign_context_entity_id_round_trips_through_tasks_and_get() {
     let pack = pack(rt);
 
     let entity = pack
-        .dispatch("create", json!({"kind": "concept", "name": "Context Entity"}))
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Context Entity"}),
+        )
         .await
         .expect("context entity create must succeed");
     let context_id = entity["id"].as_str().unwrap().to_string();
@@ -2136,7 +2139,10 @@ async fn assign_context_entity_id_round_trips_through_tasks_and_get() {
         .iter()
         .find(|task| task["full_id"].as_str() == Some(task_id.as_str()))
         .expect("created task must be in tasks(status=inbox)");
-    assert_eq!(task["context_entity_id"].as_str(), Some(context_id.as_str()));
+    assert_eq!(
+        task["context_entity_id"].as_str(),
+        Some(context_id.as_str())
+    );
     assert_eq!(
         task["properties"]["context_entity_id"].as_str(),
         Some(context_id.as_str())
@@ -2155,13 +2161,9 @@ async fn assign_context_entity_id_round_trips_through_tasks_and_get() {
         .dispatch("neighbors", json!({"id": task_id, "direction": "out"}))
         .await
         .expect("neighbors must succeed");
-    let has_annotates_edge = neighbors
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|n| {
-            n.to_string().contains("annotates") && n.to_string().contains(context_id.as_str())
-        });
+    let has_annotates_edge = neighbors.as_array().unwrap().iter().any(|n| {
+        n.to_string().contains("annotates") && n.to_string().contains(context_id.as_str())
+    });
     assert!(
         has_annotates_edge,
         "task should have an annotates edge to the context entity; neighbors: {neighbors}"

@@ -1,79 +1,53 @@
-# Issue Sweep: DB Cleanup — Status
+# Runtime Namespace Isolation — Implementation Status
 
-Generated: 2026-05-31 (implementer op3)
-
-## khive Stats (at op start)
-
-khive MCP unavailable during this session (tool blocked). khive verbs logged below reflect
-upstream ops (analyst a1) as reported in fix_brief.md.
+khive stats at task start: entities=2475, edges=7540, notes=11577
 
 ## Per-Issue Table
 
-| issue# | root cause file:line | fix applied | test name + result | status |
-|--------|---------------------|-------------|-------------------|--------|
-| #540 | `crates/khive-runtime/src/pack.rs:684,689,691,696,706,725,734,742,785,792,1660,1711,1813,1889,1917,1923,1931,2136,2425,2445,2457,2514,2596,2801,2806,2838,2850,2880`; `crates/khive-gate/src/lib.rs:199,207,209,394,443` | Replaced ADR-029/033/035 with ADR-018; EventStore substrate rows also cite ADR-004/ADR-005. 37 citation rows, docs-only. Commit `ea79bdd`. | docs-only — no test needed; `cargo check --workspace` PASS | **RESOLVED** |
-| #550 | `crates/khive-db/src/stores/vectors.rs:184-579` (939 LOC SqliteVecStore), `crates/khive-db/src/backend.rs:258-370` (vectors_for_namespace), `crates/khive-db/src/extension.rs:1-42` (ensure_extensions_loaded). sqlite-vec is the **primary** VectorStore path, not a fallback. No HNSW/Vamana DB-level replacement exists. ADR-030 requires `kkernel migrate-vectors` which is absent. | Not implemented — fails contained gate (8-11 files, 500-900 LOC, migration tooling required). Proposal recorded below. | N/A | **SKIPPED** (scope exceeds contained gate; migration tooling required per ADR-030) |
+| Issue | Root Cause (file:line) | Fix Applied | Test Name + Result | Status |
+|-------|----------------------|-------------|-------------------|--------|
+| #569 | `operations.rs` and `curation.rs` had scattered inline `!=` namespace comparisons in resolve/delete_note/update_note with no shared helper | Added `pub(crate) fn ensure_namespace(record_ns, caller_ns) -> RuntimeResult<()>` at `operations.rs:404`; routed resolve-note (`ops.rs:1573`), delete_note (`ops.rs:1609`), update_note (`curation.rs:461`) through it | (covered by existing tests + isolation tests) | RESOLVED |
+| #548 | (a) `get_edge()` at `operations.rs:1841` skipped namespace check entirely; (b) round-1 fix used `ensure_namespace(...)?` which returned `Err(NotFound)` for foreign IDs vs `Ok(None)` for absent — an existence oracle violating ADR-007:217 | Raw SQL probe before scoped fetch; foreign-namespace branch changed from `?`-propagate to `if is_err() { return Ok(None) }` at `operations.rs:1864` — both absent and foreign now return `Ok(None)` | `get_edge_cross_namespace_returns_none` (+ absent-vs-foreign equivalence assertion) — PASS | RESOLVED |
+| #567 | (a) Runtime: `merge_note()` at `curation.rs:511` entered SQL transaction before namespace checks (fixed round-1); (b) Pack: `ensure_note_kind` at `handlers.rs:1120` called `runtime.notes(token)?.get_note(id)` — `NoteStore::get_note` is ID-only (no namespace filter), leaking foreign note existence and kind before runtime denial | Runtime: both notes fetched + `ensure_namespace` called at `curation.rs:545,551` before SQL. Pack: replaced `notes(token)?.get_note(id)` with `runtime.resolve(token, id)` requiring `Resolved::Note`; resolve routes through `ensure_namespace`, so foreign and absent both yield `None` | `merge_note_cross_namespace_either_id_returns_not_found` — PASS; `ensure_note_kind_rejects_foreign_note_before_kind_check` — PASS | RESOLVED |
+| #568 | Traversal entry-points (`neighbors_with_query`, `traverse`, `bfs_traverse`, `shortest_path`) accepted caller-supplied root UUIDs without verifying namespace membership | Guard each root via `self.substrate_exists_in_ns(token, id)` at `operations.rs:857`, `operations.rs:884-890`, `graph_traversal.rs:71`, `graph_traversal.rs:146`; filter or return early if foreign | `traverse_foreign_namespace_root_yields_no_expansion` — PASS | RESOLVED |
 
-## #540 — Root Cause Detail
+## Cargo Gate Results (round 2)
 
-ADR-029/033/035 are v1 ADR numbers. ADR-018 is the current authorization-gate contract; ADR-004/ADR-005 cover the EventStore audit substrate. All 37 stale citation rows identified by explorer (e1) and mapped by analyst (a1) in `fix_brief.md` were replaced.
+```
+cd crates && cargo check --workspace
+→ Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.42s  (zero errors/warnings)
 
-Verification command (post-fix):
-```bash
-rg -n "ADR-0(29|33|35)" \
-  crates/khive-runtime/src/pack.rs \
-  crates/khive-gate/src/lib.rs \
-  crates/khive-gate-rego || true
-# Expected: no output (confirmed CLEAN)
+cd crates && cargo test --workspace
+→ all crates: 0 failed (khive-runtime 322 unit + 26 integration; khive-pack-kg 174 unit + 112 integration)
 ```
 
-cargo check output: `Finished dev profile [unoptimized + debuginfo] target(s) in 17.31s`
+## Commits (on `show/khive-issue-sweep/rt-security`)
 
-## #550 — Contained Gate Failure + Proposal
+```
+71efd72 fix(pack-kg): route ensure_note_kind through resolve, close note oracle (#567)
+0f31686 fix(runtime): get_edge foreign-ns returns None, close existence oracle (#548)
+1fbabeb refactor(runtime): route remaining note-path namespace checks through ensure_namespace (#569)
+1a0f894 chore: add implementation status artifact for o4 (#569 #548 #567 #568)
+3de5b30 test(runtime): regression tests for namespace isolation fixes (#548, #567, #568)
+31e5efa security(runtime): verify traversal roots before expansion (#568)
+1b83cb7 security(runtime): namespace-check both merge_note ids before merge (#567)
+50abfdb fix(runtime): ensure_namespace on get_edge (#548)
+a604d23 refactor(runtime): centralize namespace check in ensure_namespace helper (#569)
+```
 
-### Why Skipped
+## Skip Flags
 
-| Gate | Required | Observed |
-|------|----------|----------|
-| File count | <5 | 8-11 files across db/runtime/retrieval/knowledge/kkernel |
-| LOC delta | <200 | vectors.rs alone is 939 LOC; replacement estimated 500-900 LOC |
-| No migration tool | Not needed | ADR-030 explicitly requires `kkernel migrate-vectors` or auto-rebuild; absent from `crates/kkernel/src/main.rs:42-69` |
+None. All four issues fully resolved. No ADR-002, DB schema, or public API signature changes.
+`get_edge` signature kept as `RuntimeResult<Option<Edge>>`; foreign IDs return `Ok(None)`.
 
-sqlite-vec is the primary path: `StorageBackend::vectors_for_namespace` (backend.rs:258-370) constructs `SqliteVecStore` directly; HNSW count in `crates/khive-db/src` = 0.
+## khive Usage
 
-### Proposal For Future Work
+| Verb | Purpose | ID / Result |
+|------|---------|-------------|
+| `stats()` | Orient — entity/edge/note baseline | entities=2475, edges=7540, notes=11577 |
+| `memory.remember` (semantic, salience=0.85) | Record ensure_namespace location, call sites, test counts | `c94cef35` |
+| `memory.remember` (episodic, salience=0.75) | Record substrate_exists_in_ns traversal guard location | `9987696d` |
+| `memory.remember` (episodic, salience=0.8) | Record oracle gap fixes (#548 Ok(None), #567 pack resolve) with error format note | `21cc3cc9` |
 
-A dedicated retirement branch must implement at minimum:
-
-| Target | Required change |
-|--------|-----------------|
-| `crates/khive-db/Cargo.toml:11,29,39-41` | Remove sqlite-vec dep/feature after replacement compiles |
-| `crates/khive-db/src/extension.rs:1-42` | Delete or reduce sqlite-vec auto-extension hook |
-| `crates/khive-db/src/backend.rs:44-63` | Remove `ensure_extensions_loaded()` calls once vector factory no longer needs vec0 |
-| `crates/khive-db/src/backend.rs:235-370` | Replace `vectors()` + `vectors_for_namespace()` with HNSW/Vamana-backed factory |
-| `crates/khive-db/src/stores/vectors.rs:1-939` | Replace `SqliteVecStore` with non-sqlite-vec impl |
-| `crates/khive-db/src/stores/mod.rs:7` | Keep `vectors` module name to reduce caller churn |
-| `crates/khive-runtime/src/retrieval.rs:270-274` | Update KNN docs promising sqlite-vec brute-force exact cosine |
-| `crates/khive-pack-knowledge/src/knowledge/vamana.rs:256-303` | Stop raw SQL scanning `vec_{model}` tables; use new vector corpus abstraction |
-| `crates/kkernel/src/main.rs:42-69` + new command module | Add `kkernel migrate-vectors` (ADR-030 requirement) |
-| `crates/kkernel/src/vector.rs:92-138` | Update capability reporting that names `SqliteVecStore` |
-| `crates/khive-db/tests/contract/vector_filter.rs:1-185` | Replace sqlite-vec contract expectations with HNSW behavior |
-| `crates/khive-retrieval/Cargo.toml:47-49` + `adapters/mod.rs:13,84` | Remove sqlite-vec feature coupling |
-
-**Guardrails (non-negotiable):**
-- Do NOT delete sqlite-vec data or `vec_*` tables in existing user databases
-- Do NOT edit V1 or historical migration entries in `migrations.rs`
-- Migration/rebuild must be explicit, idempotent, and safe to rerun
-- Existing V14/V16/V17 migration entries must remain available for existing DBs
-
-**Estimated scope:** ~600-900 LOC delta, ~10 files, requires 1 new command module.
-
-## khive Usage Report
-
-| Layer | Verbs called | What mattered |
-|-------|-------------|---------------|
-| explorer (e1) | `stats`, `memory.recall`, `search`, `knowledge.search`, `get` | Prior finding `75af832d` confirmed sqlite-vec is primary path — validated analyst hypothesis before analyst wrote brief |
-| analyst (a1) | `memory.recall`, `stats`, `knowledge.suggest`, `knowledge.search`, `search`, `get` | Domain search reinforced migration risk. Memory recall `75af832d` matched explorer finding. Wrote decision `0fa8d9b3`, memory note `03edaf69`, link `a08bd5fd`, brain feedback `01d31ffc`. |
-| implementer (i1/this op) | khive MCP unavailable — tool blocked during this session | Upstream recalls (analyst `03edaf69`, `0fa8d9b3`) were read from `fix_brief.md` and informed scope decisions |
-
-**Memory/proposal IDs from upstream (a1):** memory `03edaf69`, decision `0fa8d9b3`, link `a08bd5fd`
+Upstream fix_brief.md consumed from `../an/fix_brief.md` (analyst o3).
+Consumers: tester (o9), critic (o10).

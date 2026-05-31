@@ -1842,7 +1842,10 @@ async fn test_recall_include_breakdown_flag_includes_breakdown() {
         .expect("recall with include_breakdown=true");
 
     let verbose_hits = verbose_result.as_array().expect("array");
-    assert!(!verbose_hits.is_empty(), "include_breakdown=true must have hits");
+    assert!(
+        !verbose_hits.is_empty(),
+        "include_breakdown=true must have hits"
+    );
     let bd = verbose_hits[0]
         .get("breakdown")
         .expect("include_breakdown=true result must include breakdown");
@@ -2621,15 +2624,25 @@ async fn recall_embed_include_embeddings_returns_vectors() {
         .expect("recall_embed include embeddings");
 
     // Top-level embedding array must be present.
-    let top_vec = result["embedding"].as_array().expect("top-level embedding array");
-    assert_eq!(top_vec.len(), DIMS, "top-level embedding length must match dims");
+    let top_vec = result["embedding"]
+        .as_array()
+        .expect("top-level embedding array");
+    assert_eq!(
+        top_vec.len(),
+        DIMS,
+        "top-level embedding length must match dims"
+    );
     // Per-engine embedding also present.
     let engines = result["engines"].as_array().expect("engines array");
     assert_eq!(engines.len(), 1);
     let engine_vec = engines[0]["embedding"]
         .as_array()
         .expect("per-engine embedding array");
-    assert_eq!(engine_vec.len(), DIMS, "per-engine embedding length must match dims");
+    assert_eq!(
+        engine_vec.len(),
+        DIMS,
+        "per-engine embedding length must match dims"
+    );
 }
 
 /// #566 metadata: memory.recall_embed handler must advertise include_embeddings param.
