@@ -688,14 +688,17 @@ result (e.g. create then link with the new entity's id)."#)]
         // ADR-049: forward to the warm daemon when reachable, auto-spawning it
         // on first use. Any failure (no socket, spawn failure, namespace
         // mismatch, KHIVE_NO_DAEMON) falls through to local dispatch.
-        let frame = khive_runtime::DaemonRequestFrame {
-            ops: p.ops.clone(),
-            presentation: p.presentation.clone(),
-            presentation_per_op: p.presentation_per_op.clone(),
-            namespace: self.default_namespace.clone(),
-        };
-        if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
-            return res;
+        #[cfg(unix)]
+        {
+            let frame = khive_runtime::DaemonRequestFrame {
+                ops: p.ops.clone(),
+                presentation: p.presentation.clone(),
+                presentation_per_op: p.presentation_per_op.clone(),
+                namespace: self.default_namespace.clone(),
+            };
+            if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
+                return res;
+            }
         }
         self.dispatch_request_local(p).await
     }

@@ -20,6 +20,7 @@
 //! ```
 
 pub mod curation;
+#[cfg(unix)]
 pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
@@ -40,6 +41,7 @@ pub use curation::{
     ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
     MergeSummary, NotePatch,
 };
+#[cfg(unix)]
 pub use daemon::{
     pid_path, run_daemon, socket_path, DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame,
 };

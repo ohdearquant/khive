@@ -65,13 +65,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let runtime = KhiveRuntime::new(config)?;
-    let daemon_mode = args.daemon;
     let server = KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))?;
-    if daemon_mode {
+    #[cfg(unix)]
+    if args.daemon {
         khive_runtime::daemon::run_daemon(server).await?;
-    } else {
-        server.serve_stdio().await?;
+        return Ok(());
     }
+    #[cfg(not(unix))]
+    if args.daemon {
+        anyhow::bail!("--daemon mode requires Unix (macOS/Linux). On Windows, khive-mcp runs in stdio mode only.");
+    }
+    server.serve_stdio().await?;
     Ok(())
 }
 
