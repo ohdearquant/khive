@@ -7,13 +7,13 @@ correctly to a running `khive-mcp` server.
 
 | Plugin    | Version | khive-mcp |
 | --------- | ------- | --------- |
-| kg        | 0.2.3   | ≥ 0.2.3   |
-| gtd       | 0.2.3   | ≥ 0.2.3   |
-| memory    | 0.2.3   | ≥ 0.2.3   |
-| brain     | 0.2.3   | ≥ 0.2.3   |
-| comm      | 0.2.3   | ≥ 0.2.3   |
-| schedule  | 0.2.3   | ≥ 0.2.3   |
-| knowledge | 0.2.3   | ≥ 0.2.3   |
+| kg        | 0.2.4   | ≥ 0.2.4   |
+| gtd       | 0.2.4   | ≥ 0.2.4   |
+| memory    | 0.2.4   | ≥ 0.2.4   |
+| brain     | 0.2.4   | ≥ 0.2.4   |
+| comm      | 0.2.4   | ≥ 0.2.4   |
+| schedule  | 0.2.4   | ≥ 0.2.4   |
+| knowledge | 0.2.4   | ≥ 0.2.4   |
 
 ## Step 1 — Install khive-mcp
 
