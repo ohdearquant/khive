@@ -268,7 +268,7 @@ pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
     gate: GateRef,
     default_namespace: String,
-    /// Optional audit event sink (ADR-035).
+    /// Optional audit event sink (ADR-018).
     ///
     /// When set, every gate check writes a storage `Event` in addition to the
     /// `tracing::info!` emission. The store is `Arc<dyn EventStore>` so the
@@ -326,13 +326,13 @@ impl VerbRegistryBuilder {
     /// Set the namespace surfaced to the gate when a verb does not carry an
     /// explicit `namespace` argument. Transports should plumb the runtime's
     /// `default_namespace` so the gate's `input.namespace` always reflects
-    /// the operation's true tenant (ADR-029 + ADR-007).
+    /// the operation's true tenant (ADR-018 + ADR-007).
     pub fn with_default_namespace(&mut self, ns: impl Into<String>) -> &mut Self {
         self.default_namespace = ns.into();
         self
     }
 
-    /// Set the `EventStore` used to persist audit events (ADR-035).
+    /// Set the `EventStore` used to persist audit events (ADR-018).
     ///
     /// When configured, every gate check appends one `Event` (substrate =
     /// `Event`, outcome = `Success` on allow, `Denied` on deny) in addition to
@@ -576,7 +576,7 @@ pub struct VerbRegistry {
     packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
     gate: GateRef,
     default_namespace: String,
-    /// Audit event sink — `None` means tracing-only (v0.2 default) (ADR-035).
+    /// Audit event sink — `None` means tracing-only (v0.2 default) (ADR-018).
     event_store: Option<Arc<dyn EventStore>>,
     /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
@@ -681,19 +681,19 @@ impl VerbRegistry {
     /// This is a read-only introspection path; no side effects occur.
     ///
     /// The configured [`Gate`](khive_gate::Gate) is consulted before dispatch
-    /// (ADR-029, ADR-035). `Deny` decisions return
+    /// (ADR-018). `Deny` decisions return
     /// [`RuntimeError::PermissionDenied`] immediately — the pack is never
     /// invoked. `Allow` decisions proceed to pack dispatch as before.
     ///
     /// Every gate consultation emits one `tracing::info!(... "gate.check")` event
-    /// with a structured `audit_event` field (ADR-033). When a [`EventStore`]
+    /// with a structured `audit_event` field (ADR-018). When a [`EventStore`]
     /// is configured via [`VerbRegistryBuilder::with_event_store`], an `Event`
-    /// is also persisted to the substrate (ADR-035). Storage errors are logged
+    /// is also persisted to the `Event` substrate (ADR-018; ADR-004/ADR-005). Storage errors are logged
     /// via `tracing::warn!` and never propagated.
     ///
     /// When `gate.check` itself returns an error (gate infrastructure failure),
     /// the error is logged via `tracing::warn!` and dispatch proceeds (fail-open,
-    /// consistent with ADR-029 §Rationale "Why advisory in v0.2"). No audit event
+    /// consistent with ADR-018 "Fail-open on gate Err"). No audit event
     /// is persisted for an errored gate check — no decision was produced.
     ///
     /// The synthesized `GateRequest` carries `ActorRef::anonymous()` and the
@@ -703,7 +703,7 @@ impl VerbRegistry {
     /// [`VerbRegistryBuilder::with_default_namespace`]). Gate-visible
     /// namespace and runtime-visible namespace MUST stay aligned; coercing an
     /// empty string here while the runtime keeps `""` would create an
-    /// authorization/audit blind spot on the field ADR-029 declares public.
+    /// authorization/audit blind spot on the namespace field governed by ADR-018.
     /// Transports that have richer caller context (auth headers, session
     /// info) will gain a sibling dispatch path in a follow-up.
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
@@ -722,7 +722,7 @@ impl VerbRegistry {
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}")))?;
         let gate_req = GateRequest::new(ActorRef::anonymous(), ns, verb, params.clone());
 
-        // Consult the gate (ADR-029, ADR-035).
+        // Consult the gate (ADR-018).
         //
         // - Ok(Allow) → proceed to pack dispatch (tracing + optional EventStore).
         // - Ok(Deny) → emit audit, persist if store configured, return PermissionDenied.
@@ -731,7 +731,7 @@ impl VerbRegistry {
             Ok(decision) => {
                 let is_deny = matches!(decision, GateDecision::Deny { .. });
 
-                // Emit audit event via tracing (ADR-033 — preserved path).
+                // Emit audit event via tracing (ADR-018).
                 let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
                 tracing::info!(
                     audit_event = %serde_json::to_string(&audit)
@@ -739,7 +739,7 @@ impl VerbRegistry {
                     "gate.check"
                 );
 
-                // Persist to EventStore when configured (ADR-035).
+                // Persist to EventStore when configured (ADR-018; ADR-004/ADR-005).
                 if let Some(store) = &self.event_store {
                     let outcome = if is_deny {
                         EventOutcome::Denied
@@ -782,14 +782,14 @@ impl VerbRegistry {
                 }
             }
             Err(err) => {
-                // Gate infrastructure failure — fail-open (ADR-029 §Rationale).
+                // Gate infrastructure failure — fail-open (ADR-018).
                 // No decision was produced; no audit event is persisted.
                 tracing::warn!(verb, error = %err, "gate check failed (fail-open)");
                 None
             }
         };
 
-        // Hard enforcement (ADR-035): Deny is now authoritative.
+        // Hard enforcement (ADR-018): Deny is authoritative.
         if let Some(reason) = gate_blocked {
             return Err(RuntimeError::PermissionDenied {
                 verb: verb.to_string(),
@@ -1657,7 +1657,7 @@ mod tests {
         assert_eq!(kinds, vec!["widget", "gadget"]);
     }
 
-    // ---- Gate wiring (ADR-029) ----
+    // ---- Gate wiring (ADR-018) ----
 
     use khive_gate::{Gate, GateError};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1708,7 +1708,7 @@ mod tests {
         builder.with_gate(gate.clone());
         let reg = builder.build().expect("registry builds");
 
-        // Gate denies — dispatch now returns PermissionDenied (hard enforcement, ADR-035).
+        // Gate denies — dispatch now returns PermissionDenied (hard enforcement, ADR-018).
         let err = reg.dispatch("create", Value::Null).await.unwrap_err();
         assert!(
             matches!(err, RuntimeError::PermissionDenied { ref verb, .. } if verb == "create"),
@@ -1810,7 +1810,7 @@ mod tests {
         assert_eq!(seen, vec!["local"]);
     }
 
-    // ---- Audit event emission (ADR-033) ----
+    // ---- Audit event emission (ADR-018) ----
 
     use khive_gate::{AuditDecision, AuditEvent, Obligation};
 
@@ -1886,7 +1886,7 @@ mod tests {
         builder.with_gate(gate.clone());
         let reg = builder.build().expect("registry builds");
 
-        // Gate denies — dispatch returns PermissionDenied (hard enforcement, ADR-035).
+        // Gate denies — dispatch returns PermissionDenied (hard enforcement, ADR-018).
         // The audit event is still recorded (captured inside the gate impl).
         let err = reg.dispatch("create", Value::Null).await.unwrap_err();
         assert!(matches!(err, RuntimeError::PermissionDenied { .. }));
@@ -1914,13 +1914,13 @@ mod tests {
 
         let evs = gate.events.lock().unwrap();
         let ev = &evs[0];
-        // Namespace from params wins (ADR-029 alignment rule).
+        // Namespace from params wins (ADR-018 alignment rule).
         assert_eq!(ev.namespace, "tenant-q");
         assert_eq!(ev.verb, "list");
         assert_eq!(ev.actor.kind, "anonymous");
     }
 
-    // ---- Audit tracing emission (ADR-033 §"Emission site") ----
+    // ---- Audit tracing emission (ADR-018) ----
     //
     // The AuditCapturingGate tests above prove that AuditEvent::from_check is
     // called with the right inputs, but they observe the event *inside* the
@@ -1928,7 +1928,7 @@ mod tests {
     // `tracing::info!(audit_event = ..., "gate.check")` were deleted or
     // renamed. The tests below install a capture Layer and assert on the
     // actual tracing event surfaced from dispatch. This locks the public
-    // observability contract from ADR-033: one `gate.check` info event per
+    // observability contract from ADR-018: one `gate.check` info event per
     // dispatch, carrying an `audit_event` field that round-trips back to an
     // `AuditEvent`.
 
@@ -2133,7 +2133,7 @@ mod tests {
         );
     }
 
-    // ---- Hard enforcement + EventStore persistence (ADR-035) ----
+    // ---- Hard enforcement + EventStore persistence (ADR-018; ADR-004/ADR-005) ----
 
     use crate::runtime::NamespaceToken;
     use async_trait::async_trait;
@@ -2422,7 +2422,7 @@ mod tests {
             builder.register(AlphaPack);
             builder.with_gate(Arc::new(TracingDenyGate));
             let reg = builder.build().expect("registry builds");
-            // Hard enforcement (ADR-035) — dispatch returns PermissionDenied on Deny.
+            // Hard enforcement (ADR-018) — dispatch returns PermissionDenied on Deny.
             // The tracing audit event is still emitted before the error is returned.
             let _ = reg.dispatch("create", serde_json::Value::Null).await;
         });
@@ -2442,7 +2442,7 @@ mod tests {
         assert_eq!(audit.decision, AuditDecision::Deny);
         assert_eq!(audit.deny_reason.as_deref(), Some("denied by test gate"));
         assert_eq!(audit.gate_impl, "TracingDenyGate");
-        // Wire-shape rule from ADR-033: obligations is always serialized as an
+        // Wire-shape rule from ADR-018: obligations is always serialized as an
         // array, empty on Deny. Round-trip back through serde_json::Value to
         // confirm the field exists on the wire and is `[]`, not missing.
         let payload_json: serde_json::Value =
@@ -2454,7 +2454,7 @@ mod tests {
         );
     }
 
-    // ---- EventStore audit envelope round-trip (ADR-033 / ADR-035) ----
+    // ---- EventStore audit envelope round-trip (ADR-018 / ADR-004/ADR-005) ----
     //
     // Codex review finding (Major #1): EventStore was persisting a summary
     // Event without the full AuditEvent fields (deny_reason, gate_impl,
@@ -2511,7 +2511,7 @@ mod tests {
         let ev = &page.items[0];
         assert_eq!(ev.outcome, EventOutcome::Denied);
 
-        // The payload field must hold the full AuditEvent envelope (ADR-033 contract).
+        // The payload field must hold the full AuditEvent envelope (ADR-018 contract).
         let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
@@ -2593,7 +2593,7 @@ mod tests {
         }
     }
 
-    // ---- SQL-backed audit envelope round-trip (ADR-033 / ADR-035, codex r2) ----
+    // ---- SQL-backed audit envelope round-trip (ADR-018 / ADR-004/ADR-005, codex r2) ----
     //
     // The two tests above use MemoryEventStore (no serialization). This test
     // wires the production SqlEventStore via KhiveRuntime::memory() to verify
@@ -2798,12 +2798,12 @@ mod tests {
         }
     }
 
-    // ---- Audit payload shape for 'create' verb dispatch (ADR-033 / ADR-035) ----
+    // ---- Audit payload shape for 'create' verb dispatch (ADR-018 / ADR-004/ADR-005) ----
     //
     // The previous audit tests verify the envelope shape for the 'list' verb.
     // This test dispatches 'create' (matching the create_note + annotates path)
     // and verifies that ev.verb, ev.outcome, and ev.data all round-trip correctly
-    // through the EventStore. Ensures the ADR-035 wire shape is independent of
+    // through the EventStore. Ensures the ADR-018 wire shape is independent of
     // which verb triggers the gate check.
     #[tokio::test]
     async fn audit_event_payload_shape_for_create_verb_matches_adr035_envelope() {
@@ -2835,7 +2835,7 @@ mod tests {
             .unwrap();
         let ev = &page.items[0];
 
-        // Top-level Event fields (ADR-035 §Emission).
+        // Top-level Event fields (ADR-004/ADR-005).
         assert_eq!(ev.verb, "create", "ev.verb must be the dispatched verb");
         assert_eq!(
             ev.outcome,
@@ -2847,7 +2847,7 @@ mod tests {
             "ev.namespace must match the dispatch namespace"
         );
 
-        // ev.payload must hold the full AuditEvent envelope (ADR-033 / ADR-035 contract).
+        // ev.payload must hold the full AuditEvent envelope (ADR-018 / ADR-004/ADR-005 contract).
         let data = &ev.payload;
 
         let audit: khive_gate::AuditEvent = serde_json::from_value(data.clone())
@@ -2877,7 +2877,7 @@ mod tests {
         assert_eq!(
             payload_json["obligations"],
             serde_json::Value::Array(Vec::new()),
-            "obligations must be [] on AllowAllGate (wire-shape rule ADR-033)"
+            "obligations must be [] on AllowAllGate (wire-shape rule ADR-018)"
         );
     }
 

@@ -196,7 +196,7 @@ pub enum GateError {
 pub trait Gate: Send + Sync + std::fmt::Debug {
     fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError>;
 
-    /// Short name of this backend — surfaced in audit events (ADR-033) so
+    /// Short name of this backend — surfaced in audit events (ADR-018) so
     /// downstream tooling can tell `RegoGate` results apart from
     /// `LionGate<RegoGate>` results without parsing the type.
     fn impl_name(&self) -> &'static str {
@@ -204,9 +204,9 @@ pub trait Gate: Send + Sync + std::fmt::Debug {
     }
 }
 
-// ---------- Audit event (ADR-033) ----------
+// ---------- Audit event (ADR-018) ----------
 
-/// Structured audit record emitted once per gate consultation (ADR-033).
+/// Structured audit record emitted once per gate consultation (ADR-018).
 ///
 /// The JSON projection of this struct is the **public contract** — field names
 /// are stable. Adding fields is non-breaking; removing or renaming requires a
@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(v["max"], 100);
     }
 
-    // `Obligation::Custom` must carry arbitrary JSON per ADR-029. The
+    // `Obligation::Custom` must carry arbitrary JSON per ADR-018. The
     // struct-like variant shape is mandatory here because an internally-tagged
     // newtype variant cannot merge the `kind` discriminator into a non-object
     // payload — a previous newtype shape failed for scalar/array values at
@@ -440,7 +440,7 @@ mod tests {
         assert_custom_round_trips(serde_json::json!(true));
     }
 
-    // ---- AuditEvent (ADR-033) ----
+    // ---- AuditEvent (ADR-018) ----
 
     fn sample_req_with_session() -> GateRequest {
         GateRequest::new(
