@@ -155,37 +155,47 @@ touching consumers.
 **1. Install:**
 
 ```bash
-cargo install khive-mcp
+npm install -g khive
 ```
 
-**2. Add to `.mcp.json`** (project-level or `~/.claude/mcp.json` for global):
+**2. Add to your MCP config** (`.mcp.json` in your project, or `~/.claude/mcp.json` for
+global):
+
+```json
+{ "mcpServers": { "khive": { "command": "khive", "args": ["mcp"] } } }
+```
+
+**That's it.** All 7 packs load by default, a background daemon auto-spawns to keep the runtime
+warm, and Claude Code discovers the `request` tool with the full 63-verb catalog.
+
+### Alternative: install via Cargo
+
+If you prefer Rust tooling or need to build from source:
+
+```bash
+cargo install khive-mcp                        # from crates.io
+# or:
+git clone https://github.com/ohdearquant/khive.git && cd khive
+cd crates && cargo build --release -p khive-mcp
+```
+
+Then point your MCP config at the binary directly:
 
 ```json
 { "mcpServers": { "khive": { "command": "khive-mcp" } } }
 ```
 
-**That's it.** All 7 packs load by default, the daemon auto-spawns to keep the runtime warm,
-and Claude Code discovers the `request` tool with the full 63-verb catalog.
-
-### Or build from source
-
-```bash
-git clone https://github.com/ohdearquant/khive.git && cd khive
-cd crates && cargo build --release -p khive-mcp
-# Binary at: crates/target/release/khive-mcp
-```
-
 ### Usage
 
-The agent expresses verbs as DSL ops:
+The agent expresses verbs as DSL ops inside the single `request` tool:
 
 ```text
-request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\", description=\"Low-Rank Adaptation\")")
+request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\")")
 request(ops="search(kind=\"entity\", query=\"parameter efficient fine-tuning\")")
-request(ops="link(source_id=\"<lora-uuid>\", target_id=\"<qlora-uuid>\", relation=\"variant_of\")")
+request(ops="link(source_id=\"<uuid>\", target_id=\"<uuid>\", relation=\"variant_of\")")
 
-# Or batched in one call:
-request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"A\"), create(kind=\"entity\", entity_kind=\"concept\", name=\"B\")]")
+# Batch multiple ops in one call:
+request(ops="[create(...), create(...), link(...)]")
 ```
 
 ### Claude Code plugin (skills + agent)
@@ -206,30 +216,29 @@ This adds 4 workflow skills and a researcher agent:
 | `/kg:connect` | Wire a new concept into existing knowledge — find relations     |
 | `/kg:polish`  | Audit and fix — orphans, low-degree nodes, duplicates           |
 
-### Configuration options
+### Configuration
 
 ```bash
-khive-mcp                                    # Default: ~/.khive/khive-graph.db
-khive-mcp --db /path/to/my.db               # Custom DB path
-khive-mcp --db :memory:                      # Ephemeral (testing)
-khive-mcp --namespace my-project             # Default namespace (default: "local")
-khive-mcp --no-embed                         # Disable local embedding model
-khive-mcp --log debug                        # Log level (default: warn)
+khive mcp                                     # Default: ~/.khive/khive-graph.db
+khive mcp --db /path/to/my.db                # Custom DB path
+khive mcp --db :memory:                       # Ephemeral (testing)
+khive mcp --namespace my-project              # Default namespace (default: "local")
+khive mcp --no-embed                          # Disable local embedding model
+khive mcp --log debug                         # Log level (default: warn)
 ```
 
 Environment variables: `KHIVE_DB`, `KHIVE_NAMESPACE`, `KHIVE_NO_EMBED`, `KHIVE_LOG`.
 
-### Run tests
+### Development
 
 ```bash
 cd crates && cargo test --workspace
 make ci  # Full CI: fmt, clippy, test, build
 ```
 
-### Prerequisites
+Prerequisites: Rust 1.94+ (via [rustup](https://rustup.rs)),
+Deno 2.x (for the TypeScript CLI layer — optional)
 
-- Rust 1.94+ (via [rustup](https://rustup.rs))
-- Deno 2.x (for TypeScript layers — optional, not needed for MCP server)
 - Node.js 20+ and pnpm (for frontend — optional)
 
 ---

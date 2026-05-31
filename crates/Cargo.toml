@@ -59,7 +59,7 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
-lattice-embed = "0.2.5"
+lattice-embed = "0.3.0"
 parking_lot = "0.12"
 rand = "0.8"
 rand_distr = "0.4"
@@ -71,5 +71,5 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
-# lattice 0.2.5 published — use crates.io directly. Restore [patch.crates-io]
+# lattice 0.3.0 published — use crates.io directly. Restore [patch.crates-io]
 # block below to point at local lattice when iterating on lattice-side fixes.
