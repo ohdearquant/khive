@@ -470,6 +470,12 @@ static KG_HANDLERS: [HandlerDef; 16] = [
                 description: "Post-filter search hits to entities whose properties contain all listed key=value pairs (kind=\"entity\" only). Applied after FTS+vector ranking. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}.",
             },
             ParamDef {
+                name: "tags",
+                param_type: "array",
+                required: false,
+                description: "Post-filter entity search hits to entities with any listed tag (kind=\"entity\" only, OR semantics, case-insensitive). Applied after FTS+vector ranking. E.g. [\"rust\", \"ml\"].",
+            },
+            ParamDef {
                 name: "min_score",
                 param_type: "number",
                 required: false,
@@ -805,6 +811,10 @@ impl PackRuntime for KgPack {
 
     fn handlers(&self) -> &'static [HandlerDef] {
         &KG_HANDLERS
+    }
+
+    async fn warm(&self) {
+        let _ = self.runtime.embed("khive warmup").await;
     }
 
     async fn dispatch(

@@ -826,6 +826,82 @@ async fn search_properties_filter_restricts_results() {
     }
 }
 
+/// #518: entity search with `tags` filter must return only entities whose tags match any
+/// of the requested tags (OR semantics, case-insensitive).
+#[tokio::test]
+async fn search_tags_filter_restricts_results_or_semantics() {
+    let pack = pack();
+    // Create three entities with overlapping query text but distinct tags.
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "name": "TagSearchRust",
+            "entity_kind": "concept",
+            "tags": ["rust"],
+            "description": "A tag search test entity about rust systems programming",
+        }),
+    )
+    .await
+    .unwrap();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "name": "TagSearchPython",
+            "entity_kind": "concept",
+            "tags": ["python"],
+            "description": "A tag search test entity about python data science",
+        }),
+    )
+    .await
+    .unwrap();
+    pack.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "name": "TagSearchRustML",
+            "entity_kind": "concept",
+            "tags": ["rust", "ml"],
+            "description": "A tag search test entity about rust machine learning",
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Search with tags=["python", "ml"] — should include python and rust+ml, exclude rust-only.
+    let resp = pack
+        .dispatch(
+            "search",
+            json!({
+                "kind": "entity",
+                "query": "tag search test entity",
+                "tags": ["python", "ml"],
+            }),
+        )
+        .await
+        .expect("#518: tag-filtered search must succeed");
+    let arr = resp.as_array().expect("response must be an array");
+
+    let titles: Vec<&str> = arr
+        .iter()
+        .filter_map(|h| h.get("title").and_then(Value::as_str))
+        .collect();
+
+    assert!(
+        titles.iter().any(|t| t.contains("Python")),
+        "#518: python-tagged entity must appear in results; got {titles:?}"
+    );
+    assert!(
+        titles.iter().any(|t| t.contains("RustML")),
+        "#518: rust+ml entity must appear in results; got {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"TagSearchRust"),
+        "#518: rust-only entity must be excluded from python/ml filter; got {titles:?}"
+    );
+}
+
 /// Regression for #148: `neighbors` accepts `id` (canonical) AND `node_id` (legacy alias).
 /// Both inputs must work and the response must use `id`.
 #[tokio::test]

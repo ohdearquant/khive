@@ -369,6 +369,10 @@ struct SearchParams {
     note_kind: Option<String>,
     include_superseded: Option<bool>,
     properties: Option<Value>,
+    /// Post-filter entity search hits to entities with any listed tag (OR
+    /// semantics, case-insensitive). Applied after FTS+vector ranking.
+    /// No effect when `kind` is not `"entity"`.
+    tags: Option<Vec<String>>,
     /// ue-kg-deep C4 fix: minimum score floor — results below this threshold
     /// are discarded. No default applied server-side; callers pass e.g. 0.01
     /// to suppress pure-noise hits. RRF rank-1 scores ≈ 0.016, so a floor
@@ -1070,6 +1074,17 @@ fn props_match(entity_props: Option<&Value>, filter: &Value) -> bool {
     required
         .iter()
         .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
+}
+
+/// Returns true if any `wanted` tag appears in `entity_tags` (case-insensitive,
+/// OR semantics). An empty `wanted` list matches everything.
+fn tags_match_any(entity_tags: &[String], wanted: &[String]) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    entity_tags
+        .iter()
+        .any(|tag| wanted.iter().any(|w| tag.eq_ignore_ascii_case(w)))
 }
 
 // ---- Handler helpers ----
@@ -2449,7 +2464,8 @@ impl KgPack {
                         None
                     }
                 });
-                let search_limit = if props_filter.is_some() {
+                let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
+                let search_limit = if props_filter.is_some() || tag_filter.is_some() {
                     (limit * 4).min(100)
                 } else {
                     limit
@@ -2470,41 +2486,44 @@ impl KgPack {
                 // `entity_kind` per #160. When a properties filter is also active
                 // (#163), reuse the same fetch for filtering.
                 let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
-                let entity_meta: HashMap<Uuid, (String, Option<Value>)> = if candidate_ids
-                    .is_empty()
-                {
-                    HashMap::new()
-                } else {
-                    let entities_page = self
-                        .runtime
-                        .entities(token)?
-                        .query_entities(
-                            token.namespace().as_str(),
-                            EntityFilter {
-                                ids: candidate_ids,
-                                ..EntityFilter::default()
-                            },
-                            PageRequest {
-                                offset: 0u64,
-                                limit: hits.len() as u32,
-                            },
-                        )
-                        .await
-                        .map_err(RuntimeError::Storage)?;
-                    entities_page
-                        .items
-                        .into_iter()
-                        .map(|e| (e.id, (e.kind, e.properties)))
-                        .collect()
-                };
+                let entity_meta: HashMap<Uuid, (String, Option<Value>, Vec<String>)> =
+                    if candidate_ids.is_empty() {
+                        HashMap::new()
+                    } else {
+                        let entities_page = self
+                            .runtime
+                            .entities(token)?
+                            .query_entities(
+                                token.namespace().as_str(),
+                                EntityFilter {
+                                    ids: candidate_ids,
+                                    ..EntityFilter::default()
+                                },
+                                PageRequest {
+                                    offset: 0u64,
+                                    limit: hits.len() as u32,
+                                },
+                            )
+                            .await
+                            .map_err(RuntimeError::Storage)?;
+                        entities_page
+                            .items
+                            .into_iter()
+                            .map(|e| (e.id, (e.kind, e.properties, e.tags)))
+                            .collect()
+                    };
 
-                // Apply properties post-filter if requested.
-                let filtered_hits = if let Some(pf) = props_filter {
+                // Apply properties and/or tags post-filter if requested.
+                let filtered_hits = if props_filter.is_some() || tag_filter.is_some() {
                     hits.into_iter()
                         .filter(|h| {
-                            entity_meta
-                                .get(&h.entity_id)
-                                .is_some_and(|(_, props)| props_match(props.as_ref(), pf))
+                            let Some((_, props, tags)) = entity_meta.get(&h.entity_id) else {
+                                return false;
+                            };
+                            props_filter
+                                .is_none_or(|pf| props_match(props.as_ref(), pf))
+                                && tag_filter
+                                    .is_none_or(|wanted| tags_match_any(tags, wanted))
                         })
                         .take(limit as usize)
                         .collect::<Vec<_>>()
@@ -2523,7 +2542,8 @@ impl KgPack {
                     .map(|h| {
                         // #160: include entity_kind so agents can distinguish hit
                         // kinds without an extra get() call.
-                        let entity_kind = entity_meta.get(&h.entity_id).map(|(k, _)| k.as_str());
+                        let entity_kind =
+                            entity_meta.get(&h.entity_id).map(|(k, _, _)| k.as_str());
                         serde_json::json!({
                             "id": h.entity_id.to_string(),
                             "entity_kind": entity_kind,
@@ -3744,6 +3764,51 @@ mod tests {
         }))
         .expect("SearchParams must accept min_score");
         assert_eq!(p.min_score, Some(0.1));
+    }
+
+    // #518: SearchParams must accept a `tags` field.
+    #[test]
+    fn search_tags_params_accepts_tags() {
+        use super::SearchParams;
+        let p: SearchParams = serde_json::from_value(json!({
+            "kind": "entity",
+            "query": "language models",
+            "tags": ["rust", "ml"],
+        }))
+        .expect("SearchParams must accept tags");
+        assert_eq!(
+            p.tags.as_deref(),
+            Some(&["rust".to_string(), "ml".to_string()][..])
+        );
+    }
+
+    // #518: absent tags → None (no filter applied).
+    #[test]
+    fn search_params_tags_absent_is_none() {
+        use super::SearchParams;
+        let p: SearchParams = serde_json::from_value(json!({
+            "kind": "entity",
+            "query": "language models",
+        }))
+        .unwrap();
+        assert!(
+            p.tags.is_none(),
+            "absent tags must be None; no filter applied by default"
+        );
+    }
+
+    // #518: tags_match_any — OR semantics, case-insensitive.
+    #[test]
+    fn tags_match_any_or_semantics() {
+        use super::tags_match_any;
+        let entity = vec!["Rust".to_string(), "systems".to_string()];
+        assert!(tags_match_any(&entity, &["rust".to_string()]));
+        assert!(tags_match_any(
+            &entity,
+            &["systems".to_string(), "ml".to_string()]
+        ));
+        assert!(!tags_match_any(&entity, &["python".to_string()]));
+        assert!(tags_match_any(&entity, &[]));
     }
 
     // ue-kg-deep C4 regression: absent min_score → None (no floor applied, returns all hits).

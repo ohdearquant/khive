@@ -1,56 +1,84 @@
-Verdict: REQUEST CHANGES
-Findings: 0 Critical, 3 Major, 0 Minor, 0 Suggestions
+Verdict: APPROVE-WITH-FIXES
+Findings: 0 Blocker, 0 High, 1 Medium, 1 Low
 
-## Findings
+Scope note: GitHub PR #605 currently points at `bb239e0`; this local worktree is one commit ahead at
+`f97f87b`, which adds `_context/status.md`. I reviewed the GitHub PR code at `bb239e0` and the
+local status artifact where it is the only available #533 skip-rationale document. `_context/status.md`
+changed during this review; I did not revert that concurrent update.
 
-### [Major] `rerank=false` is not a no-embedding opt-out once ANN is warm
+### [Medium] Warm Hook Has No Direct Regression Test Despite The PR Test Claim
 
-Evidence: `crates/khive-pack-knowledge/src/knowledge/mod.rs:1075` defaults the new `requested_rerank` flag, and `crates/khive-pack-knowledge/src/knowledge/mod.rs:1125` uses it only to gate `rerank_with_embeddings`. The ANN path above it still runs whenever `ann.index` is present: `crates/khive-pack-knowledge/src/knowledge/mod.rs:1111` embeds the query and fuses Vamana hits via RRF without checking `requested_rerank`. The new benchmark describes `rerank=false` as "pure TF-IDF, no embedding" at `crates/khive-pack-knowledge/tests/bench.rs:6`, but that is only true when the ANN bridge is absent; `KnowledgePack::warm` can preload the ANN bridge via `warm_known_snapshots` at `crates/khive-pack-knowledge/src/lib.rs:581`.
+Evidence: `crates/khive-pack-kg/src/lib.rs:816` adds `KgPack::warm()` and `crates/khive-pack-kg/src/lib.rs:819`
+performs the sentinel `runtime.embed("khive warmup")`; the added package integration coverage at
+`crates/khive-pack-kg/tests/integration.rs:829` covers only the #518 tag-filtered search path.
+`rg "kg_pack_warm_invokes_default_embedder|warm_invokes|khive warmup"` found only the implementation,
+not the PR-body test named `kg_pack_warm_invokes_default_embedder`.
 
-Why this matters: Users and the benchmark now treat `rerank=false` as the latency/control opt-out for embeddings. In a daemon that has restored a Vamana snapshot, `rerank=false` can still pay query embedding cost and alter ranking through ANN fusion, so the opt-out contract and the warm latency baseline are misleading.
+Why this matters: #551 is behavior-changing startup logic. The implementation is small and plausible,
+but without a mock embedder/spy test, a future no-op warm implementation, lost `tokio::spawn`, or wrong
+runtime call would still pass the current package tests. The PR description also overclaims test
+coverage that is not present in the actual diff.
 
-Suggested fix: Either gate ANN fusion on `requested_rerank` as well, or split the controls explicitly (for example `semantic`/`ann` vs `rerank`) and update the benchmark/docs to stop calling `rerank=false` pure TF-IDF. Add a regression with a preloaded ANN bridge proving the intended behavior.
+Suggested fix: Add a focused warm test using a mock/default embedder provider that records one embed
+call after `KgPack::warm()`, or remove the named test claim from the PR body.
 
-### [Major] FTS5 operator hardening still misses column-filter syntax characters
+### [Low] #533 Skip Rationale Is Not Packaged With The Current GitHub PR Head
 
-Evidence: `crates/khive-db/src/stores/text.rs:254` filters special characters before passing Plain-mode user text to MATCH, but the blocked set at `crates/khive-db/src/stores/text.rs:257` omits `{`, `}`, `[`, and `]`. The sanitized query is then sent directly as the MATCH expression at `crates/khive-db/src/stores/text.rs:571`. The new KG matrix at `crates/khive-pack-kg/tests/integration.rs:1101` covers quotes, boolean operators, NEAR, wildcard, colon, caret, parentheses, hyphen, and apostrophe, but not FTS5 column-filter braces/brackets. A direct FTS5 parser check shows these are still dangerous: `MATCH '{tenant isolation}'` returns `no such column: tenant`, `MATCH 'tenant } isolation'` returns `fts5: syntax error near "}"`, and `MATCH 'tenant [ isolation'` returns `fts5: syntax error near "["`.
+Evidence: `_context/status.md:6` contains the useful #533 skip rationale: live `AnnBridge` has no
+namespace/model/fingerprint/generation metadata and `kkernel` cannot clear in-process `SharedAnn`.
+The current GitHub PR head `bb239e0` changes only the four `crates/khive-pack-kg` files, while the
+status artifact is in the local-only `f97f87b` commit. `_context/status.md:6` also points to
+`fix_brief.md`, but no `fix_brief.md` was present in or above this worktree.
 
-Why this matters: The PR claims full operator-class coverage across db/KG surfaces, but user queries containing FTS5 column-filter syntax can still surface storage errors instead of safe empty/normal results.
+Why this matters: The skip decision is technically defensible: `crates/khive-pack-knowledge/src/knowledge/vamana.rs:20`
+shows `AnnBridge` only stores the index and ID map, `crates/khive-pack-knowledge/src/knowledge/vamana.rs:460`
+returns immediately when any ANN is loaded, and `crates/kkernel/src/reindex.rs:309` only invalidates persisted
+snapshots. But the PR artifact should carry that rationale where reviewers can see it.
 
-Suggested fix: Treat `{`, `}`, `[`, and `]` as separators or stripped operator characters in `sanitize_fts5_query`, then add db and KG regression cases for balanced/unbalanced braces and brackets.
-
-### [Major] `KnowledgePack::warm` does not guarantee the embedder is warm before the hot path
-
-Evidence: `KnowledgePack::warm` awaits Vamana snapshot warmup at `crates/khive-pack-knowledge/src/lib.rs:581`, but the new embedder warmup at `crates/khive-pack-knowledge/src/lib.rs:585` detaches a `tokio::spawn` and immediately returns. The daemon already schedules pack warmup in a background task at `crates/khive-runtime/src/daemon.rs:221`, so the embedder warm is effectively double-detached from request readiness. The new benchmark also does not exercise `KnowledgePack::warm`: it constructs a registry at `crates/khive-pack-knowledge/tests/bench.rs:67`, then measures the first default search as cold at `crates/khive-pack-knowledge/tests/bench.rs:93`; its JSON note at `crates/khive-pack-knowledge/tests/bench.rs:167` defines warm as "after first reranked query preloads embedding model".
-
-Why this matters: The PR description says cold first-query cost is eliminated from the hot path, but this implementation only starts a best-effort background embed. A request arriving before that spawned task completes can still pay the model-load cost, and the benchmark does not verify the `warm()` path that the PR is changing.
-
-Suggested fix: If the intended contract is warm-before-ready, await `runtime.embed("__khive_knowledge_warm__")` inside `KnowledgePack::warm` and benchmark a first query after `registry.call_warm_all().await` or server `warm_all().await`. If startup must remain non-blocking, update the claim and benchmark to reflect best-effort background warming, and expose/measure warm completion separately.
+Suggested fix: Push the local status commit, inline the #533 rationale in the PR body, or remove the
+missing `fix_brief.md` reference and make `_context/status.md` the canonical rationale.
 
 ## Looks Right
 
-- The RRF normalization formula itself is the theoretical maximum form requested: `source_count / (k + 1)` at `crates/khive-pack-knowledge/src/knowledge/mod.rs:1423`, matching the 1-indexed `1 / (k + rank)` implementation in `crates/khive-score/src/ops.rs:102`.
-- The default rerank flip is guarded for no-embedder runtimes at `crates/khive-pack-knowledge/src/knowledge/mod.rs:1075`, and `KhiveRuntime::memory()` still has `embedding_model: None` at `crates/khive-runtime/src/runtime.rs:337`.
-- Knowledge-pack phrase quoting looks safer than the generic TextSearch path: `quote_fts5_phrase` wraps the full raw query and doubles embedded quotes at `crates/khive-pack-knowledge/src/knowledge/mod.rs:1886`.
+- #518 tag filtering is in the requested place: `crates/khive-pack-kg/src/handlers.rs:2472` runs hybrid
+  search first, `crates/khive-pack-kg/src/handlers.rs:2487` fetches entity metadata for the candidate
+  IDs, and `crates/khive-pack-kg/src/handlers.rs:2515` applies properties/tags as post-filters before
+  result shaping.
+- #518 semantics match the request: `crates/khive-pack-kg/src/handlers.rs:1079` implements OR matching
+  with case-insensitive comparison, and `crates/khive-pack-kg/src/lib.rs:472` documents the new `tags`
+  search parameter.
+- #551 implementation follows ADR-049's best-effort warm model: `crates/khive-runtime/src/pack.rs:1077`
+  fans out pack warm hooks, `docs/adr/ADR-049-khived-daemon.md:75` says warm is non-blocking, and
+  `crates/khive-pack-kg/src/lib.rs:816` schedules the sentinel embed without propagating errors.
+- #533 skip rationale is directionally correct for this PR's scope; fixing live ANN coherence spans
+  knowledge-pack ANN metadata, persisted generation/fingerprint state, and `kkernel` daemon/process
+  invalidation behavior.
 
 ## Commands Run
 
-- `git status --short --branch`: clean PR worktree on `show/khive-issue-sweep/knowledge-search`.
-- GitHub PR metadata: local `HEAD` `340b0f7243b36f4c8b7178e0ff819d97dfca4e0c` matches PR #601 head; base is `main` `eefe5568978774f1d29b03506c9be8e9fa987c52`.
-- `RUSTC_WRAPPER= cargo test -p khive-db test_sanitize_fts5_query -- --nocapture`: passed.
-- `RUSTC_WRAPPER= cargo test -p khive-pack-knowledge --test fixes fts_operator_matrix_does_not_crash -- --nocapture`: passed.
-- `RUSTC_WRAPPER= cargo test -p khive-pack-knowledge --test fixes search_defaults_to_embedding_rerank_when_embedder_configured -- --nocapture`: passed.
-- `RUSTC_WRAPPER= cargo test -p khive-pack-knowledge --test bench bench_infrastructure_smoke_test -- --nocapture`: passed.
-- `RUSTC_WRAPPER= cargo test -p khive-pack-kg search_operator_matrix_does_not_crash -- --nocapture`: passed.
-- `sqlite3 :memory: ... MATCH '{tenant isolation}' / 'tenant } isolation' / 'tenant [ isolation'`: reproduced FTS5 parser errors for still-unsanitized operator syntax.
+- `git status --short --branch`: worktree on `show/khive-issue-sweep/retrieval-fixes`; `_context/issues.json`
+  and `_context/triage.md` were untracked at review start.
+- GitHub PR metadata via connector: PR #605 is open, head `bb239e0`, 4 changed files.
+- `git log --oneline --decorate --graph --max-count=8 --all`: confirmed local `f97f87b` is one commit ahead
+  of GitHub PR head `bb239e0`.
+- `RUSTC_WRAPPER= cargo test --manifest-path crates/Cargo.toml -p khive-pack-kg tags -- --nocapture`:
+  passed, 5 unit tests and 1 integration test.
+- `RUSTC_WRAPPER= cargo check --manifest-path crates/Cargo.toml -p khive-pack-kg`: passed.
+- `RUSTC_WRAPPER= cargo clippy --manifest-path crates/Cargo.toml -p khive-pack-kg --all-targets -- -D warnings`:
+  passed.
+- Initial `cargo test --manifest-path crates/Cargo.toml -p khive-pack-kg tags -- --nocapture` without
+  `RUSTC_WRAPPER=` failed because `sccache` was not permitted in the sandbox.
 
 ## What I Did Not Check
 
-- I did not run `cargo test --workspace` or clippy due the 20-minute review deadline.
-- I did not run the ignored latency benchmark because it is manual, environment-sensitive, and does not currently exercise `KnowledgePack::warm`.
+- I did not run full `cargo test --workspace` or full workspace clippy under the deadline.
+- I did not exercise a real daemon startup path or measure embedding cold-start latency.
+- I did not post this review to GitHub.
 
 ## Re-Review Guidance
 
-Re-review should be narrow: rerun the three requested behavior areas after fixes for `rerank=false` semantics, FTS5 brace/bracket sanitization, and the warm-start benchmark/contract.
+Narrow re-review is enough: check that the warm test or PR-body correction was added, and verify that
+the #533 skip rationale is visible in the actual PR artifact.
 
-Domain utility: SKIPPED - the khive domain-suggestion MCP call was cancelled before returning, so this review relied on repository ADRs, code, and targeted tests.
+Domain utility: SKIPPED — the khive memory/knowledge recall call was unavailable in this run, so the
+review used the repository ADRs, code, local context artifacts, and targeted tests directly.
