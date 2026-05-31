@@ -159,6 +159,13 @@ implements, competes_with, composed_with, annotates
 
 All closed sets — enforced at compile time.
 
+## What's New in 0.2.3
+
+- **Entity tags filter**: `search` and `list` now accept a `tags` parameter to filter results
+  by tag values.
+- **Warm startup**: `KgPack` initializes eagerly on server start, reducing cold-call latency
+  for the first verb dispatch.
+
 ## Links
 
 - [crates.io](https://crates.io/crates/khive-mcp)

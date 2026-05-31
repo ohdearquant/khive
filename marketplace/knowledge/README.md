@@ -29,6 +29,15 @@ All verbs are dispatched through the single MCP `request` tool.
 | `knowledge.cite(concept_id, source_id, weight?)`      | Create an `introduced_by` edge from a concept to its source document or person. `weight` is clamped to [0.0, 1.0]; defaults to 1.0. |
 | `knowledge.topic(domain?, query?, limit?)`            | List or search concept entities, optionally filtered by domain tag. `limit` max is 100; defaults to 20.                             |
 
+## What's New in 0.2.3
+
+- **Score normalization**: all search/topic scores are now normalized to `[0, 1]` for
+  consistent cross-query comparison.
+- **`rerank=true` default**: `knowledge.topic` and `knowledge.search` now default to
+  `rerank=true`, producing cleaner relevance ordering out of the box.
+- **FTS5 special character hardening**: queries containing parentheses, colons, quotes, and
+  other FTS5 metacharacters are escaped automatically instead of returning parse errors.
+
 ## Skills
 
 - **learn** — register a concept with domain and tags.

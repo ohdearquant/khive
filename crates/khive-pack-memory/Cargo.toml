@@ -11,14 +11,14 @@ categories.workspace = true
 description = "Memory verb pack — remember/recall semantics with decay-aware ranking"
 
 [dependencies]
-khive-types = { version = "0.2.2", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.2.2", path = "../khive-runtime" }
-khive-fusion = { version = "0.2.2", path = "../khive-fusion" }
-khive-retrieval = { version = "0.2.2", path = "../khive-retrieval" }
-khive-score = { version = "0.2.2", path = "../khive-score" }
-khive-pack-brain = { version = "0.2.2", path = "../khive-pack-brain" }
+khive-types = { version = "0.2.3", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.2.3", path = "../khive-runtime" }
+khive-fusion = { version = "0.2.3", path = "../khive-fusion" }
+khive-retrieval = { version = "0.2.3", path = "../khive-retrieval" }
+khive-score = { version = "0.2.3", path = "../khive-score" }
+khive-pack-brain = { version = "0.2.3", path = "../khive-pack-brain" }
 inventory = { workspace = true }
-khive-storage = { version = "0.2.2", path = "../khive-storage" }
+khive-storage = { version = "0.2.3", path = "../khive-storage" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,7 +28,7 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-khive-pack-kg = { version = "0.2.2", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.2.3", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 async-trait = { workspace = true }

@@ -56,12 +56,12 @@ request(ops="[
 
 ## Parameters
 
-| Parameter   | Type   | Required | Description |
-|-------------|--------|----------|-------------|
+| Parameter   | Type   | Required | Description                                                                              |
+| ----------- | ------ | -------- | ---------------------------------------------------------------------------------------- |
 | `to`        | string | yes      | Recipient namespace. Must equal caller namespace (cross-namespace denied until ADR-018). |
-| `content`   | string | yes      | Message body. Must not be empty. |
-| `subject`   | string | no       | Subject line for triage. |
-| `thread_id` | string | no       | Full UUID of thread root to continue. |
+| `content`   | string | yes      | Message body. Must not be empty.                                                         |
+| `subject`   | string | no       | Subject line for triage.                                                                 |
+| `thread_id` | string | no       | Full UUID of thread root to continue.                                                    |
 
 ## Anti-patterns
 

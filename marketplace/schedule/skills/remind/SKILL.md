@@ -46,10 +46,10 @@ request(ops="[
 
 ## Parameters
 
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
-| `content` | string | yes      | Reminder text. Must not be empty. |
-| `at`      | string | yes      | RFC 3339 timestamp. Must be in the future. |
+| Parameter | Type   | Required | Description                                          |
+| --------- | ------ | -------- | ---------------------------------------------------- |
+| `content` | string | yes      | Reminder text. Must not be empty.                    |
+| `at`      | string | yes      | RFC 3339 timestamp. Must be in the future.           |
 | `repeat`  | string | no       | `"daily"`, `"weekly"`, `"monthly"`, or 5-field cron. |
 
 ## Anti-patterns

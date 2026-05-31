@@ -51,6 +51,12 @@ The `request` tool also accepts an optional `presentation` field (`agent` | `ver
 | `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`         | Remove rows (at least one filter required).               |
 | `brain.reset(profile_id?)`                                              | Reset posteriors to priors; increments exploration_epoch. |
 
+### Convenience
+
+| Verb                                                                         | What it does                                                                                                                                            |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `brain.auto_feedback(recall_results, served_by_profile_id?, consumer_kind?)` | Emit implicit feedback for a batch of `memory.recall` results. Agents call this after recall instead of constructing individual `brain.feedback` calls. |
+
 ### Internal / operator-only (Subhandler — not exposed on public MCP surface)
 
 | Verb                       | What it does                                        |
@@ -59,6 +65,12 @@ The `request` tool also accepts an optional `presentation` field (`agent` | `ver
 | `brain.config(parameter?)` | Return projected config for a named pack parameter. |
 | `brain.events(limit?)`     | List recent brain-relevant events for debugging.    |
 | `brain.emit(...)`          | Deprecated alias for `brain.feedback`.              |
+
+## What's New in 0.2.3
+
+- **`brain.auto_feedback` verb**: convenience verb that lets agents emit implicit feedback for
+  an entire `memory.recall` result set in one call, keeping the memory and brain packs
+  decoupled.
 
 ## Skills
 

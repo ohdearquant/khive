@@ -51,8 +51,8 @@ Deno.test("exit: unknown pack subcommand exits 1", async () => {
   assertEquals(r.code, 1);
 });
 
-Deno.test("exit: unknown auth subcommand exits 1", async () => {
-  const r = await runCli(["auth", "unknown-subcommand"]);
+Deno.test("exit: auth (removed) exits 1 as unknown group", async () => {
+  const r = await runCli(["auth", "login"]);
   assertEquals(r.code, 1);
 });
 
@@ -78,23 +78,6 @@ Deno.test("exit: khive pack --help exits 0", async () => {
 Deno.test("exit: khive pack (no subcommand) exits 0", async () => {
   const r = await runCli(["pack"]);
   assertEquals(r.code, 0);
-});
-
-// ─── auth stubs exit non-zero ──────────────────────────────────────────────────
-
-Deno.test("exit: khive auth login exits 1 (not implemented)", async () => {
-  const r = await runCli(["auth", "login"]);
-  assertEquals(r.code, 1);
-});
-
-Deno.test("exit: khive auth status exits 1 (not implemented)", async () => {
-  const r = await runCli(["auth", "status"]);
-  assertEquals(r.code, 1);
-});
-
-Deno.test("exit: khive auth logout exits 1 (not implemented)", async () => {
-  const r = await runCli(["auth", "logout"]);
-  assertEquals(r.code, 1);
 });
 
 // ─── kg update stub exits non-zero ────────────────────────────────────────────

@@ -31,9 +31,9 @@ function printUsage(): void {
   console.log(`khive ${CLI_VERSION} — research knowledge graph CLI
 
 Usage:
+  khive mcp [flags]         Start the MCP stdio server (auto-spawns daemon)
   khive kg <subcommand>     Manage the git-native knowledge graph
   khive pack <subcommand>   Author and validate declarative packs (ADR-050)
-  khive auth <subcommand>   Authenticate with khive (optional)
 
 KG subcommands:
   init          Initialise .khive/kg/ in the current git repo
@@ -58,12 +58,8 @@ Pack subcommands (ADR-050):
   init          Scaffold a new declarative pack
   check         Validate a pack.yaml manifest
 
-Auth subcommands:
-  login         Sign in via GitHub OAuth
-  status        Show current authentication state
-  logout        Remove stored credentials
-
-All 'khive kg' commands work without a khive auth account.
+All 7 built-in packs (kg, gtd, memory, brain, comm, schedule, knowledge)
+load by default — no --pack flags needed.
 
 Run 'khive <group> <subcommand> --help' for detailed usage.`);
 }
@@ -91,15 +87,6 @@ Subcommands (Phase C1 — file-level operations):
 
 Planned (Phase C2+):
   update        Advance a remote pin`);
-}
-
-function printAuthUsage(): void {
-  console.log(`Usage: khive auth <subcommand>
-
-Subcommands:
-  login         Sign in via GitHub OAuth
-  status        Show authentication state
-  logout        Remove stored credentials`);
 }
 
 async function dispatchKg(args: string[]): Promise<void> {
@@ -201,36 +188,6 @@ async function dispatchKg(args: string[]): Promise<void> {
   void rest; // future flags
 }
 
-function dispatchAuth(args: string[]): void {
-  const [subcommand] = args;
-
-  if (!subcommand || subcommand === "--help" || subcommand === "-h") {
-    printAuthUsage();
-    return;
-  }
-
-  // Auth is phase C2 (v0.4+).
-  switch (subcommand) {
-    case "login":
-    case "status":
-    case "logout":
-      console.error(
-        `'khive auth ${subcommand}' is not yet implemented (phase C2 — v0.4+).`,
-      );
-      Deno.exit(1);
-      break;
-
-    default:
-      console.error(`Unknown auth subcommand: '${subcommand}'`);
-      console.error("Run 'khive auth --help' for available subcommands.");
-      Deno.exit(1);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
 async function dispatchPack(args: string[]): Promise<void> {
   const [subcommand, ...rest] = args;
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
@@ -283,8 +240,43 @@ if (!group || group === "--help" || group === "-h") {
   await dispatchKg(groupArgs);
 } else if (group === "pack") {
   await dispatchPack(groupArgs);
-} else if (group === "auth") {
-  dispatchAuth(groupArgs);
+} else if (group === "mcp") {
+  // Delegate to the khive-mcp Rust binary. Resolve from PATH, cargo bin,
+  // or the platform subpackage (same locations the npm shim checks).
+  const candidates = [
+    "khive-mcp",
+    Deno.env.get("HOME") + "/.cargo/bin/khive-mcp",
+  ];
+  let found: string | undefined;
+  for (const c of candidates) {
+    try {
+      const s = Deno.statSync(c);
+      if (s.isFile) {
+        found = c;
+        break;
+      }
+    } catch { /* next */ }
+  }
+  if (!found) {
+    // Try PATH resolution via `which`
+    try {
+      const p = new Deno.Command("which", { args: ["khive-mcp"], stdout: "piped", stderr: "null" });
+      const out = new TextDecoder().decode((await p.output()).stdout).trim();
+      if (out) found = out;
+    } catch { /* not found */ }
+  }
+  if (!found) {
+    console.error("khive-mcp not found. Install with: cargo install khive-mcp");
+    Deno.exit(1);
+  }
+  const proc = new Deno.Command(found, {
+    args: groupArgs,
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  const status = await proc.output();
+  Deno.exit(status.code);
 } else {
   console.error(`Unknown command group: '${group}'`);
   console.error("Run 'khive --help' for usage.");

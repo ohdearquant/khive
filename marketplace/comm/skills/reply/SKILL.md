@@ -50,10 +50,10 @@ request(ops="comm.thread(id=\"<any-message-in-thread>\")")
 
 ## Parameters
 
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
+| Parameter | Type   | Required | Description                                                                      |
+| --------- | ------ | -------- | -------------------------------------------------------------------------------- |
 | `id`      | string | yes      | Full UUID or 8-char prefix of the message to reply to. Must be kind `"message"`. |
-| `content` | string | yes      | Reply body. Must not be empty. |
+| `content` | string | yes      | Reply body. Must not be empty.                                                   |
 
 ## Anti-patterns
 

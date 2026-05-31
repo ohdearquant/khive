@@ -24,6 +24,13 @@ identical to verbose JSON — readable prose is a CLI-layer concern, not an MCP-
 
 Statuses accept canonical names _or_ aliases: `in_progress → active`, `todo → inbox`, `blocked → waiting`, `later → someday`, `finished → done`.
 
+## What's New in 0.2.3
+
+- **`context_entity_id` on assign**: `gtd.assign` now accepts an optional `context_entity_id`
+  parameter to link a task to a KG entity at creation time.
+- **`complete()` error path hardened**: `gtd.complete` returns a clear error when called on a
+  task already in a terminal state, instead of silently failing.
+
 ## Skills
 
 - **capture** — drop ideas / commitments into `inbox` cleanly.

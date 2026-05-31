@@ -1,6 +1,6 @@
 {
   "name": "khive-kernel-darwin-arm64",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "khive Rust binaries for macOS Apple Silicon (arm64)",
   "license": "Apache-2.0",
   "repository": {

@@ -43,8 +43,8 @@ request(ops="schedule.agenda()")
 
 ## Parameters
 
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
+| Parameter | Type   | Required | Description                                        |
+| --------- | ------ | -------- | -------------------------------------------------- |
 | `id`      | string | yes      | Full UUID or 8-char prefix of the scheduled event. |
 
 ## Anti-patterns

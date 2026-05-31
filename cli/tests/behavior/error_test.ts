@@ -46,16 +46,10 @@ Deno.test("error: unknown pack subcommand suggests 'khive pack --help'", async (
   assertEquals(r.stderr.includes("khive pack --help"), true);
 });
 
-Deno.test("error: unknown auth subcommand prints error to stderr", async () => {
-  const r = await runCli(["auth", "badcommand"]);
-  assertEquals(r.code, 1);
-  assertEquals(r.stderr.includes("Unknown auth subcommand"), true);
-});
-
-Deno.test("error: auth login shows not-implemented message", async () => {
+Deno.test("error: auth is now an unknown command group", async () => {
   const r = await runCli(["auth", "login"]);
   assertEquals(r.code, 1);
-  assertEquals(r.stderr.includes("not yet implemented"), true);
+  assertEquals(r.stderr.includes("Unknown command group"), true);
 });
 
 Deno.test("error: kg update shows not-implemented message", async () => {

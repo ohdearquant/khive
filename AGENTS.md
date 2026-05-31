@@ -2,11 +2,19 @@
 
 This file is for AI agents (and the humans configuring them) using khive as the research runtime.
 
-khive gives your agent three things:
+khive gives your agent:
 
 1. **A knowledge graph** — typed entities + edges you build as you work
 2. **Notes** — observations, insights, questions, decisions, references that persist across sessions
 3. **Pattern matching queries** — GQL/SPARQL traverse over the graph
+4. **Task management** — GTD lifecycle (inbox → next → active → done)
+5. **Memory** — salience- and decay-weighted recall across sessions
+6. **Communication** — namespaced message passing between agents
+7. **Scheduling** — time-triggered reminders and future verb dispatch
+8. **Knowledge corpus** — atom/domain CRUD, FTS + embedding search, compose briefings
+9. **Brain** — Bayesian profile tuning from feedback signals
+
+All 7 packs load by default. **63 public verbs** across the packs.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
 
@@ -19,28 +27,115 @@ or JSON form ([ADR-016](docs/adr/ADR-016-request-dsl.md),
 [ADR-027](docs/adr/ADR-027-single-tool-mcp-surface.md)). Verb semantics and namespace contract are
 defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 
-| Verb              | What it does                                                                                                  | When to use                                              |
-| ----------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `create`          | Add an entity or note                                                                                         | New concept, paper, observation, decision worth tracking |
-| `get`             | Fetch any record by UUID (auto-detects type)                                                                  | When you have a UUID and need the full record            |
-| `search`          | Text + semantic search over entities or notes                                                                 | Finding things by content similarity                     |
-| `list`            | Structured filtering (by kind, tags, etc.)                                                                    | Browsing a category or namespace                         |
-| `update`          | Patch properties, tags, or content (by UUID)                                                                  | Correcting or enriching an existing record               |
-| `delete`          | Soft-delete (or hard-delete) a record (by UUID)                                                               | Removing stale or incorrect data                         |
-| `link`            | Connect two nodes with a typed relation                                                                       | When relationships emerge from research                  |
-| `traverse`        | Multi-hop graph walk with depth/relation filters                                                              | Structural context — lineages, paths, clusters           |
-| `neighbors`       | Immediate neighbors of a node                                                                                 | "What connects to this entity?"                          |
-| `query`           | GQL/SPARQL query string → SQL                                                                                 | Complex pattern matching over the graph                  |
-| `merge`           | Deduplicate two entities into one (v0.1)                                                                      | "LoRA" and "Low-Rank Adaptation" are the same concept    |
-| `memory.remember` | Store a memory (memory pack — [ADR-021](docs/adr/ADR-021-memory-pack.md))                                     | Cross-session context, agent state, working memory       |
-| `memory.recall`   | Semantic search over memories with decay weighting (memory pack — [ADR-021](docs/adr/ADR-021-memory-pack.md)) | Retrieve what you stored in prior sessions               |
+### KG pack — 16 verbs (bare names, no prefix)
 
-**One MCP tool (`request`), 11 core KG verbs (bare names) + 2 memory-pack verbs (dotted form).**
+| Verb        | What it does                                     | When to use                                              |
+| ----------- | ------------------------------------------------ | -------------------------------------------------------- |
+| `create`    | Add an entity or note                            | New concept, paper, observation, decision worth tracking |
+| `get`       | Fetch any record by UUID (auto-detects type)     | When you have a UUID and need the full record            |
+| `search`    | Text + semantic search over entities or notes    | Finding things by content similarity                     |
+| `list`      | Structured filtering (by kind, tags, etc.)       | Browsing a category or namespace                         |
+| `stats`     | Entity/edge/note/event counts                    | Dashboard, health check                                  |
+| `update`    | Patch properties, tags, or content (by UUID)     | Correcting or enriching an existing record               |
+| `delete`    | Soft-delete (or hard-delete) a record (by UUID)  | Removing stale or incorrect data                         |
+| `merge`     | Deduplicate two entities into one                | "LoRA" and "Low-Rank Adaptation" are the same concept    |
+| `link`      | Connect two nodes with a typed relation          | When relationships emerge from research                  |
+| `neighbors` | Immediate neighbors of a node                    | "What connects to this entity?"                          |
+| `traverse`  | Multi-hop graph walk with depth/relation filters | Structural context — lineages, paths, clusters           |
+| `query`     | GQL/SPARQL query string → SQL                    | Complex pattern matching over the graph                  |
+| `propose`   | Create an event-sourced change proposal          | Staging changes for review before apply                  |
+| `review`    | Approve or reject a proposal                     | Gating changes through a review workflow                 |
+| `withdraw`  | Cancel an open proposal                          | Abandoning a staged change                               |
+| `verbs`     | List all registered verbs on this server         | Discovery — see what's available                         |
+
 `get`, `update`, `delete` are UUID-only — they auto-detect whether the record is an entity, note,
 or edge. `create`, `list`, `search` require `kind=entity|note` (or `kind=edge` for `list`;
 `kind=event` for audit events per [ADR-038](docs/adr/ADR-038-events-surface.md)).
 
-`memory.remember` and `memory.recall` require the memory pack: `KHIVE_PACKS=kg,memory`.
+### GTD pack — 5 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
+
+| Verb             | What it does                                            | When to use                              |
+| ---------------- | ------------------------------------------------------- | ---------------------------------------- |
+| `gtd.assign`     | Create a task (note with kind=task)                     | New work item, bug, follow-up            |
+| `gtd.next`       | List actionable tasks (status=next/active), by priority | "What should I work on?"                 |
+| `gtd.complete`   | Mark a task done or cancelled                           | Finishing work                           |
+| `gtd.tasks`      | Filtered task listing                                   | Browse tasks by status/assignee/priority |
+| `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)      | Moving a task through its lifecycle      |
+
+`gtd.assign` accepts `context_entity_id` to anchor a task to a KG entity.
+
+### Memory pack — 2 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
+
+| Verb              | What it does                                           | When to use                                |
+| ----------------- | ------------------------------------------------------ | ------------------------------------------ |
+| `memory.remember` | Store a memory with salience and decay                 | Cross-session context, agent state         |
+| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking | Retrieve what you stored in prior sessions |
+
+`memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
+Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
+
+### Brain pack — 13 verbs (`brain.` prefix)
+
+| Verb                   | What it does                                         | When to use                                     |
+| ---------------------- | ---------------------------------------------------- | ----------------------------------------------- |
+| `brain.profiles`       | List profiles (optionally filtered by lifecycle)     | See what profiles exist                         |
+| `brain.profile`        | Full detail: metadata, snapshot, state summary       | Inspect a specific profile                      |
+| `brain.create_profile` | Create a new profile with optional seed priors       | Custom tuning for a new consumer                |
+| `brain.resolve`        | Which profile serves a given consumer context?       | Before recall — check active tuning             |
+| `brain.activate`       | Start live update loop for a profile                 | Enable feedback-driven tuning                   |
+| `brain.deactivate`     | Stop live updates, retain state                      | Pause tuning without losing progress            |
+| `brain.archive`        | Read-only, audit-retained                            | Retire a profile permanently                    |
+| `brain.reset`          | Reset posteriors to priors (preserves event history) | Start tuning fresh                              |
+| `brain.feedback`       | Emit explicit feedback event                         | Rate a recall result as useful/not_useful/wrong |
+| `brain.auto_feedback`  | Emit implicit feedback for recall results            | Convenience: agents call after memory.recall    |
+| `brain.bind`           | Bind a profile to an actor + consumer                | Route a specific caller to a specific profile   |
+| `brain.unbind`         | Remove a binding                                     | Stop routing                                    |
+| `brain.bindings`       | List binding rows                                    | Audit profile routing                           |
+
+### Comm pack — 5 verbs (`comm.` prefix)
+
+| Verb          | What it does                           | When to use                              |
+| ------------- | -------------------------------------- | ---------------------------------------- |
+| `comm.send`   | Send a message (optionally threaded)   | Inter-agent or inter-namespace messaging |
+| `comm.inbox`  | List inbound messages                  | Check what's waiting                     |
+| `comm.read`   | Mark a message as read                 | Acknowledge receipt                      |
+| `comm.reply`  | Reply to a message (threading linkage) | Respond in-thread                        |
+| `comm.thread` | Retrieve full conversation thread      | Read the whole conversation              |
+
+### Schedule pack — 4 verbs (`schedule.` prefix)
+
+| Verb                | What it does                     | When to use                                    |
+| ------------------- | -------------------------------- | ---------------------------------------------- |
+| `schedule.remind`   | Create a time-triggered reminder | "Remind me to X at Y"                          |
+| `schedule.schedule` | Schedule a future verb dispatch  | Deferred actions (action is a DSL verb string) |
+| `schedule.agenda`   | List upcoming scheduled events   | "What's on the calendar?"                      |
+| `schedule.cancel`   | Cancel a scheduled event         | Remove a pending reminder/action               |
+
+### Knowledge pack — 18 verbs (`knowledge.` prefix)
+
+| Verb                       | What it does                                            | When to use                                  |
+| -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
+| `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                        | Ingesting knowledge corpus                   |
+| `knowledge.upsert_domains` | Bulk insert/update domain groupings                     | Organizing atoms into domains                |
+| `knowledge.get`            | Fetch atom/domain by UUID or slug                       | Read a specific knowledge entry              |
+| `knowledge.list`           | Paginated listing of atoms or domains                   | Browse the corpus                            |
+| `knowledge.search`         | TF-IDF search with embedding rerank (default on)        | Finding relevant knowledge                   |
+| `knowledge.suggest`        | Orient query against domains for composition            | "Which domains cover topic X?"               |
+| `knowledge.compose`        | Compose a markdown briefing from selected atoms/domains | Build a context briefing for an agent        |
+| `knowledge.edit`           | Upsert sections for an atom                             | Update part of an atom without wiping others |
+| `knowledge.import`         | Ingest markdown files as atoms                          | Batch import from filesystem                 |
+| `knowledge.delete_atoms`   | Soft-delete atoms by slug or ID                         | Retire stale knowledge                       |
+| `knowledge.stats`          | Corpus statistics: atom/domain/coverage counts          | Health check                                 |
+| `knowledge.index`          | Backfill embeddings + FTS                               | After bulk import or reindex                 |
+| `knowledge.fold`           | Budget-constrained knapsack selection                   | Token-aware subset picking                   |
+| `knowledge.challenge`      | Mark a section as disputed                              | Flag incorrect content                       |
+| `knowledge.adjudicate`     | Resolve a disputed section                              | Accept or reject a challenge                 |
+| `knowledge.learn`          | Register a concept entity with domain/tags              | Quick concept creation                       |
+| `knowledge.cite`           | Link concept → paper/person (introduced_by edge)        | Attribution                                  |
+| `knowledge.topic`          | List concepts by domain or free-text                    | Explore the concept graph                    |
+
+`knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
+cases). Scores are normalized to [0,1] when `rerank` is active (default).
 
 ### How to call a verb
 
@@ -67,20 +162,18 @@ request(ops="[{\"tool\":\"create\",\"args\":{\"kind\":\"entity\",\"entity_kind\"
 Ops in a batch run in parallel and have no ordering guarantee. If op B depends on op A's output
 (e.g. create-then-link), use two `request` calls.
 
-**Deferred (not available in v0.1 semantics):**
+**Deferred (not yet available):**
 
-- `supersede` verb — use `link(source_id=new_id, target_id=old_id, relation="supersedes")` as a
-  workaround.
 - `create(supersedes=<old-id>)` parameter shortcut — this convenience form (which would atomically
-  create a new record and add a `supersedes` edge to the old one) is **not in the v0.1 wire
-  surface**. Use the two-step workaround: `create(...)` then `link(..., relation="supersedes")`.
-- Note merge — only entity merge is implemented in v0.1 (`merge(into_id=..., from_id=...)`).
-  Deduplicating two notes is not yet supported; add a `supersedes` edge manually as a workaround.
+  create a new record and add a `supersedes` edge to the old one) is not yet in the wire surface.
+  Use the two-step approach: `create(...)` then `link(..., relation="supersedes")`.
+- Note merge — only entity merge is implemented (`merge(into_id=..., from_id=...)`).
+  Deduplicating two notes is not yet supported; add a `supersedes` edge manually.
 
 ### Notes vs entities
 
-- **Entities** = things in the world: concepts, papers, people, projects, datasets, orgs.
-  Graph nodes with typed edges between them.
+- **Entities** = things in the world: concepts, papers, people, projects, datasets, orgs,
+  artifacts, services. Graph nodes with typed edges between them.
 - **Notes** = your observations about the world: what you noticed, concluded, decided, asked, cited.
   Temporal records with salience and optional graph edges (via `annotates`).
 
@@ -89,7 +182,7 @@ Use `create(kind="note", note_kind="observation", ...)` for notes.
 
 ---
 
-## The 6 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md))
+## The 8 entity kinds (closed set — [ADR-001](docs/adr/ADR-001-entity-kind-taxonomy.md))
 
 | Kind       | What it represents                                      |
 | ---------- | ------------------------------------------------------- |
@@ -99,13 +192,15 @@ Use `create(kind="note", note_kind="observation", ...)` for notes.
 | `project`  | Codebases, libraries, tools, frameworks                 |
 | `person`   | Researchers, engineers, authors                         |
 | `org`      | Labs, companies, institutions                           |
+| `artifact` | Binaries, model checkpoints, Docker images, packages    |
+| `service`  | APIs, hosted endpoints, SaaS products                   |
 
 `concept` is the default. Use `properties` for finer distinctions (`type: "paper"`,
 `domain: "attention"`, `status: "implemented"`).
 
 ---
 
-## The 5 note kinds (closed set — [ADR-019](docs/adr/ADR-019-note-kind-taxonomy.md))
+## The 5 note kinds (closed set — [ADR-013](docs/adr/ADR-013-note-kind-taxonomy.md))
 
 | Kind          | What it records                               |
 | ------------- | --------------------------------------------- |
@@ -120,7 +215,7 @@ annotates=[entity_id], ...)`.
 
 ---
 
-## The 13-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md))
+## The 15-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md))
 
 When you `link` nodes, use ONLY these relations:
 
@@ -136,6 +231,14 @@ When you `link` nodes, use ONLY these relations:
 - `variant_of` — A is a modified version of B (QLoRA variant_of LoRA)
 - `introduced_by` — concept first described in paper/by person
 - `supersedes` — new replaces old entirely
+
+### Provenance
+
+- `derived_from` — output derived from input (artifact from dataset, document, etc.)
+
+### Temporal
+
+- `precedes` — earlier comes before later (document → document, dataset → dataset, etc.)
 
 ### Dependency
 
@@ -163,19 +266,24 @@ probably a property on the entity, not an edge.
 
 ## Tool schemas (required → **bold**, optional → normal)
 
+These are the KG pack verbs. Other packs are documented in their verb tables above.
+
 | Tool        | Fields                                                                                                                                                                                                                                           | Example                                                      |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ |
 | `create`    | **kind** (entity\|note), **name** + **entity_kind** for entity, **content** + note_kind for note; entity_type, description, properties, tags, salience, annotates                                                                                | `{"kind":"entity","entity_kind":"concept","name":"LoRA"}`    |
-| `get`       | **id** (UUID); namespace                                                                                                                                                                                                                         | `{"id":"<uuid>"}`                                            |
-| `list`      | **kind** (entity\|edge\|note\|event\|proposal); entity_kind, entity_type, note_kind, source_id, target_id, relations, min_weight, max_weight, tags, limit, offset; event: event_kind, event_kinds; message: thread_id, direction, from, to, read | `{"kind":"entity","entity_kind":"concept","limit":20}`       |
-| `update`    | **id** (UUID); name, description, properties, tags (entity), relation, weight (edge); namespace                                                                                                                                                  | `{"id":"<uuid>","description":"Updated desc"}`               |
-| `delete`    | **id** (UUID); hard (default: false); namespace                                                                                                                                                                                                  | `{"id":"<uuid>","hard":true}`                                |
-| `merge`     | **into_id**, **from_id**; strategy (prefer_into\|prefer_from\|union); namespace                                                                                                                                                                  | `{"into_id":"<uuid>","from_id":"<uuid>"}`                    |
-| `search`    | **kind** (entity\|note), **query** (text); entity_kind, entity_type, note_kind, include_superseded (note), properties (entity post-filter), min_score, limit                                                                                     | `{"kind":"entity","query":"attention mechanism"}`            |
-| `link`      | **source_id**, **target_id**, **relation**; weight (0.0–1.0); namespace                                                                                                                                                                          | `{"source_id":"<A>","target_id":"<B>","relation":"extends"}` |
-| `neighbors` | **node_id**; direction (out\|in\|both), relations, min_weight, limit; namespace                                                                                                                                                                  | `{"node_id":"<uuid>","direction":"in"}`                      |
-| `traverse`  | **roots** (UUID list); max_depth, direction, relations, include_roots; namespace                                                                                                                                                                 | `{"roots":["<uuid>"],"max_depth":2}`                         |
-| `query`     | **query** (GQL or SPARQL string); namespace                                                                                                                                                                                                      | `{"query":"MATCH (a:concept)-[:extends]->(b) RETURN a"}`     |
+| `get`       | **id** (UUID)                                                                                                                                                                                                                                    | `{"id":"<uuid>"}`                                            |
+| `list`      | **kind** (entity\|edge\|note\|event\|proposal); entity_kind, entity_type, note_kind, tags, source_id, target_id, relations, min_weight, max_weight, limit, offset; event: event_kind, event_kinds; message: thread_id, direction, from, to, read | `{"kind":"entity","entity_kind":"concept","tags":["ml"]}`    |
+| `update`    | **id** (UUID); name, description, properties, tags (entity), relation, weight (edge)                                                                                                                                                             | `{"id":"<uuid>","description":"Updated desc"}`               |
+| `delete`    | **id** (UUID); hard (default: false)                                                                                                                                                                                                             | `{"id":"<uuid>","hard":true}`                                |
+| `merge`     | **into_id**, **from_id**; strategy (prefer_into\|prefer_from\|union)                                                                                                                                                                             | `{"into_id":"<uuid>","from_id":"<uuid>"}`                    |
+| `search`    | **kind** (entity\|note), **query** (text); entity_kind, entity_type, note_kind, tags, include_superseded (note), properties (entity post-filter), min_score, limit                                                                               | `{"kind":"entity","query":"attention mechanism"}`            |
+| `link`      | **source_id**, **target_id**, **relation**; weight (0.0–1.0)                                                                                                                                                                                     | `{"source_id":"<A>","target_id":"<B>","relation":"extends"}` |
+| `neighbors` | **node_id**; direction (out\|in\|both), relations, min_weight, limit                                                                                                                                                                             | `{"node_id":"<uuid>","direction":"both"}`                    |
+| `traverse`  | **roots** (UUID list); max_depth, direction, relations, include_roots                                                                                                                                                                            | `{"roots":["<uuid>"],"max_depth":2}`                         |
+| `query`     | **query** (GQL or SPARQL string)                                                                                                                                                                                                                 | `{"query":"MATCH (a:concept)-[:extends]->(b) RETURN a"}`     |
+| `propose`   | **kind** (entity\|note\|edge), fields for the proposed change                                                                                                                                                                                    | `{"kind":"entity","entity_kind":"concept","name":"X"}`       |
+| `review`    | **proposal_id**, **verdict** (approve\|reject); comment                                                                                                                                                                                          | `{"proposal_id":"<uuid>","verdict":"approve"}`               |
+| `withdraw`  | **proposal_id**                                                                                                                                                                                                                                  | `{"proposal_id":"<uuid>"}`                                   |
 
 ### When to use which retrieval verb
 
@@ -186,9 +294,9 @@ probably a property on the entity, not an edge.
 - **`traverse(roots)`** — multi-hop graph: "reachability within N hops"
 - **`query(gql)`** — pattern matching: "concepts that extend something introduced by a paper"
 
-### v0.1 workaround: supersession via edges
+### Supersession via edges
 
-Until `supersede` lands, manually create a supersedes edge:
+To supersede a record, create a `supersedes` edge:
 
 ```
 request(ops="link(source_id=\"<new_note>\", target_id=\"<old_note>\", relation=\"supersedes\")")
@@ -330,7 +438,7 @@ structural traces.
 | ------------------------------------------------- | -------------------------------------------------- |
 | Storing findings only as notes, never as entities | Notes are for context; entities are for structure  |
 | Creating duplicate entities                       | Always `search` first — link to existing if found  |
-| Using ad-hoc relations                            | Map to the closed 13-relation set or don't link    |
+| Using ad-hoc relations                            | Map to the closed 15-relation set or don't link    |
 | Reversed `introduced_by` direction                | concept → paper (the paper introduces the concept) |
 | One-hop neighbor queries when you need lineage    | Use `traverse` with `max_depth` for multi-hop      |
 | Adding `version`/`date` to entity names           | Those are properties, not names                    |
@@ -346,6 +454,34 @@ If you are an AI agent authoring PRs, issues, or comments via someone's CLI:
 2. **Verify claims**: every claim in your PR description must match the actual diff.
 3. **Test evidence**: include `cargo test` output for behavior-changing code.
 4. **ADR awareness**: link to relevant ADRs. Schema/interface changes require an ADR first.
+
+---
+
+## Daemon and warm startup
+
+khive-mcp auto-spawns a background daemon (`khive-mcp --daemon`) on the first request. The daemon
+keeps the ANN index and embedding model warm so `knowledge.search` and `memory.recall` are fast on
+subsequent calls. Users do not need to configure or manage the daemon — it starts automatically and
+cleans up on exit.
+
+The daemon communicates over a Unix socket (`khived.sock`). If you see stale-process errors after a
+rebuild, kill zombie processes: `pkill -f khive-mcp` then reconnect.
+
+---
+
+## Namespace isolation
+
+Every ID-based operation (`get`, `update`, `delete`, `merge`) verifies that the record belongs to
+the caller's namespace at the runtime layer. Storage is ID-only by design; the runtime is the trust
+boundary. Cross-namespace access is denied.
+
+---
+
+## Admin tooling
+
+**kkernel** is an optional admin CLI for operators. It provides pack introspection, reindexing, and
+engine management commands (`kkernel sync`, `kkernel vector`). Agents do not need kkernel — all
+agent-facing operations go through the `request` tool.
 
 ---
 

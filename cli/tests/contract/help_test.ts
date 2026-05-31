@@ -77,33 +77,14 @@ Deno.test("help: khive pack with no subcommand shows usage", async () => {
   assertEquals(r.stdout.includes("Usage: khive pack"), true);
 });
 
-// ─── auth group help ───────────────────────────────────────────────────────────
-
-Deno.test("help: khive auth --help exits 0", async () => {
-  const r = await runCli(["auth", "--help"]);
-  assertEquals(r.code, 0);
-});
-
-Deno.test("help: khive auth --help matches golden file", async () => {
-  const r = await runCli(["auth", "--help"]);
-  assertEquals(r.code, 0);
-  assertGolden(r.stdout, join(GOLDEN_DIR, "help_auth.txt"));
-});
-
-Deno.test("help: khive auth with no subcommand shows usage", async () => {
-  const r = await runCli(["auth"]);
-  assertEquals(r.code, 0);
-  assertEquals(r.stdout.includes("Usage: khive auth"), true);
-});
-
 // ─── Content assertions ────────────────────────────────────────────────────────
 
-Deno.test("help: top-level help lists all three groups (kg, pack, auth)", async () => {
+Deno.test("help: top-level help lists groups (mcp, kg, pack)", async () => {
   const r = await runCli(["--help"]);
   assertEquals(r.code, 0);
+  assertEquals(r.stdout.includes("khive mcp"), true);
   assertEquals(r.stdout.includes("khive kg"), true);
   assertEquals(r.stdout.includes("khive pack"), true);
-  assertEquals(r.stdout.includes("khive auth"), true);
 });
 
 Deno.test("help: kg help lists all known subcommands", async () => {

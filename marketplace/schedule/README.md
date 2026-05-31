@@ -4,12 +4,12 @@ Set reminders, schedule future verb dispatches, view upcoming events, and cancel
 
 ## Skills
 
-| Skill | Description |
-|-------|-------------|
-| `remind` | Set a time-triggered reminder |
+| Skill      | Description                     |
+| ---------- | ------------------------------- |
+| `remind`   | Set a time-triggered reminder   |
 | `schedule` | Schedule a future verb dispatch |
-| `agenda` | View upcoming scheduled events |
-| `cancel` | Cancel a pending event |
+| `agenda`   | View upcoming scheduled events  |
+| `cancel`   | Cancel a pending event          |
 
 ## Quick start
 
@@ -26,6 +26,11 @@ request(ops="schedule.agenda()")
 # Cancel an event
 request(ops="schedule.cancel(id=\"<event-id>\")")
 ```
+
+## What's New in 0.2.3
+
+- **Cancel guard**: `schedule.cancel` now rejects attempts to cancel an already-cancelled
+  event with a clear error instead of silently succeeding.
 
 ## How it works
 

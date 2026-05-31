@@ -4,11 +4,11 @@ Structured messaging between agents, lambdas, and namespaces. Messages are store
 
 ## Skills
 
-| Skill | Description |
-|-------|-------------|
-| `send` | Send a message to a recipient |
-| `inbox` | Check inbound messages and mark them read |
-| `reply` | Reply to a message with automatic threading |
+| Skill    | Description                                     |
+| -------- | ----------------------------------------------- |
+| `send`   | Send a message to a recipient                   |
+| `inbox`  | Check inbound messages and mark them read       |
+| `reply`  | Reply to a message with automatic threading     |
 | `thread` | View a full conversation thread chronologically |
 
 ## Quick start

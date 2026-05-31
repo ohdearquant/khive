@@ -1,9 +1,9 @@
-khive 0.2.0 — research knowledge graph CLI
+khive 0.2.3 — research knowledge graph CLI
 
 Usage:
+  khive mcp [flags]         Start the MCP stdio server (auto-spawns daemon)
   khive kg <subcommand>     Manage the git-native knowledge graph
   khive pack <subcommand>   Author and validate declarative packs (ADR-050)
-  khive auth <subcommand>   Authenticate with khive (optional)
 
 KG subcommands:
   init          Initialise .khive/kg/ in the current git repo
@@ -28,11 +28,7 @@ Pack subcommands (ADR-050):
   init          Scaffold a new declarative pack
   check         Validate a pack.yaml manifest
 
-Auth subcommands:
-  login         Sign in via GitHub OAuth
-  status        Show current authentication state
-  logout        Remove stored credentials
-
-All 'khive kg' commands work without a khive auth account.
+All 7 built-in packs (kg, gtd, memory, brain, comm, schedule, knowledge)
+load by default — no --pack flags needed.
 
 Run 'khive <group> <subcommand> --help' for detailed usage.

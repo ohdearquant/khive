@@ -51,10 +51,10 @@ Both return the same thread.
 
 ## Parameters
 
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
+| Parameter | Type   | Required | Description                                              |
+| --------- | ------ | -------- | -------------------------------------------------------- |
 | `id`      | string | yes      | Full UUID or 8-char prefix of any message in the thread. |
-| `limit`   | int    | no       | Max messages to return (default 100, max 500). |
+| `limit`   | int    | no       | Max messages to return (default 100, max 500).           |
 
 ## Patterns
 

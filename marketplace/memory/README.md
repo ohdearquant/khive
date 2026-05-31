@@ -26,6 +26,15 @@ cosine similarity, `[0.0, 1.0]` or `null` for text-only hits). All values are bo
 `[0.0, 1.0]`. Passing `presentation="verbose"` adds a per-component `breakdown` field;
 `presentation` defaults to `"agent"` when omitted.
 
+## What's New in 0.2.3
+
+- **Tags filter on recall**: `memory.recall` now accepts `tags` and `tag_mode` (`any` or `all`)
+  parameters to filter recalled memories by tag values.
+- **`include_embeddings` on recall**: pass `include_embeddings=true` to include raw embedding
+  vectors in recall results (useful for downstream reranking or clustering).
+- **`presentation` alias removed**: the deprecated `presentation` positional alias on `recall`
+  is removed; use the standard `presentation` field on the `request` call instead.
+
 ## Skills
 
 - **remember** - store durable context intentionally, with the right memory type and salience.

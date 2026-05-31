@@ -3,7 +3,7 @@
 **What this is**: A research knowledge graph runtime. Typed entities, closed edge ontology,
 hybrid search, GQL/SPARQL queries — all in a single 7.7MB Rust binary over MCP stdio.
 
-**v0.1.0** — [crates.io](https://crates.io/crates/khive-mcp) | Apache 2.0
+**v0.2.3** — [crates.io](https://crates.io/crates/khive-mcp) | Apache 2.0
 
 ---
 
@@ -47,9 +47,11 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-mcp      — stdio MCP server (the only binary)         │
+│  khive-mcp      — stdio MCP server + persistent daemon       │
 │  1 tool: `request` (ADR-016) — parses DSL,                   │
 │  dispatches verb ops through the VerbRegistry                │
+│  Auto-spawns `khive-mcp --daemon` for warm ANN/embedder      │
+│  state (ADR-049). Daemon keeps indexes hot across sessions.  │
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
@@ -102,7 +104,7 @@ not shipped.
 | `crates/khive-pack-memory` | Memory pack: `remember`/`recall` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))             |
 | `crates/khive-vcs`         | KG versioning: content-addressed snapshots, branch pointers, push/pull ([ADR-010](docs/adr/ADR-010-kg-versioning.md))  |
 | `crates/khive-merge`       | KG merge: three-way merge with LCA walk, conflict enum, strategy shortcuts ([ADR-039](docs/adr/ADR-039-note-merge.md)) |
-| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry                                                             |
+| `crates/khive-mcp`         | Stdio MCP binary — single `request` tool over VerbRegistry; auto-spawns daemon                                         |
 | `docs/adr/`                | Architecture Decision Records (the design contract)                                                                    |
 | `marketplace/`             | Claude Code plugins (`kg`, `gtd`) — install via `/plugin install`                                                      |
 | `tests/smoke_test.py`      | End-to-end binary smoke test (drives every verb via the `request` DSL)                                                 |
@@ -163,7 +165,8 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 ```
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
-loads all 7 production packs: kg, gtd, memory, brain, comm, schedule, knowledge.
+loads all 7 production packs: kg, gtd, memory, brain, comm, schedule, knowledge
+(63 verbs total).
 
 ### KG pack verbs (11 — ADR-017)
 

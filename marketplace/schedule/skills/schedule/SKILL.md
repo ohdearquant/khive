@@ -48,10 +48,10 @@ Any DSL expression accepted by `request` is valid as an action.
 
 ## Parameters
 
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
-| `action`  | string | yes      | Valid khive DSL verb call. Validated at write time. |
-| `at`      | string | yes      | RFC 3339 timestamp. Must be in the future. |
+| Parameter | Type   | Required | Description                                          |
+| --------- | ------ | -------- | ---------------------------------------------------- |
+| `action`  | string | yes      | Valid khive DSL verb call. Validated at write time.  |
+| `at`      | string | yes      | RFC 3339 timestamp. Must be in the future.           |
 | `repeat`  | string | no       | `"daily"`, `"weekly"`, `"monthly"`, or 5-field cron. |
 
 ## Anti-patterns

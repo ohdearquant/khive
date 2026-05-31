@@ -20,10 +20,11 @@ No Neo4j. No SPARQL endpoint to deploy. SQLite on disk, MCP over stdio, `cargo t
 
 | Capability                  | How                                                                                                                      |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| **63 verbs, 7 packs**       | KG, GTD, memory, brain, comm, schedule, knowledge — all load by default                                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                            |
 | **Typed edges**             | 15 closed relations in 8 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation) |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                      |
-| **Hybrid retrieval**        | Runtime FTS5 + vector RRF over storage; shipped BM25, HNSW, Vamana, and fusion crates for pack-specific retrieval paths  |
+| **Hybrid retrieval**        | FTS5 + vector RRF with embedding rerank; shipped BM25, HNSW, Vamana, and fusion crates for pack-specific retrieval paths |
 | **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                                                   |
 | **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                                                        |
 | **Salience-weighted notes** | Notes carry salience scores; search ranks by semantic relevance × salience                                               |
@@ -57,10 +58,17 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-Default pack: **kg** (11 verbs — `create`, `get`, `list`, `update`, `delete`, `merge`, `search`,
-`link`, `neighbors`, `traverse`, `query`). Load the **gtd** pack alongside for task lifecycle
-(`KHIVE_PACKS=kg,gtd` or `--pack kg --pack gtd`) and get 5 more verbs: `gtd.assign`, `gtd.next`,
-`gtd.complete`, `gtd.tasks`, `gtd.transition`.
+All 7 packs load by default — **63 verbs** out of the box:
+
+| Pack          | Prefix       | Verbs | What it does                                     |
+| ------------- | ------------ | ----- | ------------------------------------------------ |
+| **kg**        | _(bare)_     | 11    | Entities, edges, notes, graph queries            |
+| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)    |
+| **memory**    | `memory.`    | 2     | Salience-weighted remember / decay-ranked recall |
+| **brain**     | `brain.`     | 13    | Bayesian user profiles + feedback loop           |
+| **comm**      | `comm.`      | 5     | Threaded messaging                               |
+| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution           |
+| **knowledge** | `knowledge.` | 14    | Atom-based KB with embedding rerank search       |
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only — they auto-detect the record type.
@@ -75,13 +83,20 @@ No language SDK to learn.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  khive-mcp       — Rust binary (stdio MCP server)            │
+│  khived           — persistent daemon (ADR-049): warm runtime │
+│                     auto-spawned on first request             │
 │  1 tool: `request` (ADR-020 + ADR-027) — parses DSL,         │
 │  dispatches each op through the VerbRegistry                 │
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg   — KG vocabulary + 11 verb handlers          │
-│  khive-pack-gtd  — task lifecycle (5 verbs, optional)        │
+│  khive-pack-kg         — KG vocabulary + 11 verb handlers    │
+│  khive-pack-gtd        — task lifecycle (5 verbs)            │
+│  khive-pack-memory     — salience + decay recall (2 verbs)   │
+│  khive-pack-brain      — Bayesian profiles (13 verbs)        │
+│  khive-pack-comm       — threaded messaging (5 verbs)        │
+│  khive-pack-schedule   — reminders + scheduled ops (4 verbs) │
+│  khive-pack-knowledge  — atom KB + embedding rerank (14 verbs)│
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -90,9 +105,13 @@ No language SDK to learn.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Embedded SQLite storage with FTS5 trigram text search and current sqlite-vec VectorStore
-compatibility. Retrieval also ships in-process BM25, HNSW, Vamana, and fusion crates for
-hybrid and pack-specific search paths. One binary, one DB file, no external services to run.
+Embedded SQLite storage with FTS5 trigram text search and sqlite-vec vector search.
+Retrieval ships in-process BM25, HNSW, Vamana, and fusion crates for hybrid and pack-specific
+search paths. One binary, one DB file, no external services to run.
+
+The **khived daemon** (ADR-049) keeps the runtime warm between MCP sessions — embedding model
+stays loaded, SQLite connections stay open, pack registries stay initialized. It auto-spawns on
+first request and persists in the background, eliminating cold-start overhead on reconnect.
 
 HTTP gateway, CLI, and visual frontend are planned for future releases.
 
@@ -100,25 +119,30 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ## Crates
 
-| Crate             | Purpose                                                                                                |
-| ----------------- | ------------------------------------------------------------------------------------------------------ |
-| `khive-types`     | Domain types, Pack trait, closed enums                                                                 |
-| `khive-score`     | Deterministic i64 fixed-point scoring                                                                  |
-| `khive-storage`   | Trait-only capability surface (zero implementations)                                                   |
-| `khive-db`        | SQLite backend: entity/note/edge tables, FTS5 TextSearch, current sqlite-vec VectorStore compatibility |
-| `khive-retrieval` | Hybrid retrieval primitives                                                                            |
-| `khive-fusion`    | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                  |
-| `khive-bm25`      | BM25 keyword index                                                                                     |
-| `khive-hnsw`      | HNSW vector index                                                                                      |
-| `khive-vamana`    | Vamana ANN index used by knowledge search                                                              |
-| `khive-query`     | SPARQL / GQL → SQL compiler                                                                            |
-| `khive-runtime`   | Service API + VerbRegistry + PackRuntime trait                                                         |
-| `khive-request`   | Request DSL parser (function-call, JSON; pipe / LNDL planned). Transport-agnostic AST.                 |
-| `khive-pack-kg`   | KG pack: vocabulary, verb handlers, kind validation                                                    |
-| `khive-pack-gtd`  | GTD pack: task lifecycle over the notes substrate (loaded via `KHIVE_PACKS`)                           |
-| `khive-mcp`       | Stdio MCP binary — single `request` tool dispatching through the VerbRegistry                          |
+| Crate                  | Purpose                                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------ |
+| `khive-types`          | Domain types, Pack trait, closed enums                                                                 |
+| `khive-score`          | Deterministic i64 fixed-point scoring                                                                  |
+| `khive-storage`        | Trait-only capability surface (zero implementations)                                                   |
+| `khive-db`             | SQLite backend: entity/note/edge tables, FTS5 TextSearch, current sqlite-vec VectorStore compatibility |
+| `khive-retrieval`      | Hybrid retrieval primitives                                                                            |
+| `khive-fusion`         | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                  |
+| `khive-bm25`           | BM25 keyword index                                                                                     |
+| `khive-hnsw`           | HNSW vector index                                                                                      |
+| `khive-vamana`         | Vamana ANN index used by knowledge search                                                              |
+| `khive-query`          | SPARQL / GQL → SQL compiler                                                                            |
+| `khive-runtime`        | Service API + VerbRegistry + PackRuntime trait                                                         |
+| `khive-request`        | Request DSL parser (function-call, JSON; pipe / LNDL planned). Transport-agnostic AST.                 |
+| `khive-pack-kg`        | KG pack: vocabulary, verb handlers, kind validation                                                    |
+| `khive-pack-gtd`       | GTD pack: task lifecycle over the notes substrate                                                      |
+| `khive-pack-memory`    | Memory pack: salience-weighted remember/recall with decay                                              |
+| `khive-pack-brain`     | Brain pack: Bayesian user profiles, feedback, resolution                                               |
+| `khive-pack-comm`      | Comm pack: threaded messaging with inbox                                                               |
+| `khive-pack-schedule`  | Schedule pack: reminders and scheduled verb execution                                                  |
+| `khive-pack-knowledge` | Knowledge pack: atom-based KB with embedding rerank search                                             |
+| `khive-mcp`            | Stdio MCP binary — single `request` tool dispatching through the VerbRegistry                          |
 
-Dependency direction (storage stack): `types → score → storage → db → query → runtime → pack-kg / pack-gtd → mcp`.
+Dependency direction (storage stack): `types → score → storage → db → query → runtime → packs → mcp`.
 Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
 packs do not depend on it).
 Storage is trait-only; backends (SQLite today, Postgres tomorrow) implement the traits without
@@ -128,11 +152,20 @@ touching consumers.
 
 ## Quick start
 
-### Install from crates.io
+**1. Install:**
 
 ```bash
 cargo install khive-mcp
 ```
+
+**2. Add to `.mcp.json`** (project-level or `~/.claude/mcp.json` for global):
+
+```json
+{ "mcpServers": { "khive": { "command": "khive-mcp" } } }
+```
+
+**That's it.** All 7 packs load by default, the daemon auto-spawns to keep the runtime warm,
+and Claude Code discovers the `request` tool with the full 63-verb catalog.
 
 ### Or build from source
 
@@ -142,23 +175,9 @@ cd crates && cargo build --release -p khive-mcp
 # Binary at: crates/target/release/khive-mcp
 ```
 
-### Configure for Claude Code
+### Usage
 
-Add to your project's `.mcp.json` (or `~/.claude/mcp.json` for global):
-
-```json
-{
-  "mcpServers": {
-    "khive": {
-      "command": "khive-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-That's it. Claude Code auto-discovers the single `request` tool (the verb catalog is rendered in
-its description); the agent expresses verbs as DSL ops:
+The agent expresses verbs as DSL ops:
 
 ```text
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\", description=\"Low-Rank Adaptation\")")
@@ -227,10 +246,10 @@ make ci  # Full CI: fmt, clippy, test, build
 
 ## Status
 
-**v0.1.2 — published on [crates.io](https://crates.io/crates/khive-mcp).** 9 crates, one
-`request` MCP tool dispatching 11 KG verbs through a DSL, pack-based verb dispatch, hybrid
-search with local embeddings, GQL/SPARQL queries. Ready for use with Claude Code and any
-MCP-compatible agent.
+**v0.2.3 — published on [crates.io](https://crates.io/crates/khive-mcp).** 63 verbs across 7
+packs, 9 entity kinds, 15 edge relations, daemon warm startup (ADR-049), knowledge search with
+embedding rerank, Bayesian brain profiles, threaded messaging, scheduled verb execution.
+Ready for use with Claude Code and any MCP-compatible agent.
 
 ## License
 
