@@ -220,6 +220,40 @@ static BRAIN_HANDLERS: &[HandlerDef] = &[
             },
         ],
     },
+    HandlerDef {
+        name: "brain.auto_feedback",
+        description: "Emit implicit feedback for recall results supplied by an agent. \
+            Convenience verb: agents call this after memory.recall instead of constructing \
+            a brain.feedback call manually. Keeps memory and brain packs decoupled (#517).",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "query",
+                param_type: "string",
+                required: true,
+                description: "Recall query that produced the results.",
+            },
+            ParamDef {
+                name: "results",
+                param_type: "array",
+                required: true,
+                description: "Recall result objects; the first object's note_id is credited.",
+            },
+            ParamDef {
+                name: "signal",
+                param_type: "string",
+                required: false,
+                description: "Feedback signal. Defaults to \"implicit_positive\".",
+            },
+            ParamDef {
+                name: "served_by_profile_id",
+                param_type: "string",
+                required: false,
+                description: "Profile ID that served the recall. Defaults like brain.feedback.",
+            },
+        ],
+    },
     // ── Declaration verbs ─────────────────────────────────────────────────
     HandlerDef {
         name: "brain.bind",
@@ -1030,6 +1064,66 @@ impl BrainPack {
         }))
     }
 
+    // ── brain.auto_feedback ───────────────────────────────────────────────
+
+    /// Convenience verb for agents: emit implicit feedback for the first result
+    /// returned by `memory.recall` without requiring a full UUID (#517).
+    ///
+    /// Accepts an 8-char Agent-mode `note_id` prefix (as returned by default
+    /// `memory.recall` output) or a full 36-char UUID. If `results` is empty,
+    /// returns `{"emitted": false, "reason": "no_results"}` without error.
+    async fn handle_auto_feedback(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AutoFeedbackParams {
+            query: String,
+            results: Vec<AutoFeedbackResult>,
+            signal: Option<String>,
+            served_by_profile_id: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct AutoFeedbackResult {
+            note_id: String,
+        }
+
+        let p: AutoFeedbackParams = serde_json::from_value(params)
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        if p.query.trim().is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "auto_feedback: `query` must not be empty".into(),
+            ));
+        }
+
+        let Some(first) = p.results.first() else {
+            return Ok(json!({
+                "emitted": false,
+                "verb": "brain.auto_feedback",
+                "reason": "no_results",
+            }));
+        };
+
+        let target = resolve_auto_feedback_target(&self.runtime, token, &first.note_id).await?;
+
+        let mut feedback_params = json!({
+            "target_id": target.to_string(),
+            "signal": p.signal.as_deref().unwrap_or("implicit_positive"),
+        });
+        if let Some(ref profile_id) = p.served_by_profile_id {
+            feedback_params["served_by_profile_id"] = json!(profile_id);
+        }
+
+        let mut out = self.handle_feedback(token, feedback_params).await?;
+        out["verb"] = json!("brain.auto_feedback");
+        out["feedback_verb"] = json!("brain.feedback");
+        out["result_count"] = json!(p.results.len());
+        Ok(out)
+    }
+
     // ── brain.emit (deprecated) ───────────────────────────────────────────
 
     /// Deprecated: use `brain.feedback`. Kept for backward-compat; routes to
@@ -1395,6 +1489,7 @@ impl PackRuntime for BrainPack {
             "brain.archive" => self.handle_archive(params).await,
             "brain.reset" => self.handle_reset(params).await,
             "brain.feedback" => self.handle_feedback(token, params).await,
+            "brain.auto_feedback" => self.handle_auto_feedback(token, params).await,
             // Declaration
             "brain.bind" => self.handle_bind(params).await,
             "brain.unbind" => self.handle_unbind(params).await,
@@ -1406,6 +1501,37 @@ impl PackRuntime for BrainPack {
             ))),
         }
     }
+}
+
+// ── brain.auto_feedback helpers ───────────────────────────────────────────────
+
+/// Resolve a `note_id` from `memory.recall` output to a full UUID.
+///
+/// Accepts a 36-char UUID directly, or an 8-char hex prefix (Agent-mode short
+/// form). Returns `InvalidInput` if neither form matches or the prefix is
+/// ambiguous.
+async fn resolve_auto_feedback_target(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw: &str,
+) -> Result<uuid::Uuid, RuntimeError> {
+    if let Ok(uuid) = raw.parse::<uuid::Uuid>() {
+        return Ok(uuid);
+    }
+    if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return runtime
+            .resolve_prefix(token, raw)
+            .await
+            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "auto_feedback: no record matches note_id prefix: {raw:?}"
+                ))
+            });
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "auto_feedback: invalid note_id {raw:?}; expected full UUID or 8-char hex prefix"
+    )))
 }
 
 // ── DispatchHook impl ─────────────────────────────────────────────────────────
@@ -3807,6 +3933,100 @@ mod tests {
             event["duration_us"]
         );
     }
+
+    // ── #517: brain.auto_feedback ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn brain_auto_feedback_emits_implicit_positive_for_first_result() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        let result = pack
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "recall calibration target",
+                    "results": [{ "note_id": target }]
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("auto_feedback succeeds");
+
+        assert_eq!(result["emitted"], json!(true), "emitted must be true");
+        assert_eq!(
+            result["signal"],
+            json!("implicit_positive"),
+            "default signal must be implicit_positive"
+        );
+        let returned_target_id = result["target_id"].as_str().unwrap_or("");
+        assert_eq!(
+            returned_target_id.len(),
+            36,
+            "target_id in auto_feedback response must be full 36-char UUID"
+        );
+        assert_eq!(
+            returned_target_id, target,
+            "target_id must match the created entity"
+        );
+        assert_eq!(
+            pack.snapshot().balanced_recall.total_events,
+            1,
+            "auto_feedback must increment total_events"
+        );
+    }
+
+    #[tokio::test]
+    async fn brain_auto_feedback_empty_results_returns_no_emit() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "empty recall results",
+                    "results": []
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("auto_feedback with empty results succeeds");
+
+        assert_eq!(result["emitted"], json!(false));
+        assert_eq!(result["reason"], json!("no_results"));
+    }
+
+    #[tokio::test]
+    async fn brain_auto_feedback_accepts_short_note_id_prefix() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+        // Use 8-char prefix as Agent mode would return from memory.recall.
+        let prefix = &target[..8];
+
+        let result = pack
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "prefix resolution test",
+                    "results": [{ "note_id": prefix }]
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("auto_feedback with 8-char prefix succeeds");
+
+        assert_eq!(result["emitted"], json!(true));
+        assert_eq!(result["target_id"].as_str().unwrap_or("").len(), 36);
+    }
 }
 
 #[cfg(test)]
@@ -3835,6 +4055,19 @@ mod help_tests {
         assert!(
             h.params.iter().any(|p| p.name == "served_by_profile_id"),
             "brain.feedback must document served_by_profile_id"
+        );
+    }
+
+    #[test]
+    fn brain_auto_feedback_handler_is_declared() {
+        let h = find_handler("brain.auto_feedback");
+        assert!(
+            h.params.iter().any(|p| p.name == "query" && p.required),
+            "brain.auto_feedback must have required query param"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "results" && p.required),
+            "brain.auto_feedback must have required results param"
         );
     }
 

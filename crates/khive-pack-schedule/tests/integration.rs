@@ -350,6 +350,44 @@ async fn test_cancel_accepts_short_id() {
     );
 }
 
+// ── #544 regression: cancel already-cancelled event ─────────────────────────
+
+#[tokio::test]
+async fn cancel_rejects_already_cancelled_event() {
+    let (registry, _rt) = build_registry();
+
+    let reminded = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({
+                "content": "cancel once",
+                "at": "2099-07-01T12:00:00Z"
+            }),
+        )
+        .await
+        .expect("remind succeeds");
+    let full_id = reminded["full_id"].as_str().expect("full_id present");
+
+    let first = registry
+        .dispatch("schedule.cancel", serde_json::json!({ "id": full_id }))
+        .await
+        .expect("first cancel succeeds");
+    assert_eq!(
+        first["status"].as_str(),
+        Some("cancelled"),
+        "first cancel must return status=cancelled"
+    );
+
+    let err = registry
+        .dispatch("schedule.cancel", serde_json::json!({ "id": full_id }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already cancelled"),
+        "second cancel must report already-cancelled state, got: {err:?}"
+    );
+}
+
 // ── C3 regression: past dates rejected ───────────────────────────────────────
 
 #[tokio::test]

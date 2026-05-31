@@ -153,23 +153,36 @@ pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> V
             let lifecycle_preserve: HashSet<&str> =
                 LIFECYCLE_NULL_PRESERVE.iter().copied().collect();
             let score_fields: HashSet<&str> = SCORE_FIELDS.iter().copied().collect();
-            transform_agent(value, &lifecycle_preserve, &score_fields, now_unix_seconds)
+            transform_agent(
+                value,
+                &lifecycle_preserve,
+                &score_fields,
+                now_unix_seconds,
+                false,
+            )
         }
     }
 }
 
 /// Apply the Agent-mode transform to an arbitrary JSON value.
+///
+/// `inside_properties` is `true` when recursing inside a `"properties"` object.
+/// Caller-supplied payload timestamps (e.g. `trigger_at`) must not be compacted
+/// because they encode domain semantics the agent may need to round-trip (#546).
 fn transform_agent(
     value: Value,
     lifecycle: &HashSet<&str>,
     scores: &HashSet<&str>,
     now: i64,
+    inside_properties: bool,
 ) -> Value {
     match value {
         Value::Object(map) => {
             let mut out = Map::new();
             for (k, v) in map {
-                let transformed = transform_field_agent(&k, v, lifecycle, scores, now);
+                let child_inside_properties = inside_properties || k == "properties";
+                let transformed =
+                    transform_field_agent(&k, v, lifecycle, scores, now, child_inside_properties);
                 match transformed {
                     None => {} // drop
                     Some(tv) => {
@@ -182,7 +195,7 @@ fn transform_agent(
         Value::Array(arr) => {
             let items: Vec<Value> = arr
                 .into_iter()
-                .map(|v| transform_agent(v, lifecycle, scores, now))
+                .map(|v| transform_agent(v, lifecycle, scores, now, inside_properties))
                 .collect();
             Value::Array(items)
         }
@@ -193,12 +206,17 @@ fn transform_agent(
 /// Transform a single named field value under Agent mode.
 ///
 /// Returns `None` if the field should be dropped.
+///
+/// `inside_properties` suppresses timestamp compaction for caller-submitted
+/// payload values (e.g. `trigger_at` stored under `"properties"`). Metadata
+/// timestamps at the top level (`created_at`, `updated_at`) are still compacted.
 fn transform_field_agent(
     key: &str,
     value: Value,
     lifecycle: &HashSet<&str>,
     scores: &HashSet<&str>,
     now: i64,
+    inside_properties: bool,
 ) -> Option<Value> {
     match &value {
         // Preserve lifecycle nulls; drop other nulls.
@@ -225,10 +243,18 @@ fn transform_field_agent(
         Value::String(s) if is_canonical_uuid(s) && should_shorten_uuid_field(key) => {
             Some(Value::String(s[..8].to_string()))
         }
-        // Compact ISO-8601 timestamps in string fields.
-        Value::String(s) if looks_like_iso8601(s) => Some(Value::String(compact_timestamp(s, now))),
+        // Compact ISO-8601 timestamps only outside caller-supplied payload objects.
+        Value::String(s) if !inside_properties && looks_like_iso8601(s) => {
+            Some(Value::String(compact_timestamp(s, now)))
+        }
         // Recurse into objects and arrays.
-        Value::Object(_) | Value::Array(_) => Some(transform_agent(value, lifecycle, scores, now)),
+        Value::Object(_) | Value::Array(_) => Some(transform_agent(
+            value,
+            lifecycle,
+            scores,
+            now,
+            inside_properties,
+        )),
         // Everything else passes through.
         _ => Some(value),
     }

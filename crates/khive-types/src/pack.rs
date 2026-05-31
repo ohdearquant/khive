@@ -112,11 +112,16 @@ pub enum VerbPresentationPolicy {
     Standard,
     /// Always use `Verbose` output regardless of the caller's mode.
     ///
-    /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`.
+    /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`,
+    /// `brain.feedback`.
     ///
     /// `link` is included because the returned edge ID is the only handle for
     /// follow-up `neighbors`/`traverse` calls; short-form IDs risk prefix
     /// collision at scale (ADR-045 §6 "Edge IDs needed for follow-up").
+    ///
+    /// `brain.feedback` is included because callers chain `target_id` from the
+    /// response back into subsequent feedback or profile queries; an 8-char
+    /// prefix is ambiguous and defeats the acknowledged-ID contract (#545).
     AlwaysVerbose,
 }
 
@@ -137,7 +142,7 @@ impl HandlerDef {
         // the same 8-char prefix (birthday collision ~65K edges), so shortening the
         // edge ID in agent mode violates ADR-045 §6 "Edge IDs needed for follow-up."
         match self.name {
-            "get" | "link" | "query" | "traverse" | "neighbors" => {
+            "get" | "link" | "query" | "traverse" | "neighbors" | "brain.feedback" => {
                 VerbPresentationPolicy::AlwaysVerbose
             }
             _ => VerbPresentationPolicy::Standard,
@@ -378,10 +383,17 @@ mod tests {
         );
     }
 
-    // AlwaysVerbose set regression: ensure get/query/traverse/neighbors remain.
+    // AlwaysVerbose set regression: ensure get/query/traverse/neighbors/brain.feedback remain.
     #[test]
     fn always_verbose_set_contains_expected_verbs() {
-        let always_verbose = ["get", "link", "query", "traverse", "neighbors"];
+        let always_verbose = [
+            "get",
+            "link",
+            "query",
+            "traverse",
+            "neighbors",
+            "brain.feedback",
+        ];
         for name in always_verbose {
             let h = HandlerDef {
                 name,

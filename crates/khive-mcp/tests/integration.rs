@@ -3422,3 +3422,90 @@ async fn topic_rejects_unknown_kwarg() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ── #545: brain.feedback default Agent response preserves full target_id ──────
+
+/// `brain.feedback` in default Agent mode must return `target_id` as the full
+/// 36-char UUID, not the 8-char Agent-mode prefix (#545).
+#[tokio::test]
+async fn brain_feedback_default_agent_response_preserves_full_target_id() -> anyhow::Result<()> {
+    let client = connect_brain_only().await?;
+
+    let created = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="BrainFeedbackTarget")"#,
+    )
+    .await?;
+    let target_id = created["id"]
+        .as_str()
+        .expect("created entity id")
+        .to_string();
+    assert_eq!(
+        target_id.len(),
+        36,
+        "entity id from verbose ok_one must be 36-char"
+    );
+
+    // Use plain `call` (not `ok_one`) so Agent mode is not forced to verbose.
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": format!(r#"brain.feedback(target_id="{target_id}", signal="useful")"#)}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(true),
+        "brain.feedback must succeed: {first}"
+    );
+
+    let returned = first["result"]["target_id"].as_str().unwrap_or("");
+    assert_eq!(
+        returned.len(),
+        36,
+        "brain.feedback Agent response target_id must be full 36-char UUID, got: {returned:?}"
+    );
+    assert_eq!(returned, target_id, "returned target_id must match input");
+    Ok(())
+}
+
+// ── #546: schedule.agenda Agent response preserves properties.trigger_at ──────
+
+/// Schedule agenda in default Agent mode must not compact `trigger_at` inside
+/// `properties` — the full ISO-8601 string must round-trip verbatim (#546).
+#[tokio::test]
+async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> anyhow::Result<()> {
+    let client = connect_schedule_only().await?;
+    let trigger_at = "2099-01-01T00:00:00Z";
+
+    ok_one(
+        &client,
+        &format!(r#"schedule.remind(content="agent trigger_at fidelity", at="{trigger_at}")"#),
+    )
+    .await?;
+
+    // Default Agent mode (no `presentation` key).
+    let result = call(&client, "request", json!({"ops": "schedule.agenda()"})).await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(true),
+        "schedule.agenda must succeed: {first}"
+    );
+
+    let events = first["result"]["events"].as_array().expect("events array");
+    assert!(!events.is_empty(), "agenda must have at least one event");
+    let actual = events[0]["properties"]["trigger_at"].as_str().unwrap_or("");
+    assert_eq!(
+        actual, trigger_at,
+        "trigger_at inside properties must be preserved verbatim in Agent mode"
+    );
+    assert_ne!(
+        actual, "2099-01-01T00:00",
+        "trigger_at must not be truncated to minute granularity"
+    );
+    Ok(())
+}

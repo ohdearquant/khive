@@ -430,8 +430,14 @@ pub(crate) async fn handle_cancel(
         )));
     }
 
-    let cancelled_at = Utc::now().to_rfc3339();
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
+    if props.get("status").and_then(Value::as_str) == Some("cancelled") {
+        return Err(RuntimeError::InvalidInput(format!(
+            "cancel: event {id} is already cancelled"
+        )));
+    }
+
+    let cancelled_at = Utc::now().to_rfc3339();
     props["status"] = json!("cancelled");
     props["cancelled_at"] = json!(cancelled_at);
     note.properties = Some(props.clone());
