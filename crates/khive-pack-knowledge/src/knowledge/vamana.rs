@@ -117,7 +117,7 @@ pub(crate) fn snapshot_key(namespace: &str, model: &str) -> String {
 }
 
 /// Model-key sanitization — must match `khive_runtime::sanitize_key`.
-fn sanitize_model_key(s: &str) -> String {
+pub(crate) fn sanitize_model_key(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()

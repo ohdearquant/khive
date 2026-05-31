@@ -61,6 +61,14 @@ async fn pack_registers_cleanly_with_verb_registry() {
         verbs.contains(&"knowledge.fold"),
         "expected 'knowledge.fold' verb, got: {verbs:?}"
     );
+    assert!(
+        verbs.contains(&"knowledge.suggest"),
+        "expected 'knowledge.suggest' verb, got: {verbs:?}"
+    );
+    assert!(
+        verbs.contains(&"knowledge.compose"),
+        "expected 'knowledge.compose' verb, got: {verbs:?}"
+    );
     // No note kinds added.
     let note_kinds: Vec<&str> = f.registry.all_note_kinds();
     assert!(
@@ -1147,4 +1155,296 @@ async fn search_type_domain_finds_upserted_domains() {
         "domain search should find the upserted domain"
     );
     assert_eq!(results[0]["kind"].as_str().unwrap_or(""), "domain");
+}
+
+// ── suggest ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn suggest_returns_domains_for_query() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                { "slug": "retrieval-methods", "name": "Retrieval Methods", "description": "sparse and dense retrieval techniques" },
+                { "slug": "embedding-theory", "name": "Embedding Theory", "description": "vector embedding concepts" },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert domains");
+
+    let resp = f
+        .dispatch("knowledge.suggest", json!({ "query": "retrieval" }))
+        .await
+        .expect("suggest ok");
+
+    assert_eq!(resp["status"], "ok");
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(
+        !results.is_empty(),
+        "suggest should return at least one domain"
+    );
+    let first = &results[0];
+    assert!(first["id"].is_string(), "result must have id");
+    assert!(first["name"].is_string(), "result must have name");
+    assert!(first["score"].is_number(), "result must have score");
+}
+
+#[tokio::test]
+async fn suggest_rejects_empty_query() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.suggest", json!({ "query": "" }))
+        .await
+        .expect_err("empty query should fail");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+}
+
+// ── compose ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn compose_returns_markdown_for_atoms() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "rag-overview",
+                    "name": "RAG Overview",
+                    "content": "Retrieval-augmented generation combines retrieval with generation."
+                },
+                {
+                    "slug": "dense-retrieval",
+                    "name": "Dense Retrieval",
+                    "content": "Dense retrieval uses vector embeddings to find relevant documents."
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atoms");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": ["rag-overview", "dense-retrieval"],
+                "query": "retrieval augmented generation"
+            }),
+        )
+        .await
+        .expect("compose ok");
+
+    assert_eq!(resp["status"], "ok");
+    let md = resp["data"]["markdown"].as_str().expect("markdown");
+    assert!(
+        md.contains("Knowledge Briefing"),
+        "markdown must have heading"
+    );
+    let atoms = resp["data"]["atoms"].as_array().expect("atoms array");
+    assert_eq!(atoms.len(), 2, "expected 2 atoms in response");
+    let count = resp["data"]["count"].as_u64().expect("count");
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn compose_returns_markdown_for_domain() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "atom-a", "name": "Atom A", "content": "content of atom a" }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom");
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                {
+                    "slug": "test-domain",
+                    "name": "Test Domain",
+                    "members": ["atom-a"]
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let domain_resp = f
+        .dispatch("knowledge.get", json!({ "id": "test-domain" }))
+        .await
+        .expect("get domain");
+    let domain_id = domain_resp["id"].as_str().expect("domain id");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "domain_ids": [domain_id],
+                "query": "content"
+            }),
+        )
+        .await
+        .expect("compose from domain ok");
+
+    assert_eq!(resp["status"], "ok");
+    let atoms = resp["data"]["atoms"].as_array().expect("atoms");
+    assert!(
+        !atoms.is_empty(),
+        "compose from domain should include member atoms"
+    );
+}
+
+#[tokio::test]
+async fn compose_rejects_missing_ids() {
+    let f = pack(rt());
+    let err = f
+        .dispatch("knowledge.compose", json!({ "query": "test" }))
+        .await
+        .expect_err("compose with no ids should fail");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn compose_rejects_empty_query() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.compose",
+            json!({ "atom_ids": ["some-atom"], "query": "" }),
+        )
+        .await
+        .expect_err("empty query should fail");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn suggest_returns_empty_when_no_domains_present() {
+    let f = pack(rt());
+    // Empty corpus: no domains upserted. suggest should succeed with an empty results array.
+    let resp = f
+        .dispatch("knowledge.suggest", json!({ "query": "anything" }))
+        .await
+        .expect("suggest on empty corpus must not crash");
+    assert_eq!(resp["status"], "ok");
+    let results = resp["data"]["results"].as_array().expect("results array");
+    assert!(
+        results.is_empty(),
+        "no domains in corpus → empty results, got: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn suggest_honors_limit_param() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                { "slug": "domain-one", "name": "Domain One", "description": "first domain about retrieval" },
+                { "slug": "domain-two", "name": "Domain Two", "description": "second domain about search" },
+                { "slug": "domain-three", "name": "Domain Three", "description": "third domain about indexing" },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert domains");
+
+    let resp = f
+        .dispatch(
+            "knowledge.suggest",
+            json!({ "query": "domain", "limit": 1 }),
+        )
+        .await
+        .expect("suggest with limit=1");
+
+    assert_eq!(resp["status"], "ok");
+    let results = resp["data"]["results"].as_array().expect("results array");
+    // All 3 seeded domains match the FTS phrase "domain"; suggest truncates to
+    // exactly `limit` via hits.truncate(limit) before returning.
+    assert_eq!(
+        results.len(),
+        1,
+        "limit=1 with 3 matching domains must return exactly 1 result, got: {}",
+        results.len()
+    );
+}
+
+#[tokio::test]
+async fn compose_accepts_mix_of_domain_ids_and_atom_ids() {
+    let f = pack(rt());
+
+    // Atom directly referenced by atom_ids.
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "direct-atom", "name": "Direct Atom", "content": "directly specified atom content" },
+                { "slug": "member-atom", "name": "Member Atom", "content": "member atom from domain" },
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atoms");
+
+    // Domain whose member provides member-atom.
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                { "slug": "mix-domain", "name": "Mix Domain", "members": ["member-atom"] }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let domain_resp = f
+        .dispatch("knowledge.get", json!({ "id": "mix-domain" }))
+        .await
+        .expect("get domain");
+    let domain_id = domain_resp["id"].as_str().expect("domain id");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "domain_ids": [domain_id],
+                "atom_ids": ["direct-atom"],
+                "query": "content"
+            }),
+        )
+        .await
+        .expect("compose with mix of domain_ids and atom_ids");
+
+    assert_eq!(resp["status"], "ok");
+    let atoms = resp["data"]["atoms"].as_array().expect("atoms array");
+    assert_eq!(
+        atoms.len(),
+        2,
+        "compose with 1 domain member + 1 direct atom should yield 2 atoms (deduped), got: {atoms:?}"
+    );
+    let count = resp["data"]["count"].as_u64().expect("count");
+    assert_eq!(count, 2);
 }

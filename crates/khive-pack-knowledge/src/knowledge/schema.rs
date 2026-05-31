@@ -375,6 +375,28 @@ pub(crate) struct SearchWeights {
     pub w_bigram: Option<f64>,
 }
 
+// ── suggest ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SuggestParams {
+    pub query: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+// ── compose ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ComposeParams {
+    #[serde(default)]
+    pub domain_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub atom_ids: Option<Vec<String>>,
+    pub query: String,
+}
+
 // ── edit ─────────────────────────────────────────────────────────────────────
 
 /// One section update within a `knowledge.edit` call.

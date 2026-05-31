@@ -12,6 +12,8 @@
 //! - `knowledge.index`           — backfill embeddings + FTS for atoms
 //! - `knowledge.fold`            — budget-constrained knapsack selection (token budgeting)
 //! - `knowledge.search`          — TF-IDF + optional embedding rerank over the corpus
+//! - `knowledge.suggest`         — orientation: ranked domain suggestions for a query
+//! - `knowledge.compose`         — orientation: markdown briefing from domains and atoms
 //!
 //! **Section tier** (ADR-048 Phase 2):
 //! - `knowledge.edit`   — upsert sections for an atom (section-level, non-destructive)
@@ -50,7 +52,7 @@ impl Pack for KnowledgePack {
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
-static KNOWLEDGE_HANDLERS: [HandlerDef; 16] = [
+static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
@@ -276,6 +278,58 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 16] = [
                 param_type: "number",
                 required: false,
                 description: "TF-IDF vs embedding blend weight (default 0.7 = TF-IDF dominant)",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "knowledge.suggest",
+        description: "Suggest relevant knowledge domains for a query",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "query",
+                param_type: "string",
+                required: true,
+                description: "Orientation query text",
+            },
+            ParamDef {
+                name: "role",
+                param_type: "string",
+                required: false,
+                description: "Agent role hint prepended to query for scoring",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Max domains (default 8, max 100)",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "knowledge.compose",
+        description: "Compose a markdown briefing from selected knowledge domains and atoms",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "domain_ids",
+                param_type: "array<string>",
+                required: false,
+                description: "Domain UUIDs or slugs whose member atoms should be included",
+            },
+            ParamDef {
+                name: "atom_ids",
+                param_type: "array<string>",
+                required: false,
+                description: "Atom UUIDs or slugs to include directly",
+            },
+            ParamDef {
+                name: "query",
+                param_type: "string",
+                required: true,
+                description: "Query used to rerank selected atom bodies",
             },
         ],
     },
@@ -555,6 +609,10 @@ impl PackRuntime for KnowledgePack {
             "knowledge.search" => {
                 KnowledgeHandlers::search(&self.runtime, token, params, &self.ann).await
             }
+            "knowledge.suggest" => {
+                KnowledgeHandlers::suggest(&self.runtime, token, params, &self.ann).await
+            }
+            "knowledge.compose" => KnowledgeHandlers::compose(&self.runtime, token, params).await,
             // section tier
             "knowledge.edit" => KnowledgeHandlers::edit(&self.runtime, token, params).await,
             "knowledge.import" => KnowledgeHandlers::import(&self.runtime, token, params).await,

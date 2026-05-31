@@ -1119,3 +1119,112 @@ async fn upsert_finalizing_does_not_demote_verified() {
         "re-finalizing must not demote an already-verified atom"
     );
 }
+
+// ── FTS5 MATCH escaping regression ───────────────────────────────────────────
+
+#[tokio::test]
+async fn fts_query_special_characters_do_not_crash() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [{
+                "slug": "tenant-isolation",
+                "name": "Tenant Isolation",
+                "description": "multi-tenant isolation handles Bob's tenant",
+                "content": "multi-tenant isolation and Bob's data separation"
+            }]
+        }),
+    )
+    .await
+    .expect("seed atom");
+
+    for query in ["multi-tenant isolation", "Bob's tenant"] {
+        let resp = f
+            .dispatch("knowledge.search", json!({ "query": query }))
+            .await
+            .expect("search should not crash on FTS5 special characters");
+        assert_eq!(resp["status"], "ok");
+    }
+}
+
+// ── stats.embedding_coverage regression ──────────────────────────────────────
+
+fn rt_with_default_embedder() -> KhiveRuntime {
+    use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
+    use khive_types::Namespace;
+    use lattice_embed::EmbeddingModel;
+    use std::sync::Arc;
+
+    KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "knowledge".to_string()],
+        backend_id: BackendId::main(),
+    })
+    .expect("runtime with default embedder")
+}
+
+#[tokio::test]
+async fn stats_embedding_coverage_counts_atom_vectors() {
+    use khive_types::{Namespace, SubstrateKind};
+    use uuid::Uuid;
+
+    let f = pack(rt_with_default_embedder());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "covered", "name": "Covered", "content": "has vector" },
+                { "slug": "uncovered", "name": "Uncovered", "content": "no vector" }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atoms");
+
+    let row = f
+        .sql_query_one(
+            "SELECT id FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2",
+            vec![
+                SqlValue::Text("local".into()),
+                SqlValue::Text("covered".into()),
+            ],
+        )
+        .await
+        .expect("covered atom row");
+    let atom_id = match row.get("id") {
+        Some(SqlValue::Text(id)) => Uuid::parse_str(id).expect("uuid id"),
+        other => panic!("expected id text, got {other:?}"),
+    };
+
+    let token =
+        f.rt.authorize(Namespace::local())
+            .expect("local namespace token");
+    let vectors = f.rt.vectors(&token).expect("vector store");
+    vectors
+        .insert(
+            atom_id,
+            SubstrateKind::Entity,
+            "local",
+            "knowledge.atom",
+            vec![vec![0.0f32; 384]],
+        )
+        .await
+        .expect("insert vector");
+
+    let stats = f
+        .dispatch("knowledge.stats", json!({}))
+        .await
+        .expect("stats ok");
+    let coverage = stats["embedding_coverage"]
+        .as_f64()
+        .expect("embedding_coverage f64");
+    assert!(
+        (coverage - 0.5).abs() < 1e-6,
+        "expected 0.5 coverage, got: {coverage}"
+    );
+}

@@ -32,9 +32,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::knowledge::schema::{
-    AdjudicateParams, Atom, ChallengeParams, DeleteAtomsParams, Domain, EditParams, FoldCandidate,
-    FoldParams, GetParams, ImportParams, IndexParams, ListParams, SearchParams, Section,
-    SectionType, UpsertAtomsParams, UpsertDomainsParams,
+    AdjudicateParams, Atom, ChallengeParams, ComposeParams, DeleteAtomsParams, Domain, EditParams,
+    FoldCandidate, FoldParams, GetParams, ImportParams, IndexParams, ListParams, SearchParams,
+    Section, SectionType, SuggestParams, UpsertAtomsParams, UpsertDomainsParams,
 };
 
 // ─── TF-IDF weight defaults ───────────────────────────────────────────────────
@@ -776,12 +776,15 @@ impl KnowledgeHandlers {
             0.0
         };
 
+        let embedding_coverage =
+            compute_embedding_coverage(runtime, token, &ns, total_atoms).await?;
+
         Ok(json!({
             "total_atoms": total_atoms,
             "total_domains": total_domains,
             "total_events": 0,
             "eval_coverage": eval_coverage,
-            "embedding_coverage": 0.0,
+            "embedding_coverage": embedding_coverage,
             "namespace": ns,
         }))
     }
@@ -1147,6 +1150,196 @@ impl KnowledgeHandlers {
             "data": { "results": results, "count": count },
         }))
     }
+
+    // ── suggest ───────────────────────────────────────────────────────────────
+
+    pub(crate) async fn suggest(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+        ann: &vamana::SharedAnn,
+    ) -> Result<Value, RuntimeError> {
+        let p: SuggestParams = deser(params)?;
+        let raw_query = p.query.trim().to_string();
+        if raw_query.is_empty() {
+            return Err(RuntimeError::InvalidInput("query must not be empty".into()));
+        }
+        let limit = p.limit.unwrap_or(8).clamp(1, 100);
+        let ns = token.namespace().as_str().to_owned();
+
+        let ctx = SearchCtx {
+            runtime,
+            ns: &ns,
+            role: p.role.as_deref(),
+            type_filter: Some("domain"),
+            min_score: 0.0,
+            w: &Weights::default(),
+            fetch_limit: limit * 3,
+            statuses: &[],
+            exclude_status: None,
+        };
+
+        let mut hits = search_core(&ctx, &raw_query).await?;
+
+        vamana::ensure_ann(runtime, token, ann).await;
+        let ann_guard = ann.read().await;
+        if let Some(ref bridge) = *ann_guard {
+            if let Ok(query_emb) = runtime.embed(&raw_query).await {
+                let ann_k = (limit * 3).max(20);
+                let ann_hits = bridge.search(&query_emb, ann_k);
+                if !ann_hits.is_empty() {
+                    fuse_ann_hits(&mut hits, &ann_hits, 0.0);
+                    hydrate_empty_hits(runtime, &ns, &mut hits).await;
+                }
+            }
+        }
+        drop(ann_guard);
+
+        rerank_with_embeddings(runtime, &raw_query, &mut hits, 0.7).await?;
+
+        hits.retain(|h| h.is_domain);
+        hits.truncate(limit);
+
+        let results: Vec<Value> = hits
+            .iter()
+            .map(|h| json!({ "id": h.id, "name": h.name, "score": h.score }))
+            .collect();
+        let count = results.len();
+
+        Ok(json!({
+            "status": "ok",
+            "data": { "results": results, "count": count },
+        }))
+    }
+
+    // ── compose ───────────────────────────────────────────────────────────────
+
+    pub(crate) async fn compose(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        let p: ComposeParams = deser(params)?;
+        let raw_query = p.query.trim().to_string();
+        if raw_query.is_empty() {
+            return Err(RuntimeError::InvalidInput("query must not be empty".into()));
+        }
+
+        let domain_ids: Vec<String> = p
+            .domain_ids
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        let atom_ids: Vec<String> = p
+            .atom_ids
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+
+        if domain_ids.is_empty() && atom_ids.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "domain_ids or atom_ids must be provided".into(),
+            ));
+        }
+
+        let ns = token.namespace().as_str().to_owned();
+
+        let mut resolved_domains: Vec<Domain> = Vec::new();
+        let mut member_slugs: Vec<String> = Vec::new();
+
+        for id in &domain_ids {
+            let domain = load_domain_by_id_or_slug(runtime, &ns, id).await?;
+            let members = parse_domain_members(&domain)?;
+            member_slugs.extend(members);
+            resolved_domains.push(domain);
+        }
+
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut ordered_atoms: Vec<Atom> = Vec::new();
+
+        for slug in &member_slugs {
+            let atom = load_atom_by_id_or_slug(runtime, &ns, slug).await?;
+            if seen_ids.insert(atom.id.to_string()) {
+                ordered_atoms.push(atom);
+            }
+        }
+        for id in &atom_ids {
+            let atom = load_atom_by_id_or_slug(runtime, &ns, id).await?;
+            if seen_ids.insert(atom.id.to_string()) {
+                ordered_atoms.push(atom);
+            }
+        }
+
+        if ordered_atoms.is_empty() {
+            return Ok(json!({
+                "status": "ok",
+                "data": {
+                    "query": raw_query,
+                    "markdown": "# Knowledge Briefing\n\nNo atoms found.",
+                    "domains": [],
+                    "atoms": [],
+                    "count": 0,
+                },
+            }));
+        }
+
+        let mut items: Vec<ScoredTextItem> = ordered_atoms
+            .iter()
+            .map(|a| ScoredTextItem {
+                id: a.id.to_string(),
+                slug: a.slug.clone(),
+                name: a.name.clone(),
+                text: atom_embed_text(a),
+                score: 1.0,
+            })
+            .collect();
+
+        rerank_text_items(runtime, &raw_query, &mut items).await?;
+
+        let sorted_atoms: Vec<(&Atom, f32)> = items
+            .iter()
+            .filter_map(|item| {
+                ordered_atoms
+                    .iter()
+                    .find(|a| a.id.to_string() == item.id)
+                    .map(|a| (a, item.score))
+            })
+            .collect();
+
+        let markdown = format_compose_markdown(&raw_query, &resolved_domains, &sorted_atoms);
+
+        let atom_json: Vec<Value> = items
+            .iter()
+            .map(|item| {
+                json!({
+                    "id": item.id,
+                    "slug": item.slug,
+                    "name": item.name,
+                    "score": item.score,
+                })
+            })
+            .collect();
+
+        let domain_json: Vec<Value> = resolved_domains
+            .iter()
+            .map(|d| json!({ "id": d.id.to_string(), "slug": d.slug, "name": d.name }))
+            .collect();
+
+        let count = atom_json.len();
+
+        Ok(json!({
+            "status": "ok",
+            "data": {
+                "query": raw_query,
+                "markdown": markdown,
+                "domains": domain_json,
+                "atoms": atom_json,
+                "count": count,
+            },
+        }))
+    }
 }
 
 // ─── TF-IDF weight container ─────────────────────────────────────────────────
@@ -1160,6 +1353,21 @@ struct Weights {
     expand_discount: f32,
     coverage_alpha: f32,
     w_bigram: f32,
+}
+
+impl Default for Weights {
+    fn default() -> Self {
+        Self {
+            w_exact_name: D_W_EXACT_NAME,
+            w_name: D_W_NAME,
+            w_description: D_W_DESCRIPTION,
+            w_tags: D_W_TAGS,
+            w_content: D_W_CONTENT,
+            expand_discount: D_EXPAND_DISCOUNT,
+            coverage_alpha: D_COVERAGE_ALPHA,
+            w_bigram: D_W_BIGRAM,
+        }
+    }
 }
 
 impl Weights {
@@ -1658,6 +1866,13 @@ fn expand_terms(terms: &mut Vec<String>) -> HashSet<String> {
         .collect()
 }
 
+// ─── FTS5 phrase quoting ─────────────────────────────────────────────────────
+
+fn quote_fts5_phrase(raw_query: &str) -> String {
+    let escaped = raw_query.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
 // ─── FTS5 candidate pool fetch ────────────────────────────────────────────────
 
 async fn fetch_fts_candidates(
@@ -1676,11 +1891,12 @@ async fn fetch_fts_candidates(
         .map_err(|e| sql_err("search fts reader", e))?;
 
     // Use the FTS5 virtual table to get candidate atom IDs quickly.
+    let match_expr = quote_fts5_phrase(raw_query);
     let fts_rows = reader
         .query_all(SqlStatement {
             sql: "SELECT id FROM fts_knowledge WHERE fts_knowledge MATCH ?1 AND namespace = ?2 LIMIT ?3".into(),
             params: vec![
-                SqlValue::Text(raw_query.replace('\'', "''")),
+                SqlValue::Text(match_expr),
                 SqlValue::Text(ns.to_owned()),
                 SqlValue::Integer(fetch_limit as i64),
             ],
@@ -1958,50 +2174,62 @@ async fn search_decomposed(
 
 // ─── embedding rerank ────────────────────────────────────────────────────────
 
+// Shared embed+cosine core: embeds [query] + candidate texts and returns one
+// cosine score per candidate, or None if the embedder is absent or fails.
+async fn embed_cosine_scores(
+    runtime: &KhiveRuntime,
+    query: &str,
+    candidate_texts: &[String],
+) -> Option<Vec<f32>> {
+    if runtime.default_embedder_name().is_empty() || candidate_texts.is_empty() {
+        return None;
+    }
+    let mut texts = Vec::with_capacity(candidate_texts.len() + 1);
+    texts.push(query.to_string());
+    texts.extend_from_slice(candidate_texts);
+    let embeddings = runtime.embed_batch(&texts).await.ok()?;
+    if embeddings.len() != texts.len() {
+        return None;
+    }
+    let query_emb = &embeddings[0];
+    Some(
+        embeddings[1..]
+            .iter()
+            .map(|emb| cosine_similarity(query_emb, emb))
+            .collect(),
+    )
+}
+
 async fn rerank_with_embeddings(
     runtime: &KhiveRuntime,
     query: &str,
     hits: &mut [ScoredHit],
     alpha: f32,
 ) -> Result<(), RuntimeError> {
-    if runtime.default_embedder_name().is_empty() || hits.is_empty() {
+    if hits.is_empty() {
         return Ok(());
     }
-
-    let mut texts: Vec<String> = Vec::with_capacity(hits.len() + 1);
-    texts.push(query.to_string());
-    for h in hits.iter() {
-        let desc = h.description.as_deref().unwrap_or("");
-        texts.push(format!("{} {}", h.name, desc));
-    }
-
-    let embeddings = match runtime.embed_batch(&texts).await {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
-    if embeddings.len() != texts.len() {
-        return Ok(());
-    }
-
-    let query_emb = &embeddings[0];
-    let max_tfidf = hits
+    let texts: Vec<String> = hits
         .iter()
-        .map(|h| h.score)
-        .fold(0.0f32, f32::max)
-        .max(1e-6);
-
-    for (i, hit) in hits.iter_mut().enumerate() {
-        let cos = cosine_similarity(query_emb, &embeddings[i + 1]);
-        let norm_tfidf = hit.score / max_tfidf;
-        hit.score = alpha * norm_tfidf + (1.0 - alpha) * cos.max(0.0);
+        .map(|h| format!("{} {}", h.name, h.description.as_deref().unwrap_or("")))
+        .collect();
+    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await {
+        let max_tfidf = hits
+            .iter()
+            .map(|h| h.score)
+            .fold(0.0f32, f32::max)
+            .max(1e-6);
+        for (hit, cos) in hits.iter_mut().zip(cosines.iter()) {
+            let norm_tfidf = hit.score / max_tfidf;
+            hit.score = alpha * norm_tfidf + (1.0 - alpha) * cos.max(0.0);
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.slug.cmp(&b.slug))
+        });
     }
-
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.slug.cmp(&b.slug))
-    });
     Ok(())
 }
 
@@ -2023,6 +2251,208 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / denom
     }
+}
+
+// ─── embedding coverage ───────────────────────────────────────────────────────
+
+async fn compute_embedding_coverage(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    ns: &str,
+    total_atoms: i64,
+) -> Result<f64, RuntimeError> {
+    if total_atoms <= 0 || runtime.default_embedder_name().is_empty() {
+        return Ok(0.0);
+    }
+
+    match runtime.vectors(token) {
+        Ok(_) => {}
+        Err(RuntimeError::Unconfigured(_)) => return Ok(0.0),
+        Err(e) => return Err(e),
+    }
+
+    let model = runtime.default_embedder_name().to_owned();
+    let table_name = format!("vec_{}", vamana::sanitize_model_key(&model));
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("stats embedding coverage reader", e))?;
+
+    let count = reader
+        .query_scalar(SqlStatement {
+            sql: format!(
+                "SELECT COUNT(DISTINCT a.id) \
+                 FROM knowledge_atoms a \
+                 WHERE a.namespace = ?1 \
+                   AND a.deleted_at IS NULL \
+                   AND a.tags NOT LIKE '%type:domain%' \
+                   AND a.id IN ( \
+                       SELECT v.subject_id FROM {table_name} v \
+                       WHERE v.namespace = ?1 \
+                         AND v.embedding_model = ?2 \
+                         AND v.field = 'knowledge.atom' \
+                   )"
+            ),
+            params: vec![SqlValue::Text(ns.to_owned()), SqlValue::Text(model.clone())],
+            label: Some("knowledge_stats_embedding_coverage".into()),
+        })
+        .await
+        .map_err(|e| sql_err("stats embedding coverage", e))?;
+
+    let atoms_with_vector = match count {
+        Some(SqlValue::Integer(n)) => n,
+        Some(other) => {
+            return Err(RuntimeError::Internal(format!(
+                "stats embedding coverage returned non-integer count: {other:?}"
+            )));
+        }
+        None => 0,
+    };
+
+    Ok(atoms_with_vector as f64 / total_atoms as f64)
+}
+
+// ─── compose helpers ──────────────────────────────────────────────────────────
+
+struct ScoredTextItem {
+    id: String,
+    slug: String,
+    name: String,
+    text: String,
+    score: f32,
+}
+
+async fn load_domain_by_id_or_slug(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    id_or_slug: &str,
+) -> Result<Domain, RuntimeError> {
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("compose domain reader", e))?;
+    let id = id_or_slug.trim().to_string();
+    let row = if id.parse::<Uuid>().is_ok() {
+        reader
+            .query_row(SqlStatement {
+                sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("compose domain by id", e))?
+    } else {
+        reader
+            .query_row(SqlStatement {
+                sql: "SELECT * FROM knowledge_domains WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("compose domain by slug", e))?
+    };
+    row.and_then(|r| domain_from_row(&r))
+        .ok_or_else(|| RuntimeError::NotFound(format!("domain not found: {id:?}")))
+}
+
+async fn load_atom_by_id_or_slug(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    id_or_slug: &str,
+) -> Result<Atom, RuntimeError> {
+    let sql = runtime.sql();
+    let mut reader = sql
+        .reader()
+        .await
+        .map_err(|e| sql_err("compose atom reader", e))?;
+    let id = id_or_slug.trim().to_string();
+    let row = if id.parse::<Uuid>().is_ok() {
+        reader
+            .query_row(SqlStatement {
+                sql: "SELECT * FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("compose atom by id", e))?
+    } else {
+        reader
+            .query_row(SqlStatement {
+                sql: "SELECT * FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("compose atom by slug", e))?
+    };
+    row.and_then(|r| atom_from_row(&r))
+        .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {id:?}")))
+}
+
+fn parse_domain_members(domain: &Domain) -> Result<Vec<String>, RuntimeError> {
+    if domain.members.is_empty() || domain.members == "[]" {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str::<Vec<String>>(&domain.members).map_err(|e| {
+        RuntimeError::Internal(format!(
+            "domain {:?} has invalid members JSON: {e}",
+            domain.slug
+        ))
+    })
+}
+
+async fn rerank_text_items(
+    runtime: &KhiveRuntime,
+    query: &str,
+    items: &mut [ScoredTextItem],
+) -> Result<(), RuntimeError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let texts: Vec<String> = items.iter().map(|item| item.text.clone()).collect();
+    if let Some(cosines) = embed_cosine_scores(runtime, query, &texts).await {
+        for (item, cos) in items.iter_mut().zip(cosines.iter()) {
+            item.score = cos.max(0.0);
+        }
+        items.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.slug.cmp(&b.slug))
+        });
+    }
+    Ok(())
+}
+
+fn format_compose_markdown(query: &str, domains: &[Domain], atoms: &[(&Atom, f32)]) -> String {
+    let mut out = String::from("# Knowledge Briefing\n\n");
+    out.push_str(&format!("Query: {query}\n"));
+    for (atom, score) in atoms {
+        out.push_str(&format!("\n## {}\n\n", atom.name));
+        out.push_str(&format!("Source: {}\n", atom.slug));
+        out.push_str(&format!("Score: {:.4}\n", score));
+        if let Some(ref desc) = atom.description {
+            if !desc.is_empty() {
+                out.push('\n');
+                out.push_str(desc);
+                out.push('\n');
+            }
+        }
+        if !atom.content.is_empty() {
+            out.push('\n');
+            out.push_str(&atom.content);
+            out.push('\n');
+        }
+    }
+    if !domains.is_empty() {
+        out.push_str("\n---\n\nDomains: ");
+        let names: Vec<&str> = domains.iter().map(|d| d.name.as_str()).collect();
+        out.push_str(&names.join(", "));
+        out.push('\n');
+    }
+    out
 }
 
 // ─── embed text helper ────────────────────────────────────────────────────────
