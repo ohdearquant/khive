@@ -1,8 +1,26 @@
 # ADR-048: Knowledge Section Profiles
 
-**Status**: proposed
+**Status**: accepted
 **Date**: 2026-05-27
 **Authors**: Ocean, lambda:khive
+
+## Current Implementation Status
+
+This ADR is accepted as the governing record for shipped knowledge sections and section
+profile primitives, while explicitly deferring broader resource dual-write, profile-weighted
+compose/suggest, hooks, lint, export, and observability phases.
+
+| Area                                                          | Status   | Shipped behavior                                                                                                                                                                                                        |
+| ------------------------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| V21 `knowledge_sections`                                      | shipped  | Dedicated section rows with 10-value `SectionType`, `UNIQUE(atom_id, section_type)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers.                                                          |
+| V22 lifecycle/source fields                                   | shipped  | Status/source columns on atoms, status columns on sections/domains, status indexes, and finalized atom backfill to `reviewed`.                                                                                          |
+| `knowledge.edit`                                              | shipped  | Upserts named sections only, keeps sibling sections untouched, preserves stable section ids, clears `embedding=NULL`, and downgrades edited verified sections to `reviewed`.                                            |
+| `knowledge.import`                                            | shipped  | Supports `atlas_md` files/directories with `chunk_strategy=section                                                                                                                                                      |
+| `knowledge.challenge` / `knowledge.adjudicate`                | shipped  | Challenge moves eligible sections to `disputed` and increments atom `dispute_count`; adjudicate requires disputed sections and resolves accept -> `verified`, reject -> `reviewed`.                                     |
+| Brain section posterior primitives                            | shipped  | Brain state, fold, feedback parsing, and `brain.create_profile(seed_priors.section_posteriors)` exist for section posteriors.                                                                                           |
+| `knowledge.suggest` / `knowledge.compose` profile weighting   | deferred | `suggest` is domain-oriented search with optional Vamana signal; `compose` uses explicit `domain_ids`/`atom_ids` and formats atom-body markdown. Neither resolves `brain` profiles or emits section-weighted manifests. |
+| Resource entity dual-write                                    | deferred | `knowledge.upsert_atoms` and `knowledge.upsert_domains` write corpus tables; domain mirror is into `knowledge_atoms` for FTS, not graph `entities`.                                                                     |
+| `knowledge.lint`, `knowledge.lint_config`, `knowledge.export` | deferred | These verbs are not registered in the shipped knowledge pack.                                                                                                                                                           |
 
 ## Context
 
@@ -16,7 +34,7 @@ and core model. Today, `knowledge.compose` returns the same content regardless o
 There is no mechanism for the system to learn which sections are valuable to which consumers
 over time.
 
-The brain pack ([ADR-032](ADR-032-brain-pack.md)) provides Beta-Binomial posterior tracking
+The brain pack ([ADR-032](ADR-032-brain-profile-orchestration.md)) provides Beta-Binomial posterior tracking
 and profile resolution via `(actor, namespace, consumer_kind) → profile_id` bindings. This
 machinery is exactly what section-weight learning needs — but it currently only supports
 per-entity posteriors for the `recall` consumer kind.
@@ -42,40 +60,46 @@ edges to other concepts, papers, projects). A resource models "how to USE it" (s
 content, embeddings, composition weights). They link via `annotates`: resource annotates
 concept.
 
-Resources participate in the full graph — they can have edges, be traversed, appear in
-search results alongside concepts and documents. The knowledge pack creates resources
-(entity_type=atom, entity_type=domain) and manages their content in the `knowledge_atoms` /
-`knowledge_sections` tables. The entity row in `entities` gives them graph position; the
-content tables give them deep searchable content.
+Resource is accepted as the governance term for actionable content agents consume, and
+the KG pack validator currently includes `Resource` as a pack-side 9th kind. Shipped
+knowledge storage, however, is still corpus-table canonical: `knowledge_atoms`,
+`knowledge_domains`, and `knowledge_sections` hold knowledge resources. The planned
+graph `entities` dual-write for atom/domain resources is deferred; current domain mirroring
+is domain-to-`knowledge_atoms` for FTS, not graph entity creation.
 
 ### Sections as a dedicated table
 
 Sections are sub-records of resource/atom entities, stored in `knowledge_sections`:
 
 ```sql
-CREATE TABLE knowledge_sections (
-    id          TEXT PRIMARY KEY,
-    atom_id     TEXT NOT NULL,
-    namespace   TEXT NOT NULL,
-    section_type TEXT NOT NULL,  -- closed enum: 10 values
-    heading     TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    tokens      INTEGER NOT NULL DEFAULT 0,
-    sort_order  INTEGER NOT NULL DEFAULT 0,
-    created_at  INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL,
-    FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id)
+CREATE TABLE IF NOT EXISTS knowledge_sections (
+    id           TEXT PRIMARY KEY,
+    atom_id      TEXT NOT NULL,
+    namespace    TEXT NOT NULL,
+    section_type TEXT NOT NULL,
+    heading      TEXT NOT NULL DEFAULT '',
+    content      TEXT NOT NULL DEFAULT '',
+    tokens       INTEGER NOT NULL DEFAULT 0,
+    sort_order   INTEGER NOT NULL DEFAULT 0,
+    embedding    BLOB,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    FOREIGN KEY (atom_id) REFERENCES knowledge_atoms(id),
+    UNIQUE(atom_id, section_type)
 );
 ```
+
+V21 also creates indexes on `atom_id`, `(namespace, section_type)`, and `(namespace, atom_id)`,
+plus an external-content FTS5 table `fts_sections` with insert/delete/update triggers.
 
 Section_type is a closed enum matching the atlas schema v1: `overview`, `core_model`,
 `boundary_conditions`, `formalism`, `operational_guidance`, `examples`, `failure_modes`,
 `expert_lens`, `references`, `other`.
 
 **Editing a section does not touch other sections.** `knowledge.edit(slug, sections=[...])`
-updates only the named section rows. Each section has its own embedding vector (re-embedded
-on edit, not the whole atom). The atom's own embedding (from description + keywords) is
-separate and only updates when the atom-level metadata changes.
+updates only the named section rows. Each section has a nullable `embedding` column. Shipped `knowledge.edit` clears
+`embedding=NULL` on section updates; `knowledge.index` currently indexes atoms, not
+sections. Section embedding backfill remains deferred.
 
 **Sections link to atoms structurally (FK), not via graph edges.** The section→atom
 relationship is always 1:N containment — there's no semantic edge type needed. All
@@ -104,7 +128,10 @@ This produces consistent 150-250 token embedding inputs regardless of atom conte
 
 ### Audit trail: notes on graph edits
 
-Every `knowledge.edit` call creates an `observation` note annotating the atom:
+Observation-note audit for every `knowledge.edit` call is deferred. Shipped `knowledge.edit`
+returns section update results and does not create graph notes.
+
+The original spec described:
 
 ```
 create(kind="note", note_kind="observation",
@@ -171,29 +198,34 @@ Key algorithms (source: `ruvector-gnn`, `ruvector-diskann`, `ruvector-rabitq`,
 - **AdaptiveHotset**: LRU cache with decaying access counts (0.95 decay factor),
   maps to hot/warm/cold tier promotion.
 
-### Namespace injection: session-to-actor mapping
+### Namespace injection: session-to-actor mapping (deferred)
 
-The MCP server already supports `--actor` / `KHIVE_ACTOR` / config file `[actor] id` for
-namespace resolution. The missing piece is **per-session injection** — the same MCP
-server process serves all Claude Code sessions, but each session has a different lambda
-identity.
+> **Deferred**: The shipped MCP `request` tool does not carry per-request caller identity
+> in its dispatch path. The two approaches below are design notes for a future
+> implementation phase, not shipped behavior. They are preserved here because ADR-048 is
+> otherwise accepted; this section is consistent with the "deferred" entries in the
+> Current Implementation Status table above.
 
-The current MCP protocol does not carry per-request caller identity. Two approaches:
+The MCP server supports `--actor` / `KHIVE_ACTOR` / config file `[actor] id` for
+static namespace resolution. Per-session dynamic injection — needed for profile-weighted
+`knowledge.compose` — is not yet wired.
 
-**Approach A: Hook-injected env (current best option)**
+The current MCP protocol does not carry per-request caller identity. Two candidate approaches:
 
-The `UserPromptSubmit` hook detects the lambda from cwd and writes an actor file:
+**Approach A: Hook-injected env**
+
+A `UserPromptSubmit` hook could detect the lambda from cwd and write an actor file:
 
 ```bash
 # Hook detects: cwd=/Users/lion/projects/khive/khive → lambda:khive
 echo "lambda:khive" > /tmp/claude_hooks/actor_context
 ```
 
-The MCP server reads this file on each `request` dispatch and uses it as the actor
+The MCP server would read this file on each `request` dispatch and use it as the actor
 for brain.resolve and namespace scoping. This is imprecise (races between concurrent
-sessions) but works for single-user local dev.
+sessions) but viable for single-user local dev. Not currently wired.
 
-**Approach B: MCP request-level context (future)**
+**Approach B: MCP request-level context**
 
 A future MCP protocol extension could carry caller context in the request envelope:
 
@@ -208,16 +240,13 @@ The server would use `_context.actor` for brain resolution and `_context.session
 feedback correlation. This eliminates the race condition in Approach A but requires MCP
 protocol changes.
 
-For v1, Approach A is sufficient. The hook-based actor injection works for the primary
-use case (single developer, one active session per project).
+### The hook opportunity (deferred)
 
-### The hook opportunity
-
-Claude Code sessions have a session ID and are invoked from a known working directory with
-a known lambda identity. A `UserPromptSubmit` hook already runs at the start of each turn.
-If the hook injects the resolved profile into the MCP namespace context, every
+If actor injection were wired (Approach A or B above), a `UserPromptSubmit` hook could
+inject the resolved profile into the MCP namespace context so that every
 `knowledge.compose` call in that session automatically uses the right profile — no agent
-cooperation required.
+cooperation required. This is not current shipped behavior; it is the target design once
+the namespace injection mechanism is implemented.
 
 For feedback, a `PostToolUse` hook on `knowledge.compose` / `knowledge.suggest` responses
 can buffer section-level usage data. At session end (`/summarize`), the hook correlates
@@ -496,7 +525,12 @@ a new exploration epoch.
 
 #### Stage 4: Apply (compose uses the learned weights)
 
-`knowledge.compose` gains an implicit profile resolution step:
+Profile-weighted `knowledge.compose` is deferred. Shipped `knowledge.compose` requires
+explicit `domain_ids` and/or `atom_ids`, reranks atom text, and returns atom-body markdown.
+The shipped function does not call `brain.resolve` and does not assemble section-weighted
+manifests.
+
+The original spec described a profile-weighted compose step:
 
 1. Read actor from `/tmp/claude_hooks/actor_context` (set by Hook A)
 2. `brain.resolve(actor=<actor>, consumer_kind="knowledge_compose")` → profile
@@ -596,7 +630,7 @@ Discount factor 0.3 means: 30% of child evidence flows to parent. This lets the
 global implementer profile benefit from khive-specific implementer experience
 without being dominated by it. Deferred to v2.
 
-### 6. Hook-injected profile context (detailed architecture)
+### 6. Hook-injected profile context (deferred)
 
 The hooks form a three-stage pipeline:
 
@@ -716,7 +750,7 @@ immediate neighbors (via `neighbors`) provide context — related concepts, impl
 projects, citing documents. This is the "graph retrieval" layer that pure vector search
 misses.
 
-### 9. KG Lint — configurable graph hygiene rules
+### 9. KG Lint — configurable graph hygiene rules (deferred)
 
 The graph needs a linting system analogous to `clippy` for Rust or `eslint` for
 JavaScript. Static rules catch structural problems; configurable rules encode
@@ -950,22 +984,25 @@ Implement section posterior initialization from caller-provided priors.
 
 ### Phase 2: Resource entity kind + sections table
 
-- ADR-001 amendment: add 9th entity kind `resource`
-- `knowledge.upsert_atoms` creates dual entity (resource/atom in `entities` +
-  content row in `knowledge_atoms`)
-- V21 migration: `knowledge_sections` table with section_type enum, per-section
-  embeddings, FK to atom
-- `knowledge.edit` verb for section-level updates without wiping other sections
-- `knowledge.import` verb for atlas markdown file ingestion with section parsing
+- ADR-001/resource governance: accepted as pack-side KG validator behavior; shared
+  `khive_types::EntityKind` still has 8 base kinds, so graph-wide taxonomy harmonization
+  is a follow-up.
+- `knowledge.upsert_atoms` / `knowledge.upsert_domains`: corpus tables only; graph
+  entity dual-write is deferred.
+- V21 migration: `knowledge_sections` table with section type enum, nullable section
+  embeddings, FK to atom, `UNIQUE(atom_id, section_type)`, indexes, and FTS5 triggers.
+- `knowledge.edit`: shipped section-level upsert without wiping siblings; verified edits
+  downgrade to `reviewed`.
+- `knowledge.import`: shipped atlas markdown ingestion with section parsing.
 
 ### Phase 3: Compose + suggest verbs with profile resolution
 
-- `knowledge.suggest` — domain discovery with profile-weighted scoring
-- `knowledge.compose` — two-stage: suggest → assemble sections with weights from
-  brain profile posteriors. Budget-constrained by token budget.
-  Returns section-typed markdown with per-section scores.
-- Brain profile resolution via `brain.resolve(actor, consumer_kind="knowledge_compose")`
-- Thompson sampling when `exploration_epoch > 0`, posterior means otherwise
+- `knowledge.suggest`: shipped as domain discovery with plain search, optional Vamana
+  ANN signal when warm, and embedding rerank; profile-weighted scoring is deferred.
+- `knowledge.compose`: shipped as explicit domain/atom markdown composition over atom
+  bodies; section-weighted output and implicit brain profile resolution are deferred.
+- Brain section posterior primitives ship, but knowledge compose/suggest do not consume
+  them yet.
 
 ### Phase 4: Hook wiring + implicit feedback
 
@@ -1082,30 +1119,11 @@ order produces different posteriors. This breaks event-sourced snapshot recovery
 
 **V20 migration DDL (updated)**:
 
-```sql
-CREATE TABLE brain_profile_snapshots (
-    id           TEXT PRIMARY KEY,
-    profile_id   TEXT NOT NULL,
-    namespace    TEXT NOT NULL,
-    -- Posteriors stored as (mean, total_mass) pairs, not (alpha, beta)
-    state_json   TEXT NOT NULL,  -- {"section_posteriors": {"overview": {"m": 0.6, "s": 45.0}, ...}}
-    last_event_seq INTEGER NOT NULL DEFAULT 0,
-    exploration_epoch INTEGER NOT NULL DEFAULT 50,
-    created_at   INTEGER NOT NULL,
-    FOREIGN KEY (profile_id) REFERENCES brain_profiles(id)
-);
-
-CREATE TABLE brain_event_log (
-    id           TEXT PRIMARY KEY,
-    profile_id   TEXT NOT NULL,
-    namespace    TEXT NOT NULL,
-    event_seq    INTEGER NOT NULL,
-    event_kind   TEXT NOT NULL,    -- 'feedback', 'reset', 'merge', 'decay'
-    payload_json TEXT NOT NULL,
-    created_at   INTEGER NOT NULL,
-    FOREIGN KEY (profile_id) REFERENCES brain_profiles(id),
-    UNIQUE(profile_id, event_seq)
-);
+```markdown
+V20 brain persistence DDL in this ADR is superseded by ADR-032 and ADR-015 V20. The
+authoritative shipped tables are `brain_profile_snapshots(profile_id, namespace,
+snapshot_json, updated_at)` and `brain_event_log(id, profile_id, namespace, event_kind,
+payload, created_at)`, plus `idx_brain_events_profile`.
 ```
 
 ### Correction 3: Filtered ANN — StitchedVamana, not ACORN

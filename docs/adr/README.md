@@ -80,10 +80,12 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-045](ADR-045-verb-response-presentation.md)         | Verb Response Presentation Modes                                                              |
 | [ADR-046](ADR-046-event-sourced-proposals.md)            | Event-Sourced Agent KG Proposals                                                              |
 | [ADR-047](ADR-047-knowledge-pack.md)                     | Knowledge Pack — Concept Registration, Citation, and Topic Search                             |
+| [ADR-048](ADR-048-knowledge-section-profiles.md)         | Knowledge Section Profiles                                                                    |
+| [ADR-049](ADR-049-khived-daemon.md)                      | khived Daemon — Persistent Warm Runtime over a Unix Socket                                    |
 
 ## Closed Taxonomies — Quick Reference
 
-- **Entity kinds (8)**: `concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service` (ADR-001)
+- **Entity kinds**: 8 shared base kinds in `khive_types` (`concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service`) plus KG pack-side `resource` governance for actionable knowledge resources (ADR-001, ADR-048)
 - **Edge relations (15 in 8 categories)** (ADR-002):
   - Structure: `contains`, `part_of`, `instance_of`
   - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`

@@ -6,7 +6,7 @@
 **Depends on**:
 
 - ADR-014 (Curation Operations — apply step rides on existing curation primitives)
-- ADR-017 (Pack Standard — `PackEventConsumer` consumes proposal events)
+- ADR-017 (Pack Standard — KG pack handler surface; async event-consumer worker registration is deferred)
 - ADR-018 (Authorization Gate — gates the apply step)
 - ADR-022 (Events Query Surface — proposals live as events)
 - ADR-032 (Brain Profile Orchestration — brain folds over proposal events)
@@ -32,7 +32,7 @@ proposals" as a query that doesn't require scanning every event.
 
 - Four new `EventKind` variants for the proposal lifecycle
 - Three new agent-facing verbs: `propose`, `review`, and `withdraw`
-- A `propose-apply` worker that listens for approved proposals and executes them
+- Handler-invoked proposal worker structs: `ProposalsProjectionWorker` maintains `proposals_open`, and `ProposalApplyWorker` is called from `review(decision=Approve)` after the review transition to execute the changeset and emit `ProposalApplied`.
 - A fold-derived "open proposals" projection table for query-time filtering
 - The Authorization Gate (ADR-018) wiring on the apply step
 
@@ -175,9 +175,10 @@ on an ADR-014 guarantee. If a future ADR-014 amendment introduces
 
 Apply is NOT a verb:
 
-- **Apply**: the `propose-apply` worker (see §5) handles application as a
-  side-effect of consuming `ProposalReviewed` events. There is no manual
-  `apply` verb — once approved, the worker fires.
+- **Apply**: v1 has no manual `apply` verb. `review(decision=Approve)` records the
+  `ProposalReviewed` transition, then synchronously invokes
+  `ProposalApplyWorker::maybe_apply(...)` before returning. Apply success or
+  failure is still represented by a separate `ProposalApplied` event.
 
 **Why `withdraw` is a verb (not `update`):** `update` in ADR-014 dispatches only
 on `kind ∈ {entity, edge, note}`. Proposal events are NOT mutable substrate
@@ -265,8 +266,9 @@ CREATE INDEX idx_proposals_open_proposer ON proposals_open(namespace, proposer);
 CREATE INDEX idx_proposals_open_updated  ON proposals_open(namespace, updated_at DESC);
 ```
 
-A `proposals-projection-worker` (a `PackEventConsumer` per ADR-017) folds
-over the four proposal events and maintains this table:
+`ProposalsProjectionWorker` is invoked by KG handlers to maintain this table.
+In v1 this is synchronous handler-invoked code, not a registered `PackEventConsumer`
+background worker:
 
 - `ProposalCreated` → INSERT with status='open'
 - `ProposalReviewed` → UPDATE counts; if `decision = Approve` and approval
@@ -310,41 +312,24 @@ migration that creates `proposals_open`).
 history is a separate query via the extended `EventFilter`. The `get` verb does
 NOT return review history inline.
 
-### 5. `propose-apply` worker
+### 5. Handler-invoked `ProposalApplyWorker` (v1)
 
-A `PackEventConsumer` (ADR-017) registered by the KG pack. The worker
-implements `PackEventConsumer` with the signature from ADR-041 (which updated
-the trait from `&Event` to `&EventView` — see ADR-041 §signature):
+v1 does not register `ProposalApplyWorker` as a `PackEventConsumer`; that runtime
+infrastructure is not shipped. `handle_review` emits/commits the review transition
+first, then calls `ProposalApplyWorker::maybe_apply(token, proposal_id, registry).await`
+for approvals. This preserves the event contract while making apply latency part of
+`review(approve)` in v1.
 
-```rust
-#[async_trait]
-impl PackEventConsumer for ProposalApplyWorker {
-    fn event_filter(&self) -> EventFilter {
-        EventFilter { kinds: vec![EventKind::ProposalReviewed], ..Default::default() }
-    }
+Call flow:
 
-    async fn on_event(
-        &self,
-        view: &EventView,
-        ctx: &RuntimeEventContext,
-    ) -> RuntimeResult<()> {
-        // 1. Parse ProposalReviewed payload from view.event.payload
-        // 2. Check proposals_open projection for approve_count threshold
-        // 3. If threshold met: load ProposalCreated event, apply changeset,
-        //    emit ProposalApplied
-        // 4. Idempotency: check view.event.id against proposals_applied
-        //    projection (proposals_open.status == 'applied')
-    }
-}
-```
+1. `handle_review` resolves the proposal id and validates state.
+2. `reviewed_and_emit` atomically advances `proposals_open` and inserts `ProposalReviewed`.
+3. On `Approve`, `ProposalApplyWorker::maybe_apply` claims `approved` to `applying`, applies the changeset, emits `ProposalApplied`, then marks `applied` or reverts to `approved` on failure.
 
-The filter uses `kinds: vec![EventKind::ProposalReviewed]` (an `EventKind`
-discriminant per ADR-022 / ADR-017), not `verbs: vec!["review"]`. ADR-017
-mandates `&EventView` (not `&Event`) for the `on_event` callback; ADR-041
-confirms the signature change. Any references to `verbs: vec!["review"]` in
-the worker registration are incorrect — filter by kind, not verb string.
+Future async worker wiring, if added, must filter by `EventKind::ProposalReviewed`,
+not by verb string. Current v1 code calls the worker directly from `handle_review`.
 
-On each `ProposalReviewed` event the worker:
+On each approved review handled by `handle_review`, `ProposalApplyWorker::maybe_apply`:
 
 1. Reads the proposal's current state from `proposals_open`.
 2. If `decision = Approve` AND approval threshold reached AND no Reject vote
@@ -549,17 +534,15 @@ commissive verb that emits a NEW `ProposalWithdrawn` event — it does not
 mutate any prior event. The handler enforces proposer-only access (by checking
 `proposals_open.proposer == actor.id`) before emitting.
 
-### Why apply runs as a background worker (not synchronously inside `review`)
+### Why apply is a separate worker step, but invoked synchronously in v1
 
-If `review(decision=Approve)` synchronously applied, the reviewer would be
-held while N changeset steps execute. Worse, if the apply failed midway, the
-reviewer would see the failure as if their _review_ failed. Separating apply
-from review:
-
-- Reviewers see immediate "review accepted" responses
-- Apply failures surface as their own event for operator triage
-- The worker is idempotent — replaying a `ProposalReviewed` event doesn't
-  re-apply if status='applied'
+v1 separates review from apply in the event model, not in the scheduler. The
+review transition is committed first; then the handler invokes the apply worker.
+This keeps review and apply audit events distinct, and apply failures surface as
+`ProposalApplied { Failed }`. Because no `PackEventConsumer` runtime is shipped,
+`review(approve)` currently includes apply latency. A future event-consumer
+implementation can move this invocation out of the handler without changing the
+proposal event contract.
 
 ### Why no auto-apply on N approvals
 
@@ -583,15 +566,15 @@ supersede, compound). Future arms add to the enum via additive semver bumps.
 
 ## Alternatives Considered
 
-| Alternative                                                       | Why rejected                                                                                                  |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| Proposal-as-Note (option a)                                       | Forces changesets into note `body`; loses schema validation; muddies the note-kind taxonomy                   |
-| PendingEdit substrate (option b)                                  | New substrate, new store, new VCS dimension — heavyweight for a workflow object                               |
-| Git-native subset (option d)                                      | Re-imports the git assumption Ocean said he wasn't sure about                                                 |
-| Apply synchronously inside `review`                               | Couples review latency to apply latency; failure-mode handling becomes ambiguous                              |
-| Approve = side-effect of `update(id=<proposal>, status=approved)` | Conflates review (a typed decision) with record mutation; loses the review-history audit trail                |
-| Per-proposer namespace for proposals                              | Cross-cuts the namespace-isolation invariant; agents can't propose changes targeting namespaces they can read |
-| Open changeset format (JSON blob)                                 | Can't validate at proposal time; failure surfaces deep inside apply with poor error messages                  |
+| Alternative                                                            | Why rejected                                                                                                                                                                  |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Proposal-as-Note (option a)                                            | Forces changesets into note `body`; loses schema validation; muddies the note-kind taxonomy                                                                                   |
+| PendingEdit substrate (option b)                                       | New substrate, new store, new VCS dimension — heavyweight for a workflow object                                                                                               |
+| Git-native subset (option d)                                           | Re-imports the git assumption Ocean said he wasn't sure about                                                                                                                 |
+| Inline apply without a separate worker step or `ProposalApplied` event | Rejected: v1 may call `ProposalApplyWorker` synchronously from `review`, but apply remains a separate worker struct and emits `ProposalApplied` for audit/failure separation. |
+| Approve = side-effect of `update(id=<proposal>, status=approved)`      | Conflates review (a typed decision) with record mutation; loses the review-history audit trail                                                                                |
+| Per-proposer namespace for proposals                                   | Cross-cuts the namespace-isolation invariant; agents can't propose changes targeting namespaces they can read                                                                 |
+| Open changeset format (JSON blob)                                      | Can't validate at proposal time; failure surfaces deep inside apply with poor error messages                                                                                  |
 
 ## Consequences
 
@@ -669,20 +652,18 @@ DDL (`PROPOSALS_OPEN_DDL`):
 3. Create expression index: `CREATE INDEX IF NOT EXISTS idx_events_payload_proposal_id ON events(json_extract(payload, '$.proposal_id'))` — backing the `EventFilter.payload_proposal_id` query extension from §4
 4. Backfill is unnecessary — no prior proposals exist
 
-### Worker registration
+### Worker invocation
 
-The KG pack registers two `PackEventConsumer` workers in its `on_register`:
+v1 does not register background `PackEventConsumer` workers in KG pack initialization.
+The KG pack registers `propose`, `review`, and `withdraw` in `KG_HANDLERS`; those
+handlers invoke worker structs directly:
 
-- `proposals-projection-worker` (event_filter: `kinds ∈ {ProposalCreated,
-  ProposalReviewed, ProposalApplied, ProposalWithdrawn}`) — folds all four
-  proposal EventKinds to maintain the `proposals_open` table
-- `propose-apply-worker` (event_filter: `kinds = {ProposalReviewed}`) — fires
-  on each approval event; apply is idempotent on `proposals_open.status`
+- `handle_propose` -> `ProposalsProjectionWorker::on_proposal_created`
+- `handle_review` -> `ProposalsProjectionWorker::reviewed_and_emit`, then
+  `ProposalApplyWorker::maybe_apply` on approve
+- `handle_withdraw` -> `ProposalsProjectionWorker::withdrawn_and_emit`
 
-Both workers filter by `EventKind` discriminant, NOT by verb string. The
-`verbs` field on `EventFilter` is for filtering by the verb that caused the
-event (e.g., "which events were caused by a `search` call"); these workers
-need events of a specific kind regardless of which verb emitted them.
+Future async worker registration may reuse the same `EventKind` filters, but it is deferred.
 
 ### Handler registration
 
@@ -774,7 +755,7 @@ Lookup wire shape:
   superseded by this ADR
 - ADR-014 (Curation Operations) — `merge_entities` and atomic compound updates
   consumed by the apply worker
-- ADR-017 (Pack Standard) — `PackEventConsumer` shape used by both workers
+- ADR-017 (Pack Standard) — handler declaration surface used by the KG pack; proposal `PackEventConsumer` registration remains deferred
 - ADR-018 (Authorization Gate) — gates the apply step
 - ADR-022 (Events Query Surface) — proposal events live as substrate events
 - ADR-016 (Request DSL) — `propose`, `review`, and `withdraw` ride the standard

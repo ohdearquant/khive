@@ -18,18 +18,18 @@ No Neo4j. No SPARQL endpoint to deploy. SQLite on disk, MCP over stdio, `cargo t
 
 ## What you get
 
-| Capability                  | How                                                                                                |
-| --------------------------- | -------------------------------------------------------------------------------------------------- |
-| **Typed entities**          | 6 closed kinds: concept, document, dataset, project, person, org                                   |
-| **Typed edges**             | 13 closed relations in 6 categories (structure, derivation, dependency, impl, lateral, annotation) |
-| **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                |
-| **Hybrid search**           | FTS5 trigram (CJK-safe) + sqlite-vec embeddings + reciprocal rank fusion                           |
-| **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                             |
-| **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                                  |
-| **Salience-weighted notes** | Notes carry salience scores; search ranks by semantic relevance × salience                         |
-| **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                                  |
-| **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges                         |
-| **Namespace isolation**     | Tenant scoping on every operation — share one DB, isolate many agents                              |
+| Capability                  | How                                                                                                                      |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                            |
+| **Typed edges**             | 15 closed relations in 8 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation) |
+| **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                      |
+| **Hybrid retrieval**        | Runtime FTS5 + vector RRF over storage; shipped BM25, HNSW, Vamana, and fusion crates for pack-specific retrieval paths  |
+| **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                                                   |
+| **GQL + SPARQL queries**    | Parse to SQL, run against the same SQLite backend                                                                        |
+| **Salience-weighted notes** | Notes carry salience scores; search ranks by semantic relevance × salience                                               |
+| **Cross-substrate links**   | Notes annotate entities (and vice versa) via the same edge system                                                        |
+| **Soft delete + supersede** | History-preserving: old records stay, newer ones supersede via graph edges                                               |
+| **Namespace isolation**     | Tenant scoping on every operation — share one DB, isolate many agents                                                    |
 
 ---
 
@@ -90,8 +90,9 @@ No language SDK to learn.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Native sqlite-vec for vector search, FTS5 trigram tokenization (CJK-safe), concurrent connection
-pooling, memory-local graph traversal. One binary, one DB file, no services to run.
+Embedded SQLite storage with FTS5 trigram text search and current sqlite-vec VectorStore
+compatibility. Retrieval also ships in-process BM25, HNSW, Vamana, and fusion crates for
+hybrid and pack-specific search paths. One binary, one DB file, no external services to run.
 
 HTTP gateway, CLI, and visual frontend are planned for future releases.
 
@@ -99,18 +100,23 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ## Crates
 
-| Crate            | Purpose                                                                                |
-| ---------------- | -------------------------------------------------------------------------------------- |
-| `khive-types`    | Domain types, Pack trait, closed enums                                                 |
-| `khive-score`    | Deterministic i64 fixed-point scoring                                                  |
-| `khive-storage`  | Trait-only capability surface (zero implementations)                                   |
-| `khive-db`       | SQLite backend: sqlite-vec, FTS5, graph edges                                          |
-| `khive-query`    | SPARQL / GQL → SQL compiler                                                            |
-| `khive-runtime`  | Service API + VerbRegistry + PackRuntime trait                                         |
-| `khive-request`  | Request DSL parser (function-call, JSON; pipe / LNDL planned). Transport-agnostic AST. |
-| `khive-pack-kg`  | KG pack: vocabulary, verb handlers, kind validation                                    |
-| `khive-pack-gtd` | GTD pack: task lifecycle over the notes substrate (loaded via `KHIVE_PACKS`)           |
-| `khive-mcp`      | Stdio MCP binary — single `request` tool dispatching through the VerbRegistry          |
+| Crate             | Purpose                                                                                                |
+| ----------------- | ------------------------------------------------------------------------------------------------------ |
+| `khive-types`     | Domain types, Pack trait, closed enums                                                                 |
+| `khive-score`     | Deterministic i64 fixed-point scoring                                                                  |
+| `khive-storage`   | Trait-only capability surface (zero implementations)                                                   |
+| `khive-db`        | SQLite backend: entity/note/edge tables, FTS5 TextSearch, current sqlite-vec VectorStore compatibility |
+| `khive-retrieval` | Hybrid retrieval primitives                                                                            |
+| `khive-fusion`    | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                  |
+| `khive-bm25`      | BM25 keyword index                                                                                     |
+| `khive-hnsw`      | HNSW vector index                                                                                      |
+| `khive-vamana`    | Vamana ANN index used by knowledge search                                                              |
+| `khive-query`     | SPARQL / GQL → SQL compiler                                                                            |
+| `khive-runtime`   | Service API + VerbRegistry + PackRuntime trait                                                         |
+| `khive-request`   | Request DSL parser (function-call, JSON; pipe / LNDL planned). Transport-agnostic AST.                 |
+| `khive-pack-kg`   | KG pack: vocabulary, verb handlers, kind validation                                                    |
+| `khive-pack-gtd`  | GTD pack: task lifecycle over the notes substrate (loaded via `KHIVE_PACKS`)                           |
+| `khive-mcp`       | Stdio MCP binary — single `request` tool dispatching through the VerbRegistry                          |
 
 Dependency direction (storage stack): `types → score → storage → db → query → runtime → pack-kg / pack-gtd → mcp`.
 Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;

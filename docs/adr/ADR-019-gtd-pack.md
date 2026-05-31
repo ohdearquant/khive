@@ -292,8 +292,10 @@ impl PackRuntime for GtdPack {
                     from_state TEXT NOT NULL,
                     to_state   TEXT NOT NULL,
                     note       TEXT,
-                    at         INTEGER NOT NULL
+                    at         INTEGER NOT NULL,
+                    namespace  TEXT
                 )",
+                "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT",
                 "CREATE INDEX IF NOT EXISTS idx_gtd_audit_note
                     ON gtd_lifecycle_audit(note_id, at DESC)",
             ],
@@ -304,8 +306,11 @@ impl PackRuntime for GtdPack {
 ```
 
 `gtd_lifecycle_audit` is a pack-auxiliary table. It records each `transition`
-invocation for replay and compliance. Per ADR-015, pack-auxiliary tables use idempotent
-`CREATE TABLE IF NOT EXISTS` and are non-evolving in v1.
+and `complete` invocation for replay and compliance, including the caller namespace.
+The `namespace` column is nullable because it was added after the table shipped:
+legacy rows may be `NULL`, while new rows always bind the authorized namespace.
+Per ADR-015, pack schema uses idempotent declarations by default; GTD's nullable
+namespace `ALTER TABLE` is the documented v1 pack-local evolution exception.
 
 `StorageProfile.roles: [Hot]` because task work is interactive — tasks are read and
 updated constantly. `default_backend: "main"` keeps tasks on the same backend as kg
@@ -443,7 +448,9 @@ is one of the most-called verbs in practice and deserves its own name.
 
 Lifecycle transitions are operationally significant. Compliance, retrospectives, and
 debugging benefit from a queryable record of "task X went from state A to state B at
-time T with note N." The audit table records each `transition` invocation.
+time T with note N in namespace NS." The audit table records each `transition` and
+`complete` invocation. Legacy rows created before the namespace backfill may have
+`NULL` namespace.
 
 This is GTD-specific data; it doesn't belong in the core `events` table (which is
 governed by ADR-004 and used for system-level events). Pack-auxiliary tables (per
@@ -539,7 +546,8 @@ minimal. Operators who want GTD configure it explicitly.
 - ADR-014: Curation Operations — shared CRUD verbs (`create`, `update`, `delete`)
   handle task notes through `TaskHook`.
 - ADR-015: Schema Migrations — pack-auxiliary tables use idempotent
-  `CREATE TABLE IF NOT EXISTS`.
+  `CREATE TABLE IF NOT EXISTS` by default; GTD's nullable audit namespace
+  backfill is the documented pack-local `ALTER TABLE` exception.
 - ADR-016: Request DSL — verb dispatch surface that routes to GTD's verbs.
 - ADR-017: Pack Standard — `Pack`, `PackRuntime`, `KindHook`, `VerbRegistry`,
   `EDGE_RULES` — the mechanism GTD demonstrates.

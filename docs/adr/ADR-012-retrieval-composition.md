@@ -342,9 +342,10 @@ contain backend-selection logic. This keeps each method single-backend by constr
 
 ### Scope (v1)
 
-v1 ships a thin, opinionated retrieval surface. Default to platform primitives
-(sqlite-vec, FTS5) for the index layer. Keep composition math in pure Rust inside
-`khive-runtime`. Defer everything else to future versions, gated on real demand.
+Current composition is layered: `khive-runtime` still provides FTS5 + vector RRF paths
+over storage; `khive-retrieval` and `khive-fusion` ship reusable hybrid/fusion primitives;
+`khive-bm25`, `khive-hnsw`, and `khive-vamana` ship lexical/ANN engines used by pack-specific
+retrieval paths.
 
 **What v1 ships:**
 

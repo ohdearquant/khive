@@ -49,6 +49,9 @@ The canonical ledger of database schema migration versions. Migration versions a
 |     V17 | v023/ADR-043 | vector_embedding_model_tag_preserving_rebuild     | shipped |
 |     V18 | v025/ADR-046 | proposals_open_add_applying_status                | shipped |
 |     V19 | v025/ADR-047 | knowledge_atoms_and_domains                       | shipped |
+|     V20 | ADR-032      | brain_profile_persistence                         | shipped |
+|     V21 | ADR-048      | knowledge_sections                                | shipped |
+|     V22 | ADR-048      | knowledge_lifecycle_status                        | shipped |
 
 > **Amendment (2026-05-24, cluster-24 + post-integration)**: The ledger above reflects what
 > actually shipped on `integration/v1-adr-alignment` after parallel cluster landings c01, c03,
@@ -85,7 +88,20 @@ The canonical ledger of database schema migration versions. Migration versions a
 > `knowledge_atoms` and `knowledge_domains` tables plus an FTS5 external-content virtual
 > table `fts_knowledge` with insert/delete/update triggers for automatic index sync. The
 > FTS5 index covers slug, name, description, and content fields with a trigram tokenizer.
-> Versions V1–V19 are production schema and are frozen.
+>
+> **V20 amendment (2026-05-30, ADR-032)**: V20 (`brain_profile_persistence`) creates
+> `brain_profile_snapshots`, `brain_event_log`, and `idx_brain_events_profile` for the brain
+> pack's persisted `BrainStateSnapshot` and replay log. Although this is pack-owned logical
+> state, the shipped schema is a `khive-db` versioned migration, so the production ledger records it here.
+>
+> **V21 amendment (2026-05-30, ADR-048)**: V21 (`knowledge_sections`) creates
+> `knowledge_sections`, section indexes, `fts_sections`, and FTS5 triggers for section-typed
+> knowledge atom content.
+>
+> **V22 amendment (2026-05-30, ADR-048)**: V22 (`knowledge_lifecycle_status`) adds
+> `knowledge_atoms.status`, `source_uri`, `source_type`, `knowledge_sections.status`,
+> `knowledge_domains.status`, status indexes, and the `finalized -> reviewed` atom backfill.
+> Versions V1–V22 are production schema and are frozen.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
@@ -257,18 +273,26 @@ fn schema_plan(&self) -> SchemaPlan {
 }
 ```
 
-`SchemaPlan` statements use `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF
-NOT EXISTS` only. They are idempotent: running them on a database that already
-has the tables is a no-op.
+`SchemaPlan` statements are primarily `CREATE TABLE IF NOT EXISTS` and `CREATE
+INDEX IF NOT EXISTS`, which are idempotent: running them on a database that
+already has the tables is a no-op. As a documented exception, a pack may include
+a nullable backward-compatible `ALTER TABLE` statement (e.g., the GTD namespace
+backfill) where startup error-handling swallows the duplicate-column error on
+re-runs.
 
 The runtime applies each loaded pack's `SchemaPlan` to its assigned backend
 (per pack's `StorageProfile`, ADR-003) at startup. Pack tables are created on
 the backends the pack uses, lazily, when the pack is first loaded.
 
-**Pack schema is non-evolving in v1.** If a pack needs to evolve its schema
-(add a column to `gtd_lifecycle_audit`), the pack must coordinate with khive-db
-to ship a versioned migration. Pack-owned evolution is deferred until a real
-use case justifies the additional machinery.
+**Pack schema is normally non-evolving in v1.** New pack-auxiliary tables use
+idempotent `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`.
+If a pack needs to change a table shape after production use, the preferred path
+is still a coordinated `khive-db` versioned migration. The only shipped exception
+in v1 is GTD's nullable `gtd_lifecycle_audit.namespace` backfill: the GTD
+`SchemaPlan` includes an idempotent `ALTER TABLE ... ADD COLUMN namespace TEXT`
+and startup handling swallows SQLite's duplicate-column error. Legacy rows may
+therefore have `NULL` namespace; new GTD transition/complete audit rows write
+the caller's authorized namespace.
 
 ### Note kinds and edge relations do not require migrations
 
@@ -379,9 +403,11 @@ posteriors) belong to the pack that introduces them. Forcing every pack to ship
 versioned migrations couples pack evolution to `khive-db` releases and adds
 governance overhead disproportionate to the value.
 
-Idempotent `CREATE TABLE IF NOT EXISTS` is the right tool for pack-auxiliary
-tables: they appear when the pack loads, never need to evolve through `ALTER
-TABLE` because the pack version controls the table structure.
+Idempotent `CREATE TABLE IF NOT EXISTS` is the default tool for pack-auxiliary
+tables: they appear when the pack loads. Pack-local `ALTER TABLE` statements
+are allowed only as documented, nullable, backward-compatible exceptions for
+already-shipped pack tables; the current v1 example is GTD audit namespace
+backfill. Structural/core schema changes still belong in versioned migrations.
 
 ### Why migration application is operator-context, not agent-context?
 

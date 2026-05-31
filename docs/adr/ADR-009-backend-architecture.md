@@ -7,8 +7,10 @@
 ## Context
 
 khive persists its knowledge graph in SQLite. The storage layer is split: `khive-storage`
-defines eight capability traits (ADR-005); `khive-db` implements them against SQLite,
-sqlite-vec, and FTS5.
+defines eight capability traits (ADR-005); `khive-db` implements SQLite storage traits,
+including FTS5 `TextSearch` and the current sqlite-vec `VectorStore`. Separate retrieval
+crates (`khive-retrieval`, `khive-bm25`, `khive-hnsw`, `khive-vamana`, `khive-fusion`)
+ship in-process retrieval engines and fusion.
 
 The backend architecture must satisfy:
 
@@ -20,8 +22,10 @@ The backend architecture must satisfy:
    database.
 3. **Trait portability.** The eight storage traits (ADR-005) are the contract boundary.
    A future non-SQLite backend must be possible without changing runtime or pack code.
-4. **Vector search.** Vector indexing and similarity search are in-process via sqlite-vec.
-   External vector database services are not part of the embedded backend story.
+4. **Vector search.** The current `khive-db` VectorStore is sqlite-vec compatibility.
+   In-process retrieval engines also ship as separate crates, and pack-specific paths may
+   layer Vamana ANN or khive-retrieval fusion above storage. External vector database
+   services are not part of the embedded backend story.
 
 ## Decision
 
@@ -36,9 +40,10 @@ khive's v1 backend is SQLite. The concrete backend crate is `khive-db`.
 - `GraphStore` — link/edge CRUD and graph traversal
 - `NoteStore` — note substrate CRUD
 - `EventStore` — append-only event log
-- `VectorStore` — dense vector indexing via sqlite-vec
+- `VectorStore` — current dense vector storage/search via sqlite-vec compatibility
 - `SparseStore` — sparse vector storage
 - `TextSearch` — full-text search via FTS5 trigram
+- Retrieval engines — BM25, HNSW, Vamana, and fusion live outside `khive-db`
 
 `khive-db` supports both file-backed and in-memory storage. In-memory mode is used for
 tests and ephemeral deployments.
@@ -139,10 +144,9 @@ same backend. The error message must state this constraint explicitly.
 Vector portability is handled through `VectorStore`, not through external vector database
 services.
 
-The v1 backend uses sqlite-vec for brute-force vector search. The v2 upgrade path is
-ruvector-core's in-process HNSW implementation, which provides filter pushdown, batch
-search, quantization, and update support behind the same `VectorStore` trait. `khive-hnsw`
-is deleted — do not rebuild HNSW inside khive; use ruvector-core directly.
+The current `khive-db` backend uses sqlite-vec for brute-force vector search. HNSW and
+Vamana now ship as khive crates (`khive-hnsw`, `khive-vamana`), and retrieval composition
+ships in `khive-retrieval` and `khive-fusion`; do not describe `khive-hnsw` as deleted.
 
 **Risk**: sqlite-vec cross-backend search via UNION ALL requires empirical validation.
 Performance and correctness of `sqlite-vec` virtual tables across ATTACHed databases
@@ -224,8 +228,9 @@ symmetry with a backend that does not exist. The cost of asymmetric naming
 An external vector database (Qdrant, Weaviate) adds a service dependency, network
 latency, deployment complexity, and a failure mode that doesn't exist in the embedded
 model. sqlite-vec provides correct (if brute-force) vector search with zero additional
-dependencies. The v2 upgrade path is ruvector-core's in-process HNSW, which replaces
-the brute-force baseline without adding external services.
+dependencies. In-process HNSW and Vamana ANN now ship as separate khive crates
+(`khive-hnsw`, `khive-vamana`); retiring sqlite-vec from `khive-db` is explicit
+future work, not current shipped behavior.
 
 ### Why one crate per backend?
 
@@ -271,7 +276,9 @@ read-only mode.
 - No Postgres or Neo4j means khive cannot leverage their query optimizers or scale properties.
   Mitigated: not a v1 requirement. Trait boundary preserves the option.
 - sqlite-vec brute-force is slow for >10K vectors.
-  Mitigated: ruvector-core in-process HNSW is the upgrade path, not an external service.
+  Mitigated: `khive-hnsw` and `khive-vamana` ship in-process ANN; pack-specific retrieval
+  paths layer them above the `khive-db` VectorStore. Retiring sqlite-vec from `khive-db`
+  is a separate future implementation step.
 - Cross-backend hard-delete is non-atomic (no 2PC across SQLite files).
   Mitigated: `_cross_backend_wal` compensation log with idempotent replay.
 - Cross-backend `merge_entity` is unsupported (v1 and v2).

@@ -55,20 +55,17 @@ Two Rust binaries with distinct trust boundaries, converging to a single binary.
 Both binaries link the same Rust crates (`khive-runtime`, `khive-pack-*`). They differ
 in what they expose, not in what they can do.
 
-**Shipped boundary**: `khive-mcp` remains the agent-facing stdio MCP binary and
-exposes the single `request` tool. `kkernel` remains the operator/admin CLI for
-sync, pack introspection, KG/vector/reindex/backend administration, and
-cross-backend coordinator operations. The old `kkernel mcp` convergence path is
-not the shipped end state and should be treated as historical/unimplemented unless
-a future ADR reopens binary consolidation.
+**Convergence path**: `kkernel` absorbs `khive-mcp` as a subcommand (`kkernel mcp`).
+The three-step sequence (add subcommand → make khive-mcp a shim → remove at v1.0)
+keeps each step small and reversible. Existing MCP configurations referencing
+`khive-mcp` continue to work through the deprecation cycle.
 
-**Current binary modes**:
+**End state**: `kkernel` is the single Rust binary with multiple modes:
 
-- `khive-mcp` — long-lived stdio MCP server with gate enforcement and `request`
+- `kkernel mcp` — long-lived stdio MCP server
 - `kkernel sync` — one-shot NDJSON → SQLite build
 - `kkernel pack list` — one-shot pack introspection
-- `kkernel kg`, `kkernel engine`, `kkernel vector`, `kkernel reindex`, and
-  `kkernel backend` — operator/admin commands
+- `kkernel db migrate` — one-shot schema migration
 
 ### Crate dependency chain
 
@@ -76,7 +73,8 @@ a future ADR reopens binary consolidation.
 khive-types          (domain types, no_std, zero deps)
   ├── khive-score    (deterministic scoring)
   ├── khive-storage  (trait-only, zero implementations)
-  │     └── khive-db (SQLite + sqlite-vec + FTS5)
+  │     ├── khive-db (SQLite storage + FTS5 TextSearch + sqlite-vec VectorStore compatibility)
+  │     └── retrieval crates (khive-retrieval, khive-fusion, khive-bm25, khive-hnsw, khive-vamana)
   ├── khive-query    (GQL/SPARQL → SQL compiler)
   ├── khive-request  (verb-dispatch DSL parser)
   └── khive-runtime  (VerbRegistry, validation, operations)
@@ -110,34 +108,35 @@ khive-mcp  (agent binary — packs + gate enforcement)
 
 ```text
 External caller (Claude Code, Python, HTTP client)
-  |
-  v
-khive-mcp request tool
-  |
-  +-- Gate enforcement
-  |
-  v
-DSL / JSON request parsing (khive-request)
-  |
-  v
-VerbRegistry dispatch
-  |
-  v
-Pack handler
-  |
-  v
-KhiveRuntime (validation, namespace enforcement, orchestration)
-  |
-  v
-Storage traits and assigned backend
+  │
+  ▼
+Binary (kkernel mcp / khive-mcp)
+  │
+  ├── [agent context only] Gate enforcement
+  │
+  ▼
+Optional DSL parsing (khive-request, if textual input)
+  │
+  ▼
+SubstrateCoordinator
+  │
+  ├── Node locator (UUID → backend resolution)
+  ├── Federated search fan-out (multi-backend)
+  ├── Cross-backend edge routing
+  │
+  ▼
+VerbRegistry dispatch → Pack handler
+  │
+  ▼
+Per-pack KhiveRuntime (validation, orchestration)
+  │
+  ▼
+StorageBackend (per-pack SQLite instance)
 ```
 
-`SubstrateCoordinator` is not on the ordinary `khive-mcp` request path. It is
-`kkernel` cross-backend/admin plumbing for backend lookup, fan-out, and routing.
-Pack handlers see a `KhiveRuntime` and do not depend on the coordinator.
-
 The `VerbRegistry` is the stable internal abstraction. MCP is the current agent-facing
-transport. All user-visible capabilities enter through registered verbs.
+transport. The SubstrateCoordinator is kernel-internal dispatch above the per-pack
+runtimes. All user-visible capabilities enter through registered verbs.
 
 ### Storage architecture
 
@@ -191,19 +190,19 @@ placement is a coordinator concern, not a pack concern.
 
 ## Crate Responsibilities
 
-| Crate             | Owns                                                                                                                                                            | Must NOT own                                                                               |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `khive-types`     | Domain structs, enums, `EntityTypeDef` contract, serialization types                                                                                            | Runtime registries, DB access, semantic validation                                         |
-| `khive-score`     | `DeterministicScore`, fusion primitives                                                                                                                         | Graph mutation, storage, transport                                                         |
-| `khive-storage`   | Storage traits, shared storage-facing types                                                                                                                     | SQLite implementation, business validation                                                 |
-| `khive-db`        | SQLite + sqlite-vec + FTS5 implementation of storage traits                                                                                                     | Entity ontology decisions, endpoint policy                                                 |
-| `khive-query`     | GQL/SPARQL parsing, AST validation, SQL compilation for graph queries                                                                                           | Retrieval engine ownership, write-time semantic validation                                 |
-| `khive-request`   | Verb-dispatch DSL parsing into typed request structures                                                                                                         | entity_type validation, endpoint validation                                                |
-| `khive-runtime`   | `VerbRegistry`, `EntityTypeRegistry`, endpoint validation, namespace enforcement, transaction orchestration, current generic hybrid/vector search orchestration | Transport parsing, pack-specific verb semantics, backend topology                          |
-| `khive-retrieval` | Reusable retrieval/ranking primitives and low-level engine/adapters where wired (ADR-030)                                                                       | MCP transport, pack verb policy, graph query SQL compilation                               |
-| Pack crates       | Vocabulary registration, verb handlers, pack-specific endpoint rules and retrieval semantics                                                                    | Raw transport handling, DB-specific persistence, cross-backend routing                     |
-| `kkernel`         | Binary composition, SubstrateCoordinator, sync, pack introspection, admin ops                                                                                   | MCP request handling, semantic validation (runtime's job), verb handler logic (pack's job) |
-| `khive-mcp`       | MCP stdio transport, gate enforcement, request/response adaptation                                                                                              | Business logic, entity CRUD, pack semantics, coordinator fan-out                           |
+| Crate            | Owns                                                                                                        | Must NOT own                                                           |
+| ---------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `khive-types`    | Domain structs, enums, `EntityTypeDef` contract, serialization types                                        | Runtime registries, DB access, semantic validation                     |
+| `khive-score`    | `DeterministicScore`, fusion primitives                                                                     | Graph mutation, storage, transport                                     |
+| `khive-storage`  | Storage traits, shared storage-facing types                                                                 | SQLite implementation, business validation                             |
+| `khive-db`       | SQLite storage implementation: SQL substrates, FTS5 TextSearch, sqlite-vec VectorStore compatibility        | Entity ontology decisions, endpoint policy, retrieval-engine policy    |
+| Retrieval crates | BM25/HNSW/Vamana indexes, hybrid retrieval primitives, and fusion strategies                                | Storage ownership, pack-specific scoring policy                        |
+| `khive-query`    | GQL/SPARQL parsing, AST validation, SQL compilation                                                         | Write-time semantic validation                                         |
+| `khive-request`  | Verb-dispatch DSL parsing into typed request structures                                                     | entity_type validation, endpoint validation                            |
+| `khive-runtime`  | `VerbRegistry`, `EntityTypeRegistry`, endpoint validation, namespace enforcement, transaction orchestration | Transport parsing, pack-specific verb semantics, backend topology      |
+| Pack crates      | Vocabulary registration, verb handlers, pack-specific endpoint rules                                        | Raw transport handling, DB-specific persistence, cross-backend routing |
+| `kkernel`        | Binary composition, SubstrateCoordinator, sync, pack introspection, admin ops                               | Semantic validation (runtime's job), verb handler logic (pack's job)   |
+| `khive-mcp`      | MCP stdio transport, gate enforcement, request/response adaptation                                          | Business logic, entity CRUD, pack semantics                            |
 
 ### Types vs Runtime boundary
 
@@ -302,7 +301,7 @@ All business operations enter through registered verbs. No transport owns khive 
 
 **A transport adapter may**:
 
-- Spawn `khive-mcp` as a subprocess
+- Spawn `kkernel mcp` (or `khive-mcp`) as a subprocess
 - Call MCP tools
 - Expose HTTP endpoints that forward to registered verbs
 - Adapt request/response formats
@@ -321,13 +320,13 @@ Future transports (HTTP gateway, web dashboard, CLI) must obey the same verb-fir
 boundary. They dispatch to `VerbRegistry` via one of the binaries, not to storage or
 runtime operations directly.
 
-| Layer              | Status               | Role                                     | Not allowed         |
-| ------------------ | -------------------- | ---------------------------------------- | ------------------- |
-| `khive-mcp`        | current              | stdio MCP transport, gate enforcement    | business logic      |
-| `kkernel mcp`      | historical/unshipped | not the shipped end state (see Decision) | —                   |
-| `khive-web`        | planned              | HTTP adapter to registered verbs         | entity CRUD         |
-| `khive-dashboard`  | planned              | visual client over verb-backed endpoints | ontology validation |
-| Python smoke tests | current              | subprocess caller over MCP stdio         | semantic SDK        |
+| Layer              | Status                | Role                                     | Not allowed         |
+| ------------------ | --------------------- | ---------------------------------------- | ------------------- |
+| `kkernel mcp`      | converging            | stdio MCP transport (absorbs khive-mcp)  | business logic      |
+| `khive-mcp`        | current (deprecating) | stdio MCP transport                      | business logic      |
+| `khive-web`        | planned               | HTTP adapter to registered verbs         | entity CRUD         |
+| `khive-dashboard`  | planned               | visual client over verb-backed endpoints | ontology validation |
+| Python smoke tests | current               | subprocess caller over MCP stdio         | semantic SDK        |
 
 Implementation details of future layers get their own ADRs when they ship.
 
@@ -397,10 +396,9 @@ be constrained by agent safety policy. Conflating both in one binary forces eith
 (a) gate enforcement on admin commands (unnecessary), or (b) a flag to disable gates
 (a security footgun). Two binaries make the trust boundary structural, not configurational.
 
-The shipped split preserves this: `khive-mcp` installs the gate stack; `kkernel`
-admin subcommands do not. The trust boundary is structural across the two binaries
-rather than selected by subcommand within one. (A future `kkernel mcp` consolidation
-would have to re-establish the gate stack in that mode.)
+The convergence to `kkernel mcp` as a subcommand preserves this: the MCP mode installs
+the gate stack; other subcommands do not. One binary, multiple trust contexts selected
+by subcommand.
 
 ### Why verb-first (not MCP-first)?
 
@@ -466,8 +464,8 @@ boundary tight and avoids adding a public surface for internal plumbing.
 
 ### Negative
 
-- Two binaries are more complex than one.
-  Accepted: the split keeps the agent-facing gate boundary structural.
+- Two binaries (three during convergence) are more complex than one.
+  Mitigated: convergence path reduces to one binary with multiple modes.
 - Multi-backend adds the SubstrateCoordinator layer.
   Mitigated: single-backend deployments see zero coordinator overhead.
 - TOML configuration is a new operational surface.

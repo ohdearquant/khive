@@ -256,7 +256,7 @@ raw i64 and `DeterministicScore` at the boundary.
 `VectorSearchRequest` includes a `filter: Option<FilterExpression>` field as the extension
 point for filter pushdown into vector indexes. The `FilterExpression` type is defined in
 `khive-storage` as a simple expression tree (`Eq`, `Ne`, `Gt`, `Lt`, `Range`, `In`, `And`,
-`Or`, `Not`). When ruvector-core HNSW replaces sqlite-vec (ADR-009), the backend maps
+`Or`, `Not`). When a backend with filter pushdown replaces or supplements sqlite-vec, the backend maps
 `FilterExpression` to ruvector-filter's expression tree.
 
 `VectorSearchRequest` carries query vectors (`Vec<Vec<f32>>` — one or many) and an
@@ -280,8 +280,8 @@ different traits. The capability surface is one: "store vectors, return top-k si
 results." Each backend picks its index strategy.
 
 ```text
-khive-db (v1):                Flat / brute-force via sqlite-vec
-khive-db (v2 future):         HNSW via ruvector-core (drop-in upgrade)
+khive-db current: Flat / brute-force via sqlite-vec
+retrieval crates shipped: HNSW via khive-hnsw and Vamana via khive-vamana; backend integration remains explicit, not implied by khive-db
 hypothetical future backends: IVF-PQ, DiskANN, GNN-based, learned
 ```
 

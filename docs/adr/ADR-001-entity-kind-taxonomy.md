@@ -44,9 +44,12 @@ strings. This is the worst combination: looks governed, actually isn't.
 
 ## Decision
 
-### 8 entity kinds
+### 8 base entity kinds plus pack-side `resource`
 
-`EntityKind` is a closed Rust enum with 8 variants:
+`khive_types::EntityKind` remains a closed Rust enum with 8 base variants. The KG pack
+validator additionally accepts `resource` as a pack-side kind for actionable content
+governed by ADR-048. Harmonizing this with the shared type enum is follow-up code work,
+not part of this doc-only batch.
 
 ```rust
 pub enum EntityKind {
@@ -136,7 +139,10 @@ Pack-registered subtype examples:
 
 ### Pack extensibility rule
 
-**Packs MUST NOT create new `EntityKind` values.**
+**Packs MUST NOT create new shared `khive_types::EntityKind` variants without an ADR.**
+ADR-048 documents the current shipped exception: the KG pack validator includes a
+pack-side `resource` kind for actionable knowledge resources, while the shared type enum
+still has 8 base kinds.
 
 Pack-declared entity kind strings MUST resolve to a closed base `EntityKind` plus a registered
 `entity_type`. The `Pack::ENTITY_KINDS` string list is a subtype registration, not an enum

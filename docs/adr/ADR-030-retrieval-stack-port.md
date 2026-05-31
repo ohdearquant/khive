@@ -42,8 +42,10 @@ not foundational.
 ## Decision
 
 Port `khive-internal/platform/retrieval/` into the OSS workspace as `khive-retrieval`.
-Use `lattice-embed` (ADR-011) as the SIMD and quantization foundation. Drop sqlite-vec
-from `khive-db`. Deliver RuVector techniques as opt-in adapter packs only.
+Use `lattice-embed` (ADR-011) as the SIMD and quantization foundation. The retrieval
+crates ship, but `khive-db` still contains sqlite-vec VectorStore compatibility in current
+code; sqlite-vec retirement remains a separate implementation issue. Deliver in-process
+retrieval techniques as opt-in adapter paths.
 
 ### Crate ownership and boundaries
 
@@ -68,8 +70,8 @@ khive/crates/
   khive-storage        — VectorStore trait contract (ADR-005, unchanged)
   khive-fold           — Fold / Objective / Anchor / Selector (ADR-024, unchanged)
   khive-score          — DeterministicScore, RRF math (ADR-006, unchanged)
-  khive-db             — SQLite backend; drops sqlite-vec dependency
-  khive-retrieval      — NEW: ported from khive-internal/platform/retrieval/
+  khive-db             — SQLite backend; still includes sqlite-vec VectorStore compatibility
+  khive-retrieval      — ported retrieval primitives from khive-internal/platform/retrieval/
     hnsw/              — HNSW index, INT8 two-phase quantized search
     bm25/              — BM25 keyword index
     fusion/            — RRF / Weighted / Union / VectorOnly strategies
@@ -126,23 +128,24 @@ pub use khive_retrieval::{
 ```
 
 `StorageVectorSearch` and `StorageKeywordSearch` implement the `VectorStore` and
-`TextSearch` traits from ADR-005 respectively. `khive-runtime` replaces its sqlite-vec
-paths with these adapters; the retrieval composition described in ADR-012 is unchanged.
+`TextSearch` traits from ADR-005 respectively. `khive-runtime` still has FTS5 + VectorStore RRF paths over storage. The retrieval port
+crates ship alongside that path; replacing or retiring sqlite-vec remains explicit follow-up
+work, not completed current behavior.
 
 `HybridSearcher` provides the common dense+keyword+fusion entry point. ADR-031
 (multi-engine composition) wraps multiple `HnswIndex` instances behind the same surface.
 ADR-032 (brain profile orchestration) consumes ranked candidates from `HybridSearcher`
 and applies fold-based reranking (ADR-024).
 
-### sqlite-vec retirement
+### sqlite-vec retirement (deferred)
 
-`khive-db` drops the `sqlite-vec` dependency in the same commit that adds
-`khive-retrieval`. `VectorStore` impls in `khive-db` route through `HnswIndex`.
+`khive-db` still contains the sqlite-vec `VectorStore` compatibility path in current
+shipped code. The retrieval crates (`khive-retrieval`, `khive-hnsw`, `khive-vamana`)
+ship alongside it; they do not replace or remove the sqlite-vec dependency from `khive-db`.
 
-OSS users with sqlite-vec data need a one-time migration: rebuild the HNSW index from
-stored embeddings. `HnswIndex::rebuild` handles this. Migration is provided either as a
-`kkernel` subcommand (`kkernel migrate-vectors`) or as an auto-detect-and-rebuild path
-on first startup — decided during Phase 1 implementation.
+Retiring sqlite-vec from `khive-db` — routing `VectorStore` impls through `HnswIndex`,
+providing an OSS migration path (`kkernel migrate-vectors` or auto-detect-and-rebuild) —
+is a separate future implementation issue, not completed by this port.
 
 ### Formal proofs
 

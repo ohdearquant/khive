@@ -1,6 +1,6 @@
 # ADR-049: khived daemon — persistent warm runtime over a Unix socket
 
-**Status**: proposed
+**Status**: accepted
 **Date**: 2026-05-30
 **Authors**: Ocean, lambda:khive
 

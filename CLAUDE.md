@@ -64,7 +64,8 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  khive-runtime — composable Service API + VerbRegistry       │
 │  khive-request — DSL parser (function-call + JSON forms)     │
 │  khive-query   — GQL/SPARQL → SQL compiler                   │
-│  khive-db      — SQLite + sqlite-vec + FTS5                  │
+│  khive-db      — SQLite storage + FTS5 TextSearch + sqlite-vec VectorStore compatibility │
+│  retrieval     — khive-retrieval/fusion/bm25/hnsw/vamana engines and fusion primitives   │
 │  khive-storage — trait-only capability surface               │
 │  khive-score   — deterministic i64 scoring                   │
 │  khive-types   — domain types + Pack trait                   │
@@ -87,7 +88,12 @@ not shipped.
 | `crates/khive-types`       | Domain types: Entity, Note, Event, EntityKind, EdgeRelation, Pack trait                                                |
 | `crates/khive-score`       | Deterministic i64 fixed-point scoring + RRF                                                                            |
 | `crates/khive-storage`     | Trait-only: SqlAccess, GraphStore, VectorStore, TextSearch                                                             |
-| `crates/khive-db`          | SQLite backend + sqlite-vec + FTS5 trigram                                                                             |
+| `crates/khive-db`          | SQLite backend; FTS5 trigram TextSearch; current sqlite-vec VectorStore compatibility                                  |
+| `crates/khive-retrieval`   | Hybrid retrieval primitives over dense, lexical, graph, and fusion signals                                             |
+| `crates/khive-fusion`      | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                                  |
+| `crates/khive-bm25`        | BM25 keyword index                                                                                                     |
+| `crates/khive-hnsw`        | HNSW vector index                                                                                                      |
+| `crates/khive-vamana`      | Vamana ANN index used by knowledge search                                                                              |
 | `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                     |
 | `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                         |
 | `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                           |
