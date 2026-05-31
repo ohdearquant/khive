@@ -22,7 +22,13 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 
+fn disable_daemon() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("KHIVE_NO_DAEMON", "1"));
+}
+
 fn make_server() -> KhiveMcpServer {
+    disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
@@ -1031,6 +1037,7 @@ impl PackRuntime for ErrorInjectPack {
 
 /// Build a server backed only by the `ErrorInjectPack` (no DB, no embedding).
 fn make_error_inject_server() -> KhiveMcpServer {
+    disable_daemon();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(ErrorInjectPack);
     let registry = builder.build().expect("error-inject registry builds");
@@ -1532,6 +1539,7 @@ async fn test_h3_prev_nonexistent_field_error_lists_available_fields() -> anyhow
 // the HandlerDef.params slices are populated (not left as &[]).
 
 fn make_full_server() -> KhiveMcpServer {
+    disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
@@ -1655,6 +1663,7 @@ async fn help_propose_params_non_empty_with_title_description_changeset() -> any
 // ── help=true schema envelopes for comm + schedule verbs (issue #287) ─────────
 
 fn make_comm_schedule_server() -> KhiveMcpServer {
+    disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
@@ -1892,6 +1901,7 @@ async fn startup_migrations_applied_to_fresh_file_backed_db() -> anyhow::Result<
 /// to the handler.  `help=true` introspection must still work (short-circuit
 /// before the gate).
 fn make_brain_server() -> KhiveMcpServer {
+    disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("braintest").unwrap(),
@@ -3041,6 +3051,7 @@ async fn recall_returns_iso8601_timestamps() -> anyhow::Result<()> {
 }
 
 fn make_comm_server_only() -> KhiveMcpServer {
+    disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("commtest").unwrap(),
@@ -3106,6 +3117,7 @@ async fn send_returns_iso8601_timestamps() -> anyhow::Result<()> {
 }
 
 fn make_schedule_server_only() -> KhiveMcpServer {
+    disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("schedtest").unwrap(),
@@ -3359,6 +3371,7 @@ async fn brain_profile_rejects_unknown_kwarg() -> anyhow::Result<()> {
 }
 
 fn make_knowledge_server() -> KhiveMcpServer {
+    disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("knowtest").unwrap(),

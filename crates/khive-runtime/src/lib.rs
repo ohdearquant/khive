@@ -20,6 +20,7 @@
 //! ```
 
 pub mod curation;
+pub mod daemon;
 pub mod embedder_registry;
 pub mod engine_config;
 pub mod error;
@@ -38,6 +39,9 @@ pub mod validation;
 pub use curation::{
     ContentMergeStrategy, EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityPatch,
     MergeSummary, NotePatch,
+};
+pub use daemon::{
+    pid_path, run_daemon, socket_path, DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{config_from_env, ConfigError, EngineConfig, KhiveConfig};

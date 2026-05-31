@@ -951,7 +951,7 @@ impl KnowledgeHandlers {
         // rebuilds lazily on the next search call.
         if indexed > 0 {
             vamana::invalidate_snapshot(runtime, &ns).await;
-            *ann.write().await = None;
+            *ann.index.write().await = None;
         }
 
         let mut ann_count: Option<usize> = None;
@@ -969,7 +969,7 @@ impl KnowledgeHandlers {
                             tracing::error!(error = %e, "failed to persist Vamana snapshot");
                         }
                     }
-                    let mut guard = ann.write().await;
+                    let mut guard = ann.index.write().await;
                     *guard = Some(bridge);
                 }
                 Err(e) => {
@@ -1103,11 +1103,12 @@ impl KnowledgeHandlers {
             search_core(&ctx, &raw_query).await?
         };
 
-        // Warm-load Vamana ANN from snapshot or corpus scan (no-op if already loaded).
-        vamana::ensure_ann(runtime, token, ann).await;
+        // Trigger a fire-once background warm (ADR-049): never block search on the
+        // ANN rebuild. The fusion below only runs if the index is already populated.
+        vamana::ensure_ann_background(runtime, token, ann);
 
         // ANN parallel signal: embed query, search Vamana, fuse via RRF
-        let ann_guard = ann.read().await;
+        let ann_guard = ann.index.read().await;
         if let Some(ref bridge) = *ann_guard {
             if let Ok(query_emb) = runtime.embed(&raw_query).await {
                 let ann_k = fetch_limit.max(20);
@@ -1181,8 +1182,8 @@ impl KnowledgeHandlers {
 
         let mut hits = search_core(&ctx, &raw_query).await?;
 
-        vamana::ensure_ann(runtime, token, ann).await;
-        let ann_guard = ann.read().await;
+        vamana::ensure_ann_background(runtime, token, ann);
+        let ann_guard = ann.index.read().await;
         if let Some(ref bridge) = *ann_guard {
             if let Ok(query_emb) = runtime.embed(&raw_query).await {
                 let ann_k = (limit * 3).max(20);

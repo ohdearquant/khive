@@ -1074,6 +1074,15 @@ impl VerbRegistry {
         }
     }
 
+    /// Invoke `PackRuntime::warm` on every registered pack (ADR-049).
+    /// Called by the daemon at boot (in a background task) so expensive in-memory
+    /// state (ANN indexes) is pre-loaded without blocking request serving.
+    pub async fn call_warm_all(&self) {
+        for pack in self.packs.iter() {
+            pack.warm().await;
+        }
+    }
+
     /// Resolve the presentation policy for a verb name (ADR-045 §6).
     ///
     /// Walks all registered handlers (including subhandlers) for the first

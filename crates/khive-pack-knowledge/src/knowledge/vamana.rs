@@ -8,6 +8,7 @@
 //! `kkernel reindex` actively invalidates snapshots after re-embedding (second
 //! line of staleness defence).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
@@ -21,10 +22,20 @@ pub(crate) struct AnnBridge {
     id_map: Vec<Uuid>,
 }
 
-pub(crate) type SharedAnn = Arc<RwLock<Option<AnnBridge>>>;
+/// Shared ANN state: the index plus a single-flight guard so at most one
+/// background warm runs at a time (ADR-049).
+pub(crate) struct AnnState {
+    pub(crate) index: RwLock<Option<AnnBridge>>,
+    warming: AtomicBool,
+}
+
+pub(crate) type SharedAnn = Arc<AnnState>;
 
 pub(crate) fn new_shared() -> SharedAnn {
-    Arc::new(RwLock::new(None))
+    Arc::new(AnnState {
+        index: RwLock::new(None),
+        warming: AtomicBool::new(false),
+    })
 }
 
 impl AnnBridge {
@@ -373,7 +384,7 @@ pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
 /// the first successfully loaded snapshot is retained; subsequent ones are
 /// no-ops under the write-lock TOCTOU guard inside `ensure_ann`.
 pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
-    if ann.read().await.is_some() {
+    if ann.index.read().await.is_some() {
         return;
     }
 
@@ -414,10 +425,31 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
             Err(_) => continue,
         };
         ensure_ann(rt, &token, ann).await;
-        if ann.read().await.is_some() {
+        if ann.index.read().await.is_some() {
             break;
         }
     }
+}
+
+/// Fire-once background warm. Returns immediately. If the ANN is already loaded
+/// or a warm is already in flight, does nothing. On a completed attempt that
+/// produced no index (e.g. no corpus yet), clears the guard so a later search
+/// can retry.
+pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, ann: &SharedAnn) {
+    if ann.warming.swap(true, Ordering::AcqRel) {
+        return; // already warming or warmed
+    }
+    let rt = rt.clone();
+    let ann = ann.clone();
+    let ns = token.namespace().clone();
+    tokio::spawn(async move {
+        if let Ok(token) = rt.authorize(ns) {
+            ensure_ann(&rt, &token, &ann).await;
+        }
+        if ann.index.read().await.is_none() {
+            ann.warming.store(false, Ordering::Release); // allow retry later
+        }
+    });
 }
 
 /// Lazy warm-load: if `ann` is already populated, return immediately.
@@ -427,7 +459,7 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
 /// Write failures are logged as errors and do not prevent search from proceeding.
 pub(crate) async fn ensure_ann(rt: &KhiveRuntime, token: &NamespaceToken, ann: &SharedAnn) {
     // Fast path: already loaded.
-    if ann.read().await.is_some() {
+    if ann.index.read().await.is_some() {
         return;
     }
 
@@ -445,7 +477,7 @@ pub(crate) async fn ensure_ann(rt: &KhiveRuntime, token: &NamespaceToken, ann: &
             if snapshot.fingerprint == fp {
                 match AnnBridge::from_vamana_snapshot(snapshot) {
                     Ok(bridge) => {
-                        let mut guard = ann.write().await;
+                        let mut guard = ann.index.write().await;
                         // Re-check under write lock to avoid TOCTOU.
                         if guard.is_none() {
                             *guard = Some(bridge);
@@ -475,7 +507,7 @@ pub(crate) async fn ensure_ann(rt: &KhiveRuntime, token: &NamespaceToken, ann: &
                     tracing::error!(error = %e, "failed to persist Vamana snapshot after rebuild");
                 }
             }
-            let mut guard = ann.write().await;
+            let mut guard = ann.index.write().await;
             if guard.is_none() {
                 *guard = Some(bridge);
             }
@@ -577,12 +609,15 @@ mod tests {
         let vectors = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         let ids = vec![Uuid::new_v4(), Uuid::new_v4()];
         let bridge = AnnBridge::build(vectors, dim, ids).expect("build");
-        *ann.write().await = Some(bridge);
-        assert!(ann.read().await.is_some(), "pre-condition: ANN loaded");
-
-        *ann.write().await = None;
+        *ann.index.write().await = Some(bridge);
         assert!(
-            ann.read().await.is_none(),
+            ann.index.read().await.is_some(),
+            "pre-condition: ANN loaded"
+        );
+
+        *ann.index.write().await = None;
+        assert!(
+            ann.index.read().await.is_none(),
             "clearing SharedAnn must remove the bridge"
         );
     }

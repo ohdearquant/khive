@@ -81,6 +81,9 @@ fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>)
 #[derive(Clone)]
 pub struct KhiveMcpServer {
     registry: VerbRegistry,
+    /// Namespace this registry was built for. The stdio client passes it to the
+    /// daemon (ADR-049); a mismatch triggers local-dispatch fallback.
+    default_namespace: String,
 }
 
 /// Failure reason inside a [`PackRegError`].
@@ -207,7 +210,10 @@ impl KhiveMcpServer {
         // tables are present before any handler runs. Errors are logged but
         // not propagated so a single pack's schema failure cannot abort startup.
         registry.apply_schema_plans(runtime.backend());
-        Ok(Self { registry })
+        Ok(Self {
+            registry,
+            default_namespace: default_namespace.as_str().to_string(),
+        })
     }
 
     /// Build a server directly from a pre-configured registry.
@@ -217,7 +223,21 @@ impl KhiveMcpServer {
     /// Production code should use [`Self::new`] or [`Self::with_packs`].
     #[doc(hidden)]
     pub fn from_registry(registry: VerbRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            default_namespace: "local".to_string(),
+        }
+    }
+
+    /// Namespace this server's registry was built for.
+    pub fn default_namespace(&self) -> &str {
+        &self.default_namespace
+    }
+
+    /// Warm every pack's in-memory state (ADR-049). Called by the daemon in a
+    /// background task after the socket is bound.
+    pub async fn warm_all(&self) {
+        self.registry.call_warm_all().await;
     }
 
     /// Serve over stdio (blocks until the connection closes).
@@ -665,6 +685,29 @@ Tip: for one-shot calls, the single-op form is the densest. Use batch when
 several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
     async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
+        // ADR-049: forward to the warm daemon when reachable, auto-spawning it
+        // on first use. Any failure (no socket, spawn failure, namespace
+        // mismatch, KHIVE_NO_DAEMON) falls through to local dispatch.
+        let frame = khive_runtime::DaemonRequestFrame {
+            ops: p.ops.clone(),
+            presentation: p.presentation.clone(),
+            presentation_per_op: p.presentation_per_op.clone(),
+            namespace: self.default_namespace.clone(),
+        };
+        if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
+            return res;
+        }
+        self.dispatch_request_local(p).await
+    }
+}
+
+impl KhiveMcpServer {
+    /// Parse and dispatch a request against this server's own registry.
+    ///
+    /// This is the canonical dispatch path. The stdio `request` tool calls it
+    /// only as a fallback; the daemon calls it directly (never through the tool
+    /// wrapper), so there is no risk of a daemon forwarding to itself.
+    pub async fn dispatch_request_local(&self, p: RequestParams) -> Result<String, McpError> {
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
 
         // Parse presentation strings → PresentationMode (ADR-045).

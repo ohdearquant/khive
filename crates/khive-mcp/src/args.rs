@@ -69,6 +69,14 @@ pub struct Args {
     ///   3. ~/.khive/config.toml
     #[arg(long = "config", env = "KHIVE_CONFIG")]
     pub config: Option<PathBuf>,
+
+    /// Run as a persistent daemon over a Unix socket instead of stdio (ADR-049).
+    ///
+    /// The daemon owns the warm pack registry (ANN indexes) and serves request
+    /// frames from thin stdio clients that auto-spawn it. Bound to
+    /// `~/.khive/khived.sock`.
+    #[arg(long)]
+    pub daemon: bool,
 }
 
 /// Resolve the CLI-tier namespace from parsed `Args`.

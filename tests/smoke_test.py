@@ -92,11 +92,13 @@ def main():
     print(f"Binary: {BINARY}")
     assert os.path.exists(BINARY), f"Binary not found: {BINARY}"
 
+    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
         [BINARY, "--db", ":memory:", "--no-embed", "--log", "error"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
 
     try:
@@ -377,6 +379,7 @@ def main():
 
 def gtd_smoke():
     """Optional smoke test for the gtd pack — only runs if KHIVE_PACKS=...,gtd."""
+    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
         [
             BINARY, "--db", ":memory:", "--no-embed", "--log", "error",
@@ -385,6 +388,7 @@ def gtd_smoke():
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     try:
         send(proc, "initialize", {
@@ -470,6 +474,7 @@ def gtd_smoke():
 
 def memory_smoke():
     """Optional smoke test for the memory pack — exercises remember and recall."""
+    env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
         [
             BINARY, "--db", ":memory:", "--no-embed", "--log", "error",
@@ -478,6 +483,7 @@ def memory_smoke():
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     try:
         send(proc, "initialize", {
