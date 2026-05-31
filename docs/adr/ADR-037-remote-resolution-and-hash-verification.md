@@ -37,39 +37,23 @@ reproducibility but not archive-content integrity.
 
 Three accepted forms, in order of specificity:
 
-| Form                             | Meaning                                                   |
-| -------------------------------- | --------------------------------------------------------- |
-| `<uuid>` or `<short-id>`         | Local search in default namespace — existing behavior     |
-| `<namespace>:<uuid>`             | Namespace-qualified local ref; no remote lookup triggered |
-| `kg://<remote>/<namespace>/<id>` | Fully qualified remote ref                                |
+| Form                             | Meaning                                                            |
+| -------------------------------- | ------------------------------------------------------------------ |
+| `<uuid>`                         | Local UUID parse in caller namespace                               |
+| `<short-id>`                     | Local 8+ hex UUID-prefix lookup in caller namespace                |
+| `<entity-name>`                  | Local entity-name lookup in caller namespace                       |
+| `<namespace>:<uuid>`             | Reserved local shorthand; not part of shipped `resolve_uuid_async` |
+| `kg://<remote>/<namespace>/<id>` | Reserved/deferred remote ref form                                  |
 
-The `kg://` scheme is reserved for remote refs. `<namespace>:<uuid>` is a local shorthand;
-it does not require or trigger a network fetch. The short-id form resolves within the
-caller's configured namespace, unchanged from prior behavior.
+The shipped resolver is local-only. `resolve_uuid_async` follows this precedence:
 
-#### Resolver order (v1)
+1. Parse a full UUID string.
+2. Resolve an 8+ hex-character UUID prefix via `runtime.resolve_prefix`.
+3. Treat every other string as an entity name and call `resolve_name_async`.
 
-`resolve_uuid_async` follows this precedence, stopping at the first match:
-
-1. **Local working tree**: if the path resolves locally, return it (no fetch).
-2. **Hash-verified cache**: if the cache has an entry matching the requested
-   content hash, return it (fast path).
-3. **Stale cache + `--fetch=auto`**: if the cache has a _stale_ entry (hash
-   mismatch or age past TTL):
-   a. If `--fetch=auto` (default) or `--fetch=always`: re-fetch from remote into
-   a staging path, verify SHA-256, atomic-rename over the stale cache entry,
-   return the refreshed entry.
-   b. If `--fetch=never`: emit a warning, return the stale entry, mark response
-   `from_stale_cache=true`.
-4. **No cache + `--fetch` permitted**: fetch from remote, verify SHA-256, store
-   in cache, return.
-5. **No cache + `--fetch=never`**: error.
-
-Remote fetch (steps 3a and 4) is never triggered automatically during normal verb dispatch.
-MCP tool calls and programmatic verb calls default to `--fetch=never`. Remote fetch requires
-explicit opt-in (`--fetch=auto` or `--fetch=always`) to prevent unexpected network access
-inside agent-driven workflows. The key change: **hash check before accepting a cache hit**
-(step 2 requires hash match; stale entries route to step 3).
+Remote cache/fetch ordering, stale-cache fallback, and `kg://` parsing are deferred.
+Runtime verb calls do not expose `--fetch`; operators pre-populate remote data with
+`kkernel kg fetch` / `kkernel kg sync` before local resolution.
 
 #### Ambiguity handling
 
@@ -80,64 +64,27 @@ the existing behavior for local short-ID resolution.
 Short IDs presented inside a `kg://` ref resolve against all entities in the remote cache
 whose UUID begins with the prefix. Ambiguity is also an error there.
 
-#### `schema.yaml` remotes section
+#### Remote configuration and cache status
 
-Extending the remotes block established in ADR-020:
+Schema-driven remote lookup is deferred. The shipped remote sync/fetch path builds
+`RemoteConfig` from explicit `kkernel kg fetch` / `kkernel kg sync` CLI arguments
+(`remote`, `--url`, `--ref`, `--namespace`, `--pin`) rather than parsing a
+`schema.yaml remotes` block.
 
-```yaml
-remotes:
-  - name: upstream
-    url: https://github.com/org/kg-data.git
-    ref: main
-    namespace: research
-    pin: "sha256:abc123...64hexchars" # optional; when present, sync is mandatory-verify
-```
-
-| Field       | Required | Description                                                       |
-| ----------- | -------- | ----------------------------------------------------------------- |
-| `url`       | yes      | Git remote URL                                                    |
-| `ref`       | yes      | Branch or tag to resolve against                                  |
-| `namespace` | yes      | Namespace scoping entity resolution for this remote               |
-| `pin`       | no       | SHA-256 content hash; when present, cache is rejected on mismatch |
-
-The `commit` field from ADR-020 (the git commit SHA pin) and the `pin` field here are
-independent. `commit` is the git-level content address of the remote tree at a specific
-commit. `pin` is the logical content hash of the parsed KG archive, computed from the
-canonical entity and edge representation. Both may be present simultaneously.
-
-#### Remote cache layout
-
-```
-.khive/kg/remotes/<remote-name>/
-    entities.ndjson   # remote entities at last sync, sorted by UUID
-    edges.ndjson      # remote edges at last sync, sorted by (source, target, relation)
-    meta.json         # { fetched_at, ref, commit_sha, content_hash }
-```
-
-The cache is read-only from the runtime's perspective. Only `kkernel kg sync` or
-`kkernel kg fetch <remote>` populates it. A stale cache (older than `cache_ttl_seconds` in
-config, default 86400 seconds) produces a warning but is still used; `--fetch` or an
-explicit sync refreshes it.
-
-#### Trust and authorization
-
-Remote resolution is read-only. A `link` or `create` that references an entity by `kg://`
-ref targets the entity's local UUID — the entity must be imported into the local namespace
-first, or the link targets a locally cached copy. Writes that would create an entity in a
-remote namespace are rejected with `RuntimeError::CrossNamespaceWrite`. Authorization rules
-from [ADR-018](ADR-018-authorization-gate.md) apply at the runtime layer regardless of
-whether the entity originated locally or from a remote cache.
+`khive-vcs::sync::run_sync_remote` does implement fail-closed hash verification and cache
+publication for explicit sync/fetch calls. Runtime `resolve_uuid_async` does not consult
+that cache.
 
 #### Failure modes
 
-| Condition                                                  | Error                                      |
-| ---------------------------------------------------------- | ------------------------------------------ |
-| `kg://` ref names a remote not in `schema.yaml`            | `UnknownRemote { name }`                   |
-| Cache absent and `--fetch` not requested                   | `RemoteCacheMissing { remote, namespace }` |
-| Cache present but content hash mismatches `pin`            | `HashMismatch { expected, actual }`        |
-| Short ID matches multiple remote cache entries             | `AmbiguousId { id, count }`                |
-| Namespace in `kg://` ref differs from configured namespace | `NamespaceMismatch { expected, actual }`   |
-| Offline or fetch fails                                     | `RemoteFetchError { remote, message }`     |
+| Condition                                           | Shipped behavior                                                  |
+| --------------------------------------------------- | ----------------------------------------------------------------- |
+| Full UUID parses                                    | returned directly                                                 |
+| 8+ hex prefix misses                                | `InvalidInput("no record matches prefix")`                        |
+| 8+ hex prefix is ambiguous                          | `runtime.resolve_prefix` error                                    |
+| Name lookup fails                                   | `resolve_name_async` error                                        |
+| `kg://` ref, stale cache, missing cache, remote ref | deferred; not parsed by shipped resolver                          |
+| Hash mismatch during explicit sync/fetch            | `VcsError::HashMismatch { expected, actual }` before cache writes |
 
 ### Part 2: Content-Hash Verification
 
@@ -227,12 +174,10 @@ to concurrent readers.
 
 #### Repin workflow
 
-`kkernel kg sync --repin <remote>` skips hash comparison and writes the computed
-`SnapshotId` back into `schema.yaml` as the new `pin` value for the named remote. This is
-a deliberate trust-upgrade operation. The caller is responsible for verifying remote content
-independently (via git log, PR review, or out-of-band audit) before repinning. The repin
-command does not suppress other verification — schema compliance and referential integrity
-checks still run.
+`kkernel kg sync --repin <remote>` skips hash comparison and returns the computed
+`SnapshotId` / `repinned` result to the caller. It does not write the new pin back into
+`schema.yaml`; schema updates are caller-managed. The caller is responsible for verifying
+remote content independently before committing a new pin.
 
 ## Rationale
 
@@ -324,16 +269,14 @@ escape hatch for legitimate upstream updates.
 
 ### Integration points
 
-- `resolve_uuid_async` (`crates/khive-runtime/src/operations.rs`) — primary resolver entry
-  point; gains `kg://` parsing and steps 3-5 of the resolver order.
-- `link` verb validation — must resolve remote refs before checking endpoint kind constraints.
-- `kkernel kg sync` — gains staging workflow, canonical hash computation, pin comparison, and
-  `meta.json` content-hash write.
-- `kkernel kg sync --repin <remote>` — new flag; skips pin comparison, writes computed hash.
-- `kkernel kg doctor` — reports stale caches, missing pins, and hash mismatches as health
-  findings.
-- `kkernel kg validate --resolve-remotes` — confirms every `kg://` ref and `<remote>:<uuid>`
-  edge target resolves against the remote cache or a live fetch.
+- `resolve_uuid_async` (`crates/khive-pack-kg/src/handlers.rs`) — shipped local resolver:
+  full UUID, 8+ hex prefix, then entity name.
+- `kkernel kg fetch` / `kkernel kg sync` — explicit operator paths for remote archive fetch,
+  staging, canonical hash computation, pin comparison, and cache/meta publication.
+- `kkernel kg sync --repin <remote>` — skips pin comparison and returns the computed hash for
+  caller-managed schema update.
+- `kg://` parsing, runtime remote lookup, `kkernel kg doctor`, and
+  `kg validate --resolve-remotes` are deferred.
 
 ## Open Questions
 

@@ -111,8 +111,8 @@ out of JSON into a relational shape for efficient querying.
 
 ```sql
 CREATE TABLE event_observations (
-    event_id       BLOB NOT NULL,        -- FK to events.id (UUID bytes)
-    entity_id      BLOB NOT NULL,        -- FK to entities.id OR notes.id (polymorphic
+    event_id       TEXT NOT NULL,        -- FK to events.id (UUID string)
+    entity_id      TEXT NOT NULL,        -- FK to entities.id OR notes.id (polymorphic
                                          -- by referent_kind below — substrate table is
                                          -- determined by referent_kind, not enforced as
                                          -- a hard FK because the projection spans two
@@ -531,62 +531,52 @@ follow-up ADR. Today they're context, not content.
 
 ### Schema migration
 
-Migration V7 (`event_observations_and_session_id`). See ADR-015's Migration Ledger for the full version map.
+The shipped ADR-041 DDL is Migration V13 (`event_observability_provenance`). V8 is the
+reserved ADR-041 placeholder (`reserved_adr041_event_observations_and_session_id`) and is
+a no-op retained for migration-ledger contiguity.
 
 ```rust
 VersionedMigration {
-    version: 7,
-    name: "event_observations_and_session_id",
-    up: r#"
-        ALTER TABLE events ADD COLUMN session_id BLOB;
-        CREATE INDEX IF NOT EXISTS idx_events_session
-            ON events(namespace, session_id, created_at, id);
-
-        CREATE TABLE event_observations (
-            event_id      BLOB NOT NULL,
-            entity_id     BLOB NOT NULL,
-            referent_kind TEXT NOT NULL,
-            role          TEXT NOT NULL,
-            position      INTEGER NOT NULL,
-            PRIMARY KEY (event_id, role, position)
-        );
-        CREATE INDEX IF NOT EXISTS idx_event_obs_entity
-            ON event_observations(entity_id, role);
-        CREATE INDEX IF NOT EXISTS idx_event_obs_event_role
-            ON event_observations(event_id, role);
-    "#,
+    version: 13,
+    name: "event_observability_provenance",
+    up: V13_EVENT_OBSERVABILITY_PROVENANCE,
 }
 ```
 
+The generated V13 SQL adds `events.session_id TEXT`, creates `event_observations` with
+`event_id TEXT` and `entity_id TEXT`, and creates `idx_events_session`,
+`idx_event_obs_entity`, and `idx_event_obs_event_role`.
+
 ### Runtime additions
 
-- `crates/khive-runtime/src/events.rs`: `emit_event` path — invoke per-kind decoder,
-  insert observations in the same transaction.
-- `crates/khive-runtime/src/observations.rs` (new): `ObservationRole` enum,
-  `ObservationDecoder` trait, per-kind decoder registry.
-- `crates/khive-runtime/src/event_view.rs` (new): `EventView` + `EventObservation`.
-  Access raw `Event` data via `view.event` (explicit field access — `EventView` does NOT
-  implement `Deref<Target=Event>`; callers must use `view.event.field`, never `view.field`).
+- `crates/khive-storage/src/event.rs`: owns `EventFilter`, `EventView`,
+  `EventObservation`, `ObservationRole`, and `ReferentKind`.
+- `crates/khive-db/src/stores/event.rs`: owns same-transaction
+  `insert_event_with_observations`, per-kind observation decoding, and SQL filtering.
+- `crates/khive-query/src/compilers/sql.rs`: owns synthetic `observed_as_*` GQL lowering.
+- `crates/khive-query/src/validate.rs`: skips closed-edge validation for synthetic
+  `observed_as_*` relation names.
 
 ### EventFilter extensions
 
-- `crates/khive-storage/src/event.rs`: add `observed: Vec<Uuid>`, `selected: Vec<Uuid>`
-  fields to `EventFilter`; extend the SQL builder with the EXISTS sub-queries.
+- `crates/khive-storage/src/event.rs`: `EventFilter` includes `observed`, `selected`,
+  `session_id`, and additive `payload_proposal_id`; DB lowering uses `EXISTS` subqueries
+  over `event_observations`.
 
 ### Per-kind decoder examples
 
-- `RecallExecutedDecoder`: `payload.candidates` → `Candidate` rows;
-  `payload.selected` → `Selected` rows.
-- `LinkCreatedDecoder`: `payload.source_id` and `payload.target_id` → two `Target`
+- `RecallExecuted` / `SearchExecuted` / `RerankExecuted`: `payload.candidates` →
+  `Candidate` note rows; `payload.selected` / `payload.reranked` / `payload.final_scores`
+  → `Selected` note rows.
+- `LinkCreated`: `payload.source_id` and `payload.target_id` → two entity `Target`
   rows at `position=0` and `position=1`.
-- `FeedbackExplicitDecoder`: `payload.about_id` → `Signal` row.
+- `FeedbackExplicit`: `payload.about_id` → entity `Signal` row.
 
 ### PackEventConsumer dispatch update
 
-`PackEventConsumer::on_event` signature changes from `&Event` to `&EventView`. The
-runtime fetches `(event, observations)` together; consumers access the raw
-`Event` via `view.event` (explicit field access — EventView does NOT implement
-`Deref<Target=Event>`).
+No shipped `crates/khive-runtime/src/events.rs`, `observations.rs`, or `event_view.rs`
+files own this behavior. Consumers that need event observations read the shipped
+`EventView` shape from `khive-storage`.
 
 ### Tests
 

@@ -26,45 +26,31 @@ ADR-011 notes this:
 > a rerank crate, `khive-runtime` adds a `rerank()` method that calls it directly —
 > same pattern as embedding. No HTTP, no service abstraction.
 
-That deferral is no longer right. Lattice ships the full inference stack today —
-Qwen3, BERT, GQA/RoPE/KV cache/paged-KV/continuous-batching (lattice ADRs 001, 009,
-047, 048). A small reasoning model (Qwen3-class, ~0.8B parameters) running locally
-via `lattice-inference` is the missing rerank tier. And it is the **first** khive
-call site that consumes `LoraHook` from lattice ADR-008 — which makes it the v1
-entry point for ADR-032 §5b LoRA-class brain profiles.
+Current shipped state is narrower than this ADR's native-rerank target. ADR-033
+ships a memory-pack weighted feature rerank path: `RecallConfig.reranker_weights`
+uses the feature keys `relevance`, `salience`, `temporal`, `text_match`, and
+`vector_match`; when non-empty, that weighted score replaces the default final
+`rank_score`.
 
-ADR-032 §5b table makes the boundary explicit: the embedding model is NOT
-LoRA-adapted (online adaptation would silently misalign stored vectors against
-newly-produced ones). The reranker IS. This ADR specifies that consumer.
+Native lattice/cross-encoder rerank, LoRA hook resolution, runtime rerank config,
+latency disable behavior, and memory-path `RerankExecuted` emission are deferred.
+`khive-retrieval` contains a native cross-encoder scaffold and an empty
+`native-rerank` feature only.
 
 ### What this ADR does
 
-- Adds a **composable** rerank stage to the recall pipeline (ADR-033) between fuse
-  and score. The stage runs one or more named rerankers, each producing a per-candidate
-  score; their contributions feed `recall.score`'s weighted sum.
-- Defines the `Reranker` trait and three v1 built-in implementations:
-  cross-encoder (lattice-inference), salience-weighted (pure math from memory
-  metadata), and graph-proximity (hop-decay over KG structure).
-- Defines the lattice-inference cross-encoder call signature, model selection,
-  and latency budget — the heaviest single reranker. (§§1–6)
-- Wires brain-resolved LoRA hooks into the cross-encoder forward pass — LoRA
-  adapts only LLM-based rerankers; pure-math rerankers (salience, graph-proximity)
-  carry no adapter.
-- Specifies the failure modes (no rerank model loaded, no profile bound,
-  target-model mismatch) — each falls back gracefully.
-- Reserves the same shape for future call sites (query paraphraser, synthesizer) so
-  they reuse the dispatch pattern.
+- Defines the deferred native rerank design: a local cross-encoder/lattice tier,
+  LoRA hook routing, and native rerank events.
+- Establishes that embeddings are not LoRA-adapted; only future LLM-based rerank
+  and similar inference call sites may consume LoRA hooks.
+- Reserves the same shape for future call sites (query paraphraser, synthesizer).
 
 ### What this ADR does NOT do
 
-- Add query paraphrasing or synthesis call sites — separate future ADRs.
-- Adapt the embedding model (forbidden by ADR-032 §5b).
-- Specify training a rerank LoRA from scratch — training pipelines live in
-  `lattice-tune::train` (lattice ADR-026); brain consumes already-trained adapters
-  and tunes them online via `khive-pack-brain::lora::sgd_step` (ADR-032 §5b).
-- Replace the existing scoring formula (ADR-033 §1). Rerank is an _additional_ signal
-  the scoring pipeline can weigh; the existing RRF + salience + temporal terms
-  remain.
+- Change the shipped ADR-033 weighted feature rerank contract.
+- Claim that `lattice-inference`, LoRA hooks, runtime `rerank_model_id`, or
+  memory-path `RerankExecuted` emission are currently shipped.
+- Add query paraphrasing or synthesis call sites.
 
 ---
 
@@ -81,43 +67,27 @@ newly-produced ones). The reranker IS. This ADR specifies that consumer.
 ADR-030 provides retrieval engines and low-level fusion primitives; it does NOT define
 reranker traits or rerank weights. Those belong here.
 
-**Resolution**: the rerank stage resolves `consumer_kind="rerank"` against the brain
-profile binding chain (ADR-032 §10), unless the upstream recall profile pins a
-`rerank_profile_id`. See ADR-033 §8.2 for the full recall→rerank profile resolution
-precedence.
+**Resolution**: shipped weighted feature rerank does not resolve brain profiles or LoRA
+hooks. Native rerank profile resolution for `consumer_kind="rerank"` is deferred.
 
-**Score shape**: `RerankedHit` carries two score fields:
+**Score shape**: shipped `memory.recall_rerank` returns:
 
-- `rerank_scores: HashMap<&'static str, f32>` — per-reranker score keyed by reranker
-  name (e.g., `"cross_encoder"`, `"salience"`, `"graph_proximity"`). Used by
-  `recall.score` via `RecallConfig.reranker_weights` and available for audit.
-- `final_score: f32` — weighted combination of per-reranker scores computed by the
-  rerank stage for ordering purposes. `recall.score` may further blend this with the
-  RRF + salience + temporal terms.
+- `rerank_scores`: per-feature weighted contributions keyed by feature name.
+- `rerank_score`: the normalized weighted feature score.
 
-Both fields are always present after the rerank stage runs. Downstream stages use
-`final_score` for ordering and `rerank_scores` for per-reranker audit/debug.
+In full `memory.recall`, when `reranker_weights` is non-empty, `rerank_score` becomes
+the final `rank_score` directly. It is not further blended with RRF/salience/temporal.
 
-### 1. New stage: `recall.rerank` between `recall.fuse` and `recall.score`
+### 1. Shipped weighted-rerank subhandler and deferred native stage
 
-ADR-033 §2 defines five pipeline stages. This ADR inserts a sixth between fuse and
-score:
+The shipped memory-pack subhandler is:
 
-```text
-recall(query, namespace, limit, config?):
-  recall.embed        →  {embeddings: [{engine_id, model_id, vector}]}     (ADR-033, ADR-031)
-  recall.candidates   →  {text_hits, vector_hits_by_engine}                 (ADR-033, ADR-031)
-  recall.fuse         →  {fused_hits}                                       (ADR-033)
-  recall.rerank       →  {reranked: [{id, rerank_scores: HashMap<&'static str, f32>, final_score: f32}]}  (this ADR)
-  recall.score        →  {scored: [{id, score, breakdown}]}                 (ADR-033)
-  selector            →  top-K under budget                                 (ADR-033)
-```
+| Handler                | Visibility | Input                   | Output                                                                   |
+| ---------------------- | ---------- | ----------------------- | ------------------------------------------------------------------------ |
+| `memory.recall_rerank` | Subhandler | `{candidates, config?}` | `{reranked: [{note_id, rerank_scores, rerank_score}], active_rerankers}` |
 
-The rerank stage is a new memory-pack-owned handler:
-
-| Handler                | Visibility | Input                                               | Output                                                                                                |
-| ---------------------- | ---------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `memory.recall_rerank` | Internal   | `{query, fused_hits, hook?: profile_id, model_id?}` | `{reranked: [{id, rerank_scores: HashMap<&'static str, f32>, final_score: f32}], hook_applied: bool}` |
+It is an internal feature-weight subhandler. It does not accept `hook`, `profile_id`, or
+`model_id`, and it does not return `hook_applied`.
 
 The `hook` parameter is an optional profile id — when provided, the handler resolves
 the profile and passes its `LoraHook` to the rerank forward (§4 below). When omitted,
@@ -132,7 +102,7 @@ deployment has a rerank model configured.
 Rerank model choice is a deployment configuration parameter, not a hardcoded constant.
 `RuntimeConfig` gains:
 
-```rust
+````rust
 pub struct RuntimeConfig {
     // … existing fields …
     // NOTE: embedding_model is NOT carried here. Embedding generation is the
@@ -147,21 +117,10 @@ pub struct RuntimeConfig {
 
 /// Rerank-specific configuration, separate from RuntimeConfig.
 /// Embedding model is NOT carried here — embedding generation is the caller's
-/// responsibility per ADR-031:342-348. The reranker receives pre-computed
-/// embeddings if cross-encoder reranking needs them.
-pub struct RerankConfig {
-    pub rerankers: Vec<RerankerDef>,
-    pub reranker_weights: HashMap<String, f64>,
-    pub top_k: usize,
-}
-```
-
-Default `None`. Deployments opt in by setting `KHIVE_RERANK_MODEL_ID` env var or the
-config field. v1 sentinel default model: a Qwen3-class small model (~0.8B) loaded via
-`lattice-inference`. The exact model is chosen by the deployment — lattice ships
-multiple Qwen3 variants and supports BERT-class cross-encoders too. khive does not
-prescribe a single model; it prescribes the loading path (`lattice-tune::registry`)
-and the inference path (`lattice-inference::forward`).
+No shipped `RerankConfig`, `RuntimeConfig.rerank_model_id`, `RuntimeConfig.rerank_top_n`,
+or `KHIVE_RERANK_*` environment variable surface exists. The shipped opt-in is
+per-call or active `RecallConfig.reranker_weights` in the memory pack. Native model
+selection remains deferred.
 
 ### 3. Latency budget
 
@@ -186,24 +145,9 @@ the operator can `KHIVE_RERANK_DISABLED=1` to force-skip.
 
 ### 4. LoRA hook resolution
 
-When the recall pipeline reaches `recall.rerank`, brain (if loaded) resolves a
-profile via `brain.resolve(actor, namespace, consumer_kind="rerank")`. The resolved
-profile's `inference_hook` (ADR-032 §2) returns `Option<Box<dyn LoraHook>>`:
-
-- **No brain loaded**: rerank runs with `NoopLoraHook`.
-- **Brain loaded, no profile bound for this context**: same — `NoopLoraHook`.
-- **Profile bound, non-LoRA state class**: `profile.inference_hook` is `None` for
-  Bayesian, Trajectory, etc. classes — `NoopLoraHook`.
-- **Profile bound, LoRA class, target_model_id mismatch**: drop the hook with a debug
-  log; rerank with `NoopLoraHook`. The adapter was trained for a different rerank
-  model — applying it would produce nonsense (ADR-032 §5b).
-- **Profile bound, LoRA class, target_model_id matches**: pass `state.as_hook()`
-  to the rerank forward. The adapter modifies the forward pass per layer per module
-  via lattice ADR-008's hook.
-
-The hook is read from brain's per-context `ArcSwap<Box<dyn LoraHook>>` (ADR-032 §5b).
-The cost when no adapter is bound: a `Box::new(NoopLoraHook)` with `#[inline(always)]`
-empty body — eliminated by the compiler at the forward-pass call sites.
+Native LoRA hook resolution is deferred. Shipped `brain.resolve` exists, but the memory
+weighted-rerank path does not resolve rerank profiles, does not call `resolve_rerank_hook`,
+and does not depend on lattice LoRA hook types.
 
 ```rust
 async fn handle_recall_rerank(
@@ -236,7 +180,7 @@ async fn handle_recall_rerank(
 
     Ok(merge_scores(fused_hits, scores))
 }
-```
+````
 
 `brain.resolve_rerank_hook(caller_ctx, model_id)` is the §4 resolution chain plus the
 target-model-id check, returning `Box<NoopLoraHook>` on any mismatch.
@@ -284,60 +228,25 @@ that reference rerank outputs).
 The rerank stage is degraded-mode-tolerant by design — fused hits are always a valid
 fallback because they're what the pipeline used before this ADR existed.
 
-### 7. Reranker trait — the composability surface
+### 7. Native reranker trait — deferred
 
-§§1–6 specified the cross-encoder reranker. v1 ships three rerankers behind a
-single trait so the recall pipeline composes them by configuration, not code
-change:
+The shipped memory pack does not instantiate native reranker objects and does not ship
+`cross_encoder`, `salience`, or `graph_proximity` model/pure-math rerankers behind a
+memory-pack `Reranker` trait.
 
-```rust
-pub trait Reranker: Send + Sync {
-    /// Stable name used in RecallConfig (e.g., "cross_encoder", "salience",
-    /// "graph_proximity"). MUST be unique across registered rerankers.
-    fn name(&self) -> &'static str;
+Shipped rerank computes a single weighted score from five feature keys:
 
-    /// Score N (query, candidate) pairs. Returns one f32 per candidate in input order.
-    /// Pure rerankers (salience, graph_proximity) ignore `query` and `hook`.
-    async fn score_batch(
-        &self,
-        query:      &str,
-        candidates: &[RerankCandidate<'_>],
-        ctx:        &RerankContext<'_>,
-    ) -> Result<Vec<f32>, RerankerError>;
-}
+| Feature name   | Source                               |
+| -------------- | ------------------------------------ |
+| `relevance`    | Fused retrieval score                |
+| `salience`     | Decay-adjusted note salience         |
+| `temporal`     | Half-life recency score              |
+| `text_match`   | Candidate appeared in text results   |
+| `vector_match` | Candidate appeared in vector results |
 
-pub struct RerankContext<'a> {
-    pub namespace:  &'a str,
-    pub hook:       Option<&'a dyn LoraHook>,    // None for pure-math rerankers
-    pub config:     &'a RerankerConfig,
-    // future: deadline, tracing span
-}
-```
-
-Each Reranker owns its own latency budget; the cross-encoder's ≤50ms/≤200ms (§3)
-is one Reranker's policy. Pure-math rerankers (salience, graph-proximity) are
-microsecond-scale and impose no budget.
-
-#### v1 built-in rerankers
-
-| Name              | Implementation                                                                                                                                                                                                                 | Adapter?          | Source                          |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------- | ------------------------------- |
-| `cross_encoder`   | Calls `lattice_inference::rerank(model_id, inputs, hook)` per §1                                                                                                                                                               | Yes (LoRA via §4) | §§1–6 of this ADR               |
-| `salience`        | `score(c) = α + (1 - α) * c.salience` with α default `0.5` (matches old khive ADR-024 salience-weighted rerank). Pure math, no IO.                                                                                             | No                | New in v1                       |
-| `graph_proximity` | `score(c) = base * decay^min_hops(c.entity, anchor_entities)` with `decay` default `0.7`. `anchor_entities` come from `RerankContext.config.anchors` (caller-specified). Reads the edge table via `khive-storage::GraphStore`. | No                | Restored from old khive ADR-061 |
-
-`salience` and `graph_proximity` are pure-math rerankers — no model, no inference,
-no adapter. They serve as cheap signal that brain can learn to weight up or down
-per profile. The cross-encoder is the heavy-but-precise rerankerin this lineup; the
-others are cheap-but-shallow.
-
-#### Stage execution
-
-`recall.rerank` runs ALL configured rerankers in parallel (since they are
-independent), collects their per-candidate scores, and writes them to the
-candidate as `rerank_scores: HashMap<&'static str, f32>` (keyed by reranker name).
-The score stage (`recall.score`) consumes this map via per-reranker weights in
-`RecallConfig.reranker_weights: HashMap<String, f64>`.
+The generic retrieval `Reranker` trait and native cross-encoder scaffold exist in
+`khive-retrieval`, but native cross-encoder use remains deferred until the inference
+port lands.
 
 If a reranker errors, its scores default to `0.0` for that batch — the rest of the
 pipeline proceeds. This preserves the §6 degraded-mode-tolerance contract per
@@ -385,26 +294,20 @@ into the Reranker trait would dilute it.
 
 ## Rationale
 
-### Why insert rerank between fuse and score (not replace score)
+### Why shipped weighted rerank replaces the default score
 
-`recall.score` applies the v1 weighted formula over `(rrf_score, salience, temporal)`.
-Rerank produces an additional signal — `rerank_score` — that the scoring pipeline can
-weight alongside the existing terms. Replacing scoring entirely would discard the
-working salience and temporal logic; inserting rerank as a stage adds signal without
-removing any.
-
-Concretely, ADR-033's `RecallConfig` gains `reranker_weights: HashMap<String, f64>` (default
-`{}`, so behavior is unchanged when no reranker is configured). With one or more rerankers
-enabled, the formula becomes:
+ADR-033's shipped behavior is REPLACE, not blend. `RecallConfig.reranker_weights`
+defaults to `{}`, so behavior is unchanged when no weighted feature rerank is configured.
+When one or more supported feature weights are configured, the formula becomes:
 
 ```text
-score = relevance_weight * rrf_score
-      + salience_weight * effective_salience
-      + temporal_weight * temporal
-      + Σᵢ reranker_weights[i] * reranker_score[i]
+rank_score = Σ(weights[feature] × feature_value) / Σ(positive recognized weights)
 ```
 
-The weighted composition is the standard `WeightedObjective` extension (ADR-024).
+The supported feature keys are `relevance`, `salience`, `temporal`, `text_match`, and
+`vector_match`. The existing default scoring path is skipped for that request because
+the weighted feature score already covers the same base axes plus retrieval-source
+features.
 
 ### Why rerank, not query paraphrasing, first
 
@@ -533,23 +436,22 @@ deployments compile the flag in but never load a LoRA profile.
 
 ### Events
 
-- `crates/khive-types/src/event.rs`: add `EventKind::RerankExecuted`.
-- `crates/khive-runtime/src/observations.rs`: add per-kind decoder for
-  `RerankExecuted` per ADR-041 (Candidate inputs + Selected outputs).
+`EventKind::RerankExecuted` and DB projection support exist, but the shipped memory
+weighted-rerank path does not emit `RerankExecuted`. Event emission is reserved for the
+native rerank path or a future explicit instrumentation change.
 
 ### Tests
 
-| Scenario                                                                    | Assert                                                                                           |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `rerank_model_id = None`                                                    | Recall pipeline skips rerank stage; results identical to pre-ADR.                                |
-| `rerank_model_id = Some(...)`, no brain                                     | Rerank runs with NoopLoraHook; `hook_applied = false`.                                           |
-| Brain bound, non-LoRA profile                                               | Rerank runs with NoopLoraHook; event records `served_by_profile_id`.                             |
-| Brain bound, LoRA profile, matching target                                  | Rerank runs with adapter hook; event records `hook_applied=true, hook_target_match=true`.        |
-| Brain bound, LoRA profile, mismatched target                                | Rerank runs with NoopLoraHook; event records `hook_applied=false, hook_target_match=false`.      |
-| Rerank latency > 500ms                                                      | Warning event emitted; rerank still applied for the call.                                        |
-| 5 latency warnings in 5min                                                  | Rerank disabled for process lifetime; subsequent calls log "rerank disabled by SLO".             |
-| `lattice-tune/inference-hook` disabled at compile + LoRA profile registered | Boot fails with feature-flag error.                                                              |
-| Rerank output ordering                                                      | Top-K reranked items appear in `Selected` rows of `RerankExecuted` event with correct positions. |
+Shipped tests cover:
+
+| Scenario                          | Assert                                                                               |
+| --------------------------------- | ------------------------------------------------------------------------------------ |
+| Empty `reranker_weights`          | Weighted rerank is pass-through and default scoring behavior is unchanged.           |
+| Configured feature weights        | Weighted feature score changes result ordering and replaces the default final score. |
+| `memory.recall_rerank` subhandler | Returns `{reranked, active_rerankers}` with per-feature `rerank_scores`.             |
+
+Native model, LoRA hook, latency-disable, process-wide disable, and emitted-event tests
+are deferred with native rerank.
 
 ---
 

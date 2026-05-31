@@ -81,17 +81,19 @@ struct BulkLinkEntry {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LinkParams {
-    namespace: Option<String>,
     // singleton fields — all optional when `links` is present
     source_id: Option<String>,
     target_id: Option<String>,
     relation: Option<String>,
     weight: Option<f64>,
+    metadata: Option<Value>,
+    dependency_kind: Option<String>,
+    verbose: Option<bool>,
     // bulk fields
     links: Option<Vec<BulkLinkEntry>>,
     atomic: Option<bool>,   // default true
-    verbose: Option<bool>,
 }
 ```
 
@@ -102,18 +104,18 @@ Every entry in a bulk call undergoes the same validation as a singleton:
 1. `source_id` and `target_id` are resolved via `resolve_uuid_async` before any write.
 2. Endpoint kind rules (`validate_edge_relation_endpoints` per ADR-002) are enforced for every entry.
 3. Weights are clamped to `[0.0, 1.0]`.
-4. Duplicate natural keys `(source, target, relation)` within the same call are rejected before
-   reaching storage — detected in-process, not via DB round-trip.
+4. Duplicate natural keys `(source, target, relation)` within the same call are coalesced before
+   storage and counted in `skipped`.
 
 #### Atomicity modes
 
-`atomic = true` (default): all entries are validated and built into `Vec<Edge>` before
-`upsert_edges` is called. The `BEGIN IMMEDIATE` transaction in the DB layer either commits the
-entire set or rolls back entirely. If any entry fails validation, no edges are written.
+`atomic = true` (default): all entries are resolved and built into `Vec<LinkSpec>` before
+`runtime.link_many` is called. The DB layer either commits the entire set or rolls back entirely.
+If any entry fails validation before `link_many`, no edges are written.
 
-`atomic = false` (opt-in): entries are submitted in a single `upsert_edges` call, but per-entry
-storage errors are tolerated. The response carries per-entry success/failure. Callers must inspect
-`errors` to determine which entries did not land.
+`atomic = false` (opt-in): entries are attempted one by one through singleton `runtime.link`.
+Validation/storage errors are collected in `errors`, successful entries commit individually, and
+duplicate natural keys are counted in `skipped`.
 
 #### Limit
 
@@ -147,36 +149,25 @@ call. When `verbose = false`, `edges` is omitted from the response.
 ### Part 2: Request Batch Conflict Detection
 
 Add a write-set preflight step in `run_parsed` before `join_all`. If two operations in the same
-parallel batch target the same write key, the entire batch is rejected before any dispatch.
+parallel batch target the same write key, conflicting operations receive per-op conflict errors;
+non-conflicting operations still dispatch. This preserves the ADR-016 envelope invariant:
+`results.length == summary.total == input.ops.length`.
 
 #### Write-set model
 
-Each mutating verb reports a set of opaque conflict keys. Key formats:
+The shipped preflight uses static parser-side extraction in `khive-request`, not a
+`PackRuntime::write_keys` trait method. Current key formats are parser-owned opaque strings:
 
 ```text
-entity:<namespace>:<uuid>
-note:<namespace>:<uuid>
-edge:<namespace>:<edge_id>
-edge-natural:<namespace>:<source_uuid>:<target_uuid>:<relation>
+entity:<uuid>
+edge-natural:<source_uuid>:<target_uuid>:<relation>
 ```
 
-Packs expose write-key metadata via a new optional method on `PackRuntime`:
-
-```rust
-// crates/khive-runtime/src/pack.rs
-fn write_keys(
-    &self,
-    verb: &str,
-    params: &Value,
-    default_namespace: &str,
-) -> Option<Vec<String>> {
-    let _ = (verb, params, default_namespace);
-    None
-}
-```
-
-The default returns `None`. Existing packs compile without changes. Opt-in for new packs that
-want conflict protection.
+Known implementation gap: the intended stable error shape includes `conflict_ops`, and bulk
+`link(links=[...])` should contribute every contained natural edge key. The current shipped
+implementation omits `conflict_ops` and only extracts singleton `link(source_id, target_id,
+relation)` keys. Keep those as code-side follow-ups; do not change this ADR to claim bulk
+array conflict protection is complete.
 
 #### Preflight algorithm
 
@@ -224,8 +215,9 @@ bulk operation:
 - Non-conflicting ops execute normally.
 - `results.length == summary.total == input.ops.length` (ADR-016 contract preserved).
 
-If atomic-all-or-nothing semantics are required, the caller uses the chain syntax
-(ADR-016 `[op1 | op2]`) which aborts the chain on first failure.
+If ordered dependency semantics are required, the caller uses top-level pipe-chain syntax
+(ADR-016 `op1(...) | op2(...)`) which aborts the chain on first failure. Do not wrap pipe
+chains in `[...]`; bracketed form is the parallel batch syntax.
 
 #### Error shape (per conflicting op)
 

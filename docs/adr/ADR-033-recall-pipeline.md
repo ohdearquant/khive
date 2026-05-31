@@ -39,19 +39,19 @@ calibrated empirically without recompilation.
 
 ```rust
 /// Per-call configuration for the recall scoring pipeline.
-/// All fields have defaults that reproduce v1 behavior exactly.
+/// All fields have defaults that reproduce current shipped behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RecallConfig {
     // Fusion weights — must be non-negative; sum must be > 0
     pub relevance_weight: f64,       // default 0.70
-    pub salience_weight: f64,         // default 0.20
+    pub salience_weight: f64,        // default 0.20
     pub temporal_weight: f64,        // default 0.10
 
-    // Per-reranker weights, keyed by reranker name (ADR-042 §7). v1 built-ins:
-    // "cross_encoder", "salience", "graph_proximity". Missing keys → 0.0 (disabled).
+    // Weighted feature rerank. Keys are feature names, not model reranker names.
+    // Supported shipped keys: "relevance", "salience", "temporal",
+    // "text_match", "vector_match". Missing keys are disabled.
     pub reranker_weights: HashMap<String, f64>,
-    // Per-reranker config (e.g., graph_proximity anchors, salience α).
-    pub reranker_params:  HashMap<String, serde_json::Value>,
 
     // Temporal parameters
     pub temporal_half_life_days: f64, // default 30.0
@@ -59,16 +59,15 @@ pub struct RecallConfig {
 
     // Retrieval parameters
     pub candidate_multiplier: u32,    // default 20 — candidates per path before fusion
-    pub fusion_strategy: FusionStrategy, // default Weighted { weights: [0.7, 0.3] } (CC-6)
-    pub min_score: f64,              // default 0.0
-    pub min_salience: f64,           // default 0.0
+    pub candidate_limit: Option<u32>, // explicit cap; None preserves multiplier behavior
+    pub fuse_strategy: FusionStrategy, // default Weighted { weights: [0.7, 0.3] }
+    pub min_score: f64,               // default 0.0
+    pub min_salience: f64,            // default 0.0
+    pub include_breakdown: bool,      // default false
 
-    // Selector parameters
-    pub diversity_bias: f32,         // default 0.0 — category diversity
-    pub budget: Option<usize>,       // default None — no token/byte budget
-
-    // Migration behavior (ADR-043)
-    pub fallback_during_migration: bool, // default true — FTS5-only when no active model
+    // Archive scoring override and brain-profile hint.
+    pub scoring: Option<ScoringConfig>,
+    pub brain_profile: Option<BrainProfileHint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,28 +87,25 @@ Defaults reproduce current behavior. Changing any field is a backward-compatible
 shift. Invalid configs (negative weights, zero-sum weights) are caught at handler entry and
 return a per-op `{ok: false, error: "..."}` response; the batch does not abort.
 
-Pack defaults are set in `settings.json` under the `memory` pack key. Per-call overrides in
-the `config` field take precedence over pack defaults for the duration of one call.
+The shipped pack keeps an in-process active `RecallConfig` in `MemoryPack`.
+`PackTunable::apply_config` validates and updates that active config. Per-call overrides in
+the `config` field take precedence for one call. File-backed persistence of calibrated
+defaults is not shipped in ADR-033.
 
 ### 2. Six pipeline stages
 
-The recall pipeline decomposes into six stages. Each stage is an independently callable
-handler. The `recall` verb runs all six in sequence. Individual handlers are available for
-calibration and debugging.
+The recall pipeline decomposes into shipped subhandlers. `memory.recall` is the public verb.
+The debug/calibration handlers are registered as `Visibility::Subhandler`; MCP blocks normal
+calls to subhandlers and exposes help only.
 
-All handlers live under the `memory` pack namespace. The five debug/calibration handlers
-are tagged `Visibility::Internal` (per [ADR-023](ADR-023-declarative-pack-format.md) §2);
-only `memory.recall` is `Visibility::Verb` and reachable from MCP. The Internal handlers
-remain callable via `kkernel call memory <handler>` for operator/CI workflows.
-
-| Handler                    | Visibility | Input                                | Output                                                                                          |
-| -------------------------- | ---------- | ------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| `memory.recall_embed`      | Internal   | `{query: str}`                       | `{embeddings: [{engine_id, model_id, vector: [f32]}]}`                                          |
-| `memory.recall_candidates` | Internal   | `{query, namespace, limit}`          | `{text_hits, vector_hits_by_engine}`                                                            |
-| `memory.recall_fuse`       | Internal   | `{text_hits, vector_hits, strategy}` | `{fused_hits}`                                                                                  |
-| `memory.recall_rerank`     | Internal   | `{query, fused_hits, config}`        | `{reranked: [{id, rerank_scores: {name: f32}}]}` — runs all configured rerankers per ADR-042 §7 |
-| `memory.recall_score`      | Internal   | `{fused_hits, reranked?, config}`    | `{scored: [{id, score, breakdown}]}`                                                            |
-| `memory.recall`            | **Verb**   | `{query, namespace, limit, config?}` | `{results}`                                                                                     |
+| Handler                    | Visibility | Input                                  | Output                                                                   |
+| -------------------------- | ---------- | -------------------------------------- | ------------------------------------------------------------------------ |
+| `memory.recall_embed`      | Subhandler | `{query: str}`                         | `{embeddings: [{engine_id, model_id, vector: [f32]}]}`                   |
+| `memory.recall_candidates` | Subhandler | `{query, namespace, limit}`            | `{text_hits, vector_hits_by_engine}`                                     |
+| `memory.recall_fuse`       | Subhandler | `{text_hits, vector_hits, strategy}`   | `{fused_hits}`                                                           |
+| `memory.recall_rerank`     | Subhandler | `{candidates, config?}`                | `{reranked: [{note_id, rerank_scores, rerank_score}], active_rerankers}` |
+| `memory.recall_score`      | Subhandler | `{fused_hits, reranked?, config}`      | `{scored: [{id, score, breakdown}]}`                                     |
+| `memory.recall`            | **Verb**   | `{query, namespace?, limit?, config?}` | `{results}`                                                              |
 
 `memory.recall_embed` generates one embedding **per active engine** — the multi-engine
 fan-out from ADR-031. The output is a list of `{engine_id, model_id, vector}` triples,
@@ -182,67 +178,19 @@ Dotted handlers establish a convention: packs may expose sub-verb handlers at
 pattern (e.g., `kg.validate`, `gtd.schedule`) but each pack must document its dotted surface
 in its pack manifest.
 
-### 4. Three new Objective implementations
+### 4. Shipped scoring and rerank behavior
 
-The recall pipeline maps to a `ComposePipeline` ([ADR-024](ADR-024-fold-cognitive-primitives.md)):
+The shipped `memory.recall` path computes the three base score components
+(`relevance`, `salience`, `temporal`) and then chooses one final score path:
 
-```rust
-impl MemoryPack {
-    fn build_recall_pipeline(
-        &self,
-        config: &RecallConfig,
-    ) -> ComposePipeline<NoteCandidate> {
-        let mut terms: Vec<(f64, Box<dyn Objective<NoteCandidate>>)> = vec![
-            (config.relevance_weight, Box::new(RrfFusionObjective)),
-            (config.salience_weight, Box::new(DecayAwareSalienceObjective {
-                decay_model: config.decay_model.clone(),
-            })),
-            (config.temporal_weight, Box::new(TemporalRecencyObjective {
-                half_life_days: config.temporal_half_life_days,
-            })),
-        ];
-        // Per-reranker contributions (ADR-042 §7). Each reranker's score lives on
-        // NoteCandidate.rerank_scores keyed by reranker name; the Objective looks
-        // up its own key. Missing keys are treated as 0.0 (reranker not run).
-        for (name, weight) in &config.reranker_weights {
-            if *weight > 0.0 {
-                terms.push((*weight, Box::new(RerankerObjective::new(name.clone()))));
-            }
-        }
-        let objective = WeightedObjective::new(terms);
+1. When `RecallConfig.reranker_weights` is empty, use the default/archive scoring path.
+2. When `RecallConfig.reranker_weights` is non-empty, build the five rerank features
+   (`relevance`, `salience`, `temporal`, `text_match`, `vector_match`) and call
+   `weighted_rerank`; the returned value becomes the final `rank_score`.
 
-        ComposePipeline {
-            anchor: Box::new(NoAnchor),
-            objective: Box::new(objective),
-            selector: Box::new(GreedySelector),
-        }
-    }
-}
-```
-
-The three new Objective implementations:
-
-```rust
-/// Scores by RRF-fused retrieval relevance.
-/// Receives the pre-computed RRF score via NoteCandidate.rrf_score — pure math, no IO.
-pub struct RrfFusionObjective;
-
-/// Scores by salience with configurable temporal decay.
-pub struct DecayAwareSalienceObjective {
-    pub decay_model: DecayModel,
-}
-
-/// Scores by pure temporal recency with configurable half-life.
-pub struct TemporalRecencyObjective {
-    pub half_life_days: f64,
-}
-```
-
-These implement the `Objective<NoteCandidate>` trait from `khive-fold`. They compose via
-`WeightedObjective`, `PriorityObjective`, and other combinators from ADR-024. They
-participate in the Hoare triple. Precision-weighting (ADR-024 §Bayesian extensions) applies
-to each — callers with calibrated precision estimates for RRF reliability or decay accuracy
-may override the default `precision() = 1.0`.
+This is a REPLACE strategy, not an additive `WeightedObjective` blend with named
+model rerankers. `RerankerObjective`, `cross_encoder`, and `graph_proximity` remain
+deferred native-rerank design owned by ADR-042.
 
 ### 5. Config as a recall verb parameter
 
@@ -262,9 +210,7 @@ The `recall` verb accepts an optional `config` object. Missing fields use pack d
 }
 ```
 
-Per-call config does not persist. To persist a calibrated config, write it to `settings.json`
-under the memory pack's config key. File-based defaults and per-call overrides compose: the
-call-level config wins field-by-field over file defaults.
+Per-call config does not persist.
 
 ### 6. Recall Hoare triple
 
@@ -398,10 +344,10 @@ per-model vector breakdown is only exposed via the `recall.candidates` sub-handl
 vector store (single-model path). `recall.candidates` will not include
 `vector_candidates_per_model` in this case.
 
-**Strategy guidance for N > 1 models:** The `Weighted` fusion strategy uses two
-configurable weights (vector, keyword). With N > 1 models, the N vector sources and 1 text
-source exceed the expected 2-source layout. Use `"rrf"` (default) or `"union"` when multiple
-models are active; `"weighted"` maps only the first two sources to the configured weights.
+**Strategy guidance for N > 1 models:** The shipped weighted fusion path first unions
+per-model vector hits into one combined vector source, then fuses `[combined_vector, text]`
+with the configured vector/text weights. `"rrf"` and `"union"` still accept N separate
+vector sources; `"weighted"` operates on the combined-vector plus text layout.
 
 ### 7. Calibration protocol
 
@@ -433,72 +379,15 @@ The brain's Bayesian update loop treats each weight in `RecallConfig` as a param
 prior distribution. Posterior updates from confirmed feedback events shift the weight
 estimates. The brain exposes its learned config via `brain.config(param="recall.*")`.
 
-#### 8.1 Profile resolution at recall setup
+#### 8.1 Shipped brain integration status
 
-The recall profile resolves `consumer_kind="recall"` and controls **recall-stage**
-configuration: query interpretation, candidate generation, diversity, top-k, and
-recall-level scoring. The recall profile does NOT automatically own rerank-stage
-model/profile selection. The rerank stage resolves `consumer_kind="rerank"` independently
-(see ADR-042), unless the recall profile **explicitly pins** a `rerank_profile_id`.
+Shipped brain integration for memory recall is limited to `PackTunable` projection and
+application of `BalancedRecallState` into `RecallConfig`. `brain_profile` is a config
+hint; handler-level cross-pack lookup is still TODO.
 
-When the brain pack is loaded, the `recall` handler resolves a profile at setup time
-(before any stage runs) via `brain.resolve(actor, namespace, consumer_kind="recall")`
-— ADR-032 §10. The resolved profile contributes:
-
-- **Config overrides**: `RecallConfig` fields the profile has tuned (relevance/salience/
-  temporal/rerank weights, decay model, half-life). Profile config overrides compose
-  field-by-field with the per-call `config` argument; the per-call config wins (operator
-  override beats automated tuning).
-- **Adapter hook (LoRA-class profiles only)**: `profile.inference_hook` returns a
-  `Box<dyn LoraHook>` consumed by the **rerank** call site (ADR-042), NOT by
-  `recall_embed`. Embedding is static / re-indexed on model upgrade — it is never
-  LoRA-adapted online (ADR-032 §5b table). The LoRA adapters in brain profiles
-  target the derivable harness models (reranker, future paraphraser, future
-  synthesizer) — see ADR-011 §"Adapter-aware inference" for the trait surface.
-
-#### 8.2 Recall → rerank profile resolution
-
-Profile ownership is split by stage:
-
-1. Recall profile resolves at call entry (`consumer_kind="recall"`).
-2. If the recall profile explicitly pins `rerank_profile_id`, use that rerank profile.
-3. Otherwise, the rerank stage resolves `consumer_kind="rerank"` using the same call
-   context (actor / namespace).
-4. If no rerank binding exists, fall back to default rerank config.
-
-Feedback rule:
-
-- Recall-stage feedback updates the **recall** profile.
-- Rerank-stage feedback updates the **rerank** profile actually used (after
-  pinning/fallback resolution).
-
-#### 8.2 Adapter routing by target model id
-
-A LoRA adapter is **tied to one lattice model's weight space**. Applying a reranker
-adapter to a paraphraser (or vice versa) produces nonsense.
-
-Resolution rule: `LoraProfileState.target_model_id` (ADR-032 §5b) names the lattice
-`RegisteredModel.id` the adapter was trained against. When the rerank pass (ADR-042)
-consumes the fused candidates from `recall_fuse`, it applies the adapter hook **only
-when the active rerank model's id matches the adapter's `target_model_id`**.
-Otherwise the hook is dropped (NoopLoraHook substitutes) and rerank runs unadapted.
-
-When future ADRs add a query-paraphrase pre-stage, the same rule applies: paraphrase
-calls the active paraphrase model with an adapter only when the resolved profile's
-`target_model_id` matches the paraphrase model id. Brain profiles can compose multiple
-LoRA states across multiple target models (ADR-032 §5g Composite) — one per derivable
-model in the pipeline.
-
-ADR-031's multi-engine **embedding** fan-out is orthogonal to adapter routing —
-embeddings are not adapted (ADR-032 §5b table). Multiple engines produce multiple
-candidate sets; the rerank stage fuses across engines, then applies one rerank
-adapter (matched by `target_model_id`) to the fused list.
-
-The memory pack does not implement the learning loop — it only produces the breakdowns
-that the brain consumes. The coupling is one-way for weight learning: brain reads recall
-breakdowns; recall reads brain config at setup time. The LoRA-adapter coupling is also
-brain → rerank (one direction); recall itself does not consume the adapter, the rerank
-stage in ADR-042 does.
+Runtime `brain.resolve` at recall call entry, rerank-stage profile resolution, LoRA hook
+routing, and target-model matching are deferred to the native rerank work in ADR-042.
+The shipped weighted feature rerank path does not consume brain LoRA adapters.
 
 ## Rationale
 

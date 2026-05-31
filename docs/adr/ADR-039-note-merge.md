@@ -48,8 +48,8 @@ state change occurs. The caller is responsible for ensuring both IDs are the sam
 ```rust
 // crates/khive-pack-kg/src/handlers.rs
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MergeParams {
-    namespace:        Option<String>,
     into_id:          String,
     from_id:          String,
     kind:             Option<String>,          // public DSL discriminator: "entity" (default) | "note" | granular kinds
@@ -72,30 +72,30 @@ after the registry maps `kind` to its storage family.
 
 Note content requires its own merge policy because entities have no content field.
 
-| Value              | Behaviour                                                                                                                           |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `append` (default) | Appends `from` body to `into` body with a provenance separator: `\n\n---\n*merged from {from_id} at {merged_at}*\n\n{from_content}` |
-| `prefer_into`      | Keeps `into.content` unchanged; `from.content` is discarded.                                                                        |
-| `prefer_from`      | Replaces `into.content` with `from.content`.                                                                                        |
+| Value              | Behaviour                                                                                                                                                       |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `append` (default) | Appends `from` body to `into` body with a plain separator: `\n\n---\n\n{from_content}`. Provenance is stored in `_merge_history`, not embedded in note content. |
+| `prefer_into`      | Keeps `into.content` unchanged; `from.content` is discarded.                                                                                                    |
+| `prefer_from`      | Replaces `into.content` with `from.content`.                                                                                                                    |
 
 `append` is the default because it is the only lossless option. `prefer_into` and `prefer_from`
 are explicit opt-outs: the caller takes responsibility for discarding content.
 
 ### Field-level merge rules
 
-| Field          | Rule                                                                                    |
-| -------------- | --------------------------------------------------------------------------------------- |
-| `content`      | Per `content_strategy` above.                                                           |
-| `properties`   | Deep-merge via existing `merge_properties` helper (same as entity merge).               |
-| `tags`         | Union via existing `union_tags` helper (same as entity merge).                          |
-| `status`       | `prefer_into` always — status lifecycle is owned by the target note.                    |
-| `salience`     | `max(into.salience, from.salience)` — preserve the higher attention weight.             |
-| `decay_factor` | `into.decay_factor` always — the caller owns the decay policy of the target note.       |
-| `expires_at`   | Later of the two expiry timestamps if either is set; `None` if both are `None`.         |
-| `created_at`   | Preserve `into.created_at` — the target note retains its original timestamp.            |
-| `updated_at`   | Set to the merge timestamp.                                                             |
-| `kind`         | Must match between `into` and `from`; mismatched kinds reject with `IncompatibleKinds`. |
-| `memory_type`  | `into.memory_type` always (memory pack field; preserved from target).                   |
+| Field          | Rule                                                                                                                                                                         |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `content`      | Per `content_strategy` above.                                                                                                                                                |
+| `properties`   | Deep-merge via existing `merge_properties`, then append `_merge_history`.                                                                                                    |
+| `tags`         | Shipped storage-level notes have no `tags` column; `tags_unioned` remains `0`. Memory-pack tags, when present, live under `properties.tags` and follow property merge rules. |
+| `status`       | `prefer_into` always — status lifecycle is owned by the target note.                                                                                                         |
+| `salience`     | `max(into.salience, from.salience)` — preserve the higher attention weight.                                                                                                  |
+| `decay_factor` | `into.decay_factor` always — the caller owns the decay policy of the target note.                                                                                            |
+| `expires_at`   | Later of the two expiry timestamps if either is set; `None` if both are `None`.                                                                                              |
+| `created_at`   | Preserve `into.created_at` — the target note retains its original timestamp.                                                                                                 |
+| `updated_at`   | Set to the merge timestamp.                                                                                                                                                  |
+| `kind`         | Must match between `into` and `from`; mismatched kinds reject with `IncompatibleKinds`.                                                                                      |
+| `memory_type`  | Memory-pack `memory_type` is stored in `properties.memory_type`; it is not a storage column.                                                                                 |
 
 `kind` is immutable per ADR-013. Two notes of different kinds (e.g., `observation` and `insight`)
 cannot merge. The caller must supersede one with the other if cross-kind consolidation is needed.
@@ -108,15 +108,16 @@ with one appended entry per merge operation:
 ```json
 {
   "merged_from": "<from_id>",
-  "merged_at": "<ISO 8601 timestamp>",
-  "merge_strategy": "prefer_into | prefer_from | union",
-  "content_strategy": "append | prefer_into | prefer_from"
+  "merged_at": 1710000000000000,
+  "strategy": "PreferInto | PreferFrom | Union",
+  "content_strategy": "Append | PreferInto | PreferFrom"
 }
 ```
 
-The `_merge_history` key is created on first merge if absent. Subsequent merges into the same
-`into` note append entries. This provides an auditable chain without a separate event store
-query, and without requiring the caller to manage provenance manually.
+`merged_at` is an integer microsecond timestamp. Strategy values are the Rust Debug-form
+variant names emitted by the shipped implementation. The `_merge_history` key is created
+on first merge if absent. Subsequent merges into the same `into` note append entries.
+No provenance edge is created by `merge_note`.
 
 ### Graph and index behaviour
 
@@ -266,8 +267,8 @@ patch it after the merge.
 
 ## Tests Required
 
-- Happy path: two notes (same kind) merged; content appended; tags unioned; properties
-  deep-merged; `_merge_history` entry written.
+- Happy path: two notes (same kind) merged; content appended with a plain `---` separator;
+  properties deep-merged; `_merge_history` property entry written; `tags_unioned == 0`.
 - `prefer_into` content strategy: `into.content` unchanged; `from.content` discarded;
   `content_appended = false` in summary.
 - `prefer_from` content strategy: `into.content` replaced with `from.content`.

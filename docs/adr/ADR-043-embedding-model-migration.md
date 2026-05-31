@@ -145,144 +145,35 @@ column is the foreign-key-by-value reference back to `_embedding_models.model_id
 
 **sqlite-vec virtual tables.** vec0 virtual tables cannot accept `ALTER TABLE
 ADD COLUMN` because they declare their columns at `CREATE VIRTUAL TABLE` time.
-V16 handles this via the open-time path in `khive-db/src/backend.rs`: when
-opening a `vec_<engine>` table that lacks `embedding_model`, the runtime
-rebuilds the virtual table with the new schema. **Existing rows are lost on
-rebuild** — this is acceptable for deployments that have not yet enabled
-dual-embedding because vectors will be re-embedded by the next backfill cycle,
-but **operators must take a backup before upgrading any production deployment
-with persisted non-default embeddings**. A follow-up migration (tracked in
-ADR-043 §8.2) will implement a copy-with-default rebuild to preserve old
-vectors with their inferred model tag.
+V17 (`vector_embedding_model_tag_preserving_rebuild`) performs the shipped
+copy-with-default rebuild: it stages existing rows, recreates the virtual table
+with `field` and `embedding_model`, restores the rows, and backfills missing
+values to inferred defaults. After migrations, `khive-db/src/backend.rs` refuses
+to open an unmigrated vec0 table that still lacks `field` or `embedding_model`
+instead of silently dropping data.
 
-### 2. Triggers — three sources, one event
+### 2. Triggers — shipped state and deferred migration events
 
-A migration begins on one of:
+Shipped startup code registers configured embedding models directly in `_embedding_models`.
+I found no shipped event emission path for startup population. Operator migration and
+drift commands are parsable under `kkernel engine`, but `migrate` and `drift-check`
+return NotImplemented and point to follow-up #380.
 
-| Source                                                                    | Action                                                                                             | Event emitted                                                         |
-| ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| Engine config change in `khive.toml` (`[[engines]].name` or `output_dim`) | Detected at startup; kkernel compares config-declared keys against `_embedding_models` active rows | `EmbeddingModelChanged`                                               |
-| Operator CLI: `khive engine migrate <engine> --to <model>`                | Explicit start                                                                                     | `EmbeddingModelChanged`                                               |
-| Drift threshold breach via `khive engine drift-check`                     | Operator-triggered; lattice's drift detection returns distance > threshold                         | `EmbeddingDriftDetected` (advisory only — does NOT start a migration) |
+| Source                                                       | Shipped action                                    | Event emitted today |
+| ------------------------------------------------------------ | ------------------------------------------------- | ------------------- |
+| Engine config at startup                                     | Register active model rows in `_embedding_models` | None found          |
+| Operator CLI: `kkernel engine migrate <engine> --to <model>` | Callable stub returns NotImplemented (#380)       | None                |
+| Operator CLI: `kkernel engine drift-check <engine>`          | Callable stub returns NotImplemented (#380)       | None                |
 
-`EmbeddingModelChanged` payload:
+`EmbeddingModelChanged`, `EmbeddingMigrationCompleted`, `EmbeddingMigrationFailed`, and
+`EmbeddingDriftDetected` remain event enum contracts for the deferred migration worker and
+drift implementation.
 
-```rust
-pub struct EmbeddingModelChangedPayload {
-    pub engine_name:     String,
-    pub source_model_id: Option<Uuid>,    // _embedding_models.id; None on first registration
-    pub target_model_id: Uuid,            // new pending row's id
-    pub initiated_by:    InitiationKind,  // ConfigDiff | OperatorCli | (future) DriftAuto
-    pub plan:            MigrationPlanSummary,  // engine_name, source/target model ids, source/target dims, initiated_by
-    // Note: total_embeddings and batch_size are NOT in MigrationPlanSummary;
-    // they live on lattice_embed::migration::MigrationPlan, accessed by the worker
-    // directly from MigrationController — not from the event payload.
-}
-```
+### 3. `EmbedMigrationWorker` — deferred
 
-**No auto-migration on drift.** Drift detection surfaces a recommendation event; the
-operator decides whether to act. Auto-migrate on drift is out of scope (it risks
-runaway re-embed loops with model-quality oscillations) — its own ADR if revisited.
-
-### 3. `EmbedMigrationWorker`
-
-A background task launched at kkernel startup (`khive-pack-memory::migration::worker`).
-It subscribes to `EmbeddingModelChanged` events (via `PackEventConsumer`, ADR-017)
-and drives the migration to completion through `lattice_embed::migration::MigrationController`.
-
-Per-event flow:
-
-1. **Plan**: load the event payload's `MigrationPlanSummary`, construct a lattice
-   `MigrationPlan` via `MigrationController::plan(source, target, batch_size)`.
-2. **Stage table**: `CREATE TABLE vec_<engine>_pending AS SELECT * FROM vec_<engine> WHERE 0;`
-   — schema-matching empty table. `_pending` carries the new model's vectors as
-   they are produced.
-3. **Iterate batches**:
-   ```rust
-   while let Some(batch) = controller.next_batch().await? {
-       let records: Vec<(Uuid, String)> = load_record_texts(&batch).await?;
-       let new_vectors = registry.embed_batch(&records, target_model_id).await?;
-       insert_into_pending(&new_vectors).await?;
-       controller.mark_batch_done(batch.id).await?;
-   }
-   ```
-4. **Swap (atomic)**:
-   ```sql
-   BEGIN;
-     ALTER TABLE vec_<engine>         RENAME TO vec_<engine>_old;
-     ALTER TABLE vec_<engine>_pending RENAME TO vec_<engine>;
-     UPDATE _embedding_models SET status = 'superseded',
-         superseded_at = ?, superseded_by = ?
-         WHERE engine_name = ? AND status = 'active';
-     UPDATE _embedding_models SET status = 'active', activated_at = ?
-         WHERE id = ?;
-   COMMIT;
-   DROP TABLE vec_<engine>_old;
-   ```
-5. **Emit completion**: `EmbeddingMigrationCompleted` event carrying both model
-   ids, total records re-embedded, and elapsed time.
-
-#### sqlite-vec virtual table rename caveat
-
-The RENAME in step 4 behaves differently depending on the backend:
-
-- **Regular table** (e.g., quantized/flat backend): `ALTER TABLE vec_<engine> RENAME TO
-  vec_<engine>_old` followed by `ALTER TABLE vec_<engine>_pending RENAME TO vec_<engine>`
-  works as written. This path applies when the engine's vector store is backed by a plain
-  SQLite table.
-- **sqlite-vec virtual table**: Virtual tables created via `CREATE VIRTUAL TABLE ... USING
-  vec0(...)` do not reliably support `ALTER TABLE ... RENAME TO` once data is present. For
-  this path, use the documented sqlite-vec recreate pattern:
-  1. `CREATE VIRTUAL TABLE vec_<engine>_new USING vec0(embedding float[<new_dim>])` — create
-     a fresh virtual table with the target schema.
-  2. `INSERT INTO vec_<engine>_new SELECT * FROM vec_<engine>_pending` — copy new vectors.
-  3. `DROP TABLE vec_<engine>` — remove the old virtual table.
-  4. `ALTER TABLE vec_<engine>_new RENAME TO vec_<engine>` — rename succeeds because the
-     new table has no in-use readers (within the same transaction boundary).
-     Note: `CREATE TABLE vec_<engine>_new AS SELECT * FROM vec_<engine> WHERE 0` does NOT
-     produce a virtual table from a virtual source — always use `CREATE VIRTUAL TABLE` explicitly
-     when the source is a vec0 table.
-
-The v1 implementation uses the virtual-table path. The code in
-`khive-runtime::migration::swap` branches on the `VectorStoreCapabilities.index_kinds`
-field (ADR-044 §1) to select the correct rename strategy:
-
-```rust
-// Branch on whether the backend is a sqlite-vec virtual table:
-match vec_store.capabilities().index_kinds.iter().find(|k| matches!(k, VectorIndexKind::SqliteVec)) {
-    Some(_) => /* sqlite-vec recreate pattern (steps 1-4 above) */,
-    None    => /* regular table RENAME path */,
-}
-```
-
-If interrupted mid-batch, `MigrationController`'s persisted state lets the worker
-resume from the last `mark_batch_done`. If a batch's embedding call fails (lattice
-returns an error), the controller enters `Failed` state — the worker emits
-`EmbeddingMigrationFailed` and exits the loop. Operators recover via
-`khive engine migrate <engine> --resume` (re-enters the loop from the same
-`MigrationController` state) or `--abort`.
-
-`--abort` path: drop `vec_<engine>_pending`, leave the `_embedding_models` row in
-`pending` status for manual inspection, then call `orphan_sweep` to clean leftover
-vectors in the pending table:
-
-```rust
-vector_store.orphan_sweep(OrphanSweepConfig {
-    namespaces: vec![target_namespace],
-    subject_id_allowlist: None,   // None = scan all rows (ADR-044 §5)
-    max_delete: 1000,             // operator-context default; override for large tables
-    dry_run: false,
-}).await?;
-```
-
-Default `max_delete` is the smaller of (10% of estimated orphan count, 1000); operators
-override via `OrphanSweepConfig::max_delete`.
-
-On swap-back-rollback paths (where the pending table was already renamed to
-`vec_<engine>` before a failure), invoke `orphan_sweep` to clean up residual
-vectors from the incomplete migration before leaving the table in a known-good
-state. The `DROP TABLE vec_<engine>_old` in step 4 removes the old table outright;
-no orphan sweep is needed for that side.
+No shipped `EmbedMigrationWorker` or `MigrationController` integration was found under
+`khive-runtime` or `khive-pack-memory`. The migration state machine, pending-table swap,
+resume/abort behavior, and completion/failure event emission are deferred to #380.
 
 ### 4. Recall during migration
 
@@ -305,39 +196,23 @@ no cross-dependency. This is the only case where vector search is silently skipp
 the event log carries an `EmbeddingMigrationInProgress` annotation on each recall
 during this window so the gap is observable.
 
-### 5. Drift detection
+### 5. Drift detection — deferred
 
-`khive engine drift-check <engine> [--sample N]` (default N=1000) runs:
-
-1. Sample N stored records uniformly from the active vector table.
-2. Sample N representative texts from the namespace (notes + entity descriptions, across all packs that emit embeddings — memory and kg both contribute).
-3. Re-embed the texts under the currently-active model.
-4. Compute Wasserstein distance via `lattice_transport::drift::detect_drift_records`.
-5. Emit `EmbeddingDriftDetected` with payload `{ engine_name, distance, sample_size,
-   threshold, recommendation }`.
-
-The threshold is configurable per engine in `[[engines]]`:
-
-```toml
-[[engines]]
-name = "bge-small-en-v1.5"
-# ...
-drift_threshold = 0.15   # advisory; emit DriftDetected when distance exceeds
-```
-
-The drift check is CPU-bounded and runs off the recall hot path. Operators schedule
-it (cron, manual, post-major-data-event). khive does NOT schedule it automatically.
+`kkernel engine drift-check <engine> [--sample N]` is a parsable operator command, but the
+shipped implementation returns NotImplemented and points to #380. Sampling, Wasserstein
+distance computation, `EmbeddingDriftDetected` emission, and `drift_threshold` config are
+deferred.
 
 ### 6. Verb surface — CLI only
 
-| Command                                          | Purpose                                                                                        |
-| ------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| `khive engine list`                              | Engines and their model history (active / superseded / archived rows from `_embedding_models`) |
-| `khive engine status <engine>`                   | Per-engine: active model, migration in progress?, last drift check                             |
-| `khive engine migrate <engine> --to <model>`     | Start a migration to a new model                                                               |
-| `khive engine migrate <engine> --resume`         | Resume a `Failed` migration                                                                    |
-| `khive engine migrate <engine> --abort`          | Abort an `InProgress` migration; drop `_pending`                                               |
-| `khive engine drift-check <engine> [--sample N]` | One-shot drift detection                                                                       |
+| Command                                            | Shipped status | Purpose                                                     |
+| -------------------------------------------------- | -------------- | ----------------------------------------------------------- |
+| `kkernel engine list`                              | shipped        | List engines and model history from `_embedding_models`.    |
+| `kkernel engine status <engine>`                   | shipped        | Show active model and whether a pending row exists.         |
+| `kkernel engine migrate <engine> --to <model>`     | stub           | Returns NotImplemented; migration worker deferred to #380.  |
+| `kkernel engine migrate <engine> --resume`         | stub           | Returns NotImplemented; migration worker deferred to #380.  |
+| `kkernel engine migrate <engine> --abort`          | stub           | Returns NotImplemented; migration worker deferred to #380.  |
+| `kkernel engine drift-check <engine> [--sample N]` | stub           | Returns NotImplemented; drift integration deferred to #380. |
 
 No MCP verbs. Agents do not initiate migrations — brain profiles tune what they're
 given but cannot decide to swap the underlying model. This is the architectural
@@ -370,24 +245,21 @@ slots:
 2. `CREATE UNIQUE INDEX idx_embed_models_one_active`.
 3. `CREATE INDEX idx_embed_models_engine_status`.
 
-**V16 — `vector_embedding_model_tag`** (shipped in v022-polish):
+**V16 — `vector_embedding_model_tag`**:
 
 4. For each existing regular `vec_*` table (discovered at runtime, validated as
    alphanumeric-suffix only): `ALTER TABLE vec_<engine> ADD COLUMN embedding_model
    TEXT NOT NULL DEFAULT 'all-minilm-l6-v2'`.
 5. `CREATE INDEX idx_vec_<engine>_subject_model ON vec_<engine>(subject_id, embedding_model)`.
-6. sqlite-vec virtual tables (`vec0`) cannot accept `ALTER TABLE` — handled at
-   open time in `khive-db/src/backend.rs` by rebuilding the virtual table with
-   the new schema. See §1.1 final paragraph for the operator backup warning;
-   a preserving rebuild is the documented follow-up.
 
-Operator population of `_embedding_models` (steps for populating registry rows
-from `[[engines]]` config and emitting `EmbeddingModelChanged` events) is a
-separate startup-code path tracked in #385, not part of the SQL migrations.
+**V17 — `vector_embedding_model_tag_preserving_rebuild`**:
 
-The startup population emits one `EmbeddingModelChanged` event per engine with
-`source_model_id = None` and `initiated_by = ConfigDiff` so the audit trail starts
-clean.
+6. For sqlite-vec virtual tables (`vec0`) missing `field` or `embedding_model`, stage
+   existing rows, recreate the virtual table with the full schema, restore rows, and drop
+   the staging table. Backend open now errors if an old vec0 table remains unmigrated.
+
+Startup population registers configured embedding models in `_embedding_models` directly.
+No shipped startup `EmbeddingModelChanged` emission path was found.
 
 ## Rationale
 
@@ -482,13 +354,13 @@ Tracked in `.khive/plans/embedding-version-config.md`.
 
 ### Crate placement
 
-- `_embedding_models` schema: `khive-runtime` (substrate-shared; both memory and kg
-  packs are consumers)
-- Migration worker: `khive-runtime::migration` (shares ownership boundary with registry)
-- Drift CLI subcommand: `khive-cli::engine` (operator surface)
-- Event kinds: `khive-types::events::EventKind` (added to the closed enum)
-- Lattice composition: `lattice_embed::migration::MigrationController` consumed
-  directly; no wrapper crate
+- `_embedding_models` schema: `khive-db` migrations and backend registry helpers; runtime
+  exposes read access via `KhiveRuntime::list_embedding_models`.
+- Migration worker: deferred to #380.
+- Engine operator subcommands: `crates/kkernel/src/engine.rs`; the TypeScript `khive`
+  CLI has no `engine` group.
+- Event kinds: `khive-types::event::EventKind`.
+- Lattice migration/drift composition: deferred to #380.
 
 ### `MigrationPlanSummary`
 
@@ -570,24 +442,20 @@ per that canonical shape — no new field is introduced by this ADR.
 
 ### CLI subcommands
 
-`khive engine` subcommand group lives in `khive-cli`. Each subcommand wraps a
-direct runtime API call:
+The shipped command group is `kkernel engine`, implemented in `crates/kkernel/src/engine.rs`:
 
 ```rust
-match subcommand {
-    EngineCmd::List => runtime.list_embedding_models().await,
-    EngineCmd::Status { engine } => runtime.engine_status(&engine).await,
-    EngineCmd::Migrate { engine, to, resume, abort } => {
-        runtime.start_migration(&engine, to, resume, abort).await
-    }
-    EngineCmd::DriftCheck { engine, sample } => {
-        runtime.drift_check(&engine, sample).await
-    }
+match cmd {
+    EngineCommand::List(args) => cmd_engine_list(args).await,
+    EngineCommand::Status(args) => cmd_engine_status(args).await,
+    EngineCommand::Migrate(args) => cmd_engine_migrate(args),        // NotImplemented (#380)
+    EngineCommand::DriftCheck(args) => cmd_engine_drift_check(args), // NotImplemented (#380)
 }
 ```
 
-No MCP surface — the runtime methods are CLI-only via `khive-cli` and admin-only
-via `kkernel call`.
+`list` reads `_embedding_models` through `KhiveRuntime::list_embedding_models`.
+`status` is computed in `kkernel` from active/pending registry rows. There is no shipped
+`runtime.start_migration` or `runtime.drift_check` API, and no MCP surface.
 
 ## References
 

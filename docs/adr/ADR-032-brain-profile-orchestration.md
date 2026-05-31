@@ -75,66 +75,51 @@ profile. It is now one profile among many, not the shape of the brain itself.
 ### 1. Brain is a meta-Fold
 
 Brain is a `Fold<Event, BrainState>` whose derived state is a set of pipeline parameters.
-Unlike the predecessor design, `BrainState` holds profile registry and lifecycle metadata —
-not the posteriors directly. Posteriors live inside each profile's `Fold` state, which is
-opaque to brain.
+In shipped v1, `BrainState` stores both the profile registry and the live Bayesian recall
+state. The built-in `balanced-recall-v1` profile keeps its live posteriors in
+`BrainState.balanced_recall`; user-created Bayesian profiles keep live posteriors in
+`BrainState.profile_states`.
 
 Brain observes pack events only. It never processes its own state-transition events. This
 boundary prevents recursive self-tuning loops.
 
-### 2. Profile struct — composition of khive-fold primitives + inference-engine integration
+### 2. Shipped v1 profile record
+
+The shipped registry row is `ProfileRecord`, not the generic `Profile` composition from
+the target architecture:
 
 ```rust
-pub struct Profile {
-    pub id:           String,
-    pub description:  String,
-    pub metadata:     ProfileMetadata,
-
-    // Which events this profile consumes — EventFilter is the canonical SQL-executable
-    // predicate (ADR-022 §3a). Brain pushes this into the storage query when fanning
-    // out events, so cold profiles never wake. `.as_objective()` yields an
-    // Objective<Event> adapter view if a consumer wants typed-Objective composition.
-    pub event_filter: EventFilter,
-
-    // The cognitive primitives from ADR-024, composed:
-    pub evolver:          Box<dyn Fold<Event, StateBlob>>,
-    pub anchor:           Option<Box<dyn Anchor>>,
-    pub ranker:           Box<dyn Objective<RetrievalCandidate>>,
-    pub selector:         Box<dyn Selector<RetrievalResult>>,
-    pub snapshot_adapter: Box<dyn SnapshotAdapter>,
-
-    // Inference-engine integration — see §5b. Returns a Lattice LoraHook for
-    // LoRA-class profiles, or `None` for profiles whose state never enters the inference
-    // forward pass (e.g., pure Bayesian recall-weight profiles).
-    pub inference_hook: Option<Box<dyn LatticeAdapterProvider>>,
-}
-
-pub struct ProfileMetadata {
-    pub created_at:    DateTime<Utc>,
-    pub lifecycle:     ProfileLifecycle,
-    pub consumer_kind: String,            // e.g., "recall", "search", "link", "rerank"
-    pub state_class:   ProfileStateClass, // see §5 — Bayesian | LoRA | Trajectory | Composite | …
+pub struct ProfileRecord {
+    pub id: String,
+    pub description: String,
+    pub consumer_kind: String,
+    pub state_class: String,
+    pub lifecycle: ProfileLifecycle,
+    pub created_at: DateTime<Utc>,
+    pub state_snapshot: Option<serde_json::Value>,
+    pub total_events: u64,
+    pub exploration_epoch: u64,
 }
 
 pub enum ProfileLifecycle {
-    Defined,
-    Registered,
     Active,
     Inactive,
     Archived,
 }
+
+pub struct BrainState {
+    pub profiles: HashMap<String, ProfileRecord>,
+    pub balanced_recall: BalancedRecallState,
+    pub profile_states: HashMap<String, BalancedRecallState>,
+    pub bindings: Vec<ProfileBinding>,
+    pub section_states: HashMap<String, SectionPosteriorState>,
+}
 ```
 
-`StateBlob` is opaque bytes to brain. The profile's `Fold` knows its concrete state type;
-the snapshot adapter serializes and deserializes that type. Brain never inspects the state
-bytes. Persistence backend is composable — `ruvector-snapshot::SnapshotManager` for
-generic blobs; `lattice-tune::registry::safetensors_io` for the per-layer tensors of
-LoRA-class profile state (the scalar fields of `LoraProfileState` ride a sidecar JSON
-serde blob — see §5b).
-
-A `Profile` is a struct, not a trait. New state shapes mean a new `Profile` instance with a
-new `Fold` impl registered under a new profile id. Old profiles keep running on old data.
-Brain never breaks because state schema lives entirely in profile code.
+`state_snapshot` is JSON (`serde_json::Value`) owned by the profile record. Namespace-level
+persistence writes the full `BrainStateSnapshot` JSON blob into `brain_profile_snapshots`.
+The generic `Profile` struct, `ProfileMetadata`, `ProfileStateClass`, `SnapshotAdapter`,
+and inference-hook fields remain target architecture and are not shipped v1 API.
 
 `event_filter` makes the ADR-022 §3a unification concrete: every profile declares its
 input substrate slice via `EventFilter`. The brain pack's `PackEventConsumer::event_filter`
@@ -324,6 +309,7 @@ pub struct BalancedRecallState {
     pub temporal:   BetaPosterior,   // prior Beta(1, 9)
     pub entity_posteriors: EntityPosteriors, // bounded LRU, 10K default
     pub total_events: u64,
+    pub exploration_epoch: u64,      // increments on reset to invalidate stale views
 }
 ```
 
@@ -635,48 +621,32 @@ SafeTensors files for the A/B matrices) — that would be a two-phase commit pro
 Resolution: **SafeTensors is not the primary persistence layer**, it is an import/export
 format. The primary store is the pack's SQLite, full stop.
 
-Concrete schema in the brain pack's SQLite:
+Shipped v1 persistence is JSON snapshot based (V20 migration, `V20_BRAIN_PROFILE_PERSISTENCE`):
 
 ```sql
-CREATE TABLE profile_state_lora_layer (
-    profile_id      TEXT NOT NULL,
-    layer_idx       INTEGER NOT NULL,
-    module_name     INTEGER NOT NULL,        -- ModuleName enum discriminant (§6.1)
-    a_blob          BLOB NOT NULL,           -- row-major f32 a-matrix
-    b_blob          BLOB NOT NULL,           -- row-major f32 b-matrix
-    rank            INTEGER NOT NULL,
-    d_in            INTEGER NOT NULL,
-    d_out           INTEGER NOT NULL,
-    PRIMARY KEY (profile_id, layer_idx, module_name)
+CREATE TABLE IF NOT EXISTS brain_profile_snapshots (
+    profile_id    TEXT NOT NULL,
+    namespace     TEXT NOT NULL DEFAULT 'default',
+    snapshot_json TEXT NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (profile_id, namespace)
 );
 
-CREATE TABLE profile_state_scalars (
-    profile_id      TEXT PRIMARY KEY,
-    state_class     TEXT NOT NULL,           -- "LoraAdapter" | "Bayesian" | …
-    json_blob       BLOB NOT NULL            -- serde-serialized scalar fields
-);
-
-CREATE TABLE profile_cursor (
-    profile_id      TEXT PRIMARY KEY,
-    created_at_us   INTEGER NOT NULL,
-    event_id        BLOB NOT NULL            -- UUID bytes
+CREATE TABLE IF NOT EXISTS brain_event_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id TEXT NOT NULL,
+    namespace  TEXT NOT NULL DEFAULT 'default',
+    event_kind TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 );
 ```
 
-A single `BEGIN…COMMIT` on the pack's SQLite covers all three tables. Crash between
-reduce and commit ⇒ rollback ⇒ the next live event or restart catch-up re-applies
-the event from the persisted cursor. ADR-017's atomicity invariant holds.
-
-SafeTensors enters in two non-primary pathways:
-
-- **Import**: `brain.import_adapter(safetensors_path, base_model_id, adapter_id, version)` —
-  bulk-loads pre-trained PEFT adapters into a profile's state via lattice-tune's loader;
-  `target_model_id` is derived as `hash(base_model_id ++ adapter_id ++ version)`. One-shot,
-  no cursor interaction; runs before activation.
-- **Export**: `brain.snapshot(profile_id)` — writes the current state to a SafeTensors
-  blob (plus a sidecar JSON for scalars) at a configured path. The blob is named with
-  `(profile_id, at_event_cursor)` so backtests and audit can correlate the snapshot to
-  a known point in the event log. Export is read-only on the primary store.
+The `ProfileRecord.state_snapshot` field stores the latest profile-local JSON snapshot.
+`brain_profile_snapshots.snapshot_json` stores the namespace-level `BrainStateSnapshot`
+used for reload. The LoRA tables (`profile_state_lora_layer`, `profile_state_scalars`,
+`profile_cursor`) and SafeTensors import/export verbs are deferred until a native
+lattice/LoRA rerank call site ships.
 
 This is the right separation: the live state stays in one transactional backend; the
 portable format is for sharing/training-import/audit, where the latency of "flush to
@@ -905,118 +875,47 @@ each stage independently. The `served_by_profile_id` field on profile-served eve
 
 ### 10. Profile lifecycle and resolution
 
-Profile cardinality is **unbounded** — a deployment can carry thousands of profiles
-(one per subagent per project, one per query-cluster, one per task class). There is no
-"canonical default" globally; resolution is contextual.
+Profile cardinality is unbounded at the ADR level, but shipped v1 includes one built-in
+active fallback profile: `balanced-recall-v1`.
 
 ```
-defined  ->  registered  ->  active   <->  inactive  ->  archived
+active  <->  inactive  ->  archived
 ```
 
-- **Defined**: profile code and metadata exist; not yet registered with brain.
-- **Registered**: brain knows about it; backtest-eligible against any event window. State
-  storage exists; live update loop not yet running.
-- **Active**: live update loop runs; snapshots persist. The profile's `evolver.reduce`
-  is invoked on every event matching the profile's `event_filter: EventFilter` (via the
-  `PackEventConsumer` contract — ADR-017).
-- **Inactive**: registered but no live updates. Snapshots and state retained; profile is
-  resolvable for read-only operations (backtest, inspection).
-- **Archived**: live updates stopped; snapshots and event log retained for audit. Not
-  resolvable for live recall — explicit `brain.activate(profile_id)` revives.
-
-Active and Inactive are storage/compute states. They do NOT determine which profile
-serves a given recall — that is the resolution chain's job.
+- **Active**: the profile can be resolved and updated by feedback.
+- **Inactive**: state is retained and the profile can be inspected, but live updates are stopped.
+- **Archived**: terminal/read-only/audit-retained. No transition out of `Archived` is legal;
+  `brain.activate(profile_id)` rejects archived profiles.
 
 #### Resolution chain
 
-When a consumer (e.g., `memory.recall`) needs a profile, brain resolves one
-deterministically from the binding table:
+When a consumer needs a profile, shipped v1 resolves from in-memory `BrainState.bindings`
+using longest-match semantics. Bindings are persisted as part of the namespace
+`BrainStateSnapshot`, not as a standalone SQLite `profile_bindings` table.
 
 ```
 resolve(caller_ctx) -> profile_id
 
 caller_ctx ::= {
-    explicit_profile_id: Option<String>,  // direct override on the call
-    actor:               Option<String>,  // who invoked (e.g., "implementer-α")
-    namespace:           Option<String>,  // tenant / project (e.g., "lambda:khive")
-    consumer_kind:       String,          // verb category (e.g., "recall")
-    hint:                Option<String>,  // optional resolution hint
+    explicit_profile_id: Option<String>,
+    actor:               Option<String>,
+    namespace:           Option<String>,
+    consumer_kind:       String,
 }
 
-Match order (longest-match wins; NULL = wildcard):
-  1. explicit_profile_id                                              (manual override)
-  2. (actor, namespace, consumer_kind)                                (per-subagent-per-project)
-  3. (actor, *, consumer_kind)                                        (per-subagent, any project)
-  4. (*, namespace, consumer_kind)                                    (project-default)
-  5. (*, *, consumer_kind)                                            (system-default per verb)
-  6. (*, *, *)                                                        (last-resort fallback)
-  7. error: NoProfileResolved
+Match order:
+  1. explicit_profile_id
+  2. (actor, namespace, consumer_kind)
+  3. (actor, *, consumer_kind)
+  4. (*, namespace, consumer_kind)
+  5. (*, *, consumer_kind)
+  6. (*, *, *)
+  7. built-in fallback: balanced-recall-v1
 ```
 
-The binding table is a small SQLite table maintained by `brain.bind` / `brain.unbind`:
-
-```sql
-CREATE TABLE profile_bindings (
-    id             INTEGER PRIMARY KEY,
-    actor          TEXT NOT NULL,        -- '*' sentinel for wildcard
-    namespace      TEXT NOT NULL,        -- '*' sentinel for wildcard
-    consumer_kind  TEXT NOT NULL,        -- '*' sentinel for wildcard
-    profile_id     TEXT NOT NULL REFERENCES profiles(id),
-    priority       INTEGER NOT NULL DEFAULT 0,  -- tiebreak among same specificity
-    created_at     INTEGER NOT NULL,
-    UNIQUE (actor, namespace, consumer_kind)
-);
-
--- Covering index for the resolution SELECT (single index seek per call).
--- Order matches the resolution-tier ranking: consumer_kind is the strongest
--- discriminator (must usually match exactly), then namespace, then actor.
-CREATE INDEX idx_profile_bindings_resolve
-    ON profile_bindings (consumer_kind, namespace, actor);
-```
-
-**Wildcard sentinel**: `*` (literal asterisk) in `actor`, `namespace`, or `consumer_kind` is
-reserved as the wildcard sentinel. The application layer rejects `*` as a real value at insert
-time. This enables true UNIQUE enforcement on wildcard-bearing rows (SQLite would otherwise
-treat NULLs as distinct and accept duplicate `(NULL, NULL, NULL)` rows with the same effective
-meaning).
-
-The resolution chain is a single deterministic SELECT — no policy engine, no rules
-language, no per-tier round-trips. Specificity is computed inline via a `CASE`
-expression that scores each candidate row by how many fields matched non-wildcard;
-the row with the highest specificity wins, with `priority` and `created_at` as
-tiebreakers:
-
-```sql
--- Resolution SELECT (one round-trip, indexable, deterministic).
--- Bind parameters: :actor (required, caller value), :namespace (required, caller value),
---                  :kind (required, consumer kind).
--- Wildcard sentinel '*' matches any caller value.
-SELECT profile_id
-FROM profile_bindings
-WHERE (actor         = '*' OR actor         = :actor)
-  AND (namespace     = '*' OR namespace     = :namespace)
-  AND (consumer_kind = '*' OR consumer_kind = :kind)
-ORDER BY
-    -- Specificity score: actor=4, namespace=2, consumer_kind=1.
-    -- 4>2>1 enforces the §10 tier order (actor wins over namespace,
-    -- namespace wins over consumer_kind, all-wildcard loses to any match).
-    (CASE WHEN actor         = '*' THEN 0 ELSE 4 END
-   + CASE WHEN namespace     = '*' THEN 0 ELSE 2 END
-   + CASE WHEN consumer_kind = '*' THEN 0 ELSE 1 END) DESC,
-    priority   DESC,
-    created_at ASC
-LIMIT 1;
-```
-
-Returns zero rows ⇒ `NoProfileResolved` error (the seventh tier). Returns one row
-⇒ deterministic winner. The covering index above lets SQLite serve the WHERE clause
-without scanning the table; the `CASE`-arithmetic ORDER BY operates on the small
-post-filter result set (usually ≤6 candidates per caller — one per tier). At 10K
-profiles and 50 binding tuples per actor-namespace pair, the seek cost is
-dominated by the index lookup, not the specificity-score computation.
-
-`explicit_profile_id` (tier 1) short-circuits this SELECT: brain checks for an
-override before issuing the query.
+Archived profiles are never returned. A binding that points at an archived profile is
+ignored for live resolution. If no non-archived binding matches, `balanced-recall-v1`
+is returned.
 
 #### Binding workflow
 
@@ -1051,40 +950,33 @@ out of scope — runaway feedback risk requires its own ADR.
 
 ### 11. Brain verb surface
 
-> **Amendment (PR #461 — D-Brain round-2)**: verbs `brain.create_profile` and
-> `brain.bindings` were added to the public surface; `brain.profile` renamed its
-> canonical parameter from `id` to `profile_id` (with `id` retained as a deprecated
-> alias for one release); `brain.feedback` renamed its parameters from
-> `(target_event_id, score, reason?)` to `(target_id, signal, served_by_profile_id?)`.
-> These changes are reflected in the table below. The `brain.reset` verb now requires
-> `profile_id` explicitly and rejects archived profiles. See §11a for per-profile state
-> semantics.
+> **Amendment (current shipped v1)**: verbs `brain.create_profile` and `brain.bindings`
+> are public. `brain.profile` accepts canonical `profile_id` and legacy alias `id`.
+> `brain.feedback` takes `(target_id, signal, served_by_profile_id?)`. `brain.reset`
+> accepts optional `profile_id` and defaults to `balanced-recall-v1`.
 
-| Verb                                                                    | Speech act (ADR-025) | Visibility | Purpose                                                                                                                                                                                                                                                                                                                                |
-| ----------------------------------------------------------------------- | -------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `brain.profiles`                                                        | assertive            | Verb       | List profiles, optionally filtered by lifecycle                                                                                                                                                                                                                                                                                        |
-| `brain.profile(profile_id)`                                             | assertive            | Verb       | Metadata, latest snapshot, current state summary. `profile_id` is the canonical parameter; `id` is accepted as a deprecated alias.                                                                                                                                                                                                     |
-| `brain.resolve(actor?, namespace?, consumer_kind)`                      | assertive            | Verb       | Show which profile would serve this caller context. Response includes both `requested_consumer_kind` and `matched_consumer_kind` to surface wildcard-binding matches.                                                                                                                                                                  |
-| `brain.bindings(profile_id?, actor?, namespace?, consumer_kind?)`       | assertive            | Verb       | List rows in the profile resolution table, optionally filtered. All filters use AND semantics. Returns `{count, bindings: [...]}` even when count is zero.                                                                                                                                                                             |
-| `brain.backtest(profile_id, quality, window)`                           | assertive            | Verb       | Run backtest with specified quality Objective                                                                                                                                                                                                                                                                                          |
-| `brain.compare(profile_a, profile_b, window)`                           | assertive            | Verb       | Head-to-head backtest on shared window                                                                                                                                                                                                                                                                                                 |
-| `brain.snapshot(profile_id)`                                            | commissive           | Internal   | Force snapshot now                                                                                                                                                                                                                                                                                                                     |
-| `brain.activate(profile_id)`                                            | commissive           | Verb       | Move to Active (start live update loop)                                                                                                                                                                                                                                                                                                |
-| `brain.deactivate(profile_id)`                                          | commissive           | Verb       | Move to Inactive (stop live updates, retain state)                                                                                                                                                                                                                                                                                     |
-| `brain.archive(profile_id)`                                             | commissive           | Verb       | Move to Archived (read-only, audit-retained)                                                                                                                                                                                                                                                                                           |
-| `brain.reset(profile_id)`                                               | declaration          | Verb       | Reset posteriors to priors (preserves event history). `profile_id` is required; nonexistent and archived profiles are rejected.                                                                                                                                                                                                        |
-| `brain.create_profile(name, description?, consumer_kind?)`              | declaration          | Verb       | Create a new profile with Bayesian state initialized to default priors. `consumer_kind` must be a non-empty, non-wildcard operation kind (e.g. `"recall"`). New profiles start in `Inactive` state; call `brain.activate` before use.                                                                                                  |
-| `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)` | declaration          | Verb       | Write a row in the resolution table. Archived profiles are rejected.                                                                                                                                                                                                                                                                   |
-| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`         | declaration          | Verb       | Remove rows from the resolution table. At least one filter is required.                                                                                                                                                                                                                                                                |
-| `brain.feedback(target_id, signal, served_by_profile_id?)`              | commissive           | Verb       | Emit a `FeedbackExplicit` event. `target_id` must resolve to an existing record in the caller's namespace. `served_by_profile_id` must exist and must not be archived. Feedback is folded into the serving profile's own `BalancedRecallState`; defaults to `balanced-recall-v1` when `served_by_profile_id` is absent.                |
-| `brain.merge_profiles(profile_a, profile_b, into_id?)`                  | declaration          | Verb       | Combine two profiles of the same state class via `BetaPosterior::merge` (§5a) or class-specific merge rule; emits `ProfileMerged` event for audit. `into_id` defaults to a new profile id; passing an existing id overwrites that profile's state. Both inputs MUST share the same state class and prior — mixing classes is rejected. |
-| `brain.events`                                                          | assertive            | Internal   | List recent events (debug — `list(kind="event")` is the agent path)                                                                                                                                                                                                                                                                    |
-| `brain.emit`                                                            | assertive            | Internal   | Manually emit an event (deprecated; use `brain.feedback`)                                                                                                                                                                                                                                                                              |
-| `brain.config`                                                          | assertive            | Internal   | Projected pack config for inspection                                                                                                                                                                                                                                                                                                   |
+| Verb                                                                     | Speech act (ADR-025) | Visibility | Purpose                                                                                                                                                                |
+| ------------------------------------------------------------------------ | -------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `brain.profiles`                                                         | assertive            | Verb       | List profiles, optionally filtered by lifecycle.                                                                                                                       |
+| `brain.profile(profile_id)`                                              | assertive            | Verb       | Metadata, latest snapshot, current state summary. `profile_id` is canonical; `id` is accepted as a legacy alias.                                                       |
+| `brain.resolve(actor?, namespace?, consumer_kind)`                       | assertive            | Verb       | Show which non-archived profile would serve this caller context, falling back to `balanced-recall-v1` when no binding matches.                                         |
+| `brain.bindings(profile_id?, actor?, namespace?, consumer_kind?)`        | assertive            | Verb       | List `BrainState.bindings` rows, optionally filtered.                                                                                                                  |
+| `brain.activate(profile_id)`                                             | commissive           | Verb       | Move an inactive profile to Active. Archived profiles reject because archive is terminal.                                                                              |
+| `brain.deactivate(profile_id)`                                           | commissive           | Verb       | Move to Inactive.                                                                                                                                                      |
+| `brain.archive(profile_id)`                                              | commissive           | Verb       | Move to Archived after deactivation; archived is terminal/read-only.                                                                                                   |
+| `brain.reset(profile_id?)`                                               | declaration          | Verb       | Reset posteriors to priors, increment `exploration_epoch`, and sync `ProfileRecord.state_snapshot`. Defaults to `balanced-recall-v1`.                                  |
+| `brain.create_profile(name, description?, consumer_kind?, seed_priors?)` | declaration          | Verb       | Create an inactive Bayesian `ProfileRecord` plus live `BalancedRecallState`. `seed_priors` seeds section posteriors, not the three recall Beta priors.                 |
+| `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)`  | declaration          | Verb       | Write a binding row into `BrainState.bindings`. Archived profiles are rejected.                                                                                        |
+| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`          | declaration          | Verb       | Remove binding rows. At least one filter is required.                                                                                                                  |
+| `brain.feedback(target_id, signal, served_by_profile_id?)`               | commissive           | Verb       | Emit a `FeedbackExplicit` event and fold it into the selected profile's `BalancedRecallState`; defaults to `balanced-recall-v1` when `served_by_profile_id` is absent. |
+| `brain.events`                                                           | assertive            | Subhandler | Debug event listing.                                                                                                                                                   |
+| `brain.emit`                                                             | assertive            | Subhandler | Manual event emit/debug path; prefer `brain.feedback`.                                                                                                                 |
+| `brain.config`                                                           | assertive            | Subhandler | Projected pack config for inspection.                                                                                                                                  |
+| `brain.state`                                                            | assertive            | Subhandler | Return current `BrainState` snapshot for inspection.                                                                                                                   |
 
-`brain.bind` is the central declaration verb — it changes the institutional fact "which
-profile serves this caller context." All recall-path resolution flows through the binding
-table; no profile is special without an explicit binding row.
+`brain.backtest`, `brain.compare`, `brain.snapshot`, `brain.merge_profiles`, LoRA adapter
+import/export, and generic `Profile` composition are deferred target architecture, not
+shipped v1 handlers.
 
 Per [ADR-023](ADR-023-declarative-pack-format.md) §4 only kg owns bare verbs; everything
 above carries the `brain.` prefix on the wire.

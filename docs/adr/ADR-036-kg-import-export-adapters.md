@@ -72,32 +72,29 @@ Benefits of this separation:
    output.
 3. Adding a new format requires only an adapter; no changes to import or validation logic.
 
-The extended command form is:
+The shipped command form is:
 
 ```
-khive kg import --format <fmt> [--mapping <path>] [--default-kind <kind>]
-                  [--schema-mode strict|infer|force] [--on-conflict error|skip|update]
-                  [--continue] [--verbose] [--vault <dir>] [--timeslice <datetime>]
-                  <source>
+khive kg import [--format ndjson|csv|tsv|json] [--default-kind <kind>]
+                [--on-conflict error|skip|update] [--continue] [--verbose]
+                <source>
 ```
 
-When `--format` is omitted, `import` infers the format from the file extension:
+Deferred flags are rejected with "not yet implemented": `--mapping`, `--schema-mode`,
+`--vault`, and `--timeslice`.
 
-| Extension     | Format                   |
-| ------------- | ------------------------ |
-| `.ndjson`     | ndjson (native, ADR-020) |
-| `.csv`        | csv                      |
-| `.tsv`        | tsv                      |
-| `.bib`        | bibtex                   |
-| `.ttl`, `.n3` | turtle                   |
-| `.nt`         | ntriples                 |
-| `.graphml`    | graphml                  |
-| `.gexf`       | gexf                     |
-| `.jsonld`     | jsonld                   |
-| `.json`       | json                     |
-| `.md`         | markdown                 |
+When `--format` is omitted, the shipped CLI infers only these extensions:
 
-If inference is ambiguous, an explicit `--format` is required.
+| Extension | Format |
+| --------- | ------ |
+| `.ndjson` | ndjson |
+| `.csv`    | csv    |
+| `.tsv`    | tsv    |
+
+JSON import is shipped, but `.json` is intentionally not inferred because both generic JSON
+adapter input and KG archive JSON use that extension. Use `--format json` explicitly for
+generic JSON arrays. BibTeX, RDF/Turtle, N-Triples, JSON-LD, GraphML, GEXF, and Markdown
+are deferred.
 
 ### 2. Supported formats and phasing
 
@@ -215,91 +212,23 @@ are imported as a batch. Wikilinks are resolved relative to the vault root. Unre
 
 ### 3. Mapping file
 
-A mapping file (`.khive/kg/import-mapping.yaml` by convention, overridable via `--mapping`)
-is a YAML document controlling how source format fields map to khive entity and edge fields.
-It has two structural sections and two translation sections:
+Mapping files are deferred. The shipped CLI rejects `--mapping` with a clear
+"not yet implemented" error. Current P0 import uses direct, built-in field mapping:
 
-```yaml
-format: csv
+- CSV/TSV: auto-detect entity rows vs edge rows from header names; `--default-kind`
+  supplies a kind when entity rows omit one.
+- JSON: parse a top-level array of objects; objects with `source` and `target` become
+  edges, other objects become entities; unrecognized keys fold into `properties`.
 
-entities:
-  id: uuid # source column "uuid" -> entity id (auto-generate if absent)
-  name: title # source column "title" -> entity name
-  kind: type # source column "type" -> entity kind
-  description: abstract
-  properties:
-    year: year
-    authors: authors
-    doi: doi
-
-edges:
-  source: from_id
-  target: to_id
-  relation: rel_type
-  weight: confidence # optional, default 0.7
-
-kind_mapping: # normalize source values to canonical base EntityKind
-  "tool": project
-  "author": person
-  "organization": org
-
-type_mapping: # normalize source values to (kind, entity_type) per ADR-001
-  "paper": { kind: document, entity_type: paper }
-  "preprint": { kind: document, entity_type: paper }
-  "benchmark": { kind: dataset, entity_type: benchmark }
-  "algorithm": { kind: concept, entity_type: algorithm }
-
-relation_mapping: # normalize source values to canonical EdgeRelation strings
-  "wrote": introduced_by
-  "cites": depends_on
-```
-
-`kind_mapping`, `type_mapping`, and `relation_mapping` are applied before schema validation
-runs regardless of `--schema-mode`. `type_mapping` takes precedence over `kind_mapping` when a
-source value matches both. Source values not present in either mapping fall through to the
-active `--schema-mode` behavior.
-
-When no `--mapping` is provided and the terminal is a TTY, `import` prints the auto-detected
-column mapping and prompts to save it as `.khive/kg/import-mapping.yaml`. In non-TTY contexts
-(CI, scripted workflows), the absence of a mapping file is not an error.
-
-BibTeX has a fixed mapping (see §2) and does not use the mapping file.
+Interactive mapping generation and `.khive/kg/import-mapping.yaml` are not shipped.
 
 ### 4. Schema handling
 
-When adapter output references entity kinds or edge relations not present in the current
-`schema.yaml`, behavior is controlled by `--schema-mode`:
-
-Schema modes (`strict`/`infer`/`force`) control how **property keys** are validated against
-the schema. They MUST NOT bypass closed taxonomies: unknown `entity_kind`, `note_kind`, or
-`edge_relation` values are always rejected per ADR-001/013/002.
-
-- `--schema-mode strict` (default): reject records with unknown entity kinds, edge relations,
-  or unknown property keys. The import fails with a structured error listing every violation.
-  This is the correct mode for maintaining a curated KG.
-
-- `--schema-mode infer`: accept unknown **property keys** and add them to
-  `schema.yaml#properties`. The import summary reports every schema addition. Unknown
-  `entity_kind` values are always rejected (ADR-001). **Edge relations are a closed set
-  ([ADR-002](ADR-002-edge-ontology.md)). `--schema-mode infer` does not add new relations;
-  unknown edge relation strings are always rejected.**
-
-- `--schema-mode force`: skip **property key** schema validation. Records with unknown entity
-  properties are accepted without error. Unknown `entity_kind` values are still rejected
-  (ADR-001). **Edge relation names are always validated against the [ADR-002](ADR-002-edge-ontology.md)
-  closed set, regardless of `--schema-mode`. Unknown edge relation strings are rejected in
-  all three modes.** This is an escape hatch for exploratory imports from external ontologies.
-
-## Atomic schema publish (infer mode)
-
-When `--schema-mode infer` discovers new property keys:
-
-1. Stage proposed schema additions to a temp file (`schema.yaml.stage`).
-2. Run full import validation (record-level + referential integrity).
-3. Inside the same transaction that commits the imported records, **atomically
-   rename** `schema.yaml.stage` over `schema.yaml`.
-4. On any pre-commit failure, delete the staging file and leave `schema.yaml`
-   untouched.
+`--schema-mode` is deferred. The shipped CLI rejects `--schema-mode` with a clear
+"not yet implemented" error. Current import validates against existing closed taxonomies:
+unknown `entity_kind`, `note_kind`, and `edge_relation` values are rejected through the
+normal validation/import path. Schema inference, schema force mode, and atomic schema
+publish are deferred.
 
 ### 5. Conflict and flag interaction
 
@@ -386,45 +315,47 @@ edge count, elapsed time, estimated remaining time).
 
 ### 8. Export
 
-`khive kg export` currently produces only the default NDJSON format ([ADR-020](ADR-020-git-native-kg-implementation.md)
-§5). Non-NDJSON export formats are deferred to P1/P2. The `--format` flag on `export` is
-reserved; the current CLI rejects any non-`ndjson` value with a "not yet implemented" error.
+`khive kg export` currently produces canonical NDJSON by default and supports compatibility
+`--format archive` output. CSV, JSON-array, BibTeX, RDF, GraphML, GEXF, Markdown, and other
+non-NDJSON/non-archive export formats are deferred.
 
 Format coverage matrix:
 
-| Format    | Import        | Export        | Phase | Notes                                           |
-| --------- | ------------- | ------------- | ----- | ----------------------------------------------- |
-| NDJSON    | yes (ADR-020) | yes (ADR-020) | P0    | Canonical; lossless                             |
-| CSV       | yes           | deferred (P1) | P0/P1 | Import shipped; export deferred                 |
-| JSON      | yes           | deferred (P1) | P0/P1 | Import shipped; export deferred                 |
-| BibTeX    | deferred (P1) | deferred (P1) | P1    | Only `kind: document` with `entity_type: paper` |
-| Turtle    | deferred (P1) | deferred (P1) | P1    |                                                 |
-| N-Triples | deferred (P1) | deferred (P1) | P1    |                                                 |
-| JSON-LD   | deferred (P1) | deferred (P1) | P1    | `@context` generated from `schema.yaml`         |
-| GraphML   | deferred (P2) | deferred (P2) | P2    |                                                 |
-| GEXF      | deferred (P2) | deferred (P2) | P2    | Static on export (no timeslicing)               |
-| Markdown  | deferred (P2) | deferred (P2) | P2    | One `.md` file per entity; wikilinks for edges  |
+| Format    | Import         | Export   | Phase | Notes                                                          |
+| --------- | -------------- | -------- | ----- | -------------------------------------------------------------- |
+| NDJSON    | yes            | yes      | P0    | Canonical; lossless                                            |
+| Archive   | yes            | yes      | P0    | KG archive JSON envelope                                       |
+| CSV       | yes (Deno CLI) | deferred | P0/P1 | Rust crate CSV module is not shipped                           |
+| TSV       | yes (Deno CLI) | deferred | P0/P1 | Rust crate TSV module is not shipped                           |
+| JSON      | yes            | deferred | P0/P1 | Generic top-level array import; use `--format json` explicitly |
+| BibTeX    | deferred       | deferred | P1    |                                                                |
+| Turtle    | deferred       | deferred | P1    |                                                                |
+| N-Triples | deferred       | deferred | P1    |                                                                |
+| JSON-LD   | deferred       | deferred | P1    |                                                                |
+| GraphML   | deferred       | deferred | P2    |                                                                |
+| GEXF      | deferred       | deferred | P2    |                                                                |
+| Markdown  | deferred       | deferred | P2    |                                                                |
 
 ### 9. CLI flag reference
 
 Flags on `khive kg import` (P0 — shipped):
 
-| Flag             | Values                 | Default  | Description                           |
-| ---------------- | ---------------------- | -------- | ------------------------------------- |
-| `--format`       | see extension table §1 | inferred | Source format                         |
-| `--default-kind` | entity kind string     | —        | Kind assigned when source has no kind |
-| `--on-conflict`  | `error\|skip\|update`  | `error`  | UUID collision handling (ADR-020 §13) |
-| `--continue`     | flag                   | off      | Sugar for `--on-conflict skip`        |
-| `--verbose`      | flag                   | off      | Print detailed warning/error list     |
+| Flag             | Values                   | Default                                     | Description                                                                                   |
+| ---------------- | ------------------------ | ------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `--format`       | `ndjson\|csv\|tsv\|json` | inferred for `.ndjson`, `.csv`, `.tsv` only | Source format                                                                                 |
+| `--default-kind` | entity kind string       | —                                           | Kind assigned when source has no kind                                                         |
+| `--on-conflict`  | `error\|skip\|update`    | `error`                                     | UUID collision handling; legacy aliases `replace` and `merge` are accepted by the current CLI |
+| `--continue`     | flag                     | off                                         | Sugar for `--on-conflict skip`; mutually exclusive with explicit `--on-conflict`              |
+| `--verbose`      | flag                     | off                                         | Print detailed warning/error list                                                             |
 
 Flags on `khive kg import` (deferred — CLI rejects with "not yet implemented"):
 
-| Flag            | Values                 | Deferred to | Description                             |
-| --------------- | ---------------------- | ----------- | --------------------------------------- |
-| `--mapping`     | file path              | P1          | Column/field mapping file               |
-| `--schema-mode` | `strict\|infer\|force` | P1          | Schema validation behavior (§4)         |
-| `--timeslice`   | datetime               | P2          | GEXF dynamic: which timeslice to import |
-| `--vault`       | directory              | P2          | Markdown vault root                     |
+| Flag            | Values                 | Deferred to | Description                |
+| --------------- | ---------------------- | ----------- | -------------------------- |
+| `--mapping`     | file path              | P1          | Column/field mapping file  |
+| `--schema-mode` | `strict\|infer\|force` | P1          | Schema validation behavior |
+| `--timeslice`   | datetime               | P2          | GEXF dynamic import slice  |
+| `--vault`       | directory              | P2          | Markdown vault root        |
 
 Flags on `khive kg export` (deferred):
 
@@ -534,77 +465,43 @@ investment before usage patterns are confirmed.
 
 ### Crate structure
 
-Format adapters live in a new library crate `crates/khive-vcs-adapters/` within the `khive-vcs`
-layer. This crate has no dependency on `khive-db` or `khive-runtime` — it only imports
-`khive-types` for the entity and edge record shapes:
+The shipped Rust crate `crates/khive-vcs-adapters/` currently contains the adapter trait,
+record/error types, and a JSON adapter:
 
 ```
 crates/khive-vcs-adapters/
   Cargo.toml
   src/
-    lib.rs           -- re-exports; FormatAdapter trait
-    mapping.rs       -- MappingFile: parse import-mapping.yaml
-    csv.rs           -- CsvAdapter: streaming row parser -> entity/edge streams
-    json.rs          -- JsonAdapter: streaming object parser -> same streams
-    bibtex.rs        -- BibtexAdapter: lenient entry parser -> entities + crossref edges
-    turtle.rs        -- TurtleAdapter: Turtle/N-Triples -> entities + edges
-    jsonld.rs        -- JsonLdAdapter: expand -> TurtleAdapter pipeline
-    graphml.rs       -- GraphmlAdapter: streaming XML parser -> entities + edges
-    gexf.rs          -- GexfAdapter: streaming XML parser -> entities + edges
-    markdown.rs      -- MarkdownAdapter: frontmatter + wikilink extractor
-    schema_infer.rs  -- SchemaInferrer: accumulate unknown kinds, flush to schema.yaml
-    export/          -- deferred P1/P2 (stub module, no public surface yet)
-      mod.rs
+    lib.rs
+    adapter.rs       -- FormatAdapter trait
+    error.rs         -- AdapterError
+    record.rs        -- EntityRecord / EdgeRecord
+    json_adapter.rs  -- JsonFormatAdapter
 ```
 
-The `FormatAdapter` trait:
-
-```rust
-pub trait FormatAdapter {
-    fn name(&self) -> &str;
-    fn entities(&mut self) -> impl Iterator<Item = Result<EntityRecord, AdapterError>>;
-    fn edges(&mut self) -> impl Iterator<Item = Result<EdgeRecord, AdapterError>>;
-}
-```
-
-Adapters are stateful (they hold the streaming parser state) but produce plain record structs
-following the [ADR-020](ADR-020-git-native-kg-implementation.md) §2 field shapes.
+CSV/TSV import is shipped in the Deno CLI (`cli/lib/importers/csv.ts`), not as Rust
+`csv.rs` / `tsv.rs` modules in `khive-vcs-adapters`. Mapping, schema inference,
+BibTeX, Turtle/N-Triples, JSON-LD, GraphML, GEXF, Markdown, and non-NDJSON export
+modules are deferred.
 
 ### CLI integration
 
-The `khive kg import` command in the npm-distributed wrapper invokes:
-
-1. Detect the format from `--format` or file extension (in the wrapper).
-2. Spawn `kkernel import --format <fmt>` which instantiates the matching `FormatAdapter`
-   from `khive-vcs-adapters`.
-3. `kkernel` streams records to an intermediate NDJSON temp file inside its own process.
-4. Collect `AdapterError` entries: non-fatal → warning; fatal → abort (with non-zero exit).
-5. `kkernel` pipes the temp file through the standard NDJSON import path.
-6. Print the import summary to stdout (consumed by the wrapper).
-
-FFI is not used. The wrapper communicates with `kkernel` via subprocess + JSON.
+The user-facing Deno `khive kg import` path handles CSV/TSV/JSON adapter inputs directly,
+converts adapter records to a `KgArchive`, and delegates to the standard import path.
+`kkernel kg import` accepts archive/json/ndjson and validates/converts records for runtime
+import. It does not instantiate CSV/TSV/BibTeX/RDF/GraphML/GEXF/Markdown Rust adapters.
 
 ### Schema inference integration
 
-When `--schema-mode infer` is active, the import driver passes unknown entity kind strings to
-`SchemaInferrer`, which accumulates additions and flushes them to `schema.yaml` before the first
-database write. Unknown edge relation strings bypass the inferrer and go directly to the
-validation rejection path. `SchemaYaml` gains `add_entity_kind()` and `flush_to_disk()` methods
-that write only if additions were made, and bump `ontology_version` minor component once per
-import run rather than once per addition.
+Schema inference is deferred. The shipped CLI rejects `--schema-mode`; unknown closed
+taxonomy values are rejected through validation.
 
 ### Phasing
 
-| Phase | Scope                                                                     | Target |
-| ----- | ------------------------------------------------------------------------- | ------ |
-| 1     | `FormatAdapter` trait + `mapping.rs` + `csv.rs` + `json.rs`; P0 CLI flags | v0.5   |
-| 2     | `bibtex.rs` + `turtle.rs` (N-Triples subset first, full Turtle second)    | v0.5   |
-| 3     | `graphml.rs` + `gexf.rs` + `jsonld.rs`; export/csv + export/bibtex        | v0.6   |
-| 4     | `markdown.rs` + `--vault` flag; export/markdown                           | v0.6   |
-| 5     | Interactive mapping generation (TTY auto-detect + save prompt)            | v0.6   |
-
-Phases 1 and 2 cover the primary research audience. Phases 3–5 are independent and may ship
-in either order based on demand signals.
+| State    | Scope                                                                                                                                                   |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Shipped  | Deno CSV/TSV/JSON import; Rust `FormatAdapter`/record/error types; Rust `JsonFormatAdapter`; `kkernel kg import` archive/json/ndjson                    |
+| Deferred | mapping files, schema modes, Rust CSV/TSV modules, BibTeX/RDF/JSON-LD/GraphML/GEXF/Markdown, non-NDJSON export formats other than archive compatibility |
 
 ## Format-v2 migration UX (deferred to ADR-048)
 
