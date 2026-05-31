@@ -4,15 +4,19 @@ description: Store durable agent memory with the right type, salience, decay, ta
 
 # Remember
 
-Memory is for context that should survive the current session. Use it for stable facts, decisions, preferences, recurring observations, and session outcomes that future agents should retrieve before acting.
+Memory is for context that should survive the current session. Use it for stable facts, decisions,
+preferences, recurring observations, and session outcomes that future agents should retrieve before
+acting.
 
-Do not use memory as a scratchpad. Transient todos belong in the GTD pack; structured concepts and relationships belong in the KG pack.
+Do not use memory as a scratchpad. Transient todos belong in the GTD pack; structured concepts and
+relationships belong in the KG pack.
 
 ## Workflow
 
 ### 1. Decide whether it belongs in memory
 
-Store the item if it is likely to be useful later and would be expensive or unreliable to rediscover.
+Store the item if it is likely to be useful later and would be expensive or unreliable to
+rediscover.
 
 Good memory candidates:
 
@@ -44,7 +48,8 @@ When uncertain, use `episodic`. It is safer to preserve the context of when the 
 request(ops="memory.remember(content=\"<durable memory>\", memory_type=\"episodic\", salience=0.6)")
 ```
 
-Use `salience` from `0.0` to `1.0`. Defaults are acceptable for ordinary memories; use high salience only for context that should reliably outrank routine notes.
+Use `salience` from `0.0` to `1.0`. Defaults are acceptable for ordinary memories; use high salience
+only for context that should reliably outrank routine notes.
 
 For stable facts:
 
@@ -70,7 +75,8 @@ After storing important memory, check that a future query can find it:
 request(ops="memory.recall(query=\"<distinctive phrase>\", limit=3)")
 ```
 
-If recall cannot find it, rewrite the memory with clearer keywords or add tags in a new memory. Do not create multiple near-duplicate memories unless the difference matters.
+If recall cannot find it, rewrite the memory with clearer keywords or add tags in a new memory. Do
+not create multiple near-duplicate memories unless the difference matters.
 
 ## Patterns
 
@@ -97,8 +103,10 @@ request(ops="[
 
 ## Anti-patterns
 
-- **Remembering everything.** Memory quality drops if routine scratch work crowds out durable context.
+- **Remembering everything.** Memory quality drops if routine scratch work crowds out durable
+  context.
 - **Using vague content.** A future `recall` query depends on specific words.
 - **Inflating salience.** High-salience memories should be rare.
 - **Storing tasks as memories.** Use `assign` for commitments and lifecycle tracking.
-- **Storing relationships as prose only.** If the relationship matters structurally, use KG entities and edges.
+- **Storing relationships as prose only.** If the relationship matters structurally, use KG entities
+  and edges.

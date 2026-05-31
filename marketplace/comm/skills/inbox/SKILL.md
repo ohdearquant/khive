@@ -4,7 +4,8 @@ description: Check inbound messages and mark them read — filter by unread, rea
 
 # Inbox
 
-View inbound messages in the caller's namespace. Messages arrive via `comm.send` or `comm.reply` and start as unread. Use `comm.read` to mark them read after processing.
+View inbound messages in the caller's namespace. Messages arrive via `comm.send` or `comm.reply` and
+start as unread. Use `comm.read` to mark them read after processing.
 
 ## Workflow
 
@@ -83,10 +84,13 @@ Read before doing work — messages may contain blockers, status updates, or tas
 
 ### Triage by subject
 
-Inbox messages include `properties.subject`. Scan subjects to prioritize which messages to read first.
+Inbox messages include `properties.subject`. Scan subjects to prioritize which messages to read
+first.
 
 ## Anti-patterns
 
-- **Ignoring the inbox.** Messages from other agents/lambdas may contain blockers or coordination signals.
-- **Marking outbound messages as read.** Only inbound messages have read semantics — outbound read is rejected.
+- **Ignoring the inbox.** Messages from other agents/lambdas may contain blockers or coordination
+  signals.
+- **Marking outbound messages as read.** Only inbound messages have read semantics — outbound read
+  is rejected.
 - **Polling without limit.** In active namespaces, always set a limit to avoid large payloads.

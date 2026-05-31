@@ -1,15 +1,15 @@
 # kg — Knowledge Graph Plugin
 
-Persistent knowledge graph for AI agents. Typed entities, closed edge ontology,
-hybrid search, GQL/SPARQL queries — all via MCP.
+Persistent knowledge graph for AI agents. Typed entities, closed edge ontology, hybrid search,
+GQL/SPARQL queries — all via MCP.
 
 Part of the [khive](https://github.com/ohdearquant/khive) marketplace.
 
 ## Prerequisites
 
-This plugin provides skills and agents only — it does **not** bundle an MCP server.
-You must install the `khive-mcp` binary and register it as an MCP server in your
-harness **before** using any of the skills or agents below.
+This plugin provides skills and agents only — it does **not** bundle an MCP server. You must install
+the `khive-mcp` binary and register it as an MCP server in your harness **before** using any of the
+skills or agents below.
 
 ```bash
 # Install the binary
@@ -68,10 +68,9 @@ request(ops="[search(kind=\"entity\", query=\"LoRA\"), neighbors(node_id=\"<id>\
 | `withdraw`  | Withdraw an open proposal                   |
 
 **Proposal lifecycle**: `open → approved → applying → applied` (happy path). Terminal states:
-`rejected`, `withdrawn`. `applying` is a transient in-flight state; `withdraw` is rejected while
-the apply worker holds it. `propose` returns `proposal_id` — pass this to `review` and `withdraw`,
-not an `id` field. `review` is rejected if the proposal is not in `open` or `changes_requested`
-state.
+`rejected`, `withdrawn`. `applying` is a transient in-flight state; `withdraw` is rejected while the
+apply worker holds it. `propose` returns `proposal_id` — pass this to `review` and `withdraw`, not
+an `id` field. `review` is rejected if the proposal is not in `open` or `changes_requested` state.
 
 ### 9 Skills (workflow-shaped, not verb docs)
 
@@ -100,9 +99,9 @@ state.
 
 ### Swarm coordination via GTD pack
 
-The kg agents are designed to collaborate **via the GTD pack's task queue**, not by
-direct orchestration. Each agent on completion `assign`s follow-up tasks to the next
-agent in the pipeline, and at start runs `gtd.next(assignee=<self>)` to pull its queue.
+The kg agents are designed to collaborate **via the GTD pack's task queue**, not by direct
+orchestration. Each agent on completion `assign`s follow-up tasks to the next agent in the pipeline,
+and at start runs `gtd.next(assignee=<self>)` to pull its queue.
 
 Pipeline shape:
 
@@ -113,8 +112,8 @@ digester ──► polisher ──► gap-analyst ──► expander ──► p
                                 (taxonomy gaps)
 ```
 
-To enable the swarm: install **both** `kg` and `gtd` plugins, and ensure your
-MCP server loads both packs:
+To enable the swarm: install **both** `kg` and `gtd` plugins, and ensure your MCP server loads both
+packs:
 
 ```bash
 /plugin install kg
@@ -127,33 +126,32 @@ MCP server config (both packs):
 { "args": ["--pack", "kg", "--pack", "gtd"] }
 ```
 
-Each agent file documents its `Pickup protocol` and `Handoff protocol` sections —
-read those to understand which tasks land in your queue and which you assign on
-completion. A scheduled (or hook-triggered) `gtd.next(assignee=<agent>)` poll is enough
-to keep the swarm moving; no central orchestrator required.
+Each agent file documents its `Pickup protocol` and `Handoff protocol` sections — read those to
+understand which tasks land in your queue and which you assign on completion. A scheduled (or
+hook-triggered) `gtd.next(assignee=<agent>)` poll is enough to keep the swarm moving; no central
+orchestrator required.
 
 ## Namespace Rule (ADR-007)
 
-KG entities live in the **shared** namespace (`local` by default). Even when your MCP
-server runs with `--actor lambda:myproject`, KG operations (`create`, `link`, `search`,
-`list`, `get`, `neighbors`, `traverse`, `query`) use the shared namespace — not the
-actor namespace.
+KG entities live in the **shared** namespace (`local` by default). Even when your MCP server runs
+with `--actor lambda:myproject`, KG operations (`create`, `link`, `search`, `list`, `get`,
+`neighbors`, `traverse`, `query`) use the shared namespace — not the actor namespace.
 
-This is by design: the knowledge graph is cross-project shared knowledge. "LoRA" is one
-entity that multiple projects link to via `implements`/`depends_on` edges. If each project
-wrote to its own namespace, entities would be invisible across projects, duplicates would
-proliferate, and cross-project edges would be impossible.
+This is by design: the knowledge graph is cross-project shared knowledge. "LoRA" is one entity that
+multiple projects link to via `implements`/`depends_on` edges. If each project wrote to its own
+namespace, entities would be invisible across projects, duplicates would proliferate, and
+cross-project edges would be impossible.
 
-Scoped packs (memory, GTD, comm, brain, schedule) correctly use the actor namespace —
-those are per-agent operational data.
+Scoped packs (memory, GTD, comm, brain, schedule) correctly use the actor namespace — those are
+per-agent operational data.
 
 ## Schema
 
 **8 entity kinds**: concept, document, dataset, project, person, org, artifact, service
 
-**15 edge relations**: contains, part_of, instance_of, extends, variant_of,
-introduced_by, supersedes, derived_from, precedes, depends_on, enables,
-implements, competes_with, composed_with, annotates
+**15 edge relations**: contains, part_of, instance_of, extends, variant_of, introduced_by,
+supersedes, derived_from, precedes, depends_on, enables, implements, competes_with, composed_with,
+annotates
 
 **5 note kinds**: observation, insight, question, decision, reference
 
@@ -161,10 +159,10 @@ All closed sets — enforced at compile time.
 
 ## What's New in 0.2.3
 
-- **Entity tags filter**: `search` and `list` now accept a `tags` parameter to filter results
-  by tag values.
-- **Warm startup**: `KgPack` initializes eagerly on server start, reducing cold-call latency
-  for the first verb dispatch.
+- **Entity tags filter**: `search` and `list` now accept a `tags` parameter to filter results by tag
+  values.
+- **Warm startup**: `KgPack` initializes eagerly on server start, reducing cold-call latency for the
+  first verb dispatch.
 
 ## Links
 

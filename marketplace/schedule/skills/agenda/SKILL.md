@@ -4,7 +4,8 @@ description: View upcoming scheduled events — filter by time window, sorted as
 
 # Agenda
 
-List pending scheduled events in the caller's namespace. Events are sorted ascending by trigger time (soonest first). Only `status: "pending"` events are shown — cancelled or fired events are excluded.
+List pending scheduled events in the caller's namespace. Events are sorted ascending by trigger time
+(soonest first). Only `status: "pending"` events are shown — cancelled or fired events are excluded.
 
 ## Workflow
 
@@ -74,4 +75,5 @@ request(ops="schedule.agenda(from=\"2026-06-02T00:00:00Z\", to=\"2026-06-08T23:5
 ## Anti-patterns
 
 - **Non-RFC-3339 filter values.** `from="next week"` is rejected.
-- **Expecting cancelled events.** Agenda only returns `status: "pending"`. Use `list(kind="scheduled_event")` via the KG pack to see all events including cancelled ones.
+- **Expecting cancelled events.** Agenda only returns `status: "pending"`. Use
+  `list(kind="scheduled_event")` via the KG pack to see all events including cancelled ones.

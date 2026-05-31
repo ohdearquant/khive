@@ -2,22 +2,22 @@
 
 Structured knowledge management on top of [khive-mcp](https://github.com/ohdearquant/khive).
 
-The knowledge pack provides three focused verbs for registering concepts, recording provenance,
-and browsing by domain — all built on the kg substrate without duplicating storage.
+The knowledge pack provides three focused verbs for registering concepts, recording provenance, and
+browsing by domain — all built on the kg substrate without duplicating storage.
 
 ## Why this pack exists
 
-The `kg` pack gives you direct CRUD for any entity kind (`create`, `link`, `search`). The
-knowledge pack adds **opinionated sugar** for the specific pattern of managing research concepts:
+The `kg` pack gives you direct CRUD for any entity kind (`create`, `link`, `search`). The knowledge
+pack adds **opinionated sugar** for the specific pattern of managing research concepts:
 
 - `learn` = `create(kind="concept")` with automatic `domain` → tag promotion (makes domain
   filterable via FTS and the `domain=` parameter on `topic`).
-- `cite` = `link(relation="introduced_by")` with weight clamped to [0, 1] and a cleaner
-  parameter name (`concept_id` / `source_id` instead of `source_id` / `target_id`).
+- `cite` = `link(relation="introduced_by")` with weight clamped to [0, 1] and a cleaner parameter
+  name (`concept_id` / `source_id` instead of `source_id` / `target_id`).
 - `topic` = `search(kind="concept")` with optional post-filter on the domain tag.
 
-Use the knowledge pack when you want the auto-promotion and concise API. Use `kg` verbs
-directly when you need other entity kinds, relations, or full parameter control.
+Use the knowledge pack when you want the auto-promotion and concise API. Use `kg` verbs directly
+when you need other entity kinds, relations, or full parameter control.
 
 ## Verbs
 
@@ -31,12 +31,12 @@ All verbs are dispatched through the single MCP `request` tool.
 
 ## What's New in 0.2.3
 
-- **Score normalization**: all search/topic scores are now normalized to `[0, 1]` for
-  consistent cross-query comparison.
-- **`rerank=true` default**: `knowledge.topic` and `knowledge.search` now default to
-  `rerank=true`, producing cleaner relevance ordering out of the box.
-- **FTS5 special character hardening**: queries containing parentheses, colons, quotes, and
-  other FTS5 metacharacters are escaped automatically instead of returning parse errors.
+- **Score normalization**: all search/topic scores are now normalized to `[0, 1]` for consistent
+  cross-query comparison.
+- **`rerank=true` default**: `knowledge.topic` and `knowledge.search` now default to `rerank=true`,
+  producing cleaner relevance ordering out of the box.
+- **FTS5 special character hardening**: queries containing parentheses, colons, quotes, and other
+  FTS5 metacharacters are escaped automatically instead of returning parse errors.
 
 ## Skills
 
@@ -85,8 +85,8 @@ Or add to `.mcp.json`:
 ## Presentation modes (ADR-045)
 
 The `request` tool accepts an optional `presentation` field per op: `agent` (default,
-token-efficient), `verbose` (canonical full JSON), or `human` (same as `verbose` over MCP).
-Agents should use the default `agent` mode.
+token-efficient), `verbose` (canonical full JSON), or `human` (same as `verbose` over MCP). Agents
+should use the default `agent` mode.
 
 ## License
 

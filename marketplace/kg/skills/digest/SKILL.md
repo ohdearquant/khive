@@ -4,8 +4,8 @@ description: Ingest research material into the knowledge graph — papers, conce
 
 # Digest
 
-You have material to add to the knowledge graph. This skill walks you through a complete
-ingestion: extract → create → link → annotate → verify.
+You have material to add to the knowledge graph. This skill walks you through a complete ingestion:
+extract → create → link → annotate → verify.
 
 The MCP server exposes one tool — `request` — that takes the verb call as a string:
 
@@ -16,9 +16,9 @@ request(ops="[create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\"), c
 
 The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
 
-**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`),
-even when the MCP server runs with `--actor lambda:myproject`. Do NOT override the
-namespace for entity/edge/note operations. The knowledge graph is cross-project by design.
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`), even when the
+MCP server runs with `--actor lambda:myproject`. Do NOT override the namespace for entity/edge/note
+operations. The knowledge graph is cross-project by design.
 
 ## Workflow
 
@@ -53,7 +53,8 @@ create(kind="entity", entity_kind="<kind>", name="<short canonical name>",
 | `artifact` | Generated files, model artifacts, build outputs              |
 | `service`  | Long-running services, APIs, deployed systems                |
 
-**Naming**: short canonical name people actually say. `LoRA` not `Low-Rank Adaptation of Large Language Models`. Full titles go in `properties`.
+**Naming**: short canonical name people actually say. `LoRA` not
+`Low-Rank Adaptation of Large Language Models`. Full titles go in `properties`.
 
 ### 3. Link entities
 
@@ -83,7 +84,8 @@ link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.
 | Lateral        | `composed_with` | A ↔ B                  | Used together             |
 | Annotation     | `annotates`     | note → any substrate   | Note observes/comments on |
 
-**Direction matters.** `introduced_by` goes FROM the concept TO the paper (the concept was introduced by the paper). If you get direction wrong, the traversal breaks.
+**Direction matters.** `introduced_by` goes FROM the concept TO the paper (the concept was
+introduced by the paper). If you get direction wrong, the traversal breaks.
 
 **Weight**: 1.0 = definitional, 0.7-0.9 = strong, 0.4-0.6 = plausible.
 
@@ -96,7 +98,8 @@ create(kind="note", note_kind="<kind>", content="<the observation>",
   salience=<0.0-1.0>, annotates=["<entity-uuid>"])
 ```
 
-**5 note kinds**: `observation` (I noticed), `insight` (I concluded), `question` (I wonder), `decision` (I chose), `reference` (I read).
+**5 note kinds**: `observation` (I noticed), `insight` (I concluded), `question` (I wonder),
+`decision` (I chose), `reference` (I read).
 
 Always use `annotates` to attach notes to the entities they're about.
 
@@ -108,15 +111,19 @@ After ingestion, check each new entity:
 neighbors(node_id="<entity-id>", direction="both")
 ```
 
-**Minimum edges**: concepts ≥ 4, projects ≥ 3, documents ≥ 2. If below target, add edges — every concept should have at least `instance_of` or `extends` (parent), `introduced_by` (if a paper exists), and `competes_with` (if alternatives exist).
+**Minimum edges**: concepts ≥ 4, projects ≥ 3, documents ≥ 2. If below target, add edges — every
+concept should have at least `instance_of` or `extends` (parent), `introduced_by` (if a paper
+exists), and `competes_with` (if alternatives exist).
 
 ### 6. Report
 
-Summarize: what entities were created, what edges link them, what notes captured, and what gaps remain (questions filed as `question` notes).
+Summarize: what entities were created, what edges link them, what notes captured, and what gaps
+remain (questions filed as `question` notes).
 
 ## Stop condition
 
-Material exhausted. Every entity above minimum density. No orphans (0-edge nodes). Gaps identified as `question` notes for follow-up.
+Material exhausted. Every entity above minimum density. No orphans (0-edge nodes). Gaps identified
+as `question` notes for follow-up.
 
 ## Error handling
 

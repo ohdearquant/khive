@@ -2,7 +2,7 @@
 
 // khive-mcp — per-platform binary shim for the MCP stdio server (ADR-026)
 //
-// Resolves the host platform to the matching khive-kernel-{platform}
+// Resolves the host platform to the matching @khive-ai/kernel-{platform}
 // optional dependency and execs the khive-mcp binary from its bin/ directory.
 // Falls back to a local cargo build directory for monorepo development.
 //
@@ -110,7 +110,7 @@ function getBinaryPath(binaryName) {
     process.exit(1);
   }
 
-  const pkgName = `khive-kernel-${platformSuffix}`;
+  const pkgName = `@khive-ai/kernel-${platformSuffix}`;
 
   // Package-manager-agnostic resolution (npm, yarn, pnpm isolated-store).
   try {

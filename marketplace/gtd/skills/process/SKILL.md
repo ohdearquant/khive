@@ -4,9 +4,11 @@ description: Process the GTD inbox into trusted lists - clarify each item, choos
 
 # Process
 
-The inbox is a capture bucket, not a working list. Processing turns each unclarified item into a concrete commitment, a waiting item, a someday item, or a finished/cancelled record.
+The inbox is a capture bucket, not a working list. Processing turns each unclarified item into a
+concrete commitment, a waiting item, a someday item, or a finished/cancelled record.
 
-Use this skill when `gtd.tasks(status="inbox")` has items or when `gtd.next()` feels noisy because captured work has not been clarified.
+Use this skill when `gtd.tasks(status="inbox")` has items or when `gtd.next()` feels noisy because
+captured work has not been clarified.
 
 ## Workflow
 
@@ -16,13 +18,16 @@ Use this skill when `gtd.tasks(status="inbox")` has items or when `gtd.next()` f
 request(ops="gtd.tasks(status=\"inbox\", limit=50)")
 ```
 
-Read every returned task title and description. Do not start by editing priorities. First decide what the item means and whether it is still real.
+Read every returned task title and description. Do not start by editing priorities. First decide
+what the item means and whether it is still real.
 
 ### 2. Clarify the outcome
 
-For each inbox item, write down the concrete outcome in your head before moving it. A useful item has a verb, an object, and enough context to act later.
+For each inbox item, write down the concrete outcome in your head before moving it. A useful item
+has a verb, an object, and enough context to act later.
 
-If the captured title is too vague to act on, do not promote it as-is. Either move it to `someday` with a note or cancel it and create concrete replacement tasks.
+If the captured title is too vague to act on, do not promote it as-is. Either move it to `someday`
+with a note or cancel it and create concrete replacement tasks.
 
 ### 3. Choose exactly one state
 
@@ -35,7 +40,10 @@ If the captured title is too vague to act on, do not promote it as-is. Either mo
 | `done`      | It was captured after the fact and is already complete.         |
 | `cancelled` | It is no longer worth tracking.                                 |
 
-**Transition rules**: `inbox` is a one-way entry point — no state can transition back to it. `waiting` and `someday` cannot reach each other directly (go through `next` or `active`). `done` and `cancelled` are **terminal** — no further transitions are accepted. To restart abandoned work, create a new task.
+**Transition rules**: `inbox` is a one-way entry point — no state can transition back to it.
+`waiting` and `someday` cannot reach each other directly (go through `next` or `active`). `done` and
+`cancelled` are **terminal** — no further transitions are accepted. To restart abandoned work,
+create a new task.
 
 ```
 inbox → next, waiting, someday, active, done, cancelled
@@ -72,7 +80,8 @@ request(ops="[
 ]")
 ```
 
-Use `gtd.complete` instead of `gtd.transition(..., status="done")` when recording a completed result:
+Use `gtd.complete` instead of `gtd.transition(..., status="done")` when recording a completed
+result:
 
 ```
 request(ops="gtd.complete(id=\"<id>\", result=\"already handled in the previous sweep\")")
@@ -86,7 +95,8 @@ After the inbox pass, confirm that the trusted queue is clean:
 request(ops="gtd.next(limit=20)")
 ```
 
-If `next` is empty, there is no committed actionable work. If it is too large, move low-commitment work back to `someday` or `waiting` with a note.
+If `next` is empty, there is no committed actionable work. If it is too large, move low-commitment
+work back to `someday` or `waiting` with a note.
 
 ## Patterns
 
@@ -111,7 +121,8 @@ Only do this when you are actually beginning the work. Otherwise leave it in `ne
 
 ### Split a vague inbox item
 
-If one captured item really contains several actions, cancel the vague item and create concrete replacements:
+If one captured item really contains several actions, cancel the vague item and create concrete
+replacements:
 
 ```
 request(ops="[
@@ -124,7 +135,10 @@ request(ops="[
 ## Anti-patterns
 
 - **Leaving clarified items in `inbox`.** Once you know what an item means, move it.
-- **Using `next` for maybe-work.** If you are not willing to see it in `gtd.next()`, it belongs in `someday` or `waiting`.
+- **Using `next` for maybe-work.** If you are not willing to see it in `gtd.next()`, it belongs in
+  `someday` or `waiting`.
 - **Moving blocked work to `next`.** Capture the blocker in a `waiting` transition note.
-- **Processing by priority only.** Priority is secondary; the first decision is whether the item is actionable, blocked, deferred, done, or cancelled.
-- **Starting everything you process.** `active` is for work in flight now, not work you hope to start soon.
+- **Processing by priority only.** Priority is secondary; the first decision is whether the item is
+  actionable, blocked, deferred, done, or cancelled.
+- **Starting everything you process.** `active` is for work in flight now, not work you hope to
+  start soon.

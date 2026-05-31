@@ -196,37 +196,37 @@ jobs:
       # Publish all six subpackages. If any fails, subsequent steps (including
       # umbrella publish) do not run. GitHub Actions sequential steps in a
       # single job guarantee this ordering.
-      - name: Publish khive-kernel-darwin-arm64
+      - name: Publish @khive-ai/kernel-darwin-arm64
         working-directory: npm/kernel-darwin-arm64
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Publish khive-kernel-darwin-x64
+      - name: Publish @khive-ai/kernel-darwin-x64
         working-directory: npm/kernel-darwin-x64
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Publish khive-kernel-linux-x64-gnu
+      - name: Publish @khive-ai/kernel-linux-x64-gnu
         working-directory: npm/kernel-linux-x64-gnu
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Publish khive-kernel-linux-x64-musl
+      - name: Publish @khive-ai/kernel-linux-x64-musl
         working-directory: npm/kernel-linux-x64-musl
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Publish khive-kernel-linux-arm64
+      - name: Publish @khive-ai/kernel-linux-arm64
         working-directory: npm/kernel-linux-arm64
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Publish khive-kernel-win32-x64
+      - name: Publish @khive-ai/kernel-win32-x64
         working-directory: npm/kernel-win32-x64
         run: npm publish --access public
         env:

@@ -6,12 +6,12 @@ description: Survey the graph for strategic gaps — researched-but-unbuilt conc
 
 A polished graph still has gaps. Not orphans — those are structural and `polish` handles them.
 **Strategic gaps**: things the graph's shape implies should exist but don't. Concepts everyone
-depends on but no one has built. Domains thick with research and thin with code. Alternatives
-we compared then never chose between. Papers we read once and never extended.
+depends on but no one has built. Domains thick with research and thin with code. Alternatives we
+compared then never chose between. Papers we read once and never extended.
 
-This skill walks four gap categories and emits a single `gap_inventory.md` plus a frontier
-ranking. The output is decision input — "what should we build next, given what the graph
-already says we know."
+This skill walks four gap categories and emits a single `gap_inventory.md` plus a frontier ranking.
+The output is decision input — "what should we build next, given what the graph already says we
+know."
 
 The MCP server exposes one tool — `request` — that takes the verb call as a string:
 
@@ -22,9 +22,9 @@ request(ops="[neighbors(node_id=\"<u>\", direction=\"in\", relations=[\"depends_
 
 The verb examples below show the inner call. Wrap each one as `request(ops="…")`.
 
-**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`),
-even when the MCP server runs with `--actor lambda:myproject`. Do NOT override the
-namespace for entity/edge/note operations. The knowledge graph is cross-project by design.
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`), even when the
+MCP server runs with `--actor lambda:myproject`. Do NOT override the namespace for entity/edge/note
+operations. The knowledge graph is cross-project by design.
 
 ## Workflow
 
@@ -36,8 +36,8 @@ list(kind="entity", entity_kind="project", limit=200)
 list(kind="entity", entity_kind="document", limit=500)
 ```
 
-Collect every UUID, name, and `properties.{domain, status, repo, type}` field. You will
-need these for category-2 and category-4 queries.
+Collect every UUID, name, and `properties.{domain, status, repo, type}` field. You will need these
+for category-2 and category-4 queries.
 
 ### 2. Category I — Roadmap gaps
 
@@ -55,8 +55,8 @@ Score:
 - `incoming_depends_on_count` — how many things wait on this
 - `outgoing_implements_count` — has any project realized it (should be 0 to count as roadmap gap)
 
-Flag any concept where `incoming_depends_on_count ≥ 2 AND outgoing_implements == 0`. These
-are the highest-leverage unbuilt items — many downstream concepts already assume them.
+Flag any concept where `incoming_depends_on_count ≥ 2 AND outgoing_implements == 0`. These are the
+highest-leverage unbuilt items — many downstream concepts already assume them.
 
 Subcategory — explicit roadmap debt:
 
@@ -65,9 +65,9 @@ list(kind="entity", entity_kind="document", limit=500)
 # filter for properties.type == "adr" and properties.status == "proposed"
 ```
 
-For each such ADR, walk its `introduced_by` edges back to the concepts it introduces, then
-check whether any project `implements` those concepts. Proposed ADR + zero implements =
-formal roadmap debt.
+For each such ADR, walk its `introduced_by` edges back to the concepts it introduces, then check
+whether any project `implements` those concepts. Proposed ADR + zero implements = formal roadmap
+debt.
 
 ### 3. Category II — Architectural gaps
 
@@ -80,8 +80,8 @@ Aggregate concepts by `properties.domain`. For each domain:
 - count concepts
 - count projects whose `implements` edges land on concepts in that domain
 
-Flag domains where `concept_count ≥ 5 AND project_count == 0`. The graph knows the topic
-deeply but has shipped nothing in it.
+Flag domains where `concept_count ≥ 5 AND project_count == 0`. The graph knows the topic deeply but
+has shipped nothing in it.
 
 **Orphan layers**: projects that don't compose with anything.
 
@@ -91,8 +91,8 @@ For each project:
 neighbors(node_id="<project-id>", direction="both", relations=["depends_on", "part_of", "contains"])
 ```
 
-Flag projects with zero structural edges. They exist, but the graph has no model of how they
-fit into a larger system.
+Flag projects with zero structural edges. They exist, but the graph has no model of how they fit
+into a larger system.
 
 ### 4. Category III — Feature direction gaps
 
@@ -104,9 +104,9 @@ For each concept with `outgoing_enables` edges:
 neighbors(node_id="<concept-id>", direction="out", relations=["enables"])
 ```
 
-For each enabled-target, check its `status` and `outgoing_implements`. Flag patterns where
-the source is implemented but the target is `status ∈ {"concept", "researched"}` and has
-zero implementing project. We shipped X; the thing X is supposed to enable is still a sketch.
+For each enabled-target, check its `status` and `outgoing_implements`. Flag patterns where the
+source is implemented but the target is `status ∈ {"concept", "researched"}` and has zero
+implementing project. We shipped X; the thing X is supposed to enable is still a sketch.
 
 **Decision debt** — competes_with cliques with no chosen winner:
 
@@ -114,9 +114,9 @@ zero implementing project. We shipped X; the thing X is supposed to enable is st
 neighbors(node_id="<concept-id>", direction="both", relations=["competes_with"])
 ```
 
-Build cliques (connected components under `competes_with`). For each clique of size ≥ 2,
-check if any member has an `implements` edge. Clique with zero implementations = we
-researched alternatives, never picked. The clique itself is the gap.
+Build cliques (connected components under `competes_with`). For each clique of size ≥ 2, check if
+any member has an `implements` edge. Clique with zero implementations = we researched alternatives,
+never picked. The clique itself is the gap.
 
 ### 5. Category IV — Research direction gaps
 
@@ -129,15 +129,15 @@ neighbors(node_id="<paper-id>", direction="in", relations=["introduced_by"])
 ```
 
 Flag papers with exactly one incoming `introduced_by` AND where that concept has zero
-`competes_with` AND zero `implements`. Single-use intellectual stub — we read it for one
-concept, never extended it, never compared it, never built it.
+`competes_with` AND zero `implements`. Single-use intellectual stub — we read it for one concept,
+never extended it, never compared it, never built it.
 
 **Narrow framing**: concepts in domains that should have alternatives but don't.
 
-For each concept whose `properties.domain` is one where the graph normally tracks
-alternatives (e.g., `attention`, `quantization`, `optimizer`), check `outgoing_competes_with`.
-Zero `competes_with` in a multi-option domain = the graph picked one path and didn't
-record what it rejected.
+For each concept whose `properties.domain` is one where the graph normally tracks alternatives
+(e.g., `attention`, `quantization`, `optimizer`), check `outgoing_competes_with`. Zero
+`competes_with` in a multi-option domain = the graph picked one path and didn't record what it
+rejected.
 
 ### 6. Frontier ranking
 
@@ -150,12 +150,12 @@ score = (incoming_depends_on_count × adr_mention_weight) / penalty
 Where:
 
 - `incoming_depends_on_count`: how many other concepts list this as a dependency
-- `adr_mention_weight`: count of ADR documents that cite this concept via `introduced_by`
-  (use 1 if zero ADRs cite it, to avoid zeroing-out)
+- `adr_mention_weight`: count of ADR documents that cite this concept via `introduced_by` (use 1 if
+  zero ADRs cite it, to avoid zeroing-out)
 - `penalty`: 1 if `outgoing_implements > 0`, else 10
 
-High score = "many things wait on it, our own decisions reference it, nobody has built it."
-This is the top of the queue.
+High score = "many things wait on it, our own decisions reference it, nobody has built it." This is
+the top of the queue.
 
 ### 7. Emit `gap_inventory.md`
 
@@ -216,19 +216,19 @@ These are caught by `polish`, not here:
 - Duplicate entities — structural, fix via merge
 - Under-linked nodes that are simply newly-ingested — give them edges, not strategic weight
 
-If a `gap` finding overlaps with a `polish` finding, prefer the polish framing. This skill
-assumes the graph is already structurally healthy.
+If a `gap` finding overlaps with a `polish` finding, prefer the polish framing. This skill assumes
+the graph is already structurally healthy.
 
 ## Stop condition
 
-`gap_inventory.md` exists with all four categories populated (use "none found" if a category
-is genuinely empty) plus a frontier ranking of at least the top 10 concepts. Each flagged
-item carries its UUID, the metric that flagged it, and a one-line "why it matters" drawn
-from the concept's description.
+`gap_inventory.md` exists with all four categories populated (use "none found" if a category is
+genuinely empty) plus a frontier ranking of at least the top 10 concepts. Each flagged item carries
+its UUID, the metric that flagged it, and a one-line "why it matters" drawn from the concept's
+description.
 
 ## Cadence
 
-Run after every major `digest` round and at least once before any roadmap planning. The
-inventory is a snapshot — gaps close as work happens, new ones open as research advances.
-The frontier ranking is most useful as a re-prioritization signal between waves of
-implementation work, not a one-time artifact.
+Run after every major `digest` round and at least once before any roadmap planning. The inventory is
+a snapshot — gaps close as work happens, new ones open as research advances. The frontier ranking is
+most useful as a re-prioritization signal between waves of implementation work, not a one-time
+artifact.

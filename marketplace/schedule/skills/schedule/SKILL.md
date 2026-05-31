@@ -4,7 +4,8 @@ description: Schedule a future verb dispatch — the action DSL is validated at 
 
 # Schedule
 
-Schedule a khive verb to execute at a future time. Unlike `remind` (which stores a text prompt), `schedule` stores a parseable DSL action string that can be dispatched by the trigger engine.
+Schedule a khive verb to execute at a future time. Unlike `remind` (which stores a text prompt),
+`schedule` stores a parseable DSL action string that can be dispatched by the trigger engine.
 
 ## Workflow
 
@@ -14,7 +15,8 @@ Schedule a khive verb to execute at a future time. Unlike `remind` (which stores
 request(ops="schedule.schedule(action=\"remind(content=\\\"weekly review\\\")\", at=\"2026-06-02T09:00:00Z\")")
 ```
 
-The `action` string is validated as parseable DSL at write time — invalid verb calls are rejected before they enter storage.
+The `action` string is validated as parseable DSL at write time — invalid verb calls are rejected
+before they enter storage.
 
 Response:
 
@@ -59,4 +61,5 @@ Any DSL expression accepted by `request` is valid as an action.
 - **Invalid DSL.** `action="do something"` is rejected — must be a valid verb call.
 - **Empty action.** Rejected.
 - **Past timestamps.** Rejected.
-- **Confusing remind and schedule.** Use `remind` for human-readable prompts. Use `schedule` for automated verb dispatch.
+- **Confusing remind and schedule.** Use `remind` for human-readable prompts. Use `schedule` for
+  automated verb dispatch.

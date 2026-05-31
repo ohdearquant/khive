@@ -6,16 +6,15 @@ description: Self-expansion. Take a strategic gap and grow the graph to close it
 
 `gap` finds what's missing. `expand` builds it.
 
-This is the most aggressive skill in the plugin: it adds NEW entities and edges based
-on what the graph already knows it's missing. Use it when a gap-inventory item is
-concrete enough to act on — a researched-but-unbuilt concept with downstream waiters,
-a single-use paper that should connect to more, a domain rich with concepts but no
-implementing crate.
+This is the most aggressive skill in the plugin: it adds NEW entities and edges based on what the
+graph already knows it's missing. Use it when a gap-inventory item is concrete enough to act on — a
+researched-but-unbuilt concept with downstream waiters, a single-use paper that should connect to
+more, a domain rich with concepts but no implementing crate.
 
-Self-expansion is high-leverage but easy to corrupt. **The rule**: never create an
-entity you cannot back with at least one citation — a paper, an ADR, an existing
-implementation, a quote from the source the gap came from. Speculative entities
-become noise that the next polish pass has to clean up.
+Self-expansion is high-leverage but easy to corrupt. **The rule**: never create an entity you cannot
+back with at least one citation — a paper, an ADR, an existing implementation, a quote from the
+source the gap came from. Speculative entities become noise that the next polish pass has to clean
+up.
 
 The MCP server exposes one tool — `request` — that takes the verb call as a string:
 
@@ -26,9 +25,9 @@ request(ops="[create(kind=\"entity\", entity_kind=\"project\", name=\"lora-tools
 
 The verb examples below show the inner call. Wrap each one as `request(ops="…")`.
 
-**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`),
-even when the MCP server runs with `--actor lambda:myproject`. Do NOT override the
-namespace for entity/edge/note operations. The knowledge graph is cross-project by design.
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`), even when the
+MCP server runs with `--actor lambda:myproject`. Do NOT override the namespace for entity/edge/note
+operations. The knowledge graph is cross-project by design.
 
 ## Input
 
@@ -38,13 +37,13 @@ A single gap to expand. Either:
 - A `properties.domain` value flagged as an architectural gap
 - A set of UUIDs forming a `competes_with` clique flagged as decision debt
 
-If the input isn't a structured gap from `gap_inventory.md`, run `gap` first.
-Working from a fresh inventory keeps expansion grounded.
+If the input isn't a structured gap from `gap_inventory.md`, run `gap` first. Working from a fresh
+inventory keeps expansion grounded.
 
 ## Mode selection
 
-Pick the mode that matches the gap's category. One expansion = one mode. Do not
-chain modes inside a single skill invocation.
+Pick the mode that matches the gap's category. One expansion = one mode. Do not chain modes inside a
+single skill invocation.
 
 | Gap type from `gap`                   | Mode to run |
 | ------------------------------------- | ----------- |
@@ -57,8 +56,8 @@ chain modes inside a single skill invocation.
 
 ### Mode: Promote — roadmap gap → project proposal
 
-Trigger: a concept `C` with `status ∈ {"researched", "concept"}`, ≥2 incoming
-`depends_on`, zero `implements`.
+Trigger: a concept `C` with `status ∈ {"researched", "concept"}`, ≥2 incoming `depends_on`, zero
+`implements`.
 
 Workflow:
 
@@ -75,9 +74,9 @@ search(kind="entity", query="<C.domain> <C.name>")
 list(kind="entity", entity_kind="project", limit=50)
 ```
 
-3. Determine the smallest viable project that could `implements` C. Anchor it to
-   existing infrastructure crates via `depends_on`. If no obvious crate name
-   exists, propose one based on the dominant ADR or repo in C's properties.
+3. Determine the smallest viable project that could `implements` C. Anchor it to existing
+   infrastructure crates via `depends_on`. If no obvious crate name exists, propose one based on the
+   dominant ADR or repo in C's properties.
 
 4. Create the project entity (status: `"proposed"`):
 
@@ -104,8 +103,8 @@ create(kind="note", note_kind="decision",
 
 ### Mode: Bridge — domain orphan → architectural crate proposal
 
-Trigger: a `properties.domain` value with ≥5 concept entities and zero project
-entities whose `implements` edges land in that domain.
+Trigger: a `properties.domain` value with ≥5 concept entities and zero project entities whose
+`implements` edges land in that domain.
 
 Workflow:
 
@@ -116,18 +115,17 @@ list(kind="entity", entity_kind="concept", limit=100)
 # filter by properties.domain == "<target-domain>"
 ```
 
-2. Pick the concept with the highest `incoming_depends_on` count as the
-   architectural anchor. Apply **Promote** to that anchor (above).
+2. Pick the concept with the highest `incoming_depends_on` count as the architectural anchor. Apply
+   **Promote** to that anchor (above).
 
-3. After Promote completes, walk the rest of the domain's concepts and add
-   `implements` edges from the new project to each whose description is
-   architecturally compatible (read each description to verify; do NOT
-   bulk-link).
+3. After Promote completes, walk the rest of the domain's concepts and add `implements` edges from
+   the new project to each whose description is architecturally compatible (read each description to
+   verify; do NOT bulk-link).
 
 ### Mode: Extend — single-use paper / narrow framing → adjacent concepts
 
-Trigger: a paper cited by exactly one concept, or a concept in a multi-option
-domain with zero `competes_with` edges.
+Trigger: a paper cited by exactly one concept, or a concept in a multi-option domain with zero
+`competes_with` edges.
 
 Workflow:
 
@@ -137,11 +135,11 @@ Workflow:
 neighbors(node_id="<source-id>", direction="both")
 ```
 
-2. Read the source's description. Identify named alternatives, variants, or
-   parent techniques mentioned in the text.
+2. Read the source's description. Identify named alternatives, variants, or parent techniques
+   mentioned in the text.
 
-3. For each identified neighbor that **does not exist yet** in the graph
-   (verify with `search`), create it as a concept:
+3. For each identified neighbor that **does not exist yet** in the graph (verify with `search`),
+   create it as a concept:
 
 ```
 search(kind="entity", query="<candidate-name>")
@@ -151,18 +149,17 @@ create(kind="entity", entity_kind="concept", name="<short-canonical-name>",
   properties={"domain": "<source.domain>", "status": "concept", "type": "technique"})
 ```
 
-4. Link the new concept to the source with the appropriate relation:
-   `competes_with` for alternatives, `extends`/`variant_of` for derivatives,
-   `instance_of` for specializations.
+4. Link the new concept to the source with the appropriate relation: `competes_with` for
+   alternatives, `extends`/`variant_of` for derivatives, `instance_of` for specializations.
 
-5. Hard ceiling: **max 5 new entities per Extend invocation**. Self-expansion
-   that creates more than 5 entities is no longer grounded — it's
-   hallucination. If you need more, run Extend again with a different source.
+5. Hard ceiling: **max 5 new entities per Extend invocation**. Self-expansion that creates more than
+   5 entities is no longer grounded — it's hallucination. If you need more, run Extend again with a
+   different source.
 
 ### Mode: Resolve — competes_with clique → decision
 
-Trigger: a clique of ≥2 concepts under `competes_with` with zero `implements`
-edges across all members.
+Trigger: a clique of ≥2 concepts under `competes_with` with zero `implements` edges across all
+members.
 
 Workflow:
 
@@ -172,15 +169,13 @@ Workflow:
 request(ops="[get(id=\"<m1-id>\"), get(id=\"<m2-id>\")]")
 ```
 
-2. Identify the comparison axes that matter (drawn from descriptions, properties,
-   the domain's conventions). Typical axes: performance, memory, complexity,
-   compatibility with existing infra.
+2. Identify the comparison axes that matter (drawn from descriptions, properties, the domain's
+   conventions). Typical axes: performance, memory, complexity, compatibility with existing infra.
 
-3. **Resolve does not pick winners autonomously.** It writes a `decision` note
-   that:
+3. **Resolve does not pick winners autonomously.** It writes a `decision` note that:
    - Lays out the comparison
-   - Names which axis matters most for this codebase (anchored to existing
-     project entities and their constraints)
+   - Names which axis matters most for this codebase (anchored to existing project entities and
+     their constraints)
    - Recommends a member, with stated assumptions
 
 ```
@@ -189,9 +184,8 @@ create(kind="note", note_kind="decision",
   annotates=["<member-1-uuid>", "<member-2-uuid>"])
 ```
 
-4. If the recommendation is strong (cited by an existing ADR or backed by
-   benchmark properties on the entities), also add an `implements` edge from
-   the relevant project to the chosen member.
+4. If the recommendation is strong (cited by an existing ADR or backed by benchmark properties on
+   the entities), also add an `implements` edge from the relevant project to the chosen member.
 
 ## Verification
 
@@ -201,9 +195,9 @@ After expansion, for every new entity created:
 neighbors(node_id="<new-id>", direction="both")
 ```
 
-Each new entity must meet the kind's minimum density (concept ≥ 4, project ≥ 3,
-document ≥ 2). If a new entity is below threshold and you've exhausted the
-visible context, file a `question` note recording what edge is missing:
+Each new entity must meet the kind's minimum density (concept ≥ 4, project ≥ 3, document ≥ 2). If a
+new entity is below threshold and you've exhausted the visible context, file a `question` note
+recording what edge is missing:
 
 ```
 create(kind="note", note_kind="question",
@@ -211,8 +205,7 @@ create(kind="note", note_kind="question",
   annotates=["<new-entity-id>"])
 ```
 
-A question note is honest debt — it tells the next agent what's missing without
-fabricating an edge.
+A question note is honest debt — it tells the next agent what's missing without fabricating an edge.
 
 ## Report
 
@@ -229,28 +222,25 @@ State for the record:
 ## Safety rules (mandatory)
 
 1. **One mode per invocation.** Do not chain.
-2. **Max 5 new entities per Extend.** Promote/Bridge create at most one project.
-   Resolve creates only notes (or one edge if recommendation is strong).
-3. **Every new entity needs a citation.** A description sentence sourced from
-   an existing entity, a paper, an ADR, or a code reference. No source = no
-   create. File a question note instead.
-4. **Do not create entities outside the closed taxonomies.** 8 kinds, 15
-   relations, 5 note kinds. If your expansion needs a new kind, that is an
-   ADR, not a skill invocation — stop and surface to a human.
-5. **Re-read the source after expansion** to verify you didn't drift. A
-   common failure: the gap inventory pointed at X, but mid-expansion you
-   ended up creating entities about Y. Stop and revert if so.
+2. **Max 5 new entities per Extend.** Promote/Bridge create at most one project. Resolve creates
+   only notes (or one edge if recommendation is strong).
+3. **Every new entity needs a citation.** A description sentence sourced from an existing entity, a
+   paper, an ADR, or a code reference. No source = no create. File a question note instead.
+4. **Do not create entities outside the closed taxonomies.** 8 kinds, 15 relations, 5 note kinds. If
+   your expansion needs a new kind, that is an ADR, not a skill invocation — stop and surface to a
+   human.
+5. **Re-read the source after expansion** to verify you didn't drift. A common failure: the gap
+   inventory pointed at X, but mid-expansion you ended up creating entities about Y. Stop and revert
+   if so.
 
 ## Stop condition
 
-The input gap is closed (the entity exists with min density and a relation
-back to the source) OR a `question` note explicitly records why the gap
-cannot be closed without external input. Either is an acceptable terminal
-state. Leaving the gap silently unaddressed is not.
+The input gap is closed (the entity exists with min density and a relation back to the source) OR a
+`question` note explicitly records why the gap cannot be closed without external input. Either is an
+acceptable terminal state. Leaving the gap silently unaddressed is not.
 
 ## Cadence
 
-Run after each `gap` survey. Process gaps in frontier-rank order — highest-
-leverage first. Re-run `gap` between expansions to track which gaps the
-expansion actually closed and which new gaps it opened (every expansion
-opens at least one new edge of unexplored knowledge).
+Run after each `gap` survey. Process gaps in frontier-rank order — highest- leverage first. Re-run
+`gap` between expansions to track which gaps the expansion actually closed and which new gaps it
+opened (every expansion opens at least one new edge of unexplored knowledge).

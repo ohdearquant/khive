@@ -4,7 +4,9 @@ description: Set a time-triggered reminder with optional repeat schedule.
 
 # Remind
 
-Create a reminder that triggers at a future time. The reminder is stored as a `scheduled_event` note with `status: "pending"`. The schedule pack stores intent only — trigger evaluation is handled by the runtime.
+Create a reminder that triggers at a future time. The reminder is stored as a `scheduled_event` note
+with `status: "pending"`. The schedule pack stores intent only — trigger evaluation is handled by
+the runtime.
 
 ## Workflow
 
@@ -33,7 +35,8 @@ Response:
 request(ops="schedule.remind(content=\"weekly standup prep\", at=\"2026-06-02T09:00:00Z\", repeat=\"weekly\")")
 ```
 
-Valid repeat values: `"daily"`, `"weekly"`, `"monthly"`, or a 5-field cron expression (e.g. `"0 9 * * 1"` for Mondays at 9am).
+Valid repeat values: `"daily"`, `"weekly"`, `"monthly"`, or a 5-field cron expression (e.g.
+`"0 9 * * 1"` for Mondays at 9am).
 
 ### 3. Batch reminders
 

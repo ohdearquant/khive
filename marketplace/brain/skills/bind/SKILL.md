@@ -4,11 +4,14 @@ description: Wire brain profiles to actors, namespaces, and consumer kinds via t
 
 # Bind
 
-The brain pack resolves which profile to use for a given caller context via a binding table. Each binding maps a (actor, namespace, consumer_kind) triple to a profile. Use `brain.bind` to add or replace a binding and `brain.unbind` to remove one.
+The brain pack resolves which profile to use for a given caller context via a binding table. Each
+binding maps a (actor, namespace, consumer_kind) triple to a profile. Use `brain.bind` to add or
+replace a binding and `brain.unbind` to remove one.
 
 ## How resolution works
 
-When `brain.resolve` is called with a (actor, namespace, consumer_kind) context, it walks the binding table from most-specific to least-specific:
+When `brain.resolve` is called with a (actor, namespace, consumer_kind) context, it walks the
+binding table from most-specific to least-specific:
 
 1. Exact match: actor + namespace + consumer_kind
 2. Wildcard actor: `*` + namespace + consumer_kind
@@ -23,7 +26,8 @@ The first match wins. If no match is found, `NotFound` is returned.
 
 ### brain.bind — add or replace a binding
 
-Required arg: `profile_id`. At least one of `actor`, `namespace`, or `consumer_kind` should be set; all default to `*` (wildcard) if omitted.
+Required arg: `profile_id`. At least one of `actor`, `namespace`, or `consumer_kind` should be set;
+all default to `*` (wildcard) if omitted.
 
 Bind all callers for the `recall` consumer kind to the default profile:
 
@@ -43,15 +47,18 @@ Bind a namespace + consumer kind:
 request(ops="brain.bind(profile_id=\"balanced-recall-v1\", namespace=\"project-a\", consumer_kind=\"recall\")")
 ```
 
-Set `priority` to control tie-breaking when multiple bindings could match (higher number = higher priority, default 0):
+Set `priority` to control tie-breaking when multiple bindings could match (higher number = higher
+priority, default 0):
 
 ```
 request(ops="brain.bind(profile_id=\"balanced-recall-v1\", namespace=\"project-a\", consumer_kind=\"recall\", priority=10)")
 ```
 
-If a binding for the same (actor, namespace, consumer_kind) triple already exists, `brain.bind` replaces it atomically.
+If a binding for the same (actor, namespace, consumer_kind) triple already exists, `brain.bind`
+replaces it atomically.
 
-Response: `{ "bound": true, "profile_id": "...", "actor": "...", "namespace": "...", "consumer_kind": "..." }`.
+Response:
+`{ "bound": true, "profile_id": "...", "actor": "...", "namespace": "...", "consumer_kind": "..." }`.
 
 ### brain.unbind — remove bindings
 
@@ -89,10 +96,14 @@ request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"researcher\")")
 
 ## Anti-patterns
 
-- **Using `*` inside a real value.** `*` is the wildcard sentinel. A value like `proj-*-team` is rejected.
-- **Unbinding with no args.** `brain.unbind()` with no filters is rejected with an error. At least one of `profile_id`, `actor`, `namespace`, or `consumer_kind` must be supplied.
-- **Binding to a nonexistent profile.** `brain.bind` validates the profile exists and returns `NotFound` if not. List profiles first with `brain.profiles()`.
+- **Using `*` inside a real value.** `*` is the wildcard sentinel. A value like `proj-*-team` is
+  rejected.
+- **Unbinding with no args.** `brain.unbind()` with no filters is rejected with an error. At least
+  one of `profile_id`, `actor`, `namespace`, or `consumer_kind` must be supplied.
+- **Binding to a nonexistent profile.** `brain.bind` validates the profile exists and returns
+  `NotFound` if not. List profiles first with `brain.profiles()`.
 
 ## Stop condition
 
-Binding is in place. Confirm with `brain.resolve` using the exact actor/namespace/consumer_kind context you expect to use. If resolution returns the expected profile, the skill is done.
+Binding is in place. Confirm with `brain.resolve` using the exact actor/namespace/consumer_kind
+context you expect to use. If resolution returns the expected profile, the skill is done.

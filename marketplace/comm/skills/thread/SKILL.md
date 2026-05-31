@@ -4,7 +4,8 @@ description: View a full conversation thread in chronological order.
 
 # Thread
 
-Retrieve all messages in a conversation thread, ordered chronologically (earliest first). Pass any message ID from the thread — the handler resolves to the canonical thread root automatically.
+Retrieve all messages in a conversation thread, ordered chronologically (earliest first). Pass any
+message ID from the thread — the handler resolves to the canonical thread root automatically.
 
 ## Workflow
 
@@ -68,5 +69,6 @@ Read the thread before composing a reply to avoid repeating information already 
 
 ## Anti-patterns
 
-- **Threading on a non-message note.** Only `kind="message"` notes are valid. An observation or task note returns an error.
+- **Threading on a non-message note.** Only `kind="message"` notes are valid. An observation or task
+  note returns an error.
 - **Using a nonexistent ID.** Returns "not found".

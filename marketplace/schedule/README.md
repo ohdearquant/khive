@@ -1,6 +1,7 @@
 # schedule — Time-based Scheduling
 
-Set reminders, schedule future verb dispatches, view upcoming events, and cancel scheduled items. Events are stored as `scheduled_event` notes with trigger times, repeat rules, and lifecycle status.
+Set reminders, schedule future verb dispatches, view upcoming events, and cancel scheduled items.
+Events are stored as `scheduled_event` notes with trigger times, repeat rules, and lifecycle status.
 
 ## Skills
 
@@ -29,12 +30,15 @@ request(ops="schedule.cancel(id=\"<event-id>\")")
 
 ## What's New in 0.2.3
 
-- **Cancel guard**: `schedule.cancel` now rejects attempts to cancel an already-cancelled
-  event with a clear error instead of silently succeeding.
+- **Cancel guard**: `schedule.cancel` now rejects attempts to cancel an already-cancelled event with
+  a clear error instead of silently succeeding.
 
 ## How it works
 
-The schedule pack stores intent only — it does not execute triggers. Events are `scheduled_event` notes with `status: "pending"` until cancelled. The `at` parameter must be an RFC 3339 timestamp in the future. The `action` parameter in `schedule.schedule` is validated as parseable DSL at write time. Repeat accepts `"daily"`, `"weekly"`, `"monthly"`, or a 5-field cron expression.
+The schedule pack stores intent only — it does not execute triggers. Events are `scheduled_event`
+notes with `status: "pending"` until cancelled. The `at` parameter must be an RFC 3339 timestamp in
+the future. The `action` parameter in `schedule.schedule` is validated as parseable DSL at write
+time. Repeat accepts `"daily"`, `"weekly"`, `"monthly"`, or a 5-field cron expression.
 
 ## Requirements
 

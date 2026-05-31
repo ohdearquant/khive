@@ -15,9 +15,9 @@ request(ops="[list(kind=\"edge\", source_id=\"<u>\"), list(kind=\"edge\", target
 
 The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
 
-**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`),
-even when the MCP server runs with `--actor lambda:myproject`. Do NOT override the
-namespace for entity/edge/note operations. The knowledge graph is cross-project by design.
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`), even when the
+MCP server runs with `--actor lambda:myproject`. Do NOT override the namespace for entity/edge/note
+operations. The knowledge graph is cross-project by design.
 
 ## Workflow
 
@@ -56,8 +56,8 @@ If two entities refer to the same real-world thing (e.g., "LoRA" and "Low-Rank A
 merge(into_id="<keep-id>", from_id="<remove-id>")
 ```
 
-`merge` deduplicates entities. Properties combine, tags union, edges rewire to the kept
-entity, and the duplicate is removed. Both IDs must refer to entities.
+`merge` deduplicates entities. Properties combine, tags union, edges rewire to the kept entity, and
+the duplicate is removed. Both IDs must refer to entities.
 
 For duplicate **notes** — use supersession instead:
 
@@ -80,8 +80,8 @@ For each orphan or under-linked entity, think about:
 - What competes with it? → `competes_with`
 - What project implements it? → `implements`
 
-Create the appropriate links. If you can't determine the relationship from context,
-search for clues:
+Create the appropriate links. If you can't determine the relationship from context, search for
+clues:
 
 ```
 search(kind="note", query="<entity name>")
@@ -135,10 +135,10 @@ Summarize:
 ## Data-vs-view principle
 
 Supersession **keeps** the old record and marks it superseded — it never deletes, copies, or
-transfers data. "Show only current" is a query concern handled by the search filter, not
-by data mutation. If you want to actually remove something, the verb is `delete`.
+transfers data. "Show only current" is a query concern handled by the search filter, not by data
+mutation. If you want to actually remove something, the verb is `delete`.
 
 ## Stop condition
 
-No orphans. All entities at or above minimum density. No obvious duplicates. Stale edges
-corrected. Report filed.
+No orphans. All entities at or above minimum density. No obvious duplicates. Stale edges corrected.
+Report filed.

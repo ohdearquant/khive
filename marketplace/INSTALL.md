@@ -31,10 +31,10 @@ khive-mcp --version
 
 ### Daemon (warm startup)
 
-`khive-mcp` automatically spawns a background daemon on first use. The daemon keeps embedding
-models and the ANN index warm in memory so that subsequent requests start instantly instead of
-reloading from disk. No user action is needed — install, configure, and the daemon lifecycle is
-handled for you.
+`khive-mcp` automatically spawns a background daemon on first use. The daemon keeps embedding models
+and the ANN index warm in memory so that subsequent requests start instantly instead of reloading
+from disk. No user action is needed — install, configure, and the daemon lifecycle is handled for
+you.
 
 If you need manual control:
 
@@ -43,8 +43,8 @@ If you need manual control:
 
 ### kkernel (optional admin CLI)
 
-`kkernel` is a separate admin binary for pack introspection, reindexing, and engine management.
-Most users never need it. If you do:
+`kkernel` is a separate admin binary for pack introspection, reindexing, and engine management. Most
+users never need it. If you do:
 
 ```bash
 cargo install kkernel
@@ -212,5 +212,6 @@ All examples should report `invalid=0`.
 ## Links
 
 - Repository: <https://github.com/ohdearquant/khive>
-- ADR-016 (request DSL): <https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md>
+- ADR-016 (request DSL):
+  <https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md>
 - Releases: <https://github.com/ohdearquant/khive/releases>

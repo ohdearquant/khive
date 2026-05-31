@@ -4,7 +4,9 @@ description: Reply to a message with automatic threading, subject prefixing, and
 
 # Reply
 
-Reply to an existing message. The reply is automatically threaded to the original conversation, the subject gets "Re: " prepended (if not already present), and the recipient is routed to the "other party" — if you are the original sender, the reply goes to the original recipient, and vice versa.
+Reply to an existing message. The reply is automatically threaded to the original conversation, the
+subject gets "Re: " prepended (if not already present), and the recipient is routed to the "other
+party" — if you are the original sender, the reply goes to the original recipient, and vice versa.
 
 ## Workflow
 
@@ -57,6 +59,8 @@ request(ops="comm.thread(id=\"<any-message-in-thread>\")")
 
 ## Anti-patterns
 
-- **Replying to a non-message note.** `comm.reply` only works on notes with `kind="message"`. Replying to an observation or task returns an error.
+- **Replying to a non-message note.** `comm.reply` only works on notes with `kind="message"`.
+  Replying to an observation or task returns an error.
 - **Empty reply content.** Rejected.
-- **Using `comm.send` with `thread_id` instead of `reply`.** `reply` handles subject prefixing and recipient routing automatically.
+- **Using `comm.send` with `thread_id` instead of `reply`.** `reply` handles subject prefixing and
+  recipient routing automatically.

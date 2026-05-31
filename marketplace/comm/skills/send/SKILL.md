@@ -4,7 +4,8 @@ description: Send a message to a recipient with optional subject and threading.
 
 # Send
 
-Send a structured message to another agent, lambda, or namespace. Each send creates an outbound copy (sender's namespace) and an inbound copy (recipient's namespace).
+Send a structured message to another agent, lambda, or namespace. Each send creates an outbound copy
+(sender's namespace) and an inbound copy (recipient's namespace).
 
 ## Workflow
 
@@ -67,4 +68,5 @@ request(ops="[
 
 - **Empty content.** Rejected with an error.
 - **Cross-namespace sends.** `to="other-ns"` is denied — use the same namespace as the caller.
-- **Using send for replies.** Use `comm.reply` — it handles threading, subject prefixing, and routing automatically.
+- **Using send for replies.** Use `comm.reply` — it handles threading, subject prefixing, and
+  routing automatically.

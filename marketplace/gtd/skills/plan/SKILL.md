@@ -4,9 +4,11 @@ description: Plan a realistic GTD week - review all lists, choose commitments, d
 
 # Plan
 
-Planning is the weekly commitment pass. It turns a processed task system into a small set of work that should actually move this week.
+Planning is the weekly commitment pass. It turns a processed task system into a small set of work
+that should actually move this week.
 
-Use this after `process` has cleared the inbox or when `gtd.next()` is technically correct but too broad to guide the week.
+Use this after `process` has cleared the inbox or when `gtd.next()` is technically correct but too
+broad to guide the week.
 
 ## Workflow
 
@@ -24,7 +26,8 @@ request(ops="[
 ]")
 ```
 
-If the inbox has more than a few items, run `process` first. Planning on an unprocessed inbox mixes capture with commitment and produces a noisy week.
+If the inbox has more than a few items, run `process` first. Planning on an unprocessed inbox mixes
+capture with commitment and produces a noisy week.
 
 ### 2. Close or park stale active work
 
@@ -54,7 +57,8 @@ Review current next work:
 request(ops="gtd.tasks(status=\"next\", limit=100)")
 ```
 
-Keep only the tasks you are willing to see every time you call `gtd.next()` this week. If a task is real but not for this week, move it:
+Keep only the tasks you are willing to see every time you call `gtd.next()` this week. If a task is
+real but not for this week, move it:
 
 ```
 request(ops="gtd.transition(id=\"<id>\", status=\"someday\", note=\"weekly plan: not this week\")")
@@ -108,7 +112,8 @@ End by checking the actionable queue:
 request(ops="gtd.next(limit=20)")
 ```
 
-The result should be small enough to scan and concrete enough to act. If it is not, continue deferring, waiting, cancelling, or splitting tasks.
+The result should be small enough to scan and concrete enough to act. If it is not, continue
+deferring, waiting, cancelling, or splitting tasks.
 
 ## Patterns
 
@@ -123,7 +128,8 @@ request(ops="[
 ]")
 ```
 
-Use the results to make decisions, then send a second batch of transitions. Do not mix inspection and decisions until you have read the lists.
+Use the results to make decisions, then send a second batch of transitions. Do not mix inspection
+and decisions until you have read the lists.
 
 ### Rebalance by assignee
 
@@ -135,7 +141,8 @@ request(ops="[
 ]")
 ```
 
-If one assignee has too much work, assign explicit follow-ups to other agents or move lower-priority items to `someday`.
+If one assignee has too much work, assign explicit follow-ups to other agents or move lower-priority
+items to `someday`.
 
 ### Create a planning trail
 
@@ -149,8 +156,12 @@ Future review depends on those notes to distinguish blocked work from abandoned 
 
 ## Anti-patterns
 
-- **Planning before processing.** Clear or triage `inbox` first, otherwise captured noise becomes fake commitment.
+- **Planning before processing.** Clear or triage `inbox` first, otherwise captured noise becomes
+  fake commitment.
 - **Keeping everything in `next`.** A trusted next list is selective. Move non-commitments out.
-- **Leaving stale `active` tasks untouched.** Active work that is not moving should become `waiting`, `next`, `someday`, `done`, or `cancelled`.
-- **Assigning vague follow-ups.** New tasks created during planning should be concrete enough for the assignee to start.
-- **No final `gtd.next()` check.** Planning is not complete until the actionable list reflects the plan.
+- **Leaving stale `active` tasks untouched.** Active work that is not moving should become
+  `waiting`, `next`, `someday`, `done`, or `cancelled`.
+- **Assigning vague follow-ups.** New tasks created during planning should be concrete enough for
+  the assignee to start.
+- **No final `gtd.next()` check.** Planning is not complete until the actionable list reflects the
+  plan.

@@ -1,15 +1,21 @@
 {
-  "name": "khive-kernel-linux-x64-musl",
-  "version": "0.2.4",
+  "name": "@khive-ai/kernel-linux-x64-musl",
+  "version": "0.2.5",
   "description": "khive Rust binaries for Linux x86_64 musl (Alpine etc.)",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/ohdearquant/khive"
   },
-  "os": ["linux"],
-  "cpu": ["x64"],
-  "libc": ["musl"],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "musl"
+  ],
   "files": [
     "bin/"
   ],

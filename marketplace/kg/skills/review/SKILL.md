@@ -12,13 +12,12 @@ The MCP server exposes one tool, `request`, that takes the verb call as a string
 request(ops="review(proposal_id=\"00000000-0000-0000-0000-000000000001\", decision=\"approve\", comment=\"Change matches the cited evidence.\")")
 ```
 
-Required args: `proposal_id`, `decision`.
-Optional args: `comment`, `namespace`.
+Required args: `proposal_id`, `decision`. Optional args: `comment`, `namespace`.
 
 Valid `decision` values: `approve`, `reject`, `comment`, `request_changes`, `requestchanges`.
 
-**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`).
-Do NOT override the namespace with `lambda:*` actor namespaces.
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`). Do NOT
+override the namespace with `lambda:*` actor namespaces.
 
 ## Workflow
 
@@ -30,7 +29,8 @@ Retrieve the proposal before deciding:
 request(ops="get(id=\"<proposal-id>\")")
 ```
 
-Inspect `changeset.kind` and the source IDs. Verify the cited entities exist and the relationship is correct.
+Inspect `changeset.kind` and the source IDs. Verify the cited entities exist and the relationship is
+correct.
 
 ### 2. Verify source evidence
 

@@ -9,9 +9,9 @@ homepage.workspace = true
 description = "KG three-way merge with conflict detection (ADR-043)"
 
 [dependencies]
-khive-runtime = { version = "0.2.4", path = "../khive-runtime" }
-khive-storage = { version = "0.2.4", path = "../khive-storage" }
-khive-vcs = { version = "0.2.4", path = "../khive-vcs" }
+khive-runtime = { version = "0.2.5", path = "../khive-runtime" }
+khive-storage = { version = "0.2.5", path = "../khive-storage" }
+khive-vcs = { version = "0.2.5", path = "../khive-vcs" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

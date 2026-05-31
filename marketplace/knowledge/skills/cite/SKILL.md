@@ -4,8 +4,8 @@ description: Link a concept to the paper or person that introduced it.
 
 # Cite
 
-Create a provenance-tracked `introduced_by` edge from a concept entity to the document or
-person that first introduced it. This follows the ADR-002 base endpoint contract:
+Create a provenance-tracked `introduced_by` edge from a concept entity to the document or person
+that first introduced it. This follows the ADR-002 base endpoint contract:
 `concept -[introduced_by]-> document` or `concept -[introduced_by]-> person`.
 
 ## Usage
@@ -50,7 +50,7 @@ request(ops="knowledge.cite(concept_id=\"<concept_full_id>\", source_id=\"<paper
 
 ## Anti-patterns
 
-- **Citing concept → concept.** `introduced_by` requires the target to be a `document` or
-  `person`. Use the kg `link` verb with a different relation (e.g. `extends`) for concept→concept.
-- **Using a note ID as source.** Notes are not valid targets for `introduced_by`. The source must
-  be a `document` or `person` _entity_.
+- **Citing concept → concept.** `introduced_by` requires the target to be a `document` or `person`.
+  Use the kg `link` verb with a different relation (e.g. `extends`) for concept→concept.
+- **Using a note ID as source.** Notes are not valid targets for `introduced_by`. The source must be
+  a `document` or `person` _entity_.

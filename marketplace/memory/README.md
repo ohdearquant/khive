@@ -2,11 +2,15 @@
 
 Persistent agent memory on top of [khive-mcp](https://github.com/ohdearquant/khive).
 
-A memory is a note with `kind = "memory"`. The memory pack adds two focused verbs: `remember` for storing durable context and `recall` for retrieving memory notes with decay-aware ranking. Memories can be tagged, typed as `episodic` or `semantic`, assigned a salience score, and optionally linked to a source entity or note.
+A memory is a note with `kind = "memory"`. The memory pack adds two focused verbs: `remember` for
+storing durable context and `recall` for retrieving memory notes with decay-aware ranking. Memories
+can be tagged, typed as `episodic` or `semantic`, assigned a salience score, and optionally linked
+to a source entity or note.
 
 ## Verbs
 
-All verbs are dispatched through the single MCP `request` tool ([ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)).
+All verbs are dispatched through the single MCP `request` tool
+([ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)).
 
 | Verb                                                                                                        | What it does                                                             |
 | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
@@ -21,10 +25,10 @@ Memory types (`memory_type` values):
 | `semantic` | Stable facts, preferences, project context, and reusable knowledge.                      |
 
 `memory.recall` results include a score triplet: `score` (absolute relevance, `[0.0, 1.0]`),
-`rank_score` (composite ordering score, `[0.0, 1.0]`), and `raw_score` (pre-fusion vector
-cosine similarity, `[0.0, 1.0]` or `null` for text-only hits). All values are bounded to
-`[0.0, 1.0]`. Passing `presentation="verbose"` adds a per-component `breakdown` field;
-`presentation` defaults to `"agent"` when omitted.
+`rank_score` (composite ordering score, `[0.0, 1.0]`), and `raw_score` (pre-fusion vector cosine
+similarity, `[0.0, 1.0]` or `null` for text-only hits). All values are bounded to `[0.0, 1.0]`.
+Passing `presentation="verbose"` adds a per-component `breakdown` field; `presentation` defaults to
+`"agent"` when omitted.
 
 ## What's New in 0.2.3
 
@@ -32,8 +36,8 @@ cosine similarity, `[0.0, 1.0]` or `null` for text-only hits). All values are bo
   parameters to filter recalled memories by tag values.
 - **`include_embeddings` on recall**: pass `include_embeddings=true` to include raw embedding
   vectors in recall results (useful for downstream reranking or clustering).
-- **`presentation` alias removed**: the deprecated `presentation` positional alias on `recall`
-  is removed; use the standard `presentation` field on the `request` call instead.
+- **`presentation` alias removed**: the deprecated `presentation` positional alias on `recall` is
+  removed; use the standard `presentation` field on the `request` call instead.
 
 ## Skills
 
@@ -42,9 +46,9 @@ cosine similarity, `[0.0, 1.0]` or `null` for text-only hits). All values are bo
 
 ## Prerequisites
 
-This plugin provides skills only — it does **not** bundle an MCP server.
-You must install the `khive-mcp` binary and register it as an MCP server in your
-harness **before** using any of the skills below.
+This plugin provides skills only — it does **not** bundle an MCP server. You must install the
+`khive-mcp` binary and register it as an MCP server in your harness **before** using any of the
+skills below.
 
 ```bash
 # Install the binary
@@ -67,8 +71,8 @@ Or add to your project's `.mcp.json`:
 }
 ```
 
-The runtime resolves the memory pack's `kg` dependency, so memory notes are stored
-in the same substrate as the knowledge graph.
+The runtime resolves the memory pack's `kg` dependency, so memory notes are stored in the same
+substrate as the knowledge graph.
 
 ## Install
 

@@ -4,9 +4,12 @@ description: Periodic GTD review — empty the inbox, defer / cancel stale items
 
 # Review
 
-The GTD queue is trustworthy only if you review it. This skill is the recurring sweep: clear `inbox`, prune `someday`, finish or cancel old `active` work, and decide what's `next` for the period ahead.
+The GTD queue is trustworthy only if you review it. This skill is the recurring sweep: clear
+`inbox`, prune `someday`, finish or cancel old `active` work, and decide what's `next` for the
+period ahead.
 
-Cadence: weekly is the GTD canon. For agent-driven workloads, do it at session start or at the boundary of a focus block.
+Cadence: weekly is the GTD canon. For agent-driven workloads, do it at session start or at the
+boundary of a focus block.
 
 ## Workflow
 
@@ -44,7 +47,8 @@ request(ops="[
 request(ops="gtd.tasks(status=\"active\", limit=20)")
 ```
 
-If something's been `active` for more than a few days without progress, it's probably not actually in flight. Either:
+If something's been `active` for more than a few days without progress, it's probably not actually
+in flight. Either:
 
 - Park it: `gtd.transition(id=..., status="waiting", note="<blocker>")`
 - Finish it: `gtd.complete(id=..., result="<one line>")`
@@ -58,7 +62,9 @@ Active should reflect _now_, not aspiration.
 request(ops="gtd.tasks(status=\"waiting\", limit=20)")
 ```
 
-For each, read `properties.transition_note` or `properties.description` to remember the blocker. If the blocker is resolved, transition back to `next` or `active`. If the blocker is permanent, `cancelled`.
+For each, read `properties.transition_note` or `properties.description` to remember the blocker. If
+the blocker is resolved, transition back to `next` or `active`. If the blocker is permanent,
+`cancelled`.
 
 ```
 request(ops="gtd.transition(id=\"<id>\", status=\"next\", note=\"unblocked: Alex approved spec\")")
@@ -70,7 +76,8 @@ request(ops="gtd.transition(id=\"<id>\", status=\"next\", note=\"unblocked: Alex
 request(ops="gtd.tasks(status=\"someday\", limit=50)")
 ```
 
-The `someday` list will rot if you never look at it. For each, ask: "would I be sad if this never happens?"
+The `someday` list will rot if you never look at it. For each, ask: "would I be sad if this never
+happens?"
 
 - Yes → promote to `next` and commit, or set a `due` to make it real.
 - No → `cancelled`.
@@ -81,7 +88,9 @@ The `someday` list will rot if you never look at it. For each, ask: "would I be 
 request(ops="gtd.tasks(status=\"done\", limit=20)")
 ```
 
-Reading recent completions often reveals follow-up work (a `result` line that ends with "...but should also do X"). Capture follow-ups with `gtd.assign` while context is fresh. `done` is terminal — create a new task rather than reopening.
+Reading recent completions often reveals follow-up work (a `result` line that ends with "...but
+should also do X"). Capture follow-ups with `gtd.assign` while context is fresh. `done` is terminal
+— create a new task rather than reopening.
 
 ## Patterns
 
@@ -99,7 +108,8 @@ Process those three, ignore `someday` for the short version.
 
 ### Review with cross-pack search
 
-If the `kg` pack is loaded, search the past week's recorded insights before reviewing — it surfaces commitments that may not have made it into a task:
+If the `kg` pack is loaded, search the past week's recorded insights before reviewing — it surfaces
+commitments that may not have made it into a task:
 
 ```
 request(ops="search(kind=\"note\", query=\"commitment OR promise OR todo\", limit=10)")
@@ -119,7 +129,12 @@ Don't let zombies linger in `next`. They erode trust in the actionable list.
 
 ## Anti-patterns
 
-- **Reviewing without making decisions.** If you read the inbox without transitioning, the next review will be longer. Make a call on every item.
-- **Hoarding `someday`.** A list of 200 maybe-projects is no different from no list. Cull aggressively — anything you wouldn't actively pull onto `next` in the next three months is `cancelled`.
-- **Trying to reopen `done` tasks.** `done` and `cancelled` are terminal. If work comes back, capture a new task — don't attempt a transition out of a terminal state.
-- **Batch transitioning without notes.** When deferring, killing, or unblocking, take three seconds to add a `note` — future you (and future agents searching task content) need the context.
+- **Reviewing without making decisions.** If you read the inbox without transitioning, the next
+  review will be longer. Make a call on every item.
+- **Hoarding `someday`.** A list of 200 maybe-projects is no different from no list. Cull
+  aggressively — anything you wouldn't actively pull onto `next` in the next three months is
+  `cancelled`.
+- **Trying to reopen `done` tasks.** `done` and `cancelled` are terminal. If work comes back,
+  capture a new task — don't attempt a transition out of a terminal state.
+- **Batch transitioning without notes.** When deferring, killing, or unblocking, take three seconds
+  to add a `note` — future you (and future agents searching task content) need the context.

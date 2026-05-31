@@ -4,17 +4,21 @@ description: Capture a task or commitment into the GTD inbox cleanly — title, 
 
 # Capture
 
-You have a thought, commitment, request, or to-do that needs to leave your head. Drop it in the inbox now; plan later.
+You have a thought, commitment, request, or to-do that needs to leave your head. Drop it in the
+inbox now; plan later.
 
 ## Principle
 
-Capture is a one-shot action. The goal is to **stop thinking about it** and trust the system to surface it later. Don't try to schedule, prioritize precisely, or break down — `inbox` is the right status for anything you haven't processed.
+Capture is a one-shot action. The goal is to **stop thinking about it** and trust the system to
+surface it later. Don't try to schedule, prioritize precisely, or break down — `inbox` is the right
+status for anything you haven't processed.
 
 ## Workflow
 
 ### 1. Decide the title
 
-A task title is what you'd say out loud: short, verb-first, complete enough to remember in a week. "draft README" beats "documentation"; "ship release" beats "release stuff".
+A task title is what you'd say out loud: short, verb-first, complete enough to remember in a week.
+"draft README" beats "documentation"; "ship release" beats "release stuff".
 
 ### 2. Assign with the smallest commitment
 
@@ -22,7 +26,8 @@ A task title is what you'd say out loud: short, verb-first, complete enough to r
 request(ops="gtd.assign(title=\"<title>\", priority=\"p2\")")
 ```
 
-Default priority is `p2`. Use `p0`/`p1` only if you genuinely want it pushed up in `next` listings. `p3` for "nice to have, no pressure".
+Default priority is `p2`. Use `p0`/`p1` only if you genuinely want it pushed up in `next` listings.
+`p3` for "nice to have, no pressure".
 
 ### 3. Add context if it's not in your head
 
@@ -54,8 +59,10 @@ request(ops="[
 
 Resist:
 
-- Setting `status=\"active\"` because "I'll do it now" — start the task with `gtd.transition`, not on creation.
-- Adding `depends_on` for soft preferences — only encode hard prerequisites (the dep must actually be done first).
+- Setting `status=\"active\"` because "I'll do it now" — start the task with `gtd.transition`, not
+  on creation.
+- Adding `depends_on` for soft preferences — only encode hard prerequisites (the dep must actually
+  be done first).
 - Writing the full description up front — capture the _task_, save the _plan_ for later.
 
 ## When to use other verbs instead
@@ -86,9 +93,10 @@ request(ops="gtd.assign(title=\"write spec\", priority=\"p1\")")
 request(ops="gtd.assign(title=\"implement feature\", priority=\"p2\", depends_on=[\"<spec-uuid>\"])")
 ```
 
-`assign`'s `depends_on` writes both the property (`properties.depends_on`) and a `depends_on`
-graph edge between the two tasks — so `neighbors(node_id=\"<impl-uuid>\", direction=\"out\", relations=[\"depends_on\"])`
-will surface the blocker.
+`assign`'s `depends_on` writes both the property (`properties.depends_on`) and a `depends_on` graph
+edge between the two tasks — so
+`neighbors(node_id=\"<impl-uuid>\", direction=\"out\", relations=[\"depends_on\"])` will surface the
+blocker.
 
 **Quick brain-dump** (4 things at once):
 

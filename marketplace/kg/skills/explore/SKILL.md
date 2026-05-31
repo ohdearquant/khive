@@ -4,8 +4,8 @@ description: Discover what the knowledge graph knows about a topic. Traverse, na
 
 # Explore
 
-You want to know what the graph contains about a topic. This skill retrieves, traverses,
-and narrates — giving you a grounded picture of existing knowledge and where the gaps are.
+You want to know what the graph contains about a topic. This skill retrieves, traverses, and
+narrates — giving you a grounded picture of existing knowledge and where the gaps are.
 
 The MCP server exposes one tool — `request` — that takes the verb call as a string:
 
@@ -16,9 +16,9 @@ request(ops="[search(kind=\"entity\", query=\"X\"), search(kind=\"note\", query=
 
 The verb examples in this skill show the inner call. Wrap each one as `request(ops="…")`.
 
-**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`),
-even when the MCP server runs with `--actor lambda:myproject`. Do NOT override the
-namespace for entity/edge/note operations. The knowledge graph is cross-project by design.
+**Namespace rule (ADR-007)**: KG operations always use the shared namespace (`local`), even when the
+MCP server runs with `--actor lambda:myproject`. Do NOT override the namespace for entity/edge/note
+operations. The knowledge graph is cross-project by design.
 
 ## Workflow
 
@@ -29,8 +29,8 @@ search(kind="entity", query="<topic>")
 search(kind="note", query="<topic>")
 ```
 
-Entity search finds concepts/papers/projects by name and description.
-Note search finds observations/insights/decisions by content (excludes superseded notes automatically).
+Entity search finds concepts/papers/projects by name and description. Note search finds
+observations/insights/decisions by content (excludes superseded notes automatically).
 
 ### 2. Expand from hits
 
@@ -49,8 +49,10 @@ traverse(roots=["<entity-id>"], max_depth=3, direction="out",
 
 Common traversal patterns:
 
-- **Lineage** (what does X build on): `direction="out"`, `relations=["extends", "variant_of", "instance_of"]`
-- **Descendants** (what builds on X): `direction="in"`, `relations=["extends", "variant_of", "implements"]`
+- **Lineage** (what does X build on): `direction="out"`,
+  `relations=["extends", "variant_of", "instance_of"]`
+- **Descendants** (what builds on X): `direction="in"`,
+  `relations=["extends", "variant_of", "implements"]`
 - **Notes about X**: `direction="in"`, `relations=["annotates"]`
 - **What X enables**: `direction="in"`, `relations=["depends_on", "enables"]`
 
@@ -88,7 +90,8 @@ Identify what's missing:
 - Questions filed but unresolved
 - Expected relationships that don't exist
 
-Report gaps as actionable next steps (e.g., "X exists but has no `introduced_by` edge — find the source paper").
+Report gaps as actionable next steps (e.g., "X exists but has no `introduced_by` edge — find the
+source paper").
 
 ## Choosing the right verb
 
@@ -102,4 +105,5 @@ Report gaps as actionable next steps (e.g., "X exists but has no `introduced_by`
 
 ## Stop condition
 
-Topic coverage saturated — you've traversed the relevant subgraph, narrated the connections, and identified actionable gaps. Don't chase every thread; report gaps for follow-up ingestion.
+Topic coverage saturated — you've traversed the relevant subgraph, narrated the connections, and
+identified actionable gaps. Don't chase every thread; report gaps for follow-up ingestion.

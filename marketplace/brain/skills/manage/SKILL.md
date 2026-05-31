@@ -4,7 +4,9 @@ description: Control brain profile lifecycle — activate, deactivate, and archi
 
 # Manage
 
-Use `manage` to change a profile's lifecycle state. Lifecycle controls whether the brain pack applies live posterior updates for a given profile and whether the profile can serve active requests.
+Use `manage` to change a profile's lifecycle state. Lifecycle controls whether the brain pack
+applies live posterior updates for a given profile and whether the profile can serve active
+requests.
 
 ## Lifecycle states
 
@@ -26,7 +28,8 @@ request(ops="brain.activate(profile_id=\"balanced-recall-v1\")")
 
 Response: `{ "profile_id": "...", "lifecycle": "active" }`.
 
-Use this after a profile was deactivated for maintenance or experimentation and is ready to serve traffic again.
+Use this after a profile was deactivated for maintenance or experimentation and is ready to serve
+traffic again.
 
 ### brain.deactivate — pause live updates
 
@@ -36,7 +39,8 @@ request(ops="brain.deactivate(profile_id=\"balanced-recall-v1\")")
 
 Response: `{ "profile_id": "...", "lifecycle": "inactive" }`.
 
-Posteriors are frozen in their current state. Use this before performing a `brain.reset` if you want to prevent further drift while you inspect the profile. Use `brain.activate` to resume.
+Posteriors are frozen in their current state. Use this before performing a `brain.reset` if you want
+to prevent further drift while you inspect the profile. Use `brain.activate` to resume.
 
 ### brain.archive — retire a profile
 
@@ -49,7 +53,8 @@ request(ops="brain.deactivate(profile_id=\"balanced-recall-v1\") | brain.archive
 
 Response of the archive call: `{ "profile_id": "...", "lifecycle": "archived" }`.
 
-Archived profiles are retained for audit purposes. They no longer receive updates. Archive when a profile is superseded by a replacement; do not delete profiles that have accumulated event history.
+Archived profiles are retained for audit purposes. They no longer receive updates. Archive when a
+profile is superseded by a replacement; do not delete profiles that have accumulated event history.
 
 ## Patterns
 
@@ -73,8 +78,7 @@ request(ops="brain.activate(profile_id=\"balanced-recall-v1\")")
 
 ### Check lifecycle after transition
 
-Active profiles must be deactivated before archiving. Use two sequential requests or the chain
-form:
+Active profiles must be deactivated before archiving. Use two sequential requests or the chain form:
 
 ```
 request(ops="brain.deactivate(profile_id=\"balanced-recall-v1\") | brain.archive(profile_id=$prev.profile_id) | brain.profile(profile_id=$prev.profile_id)")
@@ -84,9 +88,13 @@ Verify the `lifecycle` field in the second result equals `archived`.
 
 ## Stop condition
 
-Profile lifecycle has been updated. Confirm with `brain.profile` if needed. To adjust bindings, use the `bind` skill. To adjust posteriors, use the `tune` skill.
+Profile lifecycle has been updated. Confirm with `brain.profile` if needed. To adjust bindings, use
+the `bind` skill. To adjust posteriors, use the `tune` skill.
 
 ## Anti-patterns
 
-- **Archiving the only active profile.** If `balanced-recall-v1` is the sole active profile for the `recall` consumer kind, archiving it makes `brain.resolve(consumer_kind="recall")` return `NotFound`.
-- **Repeated archive/activate cycles.** Archive is a terminal-intent state. Use `inactive` for temporary pauses.
+- **Archiving the only active profile.** If `balanced-recall-v1` is the sole active profile for the
+  `recall` consumer kind, archiving it makes `brain.resolve(consumer_kind="recall")` return
+  `NotFound`.
+- **Repeated archive/activate cycles.** Archive is a terminal-intent state. Use `inactive` for
+  temporary pauses.

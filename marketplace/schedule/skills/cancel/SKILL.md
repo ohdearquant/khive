@@ -4,7 +4,8 @@ description: Cancel a pending scheduled event — sets status to cancelled with 
 
 # Cancel
 
-Cancel a scheduled event. Sets `status: "cancelled"` and records `cancelled_at`. The event remains in storage for audit purposes but no longer appears in `agenda`.
+Cancel a scheduled event. Sets `status: "cancelled"` and records `cancelled_at`. The event remains
+in storage for audit purposes but no longer appears in `agenda`.
 
 ## Workflow
 
@@ -49,6 +50,8 @@ request(ops="schedule.agenda()")
 
 ## Anti-patterns
 
-- **Cancelling a non-scheduled-event note.** `cancel` only works on notes with `kind="scheduled_event"`. Cancelling a task or observation returns an error.
+- **Cancelling a non-scheduled-event note.** `cancel` only works on notes with
+  `kind="scheduled_event"`. Cancelling a task or observation returns an error.
 - **Cancelling a nonexistent ID.** Returns "not found".
-- **Note:** Cancelling an already-cancelled event is currently idempotent (no error, overwrites `cancelled_at`). See issue #544.
+- **Note:** Cancelling an already-cancelled event is currently idempotent (no error, overwrites
+  `cancelled_at`). See issue #544.
