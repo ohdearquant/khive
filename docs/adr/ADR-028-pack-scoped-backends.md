@@ -48,73 +48,53 @@ The architecture must satisfy:
 
 ## Decision
 
-Each pack declares its backend by name in `khive.toml`. The kernel boot reads the
-configuration, instantiates the named backends, applies each pack's schema in declaration
-order, and constructs the pack with a `KhiveRuntime` wrapping that backend. Sharing is
-opt-in via shared backend name.
+ADR-028 remains the accepted target design for pack-scoped backends, but the shipped
+v1 configuration/runtime surface is narrower:
 
-### 1. Configuration schema
+1. `KhiveConfig` currently parses only `[[engines]]` and `[actor]`.
+2. Runtime boot constructs a single `KhiveRuntime` over one default backend.
+3. Pack selection is global per ADR-027, not configured per `[packs.<name>]`.
+4. `[[backends]]`, `[packs.<name>] backend = ...`, per-pack engine lists, declaration-order
+   schema application, and per-pack runtime instances are deferred.
+5. Unknown TOML keys are currently ignored by the parser; unsupported backend/pack keys do
+   not configure runtime behavior.
 
-`~/.khive/khive.toml` — process-wide composition (project-level `.khive/khive.toml`
-overrides per ADR-035):
+The remaining multi-backend sections in this ADR describe the deferred target design unless
+explicitly marked as shipped.
+
+### 1. Current shipped configuration schema
+
+The shipped config file is `khive.toml` or `.khive/config.toml` resolved per ADR-035. The
+accepted fields today are:
 
 ```toml
-# Backends — named SQLite databases. Multiple packs may share by name.
-[[backends]]
-name = "main"
-path = "~/.khive/khive.db"
-cache_mb = 256                  # SQLite cache_size in MB
-journal_mode = "wal"            # default wal
-pragma_synchronous = "normal"   # default normal
-
-[[backends]]
-name = "lore"
-path = "~/.khive/lore.db"
-cache_mb = 128
-
-[[backends]]
-name = "archive"
-path = "~/.khive/archive.db"
-read_only = true                # opens with SQLITE_OPEN_READONLY
-
-# Embedding engines (per ADR-031) — process-wide registry.
 [[engines]]
-name = "bge-small-en-v1.5"
-dim = 384
-weight = 1.0
+name = "default"
+model = "all-minilm-l6-v2"
+default = true
+fusion_weight = 1.0
+dims = 384
 
-[[engines]]
-name = "multilingual-e5-small"
-dim = 384
-weight = 0.8
-
-# Pack configuration — declares backend assignment + engine selection.
-[packs.kg]
-backend = "main"
-engines = ["bge-small-en-v1.5", "multilingual-e5-small"]
-
-[packs.memory]
-backend = "main"                # shared with kg → entities can link to memory notes
-engines = ["bge-small-en-v1.5", "multilingual-e5-small"]
-
-[packs.gtd]
-backend = "main"                # shared with kg → tasks can reference entities
-engines = []                    # GTD is CRUD, no vectorization
-
-[packs.lore]
-backend = "lore"                # dedicated — no cross-link to hot data
-engines = ["bge-small-en-v1.5"] # cheap single engine for cold corpus
-
-[packs.archive]
-backend = "archive"
-engines = []
+[actor]
+id = "local"
+display_name = "Local khive"
 ```
 
-**Built-in default** (no `khive.toml` present): one `[[backends.main]]` at
-`~/.khive/khive.db`, default engine list per ADR-031, all known packs assigned to `main`.
-This preserves the single-backend single-engine behavior current khive users observe.
+The following target fields are **deferred** and are not part of the shipped parser:
 
-### 2. Rust types
+- `[[backends]]`
+- `[packs.<name>]`
+- `[packs.<name>].backend`
+- per-pack `[packs.<name>].engines`
+- backend tuning fields such as `cache_mb`, `journal_mode`, `pragma_synchronous`, and
+  `read_only`
+
+Current backend behavior is one default backend, `BackendId::main()`, backed by
+`RuntimeConfig::db_path` (`~/.khive/khive-graph.db` by default). The `kkernel backend`
+commands expose this single default backend shape while the multi-backend parser/boot path
+is deferred.
+
+### 2. Deferred target Rust types
 
 ```rust
 // crates/khive-config/src/lib.rs  (or in khive-mcp for v1 interim)
@@ -278,7 +258,7 @@ must either rename one pack's table (by editing the pack) or move one pack to a 
 backend. **Auto-prefixing** (silently renaming `tasks` → `gtd_tasks`) is rejected: it
 hides bugs where two packs unintentionally claim the same logical table.
 
-### 8. Boot sequence
+### 8. Deferred target boot sequence
 
 ```rust
 // crates/khive-mcp/src/main.rs (and kkernel boot)

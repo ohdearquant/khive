@@ -28,173 +28,88 @@ extension mechanism. Pack authors who define domain-specific entity kinds often 
 which invariants those kinds must satisfy — making the validation pipeline pack-aware
 closes the loop between vocabulary and correctness enforcement.
 
-This ADR extends `kkernel kg validate` to support:
+This ADR documents the shipped `kkernel kg validate` validation surface:
 
-1. A declarative rule configuration file at `.khive/kg/rules.yaml`.
-2. A set of built-in configurable rules beyond the structural checks from ADR-020.
-3. A custom rule API: Rust pack validators (v1); Deno/TypeScript executable rules deferred.
-4. Pre-commit hook integration so validation runs before a commit can be created.
-5. CI/CD integration with machine-readable output and a GitHub Action.
-6. Auto-fix support for mechanically correctable violations.
-7. Pack-provided rules shipped alongside the vocabulary they govern (ADR-023 extension).
+1. An optional TOML rule configuration file at `.khive/kg/rules.toml`.
+2. ADR-020 structural checks that always run first.
+3. A TOML `[[rules]]` RulePass with `id`, `severity`, `kind`, optional `condition`,
+   optional `require_field`, and optional `message` fields.
+4. Pre-commit hook integration so validation can run before a commit can be created.
+5. CI/CD integration with machine-readable output.
+6. Unsupported YAML rule files are rejected with an error directing users to TOML.
+7. Custom executable rules (Deno/TypeScript) and YAML schema validation are not shipped.
+   Pack-provided validators have a shipped Rust API (`PackRuntime::validation_rules`,
+   `VerbRegistry::all_validation_rules`) but CLI runner integration remains deferred.
+   Auto-fix callbacks have a type stub (`GraphPatch`) but no write-path implementation.
 
 ### What changes and what does not
 
 - ADR-020 `khive kg validate` built-in structural checks: **unchanged**. This ADR adds
-  a second pass (the RulePass) that runs after the structural pass and is governed by
-  `.khive/kg/rules.yaml`.
-- ADR-023 pack standard: **extended via a Rust mechanism, not YAML.** Packs may
-  contribute validation rules through a `const VALIDATION_RULES: &[ValidationRule]` on
-  the `Pack` trait (see §7). Pack-contributed rules are merged into the active rule set
-  at boot. Custom executable rules from non-Rust authors are NOT supported in v1 — the
-  retracted YAML `pack.yaml` model is gone.
-- ADR-020 `khive kg init`: **extended** to generate `.khive/kg/rules.yaml` and
-  optionally install the pre-commit hook during project initialization.
+  an optional TOML RulePass that runs after the structural pass when
+  `.khive/kg/rules.toml` exists and `--no-rules` is not set.
+- ADR-023 pack standard: **extended by the shipped Rust validator API** (`PackRuntime::validation_rules`,
+  `VerbRegistry::all_validation_rules`). What remains deferred is CLI runner integration —
+  `kkernel kg validate` does not yet call these methods against live corpus data.
+- ADR-020 `khive kg init`: currently initializes `.khive/kg/{entities,edges}.ndjson`,
+  `.khive/khive.toml`, and hooks; it does not generate `rules.toml`.
 - All other ADR-020 contracts: unchanged.
 
 ## Decision
 
 ### 1. Rule configuration
 
-Rules are declared in `.khive/kg/rules.yaml`. The file is optional; if absent, only the
-ADR-020 built-in structural checks run. When present, built-in checks are also
-configurable through it.
+Rules are declared in `.khive/kg/rules.toml`. The file is optional; if absent, only the
+ADR-020 built-in structural checks run. When present and `--no-rules` is not set,
+the validator parses TOML and evaluates each `[[rules]]` entry in file order.
 
-```yaml
-# .khive/kg/rules.yaml
+```toml
+# .khive/kg/rules.toml
 
-rules:
-  # Built-in rules from ADR-020 kkernel kg validate
-  schema-compliance:
-    severity: error
-    enabled: true
+[[rules]]
+id = "concept-must-have-description"
+severity = "warning"
+kind = "entity"
+condition = "kind=concept"
+require_field = "description"
+message = "Concept {id} missing description"
 
-  referential-integrity:
-    severity: error
-    enabled: true
-
-  no-duplicate-uuids:
-    severity: error
-    enabled: true
-
-  sort-order:
-    severity: warning
-    enabled: true
-
-  remote-resolution:
-    severity: error
-    enabled: true # set false to skip network calls in offline environments
-    resolve_remotes: false
-
-  # Structural rules
-  no-orphan-entities:
-    severity: warning
-    config:
-      min_edges: 1 # every entity must have at least this many edges
-
-  no-self-loops:
-    severity: error
-
-  # Density rules
-  min-edge-density:
-    severity: warning
-    config:
-      min_edges_per_entity: 3
-      exclude_kinds: [person] # entity kinds exempt from the density check
-
-  # Property rules
-  required-properties:
-    severity: error
-    config:
-      concept:
-        - description
-        - domain
-      document:
-        - title
-        - authors
-        - year
-
-  # Naming rules
-  naming-convention:
-    severity: warning
-    config:
-      entity_names: title-case # "Flash Attention" not "flash attention"
-      kind_names: lowercase # "concept" not "Concept"
-
-  # Graph size
-  max-entity-count:
-    severity: info
-    config:
-      max: 10000
-      message: "Consider splitting into multiple KGs"
+[[rules]]
+id = "no-self-loops"
+severity = "error"
+kind = "edge"
+condition = "source_id=target_id"
+message = "Self-loop detected on {id}"
 ```
 
-Every rule entry has:
+Every shipped TOML rule entry has:
 
-- **id** (the YAML key): stable identifier used in reports and fix invocations.
+- **id**: stable identifier used in `RuleResult.id`.
 - **severity**: `error` | `warning` | `info`. Errors cause `kkernel kg validate` to exit
   with code 1. Warnings and info are printed but do not affect the exit code unless
   `--strict` is passed.
-- **enabled**: `true` (default) | `false`. A disabled rule is not evaluated and produces
-  no output.
-- **config** (optional): rule-specific parameters. Unknown config keys for a built-in
-  rule are an error in `rules.yaml` itself (not a KG violation), so typos surface
-  immediately with a suggestion. Rules not listed in `rules.yaml` use their built-in
-  defaults.
+- **kind**: `entity` or `edge`; unknown kinds produce an error rule result.
+- **condition**: optional `field=value` equality filter; `source_id=target_id` is the
+  self-loop sentinel for edges.
+- **require_field**: optional field name that must be present and non-empty on matching
+  records.
+- **message**: optional violation message; `{id}` is replaced with the record id when
+  present.
 
-Built-in configurable rule set:
+The shipped TOML schema has no `enabled`, `module`, or nested `config` fields. Remove a
+rule entry to disable it.
 
-| Rule                    | Governs                                                                                 |
-| ----------------------- | --------------------------------------------------------------------------------------- |
-| `schema-compliance`     | Entity kinds and edge relations match `schema.yaml` vocabulary                          |
-| `referential-integrity` | All edge targets resolve to known entities or valid remote refs                         |
-| `no-duplicate-uuids`    | No two entity or edge records share a UUID                                              |
-| `sort-order`            | `entities.ndjson` sorted by UUID; `edges.ndjson` sorted by `(source, target, relation)` |
-| `remote-resolution`     | Cross-repo `<remote>:<uuid>` targets resolve at pinned commit                           |
-| `no-orphan-entities`    | Every entity has at least `config.min_edges` edges                                      |
-| `no-self-loops`         | No edge where `source == target`                                                        |
-| `min-edge-density`      | Average edges per entity across entity kinds not in `exclude_kinds`                     |
-| `required-properties`   | Per-kind required property key presence                                                 |
-| `naming-convention`     | Entity name and kind name casing conventions                                            |
-| `max-entity-count`      | Total entity count cap with a configurable advisory message                             |
+### 2. Configurable TOML RulePass
 
-### 2. Custom rule API
+The shipped configurable pass is data-driven from `.khive/kg/rules.toml`, not a Rust
+custom-rule API. Each `[[rules]]` entry selects `kind = "entity"` or `"edge"`, optionally
+filters by `condition`, optionally requires a field with `require_field`, and emits
+`message` with `{id}` substitution when a matching record violates the rule.
 
-#### Custom executable rule runtimes (v1 scope)
-
-v1 supports Rust pack validators only.
-
-**Out of scope for v1** (deferred to a future ADR):
-
-- Deno / TypeScript executable rules
-- Non-Rust executable rule runtimes generally
-- TS↔Rust FFI for validation
-- Deno runtime packaging
-
-v1 rule shape:
-
-```rust
-pub trait ValidationRule: Send + Sync {
-    fn id(&self) -> RuleId;
-    fn validate(
-        &self,
-        graph: &GraphSnapshot,
-        ctx: &ValidationContext,
-    ) -> Vec<ValidationFinding>;
-}
-```
-
-Validation rules are registered through the Rust pack system (ADR-017). This avoids adding
-a second executable runtime, permission model, sandbox story, packaging path, and failure
-mode to v1.
-
-**Rejected for v1**: Deno/TypeScript executable validation rules. Revisit in a follow-up ADR
-once a downstream consumer presents a concrete requirement.
-
-In v1, custom rules beyond the built-in set are authored as Rust pack validators (§9). The
-`module` key in `rules.yaml` is reserved for a future non-Rust runtime and is not supported
-in v1; specifying it produces exit code 2 ("unknown key `module` for custom rules — non-Rust
-rule runtimes are not supported in v1").
+The Rust pack validator API (`PackRuntime::validation_rules`, `VerbRegistry::all_validation_rules`,
+`ValidationRule`, `ValidationContext`, `Violation`) is shipped in `khive-runtime`. What is
+deferred is wiring this API into the `kkernel kg validate` CLI runner so that pack-provided
+rules execute against corpus data. Deno/TypeScript executable rules, a `module` key, and
+non-Rust rule runtimes remain deferred pending a follow-up ADR.
 
 ### 3. Git hook integration
 
@@ -245,15 +160,15 @@ Hook management subcommands (for repos without `init`):
 `kkernel kg validate` gains the following flags in addition to the existing
 `--resolve-remotes` and `--schema-compat` from ADR-020:
 
-| Flag                          | Behavior                                                           |
-| ----------------------------- | ------------------------------------------------------------------ |
-| `--fix`                       | Apply all fixable rules and report what changed                    |
-| `--strict`                    | Treat warnings as errors; non-zero exit when `warnings > 0`        |
-| `--format text\|json\|github` | Output format (default: `text`)                                    |
-| `--verbose`                   | Expand all violation lists (default: show up to 2 then `+ N more`) |
-| `--quiet`                     | Print summary line only; suppress per-rule lines                   |
-| `--rules <path>`              | Override the default `.khive/kg/rules.yaml` path                   |
-| `--no-rules`                  | Run ADR-020 built-in structural checks only; skip `rules.yaml`     |
+| Flag                          | Behavior                                                                     |
+| ----------------------------- | ---------------------------------------------------------------------------- |
+| `--fix`                       | Apply all fixable rules and report what changed                              |
+| `--strict`                    | Treat warnings as errors; non-zero exit when `warnings > 0`                  |
+| `--format text\|json\|github` | Output format (default: `text`)                                              |
+| `--verbose`                   | Expand all violation lists (default: show up to 2 then `+ N more`)           |
+| `--quiet`                     | Print summary line only; suppress per-rule lines                             |
+| `--rules <path>`              | Override the default `.khive/kg/rules.toml` path                             |
+| `--no-rules`                  | Run ADR-020 built-in structural checks only; skip configurable TOML RulePass |
 
 ### 5. Output formats
 
@@ -330,11 +245,11 @@ inline in the PR diff view. No output for passing rules.
 
 ### 6. Exit codes
 
-| Code | Meaning                                                                                                            |
-| ---- | ------------------------------------------------------------------------------------------------------------------ |
-| `0`  | All rules passed (no errors; warnings allowed unless `--strict`)                                                   |
-| `1`  | One or more rules at severity `error` violated                                                                     |
-| `2`  | `rules.yaml` itself failed schema validation (malformed, unknown key, missing module file, invalid severity value) |
+| Code | Meaning                                                                                         |
+| ---- | ----------------------------------------------------------------------------------------------- |
+| `0`  | All rules passed (no errors; warnings allowed unless `--strict`)                                |
+| `1`  | One or more rules at severity `error` violated                                                  |
+| `2`  | `rules.toml` parse failure or unsupported format (e.g. `.yaml`/`.yml` file passed to `--rules`) |
 
 Exit code 2 is reserved for infrastructure failures in the rules file. CI pipelines can
 route exit 1 (fix your KG) and exit 2 (fix your rules file) to different notifications.
@@ -396,172 +311,48 @@ The `fix` callback receives the same `ValidationContext` and the violations emit
 The validation pipeline runs in a defined sequence:
 
 1. **ADR-020 structural checks** (schema compliance, referential integrity, duplicate
-   UUIDs, sort order, remote resolution). Run first; results always included even if later
-   passes fail.
-2. **Built-in configurable rules** from `rules.yaml` without a `module` key (orphan
-   entities, self-loops, edge density, required properties, naming, max count).
-3. **Custom rules** from `rules.yaml` with a `module` key, in file declaration order.
-4. **Pack-provided rules** (§9), in pack installation order from `schema.yaml#packs`.
+   UUIDs, sort order, remote resolution). Run first; results always included.
+2. **Configurable TOML rules** from `.khive/kg/rules.toml`, when the file exists and
+   `--no-rules` is not set. Rules run in file order.
+3. **Pack-provided validation rules** (§9): the Rust API is shipped; CLI runner integration
+   is deferred. **Custom executable rules** (Deno/TypeScript) are not shipped.
 
-A structural error in step 1 does not abort steps 2–4. All passes run to completion so
-contributors receive a full picture in a single invocation rather than iterative
-fix-and-validate cycles.
+A structural error in step 1 does not abort the optional TOML RulePass. All shipped passes
+run to completion so contributors receive a full picture in a single invocation rather than
+iterative fix-and-validate cycles.
 
-### 9. Pack-provided rules
+### 9. Pack-provided validator API
 
-A pack ([ADR-023](ADR-023-declarative-pack-format.md)) declares validation rules as a
-`const` on its `Pack` impl. Each rule is a Rust struct carrying the same identity,
-severity, and predicate logic as a project custom rule (§2), but compiled into the pack
-binary — no separate `validation/` directory, no `pack.yaml`.
+The Rust validator API is shipped in `khive-runtime`:
 
-```rust
-// crates/khive-pack-biology/src/lib.rs
-use khive_runtime::validation::{ValidationRule, Severity, RuleFn};
+- `crates/khive-runtime/src/validation.rs` defines `ValidationRule`, `RuleFn`, `FixFn`,
+  `GraphPatch`, `ValidationContext`, `GraphSnapshot`, `Violation`, `ValidationReport`, and
+  `Severity`.
+- `PackRuntime::validation_rules() -> &'static [ValidationRule]` (in
+  `crates/khive-runtime/src/pack.rs`) is a trait method packs override to contribute
+  domain-specific rules. The default returns `&[]` so existing packs compile without changes.
+- `VerbRegistry::all_validation_rules()` (in `crates/khive-runtime/src/pack.rs`) collects
+  rules from every registered pack and returns them as `Vec<&'static ValidationRule>`.
 
-impl Pack for BiologyPack {
-    const NAME:         &'static str            = "biology";
-    const ENTITY_KINDS: &'static [&'static str] = &["species"];
-    // ... other consts ...
+Rule IDs must follow the `<pack>/<rule-id>` namespace convention. Built-in rules (no pack
+prefix) are reserved for the `khive-runtime` validation infrastructure.
 
-    const VALIDATION_RULES: &'static [ValidationRule] = &[
-        ValidationRule {
-            id:          "biology/required-taxa-rank",
-            severity:    Severity::Warning,
-            description: "Requires all species entities to carry a taxa_rank property",
-            check:       check_required_taxa_rank as RuleFn,
-            fix:         None,
-        },
-    ];
-}
+**What remains deferred**: the CLI runner (`kkernel kg validate`) does not yet call
+`all_validation_rules()` against live corpus data. The `GraphPatch` type carries no fields
+(auto-fix callbacks are a stub pending the write path). `GraphSnapshot` exposes only
+`entity_count` and `edge_count` in v1. A follow-up ADR must wire the runtime rule
+collection into the CLI validation pass and extend `GraphSnapshot` before pack-provided
+rules run during `kkernel kg validate` invocations.
 
-fn check_required_taxa_rank(ctx: &ValidationContext) -> Vec<Violation> { ... }
-```
+### 10. `rules.toml` loading and unsupported YAML
 
-Pack rule IDs are namespaced by pack name to prevent collisions:
-`<pack-name>/<rule-id>`. In the example above the full rule ID is
-`biology/required-taxa-rank`. Projects can override a pack rule's severity or disable it
-in their `rules.yaml`:
-
-```yaml
-rules:
-  biology/required-taxa-rank:
-    severity: error # escalate from pack default of warning
-    enabled: true
-```
-
-Pack rules not mentioned in `rules.yaml` run with the severity declared in the pack's
-`VALIDATION_RULES` const. Installing a pack may add new validation rules to the
-project's pipeline without any `rules.yaml` change — the pack author signals intended
-severity in code.
-
-**No executable TypeScript rules from packs in v1.** Pack rules are Rust functions
-compiled into the kkernel binary; their trust model is "trusted by compilation"
-(ADR-023). Custom executable rules in non-Rust languages are reserved for a future ADR
-once the security/sandboxing model is settled.
-
-### 9a. Rule shapes — `CorpusCheck` vs streaming `Fold`
-
-The `RuleFn = fn(&ValidationContext) -> Vec<Violation>` shape used by `VALIDATION_RULES`
-above is a **whole-corpus check** — the rule sees `entities + edges + schema + config`
-together and returns violations. This is the right shape for rules that span the corpus
-(referential integrity, remote resolution, min-edge-density, cross-repo references).
-
-Some rules don't need the whole corpus — they evaluate one record at a time. For these,
-ADR-024's `Fold` is a better fit because it streams, has reusable combinators
-(`FilterFold`, `MapFold`), and runs deterministically over `EventStore`/`EntityStore`
-output without materializing the whole corpus in memory.
-
-Two complementary rule shapes are supported. Both return `Vec<Violation>` per rule
-invocation — the validator aggregates per-rule violations into the final
-`ValidationReport`. `CorpusCheck::check` matches the existing `RuleFn = fn(&ValidationContext)
--> Vec<Violation>` shape so pack-declared rules (§9) and the streaming dispatcher
-agree on the per-rule contract.
-
-```rust
-/// Whole-corpus check (existing). Sees entities + edges + schema together.
-pub trait CorpusCheck: Send + Sync {
-    fn check(&self, ctx: &ValidationContext) -> Vec<Violation>;
-}
-
-/// Streaming check (new). Per-entity, per-edge, or per-event reduction.
-/// Reuses ADR-024 Fold combinators. The item enum is owned because the dispatcher
-/// streams records out of the stores by value — there is no corpus-wide borrow
-/// to tie the items to. Cheap clones (entity/edge/event records are small
-/// structs); Arc-wrap if pack authors need shared ownership.
-pub enum ValidationItem {
-    Entity(Entity),
-    Edge(Edge),
-    Event(Event),
-}
-
-pub trait StreamingRule: Fold<ValidationItem, RuleState> + Send + Sync {
-    /// Inherited from Fold: init, reduce, finalize, derive.
-    /// finalize() converts accumulated state into the rule's RuleState; the
-    /// dispatcher calls to_violations() on the finalized state.
-    fn to_violations(&self, state: RuleState) -> Vec<Violation>;
-}
-```
-
-The validator dispatches each rule by shape and unifies on `Vec<Violation>`:
+`kkernel kg validate` parses `rules.toml` with TOML deserialization. Files ending in
+`.yaml` or `.yml` are rejected with an error directing the user to TOML. A rule-file parse
+or unsupported-format error aborts with exit code 2:
 
 ```
-For each declared rule:
-  let vs: Vec<Violation> = match rule.shape() {
-    Corpus    => rule.as_corpus_check().check(ctx),                         // one batch
-    Streaming => {
-        let state = stream_items(stores)                                    // per-record
-            .fold(rule.init(&fold_ctx),
-                  |s, item| rule.reduce(s, &item, &fold_ctx));
-        let state = rule.finalize(state, &fold_ctx);
-        rule.to_violations(state)
-    }
-  };
-  report.add(rule.id(), vs);
-Aggregate per-rule entries → ValidationReport.
-```
-
-**Determinism for streaming reports**: rules MUST emit violations in canonical order —
-`BTreeSet` / `BTreeMap` / `Vec + final sort`, never `HashMap` iteration order. Canonical
-violation order across the report:
-
-```
-(rule_id ASC, severity DESC, entity_id ASC NULLS LAST, edge_id ASC NULLS LAST, message ASC)
-```
-
-**When to choose which shape**:
-
-All streaming rules implement `StreamingRule` (which `: Fold<ValidationItem, RuleState>`).
-The "what's inside the ValidationItem" column says which variants the rule's `reduce`
-actually inspects — the dispatcher routes all three variants to every streaming rule,
-and the rule's body matches on the variant it cares about. Pure counters and per-kind
-filters are cheap; pack authors can compose `FilterFold` (ADR-024) to discard variants
-they don't need.
-
-| Rule                                | Shape                                    | Inspects                 | Reason                          |
-| ----------------------------------- | ---------------------------------------- | ------------------------ | ------------------------------- |
-| Required property present on entity | `StreamingRule`                          | `ValidationItem::Entity` | Per-entity, no joins            |
-| Naming convention                   | `StreamingRule`                          | `ValidationItem::Entity` | Per-entity                      |
-| No duplicate UUIDs                  | `StreamingRule` (state: `HashSet<Uuid>`) | `ValidationItem::Entity` | Accumulator                     |
-| No self-loops                       | `StreamingRule`                          | `ValidationItem::Edge`   | Per-edge                        |
-| Max entity count                    | `StreamingRule` (state: counter)         | `ValidationItem::Entity` | Pure counter                    |
-| Referential integrity               | `CorpusCheck`                            | n/a                      | Needs entities + edges together |
-| Min edge density                    | `CorpusCheck`                            | n/a                      | Aggregate over the whole corpus |
-| Remote resolution                   | `CorpusCheck`                            | n/a                      | Needs remote registry config    |
-
-Pack authors may declare both shapes in `VALIDATION_RULES` — the runtime selects by
-trait impl at boot. The `Severity`, `id`, `description`, `fix` fields are identical;
-only the predicate side differs.
-
-### 10. `rules.yaml` schema validation
-
-`kkernel kg validate` validates `rules.yaml` itself against a built-in JSON Schema before
-evaluating any rules. A malformed `rules.yaml` — unknown top-level key, invalid severity
-value, `module` pointing to a non-existent file, unknown `config` key for a built-in rule
-— produces a structured error naming the offending field and aborts with exit code 2:
-
-```
-ERROR: rules.yaml line 14: unknown config key "min_edges_per_node" for rule "min-edge-density"
-  Did you mean "min_edges_per_entity"?
+ERROR: rules.toml: TOML parse error at line 3, column 1: expected a table key, found '.'
+ERROR: rules.yaml: unsupported rules file format — rename to rules.toml and convert to TOML [[rules]] syntax
 ```
 
 This validation is separate from and prior to KG validation. Exit code 2 is distinct from
@@ -588,7 +379,7 @@ jobs:
       - name: Validate KG
         uses: khive/kg-validate-action@v1
         with:
-          rules: .khive/kg/rules.yaml
+          rules: .khive/kg/rules.toml
           fail-on: error # "error" | "warning" | "never"
           format: github
           resolve-remotes: "true"
@@ -631,9 +422,9 @@ v1 custom rules are Rust pack validators compiled into the `kkernel` binary. The
 model is "trusted by compilation" — the same model as the pack vocabulary itself (ADR-017).
 No additional sandbox is needed.
 
-Deno/TypeScript executable rules are explicitly deferred. The `module` key in `rules.yaml`
-is reserved but unimplemented in v1; the validator rejects it with exit code 2. A follow-up
-ADR may activate the key once a consumer presents a concrete requirement.
+Deno/TypeScript executable rules are explicitly deferred. The shipped TOML `RuleConfig`
+has no `module` field. Non-Rust executable rules remain future work and are not part of
+the current validation surface.
 
 ### Why per-rule severity rather than per-violation severity for built-ins
 
@@ -709,19 +500,20 @@ into a single non-zero exit code obscures which action is needed.
 - The ADR-020 structural pass is unchanged. Existing `kkernel kg validate` invocations
   continue to work and gain the new rules transparently.
 - The JSON output format (`--format json`) extends the ADR-020 exit-code contract: 0 for
-  clean, 1 for violations, 2 for `rules.yaml` parse errors. The text format is a superset
+  clean, 1 for violations, 2 for rule-file parse or unsupported-format errors. The text format is a superset
   of the ADR-020 single-line-per-check output.
-- `kkernel kg init` is extended but backward-compatible. Existing `.khive/kg/` directories
-  are unaffected; `kkernel kg init --add-hooks` installs the hook without reinitializing.
+- `kkernel kg init` remains backward-compatible. Existing `.khive/kg/` directories
+  are unaffected; current init does not generate a rules file.
 
 ## Open Questions
 
 1. **Non-Rust rule runtimes**: When a downstream consumer presents a concrete requirement
    for Deno/TypeScript or WASM executable rules, a follow-up ADR should define: module
    format contract, permission model, sandbox story, packaging path, and failure modes.
-   The `module` key in `rules.yaml` is reserved for that future ADR.
+   A future ADR should define any `module` key or executable-rule configuration before it is
+   accepted in `rules.toml`.
 
-2. **`rules.yaml` inheritance**: Should projects be able to extend a shared `rules.yaml`
+2. **`rules.toml` inheritance**: Should projects be able to extend a shared `rules.toml`
    (e.g., from an organization's pack) rather than declaring all rules from scratch? An
    `extends:` key at the top level is the natural shape; deferred pending demand.
 

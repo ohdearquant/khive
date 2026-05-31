@@ -114,24 +114,25 @@ This replaces the previous `VerbDef` type. Migration is mechanical: rename
 verb entry in pack-kg / pack-gtd / pack-memory / pack-brain crates, and mark
 internal pipeline handlers with `Visibility::Subhandler`.
 
-### 3. Operator visibility override
+### 3. Operator visibility override status
 
-`khive.toml` per-pack `verbs_disabled` downgrades author-default `Verb` handlers to
-`Subhandler` for the deployment:
+Per-pack `verbs_disabled` configuration is **not supported in the shipped v1
+operator surface**. The active surface has two controls:
 
-```toml
-[packs.memory]
-verbs_disabled = ["recall_diverse"]   # available via CLI; not on MCP
+1. Pack authors set each handler's static `Visibility::{Verb, Subhandler}` in
+   `Pack::HANDLERS`.
+2. Operators select which packs load via ADR-027 pack selection (`--pack`,
+   `KHIVE_PACKS`, or the built-in production default pack set).
 
-[packs.gtd]
-verbs_disabled = []                    # author defaults apply
-```
+The runtime's MCP capability list is built from loaded handlers whose static
+visibility is `Visibility::Verb`. There is no deployment-time downgrade path from
+`Verb` to `Subhandler`, and operators cannot promote `Subhandler` handlers onto the
+MCP wire.
 
-The runtime filters those out of the MCP capability list at boot.
-
-**Operators cannot promote `Subhandler` → `Verb`.** Promotion would bypass the pack
-author's safety contract — the pack author knows which handlers are agent-safe. Operator
-config can only shrink the MCP surface, never expand it.
+`verbs_disabled` remains a deferred policy hook. Implementing it requires a config
+parser field, boot-time validation against loaded pack handlers, and tests proving
+that disabled verbs disappear from MCP capability discovery while remaining
+available to operator-only introspection.
 
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
@@ -432,13 +433,13 @@ Three reasons:
 - **Single ABI surface.** kkernel and packs share one Rust trait. No
   format-vs-code duality. Compile-time integration checks.
 - **Predictable verb surface for agents.** Bare verbs ⇒ kg. Dotted ⇒ pack-prefixed.
-  No verb is silently replaced. The MCP capability list is stable across deployments
-  (modulo `verbs_disabled` operator policy).
+  No verb is silently replaced. The MCP capability list is stable for a selected
+  pack set and static handler visibility.
 - **Clear extension story.** New pack? Cargo-generate from template, fill handlers.
   New behavior on an existing kind? KindHook. Risky handler? Visibility::Subhandler.
-- **Auditable visibility.** The full handler surface is `kkernel call`-able for ops;
-  the MCP surface is a strict subset. Production policy can shrink the MCP surface
-  without touching code.
+- **Auditable visibility.** The full handler surface is available to operator
+  introspection; the MCP surface is the loaded subset whose handlers are declared
+  `Visibility::Verb`.
 - **No magic.** Plain Rust packs. Rust-analyzer works. Stack traces are real. LLMs
   can write packs by adapting the reference.
 
@@ -498,12 +499,11 @@ pub trait Pack {
 }
 ```
 
-### Operator config (extends `khive.toml` per ADR-028)
+### Operator config status
 
-```toml
-[packs.<name>]
-verbs_disabled = ["..."]   # Verbs to downgrade to Subhandler for this deployment
-```
+`verbs_disabled` is deferred and is not part of the shipped `khive.toml` schema.
+Current operator control is pack selection per ADR-027 plus pack-authored static
+handler visibility.
 
 ### KindHook extension
 
@@ -527,15 +527,15 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 
 ### Tests
 
-| Scenario                                                       | Assert                                                     |
-| -------------------------------------------------------------- | ---------------------------------------------------------- |
-| Two packs declare the same verb name                           | `BootError::VerbCollision` at registration                 |
-| Pack with `verbs_disabled` in khive.toml                       | MCP capability list excludes those, CLI still reaches them |
-| Substrate verb with kind-owning pack registering KindHook      | `create(kind=X, ...)` routes through prepare_create        |
-| Subhandler invoked via MCP `request("pack.subhandler_x(...)")` | `RuntimeError::HandlerNotExposed`                          |
-| Subhandler invoked via `kkernel call pack subhandler_x ...`    | Succeeds                                                   |
-| Operator tries to promote Subhandler → Verb via khive.toml     | Boot config validation rejects                             |
-| Pack template-generated crate compiles + passes smoke test     | Yes                                                        |
+| Scenario                                                       | Assert                                                      |
+| -------------------------------------------------------------- | ----------------------------------------------------------- |
+| Two packs declare the same verb name                           | `BootError::VerbCollision` at registration                  |
+| Static `Visibility::Subhandler` handler in a loaded pack       | Excluded from MCP capability list                           |
+| Substrate verb with kind-owning pack registering KindHook      | `create(kind=X, ...)` routes through prepare_create         |
+| Subhandler invoked via MCP `request("pack.subhandler_x(...)")` | `RuntimeError::HandlerNotExposed`                           |
+| Subhandler visible through operator introspection              | Listed as `Visibility::Subhandler`, not MCP-callable        |
+| Future `verbs_disabled` config policy                          | Deferred; requires parser, validation, and capability tests |
+| Pack template-generated crate compiles + passes smoke test     | Yes                                                         |
 
 ## References
 

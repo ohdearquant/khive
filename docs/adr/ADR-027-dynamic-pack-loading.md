@@ -140,30 +140,35 @@ inventory::submit!(Box::new(MemoryPackFactory) as Box<dyn PackFactory>);
 At startup, `inventory::iter::<Box<dyn PackFactory>>` collects every registered factory
 across all link units.
 
-### `KHIVE_PACKS` config selects which packs to load
+### Pack selection and shipped production default
 
-Pack selection uses three sources in order of decreasing precedence:
+Pack selection uses two shipped sources in order of decreasing precedence:
 
-1. **`--pack <name>` CLI flag** (repeatable): `kkernel mcp --pack kg --pack gtd --pack memory`.
-   Multiple `--pack` flags are joined into the final list. CLI flag wins over all other sources.
-2. **`KHIVE_PACKS` env var**: `KHIVE_PACKS=kg,gtd,memory`. Comma-separated pack names.
-   Overrides config file.
-3. **Config file**: `packs = ["kg", "gtd", "memory"]` in `~/.khive/config.toml`.
-4. **Built-in default**: `["kg"]` when no source specifies a list.
+1. **`--pack <name>` CLI flag** (repeatable): `khive-mcp --pack kg --pack gtd --pack memory`.
+   Multiple `--pack` flags are joined into the final list. CLI flag wins over the runtime
+   default.
+2. **`KHIVE_PACKS` env var**: `KHIVE_PACKS=kg,gtd,memory`. Comma- or whitespace-separated
+   pack names.
+3. **Built-in production default**: when neither CLI nor `KHIVE_PACKS` provides a non-empty
+   list, the shipped default is:
 
-Precedence: `--pack` CLI > `KHIVE_PACKS` env > config file > default.
+   ```text
+   ["kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge"]
+   ```
 
-The kernel passes the resolved list to `PackRegistry::load()`, which:
+Precedence: `--pack` CLI > `KHIVE_PACKS` env > production default.
 
-1. Resolves `REQUIRES` dependencies (transitive closure). If pack `memory` is in the list
-   and requires `kg`, but `kg` is not in the list, the load fails with
-   `MissingDependency`.
-2. Topologically sorts the resolved set. A pack loads after all its dependencies. A cycle
-   produces `DependencyCycle` with the offending names.
-3. Constructs and registers each pack via its `PackFactory`.
+The current `KhiveConfig` file parser does **not** parse a `packs = [...]` field. Config-file
+pack selection and pack-scoped backend assignment remain deferred to the ADR-028/ADR-035
+configuration work.
 
-If no source specifies a list, the default is `["kg"]` (minimal KG-only surface).
-Pack-scoped backends (ADR-028) extend this configuration with per-pack backend assignment.
+The MCP server passes the resolved list to `PackRegistry::register_packs()`, which:
+
+1. Validates that every requested pack name is linked into the binary via `inventory`.
+2. Requires all `PackFactory::requires()` dependencies to be explicitly present in the selected
+   list; missing dependencies are boot errors, not auto-added.
+3. Registers each selected pack, with `VerbRegistryBuilder::build()` enforcing the dependency
+   load order.
 
 ### Delete `khive-dialect-kg`
 

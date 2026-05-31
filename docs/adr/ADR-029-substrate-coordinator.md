@@ -35,14 +35,14 @@ cross-backend metrics. RuVector's `ShardCoordinator` is the closest reference
 This ADR specifies four tightly-coupled decisions that together form the cross-backend
 operations layer:
 
-| Concern                              | Decision                                                                    |
-| ------------------------------------ | --------------------------------------------------------------------------- |
-| Cross-backend edge representation    | D1: `target_backend` column on `graph_edges`                                |
-| Node-to-backend resolution           | D2: in-memory lazy locator cache                                            |
-| Cross-backend `link()` mechanics     | D3: coordinator-driven, with edge stored on source's backend                |
-| Substrate-kind search fan-out        | D4: unweighted RRF across backends                                          |
-| Cross-backend traversal and curation | D5: transparent BFS; merge errors on cross-backend; cascade across backends |
-| Partition tolerance                  | D6: degraded reads, hard-fail writes                                        |
+| Concern                              | Decision                                                                                                                            |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Cross-backend edge representation    | D1: `target_backend` column on `graph_edges`                                                                                        |
+| Node-to-backend resolution           | D2: in-memory lazy locator cache                                                                                                    |
+| Cross-backend `link()` mechanics     | D3: coordinator-driven, with edge stored on source's backend                                                                        |
+| Substrate-kind search fan-out        | D4: unweighted RRF across backends                                                                                                  |
+| Cross-backend traversal and curation | D5: DEFERRED in shipped code; target design retained below for transparent BFS, cross-backend merge errors, and hard-delete cascade |
+| Partition tolerance                  | D6: DEFERRED in shipped code; target design retained below for degraded reads, hard-fail writes, and backend health state           |
 
 What this ADR does **not** introduce (out of scope):
 
@@ -51,7 +51,7 @@ What this ADR does **not** introduce (out of scope):
 - Transparent re-partitioning. RuVector's `EdgeCutMinimizer` (METIS) is rejected;
   backends are user-intentional, not auto-derived.
 - Cross-backend atomic transactions. SQLite WAL is per-backend; cross-backend writes are
-  non-atomic. D5 provides a compensation WAL (`_cross_backend_wal`) that makes
+  non-atomic. The deferred D5 target design specifies a compensation WAL (`_cross_backend_wal`) intended to make
   hard-delete cascade recoverable but does NOT provide full cross-backend atomicity.
 
 ## Decision
@@ -68,9 +68,9 @@ kkernel
 │   ├── edges.rs      (D1 — target_backend column, link mechanics)
 │   ├── locator.rs    (D2 — DashMap<Uuid, BackendName>)
 │   ├── search.rs     (D4 — substrate-kind fan-out + RRF)
-│   ├── traversal.rs  (D5 — cross-backend BFS)
-│   ├── curation.rs   (D5 — update / merge / delete cascade)
-│   └── health.rs     (D6 — partition tolerance)
+│   ├── traversal.rs  (D5 — deferred target: cross-backend BFS)
+│   ├── curation.rs   (D5 — deferred target: update / merge / delete cascade)
+│   └── health.rs     (D6 — deferred target: partition tolerance)
 └── (other kkernel modules)
 ```
 
@@ -260,6 +260,13 @@ pack-local — they go to whichever backend the owning pack is assigned to.
 
 ### D5 — Cross-backend traversal and curation semantics
 
+> Status: DEFERRED in shipped code. This section is retained as target design.
+> `kkernel::coordinator` currently reserves the traversal and curation modules and
+> does not implement `cross_backend_traverse(...)`, cross-backend merge/update
+> routing, or the hard-delete cascade WAL. See
+> `crates/kkernel/src/coordinator/mod.rs:25-26` and
+> `crates/kkernel/src/coordinator/mod.rs:290-303`.
+
 **`coordinator.traverse(roots, options)`** — BFS where each `neighbors()` call is the
 unit operation:
 
@@ -431,6 +438,12 @@ Normative cross-backend semantics:
 | `search(kind=task)`          | local                  | N/A — task is pack-owned, single backend                |
 
 ### D6 — Partition tolerance
+
+> Status: DEFERRED in shipped code. This section is retained as target design.
+> `kkernel::coordinator` currently has no `BackendHealthMap`, cooldown loop, or
+> `health_map()` entry point; fan-out search reports per-backend errors but does
+> not maintain partition-health state. See
+> `crates/kkernel/src/coordinator/mod.rs:305-310`.
 
 The coordinator maintains a per-backend health map:
 
@@ -679,9 +692,10 @@ empty (one entry per substrate kind, all pointing at `main`).
    alongside names.
 3. **`CrossBackendDisallowed` concrete trigger.** Reserved error variant has no current
    rule. Either commit to a concrete rule or drop the variant until the design exists.
-4. **Cascade idempotency on partial failure.** ~~Defer~~ **Resolved in D5:** the
-   `_cross_backend_wal` provides idempotent per-backend retry. Pending rows survive
-   process restarts; replay deletes 0 rows on already-clean targets without error.
+4. **Cascade idempotency on partial failure.** DEFERRED with D5 target design: the
+   `_cross_backend_wal` is the intended idempotent per-backend retry mechanism.
+   Pending rows should survive process restarts; replay should delete 0 rows on
+   already-clean targets without error once D5 is implemented.
 5. **Per-backend cooldown configurability via TOML.** Default 30s for all backends.
    Per-backend override is one field on `BackendConfig` (ADR-028); add if operators ask.
 6. **Health introspection admin command.** `kkernel debug backend health` to print the
