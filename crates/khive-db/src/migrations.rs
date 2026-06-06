@@ -3,8 +3,8 @@
 //! Two APIs coexist:
 //! - **Legacy per-service migrations** (`ServiceSchemaPlan` / `apply_schema_plan`):
 //!   used by pack-scoped schemas.
-//! - **Versioned migrations** (`MIGRATIONS` / `run_migrations`): the ADR-015
-//!   forward-only migration pipeline for the core tables.
+//! - **Versioned migrations** (`MIGRATIONS` / `run_migrations`): the forward-only
+//!   migration pipeline for the core tables.
 
 use rusqlite::Connection;
 
@@ -87,7 +87,7 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
 }
 
 // =============================================================================
-// Versioned migration system (ADR-015)
+// Versioned migration system
 // =============================================================================
 
 /// A single forward-only schema migration.
@@ -375,7 +375,7 @@ const V14_EMBEDDING_MODEL_REGISTRY: &str = "__v14_computed_at_runtime__";
 /// missing `embedding_model`.
 const V16_VECTOR_EMBEDDING_MODEL_TAG: &str = "__v16_computed_at_runtime__";
 
-/// V17: sqlite-vec preserving rebuild (ADR-043 §1.1).
+/// V17: sqlite-vec preserving rebuild.
 ///
 /// Unlike V16 (regular tables), vec0 virtual tables cannot `ALTER TABLE ADD
 /// COLUMN`. V17 does a 6-step copy-with-default rebuild per table: create
@@ -385,12 +385,11 @@ const V16_VECTOR_EMBEDDING_MODEL_TAG: &str = "__v16_computed_at_runtime__";
 /// tables have `field` and `embedding_model`.
 const V17_VECTOR_EMBEDDING_MODEL_TAG_PRESERVING_REBUILD: &str = "__v17_computed_at_runtime__";
 
-/// V15: proposals_open projection table (ADR-046).
+/// V15: proposals_open projection table.
 ///
 /// Maintains a fold-derived view of the four proposal EventKinds so that
 /// `list(kind=proposal, status="open")` is an index scan rather than a full
-/// event-log fold. The `idx_events_payload_proposal_id` expression index
-/// (already created in V13) backs the per-proposal event history query.
+/// event-log fold.
 const V15_PROPOSALS_OPEN: &str = "\
     CREATE TABLE IF NOT EXISTS proposals_open (\
         proposal_id    TEXT PRIMARY KEY,\
@@ -755,26 +754,8 @@ const MIGRATION_TRACKING_TABLE: &str = "\
     );\
 ";
 
-/// Apply all unapplied migrations from `MIGRATIONS` in order.
-///
-/// Returns the highest version now applied, or `0` if the DB is empty and no
-/// migrations exist.
-///
-/// # Idempotency
-///
-/// Safe to call multiple times. Already-applied migrations are skipped.
-///
-/// # Atomicity
-///
-/// Each migration runs in its own transaction. A failure rolls back that
-/// migration and leaves the DB at the prior version.
-///
-/// # Errors
-///
-/// Returns `SqliteError::InvalidData` if the `MIGRATIONS` array is not
-/// contiguous (1, 2, 3, ...).
-///
-/// Returns `SqliteError::Migration { version, error }` if any migration fails.
+/// Apply all unapplied migrations in order. Idempotent; each migration runs in its own transaction.
+/// Errors on non-contiguous version array or failed migration.
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     for (i, m) in MIGRATIONS.iter().enumerate() {
         let expected = (i + 1) as u32;

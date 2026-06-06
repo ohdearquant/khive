@@ -55,24 +55,58 @@ cargo bench -p khive-db --features vectors -- storage_backend
 - Sample size: 50 iterations (200 for backend creation)
 - Benchmarks use file-backed SQLite (tempdir), not in-memory
 
-## Baseline
+## Baseline (2026-06-06, post-sweep)
 
-Baselines have not been measured yet. Run
-`cargo bench -p khive-db --features vectors` and fill in the table below with
-actual results before using this ledger for regression tracking.
+**Toolchain:** rustc 1.94.1 (e408947bf 2026-03-25)
+**Machine:** arm64 (Apple Silicon), macOS Darwin 25.5.0
+**Command:** `cargo bench -p khive-db --bench db_hot_path --features khive-db/vectors`
 
-| Benchmark                              | p50 | p95 | Notes |
-| -------------------------------------- | --- | --- | ----- |
-| `fts5_search/anyterm_1term`            | --  | --  |       |
-| `fts5_search/anyterm_3terms`           | --  | --  |       |
-| `fts5_search/plain_no_snippet`         | --  | --  |       |
-| `fts5_search/plain_with_snippet`       | --  | --  |       |
-| `fts5_upsert_batch/docs/1000`          | --  | --  |       |
-| `sqlite_vec_search/top_k/10`           | --  | --  |       |
-| `sqlite_vec_search/top_k/100`          | --  | --  |       |
-| `sqlite_vec_insert_batch/records/1000` | --  | --  |       |
-| `storage_backend_creation/memory`      | --  | --  |       |
-| `storage_backend_creation/file`        | --  | --  |       |
+### FTS5 Search (10K corpus, top-20)
+
+| Benchmark                              | Median    |
+| -------------------------------------- | --------- |
+| `fts5_search/anyterm_1term`            | 7.67 ms   |
+| `fts5_search/anyterm_3terms`           | 14.87 ms  |
+| `fts5_search/anyterm_5terms`           | 21.07 ms  |
+| `fts5_search/plain_no_snippet`         | 11.99 ms  |
+| `fts5_search/plain_with_snippet`       | 12.15 ms  |
+| `fts5_search_unranked/anyterm_top20`   | 300.1 µs  |
+| `fts5_rank_within_cap/cap/50`          | 23.71 ms  |
+| `fts5_rank_within_cap/cap/200`         | 21.32 ms  |
+| `fts5_rank_within_cap/cap/500`         | 21.20 ms  |
+| `fts5_term_stats/single_term`          | 6.34 ms   |
+| `fts5_term_stats/five_terms`           | 21.58 ms  |
+
+### FTS5 Upsert
+
+| Benchmark                     | Median    |
+| ----------------------------- | --------- |
+| `fts5_upsert_batch/docs/100`  | 7.19 ms   |
+| `fts5_upsert_batch/docs/500`  | 51.55 ms  |
+| `fts5_upsert_batch/docs/1000` | 153.69 ms |
+
+### sqlite-vec Vector Search (10K corpus, 384-dim)
+
+| Benchmark                              | Median   |
+| -------------------------------------- | -------- |
+| `sqlite_vec_search/top_k/10`           | 9.22 ms  |
+| `sqlite_vec_search/top_k/50`           | 9.58 ms  |
+| `sqlite_vec_search/top_k/100`          | 10.60 ms |
+
+### sqlite-vec Batch Insert
+
+| Benchmark                              | Median   |
+| -------------------------------------- | -------- |
+| `sqlite_vec_insert_batch/records/100`  | 5.94 ms  |
+| `sqlite_vec_insert_batch/records/500`  | 12.58 ms |
+| `sqlite_vec_insert_batch/records/1000` | 27.24 ms |
+
+### Backend Creation
+
+| Benchmark                         | Median    |
+| --------------------------------- | --------- |
+| `storage_backend_creation/memory` | 20.89 µs  |
+| `storage_backend_creation/file`   | 1.08 ms   |
 
 ## Regression policy
 

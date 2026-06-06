@@ -1,17 +1,4 @@
-//! sqlite-vec backed `VectorStore` implementation.
-//!
-//! Each `SqliteVecStore` manages a single vec0 virtual table for one embedding
-//! model. The store is scoped to a namespace for tenant isolation.
-//!
-//! # Blob format
-//!
-//! sqlite-vec expects embeddings as contiguous little-endian f32 bytes.
-//!
-//! FILE SIZE JUSTIFICATION: Vector store operations (KNN search, batch insert,
-//! upsert, delete, and index introspection) share the f32-to-blob casting
-//! helpers, vec0 virtual-table DDL patterns, and namespace-scoped query
-//! building. The sqlite-vec binding layer is inherently coupled to the store
-//! logic, making a split unnatural.
+//! sqlite-vec backed `VectorStore`: one vec0 table per embedding model, scoped to namespace.
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};

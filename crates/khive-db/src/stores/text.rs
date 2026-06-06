@@ -1,14 +1,4 @@
-//! FTS5-backed `TextSearch` implementation.
-//!
-//! Each `Fts5TextSearch` manages one FTS5 virtual table indexing `title` and `body`
-//! columns. Scores are normalized to `(0.05, 1.0]` within each result set so relative
-//! ordering is stable across tokenizers.
-//!
-//! FILE SIZE JUSTIFICATION: FTS5 query building, ranked/unranked search modes,
-//! snippet generation, term-stats collection, batch upsert, and index maintenance
-//! are tightly coupled through shared SQL patterns and scoring normalization. The
-//! internal helper functions reference common column layouts and FTS5 match syntax
-//! that would require duplicated constants or an awkward shared-state module if split.
+//! FTS5-backed `TextSearch`: one virtual table per model, scores normalized to `(0.05, 1.0]`.
 
 use std::sync::Arc;
 

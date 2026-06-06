@@ -1,18 +1,4 @@
-//! SQL-backed `GraphStore` implementation.
-//!
-//! `SqlGraphStore` stores graph edges in a regular SQLite table.
-//! Traversal uses recursive CTEs for multi-hop queries.
-//!
-//! # Connection strategy
-//!
-//! - **File-backed**: Opens standalone connections per operation.
-//! - **In-memory**: Acquires pool connections per operation via `spawn_blocking`.
-//!
-//! FILE SIZE JUSTIFICATION: Graph store operations (CRUD, neighbor queries,
-//! multi-hop traversal with recursive CTEs, edge filtering, pagination, and
-//! batch writes) share common SQL column mappings and edge validation logic.
-//! Splitting traversal from CRUD would duplicate the row-mapping helpers and
-//! edge deserialization code.
+//! SQL-backed `GraphStore`: edge CRUD, neighbor queries, and recursive CTE traversal.
 
 use std::sync::Arc;
 

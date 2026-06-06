@@ -9,7 +9,7 @@ pub mod backend;
 pub mod error;
 /// SQLite extension registration (sqlite-vec auto-extension).
 pub mod extension;
-/// Schema migration system (ADR-015 versioned migrations).
+/// Schema migration system (versioned migrations).
 pub mod migrations;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
