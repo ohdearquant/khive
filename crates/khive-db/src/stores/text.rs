@@ -1,43 +1,14 @@
 //! FTS5-backed `TextSearch` implementation.
 //!
-//! Each `Fts5TextSearch` manages a single FTS5 virtual table for full-text
-//! search. The table stores document metadata alongside the indexed text
-//! columns (`title` and `body`), with non-searchable columns marked
-//! `UNINDEXED`.
+//! Each `Fts5TextSearch` manages one FTS5 virtual table indexing `title` and `body`
+//! columns. Scores are normalized to `(0.05, 1.0]` within each result set so relative
+//! ordering is stable across tokenizers.
 //!
-//! # FTS5 table layout
-//!
-//! ```sql
-//! CREATE VIRTUAL TABLE fts_{key} USING fts5(
-//!     subject_id UNINDEXED,
-//!     kind UNINDEXED,
-//!     title,
-//!     body,
-//!     tags UNINDEXED,
-//!     namespace UNINDEXED,
-//!     metadata UNINDEXED,
-//!     updated_at UNINDEXED
-//! );
-//! ```
-//!
-//! Only `title` and `body` are full-text indexed. The remaining columns are
-//! stored for retrieval and filtering but do not participate in FTS ranking.
-//!
-//! # Connection strategy
-//!
-//! Follows the same dual-mode pattern as `SqliteVecStore`:
-//! - **File-backed**: Opens standalone connections per operation.
-//! - **In-memory**: Acquires pool connections via `spawn_blocking`.
-//!
-//! # Score normalization
-//!
-//! FTS5 `rank` values are negative (more negative = more relevant). We
-//! normalize within each result set so scores span `(0.05, 1.0]`, preserving
-//! relative ordering across all tokenizers (including trigram, which produces
-//! a narrow absolute range that the old `1/(1+|rank|)` formula collapsed into
-//! near-uniform noise). The best hit in a result set receives score `1.0`;
-//! the worst receives `0.05`. When all hits have the same rank (single hit or
-//! degenerate match), score is `1.0`.
+//! FILE SIZE JUSTIFICATION: FTS5 query building, ranked/unranked search modes,
+//! snippet generation, term-stats collection, batch upsert, and index maintenance
+//! are tightly coupled through shared SQL patterns and scoring normalization. The
+//! internal helper functions reference common column layouts and FTS5 match syntax
+//! that would require duplicated constants or an awkward shared-state module if split.
 
 use std::sync::Arc;
 
@@ -1126,6 +1097,7 @@ impl Fts5TextSearch {
     /// Callers must invoke this after any SQL-level namespace change on the
     /// backing entity table so that FTS5 keyword search stays consistent with
     /// the entity store.
+    // REASON: reserved for namespace migration operations
     #[allow(dead_code)]
     pub(crate) async fn rename_namespace(
         &self,
@@ -1214,6 +1186,9 @@ impl Fts5TextSearch {
     }
 }
 
+// INLINE TEST JUSTIFICATION: These tests construct Fts5TextSearch via its
+// pub(crate) constructor and call the pub(crate) ensure_fts5_schema helper to
+// initialize in-memory FTS5 tables. Both are inaccessible from outside the crate.
 #[cfg(test)]
 mod tests {
     use super::*;

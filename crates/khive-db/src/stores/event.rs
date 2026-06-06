@@ -1,4 +1,11 @@
 //! SQL-backed `EventStore` implementation.
+//!
+//! FILE SIZE JUSTIFICATION: Event store covers append, query-by-filter,
+//! observation recording, and paginated listing with shared row-mapping and
+//! timestamp serialization helpers. The event schema has complex JSON data
+//! columns (observations, referent kinds, outcomes) whose parsing is shared
+//! across all read paths, making a split impractical without duplicating the
+//! deserialization logic.
 
 use std::sync::Arc;
 
@@ -782,6 +789,9 @@ pub(crate) fn ensure_events_schema(conn: &rusqlite::Connection) -> Result<(), ru
     conn.execute_batch(EVENTS_DDL)
 }
 
+// INLINE TEST JUSTIFICATION: These tests use the private EVENTS_DDL constant and
+// the pub(crate) ensure_events_schema helper to bootstrap an in-memory event
+// store, which are not reachable through the crate's public API.
 #[cfg(test)]
 mod tests {
     use super::*;

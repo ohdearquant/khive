@@ -626,6 +626,9 @@ pub(crate) fn ensure_notes_schema(conn: &rusqlite::Connection) -> Result<(), rus
     conn.execute_batch(NOTES_DDL)
 }
 
+// INLINE TEST JUSTIFICATION: These tests use the private NOTES_DDL constant and
+// the pub(crate) ensure_notes_schema helper to bootstrap an in-memory note store,
+// which are not reachable through the crate's public API.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -511,6 +511,9 @@ pub(crate) fn ensure_entities_schema(conn: &rusqlite::Connection) -> Result<(), 
     conn.execute_batch(ENTITIES_DDL)
 }
 
+// INLINE TEST JUSTIFICATION: These tests use the private ENTITIES_DDL constant and
+// the pub(crate) ensure_entities_schema helper to bootstrap an in-memory entity
+// store, which are not reachable through the crate's public API.
 #[cfg(test)]
 mod tests {
     use super::*;

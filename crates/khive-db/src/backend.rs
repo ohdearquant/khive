@@ -1,23 +1,8 @@
 //! Concrete storage backend providing capability traits.
 //!
-//! `StorageBackend` owns a `ConnectionPool` and provides factory methods for
-//! all storage capability traits (`GraphStore`, `NoteStore`, `EventStore`,
-//! `VectorStore`, `TextSearch`, `SqlAccess`). Services obtain capability handles
-//! without depending on the pool directly.
-//!
-//! # Modes
-//!
-//! - **File-backed** (`StorageBackend::sqlite(path)`): Production use. Opens (or
-//!   creates) the database at the given path. Readers get standalone connections
-//!   for high concurrency.
-//! - **In-memory** (`StorageBackend::memory()`): Testing use. A single shared
-//!   connection through the pool. All data is lost when the backend is dropped.
-//!
-//! # Schema ownership
-//!
-//! `StorageBackend` creates a **bare** pool with no global schema. Each factory
-//! method (`graph()`, `notes()`, etc.) applies only the DDL for its own tables.
-//! Call `apply_schema()` to run service-specific migrations.
+//! `StorageBackend` owns a `ConnectionPool` and provides factory methods for all
+//! capability traits (`GraphStore`, `NoteStore`, `EventStore`, `VectorStore`,
+//! `TextSearch`, `SqlAccess`). File-backed for production; in-memory for tests.
 
 use std::path::Path;
 use std::sync::Arc;

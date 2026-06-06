@@ -1,3 +1,10 @@
+//! Schema migration system for khive-db (ADR-015).
+//!
+//! FILE SIZE JUSTIFICATION: Contains versioned DDL migrations that must remain
+//! in dependency order within a single file. Each `VersionedMigration` builds on
+//! the schema left by its predecessor; splitting across files would make migration
+//! sequencing harder to verify and introduce ordering bugs during schema evolution.
+
 use rusqlite::Connection;
 
 use crate::error::SqliteError;
@@ -1566,6 +1573,11 @@ pub(crate) fn build_v18_proposals_applying_sql(
 // Tests
 // =============================================================================
 
+// INLINE TEST JUSTIFICATION: These tests exercise the internal VersionedMigration
+// structs and run_migrations against raw rusqlite::Connection::open_in_memory()
+// handles, then inspect schema artifacts via direct SQL pragma queries. The
+// migration internals (MIGRATIONS array, per-version DDL) are private to this
+// module and unreachable from the crate's public API.
 #[cfg(test)]
 mod tests {
     use super::*;

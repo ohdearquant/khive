@@ -7,6 +7,12 @@
 //!
 //! - **File-backed**: Opens standalone connections per operation.
 //! - **In-memory**: Acquires pool connections per operation via `spawn_blocking`.
+//!
+//! FILE SIZE JUSTIFICATION: Graph store operations (CRUD, neighbor queries,
+//! multi-hop traversal with recursive CTEs, edge filtering, pagination, and
+//! batch writes) share common SQL column mappings and edge validation logic.
+//! Splitting traversal from CRUD would duplicate the row-mapping helpers and
+//! edge deserialization code.
 
 use std::sync::Arc;
 
@@ -904,6 +910,9 @@ pub(crate) fn ensure_graph_schema(conn: &rusqlite::Connection) -> Result<(), rus
     conn.execute_batch(GRAPH_DDL)
 }
 
+// INLINE TEST JUSTIFICATION: These tests use the private GRAPH_DDL constant and
+// the pub(crate) ensure_graph_schema helper to bootstrap an in-memory SQLite
+// graph schema, which are not reachable through the crate's public API.
 #[cfg(test)]
 mod tests {
     use super::*;

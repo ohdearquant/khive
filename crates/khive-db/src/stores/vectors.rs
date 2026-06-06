@@ -6,6 +6,12 @@
 //! # Blob format
 //!
 //! sqlite-vec expects embeddings as contiguous little-endian f32 bytes.
+//!
+//! FILE SIZE JUSTIFICATION: Vector store operations (KNN search, batch insert,
+//! upsert, delete, and index introspection) share the f32-to-blob casting
+//! helpers, vec0 virtual-table DDL patterns, and namespace-scoped query
+//! building. The sqlite-vec binding layer is inherently coupled to the store
+//! logic, making a split unnatural.
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -681,7 +687,7 @@ impl SqliteVecStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vectors"))]
 mod batch_exists_tests {
     use std::collections::HashSet;
     use std::sync::Arc;

@@ -25,7 +25,6 @@ thiserror = { workspace = true }
 rusqlite = { version = "0.33", features = ["bundled", "column_decltype"] }
 crossbeam-queue = "0.3"
 parking_lot = "0.12"
-tempfile = "3"
 sqlite-vec = { version = "0.1.9", optional = true }
 
 [dev-dependencies]
@@ -35,6 +34,14 @@ rusqlite = { version = "0.33", features = ["bundled", "column_decltype"] }
 khive-storage = { version = "0.2.5", path = "../khive-storage" }
 khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }
 uuid = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "db_hot_path"
+harness = false
+path = "benches/db_hot_path.rs"
+required-features = ["vectors"]
 
 [features]
 default = []
