@@ -79,20 +79,7 @@ pub struct Args {
     pub daemon: bool,
 }
 
-/// Resolve the CLI-tier namespace from parsed `Args`.
-///
-/// Returns `(explicit, namespace)` where `explicit` is `true` when the caller
-/// supplied `--actor` / `KHIVE_ACTOR` or `--namespace` / `KHIVE_NAMESPACE`, and
-/// `namespace` is the resolved value (defaulting to `"local"` when absent).
-///
-/// Explicitness is tracked by `Option::is_some()`, **not** by value comparison.
-/// This means `--namespace local` (or `KHIVE_NAMESPACE=local`) is correctly
-/// treated as explicit and wins over any config-file `[actor] id`.
-///
-/// # Errors
-///
-/// Returns an error when the supplied namespace string is not a valid
-/// `Namespace` (e.g. contains illegal characters).
+/// Resolve CLI namespace from `Args`. Returns `(explicit, namespace)`; errors on invalid namespace string.
 pub fn resolve_cli_namespace(args: &Args) -> Result<(bool, Namespace), String> {
     let explicit = args.actor.is_some() || args.namespace.is_some();
     let raw = args

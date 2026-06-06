@@ -138,21 +138,7 @@ pub fn builtin_pack_names() -> Vec<&'static str> {
 }
 
 impl KhiveMcpServer {
-    /// Build a server using the pack list from `runtime.config().packs`.
-    ///
-    /// The authorization gate from `runtime.config().gate` is threaded into the
-    /// registry. Gate decisions are **hard-enforcing** — a `Deny`
-    /// result blocks pack dispatch and returns `PermissionDenied`.
-    ///
-    /// Fails fast if any requested pack is unknown or has an unsatisfied
-    /// dependency. A misconfigured `KHIVE_PACKS` is a boot error —
-    /// callers must list all required packs explicitly. Use [`Self::with_packs`]
-    /// for the same strict path with an explicit pack list.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PackRegError`] if any pack in `runtime.config().packs` is
-    /// unknown or if a declared dependency is absent from the list.
+    /// Build a server from `runtime.config().packs`. Errors if any pack is unknown or missing deps.
     // The error variant intentionally carries the runtime so callers can recover.
     #[allow(clippy::result_large_err)]
     pub fn new(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
