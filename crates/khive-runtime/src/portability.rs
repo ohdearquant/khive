@@ -1,4 +1,4 @@
-//! KG export / import — portable JSON archive for namespace-scoped knowledge graphs (ADR-010).
+//! KG export / import — portable JSON archive for namespace-scoped knowledge graphs.
 //!
 //! Embeddings are excluded (regenerable from text + model). Edges are collected by
 //! querying all entity IDs in the namespace first, then fetching incident edges.
@@ -54,7 +54,7 @@ pub struct ExportedEntity {
 /// A directed edge record in the portable archive.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExportedEdge {
-    /// Stable edge identity across export/import cycles (ADR-048 D1).
+    /// Stable edge identity across export/import cycles.
     ///
     /// Old archives (pre-0.2) omit this field. `serde(default)` assigns a fresh
     /// UUID on import so backward-compatible archives are accepted as-is.
@@ -62,7 +62,7 @@ pub struct ExportedEdge {
     pub edge_id: Uuid,
     pub source: Uuid,
     pub target: Uuid,
-    /// One of the 13 canonical relations defined in ADR-002.
+    /// One of the 15 canonical edge relations.
     pub relation: EdgeRelation,
     pub weight: f64,
 }
@@ -772,7 +772,7 @@ mod tests {
         );
     }
 
-    // ── edge_id contract tests (ADR-048 D1) ──────────────────────────────────
+    // ── edge_id contract tests ────────────────────────────────────────────────
 
     /// 10. export_kg sets edge_id in the archive to the LinkId returned by link.
     #[tokio::test]

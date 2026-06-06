@@ -3,9 +3,9 @@
 //! Core merge types: conflict taxonomy, strategy enum, and `MergeEngine` trait.
 //!
 //! These types are defined here (not in `khive-vcs`) because the VCS crate
-//! currently ships only the git-native v1 surface (ADR-010/ADR-020). The
-//! three-way merge conflict taxonomy is forward-deployed v2 infrastructure
-//! that will be promoted to a shared crate when ADR-043 integration lands.
+//! currently ships only the git-native v1 surface. The three-way merge conflict
+//! taxonomy is forward-deployed v2 infrastructure that will be promoted to a
+//! shared crate when the VCS integration layer is extended.
 
 use khive_runtime::portability::KgArchive;
 use khive_vcs::VcsError;

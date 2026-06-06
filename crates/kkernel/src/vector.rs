@@ -1,4 +1,4 @@
-//! `kkernel vector` — vector store introspection and housekeeping (ADR-044).
+//! `kkernel vector` — vector store introspection and housekeeping.
 //!
 //! Implements:
 //! - `kkernel vector capabilities`  — print VectorStoreCapabilities for the active backend
@@ -61,7 +61,7 @@ pub struct VectorSweepArgs {
 
 // ── Output types ───────────────────────────────────────────────────────────────
 
-/// JSON-serializable projection of [`VectorStoreCapabilities`] (ADR-044 §1).
+/// JSON-serializable projection of [`VectorStoreCapabilities`].
 #[derive(Debug, Serialize)]
 pub struct CapabilitiesReport {
     pub engine_name: String,
@@ -90,7 +90,7 @@ pub fn run_vector(cmd: VectorCommand) -> Result<()> {
 fn cmd_vector_capabilities(args: VectorCapabilitiesArgs) -> Result<()> {
     let engine_name = args.engine.unwrap_or_else(|| "default".to_string());
 
-    // Emit the sqlite-vec baseline capabilities (ADR-044 §1).
+    // Emit the sqlite-vec baseline capabilities.
     // A full implementation instantiates the backend via KhiveRuntime, calls
     // `VectorStore::capabilities()`, and serialises the returned
     // `&'static VectorStoreCapabilities`. The static values below match the
@@ -135,8 +135,8 @@ fn cmd_vector_capabilities(args: VectorCapabilitiesArgs) -> Result<()> {
 
 fn cmd_vector_sweep(_args: VectorSweepArgs) -> Result<()> {
     Err(anyhow!(
-        "vector sweep is not yet implemented (ADR-044 backend orphan-sweep deferred to \
-         follow-up #381). SqliteVecStore returns Unsupported per the ADR."
+        "vector sweep is not yet implemented (backend orphan-sweep deferred to \
+         follow-up #381). SqliteVecStore returns Unsupported."
     ))
 }
 

@@ -37,7 +37,7 @@ use crate::entity_type_registry::EntityTypeRegistry;
 use crate::vocab::NoteKind;
 use crate::KgPack;
 
-// ---- Kind canonicalization (ADR-030) ----
+// ---- Kind canonicalization ----
 //
 // kg's vocab (EntityKind / NoteKind) provides alias normalization for kg-owned
 // kinds ("paper" → "document", "obs" → "observation", etc.). Other packs
@@ -128,7 +128,7 @@ pub(crate) enum KindSpec {
     Edge,
     /// `kind="event"` — only valid for `list`; `get` resolves events by UUID.
     Event,
-    /// `kind="proposal"` — queries the `proposals_open` projection table (ADR-046).
+    /// `kind="proposal"` — queries the `proposals_open` projection table.
     Proposal,
 }
 
@@ -323,7 +323,7 @@ struct StatsParams {}
 #[serde(deny_unknown_fields)]
 struct UpdateParams {
     id: String,
-    /// Optional — resolved from UUID when absent (ADR-014: UUID-only ops).
+    /// Optional — substrate is inferred from the UUID when absent.
     kind: Option<String>,
     name: Option<Value>,
     description: Option<Value>,
@@ -346,7 +346,7 @@ struct UpdateParams {
 #[serde(deny_unknown_fields)]
 struct DeleteParams {
     id: String,
-    /// Optional — resolved from UUID when absent (ADR-014: UUID-only ops).
+    /// Optional — substrate is inferred from the UUID when absent.
     kind: Option<String>,
     hard: Option<bool>,
 }
@@ -391,7 +391,7 @@ struct SearchParams {
     min_score: Option<f64>,
 }
 
-/// One entry in a bulk-link request (F205 / ADR-038).
+/// One entry in a bulk-link request.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BulkLinkEntry {
@@ -418,7 +418,6 @@ struct LinkParams {
     /// When `true`, output uses full UUIDs and ISO 8601 timestamps instead of
     /// the default 8-char short IDs and YYYY/MM/DD date format.
     verbose: Option<bool>,
-    // Bulk link fields (ADR-038).
     /// Multiple edges to create in one call.
     links: Option<Vec<BulkLinkEntry>>,
     /// When `true` (default), the entire batch is atomic — any failure rolls
@@ -430,7 +429,7 @@ struct LinkParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NeighborsParams {
-    /// Accepts either `id` (canonical, ADR-148 normalized) or `node_id` (legacy).
+    /// Accepts either `id` (canonical) or `node_id` (legacy alias).
     #[serde(alias = "node_id")]
     id: String,
     direction: Option<String>,
@@ -463,7 +462,7 @@ struct QueryParams {
     limit: Option<usize>,
 }
 
-// ---- Proposal param structs (ADR-046) ----
+// ---- Proposal param structs ----
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -656,7 +655,7 @@ fn flatten_get_result(substrate: &str, mut inner: Value) -> Result<Value, Runtim
 }
 
 /// Remap note response fields so pack-owned lifecycle status is visible at the
-/// top level (Option A — ADR-004).
+/// top level.
 ///
 /// The storage-layer `Note.status` field carries row-visibility state
 /// (`"active"` | `"archived"` | `"deleted"`). Packs that own a note kind can
@@ -743,8 +742,8 @@ fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
 
 /// Return the valid edge relations for an entity→entity endpoint pair (issue #486).
 ///
-/// Encodes the ADR-002 base allowlist for UX error enrichment — not for
-/// enforcement. `"*"` as `src_kind` means "any source entity kind".
+/// Encodes the base allowlist for UX error enrichment — not for enforcement.
+/// `"*"` as `src_kind` means "any source entity kind".
 /// Returns an empty vec when no base-contract relations exist for the pair.
 pub(crate) fn valid_relations_for_entity_pair(src_kind: &str, tgt_kind: &str) -> Vec<&'static str> {
     const RULES: &[(&str, &str, &str)] = &[
@@ -817,7 +816,7 @@ pub(crate) fn valid_relations_for_entity_pair(src_kind: &str, tgt_kind: &str) ->
 /// Enrich an "not in allowlist" error with the list of valid relations (issue #486).
 ///
 /// Called when `runtime.link()` returns `InvalidInput` containing the
-/// "not in the ADR-002 base endpoint allowlist" sentinel. Fetches entity kinds
+/// "not in the base endpoint allowlist" sentinel. Fetches entity kinds
 /// and appends valid relations. Returns the original message on lookup failure.
 pub(crate) async fn enrich_allowlist_error(
     original: &str,
@@ -971,7 +970,7 @@ fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeErro
 }
 
 /// Post-process an entity or note JSON value to replace `i64` microsecond epoch
-/// timestamps with ISO-8601 strings (ADR-045 §5 handler invariant — C1 fix).
+/// timestamps with ISO-8601 strings at the MCP boundary (C1 fix).
 ///
 /// Applies to the fields `created_at`, `updated_at`, `deleted_at`, and
 /// `expires_at` when they are JSON integer values.  `expires_at` is defined on
@@ -1007,7 +1006,7 @@ fn normalize_entity_timestamps_array(v: Value) -> Value {
 /// Timestamp key names that must be converted to ISO-8601 strings at the MCP
 /// boundary. This set covers all `Timestamp` and `i64` microsecond fields that
 /// appear anywhere in event/entity/note/payload JSON — including nested objects
-/// and array elements (round-6 recursive fix, ADR-045 §5).
+/// and array elements (round-6 recursive fix).
 const TIMESTAMP_KEYS: &[&str] = &[
     "created_at",
     "updated_at",
@@ -1064,7 +1063,7 @@ fn walk_timestamps(v: &mut Value) {
 }
 
 /// Normalize the `created_at` field on an event JSON object from raw
-/// microsecond integer to an ISO-8601 string (ADR-045 §5 handler invariant).
+/// microsecond integer to an ISO-8601 string at the MCP boundary.
 ///
 /// Round-6: uses `walk_timestamps` to recurse into the entire event value,
 /// including arbitrarily-nested payload objects and arrays. This subsumes the
@@ -1259,8 +1258,8 @@ fn render_query_result(result: QueryResult) -> Value {
 impl KgPack {
     /// Infer the substrate kind of an existing record from its UUID.
     ///
-    /// Called by `handle_update` and `handle_delete` when `kind` is absent
-    /// (ADR-014: UUID-only ops). Probes entity → note → edge in order.
+    /// Called by `handle_update` and `handle_delete` when `kind` is absent.
+    /// Probes entity → note → edge in order.
     /// Takes no `&VerbRegistry` so it can be `.await`ed freely without
     /// violating the `async_trait` `Send + 'static` bound on `dispatch`.
     async fn infer_kind_from_uuid(
@@ -1346,7 +1345,7 @@ impl KgPack {
         // legacy substrate-level form (`kind="entity"` + `entity_kind=…`).
         let spec = resolve_kind_spec(&raw_kind, registry)?;
 
-        // Canonicalize the sub-discriminator + look up the kind hook (ADR-030).
+        // Canonicalize the sub-discriminator + look up the kind hook.
         // For entities the hook is rarely used; for notes it's how gtd's `task`
         // kind layers defaults + edges over the shared CRUD path.
         let (sub_kind, hook) = match &spec {
@@ -1496,8 +1495,8 @@ impl KgPack {
                     .await?;
                 let id = note.id;
                 // Normalize microsecond epoch → ISO-8601 before the response
-                // reaches the presentation layer (ADR-045 §5 handler invariant,
-                // Blocker C1: note create was missing normalization).
+                // reaches the presentation layer (Blocker C1: note create was
+                // missing normalization).
                 (
                     remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
                     id,
@@ -1665,14 +1664,14 @@ impl KgPack {
     ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params)?;
 
-        // ADR-046:299 — `get(id=<proposal_id>)` resolves to the ProposalCreated
-        // event payload, not a projection row.  Try to resolve the id against
-        // proposals_open first (for UUID/prefix disambiguation), then fetch the
-        // ProposalCreated event payload.  Standard substrates win when the same
-        // id matches both (shouldn't happen in practice; proposal IDs are fresh UUIDs).
+        // `get(id=<proposal_id>)` resolves to the ProposalCreated event payload,
+        // not a projection row. Try to resolve the id against proposals_open first
+        // (for UUID/prefix disambiguation), then fetch the ProposalCreated event
+        // payload. Standard substrates win when the same id matches both (shouldn't
+        // happen in practice; proposal IDs are fresh UUIDs).
 
-        // UUID resolution: try graph token namespace first (entities and edges use the graph
-        // token, which is the caller token under ADR-050), then caller as fallback.
+        // UUID resolution: try graph token namespace first (entities and edges use
+        // the graph token), then caller as fallback.
         let id = if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, graph_token).await {
             id
         } else if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, token).await {
@@ -1685,7 +1684,7 @@ impl KgPack {
             return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
         };
 
-        // Entities and edges use the graph token (caller token under ADR-050); notes and events use caller namespace.
+        // Entities and edges use the graph token; notes and events use the caller namespace.
         if let Ok(entity) = self.runtime.get_entity(graph_token, id).await {
             return flatten_get_result("entity", normalize_entity_timestamps(to_json(&entity)?));
         }
@@ -1720,8 +1719,8 @@ impl KgPack {
             }
         }
 
-        // Fall back: resolve as a proposal_id.  ADR-046:299 specifies that
-        // get(id=<proposal_id>) resolves to the ProposalCreated event payload.
+        // Fall back: resolve as a proposal_id — get(id=<proposal_id>) resolves
+        // to the ProposalCreated event payload.
         if let Some(payload_val) = self.try_get_proposal_payload(token, &p.id).await? {
             return Ok(payload_val);
         }
@@ -1731,8 +1730,8 @@ impl KgPack {
 
     /// Resolve `raw_id` as a proposal ID and return the `ProposalCreated` event payload.
     ///
-    /// ADR-046:299 — `get(id=<proposal_id>)` resolves to the `ProposalCreated`
-    /// event payload, not a projection row.
+    /// `get(id=<proposal_id>)` resolves to the `ProposalCreated` event payload,
+    /// not a projection row.
     ///
     /// Steps:
     /// 1. Resolve `raw_id` (full UUID or 8-char prefix) against `proposals_open`.
@@ -1977,7 +1976,7 @@ impl KgPack {
                         .await?
                 };
                 // Normalize i64 microsecond timestamps to ISO-8601 strings
-                // (ADR-045 §5 handler invariant — C1 fix).
+                // at the MCP boundary.
                 Ok(normalize_entity_timestamps_array(to_json(&entities)?))
             }
             KindSpec::Edge => {
@@ -2038,7 +2037,7 @@ impl KgPack {
                 // Total scan is capped at MAX_SCAN_TOTAL to avoid pathological performance
                 // on very large note stores (e.g. 1M+ messages).
                 // For deep mailboxes, prefer comm.inbox (no cap) or comm.thread (thread-indexed).
-                // See ADR-040 §"Message-filter scan cap" for rationale and alternatives.
+                // See docs/design.md §"Message-filter scan cap" for rationale and alternatives.
                 const PAGE_SIZE: u32 = 200;
                 const MAX_SCAN_TOTAL: u32 = 10_000;
 
@@ -2256,9 +2255,9 @@ impl KgPack {
         }
         // Resolve `kind` with registry BEFORE the first .await so that the
         // registry borrow is provably dead at all yield points (mirrors the
-        // pattern used in handle_create / handle_list).  ADR-014: when `kind`
-        // is absent, the substrate is inferred from the UUID via
-        // `infer_kind_from_uuid` (which takes no `registry`).
+        // pattern used in handle_create / handle_list). When `kind` is absent,
+        // the substrate is inferred from the UUID via `infer_kind_from_uuid`
+        // (which takes no `registry`).
         let explicit_spec: Option<KindSpec> = if let Some(k) = p.kind.as_deref() {
             Some(resolve_kind_spec(k, registry)?)
         } else {
@@ -2335,7 +2334,7 @@ impl KgPack {
         let p: DeleteParams = deser(params)?;
         // Resolve `kind` with registry BEFORE the first .await — same pattern
         // as handle_update. When `kind` is absent, substrate is inferred from
-        // the UUID after the await (ADR-014).
+        // the UUID after the await.
         let explicit_spec: Option<KindSpec> = if let Some(k) = p.kind.as_deref() {
             Some(resolve_kind_spec(k, registry)?)
         } else {
@@ -2799,7 +2798,7 @@ impl KgPack {
         {
             Ok(e) => e,
             Err(RuntimeError::InvalidInput(ref msg))
-                if msg.contains("not in the ADR-002 base endpoint allowlist") =>
+                if msg.contains("not in the base endpoint allowlist") =>
             {
                 let enriched =
                     enrich_allowlist_error(msg, &self.runtime, token, source, target, relation)
@@ -2905,7 +2904,7 @@ impl KgPack {
         Ok(render_query_result(result))
     }
 
-    // ---- Proposal verbs (ADR-046) ----
+    // ---- Proposal verbs ----
 
     /// Resolve a proposal_id string (full UUID or 8-char prefix) to a full UUID.
     ///
@@ -2997,9 +2996,9 @@ impl KgPack {
         let ns = token.namespace().as_str().to_owned();
 
         // BUG-6 fix: validate parent_id exists in proposals_open before creating the
-        // amendment proposal.  ADR-046 §2 says parent_id is set when amending an
-        // earlier proposal after RequestChanges; an orphaned parent_id (pointing at
-        // a non-existent proposal) corrupts the amendment chain.
+        // amendment proposal. parent_id is set when amending an earlier proposal after
+        // RequestChanges; an orphaned parent_id (pointing at a non-existent proposal)
+        // corrupts the amendment chain.
         let validated_parent_id: Option<khive_types::Id128> = p
             .parent_id
             .as_deref()
@@ -3069,7 +3068,7 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?;
 
-        // ADR-046 §4: projection is maintained by ProposalsProjectionWorker, not inline here.
+        // Projection is maintained by ProposalsProjectionWorker, not inline here.
         crate::projection_worker::ProposalsProjectionWorker::new(self.runtime.clone())
             .on_proposal_created(token, proposal_id, &actor, &p.title, p.expiry)
             .await?;
@@ -3083,7 +3082,7 @@ impl KgPack {
     }
 
     /// `review` — declaration verb. Emits a `ProposalReviewed` event; side effects
-    /// (projection update, changeset apply) are delegated to worker structs (ADR-046 §4-5).
+    /// (projection update, changeset apply) are delegated to worker structs.
     pub(crate) async fn handle_review(
         &self,
         token: &NamespaceToken,
@@ -3154,8 +3153,8 @@ impl KgPack {
         // Without this guard a second review(approve) on an already-approved proposal
         // would silently succeed, inflating approve_count and creating spurious audit
         // events.  'approved' is included here alongside the other terminal states.
-        // Per ADR-046 §4 the apply worker runs inline after approve and sets
-        // status='applied'; after that point 'applied' also blocks re-review.
+        // The apply worker runs inline after approve and sets status='applied';
+        // after that point 'applied' also blocks re-review.
         if matches!(
             current_status,
             "applied" | "withdrawn" | "rejected" | "approved"
@@ -3231,7 +3230,7 @@ impl KgPack {
             )));
         }
 
-        // ADR-046 §5: apply worker fires on approval — idempotent on status check.
+        // Apply worker fires on approval — idempotent on status check.
         if decision == ProposalDecision::Approve {
             crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
                 .maybe_apply(token, proposal_id, registry, p.max_new_entries)
@@ -3247,7 +3246,7 @@ impl KgPack {
     }
 
     /// `withdraw` — commissive verb. Emits a `ProposalWithdrawn` event; projection
-    /// is updated by ProposalsProjectionWorker (ADR-046 §4).
+    /// is updated by ProposalsProjectionWorker.
     pub(crate) async fn handle_withdraw(
         &self,
         token: &NamespaceToken,
@@ -3386,11 +3385,10 @@ impl KgPack {
         let mut sql_params: Vec<SqlValue> = vec![SqlValue::Text(ns)];
         let mut param_idx = 2usize;
 
-        // ADR-046:277-279 — hard-state proposals (approved/rejected/applied/withdrawn)
-        // are retained for audit.  ADR-046:501-504 says list(kind=proposal) supports
-        // standard filters.  When no status is supplied, return ALL rows so callers
-        // can see the complete audit trail.  Pass status="open" (or repeat with
-        // status="changes_requested") to filter to actionable proposals only.
+        // Hard-state proposals (approved/rejected/applied/withdrawn) are retained for
+        // audit. When no status is supplied, return ALL rows so callers can see the
+        // complete audit trail. Pass status="open" (or status="changes_requested")
+        // to filter to actionable proposals only.
         if let Some(status) = &p.status {
             sql_str.push_str(&format!(" AND status = ?{param_idx}"));
             sql_params.push(SqlValue::Text(status.clone()));
@@ -3462,8 +3460,8 @@ impl KgPack {
                         }
                     })
                 };
-                // ADR-045 §5: convert microsecond epoch integers to ISO-8601
-                // strings before the MCP boundary (proposal listing fix).
+                // Convert microsecond epoch integers to ISO-8601 strings
+                // before the MCP boundary (proposal listing fix).
                 let ts_or_null = |name: &str| -> Value {
                     match get_int(name) {
                         Some(micros) => Value::String(micros_to_iso(micros)),
@@ -3519,22 +3517,22 @@ mod tests {
     use serde_json::json;
 
     // F009 (CRIT): error text must be derived from EdgeRelation::ALL, not a hardcoded list.
-    // ADR-002 mandates 15 relations; error text must include derived_from and precedes.
+    // Error text must include derived_from and precedes (all 15 relations must appear).
     #[test]
     fn parse_relation_error_lists_all_relations() {
         let err = parse_relation("not_a_relation").unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("derived_from"),
-            "F009: parse_relation error must list derived_from (ADR-002); got: {msg}"
+            "F009: parse_relation error must list derived_from; got: {msg}"
         );
         assert!(
             msg.contains("precedes"),
-            "F009: parse_relation error must list precedes (ADR-002); got: {msg}"
+            "F009: parse_relation error must list precedes; got: {msg}"
         );
     }
 
-    // ADR-014: wire-level tri-state nullable f64 for `update`.
+    // Wire-level tri-state nullable f64 for `update`:
     //   absent  → outer None (preserve existing value)
     //   null    → Some(None) (clear the value)
     //   number  → Some(Some(v)) (set to v)
@@ -3596,7 +3594,7 @@ mod tests {
         );
     }
 
-    // ADR-046: resolve_kind_spec must recognise "proposal" as KindSpec::Proposal
+    // resolve_kind_spec must recognise "proposal" as KindSpec::Proposal
     #[test]
     fn resolve_kind_spec_proposal() {
         use super::{resolve_kind_spec, KindSpec};
@@ -3624,7 +3622,7 @@ mod tests {
         );
     }
 
-    // ADR-046: propose param deserialization
+    // propose param deserialization
     #[test]
     fn propose_params_deserialization() {
         use super::ProposeParams;
@@ -3644,7 +3642,7 @@ mod tests {
         assert!(p.expiry.is_none());
     }
 
-    // ADR-046: review param deserialization with all valid decisions
+    // review param deserialization with all valid decisions
     #[test]
     fn review_params_decisions() {
         use super::ReviewParams;
@@ -3700,7 +3698,7 @@ mod tests {
         assert_eq!(p.title, "Fix RoPE");
     }
 
-    // ADR-046: KG pack must expose exactly 14 handlers including propose/review/withdraw
+    // KG pack must expose exactly 16 handlers including propose/review/withdraw/verbs/stats
     #[test]
     fn kg_pack_exposes_16_handlers() {
         use crate::KgPack;
@@ -3856,8 +3854,8 @@ mod tests {
         );
     }
 
-    // ADR-045 §5 C1: entity timestamps must be ISO-8601 strings at the handler
-    // boundary. Entity.created_at / updated_at are stored as i64 microseconds;
+    // Entity timestamps must be ISO-8601 strings at the handler boundary.
+    // Entity.created_at / updated_at are stored as i64 microseconds;
     // normalize_entity_timestamps converts them before MCP serialization.
 
     // ---- Round-6: recursive walk_timestamps unit tests ----

@@ -24,7 +24,7 @@ Snapshots track both live and tombstoned nodes for accurate restore:
 - `tombstone_count`: Number of tombstoned nodes
 - `tombstoned_ids`: IDs of tombstoned vectors for restore
 
-Invariant: `total_nodes == live_nodes + tombstone_count`, enforced by `HnswSnapshot::verify`.
+Invariant: $\text{total\_nodes} = \text{live\_nodes} + \text{tombstone\_count}$, enforced by `HnswSnapshot::verify`.
 
 ## Determinism
 

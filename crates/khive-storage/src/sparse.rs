@@ -1,4 +1,4 @@
-//! Sparse vector storage and lexical-semantic search capability (ADR-031).
+//! Sparse vector storage and lexical-semantic search capability.
 
 use async_trait::async_trait;
 use uuid::Uuid;

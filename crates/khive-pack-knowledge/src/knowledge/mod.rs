@@ -5,7 +5,7 @@
 // multiple verbs. Splitting into submodules would require making ~30 private helpers pub(crate)
 // and duplicating context structs. The module boundary is the KnowledgeHandlers impl block;
 // splitting into conceptual submodules is tracked as a future refactor once the verb surface
-// stabilizes post-ADR-048 Phase 3.
+// stabilizes post-Phase 3 section-read verb landing.
 
 //! Knowledge corpus handlers — atoms, domains, TF-IDF search, fold, index.
 //!
@@ -1190,7 +1190,7 @@ impl KnowledgeHandlers {
             search_core(&ctx, &raw_query).await?
         };
 
-        // Trigger a fire-once background warm (ADR-049): never block search on the
+        // Trigger a fire-once background warm: never block search on the
         // ANN rebuild. The fusion below only runs if the index is already populated.
         vamana::ensure_ann_background(runtime, token, ann);
 
@@ -2573,7 +2573,7 @@ fn atom_embed_text(atom: &Atom) -> String {
 // ─── section helpers ──────────────────────────────────────────────────────────
 
 // REASON: section_from_row and section_to_json are forward-deployed helpers for the
-// section-read verb surface planned in ADR-048 Phase 3; retained so the implementation
+// section-read verb surface (Phase 3); retained so the implementation
 // compiles without gaps when that verb lands.
 #[allow(dead_code)]
 fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {

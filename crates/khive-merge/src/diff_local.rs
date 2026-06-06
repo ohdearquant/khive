@@ -3,7 +3,7 @@
 //! Minimal entity+edge diff computation for the merge use case.
 //!
 //! This is a private implementation used only by `khive-merge`. It does NOT
-//! implement the full `GraphDiff` format from ADR-017 — it produces the
+//! implement a full bidirectional graph diff format — it produces the
 //! categorized entity/edge change sets that the merge algorithm needs.
 //!
 //! When `khive-diff` ships in v0.4, this can be replaced by a dep on that crate.
@@ -114,8 +114,8 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
 /// Compute edge changes between `base` and `branch`.
 ///
 /// The maps retain full `ExportedEdge` values (not just weights) so that
-/// `edge_id` is preserved in `EdgeChange::Added` entries. This is required by
-/// ADR-048 D1: edge identity must survive merge/diff cycles.
+/// `edge_id` is preserved in `EdgeChange::Added` entries. Edge identity must
+/// survive merge/diff cycles — callers must not regenerate a fresh UUID.
 pub fn diff_edges(
     base: &KgArchive,
     branch: &KgArchive,

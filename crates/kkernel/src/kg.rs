@@ -7,7 +7,7 @@
 // exposed even as pub(crate) — tests must be co-located to call them without relaxing visibility.
 
 //! `kkernel kg` — KG validation, init, hook management, fetch, export, import,
-//! and status (ADR-034, ADR-035, ADR-037, ADR-010, ADR-020, ADR-036).
+//! and status.
 //!
 //! Implements:
 //! - `kkernel kg validate` — structural + rule-pass validation
@@ -44,7 +44,7 @@ pub enum KgCommand {
 
     /// Fetch a remote KG archive into `.khive/kg/remotes/<remote>/`.
     ///
-    /// `sync` is a visible alias so ADR-037's `kkernel kg sync --repin <remote>`
+    /// `sync` is a visible alias so `kkernel kg sync --repin <remote>`
     /// reaches the same implementation.
     #[command(visible_alias = "sync")]
     Fetch(FetchArgs),
@@ -93,7 +93,7 @@ pub struct ValidateArgs {
     #[arg(long)]
     pub rules: Option<PathBuf>,
 
-    /// Run ADR-020 built-in structural checks only; skip `rules.yaml`.
+    /// Run built-in structural checks only; skip `rules.yaml`.
     #[arg(long)]
     pub no_rules: bool,
 }
@@ -187,7 +187,7 @@ pub struct ImportArgs {
     #[arg(long, default_value = "local")]
     pub namespace: String,
 
-    /// Import format. Default is the ADR-010 KgArchive JSON envelope.
+    /// Import format. Default is the `KgArchive` JSON envelope.
     #[arg(long, value_enum, default_value_t = ImportFormat::Archive)]
     pub format: ImportFormat,
 
@@ -527,7 +527,7 @@ fn adapter_records_to_archive(
 /// Validate that a deserialized edge weight is finite and within [0.0, 1.0].
 ///
 /// Rejects NaN, positive infinity, negative infinity, and values outside the
-/// accepted edge-weight domain defined in ADR-002.
+/// accepted edge-weight domain ([0.0, 1.0]).
 fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display) -> Result<()> {
     if !weight.is_finite() {
         bail!(
@@ -537,7 +537,7 @@ fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display) -> Result<
     }
     if !(0.0..=1.0).contains(&weight) {
         bail!(
-            "edge {} weight {weight} is outside the valid range [0.0, 1.0] (ADR-002)",
+            "edge {} weight {weight} is outside the valid range [0.0, 1.0]",
             edge_id
         );
     }
@@ -758,7 +758,7 @@ fn cmd_validate(args: ValidateArgs) -> Result<()> {
 
     let rules_path = args.rules.unwrap_or_else(|| kg_dir.join("rules.toml"));
 
-    // Run structural checks (ADR-020 built-ins).
+    // Run built-in structural checks.
     let mut rule_results: Vec<RuleResult> = structural_checks(&entities_path, &edges_path);
 
     // Run configurable rule pass unless --no-rules.
@@ -987,9 +987,9 @@ fn check_referential_integrity(entities_path: &Path, edges_path: &Path) -> RuleR
     }
 }
 
-// ── Configurable rule loader (issue #382, ADR-034) ────────────────────────────
+// ── Configurable rule loader (issue #382) ────────────────────────────────────
 
-/// A single configurable lint rule loaded from `rules.toml` (ADR-034).
+/// A single configurable lint rule loaded from `rules.toml`.
 ///
 /// Each rule has `id`, `severity` ("error"|"warning"|"info"), `kind` ("entity"|"edge"),
 /// an optional `condition` predicate, an optional `require_field`, and a `message`.
@@ -1304,7 +1304,7 @@ fn print_github_format(report: &ValidationReport) {
 
 // ── init ──────────────────────────────────────────────────────────────────────
 
-const DEFAULT_KHIVE_TOML: &str = r#"# .khive/khive.toml — project KG configuration (ADR-035)
+const DEFAULT_KHIVE_TOML: &str = r#"# .khive/khive.toml — project KG configuration
 # Committed to git. All collaborators use these settings.
 
 [[backends]]

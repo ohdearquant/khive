@@ -1,4 +1,4 @@
-//! Smoke test for the template pack (ADR-023 §8).
+//! Smoke tests for the template pack.
 //!
 //! Copy and adapt this file when scaffolding a new pack.
 

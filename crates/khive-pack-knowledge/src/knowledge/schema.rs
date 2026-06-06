@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-// ── SectionType enum (ADR-048 §1) ────────────────────────────────────────────
+// ── SectionType enum ─────────────────────────────────────────────────────────
 
-/// Closed 10-value enum for knowledge section classification (ADR-048).
+/// Closed 10-value enum for knowledge section classification.
 ///
 /// Each variant carries a distinct semantic role. `Other` is the catch-all for
 /// topic-specific content that does not fit a canonical type.
@@ -143,7 +143,7 @@ impl std::fmt::Display for SectionType {
 
 #[derive(Debug, Clone)]
 // REASON: section_from_row and section_to_json are forward-deployed helpers retained
-// for the section-read surface planned in ADR-048 Phase 3; not yet wired to a verb.
+// for the section-read surface (Phase 3); not yet wired to a verb.
 #[allow(dead_code)]
 pub(crate) struct Section {
     pub id: uuid::Uuid,

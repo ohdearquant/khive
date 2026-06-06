@@ -1,4 +1,4 @@
-//! Schema migration system for khive-db (ADR-015).
+//! Schema migration system for khive-db.
 //!
 //! FILE SIZE JUSTIFICATION: Contains versioned DDL migrations that must remain
 //! in dependency order within a single file. Each `VersionedMigration` builds on
@@ -75,7 +75,7 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
 }
 
 // =============================================================================
-// Versioned migration system (ADR-015)
+// Versioned migration system
 // =============================================================================
 
 /// A single forward-only schema migration.
@@ -331,12 +331,12 @@ const V12_NULLABLE_NOTE_METRICS: &str = "\
 // (which includes the new columns) does not fail with "duplicate column name".
 const V13_EVENT_OBSERVABILITY_PROVENANCE: &str = "__v13_computed_at_runtime__";
 
-/// DDL for the `_embedding_models` registry table (ADR-043 §1).
+/// DDL for the `_embedding_models` registry table.
 ///
 /// Shared between the V14 migration (`build_v14_embedding_model_registry_sql`) and
 /// the belt-and-suspenders creation in `StorageBackend::vectors_for_namespace`.
 /// Both sites reference this constant so the schema cannot silently diverge if the
-/// registry evolves (ADR-043 §8 step 4 mandates a future schema tightening).
+/// registry evolves.
 pub const EMBEDDING_MODELS_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS _embedding_models (\
         id              BLOB PRIMARY KEY,\
@@ -360,18 +360,18 @@ pub const EMBEDDING_MODELS_DDL: &str = "\
 /// V14: Embedding model registry (`_embedding_models`) and per-engine model FK column.
 ///
 /// Creates the `_embedding_models` registry table that tracks which embedding model
-/// is active for each vector engine (ADR-043 §1). Also adds the `embedding_model_id`
-/// FK column to any existing regular `vec_<engine>` tables found in sqlite_master
-/// so that stored vectors can be traced back to the model that produced them.
+/// is active for each vector engine. Also adds the `embedding_model_id` FK column to
+/// any existing regular `vec_<engine>` tables found in sqlite_master so that stored
+/// vectors can be traced back to the model that produced them.
 ///
 /// sqlite-vec virtual tables (`vec0`) do not support `ALTER TABLE ADD COLUMN`;
-/// for those tables the column is added during the startup backfill rebuild
-/// (ADR-043 §8 steps 2-4), which is deferred to a follow-up PR — see the tracking
-/// issue filed in MAJ-2 of codex round-1.
+/// for those tables the column is added during the startup backfill rebuild,
+/// which is deferred to a follow-up PR — see the tracking issue filed in MAJ-2 of
+/// codex round-1.
 ///
 /// New `vec_<engine>` tables created via `StorageBackend::vectors_for_namespace`
 /// after V14 do NOT yet include `embedding_model_id` at creation time; that column
-/// will be present only after the ADR-043 §8 step-4 rebuild lands.
+/// will be present only after the startup backfill rebuild lands.
 ///
 /// The migration SQL is computed at runtime via `build_v14_embedding_model_registry_sql`
 /// to discover existing `vec_<engine>` tables dynamically and skip the `ALTER TABLE`
@@ -387,7 +387,7 @@ const V14_EMBEDDING_MODEL_REGISTRY: &str = "__v14_computed_at_runtime__";
 /// missing `embedding_model`.
 const V16_VECTOR_EMBEDDING_MODEL_TAG: &str = "__v16_computed_at_runtime__";
 
-/// V17: sqlite-vec preserving rebuild (ADR-043 §1.1 follow-up, cluster v023/ADR-043).
+/// V17: sqlite-vec preserving rebuild (cluster v023 follow-up).
 ///
 /// V16 handled regular `vec_*` tables via `ALTER TABLE ADD COLUMN`. sqlite-vec
 /// virtual tables (`vec0`) do not support `ALTER TABLE ADD COLUMN` because their
@@ -417,7 +417,7 @@ const V16_VECTOR_EMBEDDING_MODEL_TAG: &str = "__v16_computed_at_runtime__";
 /// the set of vec0 tables is dynamic (one per configured engine).
 const V17_VECTOR_EMBEDDING_MODEL_TAG_PRESERVING_REBUILD: &str = "__v17_computed_at_runtime__";
 
-/// V15: proposals_open projection table (ADR-046).
+/// V15: proposals_open projection table.
 ///
 /// Maintains a fold-derived view of the four proposal EventKinds so that
 /// `list(kind=proposal, status="open")` is an index scan rather than a full
@@ -518,7 +518,7 @@ const V19_KNOWLEDGE_ATOMS_AND_DOMAINS: &str = "\
     END;\
 ";
 
-// V20: brain pack — profile snapshots and event log tables (ADR-048 Phase 1).
+// V20: brain pack — profile snapshots and event log tables (Phase 1).
 //
 // brain_profile_snapshots stores the full serialised profile state keyed by
 // (profile_id, namespace). brain_event_log records every mutation event for
@@ -544,7 +544,7 @@ const V20_BRAIN_PROFILE_PERSISTENCE: &str = "\
         ON brain_event_log(profile_id, namespace, created_at);\
 ";
 
-// V22: knowledge lifecycle status columns (ADR-049).
+// V22: knowledge lifecycle status columns.
 //
 // Extends knowledge_atoms with:
 //   status      — workflow state, NOT NULL DEFAULT 'draft'
@@ -555,10 +555,10 @@ const V20_BRAIN_PROFILE_PERSISTENCE: &str = "\
 // Extends knowledge_sections and knowledge_domains each with a status column
 // (NOT NULL DEFAULT 'draft') for the challenge/adjudicate workflow.
 //
-// Indexes accelerate the status-filtered list/search paths added in ADR-049 §7.
+// Indexes accelerate status-filtered list/search paths.
 // Backfill: atoms already finalized are marked 'reviewed'.
 //
-// This is the superset migration (ADR-049 lifecycle); it subsumes the earlier
+// This is the superset migration; it subsumes the earlier
 // knowledge_status_and_source draft by adding NOT NULL defaults, domains.status,
 // the section/domain status indexes, and the finalized→reviewed backfill.
 const V22_KNOWLEDGE_LIFECYCLE_STATUS: &str = "\
@@ -667,16 +667,15 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "add_entity_type_to_entities",
         up: V5_ADD_ENTITY_TYPE_TO_ENTITIES,
     },
-    // V6–V8: no-op placeholder slots originally reserved in the ADR-015 ledger for
-    // ADR-043, ADR-046, and ADR-041 respectively.  During the v1 parallel cluster
-    // landings (c01/c03/c04/c06) the concrete migrations from those ADRs landed at
-    // V5, V9, and V13 instead (slot assignments shifted as clusters merged).  V6–V8
-    // were absorbed as no-ops to keep the contiguity check passing.  Their names are
-    // frozen — V1-V13 are production schema.
+    // V6–V8: no-op placeholder slots originally reserved in the migration ledger.
+    // During the v1 parallel cluster landings (c01/c03/c04/c06) the concrete migrations
+    // landed at V5, V9, and V13 instead (slot assignments shifted as clusters merged).
+    // V6–V8 were absorbed as no-ops to keep the contiguity check passing. Their names
+    // are frozen — V1-V13 are production schema.
     //
     // NOTE: V6 was originally named "reserved_adr043_embedding_pipeline_extensions"
-    // because it was intended to hold ADR-043 work.  The actual ADR-043 migration
-    // landed at V14 (cluster-20).  V6 retains its original name to avoid breaking the
+    // because it was intended to hold embedding pipeline work. The actual migration
+    // landed at V14 (cluster-20). V6 retains its original name to avoid breaking the
     // production tracking table on existing deployments.
     VersionedMigration {
         version: 6,
@@ -723,19 +722,19 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "embedding_model_registry",
         up: V14_EMBEDDING_MODEL_REGISTRY,
     },
-    // V15: proposals_open projection table (ADR-046, cluster-22).
+    // V15: proposals_open projection table (cluster-22).
     VersionedMigration {
         version: 15,
         name: "proposals_open",
         up: V15_PROPOSALS_OPEN,
     },
-    // V16: tag vector rows with embedding_model column (ADR-043 §8, dual-embedding).
+    // V16: tag vector rows with embedding_model column (dual-embedding support).
     VersionedMigration {
         version: 16,
         name: "vector_embedding_model_tag",
         up: V16_VECTOR_EMBEDDING_MODEL_TAG,
     },
-    // V17: preserving rebuild of sqlite-vec virtual tables (ADR-043 §1.1, cluster v023/ADR-043).
+    // V17: preserving rebuild of sqlite-vec virtual tables (cluster v023).
     // Replaces the silent-drop path in backend.rs with a copy-with-default rebuild that
     // preserves existing rows and backfills missing columns to inferred defaults.
     VersionedMigration {
@@ -743,7 +742,7 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "vector_embedding_model_tag_preserving_rebuild",
         up: V17_VECTOR_EMBEDDING_MODEL_TAG_PRESERVING_REBUILD,
     },
-    // V18: add 'applying' to proposals_open status CHECK (ADR-046 §3 amendment).
+    // V18: add 'applying' to proposals_open status CHECK (apply/withdraw race fix).
     VersionedMigration {
         version: 18,
         name: "proposals_open_add_applying_status",
@@ -760,7 +759,7 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "brain_profile_persistence",
         up: V20_BRAIN_PROFILE_PERSISTENCE,
     },
-    // V21: knowledge_sections table (ADR-048 Phase 2).
+    // V21: knowledge_sections table (knowledge pack Phase 2).
     // Stores section-typed content for knowledge atoms: 10-value SectionType enum,
     // per-section FK to knowledge_atoms, UNIQUE(atom_id, section_type) constraint.
     VersionedMigration {
@@ -768,7 +767,7 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "knowledge_sections",
         up: V21_KNOWLEDGE_SECTIONS,
     },
-    // V22: knowledge lifecycle status columns (ADR-049) — superset migration.
+    // V22: knowledge lifecycle status columns — superset migration.
     // Adds: knowledge_atoms.status (NOT NULL DEFAULT 'draft'), source_uri,
     //       source_type; knowledge_sections.status; knowledge_domains.status;
     //       status indexes; and a finalized→reviewed backfill.
@@ -1112,15 +1111,15 @@ fn build_v13_event_observability_sql(conn: &Connection) -> Result<String, rusqli
 
 /// Build V14 migration SQL at runtime.
 ///
-/// Creates the `_embedding_models` registry table and its indexes (ADR-043 §1).
-/// Then discovers any existing regular (non-virtual) `vec_<engine>` tables in
-/// sqlite_master and adds the `embedding_model_id` FK column where absent.
+/// Creates the `_embedding_models` registry table and its indexes. Then discovers
+/// any existing regular (non-virtual) `vec_<engine>` tables in sqlite_master and
+/// adds the `embedding_model_id` FK column where absent.
 ///
 /// sqlite-vec virtual tables (`vec0`) do not support `ALTER TABLE ADD COLUMN`;
-/// those tables are handled by the startup backfill rebuild (ADR-043 §8) which
-/// runs after the SQL migration completes.  New `vec_<engine>` tables created
-/// after V14 do NOT yet include `embedding_model_id` at creation — that column
-/// will be present only after the ADR-043 §8 step-4 rebuild lands (follow-up).
+/// those tables are handled by the startup backfill rebuild which runs after the SQL
+/// migration completes. New `vec_<engine>` tables created after V14 do NOT yet
+/// include `embedding_model_id` at creation — that column will be present only after
+/// the startup backfill rebuild lands (follow-up).
 fn build_v14_embedding_model_registry_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
     let mut sql = String::from(EMBEDDING_MODELS_DDL);
 
@@ -1505,7 +1504,7 @@ pub fn query_embedding_models(
 }
 
 /// Build the V18 migration SQL: recreate `proposals_open` adding `'applying'` to the
-/// status CHECK constraint (ADR-046 §3 amendment — apply/withdraw race fix).
+/// status CHECK constraint (apply/withdraw race fix).
 ///
 /// SQLite does not support `ALTER TABLE … ALTER COLUMN`, so we rename the old table,
 /// create a new one with the extended CHECK, copy all rows, then drop the old table.
@@ -1863,7 +1862,7 @@ mod tests {
     }
 
     // F052 (CRIT): V9 migration must add target_backend column + partial index on graph_edges.
-    // ADR-009 requires target_backend for backend routing.
+    // target_backend is required for backend routing.
     #[test]
     fn migration_v9_adds_target_backend_index() {
         let mut conn = open_memory();
@@ -1974,7 +1973,7 @@ mod tests {
         // V18 adds 'applying' to proposals_open status CHECK;
         // V19 creates knowledge_atoms/knowledge_domains tables;
         // V20 creates brain_profile_snapshots and brain_event_log tables;
-        // V21 creates knowledge_sections table (ADR-048 Phase 2);
+        // V21 creates knowledge_sections table (knowledge pack Phase 2);
         // V22 adds status/source_uri/source_type columns.
         let version = run_migrations(&mut conn).expect("migrations after store DDL");
         assert_eq!(version, 22);

@@ -1,4 +1,4 @@
-//! AST validation per ADR-008 §Validation Rules.
+//! AST validation for the GQL/SPARQL query pipeline.
 //!
 //! Normalises edge relation aliases to canonical snake_case, rejects `namespace`
 //! in query strings (scoping is `CompileOptions::scopes` only), and caps traversal
@@ -12,7 +12,7 @@ use khive_types::EdgeRelation;
 use crate::ast::{Condition, ConditionValue, GqlQuery, PatternElement};
 use crate::error::QueryError;
 
-/// Closed set of valid synthetic ADR-041 observation relations.
+/// Closed set of valid synthetic observation relations (observed_as_* family).
 /// Any `observed_as_*` string not in this set is an unknown relation and must
 /// be rejected — the prefix alone does not confer validity.
 const SYNTHETIC_RELATIONS: &[&str] = &[
@@ -22,7 +22,7 @@ const SYNTHETIC_RELATIONS: &[&str] = &[
     "observed_as_signal",
 ];
 
-/// Maximum traversal depth allowed by the query layer (ADR-008 §Validation).
+/// Maximum traversal depth allowed by the query layer.
 pub const MAX_DEPTH: usize = 10;
 
 /// Validate and normalise an AST in place.
@@ -119,10 +119,10 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
             }
             PatternElement::Edge(edge) => {
                 for relation in edge.relations.iter_mut() {
-                    // Synthetic ADR-041 relations (observed_as_*) do not exist
-                    // in the closed EdgeRelation enum — skip taxonomy validation
-                    // for them and leave the string unchanged.  The SQL compiler
-                    // handles them via the event_observations join path.
+                    // Synthetic observed_as_* relations do not exist in the
+                    // closed EdgeRelation enum — skip taxonomy validation and
+                    // leave the string unchanged.  The SQL compiler handles them
+                    // via the event_observations join path.
                     // Only the four known synthetic relations are valid; an unknown
                     // observed_as_* string must be rejected (closes the bypass that
                     // allowed arbitrary observed_as_bogus strings to compile as
@@ -164,7 +164,7 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
                         edge.min_hops, MAX_DEPTH
                     )));
                 }
-                // Reject max_hops above the depth cap (ADR-008 §"Depth limits").
+                // Reject max_hops above the depth cap.
                 if edge.max_hops > MAX_DEPTH {
                     return Err(QueryError::InvalidInput(format!(
                         "max_hops {} exceeds the depth cap of {}; reduce the range or use a smaller bound",
@@ -291,8 +291,7 @@ mod tests {
 
     #[test]
     fn rejects_depth_above_max() {
-        // ADR-008 §"Depth limits": exceeding MAX_DEPTH is an InvalidInput error,
-        // not a silent clamp.
+        // Exceeding MAX_DEPTH is an InvalidInput error, not a silent clamp.
         let mut q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
         let err = validate(&mut q).unwrap_err();
         assert!(

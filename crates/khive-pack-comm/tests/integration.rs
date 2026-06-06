@@ -1,4 +1,4 @@
-//! Smoke tests for the comm pack (ADR-040).
+//! Smoke tests for the comm pack.
 //!
 //! INLINE TEST JUSTIFICATION: all five comm verbs (send, inbox, read, reply, thread) share a
 //! single in-memory runtime fixture. Splitting into per-verb files would require duplicating
@@ -141,7 +141,7 @@ async fn read_marks_message_as_read() {
 async fn reply_creates_threaded_message() {
     let (registry, _rt) = build_registry();
 
-    // Send the original message (same namespace — cross-namespace is denied per ADR-040 §481).
+    // Send the original message (same namespace — cross-namespace sends are denied).
     let original = registry
         .dispatch(
             "comm.send",
@@ -409,7 +409,7 @@ async fn test_short_id_collision_errors_clearly() {
 
 /// send() within the same namespace writes one outbound note in the caller's namespace.
 ///
-/// Cross-namespace sends are denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace sends are denied (issue #481 fix).
 /// Same-namespace sends must produce both outbound and inbound copies.
 #[tokio::test]
 async fn test_send_writes_outbound_in_caller_ns() {
@@ -460,7 +460,7 @@ async fn test_send_writes_outbound_in_caller_ns() {
 
 /// send() within the same namespace writes one inbound note alongside the outbound copy.
 ///
-/// Cross-namespace sends are denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace sends are denied (issue #481 fix).
 /// Same-namespace send creates both copies in the caller's namespace.
 #[tokio::test]
 async fn test_send_writes_inbound_in_recipient_ns() {
@@ -517,7 +517,7 @@ async fn test_send_writes_inbound_in_recipient_ns() {
 
 /// inbox() returns the inbound message after a same-namespace send.
 ///
-/// Cross-namespace delivery is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace delivery is denied (issue #481 fix).
 /// Same-namespace send creates an inbound copy visible in inbox().
 #[tokio::test]
 async fn test_inbox_returns_inbound_for_recipient() {
@@ -613,7 +613,7 @@ async fn test_send_to_self_writes_two_notes() {
 /// the outbound copy. Because from==to, the reply routes back to the same namespace
 /// (which is correct — there is no other party in a self-send).
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 #[tokio::test]
 async fn test_reply_from_sender_routes_to_recipient() {
     // Registry scoped to lambda:khive (sender == recipient in same-namespace mode).
@@ -667,7 +667,7 @@ async fn test_reply_from_sender_routes_to_recipient() {
 /// Within same-namespace: both are the same namespace so the routing is always self.
 /// This test verifies reply() works on an inbound message and preserves the metadata.
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 #[tokio::test]
 async fn test_reply_from_recipient_routes_to_sender() {
     // Same namespace: lambda:khive sends to lambda:khive, then replies.
@@ -1059,7 +1059,7 @@ async fn test_list_message_direction_filter() {
 /// Before the fix, read() silently mutated outbound messages, corrupting
 /// the read/unread invariant.
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 /// Same-namespace send is used here; the outbound copy stays in lambda:khive.
 #[tokio::test]
 async fn test_read_rejects_outbound_message() {
@@ -1170,7 +1170,7 @@ async fn test_thread_verb_returns_threaded_messages() {
 /// Before the fix, reply() created only an outbound note via a single
 /// create_note call, so inbox() would not surface the reply.
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 /// Same-namespace send is used here — both copies land in the caller's namespace.
 #[tokio::test]
 async fn test_reply_delivers_inbound_to_recipient() {
@@ -1490,7 +1490,7 @@ async fn test_inbox_invalid_status_banana_rejected() {
 /// After the fix, both copies share the same canonical thread_id (outbound UUID),
 /// and all replies carry that thread_id so the thread query finds them.
 ///
-/// Cross-namespace send is denied per ADR-040 §481 (issue #481 fix).
+/// Cross-namespace send is denied (issue #481 fix).
 /// Same-namespace send is used to test the canonical thread_id invariant.
 #[tokio::test]
 async fn test_cross_namespace_thread_query_finds_reply() {
@@ -1907,7 +1907,7 @@ async fn test_thread_sort_is_not_a_noop_issue_485() {
     );
 }
 
-// ── schema_plan regression: CommPack declares ADR-040 message indexes ─────────
+// ── schema_plan regression: CommPack declares comm message indexes ────────────
 
 #[tokio::test]
 async fn comm_pack_exposes_non_empty_schema_plan() {

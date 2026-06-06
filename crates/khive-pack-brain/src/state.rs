@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 // ── SectionType ───────────────────────────────────────────────────────────────
 
-/// Knowledge-section types that the brain tracks per-profile (ADR-048).
+/// Knowledge-section types that the brain tracks per-profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SectionType {
@@ -294,7 +294,6 @@ impl EntityPosteriors {
 
 /// State for the `BalancedRecallProfile` — the v1 default profile.
 ///
-/// Migrated from the predecessor scalar `BrainState` design (ADR-032 §5a).
 /// Three-parameter Beta posteriors with informative priors + per-entity LRU.
 pub struct BalancedRecallState {
     /// relevance_weight — prior Beta(7,3): warm-starts expecting 70% success
@@ -424,22 +423,22 @@ pub struct BalancedRecallSnapshot {
 
 // ── SectionPosteriorState ─────────────────────────────────────────────────────
 
-/// Default ESS cap for section posteriors (ADR-048 Correction 2: cap=100).
+/// Default ESS cap for section posteriors (cap=100).
 pub const DEFAULT_ESS_CAP: f64 = 100.0;
 
-/// Default exploration epoch countdown (ADR-048 §489).
+/// Default exploration epoch countdown.
 pub const DEFAULT_EXPLORATION_EPOCH: u64 = 50;
 
-/// Initial temperature for Thompson sampling softmax (ADR-048 Correction 1).
+/// Initial temperature for Thompson sampling softmax.
 pub const DEFAULT_TAU_0: f64 = 1.0;
 
-/// Exploit-mode temperature when exploration_epoch == 0 (ADR-048 Correction 1).
+/// Exploit-mode temperature when exploration_epoch == 0.
 pub const DEFAULT_TAU_EXPLOIT: f64 = 0.1;
 
 /// Default weight floor for section weights (5%).
 pub const DEFAULT_SECTION_WEIGHT_FLOOR: f64 = 0.05;
 
-/// Per-profile section posterior state (ADR-048 Phase 1).
+/// Per-profile section posterior state.
 pub struct SectionPosteriorState {
     pub posteriors: HashMap<SectionType, BetaPosterior>,
     pub priors: HashMap<SectionType, BetaPosterior>,
@@ -475,7 +474,7 @@ impl SectionPosteriorState {
         }
     }
 
-    /// Default informative priors from ADR-048.
+    /// Default informative priors.
     pub fn default_priors() -> HashMap<SectionType, BetaPosterior> {
         let mut m = HashMap::new();
         m.insert(SectionType::Overview, BetaPosterior::new(2.0, 2.0));
@@ -524,15 +523,15 @@ impl SectionPosteriorState {
         }
     }
 
-    /// Stochastic weights via Thompson sampling + softmax (ADR-048 Correction 1).
+    /// Stochastic weights via Thompson sampling + softmax.
     ///
     /// Explore mode (exploration_epoch > 0):
-    ///   tau = tau_0 * (exploration_epoch / DEFAULT_EXPLORATION_EPOCH)
-    ///   theta_i ~ Beta(alpha_i, beta_i) via Gamma-ratio method
-    ///   w_i = softmax(theta_i / tau), then floor at DEFAULT_SECTION_WEIGHT_FLOOR + renorm
+    ///   `tau = tau_0 * (exploration_epoch / DEFAULT_EXPLORATION_EPOCH)`
+    ///   `theta_i ~ Beta(alpha_i, beta_i)` via Gamma-ratio method
+    ///   `w_i = softmax(theta_i / tau)`, then floor at `DEFAULT_SECTION_WEIGHT_FLOOR` + renorm
     ///
-    /// Exploit mode (exploration_epoch == 0): delegates to deterministic_weights() with
-    ///   tau_exploit = DEFAULT_TAU_EXPLOIT applied over posterior means.
+    /// Exploit mode (exploration_epoch == 0): delegates to `deterministic_weights()` with
+    ///   `tau_exploit = DEFAULT_TAU_EXPLOIT` applied over posterior means.
     pub fn sample_weights(&self, rng: &mut impl rand::Rng) -> HashMap<SectionType, f64> {
         // Compute tau proportional to remaining exploration budget.
         let tau =
@@ -557,10 +556,10 @@ impl SectionPosteriorState {
         raw
     }
 
-    /// Deterministic weights from posterior means with exploit-mode softmax (ADR-048 Correction 1).
+    /// Deterministic weights from posterior means with exploit-mode softmax.
     ///
-    /// Uses tau_exploit = DEFAULT_TAU_EXPLOIT (0.1) over posterior means, then applies
-    /// weight floor at DEFAULT_SECTION_WEIGHT_FLOOR and renormalizes.
+    /// Uses `tau_exploit = DEFAULT_TAU_EXPLOIT` (0.1) over posterior means, then applies
+    /// weight floor at `DEFAULT_SECTION_WEIGHT_FLOOR` and renormalizes.
     pub fn deterministic_weights(&self) -> HashMap<SectionType, f64> {
         let tau = DEFAULT_TAU_EXPLOIT;
 
@@ -703,7 +702,7 @@ pub struct SectionPosteriorSnapshot {
 
 // ── ProfileLifecycle ──────────────────────────────────────────────────────────
 
-/// Lifecycle states for a registered profile (ADR-032 §10).
+/// Lifecycle states for a registered profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileLifecycle {
@@ -721,7 +720,7 @@ pub enum ProfileLifecycle {
 
 // ── ProfileRecord ─────────────────────────────────────────────────────────────
 
-/// Profile metadata stored in the registry (ADR-032 §2).
+/// Profile metadata stored in the registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileRecord {
     pub id: String,
@@ -742,8 +741,7 @@ impl ProfileRecord {
         let snapshot = state.to_snapshot();
         Self {
             id: "balanced-recall-v1".into(),
-            description: "Default recall profile: three-scalar Beta posteriors (ADR-032 §5a)"
-                .into(),
+            description: "Default recall profile: three-scalar Beta posteriors".into(),
             consumer_kind: "recall".into(),
             state_class: "Bayesian".into(),
             lifecycle: ProfileLifecycle::Active,
@@ -757,7 +755,7 @@ impl ProfileRecord {
 
 // ── ProfileBinding ────────────────────────────────────────────────────────────
 
-/// One row in the profile binding table (ADR-032 §10).
+/// One row in the profile binding table.
 ///
 /// Resolution uses longest-match wins; `*` is the wildcard sentinel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -774,8 +772,8 @@ pub struct ProfileBinding {
 
 /// Runtime brain state — profile registry + active state per profile.
 ///
-/// ADR-032 §1: BrainState holds profile registry and lifecycle metadata.
-/// Posteriors live inside each profile's own state, opaque to brain.
+/// `BrainState` holds profile registry and lifecycle metadata. Posteriors live
+/// inside each profile's own state, opaque to brain core.
 ///
 /// Per-profile state: `balanced_recall` holds the live state for the built-in
 /// `balanced-recall-v1` profile. `profile_states` holds live `BalancedRecallState`
@@ -783,7 +781,7 @@ pub struct ProfileBinding {
 /// creation and cleared on hard-delete; they are never absent for a living profile
 /// whose `state_class == "Bayesian"`.
 ///
-/// `section_states`: per-profile section-level Beta posteriors (ADR-048 §Phase1).
+/// `section_states`: per-profile section-level Beta posteriors.
 /// Keys are profile_id; values are `SectionPosteriorState`.
 pub struct BrainState {
     /// Registered profiles indexed by profile_id.
@@ -794,7 +792,7 @@ pub struct BrainState {
     pub profile_states: HashMap<String, BalancedRecallState>,
     /// Profile binding table — maps (actor, namespace, consumer_kind) → profile_id.
     pub bindings: Vec<ProfileBinding>,
-    /// Per-profile section posteriors (ADR-048).
+    /// Per-profile section posteriors.
     pub section_states: HashMap<String, SectionPosteriorState>,
 }
 
@@ -885,7 +883,7 @@ impl BrainState {
         }
     }
 
-    /// Resolve a profile_id for the given caller context (ADR-032 §10).
+    /// Resolve a profile_id for the given caller context.
     ///
     /// Longest-match wins: actor + namespace + consumer_kind beats actor + consumer_kind
     /// beats namespace + consumer_kind beats consumer_kind alone. Returns the
@@ -952,7 +950,7 @@ impl BrainState {
 
         // No explicit binding (or all matched bindings point at archived profiles) —
         // return the named default profile if it exists and is usable.
-        // ADR-032 §10: "balanced-recall-v1" is the v1 system-default for recall.
+        // "balanced-recall-v1" is the v1 system-default for recall.
         if let Some(default) = self.profiles.get("balanced-recall-v1") {
             if default.lifecycle == ProfileLifecycle::Active
                 && (default.consumer_kind == consumer_kind
@@ -983,7 +981,7 @@ pub struct BrainStateSnapshot {
     #[serde(default)]
     pub profile_states: HashMap<String, BalancedRecallSnapshot>,
     pub bindings: Vec<ProfileBinding>,
-    /// Per-profile section posteriors (ADR-048).
+    /// Per-profile section posteriors.
     #[serde(default)]
     pub section_states: HashMap<String, SectionPosteriorSnapshot>,
 }
@@ -1183,7 +1181,7 @@ mod tests {
     }
 
     // Regression test for MAJ-005: an archived default profile must NOT be returned
-    // by resolve (ADR-032 §10: "Archived … NOT resolvable for live recall").
+    // by resolve (archived profiles are never resolvable for live recall).
     #[test]
     fn brain_state_resolve_skips_archived_default() {
         let mut state = BrainState::new(100);

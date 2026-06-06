@@ -234,7 +234,7 @@ fn build_entity_where(
             .iter()
             .map(|t| {
                 // Normalise to lowercase so the comparison is case-insensitive
-                // (ADR-047 §91: domain filter must be case-insensitive).
+                // domain filter must be case-insensitive.
                 params.push(Box::new(t.to_lowercase()));
                 format!("?{}", params.len())
             })

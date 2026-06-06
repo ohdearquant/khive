@@ -82,12 +82,10 @@ pub fn is_terminal(s: &str) -> bool {
 /// - `cancelled` → (terminal — no outgoing transitions)
 ///
 /// **Design decision (GTD-AUD-001 / issue #273)**: `done` and `cancelled` are
-/// permanently terminal — they have no outgoing transitions.  ADR-019 was
-/// written with reopen semantics in mind, but the implementation explicitly
-/// closes terminal states to prevent accidental resurrection of completed or
-/// abandoned work.  This is the authoritative contract; ADR-019 is to be
-/// amended to reflect the no-reopen rule.  Use `gtd.assign` to create a new
-/// task if reopening semantics are required.
+/// permanently terminal — they have no outgoing transitions. The implementation
+/// explicitly closes terminal states to prevent accidental resurrection of
+/// completed or abandoned work. This is the authoritative contract.
+/// Use `gtd.assign` to create a new task if reopening semantics are required.
 pub fn allowed_transitions(from: &str) -> &'static [&'static str] {
     match from {
         "inbox" => &["next", "waiting", "someday", "active", "done", "cancelled"],

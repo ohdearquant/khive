@@ -7,7 +7,7 @@ use thiserror::Error;
 /// Convenience alias for `Result<T, RuntimeError>`.
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
-/// A single missing pack dependency (ADR-037).
+/// A single missing pack dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingPackDependency {
     pub from: String,
@@ -26,7 +26,7 @@ impl fmt::Display for MissingPackDependency {
 
 impl std::error::Error for MissingPackDependency {}
 
-/// Multiple missing pack dependencies collected into one error (ADR-037).
+/// Multiple missing pack dependencies collected into one error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingPackDependencies {
     pub missing: Vec<MissingPackDependency>,
@@ -41,7 +41,7 @@ impl fmt::Display for MissingPackDependencies {
 
 impl std::error::Error for MissingPackDependencies {}
 
-/// Circular pack dependency detected during topological sort (ADR-037).
+/// Circular pack dependency detected during topological sort.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CircularPackDependency {
     pub cycle: Vec<String>,
@@ -112,9 +112,9 @@ pub enum RuntimeError {
         second_idx: usize,
     },
 
-    /// Two packs declared the same `Visibility::Verb` handler name (ADR-017
-    /// §Boot-time collision checks). `Visibility::Subhandler` entries are
-    /// pack-prefixed and do not participate in cross-pack collision checks.
+    /// Two packs declared the same `Visibility::Verb` handler name.
+    /// `Visibility::Subhandler` entries are pack-prefixed and do not
+    /// participate in cross-pack collision checks.
     #[error(
         "verb collision: verb {verb:?} declared by both pack {first_pack:?} and pack \
          {second_pack:?}; rename one handler or use Visibility::Subhandler for internal verbs"
@@ -125,7 +125,7 @@ pub enum RuntimeError {
         second_pack: String,
     },
 
-    /// Gate denied this verb invocation (ADR-035).
+    /// Gate denied this verb invocation.
     ///
     /// Returned by `VerbRegistry::dispatch` when the configured `Gate` returns
     /// `GateDecision::Deny`. The pack is never invoked. The `reason` field
@@ -142,11 +142,11 @@ pub enum RuntimeError {
     /// Record exists but belongs to a different namespace than the provided token.
     ///
     /// Externally reported as "not found in this namespace" to avoid leaking
-    /// cross-namespace existence information (ADR-007 timing-oracle mitigation).
+    /// cross-namespace existence information (timing-oracle mitigation).
     #[error("not found in this namespace")]
     NamespaceMismatch { id: uuid::Uuid },
 
-    /// A short-prefix lookup matched more than one record (ADR-016 §UUID arguments).
+    /// A short-prefix lookup matched more than one record.
     ///
     /// `prefix` is the 8+ hex-char prefix supplied by the caller.
     /// `matches` holds the full UUIDs of all matching records (at most 2 are
@@ -157,7 +157,7 @@ pub enum RuntimeError {
         matches: Vec<uuid::Uuid>,
     },
 
-    /// Cross-backend `merge_entity` is unsupported in v1 (ADR-009 §cross-backend-merge).
+    /// Cross-backend `merge_entity` is unsupported in v1.
     ///
     /// Both entities must reside on the same backend. To merge entities on different
     /// backends, manually export `from_id`, delete it, and re-import on `into_id`'s backend.
@@ -174,7 +174,7 @@ pub enum RuntimeError {
         from_backend: String,
     },
 
-    // ── ADR-037: Remote Resolution and Content-Hash Verification ─────────────
+    // ── Remote Resolution and Content-Hash Verification ──────────────────────
     /// A `kg://` ref names a remote not declared in `schema.yaml`.
     #[error("unknown remote: {name:?}")]
     UnknownRemote { name: String },

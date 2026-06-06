@@ -12,7 +12,7 @@
 //! | Find shortest path | Bidirectional BFS | [`find_shortest_path`] |
 //! | Deep exploration | DFS | [`dfs_traverse`] |
 //!
-//! # Architecture (ADR-004)
+//! # Architecture
 //!
 //! ```text
 //! khive-db                    khive-retrieval
@@ -69,7 +69,7 @@
 //! }
 //! ```
 //!
-//! See [ADR-004](../docs/ADR-004-graph-traversal.md) for algorithm specification.
+//! See `docs/architecture.md` for algorithm specification and design rationale.
 
 mod bfs;
 mod compat;

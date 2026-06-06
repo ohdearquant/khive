@@ -9,7 +9,7 @@ use core::str::FromStr;
 
 use crate::{EdgeRelation, Header, Id128, Timestamp};
 
-/// 8 closed base kinds for graph-node classification (ADR-001).
+/// 8 closed base kinds for graph-node classification.
 ///
 /// Governed subtype values live in `Entity::entity_type`; `properties` remain
 /// metadata and must not carry ontology type strings.
@@ -41,7 +41,7 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    /// All 8 canonical entity kinds in ADR-001 table order.
+    /// All 8 canonical entity kinds in taxonomy-table order.
     pub const ALL: [Self; 8] = [
         Self::Concept,
         Self::Document,
@@ -74,7 +74,7 @@ impl fmt::Display for EntityKind {
     }
 }
 
-// Canonical entity kind strings listed in ADR-001.
+// Canonical entity kind strings for the closed 8-kind taxonomy.
 const ENTITY_KIND_VALID: &[&str] = &[
     "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
 ];
@@ -84,16 +84,16 @@ impl FromStr for EntityKind {
 
     /// Parse a string into an `EntityKind`.
     ///
-    /// Accepts the 8 canonical ADR-001 kind names (case-insensitive) plus a set
-    /// of convenience aliases to aid human-authored DSL requests (e.g. `"paper"`
+    /// Accepts the 8 canonical kind names (case-insensitive) plus a set of
+    /// convenience aliases to aid human-authored DSL requests (e.g. `"paper"`
     /// resolves to `Document`, `"repo"` to `Project`).
     ///
     /// **Note on subtype aliasing**: when `kind="paper"` is parsed here, only the
     /// base `EntityKind::Document` is returned.  Callers that need to preserve the
-    /// `entity_type` subtoken (per ADR-001 §pack-declared subtypes) must use the
-    /// pack registry resolution path, which returns both the base kind and the
-    /// subtype string.  `from_str` is intentionally base-kind-only for use in
-    /// contexts where the subtype is carried separately (e.g. `Entity.entity_type`).
+    /// `entity_type` subtoken must use the pack registry resolution path, which
+    /// returns both the base kind and the subtype string.  `from_str` is
+    /// intentionally base-kind-only for use in contexts where the subtype is
+    /// carried separately (e.g. `Entity.entity_type`).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "concept" => Ok(Self::Concept),
@@ -120,7 +120,7 @@ pub struct Entity {
     /// Identity and namespace metadata shared by all substrate records.
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub header: Header,
-    /// Closed base kind (ADR-001) that classifies this entity.
+    /// Closed base kind that classifies this entity.
     pub kind: EntityKind,
     /// Pack-governed subtype token (e.g. `"paper"`, `"snapshot"`). Never stored
     /// raw in `properties` — queries compile this to `entities.entity_type = ?`.
@@ -149,7 +149,7 @@ pub struct Link {
     pub source: Id128,
     /// Target node identifier.
     pub target: Id128,
-    /// Closed relation type (ADR-002) that semantically describes this edge.
+    /// Closed relation type that semantically describes this edge.
     pub relation: EdgeRelation,
     /// Arbitrary structured metadata attached to this edge.
     pub properties: BTreeMap<String, PropertyValue>,
@@ -175,7 +175,7 @@ impl Link {
 /// Property values stored on entities, links, and notes.
 ///
 /// Recursive: supports arrays and nested objects for free-form JSON properties
-/// (e.g. `entity_ids[]`, `alternatives_considered[]` per ADR-019).
+/// (e.g. `entity_ids[]`, `alternatives_considered[]`).
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(untagged))]

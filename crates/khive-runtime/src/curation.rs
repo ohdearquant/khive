@@ -7,8 +7,6 @@
 // those helpers. Split plan: extract patch types into `curation/patch.rs` and merge
 // logic into `curation/merge.rs` once the dedup policy API stabilises.
 //! Curation operations: entity update/merge and edge-list filter type.
-//!
-//! See ADR-014 for the full specification and semantics.
 
 use std::collections::HashSet;
 
@@ -174,7 +172,7 @@ impl KhiveRuntime {
     /// when `name` or `description` changes; skips re-indexing for property/tag-only patches.
     ///
     /// Returns `RuntimeError::NotFound` if the entity does not exist or belongs to a different
-    /// namespace. This enforces ADR-007 namespace isolation at the runtime layer.
+    /// namespace. Namespace isolation is enforced at the runtime layer.
     pub async fn update_entity(
         &self,
         token: &NamespaceToken,
@@ -269,7 +267,7 @@ impl KhiveRuntime {
                 "cannot merge an entity into itself".into(),
             ));
         }
-        // H2 fix: enforce same-kind constraint at the runtime layer (ADR-014).
+        // H2 fix: enforce same-kind constraint at the runtime layer.
         // The handler also checks this, but any direct runtime caller (CLI, tests,
         // future SDK) would bypass the handler guard without this check here.
         {
@@ -808,7 +806,7 @@ fn merge_entity_sql(
             } else {
                 edge.target_id
             };
-            // ADR-002 §134: symmetric relations must be stored with source_uuid < target_uuid.
+            // Symmetric relations must be stored with source_uuid < target_uuid.
             // Apply canonicalization so the conflict check and UPDATE both use the canonical form.
             let (new_src, new_tgt) = match edge.relation.parse::<EdgeRelation>() {
                 Ok(rel) => canonical_edge_endpoints(rel, raw_src, raw_tgt),
@@ -824,7 +822,7 @@ fn merge_entity_sql(
             }
 
             let now_ts = chrono::Utc::now().timestamp();
-            // H3 fix (ADR-009/ADR-014): preserve the original edge ID by updating
+            // H3 fix: preserve the original edge ID by updating
             // source_id/target_id in-place when no conflict exists.
             //
             // Two-step approach to handle all cases while keeping the original ID:
@@ -974,7 +972,7 @@ fn merge_entity_sql(
             )?;
         }
 
-        // --- Tombstone from entity (ADR-014: soft-delete with provenance) ---
+        // --- Tombstone from entity (soft-delete with provenance) ---
         let merge_event_id = Uuid::new_v4();
         conn.execute(
             "UPDATE entities \
@@ -1274,7 +1272,7 @@ fn merge_note_sql(
             } else {
                 edge.target_id
             };
-            // ADR-002 §134: canonicalize symmetric relations before conflict check + UPDATE.
+            // Canonicalize symmetric relations before conflict check + UPDATE.
             let (new_src, new_tgt) = match edge.relation.parse::<EdgeRelation>() {
                 Ok(rel) => canonical_edge_endpoints(rel, raw_src, raw_tgt),
                 Err(_) => (raw_src, raw_tgt),
@@ -2356,7 +2354,7 @@ mod tests {
         let tok = NamespaceToken::local();
 
         // Create three entities: A and B will be merged; shared is the common target.
-        // Use `extends` (concept→concept) which is in the ADR-002 base allowlist.
+        // Use `extends` (concept→concept) which is a valid endpoint combination.
         let a = rt
             .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await

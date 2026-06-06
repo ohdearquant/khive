@@ -4,8 +4,8 @@
 //!
 //! This crate implements a semantic three-way merge for `KgArchive` snapshots.
 //! It is not yet in the workspace member list because the VCS integration layer
-//! (ADR-010/ADR-020) must be extended before the merge engine is wired into the
-//! production pack. The design is retained for v2 promotion.
+//! must be extended to expose snapshot ancestry before the merge engine is wired
+//! into the production pack. The design is retained for v2 promotion.
 //!
 //! # Crate layout
 //!

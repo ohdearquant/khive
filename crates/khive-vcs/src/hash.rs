@@ -2,7 +2,7 @@
 //
 //! Canonical JSON serialization and SHA-256 snapshot hashing.
 //!
-//! Algorithm (ADR-010 §canonical-hash-algorithm, ADR-042 retained):
+//! Algorithm:
 //! 1. Collect non-soft-deleted entities; sort by UUID string ascending.
 //! 2. Collect edges; sort by (source, target, relation) ascending.
 //! 3. Serialize as `{"edges":[...],"entities":[...]}` with fixed field order and no whitespace.
@@ -74,8 +74,7 @@ pub fn canonical_json(archive: &KgArchive) -> Result<String, VcsError> {
 /// Serialize a single entity with fixed key order and sorted sub-fields.
 ///
 /// `entity_type` is included in the canonical representation so that two
-/// snapshots differing only in `entity_type` produce different `SnapshotId`s
-/// (ADR-020 §entity-record-shape, VCS-AUD-003).
+/// snapshots differing only in `entity_type` produce different `SnapshotId`s.
 fn entity_to_canonical_value(e: &ExportedEntity) -> Value {
     let properties = sort_properties_value(e.properties.clone());
     let mut tags = e.tags.clone();

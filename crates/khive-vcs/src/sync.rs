@@ -1,8 +1,8 @@
-//! NDJSON-to-SQLite sync library boundary (ADR-010/ADR-020, finding F106).
+//! NDJSON-to-SQLite sync library boundary.
 //!
 //! Rebuilds the SQLite database from `.khive/kg/entities.ndjson` and `edges.ndjson`.
 //! Builds atomically into a `.tmp` file then renames. Also supports remote archive
-//! fetch with SHA-256 pin verification (ADR-037) via [`run_sync_remote`].
+//! fetch with SHA-256 pin verification via [`run_sync_remote`].
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,7 +21,7 @@ use crate::error::VcsError;
 use crate::hash::snapshot_id_for_archive;
 use crate::types::SnapshotId;
 
-/// Per-record entity shape in NDJSON sources (ADR-020 §2).
+/// Per-record entity shape in NDJSON sources.
 #[derive(Debug, Serialize, Deserialize)]
 struct NdjsonEntity {
     id: Uuid,
@@ -39,7 +39,7 @@ struct NdjsonEntity {
     updated_at: Option<String>,
 }
 
-/// Per-record edge shape in NDJSON sources (ADR-020 §2).
+/// Per-record edge shape in NDJSON sources.
 #[derive(Debug, Serialize, Deserialize)]
 struct NdjsonEdge {
     edge_id: Uuid,
@@ -82,10 +82,10 @@ pub struct SyncReport {
     pub db_path: String,
 }
 
-// ── F201: Remote archive fetch (ADR-037) ──────────────────────────────────────
+// ── F201: Remote archive fetch ────────────────────────────────────────────────
 
 /// Configuration for a remote KG archive (maps to one entry in `schema.yaml`
-/// `remotes:` list per ADR-037 §schema-yaml-remotes-section).
+/// `remotes:` list).
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {
     /// Human-readable name for this remote (used in error messages and cache
@@ -118,8 +118,7 @@ pub struct RemoteSyncReport {
     pub repinned: bool,
 }
 
-/// Metadata written to `.khive/kg/remotes/<name>/meta.json` (ADR-037
-/// §remote-cache-layout).
+/// Metadata written to `.khive/kg/remotes/<name>/meta.json`.
 #[derive(Debug, Serialize)]
 struct MetaJson {
     /// ISO-8601 timestamp of when the fetch completed.
@@ -145,7 +144,7 @@ struct MetaJson {
 ///   for the caller to write back to `schema.yaml`. When `false` and a pin is
 ///   present, a hash mismatch returns [`VcsError::HashMismatch`] via `anyhow`.
 ///
-/// # Failure behaviour (ADR-037 §failure-behaviour-fail-closed)
+/// # Failure behaviour (fail-closed)
 ///
 /// On hash mismatch the function returns an error *before* any cache file is
 /// modified. The staging directory is cleaned up. The error message includes the
@@ -233,7 +232,7 @@ pub async fn run_sync_remote(
 
     // ── 3. Build KgArchive and compute canonical hash ─────────────────────────
     // build_kg_archive is fallible: an invalid relation causes it to return an
-    // error here, before any cache file is written (fail-closed per ADR-037).
+    // error here, before any cache file is written (fail-closed).
     let archive = build_kg_archive(&remote.namespace, &entities_ndjson, &edges_ndjson)
         .with_context(|| format!("validating archive for remote {:?}", remote.name))?;
     let actual_hash = snapshot_id_for_archive(&archive)
@@ -315,7 +314,7 @@ fn run_git_in(dir: &Path, args: &[&str]) -> Result<()> {
 ///
 /// Returns an error if any edge carries an unrecognised relation string, so
 /// that invalid edges are rejected *before* the hash is computed and before
-/// any cache or database write occurs (ADR-037 §failure-behaviour-fail-closed).
+/// any cache or database write occurs (fail-closed).
 fn build_kg_archive(
     namespace: &str,
     entities: &[NdjsonEntity],
@@ -439,7 +438,7 @@ pub async fn run_sync(repo_root: &Path, db_path: &Path, namespace: &str) -> Resu
     let edge_records =
         read_edges(&edges_path).with_context(|| format!("reading {}", edges_path.display()))?;
 
-    // ── Validate-first gate (ADR-020 §validate-first, ADR-036 §validation-pipeline) ──
+    // ── Validate-first gate ──────────────────────────────────────────────────────
     // Parse every edge relation before creating the temp DB so that an invalid
     // relation causes a clean error that leaves the existing DB intact.
     for (i, r) in edge_records.iter().enumerate() {
@@ -588,7 +587,7 @@ async fn upsert_entities(
             .with_context(|| format!("upsert entity {}", r.id))?;
         // Populate FTS5 index so text search works after sync.
         // Vectors are intentionally skipped: they are local-only derived state
-        // (ADR-035 §6) and will be computed by `kkernel kg embed` when needed.
+        // and will be computed by `kkernel kg embed` when needed.
         text.upsert_document(TextDocument {
             subject_id: r.id,
             kind: SubstrateKind::Entity,
@@ -817,7 +816,7 @@ mod tests {
     }
 
     /// F195: verify that FTS5 is populated during sync so text search works
-    /// after sync without a separate `kkernel kg embed` pass (ADR-035 §5).
+    /// after sync without a separate `kkernel kg embed` pass.
     #[tokio::test]
     async fn sync_populates_fts_for_text_search() {
         use khive_runtime::RuntimeConfig;
@@ -945,7 +944,7 @@ mod tests {
     }
 
     /// F201-2: `run_sync_remote` with a wrong pin fails before touching the
-    /// cache (fail-closed guarantee from ADR-037 §failure-behaviour).
+    /// cache (fail-closed guarantee).
     #[tokio::test]
     async fn run_sync_remote_rejects_hash_mismatch() {
         let remote_dir = TempDir::new().unwrap();
@@ -993,7 +992,7 @@ mod tests {
     }
 
     /// F201-3: `run_sync_remote` with no pin still proceeds and writes `meta.json`
-    /// (auditability even without a pin — ADR-037 §hash-requirement).
+    /// (hash is still computed and written for auditability).
     #[tokio::test]
     async fn run_sync_remote_no_pin_proceeds_and_writes_meta() {
         let remote_dir = TempDir::new().unwrap();

@@ -1,14 +1,14 @@
-//! KhiveMcpServer — rmcp-based MCP server exposing a single `request` tool (ADR-016).
+//! KhiveMcpServer — rmcp-based MCP server exposing a single `request` tool.
 //!
 //! Accepts the function-call DSL or JSON form and dispatches each parsed operation
 //! through the [`VerbRegistry`] built from the configured packs.
 //!
 // FILE SIZE JUSTIFICATION: `run_parsed` is long because it encodes the
-// ADR-016 execution-mode contract (Single/Parallel/Chain) as a single match
+// execution-mode contract (Single/Parallel/Chain) as a single match
 // expression. Splitting the three branches into separate functions would
-// scatter the ADR-016 contract invariants (summary shape, aborted semantics,
+// scatter the contract invariants (summary shape, aborted semantics,
 // $prev substitution ordering) across files, making them harder to review
-// against the spec. The module is the authoritative implementation of ADR-016
+// as a unit. The module is the authoritative implementation of request
 // dispatch and is intentionally co-located.
 
 use rmcp::{
@@ -76,7 +76,7 @@ fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>)
 pub struct KhiveMcpServer {
     registry: VerbRegistry,
     /// Namespace this registry was built for. The stdio client passes it to the
-    /// daemon (ADR-049); a mismatch triggers local-dispatch fallback.
+    /// daemon; a namespace mismatch triggers local-dispatch fallback.
     default_namespace: String,
 }
 
@@ -132,7 +132,7 @@ impl std::error::Error for PackRegError {}
 /// Built-in pack names known to this binary.
 ///
 /// Sourced from `PackRegistry::discovered_names()` so the list always reflects
-/// whatever pack crates are linked into the binary (ADR-027).
+/// whatever pack crates are linked into the binary.
 pub fn builtin_pack_names() -> Vec<&'static str> {
     PackRegistry::discovered_names()
 }
@@ -141,11 +141,11 @@ impl KhiveMcpServer {
     /// Build a server using the pack list from `runtime.config().packs`.
     ///
     /// The authorization gate from `runtime.config().gate` is threaded into the
-    /// registry. Gate decisions are **hard-enforcing** in v0.3 — a `Deny`
-    /// result blocks pack dispatch and returns `PermissionDenied` (ADR-035).
+    /// registry. Gate decisions are **hard-enforcing** — a `Deny`
+    /// result blocks pack dispatch and returns `PermissionDenied`.
     ///
     /// Fails fast if any requested pack is unknown or has an unsatisfied
-    /// dependency (ADR-027). A misconfigured `KHIVE_PACKS` is a boot error —
+    /// dependency. A misconfigured `KHIVE_PACKS` is a boot error —
     /// callers must list all required packs explicitly. Use [`Self::with_packs`]
     /// for the same strict path with an explicit pack list.
     ///
@@ -157,8 +157,8 @@ impl KhiveMcpServer {
     #[allow(clippy::result_large_err)]
     pub fn new(runtime: KhiveRuntime) -> Result<Self, PackRegError> {
         let packs: Vec<String> = runtime.config().packs.clone();
-        // ADR-014 (c14 hardening): fail-fast on bad packs so callers can decide
-        // recovery. The c12 schema_plan application happens inside with_packs.
+        // Fail-fast on bad packs so callers can decide recovery.
+        // Schema plan application happens inside with_packs.
         Self::with_packs(runtime, &packs)
     }
 
@@ -173,7 +173,7 @@ impl KhiveMcpServer {
         let mut builder = VerbRegistryBuilder::new();
         builder.with_gate(gate);
         builder.with_default_namespace(default_namespace.as_str());
-        // ADR-035: wire the EventStore into the registry for audit persistence.
+        // Wire the EventStore into the registry for audit persistence.
         if let Ok(tok) = runtime.authorize(khive_runtime::Namespace::local()) {
             if let Ok(event_store) = runtime.events(&tok) {
                 builder.with_event_store(event_store);
@@ -192,17 +192,17 @@ impl KhiveMcpServer {
             failure: PackRegFailure::Registry(source),
             runtime: runtime.clone(),
         })?;
-        // ADR-031: aggregate pack-declared edge endpoint rules into the runtime
+        // Aggregate pack-declared edge endpoint rules into the runtime
         // so `validate_edge_relation_endpoints` can consult them.
         runtime.install_edge_rules(registry.all_edge_rules());
-        // ADR-031 extension: invoke `PackRuntime::register_embedders` on every
-        // pack so custom embedding providers are available before the first verb
-        // dispatch. Must happen after the registry is built (packs are ordered)
+        // Invoke `PackRuntime::register_embedders` on every pack so custom
+        // embedding providers are available before the first verb dispatch.
+        // Must happen after the registry is built (packs are ordered)
         // and before any `remember`/`recall` calls that would resolve embedders.
         registry.call_register_embedders(&runtime);
-        // ADR-017 §c12: apply pack-auxiliary schema plans at startup so pack
-        // tables are present before any handler runs. Errors are logged but
-        // not propagated so a single pack's schema failure cannot abort startup.
+        // Apply pack-auxiliary schema plans at startup so pack tables are
+        // present before any handler runs. Errors are logged but not propagated
+        // so a single pack's schema failure cannot abort startup.
         registry.apply_schema_plans(runtime.backend());
         Ok(Self {
             registry,
@@ -228,8 +228,8 @@ impl KhiveMcpServer {
         &self.default_namespace
     }
 
-    /// Warm every pack's in-memory state (ADR-049). Called by the daemon in a
-    /// background task after the socket is bound.
+    /// Warm every pack's in-memory state. Called by the daemon in a background
+    /// task after the socket is bound.
     pub async fn warm_all(&self) {
         self.registry.call_warm_all().await;
     }
@@ -285,8 +285,8 @@ impl KhiveMcpServer {
                     )
                 })?;
                 let resolved_val = arg_val.resolve_all(prev).ok_or_else(|| {
-                    // adr-dsl-packs H3: include available top-level fields in the
-                    // error message, matching the UX of the bare-$prev guard.
+                    // Include available top-level fields in the error message,
+                    // matching the UX of the bare-$prev guard.
                     let fields_hint = if let Value::Object(map) = prev {
                         let mut fields: Vec<&str> =
                             map.keys().map(String::as_str).collect();
@@ -356,11 +356,10 @@ impl KhiveMcpServer {
 
         let args_value = Value::Object(resolved);
 
-        // ADR-017 §Visibility: Subhandler verbs are operator-only.
-        // Block them at the MCP wire boundary; internal callers that call
-        // VerbRegistry::dispatch directly are not affected.
-        // Exception: `help=true` is short-circuited in VerbRegistry::dispatch
-        // before reaching the pack — pass it through so introspection works.
+        // Subhandler verbs are operator-only — block them at the MCP wire
+        // boundary. Internal callers that call VerbRegistry::dispatch directly
+        // are not affected. Exception: `help=true` is short-circuited in
+        // VerbRegistry::dispatch before reaching the pack, so introspection works.
         let is_help = args_value
             .get("help")
             .and_then(Value::as_bool)
@@ -394,12 +393,12 @@ impl KhiveMcpServer {
     ///   substituted into the next op's args. If any op fails (or a `$prev`
     ///   substitution fails), remaining ops appear as `aborted: true`.
     ///
-    /// Presentation transforms (ADR-045) are applied per-op AFTER dispatch,
+    /// Presentation transforms are applied per-op AFTER dispatch,
     /// using `mode_for_op` to determine the mode per position. Chain `$prev`
     /// substitution uses canonical (verbose) handler output; the transform runs
     /// only at the final response-envelope boundary.
     ///
-    /// Response envelope (ADR-016):
+    /// Response envelope:
     /// ```json
     /// {
     ///   "results": [...],
@@ -430,12 +429,11 @@ impl KhiveMcpServer {
 
         match mode {
             ExecutionMode::Single | ExecutionMode::Parallel => {
-                // Write-key conflict preflight (ADR-038 Part 2).
+                // Write-key conflict preflight.
                 //
                 // Detect ops that target the same write key in the same parallel/single
-                // batch. Per ADR-038, conflicting ops receive per-op error entries;
-                // non-conflicting ops execute normally.  `results.length == summary.total`
-                // is preserved (ADR-016 contract).
+                // batch. Conflicting ops receive per-op error entries; non-conflicting ops
+                // execute normally. `results.length == summary.total` is preserved.
                 let conflict_indices: std::collections::HashSet<usize> = {
                     let mut seen: std::collections::HashMap<String, usize> =
                         std::collections::HashMap::new();
@@ -469,11 +467,11 @@ impl KhiveMcpServer {
                     let op_mode = mode_for_op(i);
                     async move {
                         let tool = op.tool.clone();
-                        // ADR-038: conflicting ops get a per-op error; skip dispatch.
+                        // Conflicting ops get a per-op error; skip dispatch.
                         if let Some(msg) = conflict_with {
                             return json!({ "ok": false, "tool": tool, "error": msg });
                         }
-                        // ADR-045 §6: AlwaysVerbose verbs override the caller's mode.
+                        // AlwaysVerbose verbs override the caller's presentation mode.
                         let effective_mode =
                             if registry.presentation_policy_for(&tool)
                                 == VerbPresentationPolicy::AlwaysVerbose
@@ -508,10 +506,10 @@ impl KhiveMcpServer {
                         }
                         let args_value = Value::Object(resolved);
 
-                        // ADR-017 §Visibility: block Subhandler verbs at the
-                        // MCP wire boundary.  Exception: help=true is
-                        // short-circuited in VerbRegistry::dispatch before the
-                        // pack — pass it through so introspection works.
+                        // Block subhandler verbs at the MCP wire boundary.
+                        // Exception: help=true is short-circuited in
+                        // VerbRegistry::dispatch before the pack, so
+                        // introspection passes through.
                         let is_help = args_value
                             .get("help")
                             .and_then(Value::as_bool)
@@ -558,7 +556,7 @@ impl KhiveMcpServer {
             ExecutionMode::Chain => {
                 // Sequential execution with $prev substitution and abort-on-failure.
                 // $prev uses canonical (verbose) handler output — presentation runs
-                // only at the final response-envelope boundary (ADR-045 §4).
+                // only at the final response-envelope boundary.
                 let total = ops.len();
                 let mut results: Vec<Value> = Vec::with_capacity(total);
                 // prev_result holds the CANONICAL result (pre-presentation) for $prev.
@@ -572,7 +570,7 @@ impl KhiveMcpServer {
                         continue;
                     }
                     let op_mode = mode_for_op(i);
-                    // ADR-045 §6: AlwaysVerbose verbs override the caller's mode.
+                    // AlwaysVerbose verbs override the caller's presentation mode.
                     let effective_mode = if self.registry.presentation_policy_for(&op.tool)
                         == VerbPresentationPolicy::AlwaysVerbose
                     {
@@ -619,7 +617,7 @@ impl KhiveMcpServer {
 /// Apply the presentation transform to the `result` field of a successful
 /// per-op envelope, leaving error envelopes unchanged.
 ///
-/// Per ADR-045 §3.5: "Error envelopes are NEVER transformed."
+/// Error envelopes are never transformed — only successful `result` fields.
 fn apply_presentation_to_result(
     mut result_obj: Value,
     mode: PresentationMode,
@@ -642,7 +640,7 @@ fn apply_presentation_to_result(
 impl KhiveMcpServer {
     #[tool(description = r#"Run one or more khive verbs in a single MCP call.
 
-ops syntax (ADR-016):
+ops syntax:
 
   Single op   : verb(name=value, name=value)
   Batch       : [verb(...), verb(...)]                 — parallel, max 100
@@ -680,7 +678,7 @@ Tip: for one-shot calls, the single-op form is the densest. Use batch when
 several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
     async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
-        // ADR-049: forward to the warm daemon when reachable, auto-spawning it
+        // Forward to the warm daemon when reachable, auto-spawning it
         // on first use. Any failure (no socket, spawn failure, namespace
         // mismatch, KHIVE_NO_DAEMON) falls through to local dispatch.
         #[cfg(unix)]
@@ -708,7 +706,7 @@ impl KhiveMcpServer {
     pub async fn dispatch_request_local(&self, p: RequestParams) -> Result<String, McpError> {
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
 
-        // Parse presentation strings → PresentationMode (ADR-045).
+        // Parse presentation strings → PresentationMode.
         let presentation = parse_presentation_mode(p.presentation.as_deref())
             .map_err(|e| McpError::invalid_params(e, None))?;
         let presentation_per_op: Option<Vec<Option<PresentationMode>>> =
@@ -761,7 +759,7 @@ impl ServerHandler for KhiveMcpServer {
         let catalog = self.verb_catalog();
         let builtins = builtin_pack_names().join(", ");
         let instructions = format!(
-            "khive — request-only MCP surface (ADR-016 + ADR-027). One tool, `request`, \
+            "khive — request-only MCP surface. One tool, `request`, \
              dispatches verbs through the loaded pack registry. Configure packs via \
              KHIVE_PACKS or --pack (built-ins: {builtins}). Verbs registered on this \
              server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \
@@ -778,7 +776,7 @@ impl ServerHandler for KhiveMcpServer {
     /// Override the macro-generated `list_tools` so the `request` tool's
     /// description carries the dynamic verb catalog built from the loaded
     /// pack registry. Many MCP clients only surface `tools/list` descriptions
-    /// (not server instructions) — ADR-027 requires discovery to work there.
+    /// (not server instructions) — discovery must work via tool listing.
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,

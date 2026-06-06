@@ -1,6 +1,6 @@
 //! HNSW configuration types.
 //!
-//! See ADR-003 for recommended parameter values (ef_construction, M, max_layers).
+//! See `docs/design.md` for recommended parameter values (ef_construction, M, max_layers).
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -12,7 +12,7 @@ use crate::error::{Result, RetrievalError};
 pub const MAX_LEVEL: usize = 64;
 
 /// Default threshold for triggering a rebuild (10% tombstones).
-/// Aligned with ADR-003: Index Management Strategy.
+/// At this ratio the index query recall degrades measurably; rebuild restores full quality.
 pub const DEFAULT_REBUILD_THRESHOLD: f64 = 0.10;
 
 // Re-export from canonical location (foundation/types).
@@ -20,7 +20,7 @@ pub const DEFAULT_REBUILD_THRESHOLD: f64 = 0.10;
 // Serde aliases on canonical handle backward compat: "euclidean" -> L2, "dot_product" -> Dot.
 pub use khive_types::vector::DistanceMetric;
 
-/// HNSW configuration parameters per ADR-003.
+/// HNSW index configuration parameters.
 ///
 /// Deserialization validates all invariants before returning. Invalid configs
 /// (e.g. `dimensions=0`, non-finite `ml`, `m_max0 < m`) are rejected with a
@@ -120,7 +120,7 @@ impl<'de> Deserialize<'de> for HnswConfig {
 }
 
 impl Default for HnswConfig {
-    /// Creates default configuration per ADR-003.
+    /// Creates default configuration.
     ///
     /// M=20, ef_construction=200, ef_search=80, dimensions=384.
     /// M=20 is optimal for k=10 recall at 384d (empirically measured).
@@ -193,7 +193,7 @@ impl HnswConfig {
         Ok(config)
     }
 
-    /// Create config with custom dimensions, keeping ADR-003 defaults.
+    /// Create config with custom dimensions, keeping default values for all other parameters.
     ///
     /// # Panics
     /// Panics if `dimensions` is 0.

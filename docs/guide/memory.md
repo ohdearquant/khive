@@ -98,9 +98,7 @@ request(ops="memory.recall(query=\"search optimization\", tags=[\"khive\", \"ret
 
 Recall ranking uses a composite score:
 
-```
-composite = (retrieval_score * 0.70) + (salience * decay_weight * 0.20) + (temporal_score * 0.10)
-```
+$$\text{composite} = 0.70 \cdot \text{retrieval} + 0.20 \cdot \text{salience} \cdot \text{decay} + 0.10 \cdot \text{temporal}$$
 
 Where:
 
@@ -114,9 +112,9 @@ Where:
 
 Decay follows an exponential curve:
 
-```
-decay_weight = e^(-decay_factor * age_in_days)
-```
+$$w_{\text{decay}} = e^{-\lambda \cdot t}$$
+
+where $\lambda$ is `decay_factor` and $t$ is age in days.
 
 With the default `decay_factor=0.01`:
 

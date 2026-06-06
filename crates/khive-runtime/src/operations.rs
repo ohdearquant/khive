@@ -4,7 +4,7 @@
 // canonical-endpoint logic) that require pub(crate) access — splitting into submodules
 // would require pub(crate) re-exports across every helper or circular dependencies.
 // Inline tests exercise those private helpers directly. Split plan: once the verb
-// surface stabilises post-ADR-030 retrieval refactor, group by substrate (entity,
+// surface stabilises post-retrieval-refactor, group by substrate (entity,
 // note, edge, search) into submodules under an `operations/` directory.
 //! High-level operations composing storage capabilities into user-facing verbs.
 
@@ -60,9 +60,9 @@ fn text_preview(text: &str, max_chars: usize) -> Option<String> {
     }
 }
 
-/// ADR-002: symmetric relations (`competes_with`, `composed_with`) are stored
-/// with a canonical source (lower UUID wins), so a directed `Out` or `In` query
-/// may miss results. When the relations filter is non-empty and contains **only**
+/// Symmetric relations (`competes_with`, `composed_with`) are stored with a
+/// canonical source (lower UUID wins), so a directed `Out` or `In` query may
+/// miss results. When the relations filter is non-empty and contains **only**
 /// symmetric relations, override direction to `Both` so callers always see all
 /// edges for these relations regardless of storage canonicalization.
 fn normalize_symmetric_direction(
@@ -123,7 +123,7 @@ fn endpoint_matches(spec: &EndpointKind, substrate: &str, kind: &str) -> bool {
 }
 
 /// `true` if any pack-declared edge endpoint rule allows the
-/// `(source, relation, target)` triple. ADR-031: rules are additive only.
+/// `(source, relation, target)` triple. Pack rules are additive only.
 fn pack_rule_allows(
     rules: &[EdgeEndpointRule],
     relation: EdgeRelation,
@@ -143,11 +143,11 @@ fn pack_rule_allows(
     })
 }
 
-/// ADR-002 base endpoint allowlist for entity→entity relations.
+/// Base endpoint allowlist for entity→entity relations.
 ///
 /// Returns `true` if `(src_kind, relation, tgt_kind)` is an explicitly listed
-/// triple in the ADR-002 base contract. `"*"` as `src_kind` means "any entity
-/// kind" (used for `instance_of` whose source is unrestricted).
+/// triple in the base contract. `"*"` as `src_kind` means "any entity kind"
+/// (used for `instance_of` whose source is unrestricted).
 ///
 /// Pack rules (via `EDGE_RULES`) are additive — they cannot remove rows here.
 fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &str) -> bool {
@@ -201,7 +201,7 @@ fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &st
         ("service", EdgeRelation::CompetesWith, "service"),
         ("concept", EdgeRelation::ComposedWith, "concept"),
         ("project", EdgeRelation::ComposedWith, "project"),
-        // Versioning (Supersedes — ADR-002:190-194: Concept/Document/Artifact/Service/Dataset only)
+        // Versioning (Supersedes — Concept/Document/Artifact/Service/Dataset only)
         ("concept", EdgeRelation::Supersedes, "concept"),
         ("document", EdgeRelation::Supersedes, "document"),
         ("artifact", EdgeRelation::Supersedes, "artifact"),
@@ -230,7 +230,7 @@ pub(crate) fn canonical_edge_endpoints(
     }
 }
 
-/// Infer the default `dependency_kind` from endpoint entity kinds (ADR-002).
+/// Infer the default `dependency_kind` from endpoint entity kinds.
 fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'static str> {
     match (src_kind, tgt_kind) {
         ("project", "project") => Some("build"),
@@ -266,10 +266,10 @@ fn merge_dependency_kind(
     Some(obj)
 }
 
-/// Valid `dependency_kind` values for `depends_on` edges (ADR-002).
+/// Valid `dependency_kind` values for `depends_on` edges.
 const VALID_DEPENDENCY_KINDS: &[&str] = &["build", "runtime", "data", "artifact", "tooling"];
 
-/// Validate governed edge metadata keys (ADR-002 §Edge Metadata).
+/// Validate governed edge metadata keys.
 ///
 /// Currently enforces:
 /// - `dependency_kind` is only valid on `depends_on` edges.
@@ -362,7 +362,7 @@ impl KhiveRuntime {
         Ok(entity)
     }
 
-    /// Retrieve an entity by ID, enforcing namespace isolation (ADR-007).
+    /// Retrieve an entity by ID, enforcing namespace isolation.
     ///
     /// Returns `Err(NotFound)` if the entity does not exist or belongs to a
     /// different namespace (indistinguishable — no cross-namespace existence oracle).
@@ -407,8 +407,8 @@ impl KhiveRuntime {
 
     /// Enforce that `record_ns` matches `caller_ns`.
     ///
-    /// Returns `Err(NotFound)` when they differ — ADR-007 requires wrong-namespace
-    /// and absent UUIDs to be indistinguishable externally (no existence oracle).
+    /// Returns `Err(NotFound)` when they differ — wrong-namespace
+    /// and absent UUIDs must be indistinguishable externally (no existence oracle).
     pub(crate) fn ensure_namespace(record_ns: &str, caller_ns: &str) -> RuntimeResult<()> {
         if record_ns == caller_ns {
             return Ok(());
@@ -532,7 +532,7 @@ impl KhiveRuntime {
 
     /// Validate that `source_id` and `target_id` are legal endpoints for `relation`.
     ///
-    /// Centralises the ADR-002/ADR-019/ADR-024 three-case contract so that both
+    /// Centralises the three-case relation contract so that both
     /// `link()` and `update_edge()` share identical enforcement:
     ///
     /// - `annotates`: source MUST be a note; target may be any substrate.
@@ -609,7 +609,7 @@ impl KhiveRuntime {
                     if !base_entity_rule_allows(&src_e.kind, EdgeRelation::Supersedes, &tgt_e.kind)
                     {
                         return Err(RuntimeError::InvalidInput(format!(
-                            "({}) -[supersedes]-> ({}) is not in the ADR-002 base endpoint \
+                            "({}) -[supersedes]-> ({}) is not in the base endpoint \
                              allowlist; supersedes requires same-kind entity endpoints",
                             src_e.kind, tgt_e.kind
                         )));
@@ -640,9 +640,9 @@ impl KhiveRuntime {
                 }
             }
         } else {
-            // All 13 base relations: ADR-002 contract is entity→entity with
-            // kind-level restrictions (see base allowlist). ADR-031 allows packs
-            // to extend the allowlist additively via EDGE_RULES.
+            // All 13 base relations require entity→entity with kind-level
+            // restrictions (see base allowlist). Packs may extend the allowlist
+            // additively via EDGE_RULES.
             //
             // Strategy: resolve both endpoints once, consult pack rules; on
             // miss, fall through to the original base-rule error messages.
@@ -664,14 +664,14 @@ impl KhiveRuntime {
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "link source {source_id} must be an entity for relation {relation:?} \
-                         (ADR-002: only `annotates` crosses substrates)"
+                         (only `annotates` crosses substrates)"
                     )));
                 }
                 None => {
                     if self.get_edge(token, source_id).await?.is_some() {
                         return Err(RuntimeError::InvalidInput(format!(
                             "link source {source_id} must be an entity for relation {relation:?} \
-                             (ADR-002: only `annotates` crosses substrates)"
+                             (only `annotates` crosses substrates)"
                         )));
                     }
                     return Err(RuntimeError::NotFound(format!(
@@ -684,14 +684,14 @@ impl KhiveRuntime {
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "link target {target_id} must be an entity for relation {relation:?} \
-                         (ADR-002: only `annotates` crosses substrates)"
+                         (only `annotates` crosses substrates)"
                     )));
                 }
                 None => {
                     if self.get_edge(token, target_id).await?.is_some() {
                         return Err(RuntimeError::InvalidInput(format!(
                             "link target {target_id} must be an entity for relation {relation:?} \
-                             (ADR-002: only `annotates` crosses substrates)"
+                             (only `annotates` crosses substrates)"
                         )));
                     }
                     return Err(RuntimeError::NotFound(format!(
@@ -701,7 +701,7 @@ impl KhiveRuntime {
             };
             if !base_entity_rule_allows(&src_kind, relation, &tgt_kind) {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "({src_kind}) -[{}]-> ({tgt_kind}) is not in the ADR-002 base endpoint \
+                    "({src_kind}) -[{}]-> ({tgt_kind}) is not in the base endpoint \
                      allowlist; use pack EDGE_RULES to extend the allowlist",
                     relation.as_str()
                 )));
@@ -712,20 +712,19 @@ impl KhiveRuntime {
 
     /// Create a directed edge between two substrates.
     ///
-    /// Enforces the ADR-002/ADR-019/ADR-024 three-case relation contract via
+    /// Enforces the three-case relation contract via
     /// `validate_edge_relation_endpoints`. See that method for the full contract.
     ///
     /// For symmetric relations (`competes_with`, `composed_with`) the endpoint
     /// pair is canonicalised to `source_uuid < target_uuid` so that A→B and B→A
     /// deduplicate to one row (F012).
     ///
-    /// `metadata` is validated against governed keys (ADR-002 §Edge Metadata);
-    /// `dependency_kind` is inferred for `depends_on` edges when absent (F013).
+    /// `metadata` is validated against governed keys; `dependency_kind` is
+    /// inferred for `depends_on` edges when absent (F013).
     ///
-    /// ADR-009 invariant: `target_backend` is always `None` for locally-routed
-    /// edges written through this path. The `validate_edge_relation_endpoints`
-    /// call above already ensures both endpoints exist in the local namespace,
-    /// so setting `target_backend = None` is the only valid choice (F161).
+    /// `target_backend` is always `None` for locally-routed edges written through
+    /// this path. Both endpoints must exist in the local namespace, so setting
+    /// `target_backend = None` is the only valid choice (F161).
     ///
     /// A record that exists but belongs to a different namespace is treated as not found
     /// (fail-closed; no cross-namespace existence leak).
@@ -827,9 +826,9 @@ impl KhiveRuntime {
     /// Get immediate neighbors of a node, optionally filtered by relation type.
     ///
     /// Pass `relations: Some(vec![EdgeRelation::Annotates])` to retrieve only
-    /// annotation edges, enabling cross-substrate navigation as described in ADR-024.
+    /// annotation edges, enabling cross-substrate navigation.
     ///
-    /// ADR-002: symmetric relations (`competes_with`, `composed_with`) are stored
+    /// Symmetric relations (`competes_with`, `composed_with`) are stored
     /// with the canonical source as the lower UUID. Direction normalization is
     /// applied in `neighbors_with_query` so both callers see correct results.
     pub async fn neighbors(
@@ -855,7 +854,7 @@ impl KhiveRuntime {
 
     /// Get neighbors with full query control (includes `min_weight`).
     ///
-    /// Applies symmetric-relation direction normalization (ADR-002): if the
+    /// Applies symmetric-relation direction normalization: if the
     /// relations filter contains only symmetric relations the direction is
     /// overridden to `Both` so edges stored in canonical order are always found.
     ///
@@ -1117,7 +1116,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Note> {
         let ns = token.namespace().as_str();
 
-        // Validate all annotates targets before any write (ADR-024:295 atomicity).
+        // Validate all annotates targets before any write (atomicity: no partial writes).
         for &target_id in &annotates {
             if !self.substrate_exists_in_ns(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(
@@ -1367,7 +1366,7 @@ impl KhiveRuntime {
 
     /// Search notes using a hybrid FTS5 + vector pipeline with salience weighting.
     ///
-    /// Pipeline (per ADR-024):
+    /// Pipeline:
     /// 1. FTS5 query against `notes_<namespace>`.
     /// 2. If embedding model is configured: vector search filtered to `kind="note"`.
     /// 3. RRF fusion (k=60).
@@ -1450,8 +1449,7 @@ impl KhiveRuntime {
         }
 
         // Drop superseded notes unless include_superseded is true: any note targeted
-        // by a `supersedes` edge is obsolete and excluded from default search
-        // (ADR-013, ADR-024).
+        // by a `supersedes` edge is obsolete and excluded from default search.
         if !include_superseded && !alive_notes.is_empty() {
             let graph = self.graph(token)?;
             let mut superseded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
@@ -1620,11 +1618,11 @@ impl KhiveRuntime {
     ///
     /// On hard delete, cascades to remove all incident edges (both inbound and
     /// outbound) and cleans up FTS and vector indexes, preventing dangling
-    /// references for `annotates` edges that target this note (ADR-002, ADR-024).
+    /// references for `annotates` edges that target this note.
     /// Soft delete also cleans FTS and vector indexes; edges are left in place.
     ///
     /// Returns `Ok(false)` if the note does not exist or belongs to a different
-    /// namespace (ADR-007 — wrong-namespace is indistinguishable from absent).
+    /// namespace (wrong-namespace is indistinguishable from absent).
     pub async fn delete_note(
         &self,
         token: &NamespaceToken,
@@ -1753,7 +1751,7 @@ impl KhiveRuntime {
         let warnings = compiled.warnings;
 
         // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
-        // at the query–storage boundary (ADR-008 §"Query crate compiles against khive-types only").
+        // at the query–storage boundary.
         let params: Vec<SqlValue> = compiled
             .params
             .into_iter()
@@ -1783,7 +1781,7 @@ impl KhiveRuntime {
     /// and vector indexes; edges are left in place.
     ///
     /// Returns `Err(NotFound)` if the entity does not exist or belongs to a
-    /// different namespace (ADR-007 — indistinguishable, no existence oracle).
+    /// different namespace (indistinguishable — no existence oracle).
     pub async fn delete_entity(
         &self,
         token: &NamespaceToken,
@@ -1869,7 +1867,7 @@ impl KhiveRuntime {
 
     // ---- Edge CRUD operations ----
 
-    /// Fetch a single edge by id, enforcing namespace isolation (ADR-007).
+    /// Fetch a single edge by id, enforcing namespace isolation.
     ///
     /// Returns `Err(NotFound)` if the edge exists in a different namespace,
     /// `Ok(None)` if no edge with that id exists at all.
@@ -1892,7 +1890,7 @@ impl KhiveRuntime {
         let Some(SqlValue::Text(record_ns)) = record_ns else {
             return Ok(None);
         };
-        // ADR-007: absent and foreign-namespace IDs must be indistinguishable.
+        // Absent and foreign-namespace IDs must be indistinguishable.
         if Self::ensure_namespace(&record_ns, token.namespace().as_str()).is_err() {
             return Ok(None);
         }
@@ -1927,13 +1925,13 @@ impl KhiveRuntime {
     /// When `relation` is `Some(new_rel)`, validates that the edge's existing endpoints
     /// are legal for `new_rel` before persisting. Weight-only updates (`relation = None`)
     /// skip validation. Returns `InvalidInput` if the new relation would violate the
-    /// ADR-002/ADR-019/ADR-024 three-case contract; the edge is NOT mutated on error.
+    /// three-case endpoint contract; the edge is NOT mutated on error.
     ///
-    /// ADR-002 §134: when the resulting relation is symmetric (`competes_with`,
-    /// `composed_with`), endpoint order is canonicalised to `source_uuid < target_uuid`
-    /// after validation. If a canonical row already exists at the target triple, the
-    /// non-canonical edge is deleted and the existing canonical row is refreshed
-    /// (DELETE + UPDATE pattern, mirroring `merge_entity_sql`).
+    /// For symmetric relations (`competes_with`, `composed_with`), endpoint order is
+    /// canonicalised to `source_uuid < target_uuid` after validation. If a canonical
+    /// row already exists at the target triple, the non-canonical edge is deleted and
+    /// the existing canonical row is refreshed (DELETE + UPDATE pattern, mirroring
+    /// `merge_entity_sql`).
     pub async fn update_edge(
         &self,
         token: &NamespaceToken,
@@ -1969,7 +1967,7 @@ impl KhiveRuntime {
             edge.metadata = Some(props);
         }
 
-        // ADR-002 §134: for symmetric relations, canonicalise endpoint order and check
+        // For symmetric relations, canonicalise endpoint order and check
         // for natural-key conflicts regardless of whether endpoints were flipped.
         //
         // The raw-SQL path is used for ALL symmetric relations because `upsert_edge`
@@ -2125,8 +2123,8 @@ impl KhiveRuntime {
     /// Hard-delete an edge by id.
     ///
     /// Cascades to remove any `annotates` edges whose target is the deleted edge
-    /// (ADR-002: `annotates` is note → anything; deleting an edge target leaves
-    /// annotation edges dangling if not cleaned up). Returns `true` if the primary
+    /// (`annotates` is note → anything; deleting an edge target leaves annotation
+    /// edges dangling if not cleaned up). Returns `true` if the primary
     /// edge was removed.
     ///
     /// If `edge_id` does not refer to an edge (e.g. the caller passes an entity or
@@ -2202,14 +2200,14 @@ impl KhiveRuntime {
 
     /// Validate and construct an edge from a [`LinkSpec`] without writing to storage.
     ///
-    /// Applies the full ADR-002 contract (endpoint validation, symmetric
+    /// Applies the full edge contract (endpoint validation, symmetric
     /// canonicalization, `dependency_kind` inference and metadata validation).
     /// Returns the constructed `Edge` on success; the caller is responsible for
     /// persisting it (e.g. via `upsert_edge` or `link_many`).
     ///
     /// The `token` must be a pre-authorized namespace token from the dispatch
     /// layer. If `spec.namespace` is set it must match `token.namespace()`;
-    /// a mismatch returns `RuntimeError::InvalidInput` (ADR-007).
+    /// a mismatch returns `RuntimeError::InvalidInput`.
     pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
         let ns_str = match &spec.namespace {
             Some(s) => {
@@ -2589,7 +2587,7 @@ mod tests {
         assert_eq!(updated.relation, EdgeRelation::VariantOf);
     }
 
-    // ---- Round-5 tests: update_edge endpoint validation (ADR-002 bypass fix) ----
+    // ---- Round-5 tests: update_edge endpoint validation (bypass fix) ----
 
     // update_edge: note→entity annotates → set relation=Supersedes → InvalidInput (crossing).
     // Edge must NOT be mutated in the store.
@@ -2931,7 +2929,7 @@ mod tests {
         let found = rt.get_entity(&ns_a, entity.id).await;
         assert!(found.is_ok(), "should be visible in its own namespace");
 
-        // Different namespace: NotFound error (ADR-007 — no cross-namespace existence oracle).
+        // Different namespace: NotFound error (no cross-namespace existence oracle).
         let not_found = rt.get_entity(&ns_b, entity.id).await;
         assert!(
             not_found.is_err(),
@@ -2945,7 +2943,7 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_mismatch_error_message_is_opaque() {
-        // ADR-007 timing-oracle mitigation: the external error message must not
+        // Timing-oracle mitigation: the external error message must not
         // reveal which namespace the record actually lives in.
         let rt = rt();
         let ns_a = NamespaceToken::for_namespace(Namespace::parse("secret-ns").unwrap());
@@ -2977,7 +2975,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete from wrong namespace: NotFound (ADR-007 — no existence oracle).
+        // Delete from wrong namespace: NotFound (no existence oracle).
         let cross_ns_result = rt.delete_entity(&ns_b, entity.id, true).await;
         assert!(
             cross_ns_result.is_err(),
@@ -3003,7 +3001,7 @@ mod tests {
         assert!(deleted_ok, "same-namespace delete must succeed");
     }
 
-    // ---- Note ADR-024 tests ----
+    // ---- Note annotation tests ----
 
     #[tokio::test]
     async fn create_note_indexes_into_fts5() {
@@ -3667,7 +3665,7 @@ mod tests {
             .unwrap();
         let edge_uuid: Uuid = edge.id.into();
 
-        // Create a note and annotate the edge itself (edge is a valid substrate target per ADR-024).
+        // Create a note and annotate the edge itself (edge is a valid substrate target for annotates).
         let note = rt
             .create_note(
                 &tok,
@@ -3779,7 +3777,7 @@ mod tests {
         // harness has none, so no vector assertion is needed here.
     }
 
-    // ---- Round-3 tests: relation-aware endpoint contract (ADR-002) ----
+    // ---- Round-3 tests: relation-aware endpoint contract ----
 
     // Test #2: entity→entity with non-annotates rejects an edge UUID as target.
     #[tokio::test]
@@ -4000,7 +3998,7 @@ mod tests {
         assert_eq!(neighbors[0].node_id, event_id);
     }
 
-    // ---- Round-4 tests: supersedes same-substrate contract (ADR-019/ADR-024) ----
+    // ---- Round-4 tests: supersedes same-substrate contract ----
 
     // Headline regression: note→note supersedes must succeed (was wrongly rejected before this fix).
     #[tokio::test]
@@ -4044,7 +4042,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "note→note Supersedes must succeed (ADR-019 note supersession), got {result:?}"
+            "note→note Supersedes must succeed (note supersession), got {result:?}"
         );
     }
 
@@ -4563,8 +4561,8 @@ mod tests {
 
     // ---- Hard-delete cascade for note and edge annotation targets (fix/annotates) ----
 
-    // ADR-002:73 — annotates is note → ANYTHING (entity, note, edge, event).
-    // ADR-024:103 — targets may be entity, edge, event, or note.
+    // annotates is note → ANYTHING (entity, note, edge, event);
+    // targets may be entity, edge, event, or note.
     // Hard-deleting any of those targets must cascade incident annotates edges.
     // Soft deletes leave edges (data-vs-view rule).
 
@@ -5164,8 +5162,8 @@ mod tests {
         );
     }
 
-    // F010 (CRIT): ADR-002 base endpoint allowlist — unlisted triples must fail closed.
-    // Document->Document Extends is not in the ADR-002 table; current generic fallthrough accepts it.
+    // F010 (CRIT): base endpoint allowlist — unlisted triples must fail closed.
+    // Document->Document Extends is not in the allowlist; current generic fallthrough accepts it.
     #[tokio::test]
     async fn link_extends_document_to_document_returns_invalid_input() {
         let rt = rt();
@@ -5183,12 +5181,12 @@ mod tests {
             .await;
         assert!(
             result.is_err(),
-            "F010: document->document Extends must be rejected by ADR-002 allowlist; \
+            "F010: document->document Extends must be rejected by the base allowlist; \
              current generic entity fallthrough incorrectly accepts it"
         );
     }
 
-    // F010 happy path: Concept->Concept Extends is in the ADR-002 allowlist and must succeed.
+    // F010 happy path: Concept->Concept Extends is in the base allowlist and must succeed.
     #[tokio::test]
     async fn link_extends_concept_to_concept_succeeds() {
         let rt = rt();
@@ -5206,7 +5204,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "F010: concept->concept Extends must be allowed (ADR-002 allowlist)"
+            "F010: concept->concept Extends must be allowed (base allowlist)"
         );
     }
 
@@ -5246,7 +5244,7 @@ mod tests {
         );
     }
 
-    // F010 (ADR-002): Supersedes — positive tests for all 5 allowed entity kinds.
+    // F010: Supersedes — positive tests for all 5 allowed entity kinds.
     #[tokio::test]
     async fn f010_supersedes_document_to_document_allowed() {
         let rt = rt();
@@ -5264,7 +5262,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "document->document Supersedes must be allowed (ADR-002:191), got {result:?}"
+            "document->document Supersedes must be allowed (allowlist), got {result:?}"
         );
     }
 
@@ -5285,7 +5283,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "artifact->artifact Supersedes must be allowed (ADR-002:192), got {result:?}"
+            "artifact->artifact Supersedes must be allowed (allowlist), got {result:?}"
         );
     }
 
@@ -5306,7 +5304,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "service->service Supersedes must be allowed (ADR-002:193), got {result:?}"
+            "service->service Supersedes must be allowed (allowlist), got {result:?}"
         );
     }
 
@@ -5327,11 +5325,11 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "dataset->dataset Supersedes must be allowed (ADR-002:194), got {result:?}"
+            "dataset->dataset Supersedes must be allowed (allowlist), got {result:?}"
         );
     }
 
-    // F010 (ADR-002): Supersedes — negative tests for rejected entity kinds.
+    // F010: Supersedes — negative tests for rejected entity kinds.
     #[tokio::test]
     async fn f010_supersedes_project_to_project_rejected() {
         let rt = rt();
@@ -5349,7 +5347,7 @@ mod tests {
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
-            "project->project Supersedes must be rejected (not in ADR-002 allowlist), got {result:?}"
+            "project->project Supersedes must be rejected (not in allowlist), got {result:?}"
         );
     }
 
@@ -5370,7 +5368,7 @@ mod tests {
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
-            "person->person Supersedes must be rejected (not in ADR-002 allowlist), got {result:?}"
+            "person->person Supersedes must be rejected (not in allowlist), got {result:?}"
         );
     }
 
@@ -5391,7 +5389,7 @@ mod tests {
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
-            "org->org Supersedes must be rejected (not in ADR-002 allowlist), got {result:?}"
+            "org->org Supersedes must be rejected (not in allowlist), got {result:?}"
         );
     }
 
@@ -5413,11 +5411,11 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "concept->concept Supersedes must be allowed by ADR-002 allowlist, got {result:?}"
+            "concept->concept Supersedes must be allowed by the base allowlist, got {result:?}"
         );
     }
 
-    // F161: ADR-009 target_backend invariant — all edges written through link() must have
+    // F161: target_backend invariant — all edges written through link() must have
     // target_backend = None because validate_edge_relation_endpoints already ensured the
     // target exists locally.
     #[tokio::test]
@@ -5438,7 +5436,7 @@ mod tests {
             .unwrap();
         assert!(
             edge.target_backend.is_none(),
-            "ADR-009: target_backend must be None for locally-routed edges (F161); got {:?}",
+            "F161: target_backend must be None for locally-routed edges; got {:?}",
             edge.target_backend
         );
     }
@@ -5482,7 +5480,7 @@ mod tests {
         for edge in &edges {
             assert!(
                 edge.target_backend.is_none(),
-                "ADR-009: target_backend must be None for locally-routed edges in link_many (F161); got {:?}",
+                "F161: target_backend must be None for locally-routed edges in link_many; got {:?}",
                 edge.target_backend
             );
         }
@@ -5564,7 +5562,7 @@ mod tests {
             .await;
         assert!(
             matches!(result, Err(RuntimeError::InvalidInput(_))),
-            "concept->document Supersedes must be rejected by ADR-002 allowlist, got {result:?}"
+            "concept->document Supersedes must be rejected by the base allowlist, got {result:?}"
         );
     }
 
@@ -5587,7 +5585,7 @@ mod tests {
             .unwrap();
 
         // Attempt to delete from a different namespace must return Ok(false) —
-        // indistinguishable from absent (ADR-007, no existence oracle).
+        // indistinguishable from absent (no existence oracle).
         let result = rt.delete_note(&ns_b, note.id, true).await;
         assert!(
             !result.unwrap(),
@@ -5657,7 +5655,7 @@ mod tests {
         assert_eq!(count, 1, "upsert must not duplicate the edge row");
     }
 
-    // ── #548 regression: cross-namespace get_edge must return None (ADR-007) ──
+    // ── #548 regression: cross-namespace get_edge must return None ──
 
     #[tokio::test]
     async fn get_edge_cross_namespace_returns_none() {
@@ -5692,7 +5690,7 @@ mod tests {
             "cross-namespace get_edge must return Ok(None), got {result:?}"
         );
 
-        // ADR-007: absent and foreign edge IDs must have identical observable shape.
+        // Absent and foreign edge IDs must have identical observable shape.
         let absent = rt.get_edge(&ns_b, Uuid::new_v4()).await;
         match (&result, &absent) {
             (Ok(None), Ok(None)) => {}

@@ -4,7 +4,7 @@
 // (build_conditional_event_insert) from the methods that use it. Inline tests require
 // pub(crate) access to the worker's private SQL paths for CAS race coverage.
 
-//! ProposalsProjectionWorker — maintains the `proposals_open` projection table (ADR-046 §4).
+//! ProposalsProjectionWorker — maintains the `proposals_open` projection table.
 //!
 //! Handles the four proposal event kinds (`Created`, `Reviewed`, `Applied`, `Withdrawn`)
 //! and is the sole writer to the projection table. Handlers MUST NOT update it directly.

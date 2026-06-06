@@ -55,7 +55,7 @@ pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
                 // Already seen: a later (worse) occurrence — skip it.
                 continue;
             }
-            // rank is 1-indexed per ADR-002
+            // rank is 1-indexed: position 0 in the input list → rank 1
             let rank_1_indexed = rank_0_indexed + 1;
             let contribution = rrf_score(rank_1_indexed, k);
             let entry = combined.entry(id).or_insert(DeterministicScore::ZERO);

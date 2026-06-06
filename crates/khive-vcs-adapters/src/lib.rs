@@ -1,6 +1,6 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! KG import/export format adapters (ADR-036). See `docs/protocol.md` for the
+//! KG import/export format adapters. See `docs/protocol.md` for the
 //! full pipeline description, parse strategy notes, and deferred format list.
 
 mod error;

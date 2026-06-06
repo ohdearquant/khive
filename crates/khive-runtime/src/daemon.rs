@@ -1,4 +1,4 @@
-//! khived daemon server — persistent warm runtime over a Unix socket (ADR-049).
+//! khived daemon server — persistent warm runtime over a Unix socket.
 //!
 //! The daemon binds `~/.khive/khived.sock`, accepts length-prefixed request
 //! frames, dispatches them through a [`DaemonDispatch`] implementor, and serves

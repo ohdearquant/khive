@@ -1,4 +1,4 @@
-//! `DeterministicScore` — f64-to-i64 fixed-point scoring with cross-platform determinism (ADR-006).
+//! `DeterministicScore` — f64-to-i64 fixed-point scoring with cross-platform determinism.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, Div, Mul, Sub};
 
-/// Fixed-point score with cross-platform deterministic ordering (ADR-006).
+/// Fixed-point score with cross-platform deterministic ordering.
 ///
 /// Wraps an `i64` scaled by `2^32`; use [`from_f64`][Self::from_f64] /
 /// [`to_f64`][Self::to_f64] to convert, and prefer arithmetic methods to raw
@@ -53,7 +53,7 @@ impl DeterministicScore {
     /// # Warning
     ///
     /// Passing `i64::MIN` constructs the reserved `MIN` sentinel, which violates
-    /// the "runtime values exclude MIN" proof boundary (ADR-006).  Serialized
+    /// the "runtime values exclude MIN" proof boundary.  Serialized
     /// data from untrusted sources MUST NOT use this constructor.
     ///
     /// Prefer [`from_raw_saturating`][Self::from_raw_saturating] (maps `i64::MIN`

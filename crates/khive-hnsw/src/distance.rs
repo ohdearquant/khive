@@ -34,7 +34,7 @@ pub(crate) fn cosine_distance_from_parts(dot: f32, a_norm: f32, b_norm: f32) -> 
 /// Compute distance between two vectors.
 /// Returns distance (lower = more similar) for heap operations.
 ///
-/// Uses SIMD-accelerated implementations from khive-embed (ADR-002).
+/// Uses SIMD-accelerated implementations from lattice-embed.
 #[inline]
 pub fn compute_distance(
     a: &[f32],
@@ -49,8 +49,6 @@ pub fn compute_distance(
 
     match metric {
         DistanceMetric::Cosine => {
-            // ADR-002: khive-embed is the SIMD foundation layer
-            //
             // **PROOF CORRESPONDENCE**: khive.Retrieval.Cosine.cosine_sim_bounded
             // Cosine similarity is bounded: -1 <= cos(x,y) <= 1 for unit vectors
             //
@@ -61,12 +59,9 @@ pub fn compute_distance(
         }
         DistanceMetric::Dot => {
             // Negate for min-heap (higher dot = lower distance)
-            // ADR-002: lattice-embed is the SIMD foundation layer
             -lattice_embed::simd::dot_product(a, b)
         }
         DistanceMetric::L2 => {
-            // ADR-002: lattice-embed is the SIMD foundation layer
-            //
             // **PROOF CORRESPONDENCE**: khive.Retrieval.Distance.euclidean_nonneg
             // Euclidean distance is non-negative: d(x,y) >= 0
             //

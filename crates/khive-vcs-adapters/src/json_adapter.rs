@@ -1,6 +1,6 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! JSON array format adapter (ADR-036 §2 "JSON array").
+//! JSON array format adapter.
 
 use crate::adapter::FormatAdapter;
 use crate::error::AdapterError;
@@ -58,7 +58,7 @@ impl JsonFormatAdapter {
             };
 
             // Normalise keys to lowercase once for dispatch detection.
-            // Case-insensitive per ADR-036 §2: "maps keys … case-insensitively".
+            // Keys are matched case-insensitively.
             let has_source = obj.keys().any(|k| {
                 let l = k.to_ascii_lowercase();
                 l == "source" || l == "from"
@@ -126,7 +126,7 @@ fn parse_entity(
     mut obj: serde_json::Map<String, Value>,
     warnings: &mut Vec<String>,
 ) -> Result<EntityRecord, AdapterError> {
-    // Required: name (case-insensitive per ADR-036 §2)
+    // Required: name (case-insensitive)
     let name = match remove_ci(&mut obj, "name") {
         Some((_, Value::String(s))) if !s.is_empty() => s,
         Some(_) => {
@@ -144,7 +144,7 @@ fn parse_entity(
         }
     };
 
-    // Required: kind — must be one of the 8 ADR-001 canonical kinds (case-insensitive).
+    // Required: kind — must be one of the 8 canonical entity kinds (case-insensitive).
     // Missing kind is a fatal error; callers must supply an explicit kind.
     let kind = match remove_ci(&mut obj, "kind") {
         Some((_, Value::String(s))) if !s.is_empty() => EntityKind::from_str(&s)
@@ -232,7 +232,7 @@ fn parse_entity(
         None => serde_json::Map::new(),
     };
 
-    // All remaining keys fold into properties (ADR-036 §2: "All other keys collect into properties")
+    // All remaining keys fold into properties.
     for (k, v) in obj {
         properties.insert(k, v);
     }
@@ -268,7 +268,7 @@ fn parse_edge(
             field: "target".into(),
         })?;
 
-    // Required: relation — must be one of the 15 ADR-002 canonical relations (case-insensitive).
+    // Required: relation — must be one of the 15 canonical edge relations (case-insensitive).
     let relation = match remove_ci(&mut obj, "relation") {
         Some((_, Value::String(s))) if !s.is_empty() => EdgeRelation::from_str(&s)
             .map_err(|_| AdapterError::UnknownRelation {
@@ -310,7 +310,7 @@ fn parse_edge(
         None => Uuid::new_v4(),
     };
 
-    // Optional: weight — must be finite and in [0.0, 1.0] per ADR-002 edge weight invariant.
+    // Optional: weight — must be finite and in [0.0, 1.0].
     let weight = match remove_ci(&mut obj, "weight") {
         Some((_, Value::Number(n))) => {
             let w = n.as_f64().ok_or_else(|| AdapterError::InvalidField {

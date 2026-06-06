@@ -1,4 +1,4 @@
-//! Substrate discriminant — the 3 data types in khive (ADR-004).
+//! Substrate discriminant — the 3 data types in khive.
 //!
 //! Full substrate structs live in the sibling modules (`note`, `entity`,
 //! `event`). This module provides the discriminant for typed dispatch and
@@ -7,7 +7,7 @@
 use core::fmt;
 use core::str::FromStr;
 
-/// The 3 substrate types in khive OSS (ADR-004).
+/// The 3 substrate types in khive OSS.
 ///
 /// - **Note**: temporal-referential records (observations, insights, decisions)
 /// - **Entity**: graph nodes with properties and typed links

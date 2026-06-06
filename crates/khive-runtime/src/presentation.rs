@@ -1,4 +1,4 @@
-//! Verb response presentation modes and transformation (ADR-045).
+//! Verb response presentation modes and transformation.
 //!
 //! Transforms canonical handler output into caller-appropriate form after dispatch
 //! and before wire serialization. `Agent` mode abbreviates UUIDs/timestamps and drops
@@ -11,7 +11,6 @@ use serde_json::{Map, Value};
 
 /// Convert a microsecond epoch `i64` to an RFC 3339 / ISO-8601 string.
 ///
-/// ADR-045 §5 handler invariant: "Use full ISO-8601 timestamps."
 /// Entity and Note storage uses `i64` microseconds internally; this is the
 /// single conversion point before any field reaches the MCP boundary.
 ///
@@ -22,7 +21,7 @@ pub fn micros_to_iso(micros: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-/// How the response envelope is presented to the caller (ADR-045).
+/// How the response envelope is presented to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PresentationMode {
@@ -43,15 +42,12 @@ pub enum PresentationMode {
     /// canonical JSON is returned unchanged. Terminal formatting (relative
     /// timestamps, glyph substitution, table layout) is applied by the CLI
     /// layer (`khive-cli::format::pretty`), not the MCP response pipeline.
-    ///
-    /// See module-level doc for full rationale (ADR-045 C3 design decision).
     Human,
 }
 
 /// Lifecycle `null` fields that are PRESERVED in Agent mode even when null.
 ///
 /// These fields carry lifecycle meaning (absent ≠ null) and must not be dropped.
-/// ADR-045 §3 Agent mode — "Drop semantics — lifecycle null preservation".
 const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
     "completed_at",
     "deleted_at",
@@ -68,8 +64,6 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
 ];
 
 /// Score field names that are truncated to 3 significant figures in Agent mode.
-///
-/// ADR-045 §3 Agent mode — "Score truncation".
 const SCORE_FIELDS: &[&str] = &[
     "score",
     "salience",

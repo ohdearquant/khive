@@ -4,7 +4,7 @@
 // reranking, and scoring are deeply coupled through shared intermediate types (NoteCandidate,
 // RerankFeatures, ScoreBreakdown). Splitting into sub-modules would require pub(crate)
 // exports of dozens of internal types that are intentionally private, and would fragment
-// the pipeline in a way that makes ADR-021/ADR-033 contract auditing harder. Refactoring
+// the pipeline in a way that makes contract auditing harder. Refactoring
 // is tracked as a longer-term work item; this file should not grow beyond its current size.
 
 use std::collections::{HashMap, HashSet};
@@ -803,7 +803,7 @@ impl MemoryPack {
         // Determine which embedding models to query.
         //   - explicit embedding_model → query only that model (single-model path)
         //   - is_cjk + multilingual model registered → prefer the multilingual model
-        //     (ADR-043: CJK routing is only meaningful when the model is present)
+        //     (CJK routing is only meaningful when the multilingual model is present)
         //   - None + models configured → query ALL registered models in parallel
         //   - None + no model configured → skip vector search
         let mut cjk_routed = false;
@@ -820,7 +820,7 @@ impl MemoryPack {
                 // No models configured at all — skip vector search.
                 vec![]
             } else if is_cjk {
-                // CJK routing (ADR-043): when the query is primarily CJK, prefer
+                // CJK routing: when the query is primarily CJK, prefer
                 // the multilingual model. Detect it from the explicit config field
                 // (scoring_cfg.cjk_model) or by matching registered names against
                 // known multilingual substrings. Fall back to all models when no
@@ -1100,7 +1100,7 @@ impl MemoryPack {
             Some(v) => v,
             None => 0.5,
         };
-        // F108: decay_factor must be finite and >= 0; no upper clamp per ADR-021.
+        // F108: decay_factor must be finite and >= 0; no upper clamp required.
         // NaN and Infinity are rejected because they would corrupt decay calculations.
         let decay_factor = match p.decay_factor {
             Some(v) if !v.is_finite() || v < 0.0 => {
@@ -1112,7 +1112,7 @@ impl MemoryPack {
             None => 0.01,
         };
 
-        // F107: always write memory_type to properties (ADR-021 §4, default "episodic")
+        // F107: always write memory_type to properties (default "episodic")
         let mut props = json!({ "memory_type": memory_type });
         if let Some(tags) = &p.tags {
             if !tags.is_empty() {
@@ -1268,7 +1268,7 @@ impl MemoryPack {
         if let Some(ref fs) = p.fusion_strategy {
             let mut new_strategy = parse_fusion_strategy_str(fs)?;
             // "weighted" in the request means "use weighted fusion" — the actual
-            // weight values come from pack config, not the request (ADR-033 §6.1).
+            // weight values come from pack config, not the request.
             if let (
                 FusionStrategy::Weighted {
                     weights: ref mut new_w,
@@ -1541,7 +1541,7 @@ impl MemoryPack {
                 age_days_f64,
             );
 
-            // ADR-033 §6: when reranker_weights is set, it replaces the archive score.
+            // When reranker_weights is set, it replaces the archive score.
             let source = source_by_id.get(&id).copied().unwrap_or(SearchSource::Text);
             let final_score = if !cfg.reranker_weights.is_empty() {
                 let features = RerankFeatures {
@@ -1559,7 +1559,7 @@ impl MemoryPack {
             // Absolute relevance: raw cosine if available, else composite score.
             let raw_score_opt = raw_vec_scores.get(&id).copied();
             let absolute_relevance = raw_score_opt.unwrap_or(final_score).clamp(0.0, 1.0);
-            // ADR-021 §5 / ADR-033: score field must be in [0, 1].
+            // score field must be in [0, 1].
             debug_assert!(
                 absolute_relevance <= 1.0,
                 "score violates [0,1] contract: {absolute_relevance}"
@@ -1621,7 +1621,7 @@ impl MemoryPack {
         //
         // Two complementary mechanisms (codex High #3, PR #469):
         //
-        // 1. Graph-edge check (primary — the khive contract per ADR-002):
+        // 1. Graph-edge check (primary — the khive edge-ontology contract):
         //    Any candidate note with an inbound `supersedes` edge is stale.
         //    This is the same mechanism used by `search_notes` in the runtime.
         //    Agents create supersession via `link(source=new, target=old, relation="supersedes")`.
@@ -1800,7 +1800,7 @@ impl MemoryPack {
         to_json(&results)
     }
 
-    // ── Dotted sub-handlers (ADR-062) ──────────────────────────────────────────
+    // ── Dotted sub-handlers ───────────────────────────────────────────────────
 
     pub(crate) async fn handle_recall_embed(&self, params: Value) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
@@ -2060,7 +2060,7 @@ impl MemoryPack {
         }))
     }
 
-    /// Apply the weighted feature-combination reranker to fused candidates (ADR-033 §6, PR #375).
+    /// Apply the weighted feature-combination reranker to fused candidates (PR #375).
     ///
     /// Each candidate may carry optional feature fields in addition to the
     /// required `note_id`. Supported fields (all optional, default 0.0):
@@ -2615,7 +2615,7 @@ mod tests {
     #[test]
     fn compute_score_exponential_decay_at_decay_factor_half_life() {
         // Use explicit exponential decay config — not relying on default decay_model.
-        // ADR-021 §5: salience_decayed = salience * exp(-decay_factor * age_days)
+        // exponential decay: salience_decayed = salience * exp(-decay_factor * age_days)
         // At age = ln(2)/0.01 ≈ 69.3 days: salience_decayed ≈ 0.5
         let cfg = RecallConfig {
             decay_model: DecayModel::Exponential,
@@ -2736,7 +2736,7 @@ mod tests {
 
     #[test]
     fn remember_params_decay_factor_above_one_accepted() {
-        // ADR-021 only requires decay_factor >= 0; no upper cap
+        // decay_factor requires only >= 0; no upper cap
         let df: f64 = 2.5;
         let result: Result<f64, RuntimeError> = if df < 0.0 {
             Err(RuntimeError::InvalidInput("negative".into()))

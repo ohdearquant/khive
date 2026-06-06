@@ -82,8 +82,12 @@ src/
 ├── tokenizer.rs        SimpleTokenizer + Tokenizer trait
 ├── tests.rs            Inline tests (internal field access)
 └── index/
-    ├── mod.rs           Bm25Index struct, serde, DocumentId, PostingList
-    ├── indexing.rs      index_document, remove_document, reindex
+    ├── mod.rs           Thin shim — module declarations and re-exports
+    ├── core.rs          Bm25Index struct, constructors, public methods, serde
+    ├── document_id.rs   DocumentId newtype with serde and wire-format tests
+    ├── posting.rs       PostingList, BlockMaxBlock, BlockMaxState
+    ├── scoring.rs       IdfCache, Bm25TermScorer, Bm25Stats, scoring helpers
+    ├── indexing.rs      index_document, remove_document
     ├── memory.rs        Memory budget enforcement
     └── search/
         ├── mod.rs       SearchContext, main search dispatch, WAND loop

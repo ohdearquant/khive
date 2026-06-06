@@ -1,15 +1,15 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! Adapter error type (ADR-036).
+//! Adapter error type.
 
 use thiserror::Error;
 
 /// An error produced by a format adapter.
 ///
-/// Per ADR-036 §6, fatal errors (missing required fields, structural failures)
-/// are non-recoverable: the adapter aborts and the caller must handle the error
-/// atomically. Non-fatal issues (unknown but non-required fields) are warnings
-/// reported in the import summary.
+/// Fatal errors (missing required fields, structural failures) are non-recoverable:
+/// the adapter aborts and the caller must handle the error atomically. Non-fatal
+/// issues (unknown but non-required fields) are warnings reported in the import
+/// summary.
 #[derive(Debug, Error)]
 pub enum AdapterError {
     /// A required field is missing from a record.
@@ -32,9 +32,9 @@ pub enum AdapterError {
     #[error("record {index}: unknown entity kind '{kind}'")]
     UnknownKind { index: usize, kind: String },
 
-    /// An edge relation is not in the ADR-002 closed set.
+    /// An edge relation is not in the closed set of 15 canonical relations.
     ///
-    /// This is always an error regardless of `--schema-mode` (ADR-036 §4).
+    /// This is always an error regardless of `--schema-mode`.
     #[error("record {index}: unknown edge relation '{relation}'")]
     UnknownRelation { index: usize, relation: String },
 

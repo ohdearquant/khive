@@ -1,4 +1,4 @@
-//! Full-text search capability (ADR-024).
+//! Full-text search capability.
 
 use async_trait::async_trait;
 use uuid::Uuid;

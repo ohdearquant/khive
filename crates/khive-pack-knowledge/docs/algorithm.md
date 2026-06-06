@@ -10,17 +10,16 @@ query decomposition.
 For each candidate atom/domain, the score is a weighted sum of per-field TF scores multiplied
 by the global IDF of each query term:
 
-```
-score = sum_terms(idf(term) * (
-    w_exact_name  * exact_match(term, name)  +
-    w_name        * tf(term, name)           +
-    w_description * tf(term, description)   +
-    w_tags        * tf(term, tags)           +
-    w_content     * tf(term, content)        +
-    w_bigram      * bigram_match(term, name) +
-    coverage_alpha * coverage_bonus
-))
-```
+$$
+\text{score} = \sum_{t \in \text{terms}} \mathrm{idf}(t) \cdot \Bigl(
+    w_{\text{exact\_name}} \cdot \mathrm{exact}(t, \text{name})
+  + w_{\text{name}} \cdot \mathrm{tf}(t, \text{name})
+  + w_{\text{desc}} \cdot \mathrm{tf}(t, \text{description})
+  + w_{\text{tags}} \cdot \mathrm{tf}(t, \text{tags})
+  + w_{\text{content}} \cdot \mathrm{tf}(t, \text{content})
+  + w_{\text{bigram}} \cdot \mathrm{bigram}(t, \text{name})
+\Bigr) \cdot \text{coverage}^{\alpha}
+$$
 
 Default weights: `w_exact_name=5.0`, `w_name=3.0`, `w_description=1.5`, `w_tags=1.25`,
 `w_content=1.0`, `w_bigram=2.0`, `expand_discount=0.35`, `coverage_alpha=0.5`.
@@ -36,18 +35,23 @@ appear in multiple sub-query results receive an `intersection_bonus` (default 0.
 When `rerank=true` (default) and an embedder is configured, the top candidates from TF-IDF
 are reranked by cosine similarity between the query embedding and atom content embeddings:
 
-```
-final_score = rerank_alpha * norm_tfidf + (1 - rerank_alpha) * cosine_sim
-```
+$$
+\text{final\_score} = \alpha \cdot \hat{s}_{\text{tfidf}} + (1 - \alpha) \cdot \cos(\mathbf{q}, \mathbf{d})
+$$
 
-Default `rerank_alpha=0.7` (TF-IDF dominant). The TF-IDF score is normalized to [0, 1] by
-dividing by the maximum TF-IDF score in the candidate set before blending.
+where $\alpha$ = `rerank_alpha` (default 0.7, TF-IDF dominant) and $\hat{s}_{\text{tfidf}}$
+is the TF-IDF score normalized to $[0, 1]$ by dividing by the maximum TF-IDF score in the
+candidate set.
 
 ### Vamana ANN Signal
 
 In parallel with TF-IDF, if a Vamana ANN index is warm (populated via `knowledge.index
 rebuild_ann=true`), the query embedding is also used for ANN search. ANN hits are fused with
-TF-IDF hits via RRF (Reciprocal Rank Fusion) with k=60.
+TF-IDF hits via RRF (Reciprocal Rank Fusion) with $k = 60$:
+
+$$
+\mathrm{RRF}(d) = \sum_{r \in \text{rankers}} \frac{1}{k + \mathrm{rank}_r(d)}
+$$
 
 ## Fold (`knowledge.fold`)
 

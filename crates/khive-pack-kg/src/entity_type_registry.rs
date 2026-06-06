@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use khive_types::EntityKind;
 
-use crate::RuntimeError;
+use khive_runtime::RuntimeError;
 
 /// One entry in the registry: a canonical subtype name for a specific kind,
 /// together with any accepted aliases.
@@ -81,7 +81,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
     },
     EntityTypeDef {
         kind: EntityKind::Concept,
-        // ADR-001: "model" is the alias; canonical name is "model_family"
+        // "model" is the alias; canonical name is "model_family"
         // to distinguish from a Dataset or Artifact trained model instance.
         type_name: "model_family",
         aliases: &["model"],
@@ -117,7 +117,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         aliases: &["loss"],
     },
     // ── Dataset ──────────────────────────────────────────────────────────────
-    // ADR-001: benchmark belongs to Dataset, not Concept.
+    // benchmark belongs to Dataset, not Concept (it evaluates models, it is not itself a concept).
     EntityTypeDef {
         kind: EntityKind::Dataset,
         type_name: "benchmark",
@@ -149,8 +149,8 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         aliases: &["synthetic"],
     },
     // ── Project ─────────────────────────────────────────────────────────────
-    // ADR-001 Project subtypes: library, framework, tool, application, repository.
-    // "service" and "svc" are removed — EntityKind::Service handles running
+    // Project subtypes: library, framework, tool, application, repository.
+    // "service" and "svc" are omitted — EntityKind::Service handles running
     // instances; a service codebase repo is Project + application or tool.
     EntityTypeDef {
         kind: EntityKind::Project,
@@ -245,7 +245,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         aliases: &[],
     },
     // ── Service ──────────────────────────────────────────────────────────────
-    // ADR-001 Service subtypes: inference_engine, retrieval_engine,
+    // Service subtypes: inference_engine, retrieval_engine,
     // embedding_engine, api, database, search_engine, mcp_server.
     EntityTypeDef {
         kind: EntityKind::Service,
@@ -282,7 +282,7 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         type_name: "mcp_server",
         aliases: &["mcp"],
     },
-    // Person  — no standard subtypes (roles are metadata, not subtypes per ADR-001).
+    // Person  — no standard subtypes (roles are metadata, not subtypes).
 ];
 
 /// Resolved output of [`EntityTypeRegistry::resolve`].
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn benchmark_is_dataset_not_concept() {
-        // F3 fix: benchmark moved from Concept to Dataset per ADR-001.
+        // F3 fix: benchmark belongs to Dataset, not Concept (it evaluates, it is not a concept).
         let r = reg();
         let res = r
             .resolve(EntityKind::Dataset, Some("benchmark"))
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn model_alias_resolves_to_model_family() {
-        // F3 fix: "model" is an alias for "model_family" per ADR-001.
+        // F3 fix: "model" is an accepted alias for the canonical name "model_family".
         let r = reg();
         let res = r
             .resolve(EntityKind::Concept, Some("model"))

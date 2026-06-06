@@ -56,8 +56,8 @@ fn pack(rt: KhiveRuntime) -> Fixture {
     builder.register(KgPack::new(rt.clone()));
     builder.register(GtdPack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
-    // Mirror what the MCP transport does at startup (ADR-031): install
-    // pack-declared edge endpoint rules so validation can consult them.
+    // Mirror what the MCP transport does at startup: install pack-declared
+    // edge endpoint rules so validation can consult them.
     rt.install_edge_rules(registry.all_edge_rules());
     Fixture { registry }
 }
@@ -376,7 +376,7 @@ async fn assign_creates_depends_on_edge_between_tasks() {
     let targets: Vec<_> = neighbors.iter().map(|hit| hit.node_id).collect();
     assert!(
         targets.contains(&blocker_uuid),
-        "ADR-031: task→task depends_on edge should exist; got targets {targets:?}"
+        "task→task depends_on edge should exist; got targets {targets:?}"
     );
 }
 
@@ -389,7 +389,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
 
     // Create a non-task note via runtime (e.g. an observation). The GTD edge
     // rule allows task→task only — task→observation should fail upfront so
-    // the task is never persisted (ADR-030: no failure after successful write).
+    // the task is never persisted (no failure after successful write invariant).
     let other = rt
         .create_note(
             &rt.authorize(Namespace::local()).unwrap(),
@@ -414,7 +414,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
     let msg = err.to_string();
     assert!(
         msg.contains("must be a task note"),
-        "expected ADR-031 pack-rule rejection; got: {msg}"
+        "expected pack edge-rule rejection (task→task only); got: {msg}"
     );
 
     // Atomicity: the rejected `assign` must not leave a task row behind.
@@ -443,7 +443,7 @@ async fn assign_rejects_depends_on_when_target_is_non_task_note() {
     );
 }
 
-// ── ADR-004 / ADR-019 cluster-15 tests ───────────────────────────────────────
+// ── NoteKindSpec + lifecycle audit tests ─────────────────────────────────────
 
 /// F100: GtdPack exposes a schema_plan() returning the gtd_lifecycle_audit DDL.
 #[tokio::test]
@@ -483,7 +483,7 @@ async fn verb_registry_aggregates_schema_plans() {
     );
 }
 
-/// F100 + ADR-004: GtdPack exposes NoteKindSpec for the task kind with lifecycle.
+/// F100: GtdPack exposes NoteKindSpec for the task kind with lifecycle.
 #[tokio::test]
 async fn pack_runtime_exposes_note_kind_spec_for_task() {
     use khive_runtime::PackRuntime;
@@ -499,10 +499,11 @@ async fn pack_runtime_exposes_note_kind_spec_for_task() {
         .find(|s| s.kind == "task")
         .expect("GtdPack must have NoteKindSpec for 'task'");
 
-    // ADR-004: lifecycle field must be "kind_status", NOT "status".
+    // Lifecycle field must be "kind_status", NOT "status" (avoids collision
+    // with NoteStatus, which is a row-visibility field).
     assert_eq!(
         task_spec.lifecycle.field, "kind_status",
-        "ADR-004: lifecycle field must be 'kind_status' to avoid collision with NoteStatus"
+        "lifecycle field must be 'kind_status' to avoid collision with NoteStatus"
     );
     assert_eq!(
         task_spec.lifecycle.initial, "inbox",
@@ -529,7 +530,7 @@ async fn verb_registry_aggregates_note_kind_specs() {
     );
 }
 
-/// ADR-004: lifecycle transitions in NoteKindSpec match the runtime schema.
+/// Lifecycle transitions declared in NoteKindSpec must match the runtime schema.
 #[tokio::test]
 async fn note_kind_spec_transitions_match_runtime_schema() {
     use khive_pack_gtd::schema::{can_transition, is_terminal};

@@ -1,4 +1,4 @@
-//! Note substrate — temporal-referential records (ADR-004, ADR-013).
+//! Note substrate — temporal-referential records used throughout khive.
 
 extern crate alloc;
 use alloc::collections::BTreeMap;

@@ -4,7 +4,7 @@
 // into sub-modules would fragment the sequential flow that must be read and reasoned about as a
 // unit. The inline test section requires access to private helpers and internal state.
 
-//! ProposalApplyWorker — applies approved proposal changesets to the KG (ADR-046 §5).
+//! ProposalApplyWorker — applies approved proposal changesets to the KG.
 //!
 //! Called from `handle_review` when the approval threshold is met. Reads the
 //! changeset from the event log, dispatches each arm to the runtime API, emits
@@ -71,7 +71,7 @@ impl WriteBudget {
 /// Count the total number of `AddEntity` + `AddNote` steps in a changeset tree.
 ///
 /// Used for the pre-flight budget check in `maybe_apply` to guarantee zero rows
-/// are written when the budget would be exceeded (ADR-046 §2 all-or-nothing).
+/// are written when the budget would be exceeded (all-or-nothing guarantee).
 fn count_new_entries(changeset: &ProposalChangeset) -> u64 {
     match changeset {
         ProposalChangeset::AddEntity { .. } => 1,
@@ -124,7 +124,7 @@ impl ProposalApplyWorker {
         };
 
         // Only apply when: status='approved', no rejects.
-        // ADR-046 §6: v1 threshold = 1 approve, no recorded reject.
+        // v1 approval threshold = 1 approve, no recorded reject.
         if row.status != "approved" || row.reject_count > 0 {
             return Ok(());
         }
@@ -145,7 +145,7 @@ impl ProposalApplyWorker {
         // supplied budget, emit ProposalApplied{Failed} and return — no KG writes occur,
         // no CAS transition happens, and status remains 'approved' for future retries.
         // This guarantees zero entity/note rows are written when the budget is exceeded
-        // (ADR-046 §2 all-or-nothing contract).
+        // (all-or-nothing contract).
         if let Some(max) = max_new_entries {
             let needed = count_new_entries(&changeset);
             if needed > max {
@@ -176,13 +176,13 @@ impl ProposalApplyWorker {
         // If the CAS fails here it means: (a) a concurrent withdraw already moved to
         // 'withdrawn', (b) another apply worker won the race (shouldn't happen in v1's
         // synchronous call-from-review model), or (c) the status changed for another
-        // reason.  In all cases we abort without any KG mutation — ADR-046 §9.
+        // reason.  In all cases we abort without any KG mutation.
         let claimed = self.projection.pre_apply_cas(token, proposal_id).await?;
         if !claimed {
             tracing::debug!(
                 proposal_id = %proposal_id,
                 "ProposalApplyWorker: pre-apply CAS missed — proposal already in \
-                 non-approved state (withdrawn or applied concurrently); skipping (ADR-046 §9)"
+                 non-approved state (withdrawn or applied concurrently); skipping"
             );
             return Ok(());
         }
@@ -233,7 +233,7 @@ impl ProposalApplyWorker {
             Err(e) => {
                 self.emit_apply_failed(token, proposal_id, e.to_string(), 0)
                     .await;
-                // ADR-046 §9: failed applies leave status='applying' — revert to 'approved'
+                // Failed applies leave status='applying' — revert to 'approved'
                 // so the proposal is not stuck.  Best-effort; log on failure.
                 if let Err(e2) = self
                     .projection
@@ -368,7 +368,7 @@ impl ProposalApplyWorker {
     ) -> Result<Vec<Uuid>, RuntimeError> {
         let kind = draft.kind.as_str();
 
-        // C2: Validate kind against the closed entity-kind taxonomy (ADR-001).
+        // C2: Validate kind against the closed entity-kind taxonomy.
         // Direct `create` rejects invalid kinds; the apply worker must enforce the
         // same invariant so proposals cannot bypass taxonomy validation.
         EntityKind::from_str(kind).map_err(|_| {
@@ -850,7 +850,7 @@ mod tests {
         ensure_schema(&rt).await;
 
         let proposal_id = Uuid::new_v4();
-        // Changeset references an invalid entity kind that is not in ADR-001.
+        // Changeset references an invalid entity kind (not in the closed taxonomy).
         let changeset = ProposalChangeset::AddEntity {
             entity: EntityDraft {
                 kind: "invalidkind".to_string(),

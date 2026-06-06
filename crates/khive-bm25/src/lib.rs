@@ -1,7 +1,7 @@
 //! BM25 (Okapi BM25) keyword index.
 //!
 //! Term frequency-based relevance scoring with Block-Max WAND acceleration.
-//! See ADR-003 for configuration and `docs/usage.md` for formula, examples, and ID bridging.
+//! See `docs/usage.md` for formula, examples, and ID bridging.
 
 pub mod error;
 pub mod metrics;

@@ -1,10 +1,10 @@
-//! Parameter type for the single `request` MCP tool (ADR-016 + ADR-045).
+//! Parameter type for the single `request` MCP tool.
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 /// Input for `request` — a DSL string (function-call or JSON form) plus
-/// optional presentation controls (ADR-045).
+/// optional presentation controls (`presentation` and `presentation_per_op`).
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RequestParams {
     /// One or more operations as a function-call DSL or JSON-form string.
@@ -18,11 +18,11 @@ pub struct RequestParams {
     ///
     /// Max 100 operations per batch.
     #[schemars(
-        description = "Function-call DSL or JSON-form batch (ADR-016). See request tool description."
+        description = "Function-call DSL or JSON-form batch. See request tool description."
     )]
     pub ops: String,
 
-    /// Presentation mode for the response (ADR-045).
+    /// Presentation mode for the response.
     ///
     /// - `"agent"` (default): token-efficient — short UUIDs, compact timestamps,
     ///   empty fields dropped.
@@ -34,7 +34,7 @@ pub struct RequestParams {
     #[schemars(description = "Presentation mode: \"agent\" (default), \"verbose\", or \"human\"")]
     pub presentation: Option<String>,
 
-    /// Per-operation presentation overrides (ADR-045).
+    /// Per-operation presentation overrides.
     ///
     /// When provided, entries override `presentation` per op by index.
     /// `null` entries fall back to the batch-level `presentation`.

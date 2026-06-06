@@ -3,7 +3,7 @@
 // weight_events schema; splitting them would duplicate schema definitions and connection
 // wiring. The drift-metrics sub-functions (jaccard_stability_7d, atom_rank_variance,
 // adjustment_rate_per_day) are tightly coupled to the same table and cannot be moved
-// without duplicating the SQL helpers. Co-location is intentional and reviewed by ADR-030.
+// without duplicating the SQL helpers. Co-location is intentional.
 
 //! Temporal replay APIs — Three Observables Feedback Loop (Phase 3).
 //!
@@ -56,7 +56,7 @@ use uuid::Uuid;
 use crate::persist::PersistError as EngineError;
 use crate::weights::WEIGHT_FLOOR;
 // TODO(port-engine): EmbeddedEngine not yet in khive-retrieval scope; stub for compilation.
-// Tracked: port blocked on khive-inference crate landing; see ADR-030 §"engine" integration point.
+// Tracked: port blocked on khive-inference crate landing.
 // REASON: type alias is referenced by `#[cfg(feature = "engine")]` items that are not compiled by default
 #[allow(dead_code)]
 type EmbeddedEngine = ();

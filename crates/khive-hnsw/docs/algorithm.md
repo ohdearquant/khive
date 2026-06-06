@@ -14,9 +14,9 @@ Hierarchical Navigable Small World graphs", IEEE TPAMI (2018).
 
 ## Complexity
 
-- Insert: `O(log N)` amortized
-- Search: `O(log N)` for the upper layers + `O(ef)` for the base layer scan
-- Space: `O(N × M)` where `M` is the maximum connections per node
+- Insert: $O(\log N)$ amortized
+- Search: $O(\log N)$ for the upper layers + $O(ef)$ for the base layer scan
+- Space: $O(N \times M)$ where $M$ is the maximum connections per node
 
 ## Key Parameters (HnswConfig)
 

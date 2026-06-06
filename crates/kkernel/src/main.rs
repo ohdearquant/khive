@@ -1,15 +1,15 @@
 //! `kkernel` binary — khive admin/management Rust CLI.
 //!
-//! See [ADR-003](../../docs/adr/ADR-003-system-architecture.md) for the
-//! kernel/MCP split rationale.
+//! The kernel/MCP split keeps admin and infrastructure operations out of the
+//! MCP surface.
 //!
 //! Subcommands:
 //!
 //! - `sync`    — build a queryable SQLite DB from NDJSON sources (issue #174)
 //! - `pack`    — introspect registered packs (`list`, `handler <name>`)
-//! - `kg`      — KG validation, init, hook management (ADR-034, ADR-035)
-//! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check (ADR-043)
-//! - `vector`  — vector store capabilities and orphan sweep (ADR-044)
+//! - `kg`      — KG validation, init, hook management
+//! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check
+//! - `vector`  — vector store capabilities and orphan sweep
 //! - `reindex` — rebuild embedding vectors for entities and notes
 //! - `backend` — inspect registered backends (`list`, `info <name>`)
 //!
@@ -28,7 +28,7 @@ use kkernel::{coordinator::BackendRegistry, engine, kg, pack_introspect, reindex
 #[command(
     name = "kkernel",
     version,
-    about = "khive kernel — admin/management Rust binary (ADR-027)"
+    about = "khive kernel — admin/management Rust binary"
 )]
 struct Args {
     /// Log level for stderr output. JSON results go to stdout regardless.
@@ -48,37 +48,37 @@ enum Command {
     #[command(subcommand)]
     Pack(PackCommand),
 
-    /// KG validation, init, and hook management (ADR-034, ADR-035).
+    /// KG validation, init, and hook management.
     #[command(subcommand)]
     Kg(kg::KgCommand),
 
-    /// Schema migration lifecycle: migrate and check (ADR-015).
+    /// Schema migration lifecycle: migrate and check.
     #[command(subcommand)]
     Db(DbCommand),
 
-    /// Embedding model lifecycle: list, status, migrate, drift-check (ADR-043).
+    /// Embedding model lifecycle: list, status, migrate, drift-check.
     #[command(subcommand)]
     Engine(engine::EngineCommand),
 
-    /// Vector store capabilities and orphan sweep (ADR-044).
+    /// Vector store capabilities and orphan sweep.
     #[command(subcommand)]
     Vector(vector::VectorCommand),
 
     /// Re-embed all entities and notes using the configured embedding model.
     Reindex(reindex::ReindexArgs),
 
-    /// Inspect registered backends (ADR-009, ADR-028).
+    /// Inspect registered backends.
     #[command(subcommand)]
     Backend(BackendCommand),
 }
 
-/// Database schema lifecycle subcommands (ADR-015).
+/// Database schema lifecycle subcommands.
 #[derive(Subcommand, Debug)]
 enum DbCommand {
-    /// Apply any pending schema migrations to the configured database (ADR-015).
+    /// Apply any pending schema migrations to the configured database.
     Migrate(DbMigrateArgs),
 
-    /// Report per-backend schema state without applying changes (ADR-015).
+    /// Report per-backend schema state without applying changes.
     Check(DbCheckArgs),
 }
 
@@ -155,7 +155,7 @@ enum PackCommand {
     },
 }
 
-/// Backend admin commands (ADR-003 §four-invariants, ADR-009, ADR-028).
+/// Backend admin commands.
 ///
 /// In the full multi-backend deployment, `kkernel backend list` reads `khive.toml`
 /// and enumerates all configured `[[backends]]` entries. In the current v1 implementation,
@@ -205,7 +205,7 @@ async fn cmd_db(cmd: DbCommand) -> Result<()> {
 }
 
 async fn cmd_db_migrate(args: DbMigrateArgs) -> Result<()> {
-    // KhiveRuntime::new() runs run_migrations() internally (ADR-015).
+    // KhiveRuntime::new() runs run_migrations() internally.
     // Constructing the runtime is therefore sufficient to apply all pending migrations.
     let mut cfg = RuntimeConfig::default();
     if let Some(ref db) = args.db {
@@ -403,7 +403,7 @@ fn cmd_pack(cmd: PackCommand) -> Result<()> {
 
 fn cmd_backend(cmd: BackendCommand) -> Result<()> {
     // v1: enumerate backends from RuntimeConfig defaults.
-    // Full multi-backend implementation reads khive.toml (ADR-028); this ships
+    // Full multi-backend implementation reads khive.toml; this ships
     // the CLI surface so tooling can already call `kkernel backend list`.
     let default_config = RuntimeConfig::default();
     let default_id = default_config.backend_id.clone();

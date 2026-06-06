@@ -110,7 +110,7 @@ pub enum EventKind {
     EmbeddingMigrationFailed,
     /// Drift was detected between stored and live embeddings.
     EmbeddingDriftDetected,
-    /// A proposal was submitted for review (ADR-046).
+    /// A proposal was submitted for review.
     ProposalCreated,
     /// A reviewer accepted, rejected, or commented on a proposal.
     ProposalReviewed,
@@ -350,14 +350,14 @@ pub struct ProposalCreatedPayload {
     pub parent_id: Option<Id128>,
 }
 
-/// Structured draft for adding a new entity via a proposal (ADR-046:100).
+/// Structured draft for adding a new entity via a proposal.
 ///
 /// Fields mirror the `create(kind=<entity kind>)` verb surface; `kind` is
-/// validated against the closed 8-kind taxonomy (ADR-001) at apply time.
+/// validated against the closed 8-kind entity taxonomy at apply time.
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityDraft {
-    /// Entity kind — must be one of the 8 closed ADR-001 values.
+    /// Entity kind — must be one of the 8 closed entity kind values.
     pub kind: String,
     /// Human-readable name (required).
     pub name: String,
@@ -372,7 +372,7 @@ pub struct EntityDraft {
     pub tags: Vec<String>,
 }
 
-/// Structured patch for modifying an existing entity via a proposal (ADR-046:101).
+/// Structured patch for modifying an existing entity via a proposal.
 ///
 /// Absent fields mean "leave unchanged". Setting `description` to `null` clears it.
 #[cfg(feature = "serde")]
@@ -393,7 +393,7 @@ pub struct ProposalEntityPatch {
     pub tags: Option<Vec<String>>,
 }
 
-/// Structured draft for adding a new note via a proposal (ADR-046:106).
+/// Structured draft for adding a new note via a proposal.
 ///
 /// Fields mirror the `create(kind=<note kind>)` verb surface.
 #[cfg(feature = "serde")]
@@ -441,7 +441,7 @@ mod serde_opt_opt {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProposalChangeset {
-    /// Add a new entity. `entity.kind` validated against ADR-001 at apply time.
+    /// Add a new entity. `entity.kind` validated against the closed 8-kind taxonomy at apply time.
     AddEntity {
         entity: EntityDraft,
     },
@@ -504,7 +504,7 @@ pub struct ProposalReviewedPayload {
     pub comment: Option<String>,
 }
 
-/// A reviewer's decision on a proposal (ADR-046).
+/// A reviewer's decision on a proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]

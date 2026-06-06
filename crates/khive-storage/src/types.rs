@@ -120,7 +120,7 @@ pub enum VectorIndexKind {
     Flat,
 }
 
-/// Backend capability declaration for vector stores (ADR-041, ADR-044).
+/// Backend capability declaration for vector stores.
 ///
 /// Returned by [`VectorStore::capabilities`]. Higher-level retrieval policy
 /// (hybrid search, HyDE fan-out, etc.) introspects this struct at construction
@@ -149,14 +149,14 @@ pub struct VectorStoreCapabilities {
     pub index_kinds: Vec<VectorIndexKind>,
 }
 
-/// A typed predicate for backend-pushable metadata filtering (ADR-041, ADR-044).
+/// A typed predicate for backend-pushable metadata filtering.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VectorMetadataFilter {
     /// Restrict to these namespaces.
     pub namespaces: Vec<String>,
     /// Restrict to these substrate kinds.
     pub kinds: Vec<SubstrateKind>,
-    /// Typed property predicates (ADR-044).
+    /// Typed property predicates.
     pub property_filters: Vec<PropertyFilter>,
 }
 
@@ -167,7 +167,7 @@ impl VectorMetadataFilter {
     }
 }
 
-/// A single typed metadata predicate (ADR-044).
+/// A single typed metadata predicate used in [`VectorMetadataFilter`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PropertyFilter {
     pub key: String,
@@ -175,7 +175,7 @@ pub struct PropertyFilter {
     pub value: serde_json::Value,
 }
 
-/// Comparison operators for [`PropertyFilter`] (ADR-044).
+/// Comparison operators for [`PropertyFilter`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PropertyOp {
@@ -243,12 +243,12 @@ impl VectorSearchRequest {
     }
 }
 
-/// Configuration for an orphan-sweep pass (ADR-044).
+/// Configuration for a vector orphan-sweep pass.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrphanSweepConfig {
     /// Optional allowlist of subject IDs to check. `None` = scan all rows.
     /// `Some(ids)` restricts the sweep to only those IDs; rows not in the list
-    /// are untouched even if orphaned (ADR-044 §5).
+    /// are untouched even if orphaned.
     pub subject_id_allowlist: Option<Vec<Uuid>>,
     pub namespaces: Vec<String>,
     pub substrate_kinds: Vec<SubstrateKind>,
@@ -256,7 +256,7 @@ pub struct OrphanSweepConfig {
     pub dry_run: bool,
 }
 
-/// Result of an orphan-sweep pass (ADR-044).
+/// Result of a vector orphan-sweep pass.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrphanSweepResult {
     pub scanned: u64,
@@ -265,7 +265,7 @@ pub struct OrphanSweepResult {
     pub max_delete_hit: bool,
 }
 
-// -- Sparse vector types (ADR-031) --
+// -- Sparse vector types --
 
 /// A sparse vector represented as parallel indices and values arrays.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -399,7 +399,7 @@ pub struct TextTermStats {
     pub sanitized_term: String,
     pub document_frequency: u64,
     pub document_count: u64,
-    /// Robertson-Walker IDF: ln(((N - df + 0.5) / (df + 0.5)) + 1)
+    /// Robertson-Walker IDF: $\ln\!\left(\frac{N - df + 0.5}{df + 0.5} + 1\right)$
     pub inverse_document_frequency: f64,
 }
 

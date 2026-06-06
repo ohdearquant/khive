@@ -1,4 +1,4 @@
-//! TOML-based embedding engine configuration for khive (ADR-031 §D3).
+//! TOML-based embedding engine configuration for khive.
 //!
 //! Loads `.khive/config.toml` (or `--config` / `KHIVE_CONFIG`) and exposes an
 //! `[[engines]]` array for arbitrary-N embedding engine registration. Falls back
@@ -112,13 +112,13 @@ pub struct ActorConfig {
 /// Top-level khive configuration loaded from `khive.toml` or `config.toml`.
 ///
 /// Sections consumed today:
-/// - `[[engines]]`: embedding engine declarations (ADR-031 §D3)
+/// - `[[engines]]`: embedding engine declarations
 /// - `[actor]`: default namespace / identity (OSS actor model)
 ///
 /// Unknown keys are silently ignored by serde — forward-compatible.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
-    /// Embedding engine declarations (ADR-031 §D3).
+    /// Embedding engine declarations.
     #[serde(default)]
     pub engines: Vec<EngineConfig>,
 
@@ -234,7 +234,7 @@ impl KhiveConfig {
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Validate actor.id when present — an invalid namespace is a startup error,
-        // not a silent fallback (ADR-007 §NamespaceToken minting).
+        // not a silent fallback.
         if let Some(id) = self.actor.id.as_deref() {
             if id.is_empty() {
                 return Err(ConfigError::InvalidActorId {

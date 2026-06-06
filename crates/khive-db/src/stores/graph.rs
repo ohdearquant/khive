@@ -1336,7 +1336,7 @@ mod tests {
     }
 
     // F053 (CRIT): natural-key conflict must DO UPDATE (refresh weight/metadata), not DO NOTHING.
-    // ADR-009 requires the second upsert to overwrite weight=0.5; current code keeps weight=1.0.
+    // The second upsert must overwrite weight=0.5; current code keeps weight=1.0.
     #[tokio::test]
     async fn graph_duplicate_edges_refresh_existing_row() {
         let store = setup_memory_store();

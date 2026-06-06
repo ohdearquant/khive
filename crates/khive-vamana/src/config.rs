@@ -1,14 +1,15 @@
 //! Configuration for the Vamana ANN index.
 //!
 //! [`VamanaConfig`] holds the four algorithm parameters and validates them
-//! before any index construction. ADR-048 defines the production defaults.
+//! before any index construction. Production defaults: `dimensions=384`,
+//! `max_degree=64`, `search_list_size=128`, `alpha=1.2`.
 
 use crate::error::{Result, VamanaError};
 
 /// Algorithm parameters for the Vamana index build and search phases.
 ///
 /// Validated by [`VamanaConfig::validate`] before any construction or search.
-/// ADR-048 defaults: `dimensions=384`, `max_degree=64`, `search_list_size=128`, `alpha=1.2`.
+/// Production defaults: `dimensions=384`, `max_degree=64`, `search_list_size=128`, `alpha=1.2`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VamanaConfig {
     /// Dimensionality of vectors; must be > 0.

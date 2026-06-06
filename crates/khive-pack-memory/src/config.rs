@@ -52,7 +52,7 @@ pub struct RecallConfig {
     /// Weight of pure recency. Default 0.10.
     pub temporal_weight: f64,
 
-    // --- Reranker weights (ADR-033 §1) ---
+    // --- Reranker weights ---
     /// Per-reranker weights, keyed by reranker name. Missing keys → 0.0 (disabled).
     /// v1 built-in names: "cross_encoder", "salience", "graph_proximity".
     pub reranker_weights: HashMap<String, f64>,
@@ -521,9 +521,10 @@ impl RecallConfig {
 pub enum DecayModel {
     /// `salience * exp(-decay_factor * age_days)` — uses the note's own decay_factor directly.
     ///
-    /// This is the ADR-021 §5 formula. The note's `decay_factor` controls the decay rate;
-    /// `temporal_half_life_days` is used only by the temporal recency score, not here.
-    /// Default `decay_factor=0.01` gives a ~69-day half-life: exp(-0.01 * 69.3) ≈ 0.5.
+    /// Decay formula: `salience * exp(-decay_factor * age_days)`. The note's `decay_factor`
+    /// controls the decay rate; `temporal_half_life_days` is used only by the temporal
+    /// recency score, not here. Default `decay_factor=0.01` gives a ~69-day half-life:
+    /// `exp(-0.01 * 69.3) ≈ 0.5`.
     #[default]
     Exponential,
     /// `salience / (1 + decay_factor * age_days)`
@@ -548,7 +549,7 @@ impl DecayModel {
     pub fn apply(&self, salience: f64, age_days: f64, decay_factor: f64, _half_life: f64) -> f64 {
         match self {
             DecayModel::Exponential => {
-                // ADR-021 §5: effective_salience = salience * exp(-decay_factor * age_days)
+                // effective_salience = salience * exp(-decay_factor * age_days)
                 // Uses the note's own decay_factor, not a half-life-derived constant.
                 salience * (-decay_factor * age_days).exp()
             }
@@ -606,7 +607,7 @@ mod tests {
 
     #[test]
     fn exponential_halves_at_decay_factor_half_life() {
-        // ADR-021 §5 formula: salience * exp(-decay_factor * age_days)
+        // exponential decay: salience * exp(-decay_factor * age_days)
         // Half-life = ln(2) / decay_factor ≈ 69.3 days for decay_factor=0.01
         let model = DecayModel::Exponential;
         let salience = 1.0;

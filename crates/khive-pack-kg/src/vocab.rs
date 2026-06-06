@@ -8,11 +8,11 @@ use std::string::String;
 
 use khive_types::UnknownVariant;
 
-/// Pack-local entity kind extension including `Resource` (ADR-048).
+/// Pack-local entity kind extension including `Resource`.
 ///
-/// `Resource` is the 9th kind added in ADR-048: actionable content agents
-/// consume — atoms, domains, skills, tools. Distinct from `Concept` which
-/// models abstract ideas and their graph relationships.
+/// `Resource` is the 9th entity kind: actionable content agents consume — atoms,
+/// domains, skills, tools. Distinct from `Concept` which models abstract ideas
+/// and their graph relationships.
 ///
 /// This type is `pub(crate)` because `khive_types::EntityKind` is the canonical
 /// public type re-exported from this pack. This local variant exists solely to
@@ -29,8 +29,8 @@ pub(crate) enum EntityKind {
     Org,
     Artifact,
     Service,
-    /// Actionable content agents consume (ADR-048): atoms, domains, skills,
-    /// tools, templates, prompts, runbooks.
+    /// Actionable content agents consume: atoms, domains, skills, tools,
+    /// templates, prompts, runbooks.
     Resource,
 }
 
@@ -106,7 +106,7 @@ impl std::str::FromStr for EntityKind {
     }
 }
 
-/// KG pack note kinds. Public note kind validation is canonical-only per ADR-013.
+/// KG pack note kinds. Only canonical names are accepted — aliases are rejected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NoteKind {
     /// A factual record or finding (default).
@@ -123,7 +123,7 @@ pub enum NoteKind {
 }
 
 impl NoteKind {
-    /// All 5 canonical note kinds in ADR-013 table order.
+    /// All 5 canonical note kinds in declaration order.
     pub const ALL: [Self; 5] = [
         Self::Observation,
         Self::Insight,
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn note_kind_aliases_rejected() {
-        // Aliases were removed per ADR-013 — only canonical names are accepted.
+        // Only canonical names are accepted; aliases are rejected.
         assert!(NoteKind::from_str("obs").is_err());
         assert!(NoteKind::from_str("finding").is_err());
         assert!(NoteKind::from_str("q").is_err());
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn entity_kind_resource_aliases() {
-        // ADR-048: aliases for resource entity_type values.
+        // `resource` is the 9th entity kind; these are its accepted aliases.
         for alias in ["atom", "runbook", "template", "prompt", "skill", "tool"] {
             let parsed = EntityKind::from_str(alias).unwrap();
             assert_eq!(

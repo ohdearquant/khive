@@ -1,14 +1,14 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! The [`FormatAdapter`] trait — stateful pure transform producing entity and edge record streams (ADR-036).
+//! The [`FormatAdapter`] trait — stateful pure transform producing entity and edge record streams.
 
 use crate::error::AdapterError;
 use crate::record::{EdgeRecord, EntityRecord};
 
-/// A format adapter (ADR-036 §Implementation).
+/// A format adapter for the KG import pipeline.
 ///
 /// Implementations parse a source format and yield entity and edge records
-/// following the ADR-020 §2 field shapes. The adapter writes no database
+/// using the standard `EntityRecord`/`EdgeRecord` wire shapes. The adapter writes no database
 /// state — its output is consumed by the standard `khive kg import` pipeline.
 ///
 /// Both iterators return `Result<_, AdapterError>`. A fatal error (e.g. a

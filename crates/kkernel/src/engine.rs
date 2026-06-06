@@ -1,4 +1,4 @@
-//! `kkernel engine` — embedding model lifecycle management (ADR-043).
+//! `kkernel engine` — embedding model lifecycle management.
 //!
 //! Implements:
 //! - `kkernel engine list`                     — show all engines and their model history
@@ -6,7 +6,7 @@
 //! - `kkernel engine migrate <engine> --to ... / --resume / --abort`
 //! - `kkernel engine drift-check <engine>`     — one-shot drift detection
 //!
-//! These commands are operator-only. No MCP verbs are exposed (ADR-043 §6).
+//! These commands are operator-only. No MCP verbs are exposed.
 
 use std::path::PathBuf;
 
@@ -190,7 +190,7 @@ async fn cmd_engine_status(args: EngineStatusArgs) -> Result<()> {
 
 fn cmd_engine_migrate(_args: EngineMigrateArgs) -> Result<()> {
     Err(anyhow!(
-        "engine migrate is not yet implemented (ADR-043 D2-D6 — EmbedMigrationWorker deferred \
+        "engine migrate is not yet implemented (EmbedMigrationWorker deferred \
          to follow-up #380). Use 'kkernel engine list' / 'status' to inspect registered models."
     ))
 }
@@ -199,14 +199,14 @@ fn cmd_engine_migrate(_args: EngineMigrateArgs) -> Result<()> {
 
 fn cmd_engine_drift_check(_args: EngineDriftCheckArgs) -> Result<()> {
     Err(anyhow!(
-        "engine drift-check is not yet implemented (ADR-043 §5 lattice_transport integration \
+        "engine drift-check is not yet implemented (lattice_transport integration \
          deferred). Track follow-up #380."
     ))
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Query `_embedding_models` via `KhiveRuntime::list_embedding_models` (ADR-043).
+/// Query `_embedding_models` via `KhiveRuntime::list_embedding_models`.
 ///
 /// When `db` is `None` the default path (`~/.khive/khive-graph.db`) is used.
 /// If the default file does not yet exist, returns an empty vec without creating

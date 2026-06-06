@@ -3,8 +3,8 @@
 //! Core versioning types: `SnapshotId`, `VcsState`.
 //!
 //! Legacy types (`KgSnapshot`, `KgBranch`, `RemoteConfig`) and the `VcsState.dirty`
-//! flag were removed in the ADR-010/ADR-020 alignment pass. KG branches are now
-//! git branches; there is no custom remote protocol (ADR-010, ADR-020).
+//! flag were removed during the git-native v1 alignment pass. KG branches are now
+//! git branches; there is no custom remote protocol.
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 
@@ -24,7 +24,7 @@ impl<'de> Deserialize<'de> for SnapshotId {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         // Require exact canonical form: "sha256:" prefix + 64 lower-case hex
-        // chars with no whitespace (ADR-037 §exact-lower-case-pin-format).
+        // chars with no whitespace.
         let hex = s.strip_prefix("sha256:").ok_or_else(|| {
             de::Error::custom(format!(
                 "invalid SnapshotId: missing sha256: prefix in {:?}",
@@ -94,8 +94,7 @@ impl std::fmt::Display for SnapshotId {
 /// Records which record classes are covered by a KG snapshot.
 ///
 /// v1 covers entities and edges only. Notes are excluded until note packs
-/// define versioned export, import, privacy/redaction, and merge semantics
-/// (ADR-010 §snapshot-coverage).
+/// define versioned export, import, privacy/redaction, and merge semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotCoverage {
     pub entities: bool,
@@ -114,9 +113,8 @@ pub const KG_V1_COVERAGE: SnapshotCoverage = SnapshotCoverage {
 
 /// Per-namespace VCS state.
 ///
-/// The `dirty` flag was removed per ADR-020 §7: "There is no dirty flag. The
-/// diff is computed fresh on every invocation." Use `khive kg status` (DB vs
-/// NDJSON diff) to determine uncommitted changes.
+/// There is no `dirty` flag. The diff is computed fresh on every invocation via
+/// `khive kg status` (DB vs NDJSON diff) to determine uncommitted changes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VcsState {
     pub namespace: String,

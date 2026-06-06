@@ -1,4 +1,4 @@
-//! EmbedderRegistry — pack-extensible embedding provider surface (ADR-031 extension).
+//! EmbedderRegistry — pack-extensible embedding provider surface.
 //!
 //! Packs implement [`EmbedderProvider`] and register custom models via
 //! [`KhiveRuntime::register_embedder`]. Built-in lattice models are pre-registered

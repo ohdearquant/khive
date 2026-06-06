@@ -1,12 +1,10 @@
 //! BM25 configuration types.
-//!
-//! See ADR-003 for recommended parameter values.
 
 use serde::{Deserialize, Serialize};
 
 /// BM25 configuration parameters.
 ///
-/// Default values (k1=1.2, b=0.75) from ADR-003 work well for most use cases.
+/// Default values (k1=1.2, b=0.75) work well for most use cases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bm25Config {
     /// Term saturation parameter.

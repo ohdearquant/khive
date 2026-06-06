@@ -1,9 +1,9 @@
 //! `TaskHook` — gtd's per-kind specialization for the `task` note kind.
 //!
-//! Implements the `KindHook` extension point defined in ADR-017 §pack-standard.
-//! Normalises user-facing GTD fields into the kg storage shape on `prepare_create`,
-//! and creates `depends_on` graph edges on `after_create` (best-effort).
-//! GTD lifecycle semantics are specified in ADR-019.
+//! Implements the `KindHook` extension point for the pack standard. Normalises
+//! user-facing GTD fields into the kg storage shape on `prepare_create`, and
+//! creates `depends_on` graph edges on `after_create` (best-effort). GTD
+//! lifecycle semantics are documented in `docs/design.md`.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -83,8 +83,7 @@ impl KindHook for TaskHook {
         // pre-validate each target is a task note before the storage write so
         // the kg-create path matches GTD `assign` and never leaves a task
         // persisted with a `properties.depends_on` pointing at a non-task
-        // (the GTD edge rule in ADR-017 §pack-extensible-edge-endpoints only
-        // legalises task→task `depends_on`; see also ADR-019 for task deps).
+        // (the GTD pack edge rule only legalises task→task `depends_on`).
         let mut resolved_deps: Vec<String> = Vec::new();
         if let Some(arr) = args.get("depends_on").and_then(Value::as_array) {
             for entry in arr {
@@ -97,14 +96,14 @@ impl KindHook for TaskHook {
                     Some(Resolved::Note(n)) => {
                         return Err(RuntimeError::InvalidInput(format!(
                             "depends_on target {uuid} must be a task note for relation depends_on \
-                             (got note kind {:?}); the GTD pack edge rule (ADR-017 §pack-extensible-edge-endpoints) is task→task only",
+                             (got note kind {:?}); the GTD pack edge rule is task→task only",
                             n.kind
                         )));
                     }
                     Some(_) => {
                         return Err(RuntimeError::InvalidInput(format!(
                             "depends_on target {uuid} must be a task note for relation depends_on \
-                             (got non-note substrate); the GTD pack edge rule (ADR-017 §pack-extensible-edge-endpoints) is task→task only"
+                             (got non-note substrate); the GTD pack edge rule is task→task only"
                         )));
                     }
                     None => {

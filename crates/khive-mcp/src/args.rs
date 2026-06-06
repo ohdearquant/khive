@@ -70,7 +70,7 @@ pub struct Args {
     #[arg(long = "config", env = "KHIVE_CONFIG")]
     pub config: Option<PathBuf>,
 
-    /// Run as a persistent daemon over a Unix socket instead of stdio (ADR-049).
+    /// Run as a persistent daemon over a Unix socket instead of stdio.
     ///
     /// The daemon owns the warm pack registry (ANN indexes) and serves request
     /// frames from thin stdio clients that auto-spawn it. Bound to

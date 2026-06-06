@@ -79,7 +79,7 @@ impl<S: Serialize> Checkpoint<S> {
             entries_processed,
             context,
             fold_version,
-            // ADR-024: no clock calls in the foundation layer.
+            // Foundation layer does not call Utc::now() — epoch is the safe default.
             // Callers that need the current time should set created_at after construction.
             created_at: DateTime::<Utc>::default(),
         })
@@ -109,7 +109,7 @@ impl<S: Serialize> Checkpoint<S> {
             entries_processed,
             context,
             fold_version,
-            // ADR-024: no clock calls in the foundation layer.
+            // Foundation layer does not call Utc::now() — epoch is the safe default.
             created_at: DateTime::<Utc>::default(),
         }
     }

@@ -1,8 +1,8 @@
-//! Integration tests for the `khive-request` DSL parser (ADR-016).
+//! Integration tests for the `khive-request` DSL parser.
 //!
 //! All tests exercise the public API (`parse_request`, public types). Tests that
 //! require access to `pub(crate)` helpers (`check_write_key_conflicts`) live in
-//! `src/lib.rs` under `#[cfg(test)] mod tests`.
+//! `src/conflict.rs` under `#[cfg(test)] mod tests`.
 
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, MAX_OPS};
 use serde_json::json;
@@ -289,7 +289,7 @@ fn unicode_string_arg_preserved() {
     assert_eq!(val(&v[0].args["title"]), &json!("café"));
 }
 
-// ── Chain mode (ADR-016) ──────────────────────────────────────────────────────
+// ── Chain mode ───────────────────────────────────────────────────────────────
 
 #[test]
 fn chain_two_ops_with_prev_ref() {
@@ -615,11 +615,11 @@ fn json_form_without_prev_ref_still_works() {
     assert_eq!(r.ops.len(), 2);
 }
 
-// ── adr-dsl-packs H1: PrevRefOutsideChain emitted at parse time ───────────────
+// ── PrevRefOutsideChain emitted at parse time ─────────────────────────────────
 
 #[test]
 fn prev_ref_in_single_op_is_rejected() {
-    // adr-dsl-packs H1: `get(id=$prev.id)` without chain must be rejected.
+    // `get(id=$prev.id)` without chain must be rejected.
     let err = parse_request(r#"get(id=$prev.id)"#).unwrap_err();
     assert!(
         matches!(err, DslError::PrevRefOutsideChain { .. }),
@@ -629,7 +629,7 @@ fn prev_ref_in_single_op_is_rejected() {
 
 #[test]
 fn prev_ref_in_fn_batch_is_rejected() {
-    // adr-dsl-packs H1: PrevRef inside `[create(...), get(id=$prev.id)]` is
+    // PrevRef inside `[create(...), get(id=$prev.id)]` is
     // parallel (no `|`) — must be rejected at parse time.
     let err = parse_request(r#"[create(kind="concept", name="A"), get(id=$prev.id)]"#).unwrap_err();
     assert!(
@@ -638,11 +638,11 @@ fn prev_ref_in_fn_batch_is_rejected() {
     );
 }
 
-// ── adr-dsl-packs H3: MixedSeparators emitted at parse time ──────────────────
+// ── MixedSeparators emitted at parse time ─────────────────────────────────────
 
 #[test]
 fn mixed_separators_in_fn_batch_rejected() {
-    // adr-dsl-packs H3: `[a() | b(), c()]` mixes `|` and `,` at top level.
+    // `[a() | b(), c()]` mixes `|` and `,` at top level.
     let err = parse_request("[a() | b(), c()]").unwrap_err();
     assert!(
         matches!(err, DslError::MixedSeparators),
@@ -652,7 +652,7 @@ fn mixed_separators_in_fn_batch_rejected() {
 
 #[test]
 fn mixed_separator_after_chain_rejected() {
-    // adr-dsl-packs H3: `a() | b(), c()` mixes `|` chain with trailing `,`.
+    // `a() | b(), c()` mixes `|` chain with trailing `,`.
     let err = parse_request("a() | b(), c()").unwrap_err();
     assert!(
         matches!(err, DslError::MixedSeparators),
@@ -662,7 +662,7 @@ fn mixed_separator_after_chain_rejected() {
 
 #[test]
 fn comma_only_parallel_accepted() {
-    // adr-dsl-packs H3: `[a(), b(), c()]` is valid comma-only parallel batch.
+    // `[a(), b(), c()]` is valid comma-only parallel batch.
     let r = parse_request("[a(), b(), c()]").unwrap();
     assert_eq!(r.mode, ExecutionMode::Parallel);
     assert_eq!(r.ops.len(), 3);
@@ -670,17 +670,17 @@ fn comma_only_parallel_accepted() {
 
 #[test]
 fn pipe_only_chain_accepted() {
-    // adr-dsl-packs H3: `a() | b() | c()` is valid pipe-only chain.
+    // `a() | b() | c()` is valid pipe-only chain.
     let r = parse_request("a() | b() | c()").unwrap();
     assert_eq!(r.mode, ExecutionMode::Chain);
     assert_eq!(r.ops.len(), 3);
 }
 
-// ── adr-dsl-packs H2: multi-segment dotted verb → clear error ─────────────────
+// ── multi-segment dotted verb → clear error ───────────────────────────────────
 
 #[test]
 fn three_segment_verb_name_rejected() {
-    // adr-dsl-packs H2: `brain.state.debug()` must produce UnsupportedVerbNesting,
+    // `brain.state.debug()` must produce UnsupportedVerbNesting,
     // not the misleading "expected '|' or end of input, found '.'".
     let err = parse_request("brain.state.debug()").unwrap_err();
     assert!(

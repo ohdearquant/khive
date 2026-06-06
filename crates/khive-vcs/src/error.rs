@@ -3,10 +3,10 @@
 //! Error types for the VCS layer.
 //!
 //! Remote-server and custom-push/pull error variants (`RemoteUnreachable`,
-//! `AuthFailed`, `NonFastForward`, `MergeRequired`) were removed per ADR-010/
-//! ADR-020: git is the remote protocol; there is no custom `khive-sync` server.
+//! `AuthFailed`, `NonFastForward`, `MergeRequired`) were removed: git is the
+//! remote protocol; there is no custom `khive-sync` server.
 //! `MergeNotImplemented` was removed because the custom merge engine is
-//! superseded for v1 (ADR-020 §what-adr-010-retains-this-adr-replaces).
+//! superseded for v1.
 
 use thiserror::Error;
 

@@ -129,7 +129,7 @@ pub trait Objective<T>: Send + Sync {
     /// across candidates — e.g., an embedding model that returns a confidence
     /// alongside the similarity score. The effective ranking value used by the
     /// default `select` / `select_top` implementations is `score * precision`
-    /// (ADR-059, Predictive Coding).
+    /// (predictive coding: precision-weighted scoring).
     ///
     /// When overriding, return values in (0, 1]. Non-finite values are treated
     /// as 1.0 by the default implementations.
@@ -183,8 +183,9 @@ pub trait Objective<T>: Send + Sync {
 
     /// Select the top N candidates.
     ///
-    /// Ranking uses `score * precision` (ADR-059). Small `n` (≤96) uses a sorted
-    /// small-vector path with binary-search insertion. Large `n` uses a worst-first heap.
+    /// Ranking uses `score * precision` (precision-weighted scoring). Small `n` (≤96)
+    /// uses a sorted small-vector path with binary-search insertion. Large `n` uses a
+    /// worst-first heap.
     fn select_top<'a>(
         &self,
         candidates: &'a [T],

@@ -1,4 +1,4 @@
-//! SQLite-backed `SparseStore` implementation (ADR-031).
+//! SQLite-backed `SparseStore` implementation.
 
 use std::sync::Arc;
 

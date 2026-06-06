@@ -440,7 +440,7 @@ impl Parser {
         Ok(acc)
     }
 
-    /// Parse a WHERE expression: and_expr ('OR' and_expr)* (ADR-008 §"GQL WHERE expression").
+    /// Parse a WHERE expression: and_expr ('OR' and_expr)*. AND binds tighter than OR.
     fn parse_where_expr(&mut self) -> Result<WhereExpr, QueryError> {
         let first = self.parse_and_expr()?;
         let mut acc = first;

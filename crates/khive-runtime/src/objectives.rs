@@ -3,10 +3,6 @@
 //! Domain-specific objectives that operate on pre-computed retrieval signals.
 //! Pure math: no IO, no async. The runtime layer materialises the signal data
 //! and feeds it in via the candidate struct.
-//!
-//! See ADR-033 — Recall Pipeline (NoteCandidate, DecayAwareSalienceObjective,
-//!                                TemporalRecencyObjective, RerankerObjective).
-//! See ADR-030 — Layered Retrieval Architecture (signal composition model).
 
 use std::collections::HashMap;
 
@@ -120,7 +116,7 @@ impl Objective<RetrievalCandidate> for GraphProximityObjective {
 /// Returns `rrf_score` unchanged, or 0.0 when the field is absent.
 /// Implements `Objective` for both `RetrievalCandidate` and `NoteCandidate`
 /// so the same objective can be used in the general retrieval pipeline
-/// and the memory recall pipeline (ADR-033 §4).
+/// and the memory recall pipeline.
 pub struct RrfFusionObjective;
 
 impl Objective<RetrievalCandidate> for RrfFusionObjective {
@@ -145,7 +141,7 @@ impl Objective<NoteCandidate> for RrfFusionObjective {
     }
 }
 
-// ── Memory-Recall Objectives (ADR-033 §4) ────────────────────────────────────
+// ── Memory-Recall Objectives ──────────────────────────────────────────────────
 
 /// Pre-computed signals for a single memory note candidate.
 ///
@@ -153,8 +149,6 @@ impl Objective<NoteCandidate> for RrfFusionObjective {
 /// via `DecayAwareSalienceObjective`, `TemporalRecencyObjective`, and
 /// `RerankerObjective` without any IO. The runtime layer populates this struct
 /// from stored notes before handing the slice to the pipeline.
-///
-/// See ADR-033 §4.
 #[derive(Debug, Clone)]
 pub struct NoteCandidate {
     /// Stable note UUID.
@@ -189,28 +183,28 @@ impl HasId for NoteCandidate {
 
 /// Scores a `NoteCandidate` by salience with configurable temporal decay.
 ///
-/// ADR-021 §5 / ADR-033 §4. The decay formula is determined by the configured
-/// `DecayModel` (injected at construction time). The default `DecayModel::Exponential`
-/// uses the note's own `decay_factor`: `salience * exp(-decay_factor * age_days)`.
+/// The decay formula is determined by the configured `DecayModel` (injected at
+/// construction time). The default `DecayModel::Exponential` uses the note's own
+/// `decay_factor`: `salience * exp(-decay_factor * age_days)`.
 ///
 /// This objective participates in `WeightedObjective` composition alongside
 /// `RrfFusionObjective` and `TemporalRecencyObjective` to form the full recall
 /// scoring pipeline.
 pub struct DecayAwareSalienceObjective {
     /// Exponential decay rate k (>= 0.0). Score = `salience * exp(-k * age_days)`.
-    /// Corresponds to ADR-021's per-note `decay_factor` parameter.
+    /// Corresponds to the per-note `decay_factor` parameter stored on memory notes.
     pub decay_rate: f64,
 }
 
 impl DecayAwareSalienceObjective {
     /// Create a new objective with the given exponential decay rate.
     ///
-    /// `decay_rate = 0.01` gives a ~69-day half-life (the ADR-021 default for memory notes).
+    /// `decay_rate = 0.01` gives a ~69-day half-life (default for memory notes).
     pub fn new(decay_rate: f64) -> Self {
         Self { decay_rate }
     }
 
-    /// Default memory decay rate from ADR-021: 0.01 (~69-day half-life).
+    /// Default memory decay rate: 0.01 (~69-day half-life).
     pub fn default_memory() -> Self {
         Self::new(0.01)
     }
@@ -219,7 +213,6 @@ impl DecayAwareSalienceObjective {
 impl Objective<NoteCandidate> for DecayAwareSalienceObjective {
     #[inline]
     fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
-        // ADR-021 §5 / ADR-033 §4:
         // effective_salience = salience * exp(-decay_factor * age_days)
         candidate.salience * (-candidate.decay_factor * candidate.age_days).exp()
     }
@@ -241,8 +234,8 @@ impl Objective<NoteCandidate> for DecayAwareSalienceObjective {
 /// salience 0.9 → 0.854 and salience 0.3 → 0.164 — a ~5.2× spread vs the ~3× linear
 /// spread. Keep `alpha ≤ 2.0`; values above 2 compress near-zero salience toward 0.
 ///
-/// Used by the memory recall pipeline (ADR-033 §4) to make salience a meaningful
-/// tiebreaker without dominating relevance at the default weight of 0.20.
+/// Used by the memory recall pipeline to make salience a meaningful tiebreaker
+/// without dominating relevance at the default weight of 0.20.
 pub struct AmplifiedDecayAwareSalienceObjective {
     /// Power applied to the decayed salience value. Must be > 0.
     pub alpha: f64,
@@ -291,7 +284,7 @@ pub struct TemporalRecencyObjective {
 }
 
 impl TemporalRecencyObjective {
-    /// Create with the ADR-021 default temporal half-life of 30 days.
+    /// Create with the default temporal half-life of 30 days.
     pub fn default_memory() -> Self {
         Self {
             half_life_days: 30.0,
@@ -320,7 +313,6 @@ impl Objective<NoteCandidate> for TemporalRecencyObjective {
 /// `RecallConfig.reranker_weights[name] > 0.0` before including this objective
 /// in a `WeightedObjective` composition.
 ///
-/// See ADR-033 §4 and ADR-042 §7 for the reranker integration protocol.
 pub struct RerankerObjective {
     /// Name of the reranker to look up in `candidate.rerank_scores`.
     pub reranker_name: String,
@@ -358,8 +350,6 @@ impl Objective<NoteCandidate> for RerankerObjective {
 /// scoring components (RRF relevance, amplified salience, temporal recency)
 /// weighted by the recall config parameters. Pack code uses this type to avoid
 /// a direct dependency on `khive-fold`.
-///
-/// See ADR-033 §4.
 pub struct MemoryRecallPipeline {
     pipeline: khive_fold::WeightedObjective<NoteCandidate>,
 }
@@ -392,7 +382,7 @@ impl MemoryRecallPipeline {
         Self { pipeline }
     }
 
-    /// Build a pipeline using the standard memory recall defaults from ADR-033.
+    /// Build a pipeline using the standard memory recall defaults.
     ///
     /// Weights: relevance=0.70, salience=0.20, temporal=0.10; half_life=30 days; alpha=1.5.
     pub fn default_memory() -> Self {
@@ -667,7 +657,7 @@ mod tests {
 
     #[test]
     fn decay_aware_uses_note_decay_factor_not_field() {
-        // ADR-021 §5: uses the note's own decay_factor, not the objective's
+        // uses the note's own decay_factor, not the objective's field
         let obj = DecayAwareSalienceObjective::new(0.99); // obj.decay_rate ignored
                                                           // Note's decay_factor = 0.01, age=100 days → exp(-0.01*100) ≈ 0.368
         let c = note_candidate(None, 1.0, 0.01, 100.0);
@@ -767,7 +757,7 @@ mod tests {
 
     #[test]
     fn memory_pipeline_weighted_composition() {
-        // Reproduce ADR-021 §5 formula via WeightedObjective:
+        // Reproduce decay formula via WeightedObjective:
         // score = rrf * 0.70 + salience_decayed * 0.20 + temporal * 0.10
         // At age=0: salience_decayed = salience, temporal = 1.0
         let c = NoteCandidate {

@@ -12,7 +12,7 @@ use crate::error::RuntimeResult;
 
 // ---- BackendId ----
 
-/// Identifies a named backend in a multi-backend deployment (ADR-009, ADR-028).
+/// Identifies a named backend in a multi-backend deployment.
 ///
 /// The `main` backend is the default single-backend name. Multi-backend deployments
 /// assign each `[[backends]]` entry a distinct `BackendId`. The
@@ -112,9 +112,9 @@ impl NamespaceToken {
 
     /// Return a new token with the same actor but a different namespace.
     ///
-    /// Used by packs that apply a namespace policy (e.g. ADR-007 §"Namespace-by-Layer
-    /// Rule": KG pack overrides the caller's namespace to `Namespace::local()` so
-    /// that entity/edge/note records always land in the shared graph).
+    /// Used by packs that apply a namespace policy (e.g. the KG pack overrides the
+    /// caller's namespace to `Namespace::local()` so that entity/edge/note records
+    /// always land in the shared graph).
     pub fn with_namespace(&self, ns: Namespace) -> Self {
         Self::mint_authorized(ns, self.actor.clone())
     }
@@ -124,7 +124,7 @@ impl NamespaceToken {
 
 /// Runtime configuration.
 ///
-/// Per ADR-028, the `db_path` and `embedding_model` fields are deprecated in favour of
+/// The `db_path` and `embedding_model` fields are deprecated in favour of
 /// constructing the backend externally and calling [`KhiveRuntime::from_backend`].
 /// They remain for backward compatibility with tests and single-binary deployments.
 #[derive(Clone, Debug)]
@@ -140,9 +140,9 @@ pub struct RuntimeConfig {
     /// Local embedding model. `None` disables embedding and hybrid vector search;
     /// `hybrid_search` then falls back to text-only.
     ///
-    /// Deprecated: per ADR-028/ADR-031, embedding engines move to a per-pack
-    /// `EmbedderRegistry`. This field persists for backward compatibility until
-    /// the embedder registry is fully plumbed.
+    /// Deprecated: embedding engines move to a per-pack `EmbedderRegistry`.
+    /// This field persists for backward compatibility until the embedder registry
+    /// is fully plumbed.
     pub embedding_model: Option<EmbeddingModel>,
     /// Additional embedding models to make available by request name.
     ///
@@ -151,7 +151,7 @@ pub struct RuntimeConfig {
     /// selected with `embedder(name)`, `embed_with_model(...)`, memory
     /// `remember.embedding_model`, and memory `recall.embedding_model`.
     pub additional_embedding_models: Vec<EmbeddingModel>,
-    /// Authorization gate consulted before each verb dispatch (ADR-029).
+    /// Authorization gate consulted before each verb dispatch.
     /// Default: `AllowAllGate` (permissive). For production policy enforcement,
     /// plug in a Rego- or capability-witness-backed impl.
     pub gate: GateRef,
@@ -161,7 +161,7 @@ pub struct RuntimeConfig {
     /// by the transport, not silently ignored.
     /// Default: `["kg"]`.
     pub packs: Vec<String>,
-    /// Identifies this runtime's backend in a multi-backend deployment (ADR-009, ADR-028).
+    /// Identifies this runtime's backend in a multi-backend deployment.
     ///
     /// Set by the boot path when constructing per-pack runtimes from `khive.toml`.
     /// Single-backend deployments use the default `BackendId::MAIN`.
@@ -232,7 +232,7 @@ impl Default for RuntimeConfig {
 pub struct KhiveRuntime {
     backend: Arc<StorageBackend>,
     config: RuntimeConfig,
-    /// Pack-extensible embedder registry (ADR-031 extension).
+    /// Pack-extensible embedder registry.
     ///
     /// Shared across clones via `Arc<RwLock<_>>` so that
     /// [`register_embedder`](Self::register_embedder) after clone is visible
@@ -240,10 +240,9 @@ pub struct KhiveRuntime {
     /// construction; packs may add more via [`PackRuntime::register_embedders`].
     embedder_registry: Arc<std::sync::RwLock<crate::embedder_registry::EmbedderRegistry>>,
     default_embedder_name: Arc<str>,
-    /// Pack-extensible edge endpoint rules (ADR-031). Shared across clones
-    /// via `Arc<RwLock<_>>`; installed once by the transport after the
-    /// `VerbRegistry` is built. Empty until installed — base rules
-    /// (ADR-002) still apply on their own.
+    /// Pack-extensible edge endpoint rules, shared across clones via `Arc<RwLock<_>>`.
+    /// Installed once by the transport after the `VerbRegistry` is built.
+    /// Empty until installed — base edge relation rules still apply on their own.
     edge_rules: Arc<RwLock<Vec<EdgeEndpointRule>>>,
 }
 
@@ -308,7 +307,7 @@ impl KhiveRuntime {
         })
     }
 
-    /// Construct a runtime from an already-opened backend (ADR-028 boot path).
+    /// Construct a runtime from an already-opened backend.
     ///
     /// This is the preferred constructor for multi-backend deployments. The caller
     /// (boot path in `kkernel` or `khive-mcp`) opens each backend from `khive.toml`,
@@ -526,12 +525,12 @@ impl KhiveRuntime {
         }
     }
 
-    /// Install the pack-aggregated edge endpoint rules (ADR-031).
+    /// Install the pack-aggregated edge endpoint rules.
     ///
     /// Called by the transport layer after the `VerbRegistry` is built so
-    /// that runtime-layer edge validation (in `validate_edge_relation_endpoints`)
-    /// can consult pack rules in addition to the ADR-002 base contract. Idempotent:
-    /// later calls overwrite the previous rule set.
+    /// that runtime-layer edge validation can consult pack rules in addition
+    /// to the base edge contract. Idempotent: later calls overwrite the previous
+    /// rule set.
     pub fn install_edge_rules(&self, rules: Vec<EdgeEndpointRule>) {
         if let Ok(mut guard) = self.edge_rules.write() {
             *guard = rules;

@@ -6,10 +6,10 @@
 // to the #[cfg(test)] fail_backend_id field which cannot be pub(crate) without leaking it to
 // integration tests.
 
-//! SubstrateCoordinator — cross-backend dispatch layer (ADR-003, ADR-029).
+//! SubstrateCoordinator — cross-backend dispatch layer.
 //!
 //! The coordinator lives inside `kkernel` as kernel-internal plumbing. Pack crates
-//! do not depend on it (ADR-003 §anti-pattern-9). It owns:
+//! do not depend on it — they receive a single-backend `KhiveRuntime`. It owns:
 //!
 //! - Node-to-backend location cache (D2 — `LocatorCache`, TTL-based in-memory)
 //! - Cross-backend `link()` routing (D3)
@@ -21,17 +21,17 @@
 //!
 //! When only one backend is registered, every D1–D6 mechanism degenerates to its
 //! trivial identity: no fan-out, no cross-backend routing, no health map misses.
-//! Multi-backend complexity is opt-in via `khive.toml` (ADR-028).
+//! Multi-backend complexity is opt-in via `khive.toml`.
 //!
-//! # Module structure (ADR-029 §coordinator-module-tree)
+//! # Module structure
 //!
 //! ```text
 //! kkernel::coordinator
 //!   mod.rs          — SubstrateCoordinator + BackendRegistry + LocatorCache (this file)
 //! ```
 //!
-//! Sub-modules (`edges`, `traversal`, `curation`, `health`) are reserved per ADR-029
-//! for D5/D6 work that is not yet implemented.
+//! Sub-modules (`edges`, `traversal`, `curation`, `health`) are reserved for D5/D6
+//! work that is not yet implemented.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
@@ -57,7 +57,7 @@ pub struct BackendEntry {
 
 /// Registry of all backends known to the coordinator.
 ///
-/// Constructed once at boot from `khive.toml` (ADR-028) and immutable thereafter.
+/// Constructed once at boot from `khive.toml` and immutable thereafter.
 /// Keyed by [`BackendId`] for deterministic ordering in `ids()` / `iter()` output.
 #[derive(Default)]
 pub struct BackendRegistry {
@@ -264,7 +264,7 @@ pub struct BackendSearchResult {
 
 // ---- SubstrateCoordinator ----
 
-/// Cross-backend dispatch layer (ADR-003 §four-invariants, ADR-029).
+/// Cross-backend dispatch layer.
 ///
 /// Owns node-to-backend location (D2), cross-backend link routing (D3),
 /// search fan-out with RRF (D4), traversal (D5), and partition tolerance (D6).
@@ -363,7 +363,7 @@ impl SubstrateCoordinator {
     /// Resolve which backend owns the substrate node identified by `id`.
     ///
     /// The probe checks both the entity substrate and the note substrate so that
-    /// note UUIDs are located correctly in addition to entity UUIDs (ADR-029 §D2).
+    /// note UUIDs are located correctly in addition to entity UUIDs.
     ///
     /// 1. Check the [`LocatorCache`]. Return immediately on a live hit.
     /// 2. On a miss (or expired entry), scan all backends concurrently.

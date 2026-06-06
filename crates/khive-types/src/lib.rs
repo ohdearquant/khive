@@ -46,7 +46,7 @@ pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, Re
 pub use namespace::Namespace;
 pub use note::{Note, NoteStatus};
 // REASON: `VerbDef` is marked `#[deprecated]` in pack.rs but still re-exported
-// here for callers that have not yet migrated to `HandlerDef` (ADR-023).
+// here for callers that have not yet migrated to `HandlerDef`.
 // Remove this allow once all downstream crates are migrated.
 #[allow(deprecated)]
 pub use pack::VerbDef;

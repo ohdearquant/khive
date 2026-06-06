@@ -28,14 +28,12 @@ Does not cover storage, embedding, or retrieval engine internals.
 
 ## RRF Formula
 
-```text
-score(d) = sum_i  1 / (k + rank_i(d))
-```
+$$\text{score}(d) = \sum_{i} \frac{1}{k + \text{rank}_i(d)}$$
 
 where:
-- `k = 60` (standard dampening constant — reduces dominance of rank-1 results)
-- `rank_i(d)` = position of document `d` in retriever `i`'s results (1-indexed)
-- If `d` does not appear in retriever `i`, its contribution is 0
+- $k = 60$ (standard dampening constant — reduces dominance of rank-1 results)
+- $\text{rank}_i(d)$ = position of document $d$ in retriever $i$'s results (1-indexed)
+- If $d$ does not appear in retriever $i$, its contribution is 0
 
 ### Why k=60?
 
@@ -46,13 +44,13 @@ rank-1 boosting; larger `k` → flatter distribution.
 
 ### Score range
 
-Raw RRF scores range from near 0 (low-ranked in one source) to `n_sources/(k+1)` (rank-1 in
+Raw RRF scores range from near 0 (low-ranked in one source) to $n\_\text{sources} / (k+1)$ (rank-1 in
 all sources). The `fuse()` dispatcher applies a `top_k` truncation after fusion; individual
 `reciprocal_rank_fusion` calls return the full fused list without truncation.
 
 ### Properties
 
-- **Better rank → higher contribution**: rank `r1 < r2` implies `1/(k+r1) > 1/(k+r2)`.
+- **Better rank → higher contribution**: rank $r_1 < r_2$ implies $\frac{1}{k+r_1} > \frac{1}{k+r_2}$.
 - **Present > absent**: any ranked document outscores one absent from all sources (score 0).
 - **Commutative**: source list order does not affect final scores (addition is order-independent).
 
@@ -62,9 +60,9 @@ all sources). The `fuse()` dispatcher applies a `top_k` truncation after fusion;
 
 Weighted fusion linearly combines per-source min-max normalized scores:
 
-```text
-score(d) = sum_i  weight_i * normalized_score_i(d)
-```
+$$\text{score}(d) = \sum_{i} w_i \cdot \hat{s}_i(d)$$
+
+where $\hat{s}_i(d)$ is the min-max normalized score for document $d$ from source $i$, and $w_i$ are the normalized weights.
 
 ### Weight normalization (RETRIEVAL-07)
 
@@ -79,9 +77,14 @@ instead of silently sanitizing them. `normalize_weights` is a lossy helper for i
 
 ### Per-source score normalization
 
-Each source is min-max normalized to `[0, 1]` independently before weighted combination.
-This ensures BM25 (unbounded) and cosine similarity (`[0, 1]`) contribute proportionally
-to their configured weights regardless of original score scale.
+Each source is min-max normalized to $[0, 1]$ independently before weighted combination:
+
+$$\hat{s}_i(d) = \frac{s_i(d) - \min_i}{\max_i - \min_i}$$
+
+When all scores in a source are equal (or the source has one element), every entry receives
+$1.0$ so it still contributes to the weighted combination. This ensures BM25 (unbounded) and
+cosine similarity ($[0, 1]$) contribute proportionally to their configured weights regardless
+of original score scale.
 
 ### Weight/source length mismatch
 

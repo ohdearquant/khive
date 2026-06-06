@@ -77,8 +77,7 @@ impl StorageBackend {
         crate::migrations::apply_schema_plan(writer.conn(), plan)
     }
 
-    /// Apply pack-auxiliary DDL statements (ADR-017 §Storage profile and
-    /// pack-auxiliary schema).
+    /// Apply pack-auxiliary DDL statements.
     ///
     /// Executes each DDL statement idempotently via `execute_batch`. Each
     /// statement MUST be self-contained and use `CREATE TABLE IF NOT EXISTS`
@@ -86,8 +85,8 @@ impl StorageBackend {
     /// once does not fail.
     ///
     /// Pack auxiliary tables are NOT tracked in `_schema_versions` — they are
-    /// non-versioned in v1 (ADR-017). Use `apply_schema` with a
-    /// `ServiceSchemaPlan` when version tracking is needed.
+    /// non-versioned. Use `apply_schema` with a `ServiceSchemaPlan` when version
+    /// tracking is needed.
     ///
     /// This method is lower-level than `PackRuntime::schema_plan()` — the
     /// runtime bootstrap calls `pack.schema_plan().statements` and passes the
@@ -270,7 +269,7 @@ impl StorageBackend {
         let table = format!("vec_{}", model_key);
         let writer = self.pool.try_writer()?;
 
-        // Detect old-schema vec0 tables that predate the `field` column (ADR-044).
+        // Detect old-schema vec0 tables that predate the `field` column.
         // vec0 virtual tables do not support ALTER TABLE, so we must drop and recreate
         // the table if it exists without the `field` column. Vector data is a cache —
         // callers can re-embed from the source record after the table is rebuilt.
@@ -318,7 +317,7 @@ impl StorageBackend {
             }
         }
 
-        // Ensure the _embedding_models registry table exists (ADR-043 §1).
+        // Ensure the _embedding_models registry table exists.
         // This is a no-op when the table already exists. Running it here ensures
         // the registry is present for any caller that opens a vector store without
         // first calling run_migrations() (e.g., tests that create stores directly).
@@ -355,7 +354,7 @@ impl StorageBackend {
         )?))
     }
 
-    /// Register an embedding model in the `_embedding_models` registry table (ADR-043).
+    /// Register an embedding model in the `_embedding_models` registry table.
     ///
     /// Idempotent: if a row with the same `canonical_key` already exists, updates its
     /// status back to `'active'` without changing other fields.
@@ -445,7 +444,7 @@ impl StorageBackend {
     /// Get a TextSearch for a specific table key.
     ///
     /// Creates the FTS5 virtual table if it does not already exist. Uses the
-    /// `trigram` tokenizer by default (CJK-safe, ADR-013).
+    /// `trigram` tokenizer by default (CJK-safe).
     ///
     /// The `table_key` must contain only ASCII alphanumeric/underscore characters.
     pub fn text(&self, table_key: &str) -> Result<Arc<dyn khive_storage::TextSearch>, SqliteError> {

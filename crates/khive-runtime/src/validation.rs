@@ -1,4 +1,4 @@
-//! Validation pipeline types for pack-contributed KG rules (ADR-034).
+//! Validation pipeline types for pack-contributed KG rules.
 //!
 //! Defines the trait surface for `CorpusCheck` (whole-corpus, cross-entity joins)
 //! and `StreamingRule` (per-record) shapes. Both return `Vec<Violation>` aggregated
@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 /// Pack-contributed rules MUST be namespaced (e.g. `"biology/required-taxa-rank"`).
 pub type RuleId = &'static str;
 
-/// Severity of a validation finding (ADR-034 §1).
+/// Severity of a validation finding.
 ///
 /// - `Error`: causes `kkernel kg validate` to exit with code 1.
 /// - `Warning`: reported but does not affect exit code (unless `--strict`).
@@ -31,8 +31,8 @@ pub enum Severity {
 /// Opaque snapshot of the KG corpus passed to `CorpusCheck::check`.
 ///
 /// v1 exposes the bare field set needed for the built-in rules. Pack authors
-/// that need richer access should open an ADR to extend this surface — do NOT
-/// reach through this struct to the storage layer.
+/// that need richer access should open a design review to extend this surface —
+/// do NOT reach through this struct to the storage layer.
 #[non_exhaustive]
 pub struct GraphSnapshot {
     /// Total entity count in the snapshot.
@@ -43,7 +43,7 @@ pub struct GraphSnapshot {
 
 /// Context passed to all rule implementations.
 ///
-/// Carries configuration overrides from `.khive/kg/rules.toml` (ADR-034) merged with
+/// Carries configuration overrides from `.khive/kg/rules.toml` merged with
 /// pack defaults. Rules read per-rule config from `config[rule_id]`.
 #[non_exhaustive]
 pub struct ValidationContext<'a> {
@@ -55,7 +55,7 @@ pub struct ValidationContext<'a> {
 
 // ── Violation ─────────────────────────────────────────────────────────────────
 
-/// A single rule violation produced by a rule implementation (ADR-034 §5).
+/// A single rule violation produced by a rule implementation.
 #[non_exhaustive]
 pub struct Violation {
     /// The rule that produced this violation.
@@ -95,23 +95,23 @@ impl Violation {
 
 // ── Rule function type ────────────────────────────────────────────────────────
 
-/// Whole-corpus check function type (ADR-034 §2, §9a).
+/// Whole-corpus check function type.
 ///
 /// Receives the corpus snapshot and config context; returns all violations
 /// produced by the rule in one call.
 pub type RuleFn = fn(&ValidationContext<'_>) -> Vec<Violation>;
 
-/// Optional auto-fix function type (ADR-034 §7).
+/// Optional auto-fix function type.
 ///
 /// Receives the context and violations emitted by the corresponding `RuleFn`.
 /// Returns a `GraphPatch` (opaque in v1 — see below) that the validator applies
 /// before writing NDJSON. Returning `None` leaves the graph unchanged.
 ///
-/// `GraphPatch` is a placeholder type in v1; the git-native write path
-/// (ADR-020) is out of scope for this cluster.
+/// `GraphPatch` is a placeholder type in v1; the auto-fix write path is out of
+/// scope for this cluster.
 pub type FixFn = fn(&ValidationContext<'_>, &[Violation]) -> Option<GraphPatch>;
 
-/// Opaque graph patch produced by a fix function (ADR-034 §7).
+/// Opaque graph patch produced by a fix function.
 ///
 /// v1 carries no fields — the auto-fix machinery is stubbed. The type exists
 /// so pack authors can write `fix: Some(my_fix as FixFn)` without a
@@ -121,29 +121,29 @@ pub struct GraphPatch;
 
 // ── ValidationRule ────────────────────────────────────────────────────────────
 
-/// A pack-contributed validation rule (ADR-034 §9).
+/// A pack-contributed validation rule.
 ///
 /// Rule IDs must follow the `<pack>/<rule-id>` namespace convention.
 /// See `docs/validation.md` for declaration examples and severity override rules.
 pub struct ValidationRule {
     /// Stable rule identifier in `<pack>/<rule-id>` format.
     pub id: RuleId,
-    /// Default severity; can be overridden in `.khive/kg/rules.toml` (ADR-034).
+    /// Default severity; can be overridden in `.khive/kg/rules.toml`.
     pub severity: Severity,
     /// Human-readable description shown in `kkernel kg validate` output.
     pub description: &'static str,
     /// Whole-corpus check function.
     pub check: RuleFn,
-    /// Optional auto-fix function (ADR-034 §7). `None` for unfixable rules.
+    /// Optional auto-fix function. `None` for unfixable rules.
     pub fix: Option<FixFn>,
 }
 
 // ── Aggregated report ─────────────────────────────────────────────────────────
 
-/// Aggregated result of running the full rule pipeline (ADR-034 §5).
+/// Aggregated result of running the full rule pipeline.
 #[derive(Default)]
 pub struct ValidationReport {
-    /// Violations grouped by rule ID, sorted canonically per ADR-034 §9a.
+    /// Violations grouped by rule ID, sorted canonically by rule ID.
     pub violations_by_rule: BTreeMap<String, Vec<Violation>>,
 }
 

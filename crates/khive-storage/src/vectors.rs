@@ -1,4 +1,4 @@
-//! Vector embedding storage and similarity search capability (ADR-005, ADR-044).
+//! Vector embedding storage and similarity search capability.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -16,7 +16,7 @@ use crate::types::{
     VectorStoreCapabilities, VectorStoreInfo,
 };
 
-/// Storage capability for dense vector embeddings and similarity search (ADR-005, ADR-044).
+/// Storage capability for dense vector embeddings and similarity search.
 #[async_trait]
 pub trait VectorStore: Send + Sync + 'static {
     // --- Required methods ---
@@ -79,7 +79,7 @@ pub trait VectorStore: Send + Sync + 'static {
     /// runtime layer is responsible for post-filtering when native pushdown is absent.
     ///
     /// A backend that claims `supports_filter = true` but does not override this
-    /// method will trigger a `debug_assert` at runtime (ADR-044 §4).
+    /// method will trigger a `debug_assert` at runtime.
     async fn search_with_filter(
         &self,
         request: &VectorSearchRequest,
@@ -133,7 +133,7 @@ pub trait VectorStore: Send + Sync + 'static {
             .await
     }
 
-    /// Remove vectors with no live subject (orphan sweep, ADR-044).
+    /// Remove vectors with no live subject (orphan sweep).
     ///
     /// Default returns [`StorageError::Unsupported`]. Backends that implement
     /// deletion must set `supports_orphan_sweep = true` and override this method.

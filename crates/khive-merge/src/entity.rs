@@ -195,7 +195,7 @@ fn field_level_merge(
         result.tags = tags;
     }
 
-    // Properties: per-key merge (ADR-043 §9).
+    // Properties: per-key merge (see merge_properties for rules).
     let (merged_props, prop_conflicts) = merge_properties(id, &ours.properties, &theirs.properties);
     result.properties = merged_props;
     conflicts.extend(prop_conflicts);
@@ -203,7 +203,7 @@ fn field_level_merge(
     (result, conflicts)
 }
 
-/// Merge entity properties from ours and theirs (ADR-043 §9).
+/// Merge entity properties from ours and theirs.
 ///
 /// Returns the merged property map and any per-key conflicts.
 /// Merge rules:
@@ -250,7 +250,7 @@ fn merge_properties(
                             theirs: tv.clone(),
                         });
                     }
-                    // Only theirs has this key → take theirs (ADR-043 §9).
+                    // Only theirs has this key → take theirs.
                     (None, Some(tv)) => {
                         merged.insert(key.clone(), tv.clone());
                     }
@@ -264,7 +264,7 @@ fn merge_properties(
     }
 }
 
-/// Auto-merge an entity where both branches added the same UUID (ADR-043 §4.1).
+/// Auto-merge an entity where both branches added the same UUID.
 /// Scalars → ours wins; tags → union.
 fn merge_entity_fields(ours: &ExportedEntity, theirs: &ExportedEntity) -> ExportedEntity {
     let mut result = ours.clone();

@@ -1,3 +1,3 @@
-//! SQL compilation backend for GQL ASTs (ADR-008).
+//! SQL compilation backend for GQL ASTs.
 
 pub mod sql;

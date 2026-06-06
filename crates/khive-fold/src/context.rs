@@ -102,7 +102,7 @@ impl<'de> Deserialize<'de> for SharedJson {
 ///
 /// `as_of` defaults to the Unix epoch (`DateTime::<Utc>::default()`).
 /// Callers that need "now" must pass it explicitly via [`FoldContext::at`].
-/// This preserves the ADR-024 "no clock" invariant for the foundation layer.
+/// The foundation layer does not call the system clock; callers supply timestamps.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FoldContext {
@@ -123,7 +123,7 @@ pub struct FoldContext {
 impl FoldContext {
     /// Create a new context with the Unix epoch as `as_of`.
     ///
-    /// Per ADR-024 ("no clock"), the foundation layer does not call `Utc::now()`.
+    /// The foundation layer does not call `Utc::now()`.
     /// Pass an explicit timestamp via [`FoldContext::at`] when a real wall-clock
     /// instant is needed.
     pub fn new() -> Self {

@@ -15,7 +15,8 @@ pub enum QueryError {
     #[error("unsupported feature: {0}")]
     Unsupported(String),
 
-    /// A query parameter value is out of the allowed range (ADR-008 §"Depth limits").
+    /// A query parameter value is out of the allowed range (e.g. max_hops exceeds
+    /// the 10-hop depth cap, or a limit value overflows `i64`).
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }

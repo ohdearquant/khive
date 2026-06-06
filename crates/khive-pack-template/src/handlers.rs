@@ -1,4 +1,4 @@
-//! Verb handlers for the template pack (ADR-023 §8).
+//! Verb handlers for the template pack.
 
 use serde_json::{json, Value};
 

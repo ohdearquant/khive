@@ -1,4 +1,4 @@
-//! Pack registration helpers for `khive-mcp` (ADR-027).
+//! Pack registration helpers for `khive-mcp`.
 //!
 //! Force-references one public symbol per pack crate so the linker includes their
 //! `inventory::submit!` constructors in the final binary. To add a new pack: add

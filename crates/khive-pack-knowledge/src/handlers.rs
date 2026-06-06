@@ -142,8 +142,8 @@ impl KnowledgePack {
         };
 
         // Normalise the domain once (trim + lowercase) and use the same value
-        // for properties.domain, the promoted tag, and the response — ADR-047 §91
-        // requires case-insensitive domain matching, so the three surfaces must agree.
+        // for properties.domain, the promoted tag, and the response — domain matching
+        // is case-insensitive, so the three surfaces must agree.
         let domain_norm: Option<String> = p
             .domain
             .as_ref()
@@ -186,7 +186,7 @@ impl KnowledgePack {
 
     /// Link a concept to the paper/source that introduced it.
     ///
-    /// Direction: concept →[introduced_by]→ source (ADR-002 §introduced_by).
+    /// Direction: concept →[introduced_by]→ source.
     pub(crate) async fn handle_cite(
         &self,
         token: &NamespaceToken,
@@ -245,7 +245,7 @@ impl KnowledgePack {
     ) -> Result<Value, RuntimeError> {
         let p: TopicParams = deser(params)?;
         let limit = p.limit.unwrap_or(20).min(100);
-        // Normalise domain filter to lowercase (ADR-047 §91: case-insensitive match).
+        // Normalise domain filter to lowercase for case-insensitive matching.
         let domain_filter = p
             .domain
             .as_deref()

@@ -1,19 +1,14 @@
-// FILE SIZE JUSTIFICATION: The two compilation paths (fixed-length JOIN chain and
-// variable-length recursive CTE) plus the synthetic-edge (ADR-041) lowering share
-// helper logic (namespace_filter, condition compilation, property predicate emission)
-// that cannot be cleanly split without either duplicating that logic or introducing a
-// separate internal crate.  Extraction is tracked as future work once the compiler
-// stabilizes.
 //! Compile GQL AST to parameterized SQL.
 //!
 //! Two compilation paths:
 //! - Fixed-length patterns (all edges *1..1) → JOIN chain
 //! - Variable-length patterns (any edge *N..M where M>1) → recursive CTE
 //!
-//! Synthetic edge paths (ADR-041):
-//! - Relations prefixed `observed_as_*` join against `event_observations`, not `graph_edges`.
+//! Synthetic edge paths: relations prefixed `observed_as_*` join against
+//! `event_observations`, not `graph_edges`. Only four known synthetic relations
+//! are accepted; unknown ones are rejected at validation.
 //!
-//! Security invariants (MAJ-1/MAJ-2/MAJ-3 from critic review):
+//! Security invariants:
 //! - Namespace injection: WHERE clause always comes from CompileOptions.scopes, never the query.
 //! - Edge property whitelist: only `relation` and `weight` are queryable edge columns.
 //! - Depth cap: recursive CTE depth capped at MAX_DEPTH; exceeding it errors at validation.
@@ -22,7 +17,7 @@ use crate::ast::*;
 use crate::error::QueryError;
 use crate::validate::{validate_with_warnings, MAX_DEPTH};
 
-/// Observation roles used by the synthetic edge compiler (ADR-041 §8).
+/// Observation roles used by the synthetic edge compiler.
 const SYNTHETIC_RELATIONS: &[&str] = &[
     "observed_as_candidate",
     "observed_as_selected",
@@ -30,7 +25,7 @@ const SYNTHETIC_RELATIONS: &[&str] = &[
     "observed_as_signal",
 ];
 
-/// Returns `true` when the relation string is a synthetic ADR-041 observation edge.
+/// Returns `true` when the relation string is a synthetic observation edge (`observed_as_*`).
 fn is_synthetic(rel: &str) -> bool {
     SYNTHETIC_RELATIONS.contains(&rel)
 }
@@ -158,8 +153,8 @@ fn synthetic_endpoint_node_indices(
 ///   AND a.deleted_at IS NULL AND b.deleted_at IS NULL
 /// LIMIT 10
 ///
-/// Synthetic `observed_as_*` patterns (ADR-041 §8) route the event-source node
-/// to the `events` table instead of `entities`.
+/// Synthetic `observed_as_*` patterns route the event-source node to the `events`
+/// table instead of `entities`.
 fn compile_fixed_length(
     query: &GqlQuery,
     opts: &CompileOptions,
@@ -319,7 +314,7 @@ fn compile_fixed_length(
 
                 edge_aliases.push(e_alias.clone());
 
-                // Detect synthetic event_observations edges (ADR-041 §8).
+                // Detect synthetic event_observations edges (observed_as_* relations).
                 // A synthetic edge is one whose only relation(s) are observed_as_* names.
                 // Mixed synthetic+canonical relations are rejected: the two tables don't share
                 // a common join key that would make an OR across them meaningful.
@@ -367,8 +362,8 @@ fn compile_fixed_length(
                     }
                     // Join the target node via event_observations.entity_id.
                     // The `referent_kind` column discriminates between note and entity
-                    // substrates.  Per ADR-041, recall/rerank observations always target
-                    // notes (`referent_kind='note'`); we filter to note substrate and join
+                    // Recall/rerank observations always target notes
+                    // (`referent_kind='note'`); we filter to note substrate and join
                     // the `notes` table.  An explicit `AND e0.referent_kind='note'`
                     // prevents cross-substrate ID collisions.
                     join_parts.push(format!(
@@ -445,7 +440,7 @@ fn compile_fixed_length(
         }
     }
 
-    // WHERE clause conditions from GQL WHERE (supports AND / OR tree — ADR-008)
+    // WHERE clause conditions from GQL WHERE (supports AND / OR tree)
     if let Some(where_sql) = compile_where_expr(&query.where_clause, &var_to_alias, &mut params)? {
         where_parts.push(where_sql);
     }
@@ -1290,9 +1285,9 @@ fn compile_variable_length(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VarKind {
     Node,
-    /// Node that maps to the `events` table (synthetic edge source, ADR-041 §8).
+    /// Node that maps to the `events` table (synthetic `observed_as_*` edge source).
     EventNode,
-    /// Node that maps to the `notes` table (synthetic edge target, ADR-041 §8).
+    /// Node that maps to the `notes` table (synthetic `observed_as_*` edge target).
     NoteNode,
     Edge,
 }
@@ -1308,7 +1303,7 @@ const NODE_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
-/// Columns available for projection on `notes` table nodes (ADR-041 §8 targets).
+/// Columns available for projection on `notes` table nodes (synthetic edge targets).
 const NOTE_COLUMNS: &[&str] = &[
     "id",
     "namespace",
@@ -1322,7 +1317,7 @@ const NOTE_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
-/// Columns available for projection on `events` table nodes (ADR-041 §8).
+/// Columns available for projection on `events` table nodes (synthetic edge sources).
 const EVENT_COLUMNS: &[&str] = &[
     "id",
     "namespace",
@@ -1459,8 +1454,8 @@ mod tests {
 
     #[test]
     fn depth_cap_at_ten_rejects_above_max() {
-        // ADR-008 §"Depth limits": exceeding MAX_DEPTH is an InvalidInput error at
-        // validation time — the compiler never sees a query with depth > 10.
+        // Exceeding MAX_DEPTH is an InvalidInput error at validation time —
+        // the compiler never sees a query with depth > 10.
         let q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
         let err = compile(&q, &opts()).unwrap_err();
         assert!(
@@ -1734,7 +1729,7 @@ mod tests {
         );
     }
 
-    // --- F047: OR support in WHERE clause (ADR-008 §"GQL WHERE expression") ---
+    // --- OR support in WHERE clause ---
 
     #[test]
     fn where_or_compiles_to_sql_or() {
@@ -1774,7 +1769,7 @@ mod tests {
         );
     }
 
-    // --- F218: event_observations synthetic edge support (ADR-041 §8) ---
+    // --- event_observations synthetic edge support ---
 
     #[test]
     fn synthetic_edge_joins_event_observations() {

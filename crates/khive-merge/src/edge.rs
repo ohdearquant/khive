@@ -210,7 +210,7 @@ pub fn validate_dangling_edges(
 /// Build a merged edge, preserving `edge_id` when it is already known.
 ///
 /// Pass `existing_id` from the ours/theirs/base archive to avoid generating a
-/// fresh UUID and breaking ADR-048 D1 edge-identity continuity.
+/// fresh UUID; edge identity must be stable across merge/diff cycles.
 fn build_edge(
     key: &EdgeKey,
     weight: f64,
@@ -327,7 +327,7 @@ mod tests {
         ));
     }
 
-    // ── edge_id preservation tests (ADR-048 D1) ──────────────────────────────
+    // ── edge_id preservation tests ───────────────────────────────────────────
 
     /// Branch adds an edge not present in base → merged result uses the branch's edge_id.
     #[test]
@@ -365,7 +365,7 @@ mod tests {
             weight: 0.5,
         };
         // ours modifies only the weight; the edge_id differs from base to simulate
-        // a fresh edge_id that ours assigned (ADR-048 D1 identity must survive).
+        // a fresh edge_id that ours assigned (edge identity must survive across merges).
         let ours_edge = ExportedEdge {
             edge_id: Uuid::new_v4(),
             source: a,

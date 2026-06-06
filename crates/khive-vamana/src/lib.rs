@@ -6,7 +6,8 @@
 //! (`NaN`, `Infinity`) are rejected at [`VamanaIndex::build`],
 //! [`VamanaIndex::search`], and [`VamanaIndex::from_snapshot`].
 //!
-//! See ADR-048 for default parameters (`max_degree=64`, `alpha=1.2`).
+//! Production defaults: `dimensions=384`, `max_degree=64`,
+//! `search_list_size=128`, `alpha=1.2`.
 
 pub mod config;
 pub mod distance;

@@ -1,8 +1,8 @@
-//! Verb handler implementations for the schedule pack (ADR-040).
+//! Verb handler implementations for the schedule pack.
 //!
 //! All four verbs (`remind`, `schedule`, `agenda`, `cancel`) store and query
 //! `scheduled_event` notes. Trigger evaluation is NOT performed by the pack —
-//! the pack only stores intent. See ADR-040 §Trigger evaluation for execution modes.
+//! the pack only stores intent. See `docs/design.md` for execution modes.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -88,7 +88,7 @@ fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     Ok(parsed)
 }
 
-/// Validate a cron expression (5-field) per ADR-040 §260-268.
+/// Validate a cron expression (5-field).
 ///
 /// Accepts the literals `daily`, `weekly`, `monthly`, and standard five-field
 /// cron expressions of the form `MIN HOUR DOM MON DOW`, where each field is
@@ -201,7 +201,7 @@ pub(crate) struct CancelParams {
 
 // ── handlers ─────────────────────────────────────────────────────────────────
 
-/// `remind` — create a time-triggered reminder (ADR-040 §remind).
+/// `remind` — create a time-triggered reminder.
 pub(crate) async fn handle_remind(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -261,7 +261,7 @@ pub(crate) async fn handle_remind(
     }))
 }
 
-/// `schedule` — schedule a future verb dispatch (ADR-040 §schedule).
+/// `schedule` — schedule a future verb dispatch.
 pub(crate) async fn handle_schedule(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -325,7 +325,7 @@ pub(crate) async fn handle_schedule(
     }))
 }
 
-/// `agenda` — list upcoming scheduled events (ADR-040 §agenda).
+/// `agenda` — list upcoming scheduled events.
 pub(crate) async fn handle_agenda(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -490,7 +490,7 @@ pub(crate) async fn handle_agenda(
     Ok(json!({ "events": events, "count": count }))
 }
 
-/// `cancel` — cancel a scheduled event (ADR-040 §cancel).
+/// `cancel` — cancel a scheduled event.
 pub(crate) async fn handle_cancel(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,

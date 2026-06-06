@@ -1,4 +1,4 @@
-//! Event storage capability — append-only operation log (ADR-004).
+//! Event storage capability — append-only operation log.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
