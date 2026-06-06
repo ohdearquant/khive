@@ -1655,7 +1655,8 @@ impl KgPack {
         // ProposalCreated event payload.  Standard substrates win when the same
         // id matches both (shouldn't happen in practice; proposal IDs are fresh UUIDs).
 
-        // UUID resolution: try graph namespace first (entities live there), then caller.
+        // UUID resolution: try graph token namespace first (entities and edges use the graph
+        // token, which is the caller token under ADR-050), then caller as fallback.
         let id = if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, graph_token).await {
             id
         } else if let Ok(id) = resolve_uuid_async(&p.id, &self.runtime, token).await {
@@ -1668,7 +1669,7 @@ impl KgPack {
             return Err(RuntimeError::NotFound(format!("not found: {}", p.id)));
         };
 
-        // Entities and edges use graph namespace; notes and events use caller namespace.
+        // Entities and edges use the graph token (caller token under ADR-050); notes and events use caller namespace.
         if let Ok(entity) = self.runtime.get_entity(graph_token, id).await {
             return flatten_get_result("entity", normalize_entity_timestamps(to_json(&entity)?));
         }
