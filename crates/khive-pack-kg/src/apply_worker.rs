@@ -35,6 +35,61 @@ use khive_types::{
 
 use crate::projection_worker::ProposalsProjectionWorker;
 
+// ---- WriteBudget ----
+
+/// Per-apply write budget. Tracks how many new entity/note rows may still be
+/// created in this apply run. `None` means unlimited.
+///
+/// `Compound` passes the same `&mut WriteBudget` to every nested step so
+/// consumption is cumulative across the whole changeset tree.
+#[derive(Debug, Clone, Copy)]
+struct WriteBudget {
+    max_new_entries: Option<u64>,
+    consumed_new_entries: u64,
+}
+
+impl WriteBudget {
+    fn new(max_new_entries: Option<u64>) -> Self {
+        Self {
+            max_new_entries,
+            consumed_new_entries: 0,
+        }
+    }
+
+    /// Attempt to consume one entry from the budget.
+    ///
+    /// Returns `RuntimeError::WriteBudgetExceeded` if adding one more entry
+    /// would exceed `max_new_entries`. `None` budget always succeeds.
+    fn consume_new_entry(&mut self) -> Result<(), RuntimeError> {
+        if let Some(max) = self.max_new_entries {
+            let next = self.consumed_new_entries + 1;
+            if next > max {
+                return Err(RuntimeError::WriteBudgetExceeded {
+                    max_new_entries: max,
+                    attempted_new_entries: next,
+                });
+            }
+            self.consumed_new_entries = next;
+        }
+        Ok(())
+    }
+}
+
+/// Count the total number of `AddEntity` + `AddNote` steps in a changeset tree.
+///
+/// Used for the pre-flight budget check in `maybe_apply` to guarantee zero rows
+/// are written when the budget would be exceeded (ADR-046 §2 all-or-nothing).
+fn count_new_entries(changeset: &ProposalChangeset) -> u64 {
+    match changeset {
+        ProposalChangeset::AddEntity { .. } => 1,
+        ProposalChangeset::AddNote { .. } => 1,
+        ProposalChangeset::Compound { steps } => steps.iter().map(count_new_entries).sum(),
+        _ => 0,
+    }
+}
+
+// ---- ProposalApplyWorker ----
+
 /// Worker that applies approved proposal changesets.
 pub struct ProposalApplyWorker {
     runtime: KhiveRuntime,
@@ -55,6 +110,10 @@ impl ProposalApplyWorker {
     /// Checks whether the proposal should now be applied (threshold met, not already
     /// applied/withdrawn). If yes, applies the changeset and emits `ProposalApplied`.
     ///
+    /// `max_new_entries`: caller-supplied write budget. Cloud passes remaining headroom
+    /// so the OSS apply worker enforces the cap without learning tenant plan details.
+    /// `None` means unlimited — standalone khive default, zero behaviour change.
+    ///
     /// Returns `Ok(())` in all cases — errors are emitted as `ProposalApplied { Failed }`
     /// events, not propagated to the reviewer.
     pub async fn maybe_apply(
@@ -62,6 +121,7 @@ impl ProposalApplyWorker {
         token: &NamespaceToken,
         proposal_id: Uuid,
         registry: &VerbRegistry,
+        max_new_entries: Option<u64>,
     ) -> Result<(), RuntimeError> {
         // Load current projection row.
         let row = match self.projection.get_proposal_row(token, proposal_id).await? {
@@ -84,6 +144,31 @@ impl ProposalApplyWorker {
                 return Ok(());
             }
         };
+
+        // Pre-flight write-budget check (before CAS so no revert is needed on rejection).
+        //
+        // Count AddEntity + AddNote ops recursively. If the total exceeds the caller-
+        // supplied budget, emit ProposalApplied{Failed} and return — no KG writes occur,
+        // no CAS transition happens, and status remains 'approved' for future retries.
+        // This guarantees zero entity/note rows are written when the budget is exceeded
+        // (ADR-046 §2 all-or-nothing contract).
+        if let Some(max) = max_new_entries {
+            let needed = count_new_entries(&changeset);
+            if needed > max {
+                self.emit_apply_failed(
+                    token,
+                    proposal_id,
+                    RuntimeError::WriteBudgetExceeded {
+                        max_new_entries: max,
+                        attempted_new_entries: max + 1,
+                    }
+                    .to_string(),
+                    0,
+                )
+                .await;
+                return Ok(());
+            }
+        }
 
         // H1 fix (apply/withdraw race — pre-apply CAS):
         //
@@ -109,7 +194,14 @@ impl ProposalApplyWorker {
         }
 
         // Apply the changeset — we exclusively own the 'applying' state now.
-        let apply_result = self.apply_changeset(token, &changeset, registry).await;
+        let apply_result = self
+            .apply_changeset(
+                token,
+                &changeset,
+                registry,
+                &mut WriteBudget::new(max_new_entries),
+            )
+            .await;
 
         match apply_result {
             Ok(created_records) => {
@@ -213,19 +305,26 @@ impl ProposalApplyWorker {
     ///
     /// Returns the list of created record UUIDs (for AddEntity / AddNote / AddEdge).
     ///
+    /// `budget` tracks remaining write capacity. `AddEntity` and `AddNote` each consume
+    /// one entry before the runtime create call; `Compound` passes the same budget
+    /// through each nested step so consumption is cumulative across the whole tree.
+    /// The pre-flight check in `maybe_apply` ensures the budget is never actually
+    /// exhausted here; the inline checks are defense-in-depth.
+    ///
     /// The function is `Box::pin`-wrapped to support recursion (Compound steps).
     fn apply_changeset<'a>(
         &'a self,
         token: &'a NamespaceToken,
         changeset: &'a ProposalChangeset,
         registry: &'a VerbRegistry,
+        budget: &'a mut WriteBudget,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<Uuid>, RuntimeError>> + Send + 'a>,
     > {
         Box::pin(async move {
             match changeset {
                 ProposalChangeset::AddEntity { entity } => {
-                    self.apply_add_entity(token, entity).await
+                    self.apply_add_entity(token, entity, budget).await
                 }
                 ProposalChangeset::UpdateEntity { id, patch } => {
                     self.apply_update_entity(token, *id, patch).await?;
@@ -244,7 +343,7 @@ impl ProposalApplyWorker {
                     Ok(vec![edge_id])
                 }
                 ProposalChangeset::AddNote { note } => {
-                    self.apply_add_note(token, note, registry).await
+                    self.apply_add_note(token, note, registry, budget).await
                 }
                 ProposalChangeset::MergeEntities { into, from } => {
                     self.apply_merge_entities(token, *into, *from).await?;
@@ -257,7 +356,7 @@ impl ProposalApplyWorker {
                 ProposalChangeset::Compound { steps } => {
                     let mut all_created = Vec::new();
                     for step in steps {
-                        let created = self.apply_changeset(token, step, registry).await?;
+                        let created = self.apply_changeset(token, step, registry, budget).await?;
                         all_created.extend(created);
                     }
                     Ok(all_created)
@@ -271,6 +370,7 @@ impl ProposalApplyWorker {
         &self,
         token: &NamespaceToken,
         draft: &EntityDraft,
+        budget: &mut WriteBudget,
     ) -> Result<Vec<Uuid>, RuntimeError> {
         let kind = draft.kind.as_str();
 
@@ -284,6 +384,10 @@ impl ProposalApplyWorker {
                 valid.join(" | ")
             ))
         })?;
+
+        // Consume one budget entry before the runtime write (defense-in-depth;
+        // pre-flight in maybe_apply already validated the total).
+        budget.consume_new_entry()?;
 
         let entity = self
             .runtime
@@ -362,10 +466,16 @@ impl ProposalApplyWorker {
         token: &NamespaceToken,
         draft: &NoteDraft,
         registry: &VerbRegistry,
+        budget: &mut WriteBudget,
     ) -> Result<Vec<Uuid>, RuntimeError> {
         let kind = draft.kind.as_str();
         // Validate note kind against registry (base kg kinds + all loaded pack kinds).
         let canonical_kind = crate::handlers::canonical_note_kind(kind, registry)?;
+
+        // Consume one budget entry before the runtime write (defense-in-depth;
+        // pre-flight in maybe_apply already validated the total).
+        budget.consume_new_entry()?;
+
         let note = self
             .runtime
             .create_note(
@@ -645,7 +755,7 @@ mod tests {
         let registry = build_registry(&rt);
         let worker = ProposalApplyWorker::new(rt.clone());
         worker
-            .maybe_apply(&tok, proposal_id, &registry)
+            .maybe_apply(&tok, proposal_id, &registry, None)
             .await
             .expect("maybe_apply must succeed");
 
@@ -710,7 +820,7 @@ mod tests {
         let registry = build_registry(&rt);
         let worker = ProposalApplyWorker::new(rt.clone());
         worker
-            .maybe_apply(&tok, proposal_id, &registry)
+            .maybe_apply(&tok, proposal_id, &registry, None)
             .await
             .expect("maybe_apply must succeed without error");
 
@@ -763,7 +873,7 @@ mod tests {
         let registry = build_registry(&rt);
         let worker = ProposalApplyWorker::new(rt.clone());
         worker
-            .maybe_apply(&tok, proposal_id, &registry)
+            .maybe_apply(&tok, proposal_id, &registry, None)
             .await
             .expect("maybe_apply itself must succeed (errors emitted as ProposalApplied{Failed})");
 
@@ -831,7 +941,7 @@ mod tests {
         let registry = build_registry(&rt);
         let worker = ProposalApplyWorker::new(rt.clone());
         worker
-            .maybe_apply(&tok, proposal_id, &registry)
+            .maybe_apply(&tok, proposal_id, &registry, None)
             .await
             .expect("maybe_apply must succeed without error");
 
@@ -894,7 +1004,7 @@ mod tests {
         let registry = build_registry(&rt);
         let worker = ProposalApplyWorker::new(rt.clone());
         worker
-            .maybe_apply(&tok, proposal_id, &registry)
+            .maybe_apply(&tok, proposal_id, &registry, None)
             .await
             .expect("maybe_apply itself must succeed (errors emitted as ProposalApplied{Failed})");
 
@@ -942,5 +1052,324 @@ mod tests {
                 .any(|n| n.name.as_deref() == Some("BadNote")),
             "C3: note with invalid kind must not be created in the KG"
         );
+    }
+
+    // ---- Write-budget tests ------------------------------------------------
+
+    fn make_entity_draft(name: &str) -> EntityDraft {
+        EntityDraft {
+            kind: "concept".to_string(),
+            name: name.to_string(),
+            description: None,
+            properties: None,
+            tags: vec![],
+        }
+    }
+
+    /// Over-budget flat Compound: 3 AddEntity steps, budget=Some(2).
+    /// Expects: ProposalApplied{Failed} with WriteBudgetExceeded, zero new entities.
+    #[tokio::test]
+    async fn budget_exceeded_flat_compound_creates_zero_rows() {
+        let (rt, tok) = setup();
+        ensure_schema(&rt).await;
+
+        let proposal_id = Uuid::new_v4();
+        let changeset = ProposalChangeset::Compound {
+            steps: vec![
+                ProposalChangeset::AddEntity {
+                    entity: make_entity_draft("BudgetA"),
+                },
+                ProposalChangeset::AddEntity {
+                    entity: make_entity_draft("BudgetB"),
+                },
+                ProposalChangeset::AddEntity {
+                    entity: make_entity_draft("BudgetC"),
+                },
+            ],
+        };
+
+        seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+        insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+        let entities_before = rt
+            .list_entities(&tok, None, None, 100, 0)
+            .await
+            .expect("list_entities");
+
+        let registry = build_registry(&rt);
+        let worker = ProposalApplyWorker::new(rt.clone());
+        worker
+            .maybe_apply(&tok, proposal_id, &registry, Some(2))
+            .await
+            .expect("maybe_apply must succeed (budget error emitted as ProposalApplied{Failed})");
+
+        // Verify: ProposalApplied{Failed} was emitted.
+        let event_store = rt.events(&tok).expect("event store");
+        let applied_events = event_store
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::ProposalApplied],
+                    payload_proposal_id: Some(proposal_id),
+                    ..Default::default()
+                },
+                PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("query events");
+        assert_eq!(
+            applied_events.items.len(),
+            1,
+            "budget: ProposalApplied event must be emitted on over-budget"
+        );
+        let payload_str = applied_events.items[0].payload.to_string();
+        assert!(
+            payload_str.contains("WriteBudgetExceeded")
+                || payload_str.contains("write budget exceeded"),
+            "budget: failure payload must mention WriteBudgetExceeded; got: {payload_str}"
+        );
+
+        // Verify: zero new entity rows (all-or-nothing guarantee).
+        let entities_after = rt
+            .list_entities(&tok, None, None, 100, 0)
+            .await
+            .expect("list_entities");
+        assert_eq!(
+            entities_before.len(),
+            entities_after.len(),
+            "budget: over-budget apply must create zero new entity rows"
+        );
+    }
+
+    /// In-budget flat Compound: 2 AddEntity steps, budget=Some(2).
+    /// Expects: ProposalApplied{Success}, two new entities.
+    #[tokio::test]
+    async fn budget_in_budget_flat_compound_applies_fully() {
+        let (rt, tok) = setup();
+        ensure_schema(&rt).await;
+
+        let proposal_id = Uuid::new_v4();
+        let changeset = ProposalChangeset::Compound {
+            steps: vec![
+                ProposalChangeset::AddEntity {
+                    entity: make_entity_draft("InBudgetA"),
+                },
+                ProposalChangeset::AddEntity {
+                    entity: make_entity_draft("InBudgetB"),
+                },
+            ],
+        };
+
+        seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+        insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+        let registry = build_registry(&rt);
+        let worker = ProposalApplyWorker::new(rt.clone());
+        worker
+            .maybe_apply(&tok, proposal_id, &registry, Some(2))
+            .await
+            .expect("maybe_apply must succeed");
+
+        let entities = rt
+            .list_entities(&tok, None, None, 100, 0)
+            .await
+            .expect("list_entities");
+        assert!(
+            entities.iter().any(|e| e.name == "InBudgetA"),
+            "budget: InBudgetA must be created"
+        );
+        assert!(
+            entities.iter().any(|e| e.name == "InBudgetB"),
+            "budget: InBudgetB must be created"
+        );
+    }
+
+    /// Nested Compound: outer has 1 AddEntity + inner Compound with 2 AddEntity.
+    /// Total = 3. budget=Some(2) → fail before any write.
+    #[tokio::test]
+    async fn budget_nested_compound_counts_recursively() {
+        let (rt, tok) = setup();
+        ensure_schema(&rt).await;
+
+        let proposal_id = Uuid::new_v4();
+        let changeset = ProposalChangeset::Compound {
+            steps: vec![
+                ProposalChangeset::AddEntity {
+                    entity: make_entity_draft("NestedOuter"),
+                },
+                ProposalChangeset::Compound {
+                    steps: vec![
+                        ProposalChangeset::AddEntity {
+                            entity: make_entity_draft("NestedInnerA"),
+                        },
+                        ProposalChangeset::AddEntity {
+                            entity: make_entity_draft("NestedInnerB"),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+        insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+        let entities_before = rt
+            .list_entities(&tok, None, None, 100, 0)
+            .await
+            .expect("list_entities");
+
+        let registry = build_registry(&rt);
+        let worker = ProposalApplyWorker::new(rt.clone());
+        worker
+            .maybe_apply(&tok, proposal_id, &registry, Some(2))
+            .await
+            .expect("maybe_apply must succeed (error as ProposalApplied{Failed})");
+
+        let entities_after = rt
+            .list_entities(&tok, None, None, 100, 0)
+            .await
+            .expect("list_entities");
+        assert_eq!(
+            entities_before.len(),
+            entities_after.len(),
+            "budget: nested over-budget must create zero rows"
+        );
+    }
+
+    /// Some(0) budget: AddEdge-only changeset still applies; no new entity rows needed.
+    #[tokio::test]
+    async fn budget_some_zero_allows_edge_only_changeset() {
+        let (rt, tok) = setup();
+        ensure_schema(&rt).await;
+
+        // Pre-create two entities outside the proposal.
+        let e1 = rt
+            .create_entity(&tok, "concept", None, "EdgeSrc", None, None, vec![])
+            .await
+            .expect("create e1");
+        let e2 = rt
+            .create_entity(&tok, "concept", None, "EdgeDst", None, None, vec![])
+            .await
+            .expect("create e2");
+
+        let proposal_id = Uuid::new_v4();
+        let changeset = ProposalChangeset::AddEdge {
+            source: Id128::from_u128(e1.id.as_u128()),
+            target: Id128::from_u128(e2.id.as_u128()),
+            relation: khive_types::EdgeRelation::Extends,
+            weight: Some(1.0),
+        };
+
+        seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+        insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+        let registry = build_registry(&rt);
+        let worker = ProposalApplyWorker::new(rt.clone());
+        worker
+            .maybe_apply(&tok, proposal_id, &registry, Some(0))
+            .await
+            .expect("maybe_apply must succeed");
+
+        // Verify edge was created despite budget=Some(0).
+        let edges = rt
+            .list_edges(
+                &tok,
+                khive_runtime::EdgeListFilter {
+                    source_id: Some(e1.id),
+                    ..Default::default()
+                },
+                100,
+            )
+            .await
+            .expect("list_edges");
+        assert!(
+            !edges.is_empty(),
+            "budget: Some(0) must not block AddEdge-only changeset"
+        );
+    }
+
+    /// WriteBudget unit test: consume_new_entry() honours the limit.
+    #[test]
+    fn write_budget_consume_enforces_limit() {
+        let mut budget = WriteBudget::new(Some(2));
+        assert!(budget.consume_new_entry().is_ok(), "first consume ok");
+        assert!(budget.consume_new_entry().is_ok(), "second consume ok");
+        let err = budget.consume_new_entry().expect_err("third must fail");
+        match err {
+            RuntimeError::WriteBudgetExceeded {
+                max_new_entries,
+                attempted_new_entries,
+            } => {
+                assert_eq!(max_new_entries, 2);
+                assert_eq!(attempted_new_entries, 3);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    /// WriteBudget unit test: None budget never fails.
+    #[test]
+    fn write_budget_none_is_unlimited() {
+        let mut budget = WriteBudget::new(None);
+        for _ in 0..1000 {
+            assert!(budget.consume_new_entry().is_ok());
+        }
+    }
+
+    /// count_new_entries unit test: flat and nested Compound.
+    #[test]
+    fn count_new_entries_recursive() {
+        let flat = ProposalChangeset::Compound {
+            steps: vec![
+                ProposalChangeset::AddEntity {
+                    entity: make_entity_draft("X"),
+                },
+                ProposalChangeset::AddNote {
+                    note: khive_types::NoteDraft {
+                        kind: "observation".to_string(),
+                        name: None,
+                        content: "c".to_string(),
+                        properties: None,
+                    },
+                },
+                ProposalChangeset::AddEdge {
+                    source: Id128::from_u128(0),
+                    target: Id128::from_u128(1),
+                    relation: khive_types::EdgeRelation::Extends,
+                    weight: None,
+                },
+            ],
+        };
+        assert_eq!(
+            count_new_entries(&flat),
+            2,
+            "AddEntity + AddNote = 2; AddEdge = 0"
+        );
+
+        let nested = ProposalChangeset::Compound {
+            steps: vec![
+                ProposalChangeset::AddEntity {
+                    entity: make_entity_draft("Y"),
+                },
+                ProposalChangeset::Compound {
+                    steps: vec![
+                        ProposalChangeset::AddEntity {
+                            entity: make_entity_draft("Z"),
+                        },
+                        ProposalChangeset::AddNote {
+                            note: khive_types::NoteDraft {
+                                kind: "observation".to_string(),
+                                name: None,
+                                content: "c".to_string(),
+                                properties: None,
+                            },
+                        },
+                    ],
+                },
+            ],
+        };
+        assert_eq!(count_new_entries(&nested), 3, "1 + 2 nested = 3");
     }
 }

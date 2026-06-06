@@ -472,6 +472,11 @@ struct ReviewParams {
     proposal_id: String,
     decision: String,
     comment: Option<String>,
+    /// Caller-supplied write budget for Compound applies. Cloud router passes
+    /// `max_entries - current_count` here for approved reviews so the OSS apply
+    /// worker enforces the cap without learning about tenant plans. `None` means
+    /// unlimited (standalone khive default).
+    max_new_entries: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -3212,7 +3217,7 @@ impl KgPack {
         // ADR-046 §5: apply worker fires on approval — idempotent on status check.
         if decision == ProposalDecision::Approve {
             crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
-                .maybe_apply(token, proposal_id, registry)
+                .maybe_apply(token, proposal_id, registry, p.max_new_entries)
                 .await?;
         }
 

@@ -188,6 +188,20 @@ pub enum RuntimeError {
     /// A remote fetch failed (network error, authentication failure, etc.).
     #[error("remote fetch error for remote={remote:?}: {message}")]
     RemoteFetchError { remote: String, message: String },
+
+    /// A caller-supplied write budget was exceeded during a Compound apply.
+    ///
+    /// `max_new_entries` is the limit passed by the caller. `attempted_new_entries`
+    /// is `consumed + 1`, i.e. the create that would have exceeded the cap.
+    /// `None` budget never produces this error (unlimited path).
+    #[error(
+        "write budget exceeded: max_new_entries={max_new_entries}, \
+         attempted_new_entries={attempted_new_entries}"
+    )]
+    WriteBudgetExceeded {
+        max_new_entries: u64,
+        attempted_new_entries: u64,
+    },
 }
 
 fn format_uuid_list(uuids: &[uuid::Uuid]) -> String {
