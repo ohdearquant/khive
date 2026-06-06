@@ -43,11 +43,12 @@ numbers.
 
 ## Baseline
 
-| Scenario                   | Baseline | Date | Commit |
-| -------------------------- | -------- | ---- | ------ |
-| `search_1k/3-term`         | TBD      | -    | -      |
-| `index_document/1000`      | TBD      | -    | -      |
-| `search_corpus_scale/1000` | TBD      | -    | -      |
+| Scenario                   | Baseline | Date       | Commit  | Machine              |
+| -------------------------- | -------- | ---------- | ------- | -------------------- |
+| `index_document/100`       | 5.48 ms  | 2026-06-06 | fb780c9 | Apple M-series, NEON |
+| `index_document/1000`      | 51.5 ms  | 2026-06-06 | fb780c9 | Apple M-series, NEON |
+| `index_document/5000`      | 282 ms   | 2026-06-06 | fb780c9 | Apple M-series, NEON |
+| `index_document_single/50` | 4.24 ms  | 2026-06-06 | fb780c9 | Apple M-series, NEON |
 
 Run `cargo bench -p khive-bm25 -- --save-baseline <name>` to capture a
 baseline, then compare with `--baseline <name>`.
