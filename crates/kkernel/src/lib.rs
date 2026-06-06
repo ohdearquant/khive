@@ -1,16 +1,4 @@
 //! kkernel — khive admin/management library.
-//!
-//! The kernel/MCP split keeps admin and infrastructure operations out of the
-//! MCP surface. This library exposes the building blocks that the `kkernel`
-//! binary composes into subcommands:
-//!
-//! - [`sync`] — build a queryable SQLite DB from NDJSON sources (issue #174).
-//! - [`pack_introspect`] — enumerate registered packs and their handler surface.
-//! - [`kg`] — KG validation, init, and hook management.
-//! - [`engine`] — embedding model lifecycle management.
-//! - [`vector`] — vector store introspection and orphan sweep.
-//! - [`reindex`] — rebuild embedding vectors for entities and notes.
-//! - [`coordinator`] — SubstrateCoordinator for cross-backend dispatch.
 
 pub mod coordinator;
 pub mod engine;
