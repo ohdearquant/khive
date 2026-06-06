@@ -325,6 +325,14 @@ impl SparqlParser {
             None
         };
 
+        self.skip_whitespace();
+        if self.pos < self.input.len() {
+            return Err(self.err(format!(
+                "unexpected trailing input: '{}'",
+                self.input[self.pos..].iter().collect::<String>()
+            )));
+        }
+
         // Reconstruct graph pattern from triples.
         triples_to_ast(triples, return_items, limit)
     }
@@ -653,6 +661,26 @@ mod tests {
         assert!(
             matches!(err, QueryError::Unsupported(_)),
             "expected Unsupported for disconnected property constraint, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_input_after_limit() {
+        let err = parse("SELECT ?a WHERE { ?a a :concept . ?a :extends ?b . } LIMIT 10 GARBAGE")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected trailing input"),
+            "expected trailing-input parse error, got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_input_without_limit() {
+        let err = parse("SELECT ?a WHERE { ?a a :concept . ?a :extends ?b . } and then some")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected trailing input"),
+            "expected trailing-input parse error, got {err}"
         );
     }
 }

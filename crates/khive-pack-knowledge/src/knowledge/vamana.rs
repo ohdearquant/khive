@@ -3,12 +3,12 @@
 //! Wraps `khive_vamana::VamanaIndex` with an ID map (u32 → UUID) so search
 //! results can be fused with FTS5 candidates via RRF.
 //!
-//! Persistence: `ensure_ann` loads a validated snapshot from `retrieval_snapshots`
+//! Persistence: `ensure_ann_for_model` loads a validated snapshot from `retrieval_snapshots`
 //! on first access; stale/missing snapshots trigger a full rebuild + re-persist.
 //! `kkernel reindex` actively invalidates snapshots after re-embedding (second
 //! line of staleness defence).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
@@ -22,20 +22,77 @@ pub(crate) struct AnnBridge {
     id_map: Vec<Uuid>,
 }
 
-/// Shared ANN state: the index plus a single-flight guard so at most one
-/// background warm runs at a time (ADR-049).
+/// Cache key for a per-{namespace, model} ANN index slot.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct AnnKey {
+    namespace: String,
+    model: String,
+}
+
+impl AnnKey {
+    pub(crate) fn new(namespace: &str, model: &str) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            model: model.to_owned(),
+        }
+    }
+}
+
+/// Shared ANN state: per-{namespace, model} indexes plus a single-flight guard
+/// so at most one background warm runs per key at a time (ADR-049).
 pub(crate) struct AnnState {
-    pub(crate) index: RwLock<Option<AnnBridge>>,
-    warming: AtomicBool,
+    indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
+    /// Keys currently being warmed (or already warmed). `std::sync::Mutex`
+    /// so the fire-and-check guard in `ensure_ann_background` stays sync.
+    warming: std::sync::Mutex<HashSet<AnnKey>>,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
 
 pub(crate) fn new_shared() -> SharedAnn {
     Arc::new(AnnState {
-        index: RwLock::new(None),
-        warming: AtomicBool::new(false),
+        indexes: RwLock::new(HashMap::new()),
+        warming: std::sync::Mutex::new(HashSet::new()),
     })
+}
+
+/// Insert `bridge` under `key` only if the slot is empty. Returns `true` when
+/// the bridge was inserted, `false` if the key was already present.
+pub(crate) async fn insert_ann_if_absent(ann: &SharedAnn, key: AnnKey, bridge: AnnBridge) -> bool {
+    use std::collections::hash_map::Entry;
+    let mut guard = ann.indexes.write().await;
+    match guard.entry(key) {
+        Entry::Occupied(_) => false,
+        Entry::Vacant(e) => {
+            e.insert(bridge);
+            true
+        }
+    }
+}
+
+/// Remove all in-memory ANN slots and warming-guard entries for `namespace`.
+///
+/// Called after any corpus mutation so the next search triggers a fresh load.
+pub(crate) async fn clear_namespace(ann: &SharedAnn, namespace: &str) {
+    ann.indexes
+        .write()
+        .await
+        .retain(|k, _| k.namespace != namespace);
+    ann.warming
+        .lock()
+        .expect("warming lock")
+        .retain(|k| k.namespace != namespace);
+}
+
+/// Search the already-loaded index for `key`. Returns `None` on cache miss.
+pub(crate) async fn search_loaded(
+    ann: &SharedAnn,
+    key: &AnnKey,
+    query: &[f32],
+    k: usize,
+) -> Option<Vec<(Uuid, f32)>> {
+    let guard = ann.indexes.read().await;
+    guard.get(key).map(|bridge| bridge.search(query, k))
 }
 
 impl AnnBridge {
@@ -344,7 +401,7 @@ pub(crate) async fn load_and_build_from_vector_store(
 
 /// Delete all Vamana snapshots for `namespace` from `retrieval_snapshots`.
 ///
-/// Called after any vector-corpus mutation to guarantee `ensure_ann` cannot
+/// Called after any vector-corpus mutation to guarantee `ensure_ann_for_model` cannot
 /// load a snapshot that no longer matches the live corpus.  Best-effort: if
 /// the `retrieval_snapshots` table doesn't exist yet, the call is a no-op.
 pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
@@ -373,21 +430,13 @@ pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
     }
 }
 
-/// Pre-load Vamana snapshots for all namespaces found in `retrieval_snapshots`.
+/// Pre-load Vamana snapshots for all `{ns}::vamana::{model}` keys found in
+/// `retrieval_snapshots`.  Called from `KnowledgePack::warm()` before the first
+/// search request so in-memory indexes are ready without a first-query spike.
 ///
-/// Queries the snapshots table to discover which `{ns}::vamana::{model}` keys
-/// exist, then calls `ensure_ann` for each unique namespace.  Intended to be
-/// called from `KnowledgePack::warm()` before the first search request so that
-/// the in-memory index is ready without a first-query latency spike.
-///
-/// Because `KnowledgePack` holds a single `SharedAnn` (not per-namespace), only
-/// the first successfully loaded snapshot is retained; subsequent ones are
-/// no-ops under the write-lock TOCTOU guard inside `ensure_ann`.
+/// Each unique namespace+model pair gets its own keyed slot; all snapshots are
+/// loaded, not just the first one.
 pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
-    if ann.index.read().await.is_some() {
-        return;
-    }
-
     let sql = rt.sql();
     let mut reader = match sql.reader().await {
         Ok(r) => r,
@@ -412,10 +461,12 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
             Some(SqlValue::Text(s)) => s.as_str(),
             _ => continue,
         };
-        let ns_str = match ns_key.split("::vamana::").next() {
-            Some(s) if !s.is_empty() => s,
-            _ => continue,
+        let Some((ns_str, model)) = ns_key.split_once("::vamana::") else {
+            continue;
         };
+        if ns_str.is_empty() || model.is_empty() {
+            continue;
+        }
         let ns = match Namespace::parse(ns_str) {
             Ok(n) => n,
             Err(_) => continue,
@@ -424,64 +475,75 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        ensure_ann(rt, &token, ann).await;
-        if ann.index.read().await.is_some() {
-            break;
-        }
+        ensure_ann_for_model(rt, &token, ann, model).await;
     }
 }
 
-/// Fire-once background warm. Returns immediately. If the ANN is already loaded
-/// or a warm is already in flight, does nothing. On a completed attempt that
-/// produced no index (e.g. no corpus yet), clears the guard so a later search
-/// can retry.
+/// Fire-once per-key background warm. Returns immediately. If the key is already
+/// loaded or warming is in flight for it, does nothing. On a completed attempt
+/// that produced no index (e.g. no corpus yet), removes the key from the warming
+/// guard so a later search can retry.
 pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, ann: &SharedAnn) {
-    if ann.warming.swap(true, Ordering::AcqRel) {
-        return; // already warming or warmed
-    }
-    let rt = rt.clone();
-    let ann = ann.clone();
-    let ns = token.namespace().clone();
-    tokio::spawn(async move {
-        if let Ok(token) = rt.authorize(ns) {
-            ensure_ann(&rt, &token, &ann).await;
-        }
-        if ann.index.read().await.is_none() {
-            ann.warming.store(false, Ordering::Release); // allow retry later
-        }
-    });
-}
-
-/// Lazy warm-load: if `ann` is already populated, return immediately.
-///
-/// Otherwise attempt to restore from a valid snapshot; on miss/stale/corrupt,
-/// rebuild from the full sqlite-vec corpus and persist the new snapshot.
-/// Write failures are logged as errors and do not prevent search from proceeding.
-pub(crate) async fn ensure_ann(rt: &KhiveRuntime, token: &NamespaceToken, ann: &SharedAnn) {
-    // Fast path: already loaded.
-    if ann.index.read().await.is_some() {
-        return;
-    }
-
     let model = rt.default_embedder_name().to_string();
     if model.is_empty() {
         return;
     }
-
     let ns = token.namespace().as_str().to_owned();
+    let key = AnnKey::new(&ns, &model);
+
+    {
+        let mut warming = ann.warming.lock().expect("warming lock");
+        if warming.contains(&key) {
+            return; // already warming or warmed
+        }
+        warming.insert(key.clone());
+    }
+
+    let rt = rt.clone();
+    let ann = ann.clone();
+    let token_ns = token.namespace().clone();
+    tokio::spawn(async move {
+        if let Ok(token) = rt.authorize(token_ns) {
+            ensure_ann_for_model(&rt, &token, &ann, &model).await;
+        }
+        // If loading failed, remove from warming so a later search can retry.
+        let loaded = ann.indexes.read().await.contains_key(&key);
+        if !loaded {
+            ann.warming.lock().expect("warming lock").remove(&key);
+        }
+    });
+}
+
+/// Lazy warm-load for a specific `model`. If the `{namespace, model}` key is
+/// already in the cache, return immediately. Otherwise attempt to restore from a
+/// valid snapshot; on miss/stale/corrupt, rebuild from the full sqlite-vec corpus
+/// and persist the new snapshot. Write failures are logged and do not block search.
+pub(crate) async fn ensure_ann_for_model(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    ann: &SharedAnn,
+    model: &str,
+) {
+    if model.is_empty() {
+        return;
+    }
+    let ns = token.namespace().as_str().to_owned();
+    let key = AnnKey::new(&ns, model);
+
+    // Fast path: already loaded.
+    if ann.indexes.read().await.contains_key(&key) {
+        return;
+    }
 
     // Try snapshot warm-load.
-    if let Some(snapshot) = try_load_snapshot(rt, &ns, &model).await {
-        let current_fp = compute_fingerprint(rt, token, &model).await;
+    if let Some(snapshot) = try_load_snapshot(rt, &ns, model).await {
+        let current_fp = compute_fingerprint(rt, token, model).await;
         if let Some(fp) = current_fp {
             if snapshot.fingerprint == fp {
                 match AnnBridge::from_vamana_snapshot(snapshot) {
                     Ok(bridge) => {
-                        let mut guard = ann.index.write().await;
                         // Re-check under write lock to avoid TOCTOU.
-                        if guard.is_none() {
-                            *guard = Some(bridge);
-                        }
+                        ann.indexes.write().await.entry(key).or_insert(bridge);
                         return;
                     }
                     Err(e) => {
@@ -499,18 +561,15 @@ pub(crate) async fn ensure_ann(rt: &KhiveRuntime, token: &NamespaceToken, ann: &
     }
 
     // Snapshot absent, stale, or corrupt — rebuild from vector store.
-    match load_and_build_from_vector_store(rt, token, &model).await {
+    match load_and_build_from_vector_store(rt, token, model).await {
         Ok(Some(bridge)) => {
-            let fp = compute_fingerprint(rt, token, &model).await;
+            let fp = compute_fingerprint(rt, token, model).await;
             if let Some(fingerprint) = fp {
-                if let Err(e) = persist_snapshot(rt, &ns, &model, &bridge, fingerprint).await {
+                if let Err(e) = persist_snapshot(rt, &ns, model, &bridge, fingerprint).await {
                     tracing::error!(error = %e, "failed to persist Vamana snapshot after rebuild");
                 }
             }
-            let mut guard = ann.index.write().await;
-            if guard.is_none() {
-                *guard = Some(bridge);
-            }
+            ann.indexes.write().await.entry(key).or_insert(bridge);
         }
         Ok(None) => {}
         Err(e) => {
@@ -609,16 +668,46 @@ mod tests {
         let vectors = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         let ids = vec![Uuid::new_v4(), Uuid::new_v4()];
         let bridge = AnnBridge::build(vectors, dim, ids).expect("build");
-        *ann.index.write().await = Some(bridge);
+        let key = AnnKey::new("local", "test-model");
         assert!(
-            ann.index.read().await.is_some(),
+            insert_ann_if_absent(&ann, key.clone(), bridge).await,
+            "insert must succeed on empty cache"
+        );
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
             "pre-condition: ANN loaded"
         );
 
-        *ann.index.write().await = None;
+        clear_namespace(&ann, "local").await;
         assert!(
-            ann.index.read().await.is_none(),
+            !ann.indexes.read().await.contains_key(&key),
             "clearing SharedAnn must remove the bridge"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_ann_is_keyed_by_namespace_and_model() {
+        let ann = new_shared();
+        let model = "test-model";
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        let bridge_a = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![id_a])
+            .expect("build namespace A bridge");
+        let bridge_b = AnnBridge::build(vec![0.0, 1.0, 0.0, 0.0], 4, vec![id_b])
+            .expect("build namespace B bridge");
+
+        assert!(insert_ann_if_absent(&ann, AnnKey::new("ns:a", model), bridge_a).await);
+        assert!(insert_ann_if_absent(&ann, AnnKey::new("ns:b", model), bridge_b).await);
+
+        let hits_b = search_loaded(&ann, &AnnKey::new("ns:b", model), &[1.0, 0.0, 0.0, 0.0], 1)
+            .await
+            .expect("namespace B bridge exists");
+
+        assert_eq!(hits_b.len(), 1);
+        assert_eq!(
+            hits_b[0].0, id_b,
+            "namespace B query must not return namespace A neighbour"
         );
     }
 }

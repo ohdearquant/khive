@@ -2538,4 +2538,110 @@ mod tests {
             "foreign from_id must be denied before merge, got {foreign_from:?}"
         );
     }
+
+    // ── #hardening Item 5: cross-namespace entity update/merge must be denied ──
+
+    #[tokio::test]
+    async fn update_entity_cross_namespace_returns_not_found_and_preserves_source() {
+        use crate::error::RuntimeError;
+        use crate::Namespace;
+
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let entity = rt
+            .create_entity(
+                &ns_a,
+                "concept",
+                None,
+                "Alpha",
+                Some("original"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = rt
+            .update_entity(
+                &ns_b,
+                entity.id,
+                EntityPatch {
+                    name: Some("Compromised".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(err, Err(RuntimeError::NotFound(_))),
+            "cross-namespace update must return opaque NotFound, got {err:?}"
+        );
+
+        let after = rt.get_entity(&ns_a, entity.id).await.unwrap();
+        assert_eq!(
+            after.name, "Alpha",
+            "foreign update must not mutate source row"
+        );
+        assert_eq!(after.description.as_deref(), Some("original"));
+    }
+
+    #[tokio::test]
+    async fn merge_entity_cross_namespace_either_id_returns_not_found() {
+        use crate::error::RuntimeError;
+        use crate::Namespace;
+
+        let rt = rt();
+        let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
+        let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
+
+        let into_a = rt
+            .create_entity(&ns_a, "concept", None, "Into A", None, None, vec![])
+            .await
+            .unwrap();
+        let from_a = rt
+            .create_entity(&ns_a, "concept", None, "From A", None, None, vec![])
+            .await
+            .unwrap();
+        let foreign_b = rt
+            .create_entity(&ns_b, "concept", None, "Foreign B", None, None, vec![])
+            .await
+            .unwrap();
+
+        // foreign into_id: foreign_b belongs to ns_b, caller token is ns_a
+        let foreign_into = rt
+            .merge_entity(
+                &ns_a,
+                foreign_b.id,
+                from_a.id,
+                EntityDedupMergePolicy::PreferInto,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(foreign_into, Err(RuntimeError::NotFound(_))),
+            "foreign into_id must be denied before merge, got {foreign_into:?}"
+        );
+
+        // foreign from_id: foreign_b belongs to ns_b, caller token is ns_a
+        let foreign_from = rt
+            .merge_entity(
+                &ns_a,
+                into_a.id,
+                foreign_b.id,
+                EntityDedupMergePolicy::PreferInto,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(foreign_from, Err(RuntimeError::NotFound(_))),
+            "foreign from_id must be denied before merge, got {foreign_from:?}"
+        );
+
+        // All three entities survive the failed merges.
+        assert!(rt.get_entity(&ns_a, into_a.id).await.is_ok());
+        assert!(rt.get_entity(&ns_a, from_a.id).await.is_ok());
+        assert!(rt.get_entity(&ns_b, foreign_b.id).await.is_ok());
+    }
 }

@@ -951,7 +951,7 @@ impl KnowledgeHandlers {
         // rebuilds lazily on the next search call.
         if indexed > 0 {
             vamana::invalidate_snapshot(runtime, &ns).await;
-            *ann.index.write().await = None;
+            vamana::clear_namespace(ann, &ns).await;
         }
 
         let mut ann_count: Option<usize> = None;
@@ -969,8 +969,8 @@ impl KnowledgeHandlers {
                             tracing::error!(error = %e, "failed to persist Vamana snapshot");
                         }
                     }
-                    let mut guard = ann.index.write().await;
-                    *guard = Some(bridge);
+                    let key = vamana::AnnKey::new(&ns, model_name);
+                    vamana::insert_ann_if_absent(ann, key, bridge).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to build Vamana ANN index");
@@ -1109,18 +1109,16 @@ impl KnowledgeHandlers {
         vamana::ensure_ann_background(runtime, token, ann);
 
         // ANN parallel signal: embed query, search Vamana, fuse via RRF
-        let ann_guard = ann.index.read().await;
-        if let Some(ref bridge) = *ann_guard {
-            if let Ok(query_emb) = runtime.embed(&raw_query).await {
-                let ann_k = fetch_limit.max(20);
-                let ann_hits = bridge.search(&query_emb, ann_k);
+        if let Ok(query_emb) = runtime.embed(&raw_query).await {
+            let ann_k = fetch_limit.max(20);
+            let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
+            if let Some(ann_hits) = vamana::search_loaded(ann, &key, &query_emb, ann_k).await {
                 if !ann_hits.is_empty() {
                     fuse_ann_hits(&mut hits, &ann_hits, min_score);
                     hydrate_empty_hits(runtime, &ns, &mut hits).await;
                 }
             }
         }
-        drop(ann_guard);
 
         if do_rerank && !hits.is_empty() {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
@@ -1184,18 +1182,16 @@ impl KnowledgeHandlers {
         let mut hits = search_core(&ctx, &raw_query).await?;
 
         vamana::ensure_ann_background(runtime, token, ann);
-        let ann_guard = ann.index.read().await;
-        if let Some(ref bridge) = *ann_guard {
-            if let Ok(query_emb) = runtime.embed(&raw_query).await {
-                let ann_k = (limit * 3).max(20);
-                let ann_hits = bridge.search(&query_emb, ann_k);
+        if let Ok(query_emb) = runtime.embed(&raw_query).await {
+            let ann_k = (limit * 3).max(20);
+            let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
+            if let Some(ann_hits) = vamana::search_loaded(ann, &key, &query_emb, ann_k).await {
                 if !ann_hits.is_empty() {
                     fuse_ann_hits(&mut hits, &ann_hits, 0.0);
                     hydrate_empty_hits(runtime, &ns, &mut hits).await;
                 }
             }
         }
-        drop(ann_guard);
 
         rerank_with_embeddings(runtime, &raw_query, &mut hits, 0.7).await?;
 
