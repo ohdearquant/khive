@@ -29,11 +29,45 @@ HTML reports are written to `target/criterion/`.
 - Results depend on CPU micro-architecture (branch predictor, cache sizes). Record machine for cross-run comparisons.
 - Clone / allocation setup inside `b.iter` is a known methodology issue (see AUD-005 in the 2026-06-06 audit). Results for `fuse/*` groups currently include vector-clone cost alongside fusion cost. Baseline entries below reflect current methodology until AUD-005 is resolved.
 
-## Baseline table
+## Baseline (2026-06-06, post-sweep)
 
-| Scenario | Baseline (mean) | Date | Commit | Machine |
-| --- | --- | --- | --- | --- |
-| _(no entries yet — run benchmarks on first tagged release to seed this table)_ | — | — | — | — |
+**Toolchain:** rustc 1.94.1 (e408947bf 2026-03-25)
+**Machine:** arm64 (Apple Silicon), macOS Darwin 25.5.0
+
+### Fusion (2-source)
+
+| Scenario         | Low      | Median   | High      | Outliers      |
+| ---------------- | -------- | -------- | --------- | ------------- |
+| fuse/rrf/50      | 7.577 µs | 7.818 µs | 8.127 µs  | 37/200 (19%)  |
+| fuse/rrf/100     | 15.14 µs | 15.35 µs | 15.60 µs  | 30/200 (15%)  |
+| fuse/rrf/250     | 38.38 µs | 39.08 µs | 39.87 µs  | 17/200 (9%)   |
+| fuse/rrf/500     | 91.68 µs | 95.74 µs | 100.75 µs | 18/200 (9%)   |
+| fuse/weighted/50 | 7.806 µs | 8.313 µs | 8.902 µs  | 6/200 (3%)    |
+| fuse/weighted/100| 11.72 µs | 11.99 µs | 12.38 µs  | 26/200 (13%)  |
+| fuse/weighted/250| 29.02 µs | 29.10 µs | 29.17 µs  | 9/200 (5%)    |
+| fuse/weighted/500| 60.90 µs | 63.63 µs | 66.76 µs  | 16/200 (8%)   |
+| fuse/union/50    | 3.517 µs | 3.644 µs | 3.793 µs  | 25/200 (13%)  |
+| fuse/union/100   | 7.218 µs | 7.243 µs | 7.272 µs  | 18/200 (9%)   |
+| fuse/union/250   | 18.93 µs | 19.11 µs | 19.34 µs  | 21/200 (11%)  |
+| fuse/union/500   | 39.11 µs | 39.62 µs | 40.28 µs  | 26/200 (13%)  |
+
+### Fusion (3-source)
+
+| Scenario              | Low      | Median    | High      | Outliers     |
+| --------------------- | -------- | --------- | --------- | ------------ |
+| fuse/three_sources/50 | 10.78 µs | 10.90 µs  | 11.07 µs  | 13/100 (13%) |
+| fuse/three_sources/200| 42.84 µs | 43.54 µs  | 44.48 µs  | 8/100 (8%)   |
+| fuse/three_sources/500| 107.8 µs | 110.7 µs  | 115.2 µs  | 13/100 (13%) |
+
+### Config Construction
+
+| Scenario                        | Low      | Median   | High     | Outliers    |
+| ------------------------------- | -------- | -------- | -------- | ----------- |
+| hybrid_config/new               | 3.685 ns | 3.750 ns | 3.827 ns | 15/200 (8%) |
+| hybrid_config/builder_rrf       | 6.151 ns | 6.342 ns | 6.586 ns | 15/200 (8%) |
+| hybrid_config/builder_weighted  | 21.87 ns | 22.30 ns | 22.86 ns | 9/200 (5%)  |
+| hybrid_config/normalized_weights| 843.4 ps | 877.9 ps | 915.4 ps | 12/200 (6%) |
+| search_config/default           | 3.631 ns | 3.750 ns | 3.896 ns | 12/200 (6%) |
 
 ## Regression notes
 

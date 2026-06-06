@@ -78,23 +78,7 @@ impl MetricsSink for NoopSink {
     }
 }
 
-/// Thread-safe recording sink for tests.
-///
-/// Collects every [`MetricEvent`] into an internal `Vec` guarded by a
-/// `Mutex`. Use [`events()`](Self::events) to snapshot the recorded events
-/// and [`clear()`](Self::clear) to reset.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use std::sync::Arc;
-/// use khive_retrieval::metrics::RecordingSink;
-///
-/// let sink = Arc::new(RecordingSink::new());
-/// // ... pass to index ...
-/// let events = sink.events();
-/// assert!(events.iter().any(|e| e.name == "hnsw.search.duration_ms"));
-/// ```
+/// Thread-safe recording sink for tests. Collects `MetricEvent`s into a `Mutex<Vec>`.
 #[derive(Debug, Default)]
 pub struct RecordingSink {
     events: Mutex<Vec<MetricEvent>>,

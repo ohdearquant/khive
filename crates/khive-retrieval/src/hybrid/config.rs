@@ -147,13 +147,7 @@ impl HybridConfig {
         self
     }
 
-    /// Set weights for weighted fusion.
-    ///
-    /// Weights are clamped to [0.0, 1.0].
-    ///
-    /// # Panics (debug)
-    ///
-    /// Asserts that both weights are finite in debug builds. NaN or infinity are not valid weights.
+    /// Set weights for weighted fusion (clamped to [0.0, 1.0]). Debug-asserts both weights are finite.
     #[must_use]
     pub fn with_weights(mut self, vector: f64, keyword: f64) -> Self {
         debug_assert!(

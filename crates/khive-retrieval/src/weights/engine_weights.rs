@@ -1,27 +1,4 @@
-//! Unified weight store — Three Observables Feedback Loop (Phase 2.A).
-//!
-//! This module provides the core EMA-update + audit-log primitives backing
-//! all three feedback channels:
-//!
-//! | Channel     | η     | Signal source                        |
-//! |-------------|-------|--------------------------------------|
-//! | Ambient     | 0.003 | Every recall / compose operation     |
-//! | Explicit    | 0.10  | note.create quality score            |
-//! | GroundTruth | 0.50  | Atlas eval / CLI manual trigger      |
-//!
-//! # Weight semantics
-//!
-//! Weights live in `atom_weights(namespace, atom_id)` and are bounded to
-//! `[WEIGHT_FLOOR, WEIGHT_CEIL]` = [0.1, 5.0].  Missing rows are treated as
-//! implicit 1.0 by callers; this module never inserts rows on first read.
-//!
-//! # EMA formula
-//!
-//! ```text
-//! new_weight = clamp(old_weight * (1 - η) + delta, WEIGHT_FLOOR, WEIGHT_CEIL)
-//! ```
-//!
-//! `old_weight` defaults to 1.0 when no row exists yet.
+//! EMA-based atom weight store with audit log for ambient, explicit, and ground-truth feedback.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,22 +60,7 @@ impl WeightChannel {
 // apply_weight_delta
 // ---------------------------------------------------------------------------
 
-/// Apply an EMA weight update to one `(namespace, atom_id)` pair and append
-/// an audit row to `weight_events`.
-///
-/// # Algorithm
-///
-/// ```text
-/// old  = atom_weights[namespace, atom_id].weight  (default 1.0 if missing)
-/// new  = clamp(old * (1 − η) + delta, WEIGHT_FLOOR, WEIGHT_CEIL)
-/// ```
-///
-/// Both the `atom_weights` upsert and the `weight_events` insert execute inside
-/// a single `BEGIN IMMEDIATE` transaction so they are atomically consistent.
-///
-/// # Returns
-///
-/// `(new_weight, weight_event_row_id)` on success.
+/// Apply an EMA weight update for `(namespace, atom_id)` and append an audit row. Returns `(new_weight, row_id)`.
 pub async fn apply_weight_delta(
     conn: &Arc<Mutex<Connection>>,
     namespace: &str,

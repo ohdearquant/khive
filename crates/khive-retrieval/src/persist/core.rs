@@ -69,11 +69,6 @@ pub struct RetrievalPersistence {
 
 impl RetrievalPersistence {
     /// Create a new persistence layer.
-    ///
-    /// # Arguments
-    ///
-    /// * `conn` - Arc-wrapped SQLite connection
-    /// * `namespace` - Namespace for multi-tenancy isolation
     pub fn new(conn: Arc<Mutex<Connection>>, namespace: impl Into<String>) -> Self {
         Self {
             conn,

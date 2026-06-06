@@ -1,13 +1,4 @@
-//! DFS (Depth-First Search) traversal.
-//!
-//! # Formal Verification
-//!
-//! This implementation corresponds to the formal proofs in
-//! `proofs/Lion/Retrieval/Graph.lean`. Key theorems:
-//!
-//! - `dfs_terminates_bound`: DFS bounded by |V| vertices
-//! - `visited_mono`: visited set grows monotonically
-//! - `reachable_trans`: reachability is transitive
+//! DFS (Depth-First Search) traversal over the graph legacy layer.
 
 use std::collections::HashSet;
 
@@ -18,42 +9,7 @@ use crate::error::Result;
 use super::helpers::{get_edge_weight, get_neighbor_entity, get_neighbors, matches_link_type};
 use super::types::{PathNode, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_RESULTS};
 
-/// Perform DFS traversal from a starting entity.
-///
-/// DFS explores as far as possible along each branch before backtracking.
-/// This makes it ideal for:
-///
-/// - Deep chain exploration
-/// - Path existence checking
-/// - Exhaustive graph exploration with limited results
-///
-/// # Arguments
-///
-/// * `store` - The link store to query
-/// * `ctx` - Storage context for namespace isolation
-/// * `start` - Starting entity reference
-/// * `options` - Traversal options (depth, direction, filters)
-///
-/// # Returns
-///
-/// Vector of [`PathNode`] in DFS pre-order (parent before children).
-///
-/// # Complexity
-///
-/// - Time: O(V + E) where V = vertices, E = edges
-/// - Space: O(V) for visited set + O(h) stack where h = max depth
-///
-/// # Example
-///
-/// ```ignore
-/// let options = TraversalOptions::new(5)
-///     .with_direction(Direction::Out);
-///
-/// let nodes = dfs_traverse(&store, &ctx, start_ref, &options).await?;
-/// ```
-///
-/// **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.dfs_terminates_bound`
-/// Each vertex visited at most once; |visited| bounded by |V|; stack pops exceed pushes eventually.
+/// DFS traversal from `start`. Returns [`PathNode`]s in pre-order (parent before children).
 pub async fn dfs_traverse<S: LinkStore>(
     store: &S,
     ctx: &StorageContext,

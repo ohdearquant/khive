@@ -163,30 +163,7 @@ impl RetrievalError {
         }
     }
 
-    /// Check if this error is transient (may succeed on retry).
-    ///
-    /// Transient errors include:
-    /// - External service failures (embedding store, link store)
-    /// - Network-related issues
-    /// - Resource contention
-    ///
-    /// # Retry Strategy
-    ///
-    /// For transient errors, use exponential backoff with jitter:
-    /// - Initial delay: 100ms
-    /// - Max delay: 5s
-    /// - Max retries: 3
-    /// - Jitter: +/- 20%
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use khive_retrieval::error::RetrievalError;
-    ///
-    /// fn should_retry(err: &RetrievalError) -> bool {
-    ///     err.is_transient()
-    /// }
-    /// ```
+    /// Check if this error is transient (external/network/contention — may succeed on retry).
     #[inline]
     pub fn is_transient(&self) -> bool {
         self.kind() == ErrorKind::Transient

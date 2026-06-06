@@ -100,27 +100,7 @@ impl Default for SearchPolicy {
     }
 }
 
-/// Filter search results based on policy.
-///
-/// # Arguments
-///
-/// * `results` - The search results to filter.
-/// * `policy` - The search policy to apply.
-/// * `get_clearance` - A function that returns the clearance level for a given ID.
-///
-/// # Returns
-///
-/// A new vector containing only the results the caller is authorized to see.
-///
-/// # Example
-///
-/// ```ignore
-/// let policy = SearchPolicy::new(ClearanceLevel::Internal);
-/// let filtered = filter_by_policy(results, &policy, |id| {
-///     // Look up document clearance from metadata
-///     get_document_clearance(id)
-/// });
-/// ```
+/// Filter search results to only those the caller is authorized to see per `policy`.
 pub fn filter_by_policy<Id, F>(
     results: Vec<(Id, DeterministicScore)>,
     policy: &SearchPolicy,
@@ -139,19 +119,7 @@ where
         .collect()
 }
 
-/// Filter search results using a custom predicate.
-///
-/// This is a more flexible version of `filter_by_policy` that allows
-/// arbitrary access control logic.
-///
-/// # Arguments
-///
-/// * `results` - The search results to filter.
-/// * `is_accessible` - A predicate that returns true if the caller can access the document.
-///
-/// # Returns
-///
-/// A new vector containing only the accessible results.
+/// Filter search results using a custom predicate `is_accessible`.
 pub fn filter_by_predicate<Id, F>(
     results: Vec<(Id, DeterministicScore)>,
     is_accessible: F,

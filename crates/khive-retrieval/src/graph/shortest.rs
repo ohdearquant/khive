@@ -8,45 +8,7 @@ use crate::error::{Result, RetrievalError};
 
 use super::types::{PathNode, MAX_TRAVERSAL_DEPTH};
 
-/// Find the shortest path between two entities using bidirectional BFS.
-///
-/// Bidirectional BFS searches from both start and end simultaneously,
-/// meeting in the middle. This reduces search space from O(b^d) to O(b^(d/2))
-/// where b = branching factor and d = path depth.
-///
-/// # Arguments
-///
-/// * `store` - The link store to query
-/// * `ctx` - Storage context for namespace isolation
-/// * `from` - Starting entity reference
-/// * `to` - Target entity reference
-/// * `max_depth` - Maximum path length (clamped to [`MAX_TRAVERSAL_DEPTH`])
-///
-/// # Returns
-///
-/// - `Some(Vec<PathNode>)` - Path from source to target (inclusive)
-///   - `path[0]` is the start node (via_link = None)
-///   - `path[i].via_link` is the edge from `path[i-1]` to `path[i]`
-/// - `None` - No path exists within max_depth
-///
-/// # Complexity
-///
-/// - Time: O(b^(d/2)) vs O(b^d) for standard BFS
-/// - Space: O(b^(d/2)) for both frontiers
-///
-/// # Example
-///
-/// ```ignore
-/// let path = find_shortest_path(&store, &ctx, alice_ref, bob_ref, 5).await?;
-/// if let Some(path) = path {
-///     println!("Found path of {} hops", path.len() - 1);
-///     for node in &path {
-///         if let Some(link) = &node.via_link {
-///             println!("  via {} to {:?}", link.relation, node.entity_id);
-///         }
-///     }
-/// }
-/// ```
+/// Bidirectional BFS shortest path. Returns `Some(path)` inclusive of endpoints, or `None` if unreachable within `max_depth`.
 pub async fn find_shortest_path<S: LinkStore>(
     store: &S,
     ctx: &StorageContext,

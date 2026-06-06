@@ -82,13 +82,7 @@ pub use timeout::{
     search_with_timeout,
 };
 
-/// Re-exports from `lattice-embed` for app-layer access.
-///
-/// Apps should use these re-exports instead of depending on `lattice-embed` directly.
-/// This maintains the layer boundary: apps -> platform (retrieval) -> foundation (embed).
-///
-/// Core types (`EmbeddingModel`, `EmbeddingService`, `EmbedError`) are always available.
-/// Native model implementations (`NativeEmbeddingService`, etc.) require the `embed` feature.
+/// Re-exports from `lattice-embed`. Use these instead of depending on `lattice-embed` directly.
 pub mod embed {
     // Core types and traits (always available, no feature gate needed)
     /// Result alias for embedding operations.

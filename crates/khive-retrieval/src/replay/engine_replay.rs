@@ -5,38 +5,7 @@
 // adjustment_rate_per_day) are tightly coupled to the same table and cannot be moved
 // without duplicating the SQL helpers. Co-location is intentional.
 
-//! Temporal replay APIs — Three Observables Feedback Loop (Phase 3).
-//!
-//! Provides four primitives for diffing past vs. present weight state:
-//!
-//! | Function              | Purpose                                                    |
-//! |-----------------------|------------------------------------------------------------|
-//! | [`weights_as_of`]     | Reconstruct weight snapshot at a past timestamp            |
-//! | [`replay`]            | Re-run vector search with historical or live weights       |
-//! | [`diff`]              | Jaccard + rank-delta report between two temporal replays   |
-//! | [`rank_history`]      | Weight change timeline for a single atom                   |
-//! | [`regression_check`]  | Re-run a stored compose event against current weights      |
-//!
-//! # Design
-//!
-//! The weight_events table is the ground-truth log.  No external baseline is
-//! needed — the log IS the reference.  Temporal replay reconstructs past weight
-//! state by selecting the latest `weight_events` row per (lambda_id, atom_id)
-//! with `ts ≤ at_time`.
-//!
-//! Ranking is performed by multiplying raw vector similarity scores by per-atom
-//! weights, then returning the top-K atom IDs in descending score order.
-//!
-//! # Drift Metrics (submodule)
-//!
-//! [`metrics::jaccard_stability_7d`] — rolling 7-day median Jaccard from
-//! regression_check over stored compose events.
-//!
-//! [`metrics::atom_rank_variance`] — variance of an atom's rank position across
-//! all compose events where it appeared in top_atoms.
-//!
-//! [`metrics::adjustment_rate_per_day`] — count of weight_events rows per day,
-//! useful for detecting runaway adjustment patterns.
+//! Temporal replay APIs: reconstruct past weight state and diff against present.
 
 // REASON: the `engine` feature is a future integration point (EmbeddedEngine not yet ported);
 // the cfg is intentionally undeclared so the gate never activates during normal builds.

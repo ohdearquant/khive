@@ -153,11 +153,6 @@ pub enum RerankMethod {
 
 impl QueryNode {
     /// Create a vector search leaf node.
-    ///
-    /// # Arguments
-    ///
-    /// * `embedding` - Pre-computed query embedding.
-    /// * `top_k` - Number of results to return.
     pub fn vector(embedding: Vec<f32>, top_k: usize) -> Self {
         QueryNode::Vector {
             embedding,
@@ -167,11 +162,6 @@ impl QueryNode {
     }
 
     /// Create a keyword search leaf node.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - Query text (converted via `Into<String>`).
-    /// * `top_k` - Number of results to return.
     pub fn keyword(text: impl Into<String>, top_k: usize) -> Self {
         QueryNode::Keyword {
             text: text.into(),
@@ -180,16 +170,7 @@ impl QueryNode {
         }
     }
 
-    /// Create a hybrid query (vector + keyword with RRF fusion).
-    ///
-    /// The two leaf sub-queries each request `top_k * 3` candidates to give
-    /// the fusion step a sufficiently large candidate pool.
-    ///
-    /// # Arguments
-    ///
-    /// * `embedding` - Pre-computed query embedding.
-    /// * `text` - Query text (converted via `Into<String>`).
-    /// * `top_k` - Number of final results after fusion.
+    /// Create a hybrid query (vector + keyword with RRF fusion, `top_k * 3` candidates each).
     pub fn hybrid(embedding: Vec<f32>, text: impl Into<String>, top_k: usize) -> Self {
         let candidate_k = top_k.saturating_mul(3);
         QueryNode::Fuse {

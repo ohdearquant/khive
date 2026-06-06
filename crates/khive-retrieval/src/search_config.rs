@@ -1,13 +1,4 @@
-//! Per-call hybrid search configuration.
-//!
-//! Controls vector/keyword fusion strategy and top_k for recall() and compose's search phase.
-//! Default produces RRF k=60, top_k=10 — backward-compatible with pre-Phase-7 behavior.
-//!     query: "metal inference kernel".to_string(),
-//!     search: Some(SearchConfig::vector_only()),
-//!     ..Default::default()
-//! };
-//! service.recall(opts).await?;
-//! ```
+//! Per-call hybrid search configuration (fusion strategy + top_k). Default: RRF k=60, top_k=10.
 
 use serde::{Deserialize, Serialize};
 
@@ -137,11 +128,7 @@ impl SearchConfig {
         self
     }
 
-    /// Set a minimum score filter.
-    ///
-    /// # Panics (debug)
-    ///
-    /// Asserts that `min` is finite in debug builds. NaN or infinity are not valid thresholds.
+    /// Set a minimum score filter. Debug-asserts `min` is finite.
     #[must_use]
     pub fn with_min_score(mut self, min: f64) -> Self {
         debug_assert!(min.is_finite(), "min_score must be finite, got {min}");
