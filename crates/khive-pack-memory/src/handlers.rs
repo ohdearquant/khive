@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -20,12 +22,73 @@ use khive_types::SubstrateKind;
 
 use crate::ann::{self, AnnKey};
 use crate::config::{RecallConfig, ScoreBreakdown, WeightedContributions};
+use crate::query_cache::QueryEmbeddingCache;
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
     calculate_score, contains_cjk, normalize_min_score, normalize_rank_fusion_scores,
     normalize_rrf_scores, ScoreInput, ScoringConfig,
 };
 use crate::MemoryPack;
+
+// ---------------------------------------------------------------------------
+// Per-call stage profiling, gated by KHIVE_RECALL_PROFILE=1.
+// Emits JSON lines to stderr: {"c":<call_id>,"s":<stage>,"us":<microseconds>}
+// ---------------------------------------------------------------------------
+static RECALL_CALL_ID: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static PROF_CID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn recall_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("KHIVE_RECALL_PROFILE").is_ok())
+}
+
+#[inline(always)]
+fn plog(call_id: u64, stage: &str, us: u128) {
+    eprintln!(r#"{{"c":{},"s":"{}","us":{}}}"#, call_id, stage, us);
+}
+
+#[inline(always)]
+fn plog_n(call_id: u64, stage: &str, us: u128, n: usize) {
+    eprintln!(
+        r#"{{"c":{},"s":"{}","us":{},"n":{}}}"#,
+        call_id, stage, us, n
+    );
+}
+
+/// Embed one query string for one model, checking the pack-local LRU cache first.
+///
+/// Cache hits return immediately without entering `spawn_blocking`.
+/// Cache misses run `KhiveRuntime::embed_with_model` on the blocking thread
+/// pool (CPU-bound BERT inference must not block the async executor) and then
+/// populate the cache on success.
+async fn embed_query_model(
+    runtime: khive_runtime::KhiveRuntime,
+    cache: QueryEmbeddingCache,
+    model_name: String,
+    query: String,
+) -> Result<(String, Vec<f32>), RuntimeError> {
+    // Fast path: cache hit — no blocking pool.
+    if let Some(v) = cache.get(&model_name, &query) {
+        return Ok((model_name, v));
+    }
+    // Slow path: BERT inference is synchronous CPU work; must not block the
+    // async executor.  Capture the handle before entering spawn_blocking so
+    // we can call the async method from the blocking thread.
+    let handle = tokio::runtime::Handle::current();
+    let model_name_blk = model_name.clone();
+    let query_blk = query.clone();
+    let v = tokio::task::spawn_blocking(move || {
+        handle.block_on(runtime.embed_with_model(&model_name_blk, &query_blk))
+    })
+    .await
+    .map_err(|e| RuntimeError::Internal(format!("recall embed task panicked: {e}")))??;
+    // Store only on success — never cache partial/error results.
+    cache.put(&model_name, &query, v.clone());
+    Ok((model_name, v))
+}
 
 fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError> {
     serde_json::to_value(v).map_err(|e| RuntimeError::InvalidInput(e.to_string()))
@@ -316,12 +379,58 @@ fn search_source_label(source: SearchSource) -> &'static str {
     }
 }
 
+/// Controls whether the FTS5 `snippet(...)` function is called during text search.
+///
+/// `Omit` passes `snippet_chars=0` to `Fts5TextSearch::search`, which substitutes
+/// `NULL AS snippet` for the snippet expression and skips BM25 snippet computation
+/// (~12ms of the 15ms p50 warm path at 10k).  Only diagnostic verbs that surface
+/// snippet text to callers should use `Include`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TextSnippetPolicy {
+    Omit,
+    Include { chars: usize },
+}
+
+impl TextSnippetPolicy {
+    fn snippet_chars(self) -> usize {
+        match self {
+            Self::Omit => 0,
+            Self::Include { chars } => chars.max(1),
+        }
+    }
+}
+
+const RECALL_DIAGNOSTIC_SNIPPET_CHARS: usize = 200;
+
 #[derive(Default)]
 struct CandidateMeta {
     in_text: bool,
     in_vector: bool,
     title: Option<String>,
     snippet: Option<String>,
+}
+
+struct RecallCandidateParams<'a> {
+    candidate_limit: u32,
+    embedding_model: Option<&'a str>,
+    is_cjk: bool,
+    scoring_cfg: &'a crate::scoring::ScoringConfig,
+    snippet_policy: TextSnippetPolicy,
+}
+
+/// Parameters for the vector (ANN / sqlite-vec) candidate collection leg.
+struct RecallVectorCandidateParams<'a> {
+    candidate_limit: u32,
+    embedding_model: Option<&'a str>,
+    is_cjk: bool,
+    scoring_cfg: &'a crate::scoring::ScoringConfig,
+}
+
+/// Output of the vector candidate collection leg.
+struct RecallVectorCandidateResult {
+    vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
+    /// True when CJK routing was applied and a multilingual model was selected.
+    cjk_routed: bool,
 }
 
 fn retrieval_hybrid_config(strategy: &FusionStrategy, limit: usize) -> HybridConfig {
@@ -500,6 +609,13 @@ fn fuse_candidates(
         .collect()
 }
 
+/// Maximum number of OR terms sent to the FTS5 trigram index per recall query.
+///
+/// Each additional term fans out the BM25 match scan. Keeping this explicit
+/// and named (rather than a bare `10`) makes future fanout sweep tests possible
+/// without changing production behaviour.
+const RECALL_FTS_TERM_FANOUT_LIMIT: usize = 10;
+
 /// Break a recall query into individual search terms for FTS fanout.
 ///
 /// Splits on whitespace and common punctuation, lowercases, deduplicates, and
@@ -508,6 +624,14 @@ fn fuse_candidates(
 /// pool — whereas a plain conjunction MATCH only returns notes containing ALL
 /// terms.
 fn recall_text_terms(query: &str) -> Vec<String> {
+    recall_text_terms_with_limit(query, RECALL_FTS_TERM_FANOUT_LIMIT)
+}
+
+/// Like `recall_text_terms` but with a caller-supplied fanout cap.
+///
+/// Used by tests to probe fanout behaviour at values other than the default
+/// without touching production code paths.
+fn recall_text_terms_with_limit(query: &str, limit: usize) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut terms: Vec<String> = query
         .split(|c: char| {
@@ -519,7 +643,7 @@ fn recall_text_terms(query: &str) -> Vec<String> {
         })
         .filter(|t| !t.is_empty() && seen.insert(t.clone()))
         .collect();
-    terms.truncate(10);
+    terms.truncate(limit);
     terms
 }
 
@@ -537,11 +661,15 @@ impl MemoryPack {
         query: &str,
         ns: &str,
         candidate_limit: u32,
+        snippet_policy: TextSnippetPolicy,
     ) -> Result<Vec<TextSearchHit>, RuntimeError> {
         let terms = recall_text_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
         }
+        let prof = recall_profile_enabled();
+        let call_id = PROF_CID.with(|c| c.get());
+        let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
         // Issue #288 opt: single FTS5 MATCH with OR semantics instead of N probes.
         // AnyTerm mode joins tokens with " OR " after per-token sanitization.
@@ -555,11 +683,16 @@ impl MemoryPack {
                     ..TextFilter::default()
                 }),
                 top_k: candidate_limit,
-                snippet_chars: 200,
+                snippet_chars: snippet_policy.snippet_chars(),
             })
             .await?;
         hits.sort_by_key(|h| h.rank);
         hits.truncate(candidate_limit as usize);
+        if prof {
+            if let Some(t) = t_fts {
+                plog_n(call_id, "fts", t.elapsed().as_micros(), hits.len());
+            }
+        }
         Ok(hits)
     }
 
@@ -567,23 +700,65 @@ impl MemoryPack {
         &self,
         query: &str,
         token: &NamespaceToken,
-        candidate_limit: u32,
-        embedding_model: Option<&str>,
-        // When true, prefer the multilingual model for CJK queries.
-        // Ignored when no multilingual model is registered.
-        is_cjk: bool,
-        scoring_cfg: &crate::scoring::ScoringConfig,
+        opts: RecallCandidateParams<'_>,
     ) -> Result<RecallCandidateSet, RuntimeError> {
+        let RecallCandidateParams {
+            candidate_limit,
+            embedding_model,
+            is_cjk,
+            scoring_cfg,
+            snippet_policy,
+        } = opts;
         let ns = token.namespace().as_str().to_string();
-        // Tracks whether CJK routing was actually applied (multilingual model found).
-        let mut cjk_routed = false;
-        // F111 + Issue #288: fan out one FTS5 MATCH per term so notes matching
-        // ANY term enter the candidate pool. A single conjunction MATCH ("term1
-        // term2 term3") only returns notes containing all terms, which leaves
-        // text_candidates empty for memory notes that partially match the query.
-        let text_hits = self
-            .collect_recall_text_hits(token, query, &ns, candidate_limit)
-            .await?;
+
+        // F111 + Issue #288: FTS5 text leg and vector/ANN leg run concurrently.
+        // Both futures borrow self/token/ns and are async-runtime-aware, so
+        // tokio::try_join! is sufficient — no Send + 'static task boundary needed.
+        let text_fut =
+            self.collect_recall_text_hits(token, query, &ns, candidate_limit, snippet_policy);
+        let vector_fut = self.collect_recall_vector_hits(
+            token,
+            query,
+            &ns,
+            RecallVectorCandidateParams {
+                candidate_limit,
+                embedding_model,
+                is_cjk,
+                scoring_cfg,
+            },
+        );
+
+        let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+
+        Ok(RecallCandidateSet {
+            namespace: ns,
+            text_hits,
+            vector_hits_per_model: vector_result.vector_hits_per_model,
+            cjk_routed: vector_result.cjk_routed,
+        })
+    }
+
+    /// Collect vector (ANN / sqlite-vec) recall candidates.
+    ///
+    /// Extracted from `collect_recall_candidates` so the FTS5 leg and this leg
+    /// can be driven concurrently via `tokio::try_join!`. All semantics —
+    /// CJK routing, concurrent multi-model embedding, warm ANN first with
+    /// sqlite-vec fallback, and profile logging — are preserved unchanged.
+    async fn collect_recall_vector_hits(
+        &self,
+        token: &NamespaceToken,
+        query: &str,
+        ns: &str,
+        opts: RecallVectorCandidateParams<'_>,
+    ) -> Result<RecallVectorCandidateResult, RuntimeError> {
+        let RecallVectorCandidateParams {
+            candidate_limit,
+            embedding_model,
+            is_cjk,
+            scoring_cfg,
+        } = opts;
+        let prof = recall_profile_enabled();
+        let call_id = PROF_CID.with(|c| c.get());
 
         // Determine which embedding models to query.
         //   - explicit embedding_model → query only that model (single-model path)
@@ -591,6 +766,7 @@ impl MemoryPack {
         //     (ADR-043: CJK routing is only meaningful when the model is present)
         //   - None + models configured → query ALL registered models in parallel
         //   - None + no model configured → skip vector search
+        let mut cjk_routed = false;
         let model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
@@ -634,34 +810,83 @@ impl MemoryPack {
         let vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)> = if model_names.is_empty() {
             vec![]
         } else {
-            // Phase 1: embed the query with each model in parallel.
-            // Spawning separate tasks allows the embedding services to run
-            // concurrently even though KhiveRuntime::embed_with_model is async.
-            let mut embed_handles = Vec::with_capacity(model_names.len());
-            for model_name in model_names.iter().cloned() {
-                let rt = self.runtime.clone();
-                let q = query.to_string();
-                embed_handles.push(tokio::spawn(async move {
-                    rt.embed_with_model(&model_name, &q)
-                        .await
-                        .map(|v| (model_name, v))
-                }));
-            }
-            let mut query_vecs: Vec<(String, Vec<f32>)> = Vec::with_capacity(embed_handles.len());
-            for handle in embed_handles {
-                let pair: (String, Vec<f32>) = handle.await.map_err(|e| {
-                    RuntimeError::Internal(format!("recall embed task panicked: {e}"))
-                })??;
-                query_vecs.push(pair);
+            // Phase 1: embed the query with each model, concurrently, on the
+            // blocking pool.  Cache hits bypass spawn_blocking entirely.
+            //
+            // For the default two-model path (multilingual + English) we use
+            // tokio::join! so both futures are polled concurrently from a
+            // single await point — no sequential serialization even when one
+            // finishes before the other.
+            let t_embed = if prof { Some(Instant::now()) } else { None };
+            let query_vecs: Vec<(String, Vec<f32>)> = match model_names.len() {
+                1 => {
+                    let m = model_names.into_iter().next().unwrap();
+                    vec![
+                        embed_query_model(
+                            self.runtime.clone(),
+                            self.query_cache.clone(),
+                            m,
+                            query.to_string(),
+                        )
+                        .await?,
+                    ]
+                }
+                2 => {
+                    let mut it = model_names.into_iter();
+                    let m0 = it.next().unwrap();
+                    let m1 = it.next().unwrap();
+                    let f0 = embed_query_model(
+                        self.runtime.clone(),
+                        self.query_cache.clone(),
+                        m0,
+                        query.to_string(),
+                    );
+                    let f1 = embed_query_model(
+                        self.runtime.clone(),
+                        self.query_cache.clone(),
+                        m1,
+                        query.to_string(),
+                    );
+                    let (r0, r1) = tokio::join!(f0, f1);
+                    vec![r0?, r1?]
+                }
+                _ => {
+                    // N > 2: spawn one task per model, preserve model order.
+                    let mut handles = Vec::with_capacity(model_names.len());
+                    for model_name in model_names {
+                        let rt = self.runtime.clone();
+                        let cache = self.query_cache.clone();
+                        let q = query.to_string();
+                        handles.push(tokio::spawn(async move {
+                            embed_query_model(rt, cache, model_name, q).await
+                        }));
+                    }
+                    let mut vecs = Vec::with_capacity(handles.len());
+                    for h in handles {
+                        let pair = h.await.map_err(|e| {
+                            RuntimeError::Internal(format!("recall embed task panicked: {e}"))
+                        })??;
+                        vecs.push(pair);
+                    }
+                    vecs
+                }
+            };
+
+            if prof {
+                if let Some(t) = t_embed {
+                    plog_n(call_id, "embed", t.elapsed().as_micros(), query_vecs.len());
+                }
             }
 
             // Phase 2: search each model's vector store with the pre-embedded query.
             // Warm ANN path: use in-memory Vamana index when ready to avoid the
             // O(corpus) sqlite-vec brute-force scan. Falls back to exact search
             // while the background build runs (first request triggers the build).
+            let t_ann_total = if prof { Some(Instant::now()) } else { None };
+            let mut ann_route = "ann";
             let mut results = Vec::with_capacity(query_vecs.len());
             for (model_name, vec) in query_vecs {
-                let key = AnnKey::new(&ns, &model_name);
+                let key = AnnKey::new(ns, &model_name);
 
                 match ann::search_loaded(&self.ann, &key, &vec, candidate_limit as usize).await {
                     Ok(Some(raw_hits)) => {
@@ -737,13 +962,14 @@ impl MemoryPack {
 
                 // Exact sqlite-vec fallback: EmptyCorpus, post-error clear, or race.
                 tracing::debug!(model = %model_name, namespace = %ns, "memory recall via exact sqlite-vec");
+                ann_route = "sqlite_vec";
                 let hits = self
                     .runtime
                     .vectors_for_model(token, &model_name)?
                     .search(VectorSearchRequest {
                         query_vectors: vec![vec],
                         top_k: candidate_limit,
-                        namespace: Some(ns.clone()),
+                        namespace: Some(ns.to_string()),
                         kind: Some(SubstrateKind::Note),
                         embedding_model: Some(model_name.clone()),
                         filter: None,
@@ -752,12 +978,22 @@ impl MemoryPack {
                     .await?;
                 results.push((model_name, hits));
             }
+            if prof {
+                if let Some(t) = t_ann_total {
+                    let total_hits: usize = results.iter().map(|(_, h)| h.len()).sum();
+                    eprintln!(
+                        r#"{{"c":{},"s":"ann","us":{},"n":{},"route":"{}"}}"#,
+                        call_id,
+                        t.elapsed().as_micros(),
+                        total_hits,
+                        ann_route,
+                    );
+                }
+            }
             results
         };
 
-        Ok(RecallCandidateSet {
-            namespace: ns,
-            text_hits,
+        Ok(RecallVectorCandidateResult {
             vector_hits_per_model,
             cjk_routed,
         })
@@ -950,6 +1186,17 @@ impl MemoryPack {
         _registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: RecallParams = deser(params)?;
+        // Profile mode: assign a call ID and record the start time.
+        let prof = recall_profile_enabled();
+        let call_id = if prof {
+            let id = RECALL_CALL_ID.fetch_add(1, Ordering::Relaxed);
+            PROF_CID.with(|c| c.set(id));
+            id
+        } else {
+            0
+        };
+        let t_total = if prof { Some(Instant::now()) } else { None };
+        let mut t_stage = if prof { Some(Instant::now()) } else { None };
 
         // H3 + Medium: reject empty and noise-only queries before any DB access.
         // is_meaningful_query covers: empty/whitespace, symbols-only, single Latin
@@ -1031,20 +1278,59 @@ impl MemoryPack {
         // candidate_multiplier or candidate_limit (codex High #2, PR #469).
         let candidate_limit =
             recall_candidate_count(&cfg, limit_u32).min(scoring_cfg.max_recall_candidates as u32);
+        // [profile] lap: setup overhead before retrieval
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog(call_id, "setup", t.elapsed().as_micros());
+            }
+            t_stage = Some(Instant::now());
+        }
         let candidates = self
             .collect_recall_candidates(
                 query_trimmed,
                 token,
-                candidate_limit,
-                p.embedding_model.as_deref(),
-                is_cjk,
-                &scoring_cfg,
+                RecallCandidateParams {
+                    candidate_limit,
+                    embedding_model: p.embedding_model.as_deref(),
+                    is_cjk,
+                    scoring_cfg: &scoring_cfg,
+                    snippet_policy: TextSnippetPolicy::Omit,
+                },
             )
             .await?;
+        // [profile] lap: total retrieval (FTS+embed+ANN, see inner logs for breakdown)
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog_n(
+                    call_id,
+                    "candidates",
+                    t.elapsed().as_micros(),
+                    candidates.text_hits.len()
+                        + candidates
+                            .vector_hits_per_model
+                            .iter()
+                            .map(|(_, h)| h.len())
+                            .sum::<usize>(),
+                );
+            }
+            t_stage = Some(Instant::now());
+        }
         // CJK was actually routed only if a multilingual model was found.
         let actual_cjk_routed = candidates.cjk_routed;
         let (memory_ids, mut notes_by_id) =
             self.load_memory_candidate_notes(token, &candidates).await?;
+        // [profile] lap: note hydration
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog_n(
+                    call_id,
+                    "hydration",
+                    t.elapsed().as_micros(),
+                    notes_by_id.len(),
+                );
+            }
+            t_stage = Some(Instant::now());
+        }
 
         // Capture raw vector scores before fusion — used as raw_score in the
         // response triplet and as the cosine-similarity gate for min_raw_relevance.
@@ -1066,6 +1352,13 @@ impl MemoryPack {
         };
 
         let fused = fuse_candidates(&candidates, &memory_ids, &cfg, candidate_limit as usize);
+        // [profile] lap: fusion + normalization
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog_n(call_id, "fusion", t.elapsed().as_micros(), fused.len());
+            }
+            t_stage = Some(Instant::now());
+        }
 
         if fused.is_empty() {
             return to_json(&Vec::<Value>::new());
@@ -1240,6 +1533,14 @@ impl MemoryPack {
             });
         }
 
+        // [profile] lap: scoring loop
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog_n(call_id, "scoring", t.elapsed().as_micros(), ranked.len());
+            }
+            t_stage = Some(Instant::now());
+        }
+
         // MMR diversity penalty: suppress near-duplicate content.
         //
         // Applied pre-sort so the penalty participates in final ranking.
@@ -1260,6 +1561,14 @@ impl MemoryPack {
                     }
                 }
             }
+        }
+
+        // [profile] lap: MMR
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog_n(call_id, "mmr", t.elapsed().as_micros(), ranked.len());
+            }
+            t_stage = Some(Instant::now());
         }
 
         // Supersedes suppression: drop memories that have been superseded.
@@ -1331,6 +1640,14 @@ impl MemoryPack {
             if !superseded_ids.is_empty() {
                 ranked.retain(|sn| !superseded_ids.contains(&sn.id));
             }
+        }
+
+        // [profile] lap: supersedes edge query
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog_n(call_id, "supersedes", t.elapsed().as_micros(), ranked.len());
+            }
+            t_stage = Some(Instant::now());
         }
 
         ranked.sort_by(|a, b| {
@@ -1422,6 +1739,16 @@ impl MemoryPack {
                     "vector_candidates_per_model": per_model,
                 },
             }));
+        }
+
+        // [profile] total
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog_n(call_id, "serialize", t.elapsed().as_micros(), results.len());
+            }
+            if let Some(ref t) = t_total {
+                plog(call_id, "total", t.elapsed().as_micros());
+            }
         }
 
         to_json(&results)
@@ -1526,10 +1853,15 @@ impl MemoryPack {
             .collect_recall_candidates(
                 &p.query,
                 token,
-                candidate_limit,
-                p.embedding_model.as_deref(),
-                false, // CJK routing not applied for the candidates sub-verb
-                &scoring_cfg,
+                RecallCandidateParams {
+                    candidate_limit,
+                    embedding_model: p.embedding_model.as_deref(),
+                    is_cjk: false, // CJK routing not applied for the candidates sub-verb
+                    scoring_cfg: &scoring_cfg,
+                    snippet_policy: TextSnippetPolicy::Include {
+                        chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,
+                    },
+                },
             )
             .await?;
 
@@ -1620,10 +1952,15 @@ impl MemoryPack {
             .collect_recall_candidates(
                 &p.query,
                 token,
-                candidate_limit,
-                p.embedding_model.as_deref(),
-                false, // CJK routing not applied for the fuse sub-verb
-                &scoring_cfg_fuse,
+                RecallCandidateParams {
+                    candidate_limit,
+                    embedding_model: p.embedding_model.as_deref(),
+                    is_cjk: false, // CJK routing not applied for the fuse sub-verb
+                    scoring_cfg: &scoring_cfg_fuse,
+                    snippet_policy: TextSnippetPolicy::Include {
+                        chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,
+                    },
+                },
             )
             .await?;
         let (memory_ids, notes_by_id) =
@@ -1835,6 +2172,30 @@ impl MemoryPack {
 mod tests {
     use super::*;
     use crate::config::DecayModel;
+
+    // ── TextSnippetPolicy ────────────────────────────────────────────────────
+
+    #[test]
+    fn text_snippet_policy_omit_returns_zero() {
+        assert_eq!(TextSnippetPolicy::Omit.snippet_chars(), 0);
+    }
+
+    #[test]
+    fn text_snippet_policy_include_returns_chars() {
+        assert_eq!(
+            TextSnippetPolicy::Include { chars: 200 }.snippet_chars(),
+            200
+        );
+    }
+
+    #[test]
+    fn text_snippet_policy_include_zero_chars_clamps_to_one() {
+        assert_eq!(
+            TextSnippetPolicy::Include { chars: 0 }.snippet_chars(),
+            1,
+            "Include{{chars:0}} must clamp to 1 so callers always get some snippet"
+        );
+    }
 
     #[test]
     fn validate_memory_type_rejects_invalid() {
@@ -2593,6 +2954,79 @@ mod tests {
             score_high > score_low,
             "high-salience (0.9, relevance=0.8, score={score_high}) should outrank \
              low-salience (0.3, relevance=0.9, score={score_low}) under default Weighted strategy"
+        );
+    }
+
+    // ── FTS fanout constant + recall_text_terms_with_limit ────────────────────
+
+    #[test]
+    fn fanout_constant_matches_production_limit() {
+        // The named constant must equal 10 — any change here is an intentional
+        // fanout decision, not a silent drift.
+        assert_eq!(
+            RECALL_FTS_TERM_FANOUT_LIMIT, 10,
+            "RECALL_FTS_TERM_FANOUT_LIMIT drifted from 10; update this test if intentional"
+        );
+    }
+
+    #[test]
+    fn recall_text_terms_with_limit_truncates_to_limit() {
+        // 11-term query must be capped at the supplied limit.
+        let terms = recall_text_terms_with_limit("a b c d e f g h i j k", 10);
+        assert_eq!(
+            terms.len(),
+            10,
+            "expected 10 terms, got {}: {terms:?}",
+            terms.len()
+        );
+        assert_eq!(terms[0], "a");
+        assert_eq!(terms[9], "j");
+    }
+
+    #[test]
+    fn recall_text_terms_with_limit_smaller_cap() {
+        // limit=3 returns only the first 3 terms; future fanout sweeps can use this
+        // without touching production code.
+        let terms = recall_text_terms_with_limit("recall search path latency", 3);
+        assert_eq!(terms, vec!["recall", "search", "path"]);
+    }
+
+    #[test]
+    fn recall_text_terms_cjk_not_dropped() {
+        // CJK characters are alphanumeric under Unicode, so trim_matches must not
+        // strip them. ascii_lowercase is a no-op for non-ASCII, so they pass through
+        // unchanged.
+        let terms = recall_text_terms_with_limit("東京 レイテンシ ベクトル検索", 10);
+        assert_eq!(
+            terms.len(),
+            3,
+            "CJK terms must not be dropped by ASCII cleanup: got {terms:?}"
+        );
+        assert!(
+            terms.contains(&"東京".to_string()),
+            "expected 東京 in {terms:?}"
+        );
+        assert!(
+            terms.contains(&"レイテンシ".to_string()),
+            "expected レイテンシ in {terms:?}"
+        );
+    }
+
+    #[test]
+    fn recall_text_terms_deduplicates() {
+        // Duplicate tokens must be counted once; the cap applies to the deduplicated set.
+        let terms = recall_text_terms_with_limit("recall recall search search", 10);
+        assert_eq!(terms, vec!["recall", "search"]);
+    }
+
+    #[test]
+    fn recall_text_terms_production_path_uses_constant() {
+        // recall_text_terms (no limit arg) must produce the same result as calling
+        // recall_text_terms_with_limit with RECALL_FTS_TERM_FANOUT_LIMIT.
+        let query = "a b c d e f g h i j k";
+        assert_eq!(
+            recall_text_terms(query),
+            recall_text_terms_with_limit(query, RECALL_FTS_TERM_FANOUT_LIMIT),
         );
     }
 }

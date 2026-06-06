@@ -158,7 +158,7 @@ impl Default for RecallConfig {
             temporal_half_life_days: 30.0,
             decay_model: DecayModel::default(),
             candidate_multiplier: 20,
-            candidate_limit: None,
+            candidate_limit: Some(150),
             // CC-6: Weighted fusion respects score magnitude, allowing the salience
             // amplifier to meaningfully differentiate high- vs low-salience memories.
             // Weights [vector=0.7, text=0.3] match the prior RRF intent: vector
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn new_fields_have_correct_defaults() {
         let cfg = RecallConfig::default();
-        assert_eq!(cfg.candidate_limit, None);
+        assert_eq!(cfg.candidate_limit, Some(150));
         // CC-6: default changed to Weighted [0.7, 0.3] so salience can influence ranking
         assert!(
             matches!(
@@ -621,9 +621,11 @@ mod tests {
     #[test]
     fn partial_config_new_fields_use_defaults() {
         // Parse JSON that omits all new fields — they should fall back to defaults.
+        // With #[serde(default)] on the struct, missing fields use RecallConfig::default(),
+        // so candidate_limit falls back to Some(150), not Option::default() == None.
         let json = r#"{"temporal_weight": 0.15}"#;
         let cfg: RecallConfig = serde_json::from_str(json).expect("deserialize partial");
-        assert_eq!(cfg.candidate_limit, None);
+        assert_eq!(cfg.candidate_limit, Some(150));
         // CC-6: default changed to Weighted [0.7, 0.3]
         assert!(
             matches!(cfg.fuse_strategy, FusionStrategy::Weighted { .. }),

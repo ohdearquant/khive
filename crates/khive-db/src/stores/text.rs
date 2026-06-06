@@ -600,7 +600,17 @@ impl TextSearch for Fts5TextSearch {
             };
 
             // Snippet column index 3 = body in the FTS5 schema.
-            let snippet_chars = request.snippet_chars.max(1) as i32;
+            // snippet_chars == 0 is the sentinel for "no snippet" — skip the
+            // snippet(...) call entirely and return NULL instead.  This avoids
+            // the ~12ms BM25 snippet computation on the hot recall path where
+            // snippets are unused.  Callers that need snippets (diagnostics) pass
+            // snippet_chars > 0 and get the same behaviour as before.
+            let snippet_expr = if request.snippet_chars == 0 {
+                "NULL AS snippet".to_string()
+            } else {
+                let chars = i32::try_from(request.snippet_chars).unwrap_or(i32::MAX);
+                format!("snippet({table}, 3, '', '', '...', {chars})")
+            };
 
             let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
                 build_filter_clause(filter, &table, 3)
@@ -609,7 +619,7 @@ impl TextSearch for Fts5TextSearch {
             };
 
             let sql = format!(
-                "SELECT subject_id, rank, title, snippet({table}, 3, '', '', '...', {snippet_chars}) \
+                "SELECT subject_id, rank, title, {snippet_expr} \
                  FROM {table} WHERE {table} MATCH ?1{filter_clause} \
                  ORDER BY rank LIMIT ?2",
             );
@@ -633,7 +643,7 @@ impl TextSearch for Fts5TextSearch {
                 let id_str: String = row.get(0)?;
                 let fts_rank: f64 = row.get(1)?;
                 let title: String = row.get(2)?;
-                let snippet: String = row.get(3)?;
+                let snippet: Option<String> = row.get(3)?;
 
                 let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -667,7 +677,7 @@ impl TextSearch for Fts5TextSearch {
                         score: DeterministicScore::from_f64(score),
                         rank,
                         title: if title.is_empty() { None } else { Some(title) },
-                        snippet: if snippet.is_empty() { None } else { Some(snippet) },
+                        snippet: snippet.filter(|s| !s.is_empty()),
                     }
                 })
                 .collect();
@@ -1592,6 +1602,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    /// snippet_chars=0 omits snippet computation without changing IDs, ranks, or scores.
+    ///
+    /// Regression for the snippet-free FTS optimization: verifies the `NULL AS snippet`
+    /// path returns identical candidate identity and ordering to the regular path, and
+    /// that every snippet field is None when snippet_chars=0.
+    #[tokio::test]
+    async fn search_snippet_chars_zero_omits_snippets_without_changing_rank() {
+        let store = setup_memory_store("snippet_zero");
+
+        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let bodies = [
+            "alpha bravo charlie delta the quick fox jumped",
+            "bravo charlie delta echo the slow fox slept",
+            "charlie delta echo foxtrot the lazy dog barked",
+            "delta echo foxtrot golf a completely different document",
+        ];
+        for (id, body) in ids.iter().zip(bodies.iter()) {
+            store
+                .upsert_document(make_document(*id, "title", body))
+                .await
+                .unwrap();
+        }
+
+        let req_with = TextSearchRequest {
+            query: "bravo charlie".to_string(),
+            mode: TextQueryMode::AnyTerm,
+            filter: Some(ns_filter("test_ns")),
+            top_k: 10,
+            snippet_chars: 64,
+        };
+        let req_zero = TextSearchRequest {
+            snippet_chars: 0,
+            ..req_with.clone()
+        };
+
+        let hits_with = store.search(req_with).await.unwrap();
+        let hits_zero = store.search(req_zero).await.unwrap();
+
+        assert!(!hits_with.is_empty(), "snippet path must return hits");
+        assert_eq!(
+            hits_with.len(),
+            hits_zero.len(),
+            "hit count must be identical regardless of snippet_chars"
+        );
+
+        for (hw, hz) in hits_with.iter().zip(hits_zero.iter()) {
+            assert_eq!(hw.subject_id, hz.subject_id, "subject_id must match");
+            assert_eq!(hw.rank, hz.rank, "rank must match");
+            assert!(
+                (hw.score.to_f64() - hz.score.to_f64()).abs() < 1e-12,
+                "score must match: with={} zero={}",
+                hw.score.to_f64(),
+                hz.score.to_f64()
+            );
+            assert!(
+                hz.snippet.is_none(),
+                "snippet must be None when snippet_chars=0, got {:?}",
+                hz.snippet
+            );
+        }
+    }
+
+    // Boundary case: a hit ranked near the last position in a multi-result set
+    // must still have snippet=None when snippet_chars=0.
+    #[tokio::test]
+    async fn search_snippet_chars_zero_bottom_ranked_hit_has_no_snippet() {
+        let store = setup_memory_store("snippet_zero_boundary");
+
+        // Insert enough docs so the last-ranked result is a "boundary" case.
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let body = format!("keyword_boundary doc number {i} with varying relevance");
+            store
+                .upsert_document(make_document(*id, "t", &body))
+                .await
+                .unwrap();
+        }
+
+        let hits = store
+            .search(TextSearchRequest {
+                query: "keyword_boundary".to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 5, "all 5 docs must match");
+        // The last-ranked hit (boundary) must also have no snippet.
+        let last = hits.last().unwrap();
+        assert!(
+            last.snippet.is_none(),
+            "bottom-ranked hit must have snippet=None when snippet_chars=0, got {:?}",
+            last.snippet
+        );
     }
 
     /// Score normalization: all scores stay in (0, 1], and a single-hit result

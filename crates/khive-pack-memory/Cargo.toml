@@ -27,12 +27,15 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
+lru = "0.12"
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 khive-pack-kg = { version = "0.2.5", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 async-trait = { workspace = true }
+tempfile = "3"
 
 [[test]]
 name = "integration"

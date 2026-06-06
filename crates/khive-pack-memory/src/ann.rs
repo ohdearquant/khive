@@ -16,6 +16,8 @@
 //! false-stale rebuilds.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
@@ -58,6 +60,10 @@ pub(crate) struct AnnBridge {
 pub(crate) struct AnnState {
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
     warming: Mutex<HashSet<AnnKey>>,
+    /// Counts how many times `search_loaded` returned a warm hit. Test-only;
+    /// call `reset_warm_route_count()` between operations to isolate counts.
+    #[cfg(test)]
+    pub(crate) warm_route_count: AtomicUsize,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
@@ -66,7 +72,20 @@ pub(crate) fn new_shared() -> SharedAnn {
     Arc::new(AnnState {
         indexes: RwLock::new(HashMap::new()),
         warming: Mutex::new(HashSet::new()),
+        #[cfg(test)]
+        warm_route_count: AtomicUsize::new(0),
     })
+}
+
+#[cfg(test)]
+impl AnnState {
+    pub(crate) fn warm_route_count(&self) -> usize {
+        self.warm_route_count.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn reset_warm_route_count(&self) {
+        self.warm_route_count.store(0, Ordering::SeqCst);
+    }
 }
 
 // ── AnnBridge ─────────────────────────────────────────────────────────────────
@@ -197,7 +216,11 @@ pub(crate) async fn search_loaded(
     let guard = ann.indexes.read().await;
     match guard.get(key) {
         None => Ok(None),
-        Some(bridge) => bridge.search(query, k).map(Some),
+        Some(bridge) => {
+            #[cfg(test)]
+            ann.warm_route_count.fetch_add(1, Ordering::SeqCst);
+            bridge.search(query, k).map(Some)
+        }
     }
 }
 

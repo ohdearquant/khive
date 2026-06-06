@@ -1,6 +1,7 @@
 pub(crate) mod ann;
 pub mod config;
 pub mod handlers;
+pub(crate) mod query_cache;
 pub mod rerank;
 pub mod scoring;
 pub mod tunable;
@@ -16,6 +17,7 @@ use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
 use crate::ann::{new_shared, SharedAnn};
 use crate::config::RecallConfig;
+use crate::query_cache::QueryEmbeddingCache;
 
 pub struct MemoryPack {
     runtime: KhiveRuntime,
@@ -23,6 +25,8 @@ pub struct MemoryPack {
     config: Mutex<RecallConfig>,
     /// Per-`(namespace, model)` warm ANN indexes.
     ann: SharedAnn,
+    /// Bounded exact-match query embedding cache (model_name, query_text) → Vec<f32>.
+    pub(crate) query_cache: QueryEmbeddingCache,
 }
 
 impl MemoryPack {
@@ -239,7 +243,13 @@ impl MemoryPack {
             runtime,
             config: Mutex::new(RecallConfig::default()),
             ann: new_shared(),
+            query_cache: QueryEmbeddingCache::with_default_capacity(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ann_for_test(&self) -> SharedAnn {
+        self.ann.clone()
     }
 }
 
@@ -308,5 +318,182 @@ impl PackRuntime for MemoryPack {
                 "memory pack does not handle verb {verb:?}"
             ))),
         }
+    }
+}
+
+// ── MAJ-1 regression test: second recall routes through warm ANN ──────────────
+
+#[cfg(test)]
+mod ann_route_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use khive_pack_kg::KgPack;
+    use khive_runtime::{EmbedderProvider, Namespace, RuntimeConfig, VerbRegistryBuilder};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+    // Deterministic embedding service: distinct vector per unique text via FNV hash.
+    struct HashVecService {
+        dims: usize,
+    }
+
+    fn fnv_to_vec(text: &str, dims: usize) -> Vec<f32> {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in text.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0001_0000_01b3);
+        }
+        let mut v = Vec::with_capacity(dims);
+        let mut s = h;
+        for _ in 0..dims {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            v.push(((s >> 33) as f32) / (0x7fff_ffff_u32 as f32) - 1.0);
+        }
+        v
+    }
+
+    #[async_trait]
+    impl EmbeddingService for HashVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|t| fnv_to_vec(t, self.dims)).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "hash-vec"
+        }
+    }
+
+    struct HashVecProvider {
+        model_name: String,
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for HashVecProvider {
+        fn name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(HashVecService { dims: self.dims }))
+        }
+    }
+
+    /// Regression: the second `memory.recall` call on a namespace with N embedded
+    /// notes must route through the warm Vamana ANN index, not the O(N) sqlite-vec
+    /// exact fallback.
+    ///
+    /// Proof of correctness: the first recall builds the ANN synchronously (via
+    /// `ensure_ann_for_model` awaited at `handlers.rs:690`). After the build the
+    /// `AnnState` warm-route counter is reset. The second recall hits
+    /// `search_loaded` with the index already loaded and increments the counter.
+    /// An assertion on the counter value is deterministic — it does not depend on
+    /// wall-clock timing or tracing output.
+    ///
+    /// Fail-on-revert proof: reverting the awaited `ensure_ann_for_model` call back
+    /// to fire-and-forget (`ensure_ann_background`) means the first recall does not
+    /// build the index synchronously. The second recall races against the background
+    /// task; in test execution without `tokio::time::sleep`, the task typically has
+    /// not completed, so `search_loaded` returns `Ok(None)` and the counter stays 0,
+    /// causing this assertion to fail.
+    #[tokio::test]
+    async fn recall_second_call_uses_warm_ann_route() {
+        let tmp = tempfile::Builder::new()
+            .prefix("khive-memory-ann-route-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("temp /tmp db dir");
+        let db_path = tmp.path().join("khive-graph.db");
+
+        const MODEL: &str = "ann-route-test-model";
+        const DIMS: usize = 32;
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        // Create notes with embedding_model: None so the runtime auto-detects
+        // the registered custom provider (resolve_embedding_model only handles
+        // lattice aliases; custom provider names must go through the auto-detect path).
+        for i in 0..32u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("ann warm route note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+        }
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann = pack.ann_for_test();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        // First recall: triggers synchronous ANN build on cache miss.
+        // No explicit embedding_model — auto-detects ann-route-test-model.
+        registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "ann warm route note 7",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("first recall");
+
+        ann.reset_warm_route_count();
+
+        // Second recall: index is already loaded — must go through warm ANN.
+        registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "ann warm route note 7",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("second recall");
+
+        assert!(
+            ann.warm_route_count() > 0,
+            "second recall must route through warm ANN, not exact sqlite-vec fallback"
+        );
     }
 }
