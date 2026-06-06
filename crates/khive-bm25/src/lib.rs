@@ -10,9 +10,6 @@ mod config;
 mod index;
 mod tokenizer;
 
-#[cfg(test)]
-mod tests;
-
 // Re-export public types
 pub use config::Bm25Config;
 pub use error::{ErrorKind, Result, RetrievalError};

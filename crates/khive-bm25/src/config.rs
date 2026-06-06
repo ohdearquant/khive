@@ -53,6 +53,14 @@ impl Bm25Config {
         }
     }
 
+    /// Create a validated BM25 configuration, returning an error if parameters
+    /// are invalid (non-finite, negative k1, or b outside [0, 1]).
+    pub fn try_new(k1: f64, b: f64) -> Result<Self, &'static str> {
+        let config = Self::new(k1, b);
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Set memory budget in bytes.
     ///
     /// When set, `index_document()` calls that would cause the estimated

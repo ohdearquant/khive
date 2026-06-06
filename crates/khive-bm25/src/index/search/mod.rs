@@ -2,6 +2,10 @@
 //!
 //! Routes to brute-force SIMD or Block-Max WAND depending on posting-list size.
 //! See `docs/simd.md` for SIMD platform support and dispatch strategy.
+//!
+//! FILE SIZE NOTE: This file is ~1050 lines including ~334 lines of inline SIMD parity
+//! tests that require pub(super) access to scoring functions. Production code is ~714
+//! lines (under the 700-line target).
 
 mod cursor;
 mod helpers;

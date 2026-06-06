@@ -3,6 +3,10 @@
 //! Scores are converted to `DeterministicScore` at the API boundary for cross-platform
 //! consistency. See `docs/algorithm.md` for BM25 properties, floating-point design
 //! rationale, WAND block-max details, IDF cache design, and thread-safety trade-offs.
+//!
+//! FILE SIZE JUSTIFICATION: This file exceeds 1000 lines because Bm25Index, its custom
+//! Deserialize impl, PostingList serde validation, BlockMax metadata, and regression tests
+//! share coupled invariants that are harder to verify if split across modules.
 
 mod indexing;
 mod memory;
@@ -769,6 +773,10 @@ impl Bm25Index {
         if idx < self.doc_lengths_vec.len() {
             self.doc_lengths_vec[idx]
         } else {
+            debug_assert!(
+                false,
+                "doc_lengths_vec not populated for internal_id {internal_id}"
+            );
             self.doc_lengths.get(&internal_id).copied().unwrap_or(0)
         }
     }
@@ -1084,7 +1092,10 @@ fn build_term_block_max_meta(
         for i in start..end {
             let doc_id = postings.doc_ids[i];
             let term_freq = postings.term_freqs[i];
-            let doc_length = doc_lengths.get(&doc_id).copied().unwrap_or(0);
+            let doc_length = doc_lengths.get(&doc_id).copied().unwrap_or_else(|| {
+                debug_assert!(false, "posting list references unknown doc_id {doc_id}");
+                0
+            });
             let score = bm25_term_score(idf, term_freq, doc_length, avgdl, k1, b);
             if score > max_score_contribution {
                 max_score_contribution = score;
@@ -1173,5 +1184,170 @@ mod document_id_wire_format {
         let json = serde_json::to_string(&id).expect("serialize");
         let back: DocumentId = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, id);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use crate::{Bm25Config, Bm25Index};
+
+    #[test]
+    fn serde_roundtrip_search_works_with_4_postings() {
+        let mut index = Bm25Index::default();
+        for i in 0..4 {
+            index.index_document(format!("doc{i}"), "alpha").unwrap();
+        }
+        let json = serde_json::to_string(&index).unwrap();
+        let restored: Bm25Index = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.doc_lengths_f32.len(),
+            restored.next_internal_id as usize,
+            "doc_lengths_f32 must be rebuilt on deserialization"
+        );
+        let results = restored.search("alpha", 10);
+        assert_eq!(results.len(), 4, "all 4 docs must be found");
+    }
+
+    #[test]
+    fn serde_roundtrip_search_works_with_8_postings() {
+        let mut index = Bm25Index::default();
+        for i in 0..8 {
+            index.index_document(format!("doc{i}"), "alpha").unwrap();
+        }
+        let json = serde_json::to_string(&index).unwrap();
+        let restored: Bm25Index = serde_json::from_str(&json).unwrap();
+        let results = restored.search("alpha", 10);
+        assert_eq!(results.len(), 8, "all 8 docs must be found");
+    }
+
+    #[test]
+    fn remove_old_doc_after_deserialize_and_new_insert_leaves_no_stale_posting() {
+        let mut index = Bm25Index::default();
+        index.index_document("old_doc", "alpha").unwrap();
+        let json = serde_json::to_string(&index).unwrap();
+        let mut restored: Bm25Index = serde_json::from_str(&json).unwrap();
+        restored.index_document("new_doc", "beta").unwrap();
+        for internal_id in restored.doc_lengths.keys() {
+            assert!(
+                restored.forward_index.contains_key(internal_id),
+                "forward_index must cover every live doc after new insert post-serde"
+            );
+        }
+        assert!(restored.remove_document("old_doc"));
+        let hits = restored.search("alpha", 10);
+        assert!(
+            hits.is_empty(),
+            "old_doc must not remain searchable after removal"
+        );
+    }
+
+    #[test]
+    fn reindex_with_empty_text_preserves_old_document() {
+        let mut index = Bm25Index::default();
+        index.index_document("doc1", "original content").unwrap();
+        index.index_document("doc1", "").unwrap();
+        assert!(
+            index.contains_document("doc1"),
+            "doc must survive a no-op empty reindex"
+        );
+        let results = index.search("original", 10);
+        assert_eq!(
+            results.len(),
+            1,
+            "doc must still be searchable after empty reindex"
+        );
+    }
+
+    #[test]
+    fn budget_check_does_not_overflow() {
+        let config = Bm25Config::default().with_memory_budget(1);
+        let mut index = Bm25Index::new(config);
+        let result = index.index_document("doc1", "hello world");
+        assert!(result.is_err(), "budget should be exceeded");
+    }
+
+    #[test]
+    fn config_nan_k1_rejected_by_try_new() {
+        let config = Bm25Config::new(f64::NAN, 0.75);
+        assert!(
+            Bm25Index::try_new(config).is_err(),
+            "NaN k1 must be rejected by try_new"
+        );
+    }
+
+    #[test]
+    fn config_inf_b_rejected_by_try_new() {
+        let config = Bm25Config::new(1.2, f64::INFINITY);
+        assert!(
+            Bm25Index::try_new(config).is_err(),
+            "Inf b must be rejected by try_new"
+        );
+    }
+
+    #[test]
+    fn block_size_zero_rejected_on_deserialization() {
+        let mut index = Bm25Index::default();
+        index.index_document("doc1", "hello world").unwrap();
+        let json = serde_json::to_string(&index).unwrap();
+        let tampered = json.replace(
+            &format!("\"block_size\":{}", super::DEFAULT_BLOCK_SIZE),
+            "\"block_size\":0",
+        );
+        let result: Result<Bm25Index, _> = serde_json::from_str(&tampered);
+        assert!(
+            result.is_err(),
+            "block_size=0 must be rejected during deserialization"
+        );
+    }
+
+    #[test]
+    fn postings_epoch_max_does_not_collide_with_stale_sentinel() {
+        let mut index = Bm25Index::default();
+        index.index_document("doc1", "hello world").unwrap();
+        let json = serde_json::to_string(&index).unwrap();
+        let tampered = json.replace(
+            &format!("\"postings_epoch\":{}", index.postings_epoch),
+            &format!("\"postings_epoch\":{}", u64::MAX),
+        );
+        let restored: Bm25Index = serde_json::from_str(&tampered).unwrap();
+        let results = restored.search("hello", 10);
+        assert_eq!(
+            results.len(),
+            1,
+            "search must work with postings_epoch=u64::MAX"
+        );
+    }
+
+    #[test]
+    fn posting_list_sentinel_doc_id_rejected_via_index_serde() {
+        let mut index = Bm25Index::default();
+        index.index_document("doc1", "hello").unwrap();
+        let json = serde_json::to_string(&index).unwrap();
+        let tampered = json.replace("[0],\"term_freqs\":[1]", "[4294967295],\"term_freqs\":[1]");
+        if tampered == json {
+            return;
+        }
+        let result: Result<Bm25Index, _> = serde_json::from_str(&tampered);
+        assert!(
+            result.is_err(),
+            "posting list with u32::MAX doc_id must be rejected"
+        );
+    }
+
+    #[test]
+    fn unsorted_posting_list_rejected_via_index_serde() {
+        let mut index = Bm25Index::default();
+        index.index_document("doc0", "common term").unwrap();
+        index.index_document("doc1", "common word").unwrap();
+        let json = serde_json::to_string(&index).unwrap();
+        let tampered = json.replace("[0,1],\"term_freqs\"", "[1,0],\"term_freqs\"");
+        if tampered == json {
+            return;
+        }
+        let result: Result<Bm25Index, _> = serde_json::from_str(&tampered);
+        assert!(
+            result.is_err(),
+            "posting list with unsorted doc_ids must be rejected"
+        );
     }
 }
