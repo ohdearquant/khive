@@ -1,13 +1,7 @@
 //! Metrics infrastructure for HNSW observability.
-//!
-//! Pluggable MetricsSink trait for insert, search, and rebuild telemetry.
-//! Object-safe via `Arc<dyn MetricsSink>` so one sink can serve multiple index instances.
+//! Pluggable `MetricsSink` trait for insert, search, and rebuild telemetry.
 
 use std::sync::{Arc, Mutex};
-
-// ---------------------------------------------------------------------------
-// Metric value types
-// ---------------------------------------------------------------------------
 
 /// A single metric value emitted from an HNSW operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,32 +25,13 @@ pub struct MetricEvent {
     pub labels: Vec<(&'static str, String)>,
 }
 
-// ---------------------------------------------------------------------------
-// Sink trait
-// ---------------------------------------------------------------------------
-
 /// Receiver for metric events from HNSW operations.
-///
-/// Implement this trait to bridge HNSW telemetry to your observability stack
-/// (e.g., Prometheus, OpenTelemetry, tracing spans).
-///
-/// # Thread Safety
-///
-/// The trait requires `Send + Sync` so that `Arc<dyn MetricsSink>` can be
-/// shared across threads.
 pub trait MetricsSink: Send + Sync {
     /// Handle a metric event.
     fn emit(&self, event: MetricEvent);
 }
 
-// ---------------------------------------------------------------------------
-// Emit helper
-// ---------------------------------------------------------------------------
-
-/// Emit a metric event to the attached sink, if any.
-///
-/// This is the call-site helper used by `HnswIndex` internals. It is a no-op
-/// when `sink` is `None`.
+/// Emit a metric event to the attached sink; no-op when `sink` is `None`.
 #[inline]
 pub fn emit(sink: &Option<Arc<dyn MetricsSink>>, event: MetricEvent) {
     if let Some(s) = sink {
@@ -64,13 +39,7 @@ pub fn emit(sink: &Option<Arc<dyn MetricsSink>>, event: MetricEvent) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Metric name constants
-// ---------------------------------------------------------------------------
-
-/// Canonical metric name constants.
-///
-/// Using `&'static str` constants avoids string formatting on the hot path.
+/// Canonical metric name constants (`&'static str` to avoid hot-path formatting).
 pub mod names {
     /// Duration of a single insert operation in milliseconds (Histogram).
     pub const HNSW_INSERT_DURATION_MS: &str = "hnsw.insert.duration_ms";
@@ -94,13 +63,7 @@ pub mod names {
     pub const HNSW_REBUILD_NODES_REMOVED: &str = "hnsw.rebuild.nodes_removed";
 }
 
-// ---------------------------------------------------------------------------
-// Recording sink (test helper)
-// ---------------------------------------------------------------------------
-
-/// A `MetricsSink` that records all events for inspection in tests.
-///
-/// Thread-safe: uses an internal `Mutex`.
+/// A `MetricsSink` that records all events for inspection in tests. Thread-safe via `Mutex`.
 pub struct RecordingSink {
     events: Mutex<Vec<MetricEvent>>,
 }

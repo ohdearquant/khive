@@ -11,13 +11,8 @@ use crate::metrics::{self, MetricEvent, MetricValue};
 use crate::node::HnswNode;
 
 impl HnswIndex {
-    /// Insert a vector into the index.
-    ///
-    /// If the ID already exists, the vector is updated.
-    /// Returns an error if dimensions don't match.
-    ///
-    /// Emits `hnsw.insert.duration_ms`, `hnsw.insert.count`, and
-    /// `hnsw.index.size` metrics when a sink is attached.
+    /// Insert a vector into the index; updates in place if the ID already exists.
+    /// Returns an error on dimension mismatch. Emits insert metrics when a sink is attached.
     pub fn insert(&mut self, id: NodeId, vector: Vec<f32>) -> Result<()> {
         let start = std::time::Instant::now();
 
@@ -53,10 +48,7 @@ impl HnswIndex {
         result
     }
 
-    /// Insert a batch of vectors. Returns IDs that failed along with their errors.
-    ///
-    /// Callers can hold the write lock once around this call rather than once
-    /// per record, keeping the lock window bounded to the batch size.
+    /// Insert a batch of vectors; returns IDs that failed with their errors.
     pub fn insert_many(
         &mut self,
         items: impl IntoIterator<Item = (NodeId, Vec<f32>)>,
@@ -216,15 +208,8 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Generate random level for new node (exponential distribution).
-    ///
-    /// Uses seeded RNG if `config.seed` was set for reproducible builds.
-    ///
-    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.HNSW.level_prob_sums_to_one`
-    /// Level probabilities form a valid distribution: sum_{l=0}^{inf} P(level=l) = 1
-    ///
-    /// **PROOF CORRESPONDENCE**: `khive.Retrieval.HNSW.level_survival_decreasing`
-    /// Survival probability decreases exponentially: P(level >= l) = (1/M)^l
+    /// Generate random level for a new node using exponential distribution.
+    /// Uses seeded RNG when `config.seed` is set for reproducible builds.
     pub(super) fn random_level(&mut self) -> usize {
         let r: f64 = self.rng.gen::<f64>().max(f64::MIN_POSITIVE);
         let level = (-r.ln() * self.config.ml).floor() as usize;

@@ -1,7 +1,4 @@
-//! Distance computation for HNSW.
-//!
-//! Cosine, Dot, and L2 metrics with SIMD-friendly scalar loops.
-//! See `docs/distance.md` for metric property references.
+//! Distance computation for HNSW — Cosine, Dot, and L2 metrics.
 
 use super::config::DistanceMetric;
 // Use the lossy variant: input vectors are validated as finite at the insert boundary,
@@ -10,13 +7,7 @@ use super::config::DistanceMetric;
 pub(crate) use khive_score::score_from_distance_lossy as score_from_distance;
 
 /// Compute cosine distance from pre-computed dot product and norms.
-///
-/// Clamps the cosine similarity to [-1, 1] before converting to distance,
-/// preventing out-of-range values caused by floating-point rounding when
-/// vectors are not perfectly unit-normalised (RETRIEVAL-M3).
-///
-/// Returns a distance in [0, 2] (0 = identical direction, 2 = opposite).
-/// Falls back to 1.0 (orthogonal) for zero or infinite norms.
+/// Clamps to [-1, 1]; returns [0, 2]; falls back to 1.0 for zero/infinite norms.
 #[inline]
 pub(crate) fn cosine_distance_from_parts(dot: f32, a_norm: f32, b_norm: f32) -> f32 {
     let denom = a_norm * b_norm;
@@ -31,10 +22,8 @@ pub(crate) fn cosine_distance_from_parts(dot: f32, a_norm: f32, b_norm: f32) -> 
     }
 }
 
-/// Compute distance between two vectors.
+/// Compute distance between two vectors using SIMD-accelerated implementations.
 /// Returns distance (lower = more similar) for heap operations.
-///
-/// Uses SIMD-accelerated implementations from lattice-embed.
 #[inline]
 pub fn compute_distance(
     a: &[f32],
@@ -81,14 +70,8 @@ pub fn compute_distance(
     }
 }
 
-/// Ordering distance for HNSW-internal comparisons (graph maintenance, neighbor selection).
-///
-/// Returns a value that is **monotone** with the true distance: smaller ordering distance
-/// ↔ smaller true distance. Callers must NOT interpret the return value as a true distance
-/// (e.g., do not pass it to `distance_to_similarity`). Use `compute_distance` for output.
-///
-/// Optimization: for L2 metric, returns squared Euclidean distance (skips the final `.sqrt()`).
-/// For all other metrics, identical to `compute_distance`.
+/// Monotone ordering distance for HNSW internals; not a true distance.
+/// For L2 returns squared Euclidean (skips sqrt); for other metrics identical to `compute_distance`.
 #[inline]
 pub(crate) fn compute_ordering_distance(
     a: &[f32],
@@ -103,20 +86,7 @@ pub(crate) fn compute_ordering_distance(
     }
 }
 
-/// Ordered wrapper for f32 to enable use in BinaryHeap.
-///
-/// # NaN Handling
-///
-/// NaN values are treated as "infinite distance" (greater than all other values).
-/// This ensures deterministic ordering and fail-safe behavior when encountering
-/// malformed embeddings. Two NaN values compare as equal.
-///
-/// # Formal Properties
-///
-/// - Reflexive: a.cmp(a) = Equal
-/// - Antisymmetric: a.cmp(b) = Less implies b.cmp(a) = Greater
-/// - Transitive: a < b and b < c implies a < c
-/// - Total: for all a, b: a.cmp(b) is defined
+/// Ordered wrapper for f32; NaN treated as greater than all finite values.
 #[derive(Clone, Copy, PartialEq)]
 pub struct OrderedF32(pub f32);
 

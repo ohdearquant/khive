@@ -1,7 +1,3 @@
-// INLINE TEST JUSTIFICATION: Checkpoint unit tests access private struct fields
-// and internal helpers (e.g. `SnapshotError` variants, direct struct construction)
-// that are not part of the public API. Tests must live here to validate internal
-// invariants without widening the public surface.
 #![allow(clippy::field_reassign_with_default)]
 
 use super::*;

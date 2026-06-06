@@ -1,6 +1,4 @@
 //! 128-bit opaque node identifier for HNSW entries.
-
-/// 128-bit opaque node identifier for HNSW entries.
 ///
 /// Serializes as a 32-character lowercase hex string (compatible with the
 /// snapshot format used by `HnswSnapshot`).

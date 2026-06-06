@@ -1,7 +1,5 @@
 //! Index alias management for zero-downtime HNSW index migration.
-//!
-//! Blue-green swap via atomic pointer exchange; concurrent readers drain safely.
-//! See `docs/alias.md` for the migration steps and concurrency model.
+//! Blue-green swap via atomic pointer exchange; see `docs/alias.md`.
 
 mod drain;
 pub mod error;

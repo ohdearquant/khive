@@ -1,20 +1,10 @@
 //! Pre-allocated search buffers for HNSW search.
-//!
-//! Reuse HnswSearchContext across calls to amortize heap allocation.
-//! Buffer reuse eliminates allocator pressure; O(1) generation-counter visited set avoids hashing.
 
 use std::collections::BinaryHeap;
 
 use crate::distance::OrderedF32;
 
-/// O(1) visited set using generation counter and dense array.
-///
-/// Each node slot stores the generation number when it was last visited.
-/// To "clear" the set, we just increment the generation counter -- O(1).
-/// A node is visited iff `markers[id] == generation`.
-///
-/// This replaces `HashSet<EmbeddingId>` which required O(capacity) clear
-/// and O(1) amortized insert with hash computation overhead per operation.
+/// O(1) visited set: generation counter + dense array; increment to clear.
 pub(crate) struct VisitedSet {
     /// Current generation number. Incremented on each `clear()`.
     generation: u64,
@@ -32,10 +22,7 @@ impl VisitedSet {
         }
     }
 
-    /// Clear the visited set in O(1) by incrementing the generation counter.
-    ///
-    /// On the extremely rare wrap-around (every 2^64 clears), we zero the
-    /// markers array to prevent false positives.
+    /// Clear in O(1) by incrementing the generation counter.
     #[inline]
     pub fn clear(&mut self) {
         self.generation = self.generation.wrapping_add(1);
@@ -54,8 +41,7 @@ impl VisitedSet {
         }
     }
 
-    /// Mark a node as visited. Returns `true` if the node was NOT previously visited
-    /// (i.e., this is the first visit), matching `HashSet::insert` semantics.
+    /// Mark a node as visited; returns `true` if this is the first visit.
     #[inline]
     pub fn visit(&mut self, id: usize) -> bool {
         if id >= self.markers.len() {
@@ -78,32 +64,7 @@ impl VisitedSet {
     }
 }
 
-/// Pre-allocated search context for HNSW queries.
-///
-/// Reuse across multiple `search_with_context` calls to amortize allocation cost.
-/// The context holds the working buffers for the greedy beam search:
-///
-/// - `candidates`: min-heap of nodes to explore (closest first) -- uses internal usize IDs
-/// - `results`: max-heap of best results so far (furthest first, for pruning) -- uses internal usize IDs
-/// - `visited`: generation-counter visited set indexed by internal usize ID
-/// - `result_buf`: scratch buffer for final sorted output (internal usize IDs)
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use khive_retrieval::hnsw::{HnswIndex, HnswSearchContext};
-///
-/// let index = HnswIndex::new(128);
-/// // ... insert vectors ...
-///
-/// let mut ctx = HnswSearchContext::new(index.config().ef_search);
-///
-/// // Reuse ctx across many searches
-/// for query in queries {
-///     let results = index.search_with_context(&query, 10, &mut ctx)?;
-///     // process results...
-/// }
-/// ```
+/// Pre-allocated search context; reuse across calls to amortize allocation cost.
 pub struct HnswSearchContext {
     /// Min-heap: candidates to explore (closest first). Uses internal usize IDs.
     pub(crate) candidates: BinaryHeap<std::cmp::Reverse<(OrderedF32, usize)>>,
@@ -118,10 +79,7 @@ pub struct HnswSearchContext {
 }
 
 impl HnswSearchContext {
-    /// Create a new search context pre-allocated for the given `ef` value.
-    ///
-    /// The `ef` parameter should match or exceed the `ef_search` config value
-    /// of the index you plan to search.
+    /// Create a pre-allocated context sized for the given `ef` value.
     pub fn new(ef: usize) -> Self {
         Self {
             candidates: BinaryHeap::with_capacity(ef),
@@ -132,10 +90,7 @@ impl HnswSearchContext {
         }
     }
 
-    /// Clear all buffers without deallocating.
-    ///
-    /// Called automatically at the start of each search. You do not need to
-    /// call this manually.
+    /// Clear all buffers without deallocating; called automatically at search start.
     pub(crate) fn clear(&mut self) {
         self.candidates.clear();
         self.results.clear();

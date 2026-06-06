@@ -1,7 +1,4 @@
-//! HNSW index implementation.
-//!
-//! Core structure with insert, delete, search, and rebuild operations.
-//! Nodes use dense usize indices internally; NodeId (128-bit) conversion happens at the API boundary.
+//! HNSW index implementation — insert, delete, search, and rebuild.
 
 mod build_batch;
 mod index_impl;

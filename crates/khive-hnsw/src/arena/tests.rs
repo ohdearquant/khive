@@ -1,9 +1,3 @@
-// INLINE TEST JUSTIFICATION: Arena tests require access to private fields
-// (`bump_offset`, `capacity`, raw arena internals) and non-`pub` helpers that
-// are not exposed through the crate's public API. Moving to `tests/` would
-// force either pub(crate) leakage or loss of coverage for critical safety invariants.
-//! Tests for the search arena allocator.
-
 use super::*;
 
 // =========================================================================

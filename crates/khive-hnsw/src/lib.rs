@@ -1,8 +1,4 @@
 //! HNSW (Hierarchical Navigable Small World) vector index.
-//!
-//! Approximate nearest neighbor search with O(log N) complexity.
-//! See `docs/algorithm.md` for the multi-layer graph design, parameter guide,
-//! arena allocator rationale, and tombstone/checkpoint behavior.
 
 pub mod alias;
 pub mod arena;

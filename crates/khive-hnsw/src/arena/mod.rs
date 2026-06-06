@@ -1,10 +1,7 @@
 //! Bump arena allocator for zero-allocation HNSW search.
-//!
-//! Fixed-size slab with O(1) reset between queries; not thread-safe by design.
-//! See `docs/arena.md` for design rationale and thread-safety notes.
+//! Fixed-size slab with O(1) reset; not thread-safe by design.
 
-// REASON: The inner module is intentionally named `arena` to match the public
-// type `SearchArena` exported from it; the name duplication is structural, not accidental.
+// REASON: inner module named `arena` to match the exported `SearchArena` type.
 #[allow(clippy::module_inception)]
 mod arena;
 mod arena_heap;

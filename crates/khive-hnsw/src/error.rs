@@ -89,11 +89,7 @@ impl RetrievalError {
 /// Convenience `Result` alias for HNSW operations.
 pub type Result<T> = std::result::Result<T, RetrievalError>;
 
-/// Validate that a vector contains only finite values.
-///
-/// Rejects `NaN`, `Infinity`, and `-Infinity`. Used at every public boundary
-/// (insert, build_batch, search, search_with_context) to prevent malformed
-/// vectors from entering the index or producing silent garbage results.
+/// Rejects vectors containing `NaN`, `Infinity`, or `-Infinity`.
 #[inline]
 pub fn validate_finite_vector(vector: &[f32]) -> Result<()> {
     for (i, &v) in vector.iter().enumerate() {

@@ -14,20 +14,7 @@ pub(crate) struct QuantMeta {
 }
 
 /// INT8 quantized vector arena for HNSW search acceleration.
-///
-/// Stores quantized vectors in a flat `Vec<i8>` arena with the same ordering
-/// as the main `nodes` vector. Used for fast approximate distance computation
-/// during the candidate filtering phase of search.
-///
-/// # Two-Phase Search Strategy
-///
-/// 1. **Phase 1 (INT8)**: Compute approximate distance using quantized vectors.
-///    This is ~3x faster than f32 distance computation (11ns vs 34ns for 384d).
-/// 2. **Phase 2 (f32)**: For candidates that pass the approximate threshold,
-///    compute precise f32 distance for final ranking.
-///
-/// This skip pattern avoids f32 distance computation for obviously distant
-/// neighbors, providing significant speedup at scale (50K+ vectors).
+/// Flat `Vec<i8>` arena parallel to `nodes`; used for approximate candidate filtering (~3x faster).
 #[derive(Debug, Clone)]
 pub(crate) struct QuantizedArena {
     /// Flat INT8 vector data. Vector `i` starts at `i * dims`.
@@ -48,10 +35,7 @@ impl QuantizedArena {
         }
     }
 
-    /// Quantize a float vector and append it to the arena.
-    ///
-    /// Uses symmetric quantization: `[-max_abs, max_abs]` -> `[-127, 127]`.
-    /// Returns the index of the newly added vector (should match the internal ID).
+    /// Quantize a float vector and append it; symmetric `[-max_abs, max_abs]` → `[-127, 127]`.
     pub(crate) fn push(&mut self, vector: &[f32], norm: f32) -> usize {
         debug_assert_eq!(vector.len(), self.dims);
 
@@ -129,10 +113,7 @@ impl QuantizedArena {
         &self.data[offset..offset + self.dims]
     }
 
-    /// Compute approximate INT8 dot product between two quantized vectors,
-    /// returning the result in the original f32 scale.
-    ///
-    /// Uses SIMD-accelerated INT8 dot product from khive-embed.
+    /// Compute approximate INT8 dot product, returning result in f32 scale.
     #[inline]
     #[allow(dead_code)] // Available for Dot metric path (future)
     pub fn dot_product_approx(&self, a_idx: usize, b_data: &[i8], b_scale: f32) -> f32 {
@@ -145,10 +126,7 @@ impl QuantizedArena {
         int8_dot_product_raw(a_data, b_data) / denom
     }
 
-    /// Compute approximate INT8 cosine distance between a stored vector and
-    /// a query's quantized form.
-    ///
-    /// Returns distance (1 - cosine_similarity), comparable to the f32 path.
+    /// Compute approximate INT8 cosine distance; returns `1 - cosine_similarity`.
     #[inline]
     pub fn cosine_distance_approx(
         &self,
@@ -177,13 +155,7 @@ impl QuantizedArena {
     }
 }
 
-/// Raw INT8 dot product using SIMD from khive-embed.
-///
-/// Zero-allocation path: takes raw `&[i8]` slices and returns the integer
-/// dot product as f32 (no scale factor division). The caller handles scaling.
-///
-/// Uses the same SIMD backend as `dot_product_i8` (NEON/AVX2/AVX-512 VNNI)
-/// but without constructing `QuantizedVector` wrappers.
+/// Raw INT8 dot product via SIMD; returns unscaled f32 result (caller handles scale factor).
 #[inline]
 pub(crate) fn int8_dot_product_raw(a: &[i8], b: &[i8]) -> f32 {
     lattice_embed::simd::dot_product_i8_raw(a, b)

@@ -14,25 +14,8 @@ use super::super::node::HnswNode;
 use super::super::stats::TombstoneStats;
 use super::quantized::QuantizedArena;
 
-/// HNSW vector index with tombstone-based lazy deletion.
-///
-/// This is an IN-MEMORY index. Persistence via snapshots is handled separately.
-/// All output scores are `DeterministicScore` for cross-platform consistency.
-///
-/// # Internal ID Scheme
-///
-/// Nodes are stored in a dense `Vec<HnswNode>` indexed by `usize`. The mappings
-/// `id_to_internal` and `internal_to_id` convert between external `NodeId`
-/// and internal `usize` at the API boundary. All neighbor lists, entry point,
-/// and tombstone tracking use internal `usize` IDs for O(1) lookups.
-///
-/// # INT8 Quantized Search (opt-in)
-///
-/// When `use_quantized` is true, search uses a two-phase strategy:
-/// 1. INT8 approximate distance for candidate filtering (~3x faster)
-/// 2. f32 precise distance for final scoring (exact results)
-///
-/// Enable via `HnswIndex::set_quantized(true)` or `HnswIndex::with_quantized()`.
+/// In-memory HNSW vector index with tombstone-based lazy deletion.
+/// Nodes use internal `usize` IDs for O(1) lookups; `NodeId` ↔ `usize` maps live at the API boundary.
 pub struct HnswIndex {
     /// Configuration.
     pub(crate) config: HnswConfig,
@@ -120,24 +103,14 @@ impl HnswIndex {
         Self::with_config(HnswConfig::with_dimensions(dimensions))
     }
 
-    /// Create a new HNSW index with custom configuration.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `config` fails validation. This is a programmer-only constructor
-    /// for cases where the caller has already validated the config (e.g. using
-    /// `HnswConfig::default()` or a named preset). External or deserialized
-    /// configs must use `try_with_config` instead.
+    /// Create a new HNSW index with custom configuration. Panics if config is invalid; use `try_with_config` for external input.
     pub fn with_config(config: HnswConfig) -> Self {
         config.validate().expect("HNSW configuration must be valid");
         Self::build_from_config(config)
     }
 
-    /// Create a new HNSW index with custom configuration, returning an error
-    /// if the configuration is invalid.
-    ///
-    /// Use this constructor when the config originates from external input
-    /// (deserialization, user-provided values, etc.).
+    /// Create a new HNSW index with custom configuration, returning an error if invalid.
+    /// Use for configs from external input (deserialization, user-provided values).
     pub fn try_with_config(config: HnswConfig) -> crate::error::Result<Self> {
         config.validate()?;
         Ok(Self::build_from_config(config))
@@ -175,10 +148,7 @@ impl HnswIndex {
     }
 
     /// Attach a metrics sink (builder pattern).
-    ///
-    /// The sink receives `MetricEvent`s from `search`, `insert`, and `rebuild`
-    /// operations. Pass an `Arc<dyn MetricsSink>` to share a single sink across
-    /// multiple indices.
+    /// The sink receives events from `search`, `insert`, and `rebuild` operations.
     #[must_use]
     pub fn with_metrics(mut self, sink: Arc<dyn MetricsSink>) -> Self {
         self.metrics = Some(sink);
@@ -192,27 +162,15 @@ impl HnswIndex {
         self.metrics = sink;
     }
 
-    /// Enable INT8 quantized distance for search candidate filtering.
-    ///
-    /// When enabled, search uses a two-phase strategy:
-    /// 1. INT8 approximate distance for candidate screening (~3x faster)
-    /// 2. f32 precise distance for final ranking (exact results)
-    ///
-    /// Recommended for indexes with 50K+ vectors where distance computation
-    /// dominates search time. For smaller indexes, the overhead of maintaining
-    /// the quantized arena may not be worthwhile.
-    ///
-    /// This is a builder-pattern method. For runtime toggling, use `set_quantized`.
+    /// Enable INT8 quantized distance for candidate filtering (builder pattern).
+    /// Two-phase: INT8 screening (~3x faster) then f32 final ranking. Use `set_quantized` for runtime toggle.
     #[must_use]
     pub fn with_quantized(mut self) -> Self {
         self.use_quantized = true;
         self
     }
 
-    /// Enable or disable INT8 quantized search at runtime.
-    ///
-    /// The quantized arena is always maintained (populated on insert),
-    /// so toggling this flag has no rebuilding cost.
+    /// Enable or disable INT8 quantized search at runtime; no rebuild cost since the arena is always maintained.
     pub fn set_quantized(&mut self, enabled: bool) {
         self.use_quantized = enabled;
     }
@@ -238,10 +196,6 @@ impl HnswIndex {
     }
 
     /// Get the vector for an embedding ID, if present.
-    ///
-    /// Used by the build swap logic to recover concurrent writes:
-    /// entries inserted into the live HNSW during a background build
-    /// need their vectors re-inserted into the new index at swap time.
     pub fn get_vector(&self, id: &NodeId) -> Option<Vec<f32>> {
         self.id_to_internal
             .get(id)
@@ -295,23 +249,8 @@ impl HnswIndex {
         self.internal_to_id[iid]
     }
 
-    /// Create a serializable snapshot of the index state.
-    ///
-    /// The snapshot captures:
-    /// - All indexed vector IDs and their raw f32 embeddings
-    /// - Graph topology (neighbor connections per layer)
-    /// - Tombstone information
-    /// - Configuration for compatibility checking
-    ///
-    /// # Self-Contained Warm Start
-    ///
-    /// The returned snapshot includes the full vector data in the `vectors`
-    /// field, making it self-contained for warm-start restores.  Use
-    /// Use `restore_from_snapshot_embedded` to restore directly from the
-    /// snapshot without supplying a separate vector map.
-    ///
-    /// Size estimate: `dimensions × 4 bytes × node_count`.
-    /// For 384-dim embeddings with 10 K nodes: ~15 MB.
+    /// Create a serializable snapshot including full vector data for warm-start restores.
+    /// Use `restore_from_snapshot_embedded` to restore without a separate vector map.
     pub fn snapshot(&self) -> super::super::checkpoint::HnswSnapshot {
         use super::super::checkpoint::{HnswCheckpointConfig, HnswSnapshot};
 
@@ -373,17 +312,7 @@ impl HnswIndex {
         }
     }
 
-    /// Restore index topology from a snapshot using embedded vector data.
-    ///
-    /// Convenience wrapper for snapshots produced by `snapshot` (which embed
-    /// the full f32 vectors).  No external vector map is required.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The snapshot contains no embedded vectors (`vectors` field is empty)
-    /// - Snapshot config is incompatible with current config
-    /// - Snapshot verification fails
+    /// Restore from a self-contained snapshot (embedded vectors). Errors on missing vectors or incompatible config.
     pub fn restore_from_snapshot_embedded(
         &mut self,
         snapshot: &super::super::checkpoint::HnswSnapshot,
@@ -401,34 +330,7 @@ impl HnswIndex {
         self.restore_from_snapshot(snapshot, &vectors)
     }
 
-    /// Restore index topology from a snapshot.
-    ///
-    /// This rebuilds the neighbor connections from the snapshot. The caller
-    /// must supply vector data via the `vectors` map.  If the snapshot was
-    /// produced by `snapshot` it already embeds vector data in
-    /// `snapshot.vectors`; you can use `restore_from_snapshot_embedded`
-    /// instead in that case.
-    ///
-    /// When both the snapshot's embedded `vectors` field and the caller-supplied
-    /// `vectors` map contain an entry for the same `NodeId`, the caller-supplied
-    /// entry takes precedence (useful for applying incremental updates on top of
-    /// a base snapshot).
-    ///
-    /// # Arguments
-    ///
-    /// * `snapshot` - The snapshot to restore from
-    /// * `vectors` - Map of ID -> vector data for all indexed vectors.
-    ///   May be empty if `snapshot.vectors` is non-empty (self-contained snapshot).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Snapshot config is incompatible with current config
-    /// - Snapshot verification fails
-    /// - Referenced vectors are missing from both the snapshot and the external map
-    /// - Any vector has incorrect dimensions
-    /// - Entry point is not in indexed_ids
-    /// - Snapshot layer count exceeds MAX_LEVEL
+    /// Rebuild neighbor connections from a snapshot. Caller-supplied `vectors` override embedded ones. Errors on incompatible config, missing vectors, or bad dims.
     pub fn restore_from_snapshot(
         &mut self,
         snapshot: &super::super::checkpoint::HnswSnapshot,

@@ -4,19 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::NodeId;
 
-/// Sort NodeIds by their byte representation for deterministic ordering.
-///
-/// Consistent ordering across runs regardless of HashMap iteration order,
-/// which is critical for reproducible checkpoint hashes and stable index-based encodings.
+/// Sort `NodeId`s by byte representation for deterministic, reproducible ordering.
 #[inline]
 pub fn sort_ids(ids: &mut [NodeId]) {
     ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 }
 
-/// Subset of [`super::super::HnswConfig`] relevant for checkpoint compatibility.
-///
-/// Stored as simple values (e.g. `metric` as `String`) so that checkpoints
-/// remain deserializable even if the enum representation changes.
+/// Subset of `HnswConfig` for checkpoint compatibility; stored as simple values for forward compat.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HnswCheckpointConfig {
     /// Maximum connections per node per layer (M).

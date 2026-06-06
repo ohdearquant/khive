@@ -56,30 +56,7 @@ pub enum SnapshotError {
 }
 
 /// Serializable snapshot of HNSW index state.
-///
-/// Captures enough information to reconstruct the index without
-/// re-indexing all vectors from scratch.
-///
-/// # Backward Compatibility
-///
-/// This struct maintains backward compatibility with v1 snapshots that only
-/// had `vector_count`. When deserializing old snapshots:
-/// - `vector_count` is read and used to populate `total_nodes`/`live_nodes`
-/// - New tombstone fields default to empty/zero
-/// - Missing `vectors` field defaults to empty (old snapshots require external vector supply)
-///
-/// Call [`HnswSnapshot::normalize`] after deserialization to ensure consistent state.
-///
-/// # Warm Start
-///
-/// When `vectors` is non-empty the snapshot is self-contained: call
-/// `HnswIndex::restore_from_snapshot_embedded` to restore without supplying
-/// an external vector map.  Snapshots produced by `HnswIndex::snapshot`
-/// always include the full f32 vector data.
-///
-/// The estimated size overhead is `dimensions × 4 bytes × node_count`.
-/// For 384-dim embeddings with 10 K nodes this is ~15 MB — well within
-/// typical checkpoint budgets.
+/// When `vectors` is non-empty, restore via `restore_from_snapshot_embedded`; otherwise supply an external map.
 #[derive(Debug, Clone, Serialize)]
 pub struct HnswSnapshot {
     /// Legacy field for backward compatibility with v1 snapshots.
@@ -135,20 +112,12 @@ pub struct HnswSnapshot {
 }
 
 impl HnswSnapshot {
-    /// Check if this snapshot is compatible with the given config.
-    ///
-    /// Two configs are compatible when `m`, `ef_construction`, and `metric`
-    /// all match. Loading a snapshot into an index with incompatible
-    /// parameters would produce incorrect search results.
+    /// Check if this snapshot is compatible with the given config (m, ef_construction, metric must match).
     pub fn is_compatible(&self, config: &HnswCheckpointConfig) -> bool {
         self.config == *config
     }
 
     /// Get the number of live (non-tombstoned) vectors in this snapshot.
-    ///
-    /// For backward compatibility, this returns `live_nodes` which represents
-    /// the same semantic meaning as the legacy `vector_count` (all vectors
-    /// were "live" before tombstone support).
     pub fn len(&self) -> usize {
         self.live_nodes
     }
@@ -168,14 +137,7 @@ impl HnswSnapshot {
         self.live_nodes == 0
     }
 
-    /// Normalize the snapshot after deserialization.
-    ///
-    /// This handles backward compatibility with v1 snapshots that only
-    /// had `vector_count`. If `total_nodes` is 0 but `vector_count` > 0
-    /// or `indexed_ids` is non-empty, the counts are populated from
-    /// available data.
-    ///
-    /// Call this after deserializing a snapshot of unknown version.
+    /// Normalize v1 backward-compat fields after deserialization; call on snapshots of unknown version.
     pub fn normalize(&mut self) {
         // Handle v1 -> v2 migration
         if self.total_nodes == 0 {
@@ -198,16 +160,7 @@ impl HnswSnapshot {
         }
     }
 
-    /// Verify internal consistency of the snapshot.
-    ///
-    /// Checks:
-    /// 1. `total_nodes == live_nodes + tombstone_count`
-    /// 2. `indexed_ids.len() == total_nodes`
-    /// 3. `tombstoned_ids.len() == tombstone_count`
-    /// 4. All tombstoned IDs exist in indexed_ids
-    ///
-    /// Returns `Ok(())` if all invariants hold, otherwise returns the
-    /// first error encountered.
+    /// Verify internal consistency: counts, ID list lengths, tombstone membership.
     pub fn verify(&self) -> Result<(), SnapshotError> {
         // Check count consistency
         if self.total_nodes != self.live_nodes + self.tombstone_count {
@@ -247,10 +200,7 @@ impl HnswSnapshot {
         Ok(())
     }
 
-    /// Check if indexed_ids, tombstoned_ids, and layers are in canonical sorted order.
-    ///
-    /// Canonical order means all ID lists are sorted by their byte representation.
-    /// This ensures deterministic serialization and stable index-based encodings.
+    /// Check if all ID lists are in canonical (byte-sorted) order for deterministic serialization.
     pub fn is_canonical(&self) -> bool {
         // Check indexed_ids are sorted
         let ids_sorted = self
@@ -285,17 +235,8 @@ impl HnswSnapshot {
         true
     }
 
-    /// Ensure canonical ordering (idempotent).
-    ///
-    /// Sorts `indexed_ids`, `tombstoned_ids`, and layer node entries by their
-    /// byte representation. This should be called before serializing snapshots
-    /// to ensure deterministic output.
-    ///
-    /// # Note
-    ///
-    /// Neighbor lists within each node are intentionally not sorted, as their order
-    /// may reflect proximity/priority from the HNSW algorithm. Only the top-level
-    /// node ordering within layers is canonicalized.
+    /// Sort ID lists and layer nodes by byte representation for deterministic serialization.
+    /// Neighbor lists within each node are intentionally left unsorted.
     pub fn canonicalize(&mut self) {
         // Sort indexed IDs
         sort_ids(&mut self.indexed_ids);
@@ -312,10 +253,7 @@ impl HnswSnapshot {
 
 // ── Wire type for validated deserialization ─────────────────────────────
 
-/// Raw wire representation of [`HnswSnapshot`] for serde.
-///
-/// Deserialization goes through this type, which normalizes v1 backward-compat
-/// fields and verifies invariants before returning a valid `HnswSnapshot`.
+/// Raw wire representation of [`HnswSnapshot`] for serde; normalizes and verifies on `TryFrom`.
 #[derive(Serialize, Deserialize)]
 struct RawHnswSnapshot {
     #[serde(default, skip_serializing_if = "is_zero")]

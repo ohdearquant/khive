@@ -52,20 +52,51 @@ Default `HnswConfig` applies unless overridden per group:
 | `dimensions`     | 384   |
 | `metric`         | Cosine (default); L2/Dot in `search_metrics` |
 
-## Baseline Table
+## Baseline Table (2026-06-06, post-sweep)
 
-_Record results here after each release benchmark run._
+**Toolchain:** rustc 1.94.1 (e408947bf 2026-03-25)
+**Machine:** arm64 (Apple Silicon), macOS Darwin 25.5.0
 
-| Scenario                     | Baseline (ms/iter) | Date | Commit | Machine |
-| ---------------------------- | ------------------ | ---- | ------ | ------- |
-| build/sequential_1000        | —                  | —    | —      | —       |
-| build/sequential_5000        | —                  | —    | —      | —       |
-| build/batch_1000             | —                  | —    | —      | —       |
-| build/batch_5000             | —                  | —    | —      | —       |
-| search/n5k_k10               | —                  | —    | —      | —       |
-| search/n5k_k50               | —                  | —    | —      | —       |
-| search/n5k_k10_with_ctx      | —                  | —    | —      | —       |
-| search_quantized/n5k_k10_int8| —                  | —    | —      | —       |
-| distance/cosine_384d         | —                  | —    | —      | —       |
-| distance/l2_384d             | —                  | —    | —      | —       |
-| distance/dot_384d            | —                  | —    | —      | —       |
+### Build
+
+| Scenario              | Low       | Median    | High      |
+| --------------------- | --------- | --------- | --------- |
+| build/sequential_1000 | 169.80 ms | 170.41 ms | 171.01 ms |
+| build/sequential_5000 | 1.472 s   | 1.500 s   | 1.531 s   |
+| build/batch_1000      | 54.48 ms  | 54.79 ms  | 55.38 ms  |
+| build/batch_5000      | 413.32 ms | 422.97 ms | 435.32 ms |
+
+### Search (5K corpus, 384-dim)
+
+| Scenario                      | Low       | Median    | High      |
+| ----------------------------- | --------- | --------- | --------- |
+| search/n5k_k10                | 115.48 µs | 116.33 µs | 117.29 µs |
+| search/n5k_k50                | 116.55 µs | 117.21 µs | 117.88 µs |
+| search/n5k_k10_with_ctx       | 114.22 µs | 115.34 µs | 116.52 µs |
+| search/n5k_k50_with_ctx       | 118.11 µs | 122.01 µs | 126.54 µs |
+| search_quantized/n5k_k10_int8 | 155.16 µs | 157.69 µs | 161.47 µs |
+
+### Distance Kernels (384-dim)
+
+| Scenario             | Low       | Median    | High      |
+| -------------------- | --------- | --------- | --------- |
+| distance/cosine_384d | 610.89 ns | 612.32 ns | 613.88 ns |
+| distance/l2_384d     | 29.71 ns  | 29.78 ns  | 29.85 ns  |
+| distance/dot_384d    | 27.93 ns  | 28.05 ns  | 28.20 ns  |
+
+### Search Context
+
+| Scenario                     | Low       | Median    | High      |
+| ---------------------------- | --------- | --------- | --------- |
+| search_context/new_ef80      | 110.14 ns | 110.71 ns | 111.65 ns |
+| search_context/new_ef200     | 190.74 ns | 193.56 ns | 197.15 ns |
+| search_context/ctx_reuse_k10 | 114.74 µs | 115.30 µs | 115.85 µs |
+| search_context/ctx_fresh_k10 | 116.15 µs | 116.86 µs | 117.60 µs |
+
+### Per-Metric Search (5K corpus, k=10)
+
+| Scenario                      | Low       | Median    | High      |
+| ----------------------------- | --------- | --------- | --------- |
+| search_metrics/n5k_k10_cosine | 118.20 µs | 119.96 µs | 122.27 µs |
+| search_metrics/n5k_k10_l2     | 137.90 µs | 138.54 µs | 139.10 µs |
+| search_metrics/n5k_k10_dot    | 115.05 µs | 115.71 µs | 116.48 µs |

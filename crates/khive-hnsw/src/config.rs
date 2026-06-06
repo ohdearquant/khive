@@ -1,6 +1,4 @@
 //! HNSW configuration types.
-//!
-//! See `docs/design.md` for recommended parameter values (ef_construction, M, max_layers).
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -21,65 +19,43 @@ pub const DEFAULT_REBUILD_THRESHOLD: f64 = 0.10;
 pub use khive_types::vector::DistanceMetric;
 
 /// HNSW index configuration parameters.
-///
-/// Deserialization validates all invariants before returning. Invalid configs
-/// (e.g. `dimensions=0`, non-finite `ml`, `m_max0 < m`) are rejected with a
-/// descriptive error at the deserialization boundary.
+/// Deserialization validates all invariants; invalid configs are rejected with a descriptive error.
 #[derive(Debug, Clone, Serialize)]
 pub struct HnswConfig {
-    /// Maximum number of connections per node per layer (M).
-    /// Higher = better recall, more memory, slower build.
-    /// Recommended: 16 (small), 32 (medium), 64 (large datasets).
+    /// Maximum connections per node per layer (M).
     pub m: usize,
 
     /// Maximum connections for layer 0 (typically 2*M).
-    /// Layer 0 is densest, needs more connections for good recall.
     pub m_max0: usize,
 
-    /// Size of dynamic candidate list during construction.
-    /// Higher = better graph quality, slower build.
-    /// Recommended: 100-500.
+    /// Dynamic candidate list size during construction.
     pub ef_construction: usize,
 
-    /// Normalization factor for level generation: 1/ln(M).
-    /// Controls how quickly layers thin out.
+    /// Level normalization factor: 1/ln(M).
     pub ml: f64,
 
-    /// Search ef (dynamic candidate list size during search).
-    /// Higher = better recall, slower search.
-    /// Recommended: 50-200.
+    /// Dynamic candidate list size during search.
     pub ef_search: usize,
 
     /// Vector dimensions (must match embedding model).
-    /// Default: 768 (BGE-base).
     pub dimensions: usize,
 
     /// Distance metric for similarity computation.
     pub metric: DistanceMetric,
 
-    /// Threshold for automatic rebuild (tombstone ratio).
-    /// When tombstones exceed this ratio, rebuild() is recommended.
+    /// Tombstone ratio threshold; above this, rebuild() is recommended.
     pub rebuild_threshold: f64,
 
-    /// Seed for reproducible level generation.
-    /// If None, uses OS entropy (non-deterministic).
-    /// If Some(seed), uses seeded RNG for reproducible index structure.
+    /// Seed for reproducible level generation; `None` uses OS entropy.
     #[serde(default)]
     pub seed: Option<u64>,
 
-    /// Maximum memory budget in bytes for the index.
-    /// If None, no memory limit is enforced (default).
-    /// If Some(limit), inserts that would exceed the budget are rejected
-    /// with `RetrievalError::BudgetExceeded`. Updates to existing entries
-    /// bypass the budget check.
+    /// Memory budget in bytes; inserts exceeding it return `BudgetExceeded`.
     #[serde(default)]
     pub memory_budget: Option<usize>,
 }
 
-/// Wire-format mirror used only for deserialization.
-///
-/// Derives `Deserialize` without invariant checks; the `Deserialize` impl for
-/// `HnswConfig` uses this to deserialize then validate in one step.
+/// Wire-format mirror for deserialization; validated in the `HnswConfig::Deserialize` impl.
 #[derive(Deserialize)]
 struct HnswConfigWire {
     m: usize,
@@ -120,11 +96,7 @@ impl<'de> Deserialize<'de> for HnswConfig {
 }
 
 impl Default for HnswConfig {
-    /// Creates default configuration.
-    ///
     /// M=20, ef_construction=200, ef_search=80, dimensions=384.
-    /// M=20 is optimal for k=10 recall at 384d (empirically measured).
-    /// ef_search=80 sufficient for <100K corpus; 100 was overprovisioned.
     fn default() -> Self {
         Self {
             m: 20,
@@ -193,10 +165,7 @@ impl HnswConfig {
         Ok(config)
     }
 
-    /// Create config with custom dimensions, keeping default values for all other parameters.
-    ///
-    /// # Panics
-    /// Panics if `dimensions` is 0.
+    /// Create config with custom dimensions. Panics if `dimensions` is 0.
     pub fn with_dimensions(dimensions: usize) -> Self {
         Self::try_with_dimensions(dimensions).expect("HNSW dimensions must be > 0")
     }
@@ -235,20 +204,13 @@ impl HnswConfig {
     }
 
     /// Set seed for reproducible level generation.
-    ///
-    /// With the same seed and insertion order, the index structure
-    /// will be identical across runs.
     #[must_use]
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
     }
 
-    /// Set memory budget in bytes.
-    ///
-    /// When set, inserts that would cause the estimated memory usage
-    /// to exceed this limit are rejected with `BudgetExceeded`.
-    /// Updates to existing entries bypass the budget check.
+    /// Set memory budget in bytes; inserts exceeding it return `BudgetExceeded`.
     #[must_use]
     pub fn with_memory_budget(mut self, budget: usize) -> Self {
         self.memory_budget = Some(budget);
