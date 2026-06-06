@@ -1,4 +1,4 @@
-//! `DeterministicScore` — f64-to-i64 fixed-point scoring with cross-platform determinism.
+//! Fixed-point scoring: f64 → i64 at 2^32 scale for cross-platform determinism.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -7,11 +7,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, Div, Mul, Sub};
 
-/// Fixed-point score with cross-platform deterministic ordering.
-///
-/// Wraps an `i64` scaled by `2^32`; use [`from_f64`][Self::from_f64] /
-/// [`to_f64`][Self::to_f64] to convert, and prefer arithmetic methods to raw
-/// integer manipulation.
+/// Fixed-point score wrapping an `i64` scaled by `2^32`.
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[repr(transparent)]
@@ -37,38 +33,20 @@ impl DeterministicScore {
 
     /// Highest representable score (`i64::MAX`); maps to `+Infinity` in float conversion.
     pub const MAX: Self = Self(i64::MAX);
-    /// Reserved raw sentinel at `i64::MIN`. Public arithmetic and float conversion
-    /// never produce this value — see `NEG_INF` for the lowest reachable score.
-    /// Lean proof: `MIN` is the reserved NaN sentinel; runtime values are
-    /// `RuntimeValid` (NEG_INF ≤ x ≤ MAX) and disjoint from `MIN`.
+    /// Reserved sentinel at `i64::MIN`; never produced by arithmetic or float conversion.
     pub const MIN: Self = Self(i64::MIN);
-    /// Lowest reachable runtime score (= `i64::MIN + 1`). Underflow clamps here,
-    /// `-Infinity` maps here. Distinct from `MIN`, which is reserved.
+    /// Lowest reachable runtime score (`i64::MIN + 1`); underflow and `-Infinity` clamp here.
     pub const NEG_INF: Self = Self(i64::MIN + 1);
     /// Score of exactly zero.
     pub const ZERO: Self = Self(0);
 
-    /// Construct from a raw `i64` value without validation.
-    ///
-    /// # Warning
-    ///
-    /// Passing `i64::MIN` constructs the reserved `MIN` sentinel, which violates
-    /// the "runtime values exclude MIN" proof boundary.  Serialized
-    /// data from untrusted sources MUST NOT use this constructor.
-    ///
-    /// Prefer [`from_raw_saturating`][Self::from_raw_saturating] (maps `i64::MIN`
-    /// to `NEG_INF`) or [`from_raw_checked`][Self::from_raw_checked] (returns
-    /// `None` for `i64::MIN`) for safe construction from untrusted values.
+    /// Construct from a raw `i64` without validation. Passing `i64::MIN` creates the reserved sentinel.
     #[inline]
     pub const fn from_raw(raw: i64) -> Self {
         Self(raw)
     }
 
-    /// Construct from a raw `i64`, mapping the reserved `i64::MIN` sentinel to
-    /// [`NEG_INF`][Self::NEG_INF].
-    ///
-    /// Use this when reading from storage or deserializing data where `i64::MIN`
-    /// should be treated as "negative infinity" rather than an invalid sentinel.
+    /// Construct from a raw `i64`, mapping `i64::MIN` to [`NEG_INF`][Self::NEG_INF].
     #[inline]
     pub const fn from_raw_saturating(raw: i64) -> Self {
         if raw == i64::MIN {
@@ -79,9 +57,6 @@ impl DeterministicScore {
     }
 
     /// Construct from a raw `i64`, returning `None` if `raw == i64::MIN`.
-    ///
-    /// Use this for strict invariant enforcement at deserialization boundaries
-    /// where `i64::MIN` is always a protocol error.
     #[inline]
     pub const fn from_raw_checked(raw: i64) -> Option<Self> {
         if raw == i64::MIN {
@@ -139,8 +114,7 @@ impl DeterministicScore {
         self.0 == Self::MAX.0 || self.0 == Self::NEG_INF.0
     }
 
-    /// Saturating arithmetic clamps to `[NEG_INF, MAX]`. Per the Lean proof,
-    /// the reserved `MIN` (i64::MIN) sentinel is never produced.
+    /// Saturating arithmetic helper: clamps to `[NEG_INF, MAX]`, never produces `MIN`.
     #[inline]
     fn from_arithmetic_raw(raw: i128) -> Self {
         if raw >= Self::MAX.0 as i128 {
@@ -152,8 +126,7 @@ impl DeterministicScore {
         }
     }
 
-    /// Float conversion: NaN → ZERO, +Inf → MAX, -Inf → NEG_INF, finite → clamped
-    /// to `[NEG_INF, MAX]`. Reserved `MIN` is never produced.
+    /// Float conversion helper: NaN → ZERO, ±Inf → MAX/NEG_INF, finite → clamped to `[NEG_INF, MAX]`.
     #[inline]
     fn from_rounded_arithmetic(raw: f64) -> Self {
         if raw.is_nan() {

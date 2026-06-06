@@ -29,12 +29,7 @@ impl Tokenizer for WhitespaceTokenizer {
 // CjkCharTokenizer
 // ---------------------------------------------------------------------------
 
-/// Emits each CJK-family character as its own token; non-CJK runs are split on
-/// whitespace and stripped of ASCII punctuation (same heuristic as
-/// `WhitespaceTokenizer`).
-///
-/// Example: `"使用LoRA进行fine-tuning"` →
-///   `["使", "用", "LoRA", "进", "行", "fine-tuning"]`
+/// Emits each CJK character as its own token; non-CJK runs split on whitespace with ASCII punctuation stripped.
 #[derive(Debug, Default, Clone)]
 pub struct CjkCharTokenizer;
 
@@ -90,13 +85,8 @@ impl Tokenizer for KeywordTokenizer {
 // IdentifierTokenizer
 // ---------------------------------------------------------------------------
 
-/// For each whitespace-separated word:
-/// - If `is_identifier(word)`: emit the lowercased original, then each split
-///   part of at least `min_part_len` characters (deduped within this word).
-/// - Otherwise: emit the word through `WhitespaceTokenizer` (punct stripped).
-///
-/// Example (`min_part_len = 1`): `"LoRA attention"` →
-///   `["lora", "lo", "ra", "attention"]`
+/// Identifier-aware tokenizer: emits lowercased original + split parts for identifiers,
+/// falls back to `WhitespaceTokenizer` for plain words.
 #[derive(Debug, Clone)]
 pub struct IdentifierTokenizer {
     pub min_part_len: usize,

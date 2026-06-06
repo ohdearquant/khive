@@ -94,7 +94,7 @@ pub fn avg_scores(scores: &[DeterministicScore]) -> DeterministicScore {
     ) as i64)
 }
 
-/// Return the arithmetic mean of `scores` and a saturation flag (true when intermediate sums approach `i64::MAX`).
+/// Return the mean of `scores` and a boolean saturation flag.
 #[inline]
 pub fn avg_scores_checked(scores: &[DeterministicScore]) -> (DeterministicScore, bool) {
     if scores.is_empty() {
@@ -138,18 +138,7 @@ pub fn min_score(scores: &[DeterministicScore]) -> DeterministicScore {
         .unwrap_or(DeterministicScore::MAX)
 }
 
-/// Reciprocal Rank Fusion score: `1 / (k + rank)`.
-///
-/// # Rank convention
-///
-/// `rank` is treated as a **1-based rank** in the RRF formula: the first
-/// result has rank 1, the second rank 2, and so on. Passing a 0-based index
-/// from `enumerate()` gives the top result rank 0, inflating its contribution
-/// by `1/(k+0)` instead of `1/(k+1)`.
-///
-/// Prefer the explicitly named variants:
-/// - [`rrf_score_one_based`] — rank 1 means first result (standard RRF).
-/// - [`rrf_score_zero_based`] — index 0 means first result; converts to 1-based internally.
+/// RRF score `1 / (k + rank)`. Rank is 1-based; prefer `rrf_score_one_based` or `rrf_score_zero_based`.
 #[inline]
 pub fn rrf_score(rank: usize, k: usize) -> DeterministicScore {
     let Some(denominator) = k.checked_add(rank) else {
@@ -161,14 +150,7 @@ pub fn rrf_score(rank: usize, k: usize) -> DeterministicScore {
     DeterministicScore::from_f64(1.0 / (denominator as f64))
 }
 
-/// RRF score using the standard **1-based rank** convention.
-///
-/// The first result has `rank = NonZeroUsize::new(1)`, the second
-/// `NonZeroUsize::new(2)`, etc.  `k` is the smoothing constant (60 is the
-/// original paper default).
-///
-/// Using `NonZeroUsize` enforces the rank-base at the type level and prevents
-/// passing a raw `enumerate()` index of 0.
+/// RRF score with 1-based rank (first result = rank 1). `k` is the smoothing constant.
 #[inline]
 pub fn rrf_score_one_based(rank: NonZeroUsize, k: usize) -> DeterministicScore {
     let Some(denominator) = k.checked_add(rank.get()) else {
@@ -177,11 +159,7 @@ pub fn rrf_score_one_based(rank: NonZeroUsize, k: usize) -> DeterministicScore {
     DeterministicScore::from_f64(1.0 / denominator as f64)
 }
 
-/// RRF score using a **0-based index** convention.
-///
-/// Callers that produce indices from `enumerate()` should use this variant:
-/// index 0 is converted to rank 1 internally, so the top result gets the
-/// correct `1/(k+1)` weight.
+/// RRF score with 0-based index (index 0 → rank 1 internally).
 #[inline]
 pub fn rrf_score_zero_based(index: usize, k: usize) -> DeterministicScore {
     let Some(rank) = index.checked_add(1).and_then(NonZeroUsize::new) else {
@@ -192,17 +170,7 @@ pub fn rrf_score_zero_based(index: usize, k: usize) -> DeterministicScore {
 
 const SCALE_RAW: i128 = 4_294_967_296; // 2^32 — matches DeterministicScore::SCALE
 
-/// Compute the weighted sum of `scores` using the given `weights`.
-///
-/// Each score is multiplied by its corresponding weight (converted to
-/// fixed-point) and accumulated with i128 intermediates to avoid overflow.
-/// The result is clamped to `[NEG_INF, MAX]`.
-///
-/// # Errors
-///
-/// Returns [`ScoreError::LengthMismatch`] if `scores` and `weights` differ
-/// in length, or [`ScoreError::NonFiniteWeight`] if any weight is NaN or
-/// infinite.
+/// Weighted sum of `scores`. Errors on length mismatch or non-finite weights.
 #[inline]
 pub fn weighted_sum(
     scores: &[DeterministicScore],

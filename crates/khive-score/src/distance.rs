@@ -1,34 +1,9 @@
-//! Canonical distance-to-similarity conversion
-//!
-//! `score_from_distance` is the single authoritative place that converts a raw
-//! floating-point distance produced by a vector index into a `DeterministicScore`.
-//! Centralising the conversion here ensures that all retrieval back-ends (HNSW,
-//! flat-scan, future IVF …) produce identical scores for identical inputs.
-//!
-//! ## Conversion formulas (per `DistanceMetric`)
-//!
-//! | Metric  | Distance d        | Similarity            | Notes                        |
-//! |---------|-------------------|-----------------------|------------------------------|
-//! | Cosine  | 1 − cos(x,y) ∈ \[0,2\] | 1 − d              | linear inversion             |
-//! | Dot     | −⟨x,y⟩            | −d                    | negated for min-heap storage |
-//! | L2      | ‖x−y‖₂            | 1 / (1 + d)           | always positive              |
+//! Canonical distance-to-`DeterministicScore` conversion for all retrieval backends.
 
 use crate::{DeterministicScore, ScoreError};
 use khive_types::DistanceMetric;
 
-/// Strict conversion: returns an error for NaN, non-finite, or out-of-range distances.
-///
-/// This is the preferred API for new callers.  Invalid distances should be
-/// treated as missing information (use `NEG_INF`), not as a perfect match.
-///
-/// # Errors
-///
-/// - [`ScoreError::NonFiniteDistance`] — `dist` is NaN, `+Inf`, or `-Inf`.
-/// - [`ScoreError::InvalidDistanceRange`] — `dist` is finite but out of the
-///   valid range for the metric (e.g. negative L2 distance, or cosine outside
-///   `[0.0, 2.0]`).
-/// - [`ScoreError::UnsupportedMetric`] — the metric is not one of the three
-///   currently supported variants.
+/// Strict distance → score conversion. Errors on NaN, non-finite, out-of-range, or unknown metric.
 pub fn try_score_from_distance(
     dist: f32,
     metric: DistanceMetric,
@@ -64,25 +39,13 @@ pub fn try_score_from_distance(
     Ok(DeterministicScore::from_f64(similarity))
 }
 
-/// Fail-soft conversion: maps invalid distances to [`DeterministicScore::NEG_INF`].
-///
-/// Use this when you need an infallible API but still want invalid distances
-/// ranked last rather than best.  Unlike [`score_from_distance`], NaN and
-/// out-of-range values produce `NEG_INF` instead of an inflated score.
+/// Infallible distance conversion: invalid inputs map to [`DeterministicScore::NEG_INF`].
 #[inline]
 pub fn score_from_distance_lossy(dist: f32, metric: DistanceMetric) -> DeterministicScore {
     try_score_from_distance(dist, metric).unwrap_or(DeterministicScore::NEG_INF)
 }
 
-/// Convert a raw distance to a [`DeterministicScore`] (legacy API).
-///
-/// **Deprecated.** NaN input is silently treated as `0.0`, producing a perfect
-/// similarity score — a known semantic defect.  Use [`try_score_from_distance`]
-/// (strict, returns `Err`) or [`score_from_distance_lossy`] (maps invalid
-/// distances to `NEG_INF`) for new code.
-///
-/// Unknown `DistanceMetric` variants produce [`DeterministicScore::NEG_INF`]
-/// so they rank last rather than silently inheriting cosine semantics.
+/// Legacy distance conversion; NaN silently maps to a perfect score. Use `try_score_from_distance`.
 #[deprecated(
     since = "0.2.3",
     note = "NaN maps to a perfect score — use `try_score_from_distance` or `score_from_distance_lossy` instead"

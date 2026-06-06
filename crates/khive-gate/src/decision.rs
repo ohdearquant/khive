@@ -81,11 +81,7 @@ impl GateDecision {
         Ok(Self::Deny { reason })
     }
 
-    /// Returns a `Deny` with the given human-readable reason.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `reason` is empty.
+    /// Returns a `Deny` with the given reason. Panics if `reason` is empty.
     pub fn deny(reason: impl Into<String>) -> Self {
         Self::try_deny(reason).expect("GateDecision::deny: reason must not be empty")
     }

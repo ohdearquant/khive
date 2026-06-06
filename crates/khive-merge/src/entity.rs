@@ -60,8 +60,7 @@ pub fn merge_entities(
                 merged.push(e.clone());
             }
 
-            // Added in both (duplicate UUID): conflict per ADR-020 (same UUID,
-            // different content is a conflict). Identical content is auto-resolved.
+            // Added in both (duplicate UUID): conflict if content differs; auto-resolved if identical.
             (Some(EntityChange::Added(e_ours)), Some(EntityChange::Added(e_theirs))) => {
                 let diffs = detect_entity_diffs(e_ours, e_theirs);
                 if diffs.is_empty() {

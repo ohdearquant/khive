@@ -41,12 +41,7 @@ impl TryFrom<SparseVectorRaw> for SparseVector {
 }
 
 impl SparseVector {
-    /// Validate the documented invariants: equal-length arrays, strictly
-    /// increasing indices, and all values finite.
-    ///
-    /// # Errors
-    ///
-    /// Returns a human-readable description of the first violation.
+    /// Validate: equal-length arrays, strictly increasing indices, all values finite.
     pub fn validate(&self) -> Result<(), String> {
         if self.indices.len() != self.values.len() {
             return Err(format!(

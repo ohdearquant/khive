@@ -1,13 +1,6 @@
 //! Script/identifier detection and splitting for code-aware tokenization.
 
-/// Returns true if `text` looks like a code identifier.
-///
-/// Heuristics:
-/// - No whitespace characters.
-/// - Contains at least one ASCII letter.
-/// - Has a structural boundary: camelCase transition, underscore, hyphen,
-///   forward/back slash, dot, double colon, or a digit-to-letter / letter-to-digit
-///   transition.
+/// Returns true if `text` looks like a code identifier (no whitespace, ≥1 ASCII letter, structural boundary present).
 pub fn is_identifier(text: &str) -> bool {
     if text.chars().any(|c| c.is_whitespace()) {
         return false;
@@ -46,12 +39,8 @@ pub fn is_identifier(text: &str) -> bool {
     false
 }
 
-/// Split `text` on separator characters and camelCase / digit-letter boundaries,
-/// returning lowercase parts longer than `min_part_len` characters.
-///
-/// Separators consumed: `_`, `-`, `.`, `/`, `::`
-/// Boundaries detected: camelCase (lower→upper), letter→digit, digit→letter,
-/// run-of-uppercase → single uppercase before lowercase (e.g. "GPT4" → ["gpt", "4"]).
+/// Split `text` on separators (`_`, `-`, `.`, `/`, `::`) and camelCase/digit boundaries,
+/// returning lowercase parts of at least `min_part_len` characters.
 pub fn split_identifier(text: &str, min_part_len: usize) -> Vec<String> {
     // Collect chars, then split on separators / boundaries
     let chars: Vec<char> = text.chars().collect();

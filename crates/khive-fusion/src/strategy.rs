@@ -68,27 +68,20 @@ impl TryFrom<RawFusionStrategy> for FusionStrategy {
     }
 }
 
-/// Fusion strategy for combining ranked result lists (ADR-012).
+/// Fusion strategy for combining ranked result lists.
 ///
 /// Validated at construction and deserialization boundaries.
-/// See [`docs/algorithm.md`] for algorithm details.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(try_from = "RawFusionStrategy")]
 pub enum FusionStrategy {
-    /// Reciprocal Rank Fusion (default, recommended).
-    ///
-    /// Uses only ranks, making it robust to different score distributions.
-    /// Formula: score(d) = sum 1/(k + rank_i(d))
+    /// Reciprocal Rank Fusion (default, recommended). Rank-based, distribution-agnostic.
     Rrf {
         /// Smoothing constant (>= 1). Default: 60.
         k: usize,
     },
 
-    /// Weighted linear combination of scores.
-    ///
-    /// Weights are normalized to sum to 1.0 internally.
-    /// All weights must be finite (no NaN or infinity).
+    /// Weighted linear combination of scores. Weights normalized to 1.0; must be finite.
     Weighted {
         /// Weights for each source (will be normalized). Must be finite.
         weights: Vec<f64>,
@@ -103,9 +96,7 @@ pub enum FusionStrategy {
     /// Skip HNSW entirely -- return only BM25 keyword results.
     KeywordOnly,
 
-    /// Pack-defined or user-defined custom strategy (ADR-012).
-    ///
-    /// Dispatched by name through a runtime-registered executor.
+    /// Pack-defined or user-defined custom strategy dispatched by name at runtime.
     Custom {
         /// Strategy identifier registered with the fusion executor registry.
         name: String,

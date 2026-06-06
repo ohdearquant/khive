@@ -1,6 +1,6 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Top-level `three_way_merge()` and `ThreeWayMergeEngine` (ADR-039).
+//! Top-level `three_way_merge()` and `ThreeWayMergeEngine`.
 
 use std::collections::HashSet;
 
@@ -77,12 +77,12 @@ fn validate_archive(archive: &KgArchive) -> Result<(), MergeError> {
     Ok(())
 }
 
-/// Sort entities by UUID for deterministic output (ADR-010, ADR-020).
+/// Sort entities by UUID for deterministic output.
 fn sort_entities(archive: &mut KgArchive) {
     archive.entities.sort_by(|a, b| a.id.cmp(&b.id));
 }
 
-/// Sort edges by `(source, target, relation)` for deterministic output (ADR-020 NDJSON contract).
+/// Sort edges by `(source, target, relation)` for deterministic output.
 fn sort_edges(edges: &mut [ExportedEdge]) {
     edges.sort_by(|a, b| {
         a.source
@@ -93,11 +93,7 @@ fn sort_edges(edges: &mut [ExportedEdge]) {
     });
 }
 
-/// Produce a deterministic `exported_at` timestamp from the inputs.
-///
-/// Uses the latest `exported_at` from `ours` and `theirs` so repeated merges
-/// of equal inputs produce equal output, satisfying ADR-010's deterministic
-/// snapshot identity requirement.
+/// Produce a deterministic `exported_at` timestamp: latest of `ours` and `theirs`.
 fn deterministic_timestamp(ours: &KgArchive, theirs: &KgArchive) -> chrono::DateTime<chrono::Utc> {
     std::cmp::max(ours.exported_at, theirs.exported_at)
 }

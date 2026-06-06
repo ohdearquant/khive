@@ -56,12 +56,7 @@ impl ActorRef {
         Ok(Self { kind, id })
     }
 
-    /// Create a validated `ActorRef`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `kind` or `id` is empty. Prefer [`try_new`](Self::try_new)
-    /// at deserialization or untrusted-input boundaries.
+    /// Create a validated `ActorRef`. Panics if `kind` or `id` is empty.
     pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
         Self::try_new(kind, id).expect("ActorRef::new: kind and id must not be empty")
     }

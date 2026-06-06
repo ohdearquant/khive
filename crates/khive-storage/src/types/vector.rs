@@ -149,12 +149,7 @@ impl TryFrom<VectorSearchRequestRaw> for VectorSearchRequest {
 }
 
 impl VectorSearchRequest {
-    /// Validate documented invariants: non-empty query vectors, finite values,
-    /// and non-zero `top_k`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a human-readable description of the first violation.
+    /// Validate: non-empty query vectors, finite values, non-zero `top_k`. Returns first violation.
     pub fn validate(&self) -> Result<(), String> {
         if self.query_vectors.is_empty() {
             return Err("VectorSearchRequest: query_vectors must not be empty".into());

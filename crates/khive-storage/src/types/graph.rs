@@ -115,11 +115,7 @@ impl TryFrom<EdgeFilterRaw> for EdgeFilter {
 }
 
 impl EdgeFilter {
-    /// Validate that weight bounds are finite and ordered correctly.
-    ///
-    /// # Errors
-    ///
-    /// Returns a human-readable description of the first violation.
+    /// Validate that weight bounds are finite and ordered correctly. Returns first violation.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(w) = self.min_weight {
             if !w.is_finite() {

@@ -1,6 +1,6 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Least-common-ancestor (LCA) computation for snapshot histories (ADR-039).
+//! Least-common-ancestor (LCA) computation for snapshot histories.
 //!
 //! Algorithm: iterative walk of the `ours` parent chain into a HashSet;
 //! then walk the `theirs` parent chain until the first ID in the set.

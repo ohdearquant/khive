@@ -1,19 +1,11 @@
-//! Weighted linear combination fusion (RETRIEVAL-07).
-//!
-//! Weights are normalized to sum to 1.0. Negatives become 0; all-zero
-//! falls back to equal distribution. Per-source min-max normalization
-//! is applied before combination so heterogeneous score scales (BM25
-//! vs cosine) contribute proportionally.
+//! Weighted linear combination fusion with per-source min-max normalization.
 
 use khive_score::{weighted_sum, DeterministicScore};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-/// Min-max normalize a single source's scores to [0, 1] for cross-source fusion (#2496).
-///
-/// When all scores are equal (or the source has one element) every entry
-/// receives 1.0 so it still contributes to the weighted combination.
+/// Min-max normalize scores to `[0, 1]`; equal/single-element sources map to 1.0.
 const SCORE_SCALE: i128 = 4_294_967_296; // 2^32 — represents 1.0 in DeterministicScore
 
 fn min_max_normalize_source<Id>(
@@ -42,13 +34,7 @@ fn min_max_normalize_source<Id>(
 }
 
 /// Weighted linear combination of per-source min-max-normalized scores.
-///
-/// Weights are normalized to sum to 1.0; negatives become 0; all-zero
-/// falls back to equal distribution. Each source is independently min-max
-/// normalized to [0,1] before the weighted combination.
-///
-/// Returns results sorted by weighted score descending with ID tie-breaking.
-/// Does not panic; returns empty vec for empty sources.
+/// Negatives/NaN weights → 0; all-zero falls back to equal distribution.
 pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     weights: &[f64],
@@ -145,31 +131,13 @@ pub fn weighted_fusion<Id: Eq + Hash + Clone + Ord>(
 }
 
 /// Returns `true` if positive weights sum to within `tolerance` of 1.0.
-///
-/// ```rust
-/// use khive_fusion::weights_are_normalized;
-/// assert!(weights_are_normalized(&[0.6, 0.4], 1e-6));
-/// assert!(!weights_are_normalized(&[6.0, 4.0], 1e-6));
-/// ```
 #[inline]
 pub fn weights_are_normalized(weights: &[f64], tolerance: f64) -> bool {
     let sum: f64 = weights.iter().filter(|w| **w > 0.0).sum();
     (sum - 1.0).abs() <= tolerance
 }
 
-/// Normalize weights to sum to 1.0.
-///
-/// This is the same normalization logic used internally by `weighted_fusion`,
-/// exposed for callers who want to inspect or use the normalized weights.
-///
-/// # Arguments
-///
-/// * `weights` - Input weights (may be any positive scale).
-///
-/// # Returns
-///
-/// Normalized weights that sum to 1.0. Negative weights become 0.0.
-/// If all weights are <= 0, returns equal distribution.
+/// Normalize weights to sum to 1.0. Negative weights become 0.0; all-zero gives equal distribution.
 pub fn normalize_weights(weights: &[f64]) -> Vec<f64> {
     if weights.is_empty() {
         return Vec::new();
@@ -187,13 +155,7 @@ pub fn normalize_weights(weights: &[f64]) -> Vec<f64> {
     }
 }
 
-/// Normalize weights with strict finite-value validation.
-///
-/// Rejects non-finite inputs (`NaN`, `+∞`, `-∞`) that would silently corrupt scores.
-///
-/// # Errors
-///
-/// Returns `Err` with the offending index if any weight is non-finite.
+/// Normalize weights with strict validation. Returns `Err(index)` if any weight is non-finite.
 pub fn try_normalize_weights(weights: &[f64]) -> Result<Vec<f64>, usize> {
     for (i, &w) in weights.iter().enumerate() {
         if !w.is_finite() {

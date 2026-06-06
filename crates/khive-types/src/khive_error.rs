@@ -1,15 +1,4 @@
-//! Structured cross-crate error model for khive.
-//!
-//! # Design
-//!
-//! - `KhiveError` — unified error struct with kind + code + message + details
-//! - `ErrorKind` — semantic severity / HTTP-mapping bucket
-//! - `ErrorCode` — domain-scoped numeric code (`ErrorDomain::Db, 1`)
-//! - `Details` — bounded key/value metadata (max 8 pairs)
-//! - `RetryHint` — whether the caller should retry
-//!
-//! All types are `#![no_std]` compatible. Serde impls are feature-gated
-//! behind the `serde` flag (existing crate pattern).
+//! Unified cross-crate error model: `KhiveError`, `ErrorKind`, `ErrorCode`, `Details`, `RetryHint`.
 
 extern crate alloc;
 use alloc::borrow::Cow;

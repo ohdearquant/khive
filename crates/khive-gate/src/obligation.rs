@@ -78,11 +78,7 @@ impl Obligation {
         Ok(Self::RateLimit { window_secs, max })
     }
 
-    /// Create a validated `RateLimit` obligation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `window_secs` or `max` is zero.
+    /// Create a validated `RateLimit` obligation. Panics if `window_secs` or `max` is zero.
     pub fn rate_limit(window_secs: u64, max: u32) -> Self {
         Self::try_rate_limit(window_secs, max)
             .expect("Obligation::rate_limit: window_secs and max must be > 0")

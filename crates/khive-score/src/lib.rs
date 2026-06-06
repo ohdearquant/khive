@@ -1,11 +1,4 @@
-//! Cross-platform deterministic scoring.
-//!
-//! `DeterministicScore` converts f64 to fixed-point i64 (2^32 scale) for
-//! identical ranking across x86_64, ARM64, and WASM.
-//!
-//! Use `try_score_from_distance` (strict) or `score_from_distance_lossy`
-//! (infallible, maps invalid distances to `NEG_INF`) for distance conversion.
-//! `score_from_distance` is deprecated — it silently maps NaN to a perfect score.
+//! Cross-platform deterministic scoring via fixed-point i64 (2^32 scale).
 
 mod comparator;
 pub mod distance;

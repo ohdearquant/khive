@@ -1,28 +1,12 @@
 //! Reciprocal Rank Fusion (RRF) algorithm.
-//!
-//! # Properties
-//!
-//! - Better rank → higher contribution: r1 < r2 → contrib(r1) > contrib(r2)
-//! - Present documents always outscore absent
-//! - Contribution upper bound: ≤ 1/(k+1)
-//! - Total score ≤ number of sources
-//! - Sum is permutation invariant (order-independent)
-//! - Ties broken by ID for deterministic cross-platform ordering
 
 use khive_score::{rrf_score, DeterministicScore};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-/// Reciprocal Rank Fusion: combines ranked lists using only rank positions
-/// (ignores original scores). Formula: `score(d) = sum 1/(k + rank_i(d))`.
-///
-/// `sources` should be sorted by score descending (positions matter, not scores).
-/// `k` is the smoothing constant (standard: 60). Enforced >= 1 internally.
-/// Returns results sorted by RRF score descending with ID tie-breaking.
-///
-/// Properties: commutative over source order, present > absent, monotonic in rank.
-/// See module-level docs and `docs/algorithm.md` for formal properties.
+/// Reciprocal Rank Fusion: `score(d) = sum 1/(k + rank_i(d))` over all sources.
+/// `sources` sorted score-descending; `k` >= 1 enforced internally.
 pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     k: usize,

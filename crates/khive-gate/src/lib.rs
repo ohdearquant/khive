@@ -1,18 +1,9 @@
-//! khive-gate — pluggable authorization gate for verb dispatch.
+//! Pluggable authorization gate for verb dispatch.
 //!
 //! The runtime consults a [`Gate`] impl before dispatching each verb. The default
-//! [`AllowAllGate`] is permissive (suitable for personal/local deployments). For
-//! production policy enforcement, plug a Rego-backed or capability-witness-backed
-//! impl into `RuntimeConfig.gate`.
-//!
-//! # Validation
-//!
-//! Public wire types ([`ActorRef`], [`GateRequest`], [`Obligation`]) validate
-//! invariants at construction and deserialization boundaries. Empty actor
-//! kind/id, empty verb, empty deny reason, and zero rate-limit values are
-//! rejected with [`GateValidationError`]. See the ADR-018 design contract.
-//!
-//! See `docs/gate.md` for wire shapes, quick-start example, and design context.
+//! [`AllowAllGate`] is permissive. For production enforcement, plug a Rego-backed
+//! or capability-witness-backed impl into `RuntimeConfig.gate`.
+//! Wire types validate invariants at construction and deserialization boundaries.
 
 mod actor;
 mod audit;

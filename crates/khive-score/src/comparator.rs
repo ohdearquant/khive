@@ -3,13 +3,7 @@
 use crate::DeterministicScore;
 use std::cmp::Ordering;
 
-/// A scored item with deterministic tie-breaking.
-///
-/// `Ranked<T>` implements `Ord` as a **max-heap adapter**: higher score is
-/// `Greater`, lower ID wins ties.  `BinaryHeap<Ranked<T>>` pops the best item
-/// first.  For sorted `Vec` output use [`cmp_desc_then_id`] — `Vec::sort()`
-/// gives ascending order (lowest score first), which is the opposite of ranking
-/// order.  Full ordering semantics are documented in `docs/algorithm.md`.
+/// Scored item implementing max-heap `Ord`: higher score wins, lower ID breaks ties.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ranked<T: Ord> {
     score: DeterministicScore,
@@ -49,10 +43,6 @@ impl<T: Ord> Ranked<T> {
 }
 
 impl<T: Ord> Ord for Ranked<T> {
-    /// Max-heap adapter order: higher score is `Greater`; lower ID is `Greater`
-    /// on ties.  This makes `BinaryHeap<Ranked<T>>::pop()` return the best item
-    /// first.  For sorted output (highest score first) use [`cmp_desc_then_id`]
-    /// instead of relying on this `Ord` impl directly.
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.score

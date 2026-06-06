@@ -497,7 +497,7 @@ mod serde_opt_opt {
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProposalChangeset {
-    /// Add a new entity. `entity.kind` validated against ADR-001 at apply time.
+    /// Add a new entity. `entity.kind` validated at apply time.
     AddEntity {
         entity: EntityDraft,
     },

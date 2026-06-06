@@ -8,25 +8,9 @@ use super::strategy::FusionStrategy;
 use super::union::union_fusion;
 use super::weighted::weighted_fusion;
 
-/// Fuse multiple ranked result lists into a single ranked list.
+/// Fuse multiple ranked result lists into a single list sorted by fused score descending.
 ///
-/// Dispatches to the appropriate algorithm based on strategy.
-/// `Custom` strategies return [`FuseError::CustomRequiresRuntime`] --
-/// use the runtime `FusionRegistry` for custom dispatch (ADR-012).
-///
-/// Returns `Ok(results)` sorted by fused score descending, truncated to `top_k`.
-///
-/// ```rust
-/// use khive_fusion::{fuse, FusionStrategy};
-/// use khive_score::DeterministicScore;
-///
-/// let sources = vec![
-///     vec![("a", DeterministicScore::from_f64(0.9))],
-///     vec![("a", DeterministicScore::from_f64(0.8))],
-/// ];
-/// let results = fuse(sources, &FusionStrategy::default(), 10).unwrap();
-/// assert_eq!(results.len(), 1);
-/// ```
+/// Dispatches by `strategy`; `Custom` strategies return [`FuseError::CustomRequiresRuntime`].
 pub fn fuse<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     strategy: &FusionStrategy,

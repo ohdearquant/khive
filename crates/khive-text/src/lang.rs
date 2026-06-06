@@ -2,16 +2,7 @@
 
 use std::collections::HashMap;
 
-/// Returns true if `c` falls within any of the standard CJK Unicode blocks.
-///
-/// Covered ranges:
-/// - CJK Unified Ideographs (U+4E00–U+9FFF)
-/// - CJK Extension A (U+3400–U+4DBF)
-/// - CJK Extension B (U+20000–U+2A6DF)
-/// - CJK Compatibility Ideographs (U+F900–U+FAFF)
-/// - Hiragana (U+3040–U+309F)
-/// - Katakana (U+30A0–U+30FF)
-/// - Hangul Syllables (U+AC00–U+D7AF)
+/// Returns true if `c` falls within standard CJK Unicode blocks (Unified, Extension A/B, Compatibility, Hiragana, Katakana, Hangul).
 #[inline]
 pub fn is_cjk_char(c: char) -> bool {
     matches!(c,
@@ -74,12 +65,7 @@ impl ScriptProfile {
 }
 
 /// Returns true when `query` is worth sending to a retrieval backend.
-///
-/// Rejects:
-/// - Empty / whitespace-only strings.
-/// - Strings whose non-whitespace characters are all ASCII punctuation/symbols.
-/// - Single ASCII letter (e.g. "a", "Z").
-/// - Repeated-char gibberish: more than 80% of chars are the same character.
+/// Rejects empty, symbol-only, single ASCII letter, and repeated-char (>80%) gibberish.
 pub fn is_meaningful_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {

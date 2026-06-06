@@ -1,10 +1,6 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Merge-engine types for the three-way merge algorithm (ADR-039).
-//!
-//! These types are defined locally because khive-merge is forward-deployed
-//! infrastructure. When ADR-039 integration lands in khive-vcs, these will
-//! move to `khive_vcs::merge_engine` and this module will re-export them.
+//! Merge-engine types for the three-way merge algorithm.
 
 use khive_runtime::portability::KgArchive;
 use serde::{Deserialize, Serialize};

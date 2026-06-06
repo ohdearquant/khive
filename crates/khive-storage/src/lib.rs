@@ -1,14 +1,4 @@
-//! Storage capability traits — contracts that backend implementations satisfy.
-//!
-//! This crate contains zero implementations. It defines:
-//! - [`SqlAccess`]: base SQL capability (reader / writer / transaction)
-//! - [`VectorStore`]: embedding storage and similarity search
-//! - [`TextSearch`]: full-text search and document indexing
-//! - [`GraphStore`]: directed edge CRUD and graph traversal
-//! - [`NoteStore`]: temporal-referential note CRUD
-//! - [`EventStore`]: append-only operation log
-//! - Shared types ([`SqlValue`], [`VectorSearchHit`], [`TextSearchHit`], etc.)
-//! - [`StorageError`]: unified error type
+//! Storage capability traits: `SqlAccess`, `VectorStore`, `TextSearch`, `GraphStore`, `NoteStore`, `EventStore`.
 
 pub mod capability;
 pub mod entity;

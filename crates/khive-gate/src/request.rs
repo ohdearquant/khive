@@ -82,12 +82,7 @@ impl GateRequest {
         })
     }
 
-    /// Builds a `GateRequest` with default (empty) context.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `verb` is empty. Prefer [`try_new`](Self::try_new) at
-    /// deserialization or untrusted-input boundaries.
+    /// Builds a `GateRequest` with default (empty) context. Panics if `verb` is empty.
     pub fn new(
         actor: ActorRef,
         namespace: Namespace,
