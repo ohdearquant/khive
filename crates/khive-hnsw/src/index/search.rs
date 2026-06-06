@@ -1,3 +1,9 @@
+// FILE SIZE JUSTIFICATION: The search layer implementation comprises tightly
+// coupled phases (greedy upper-layer descent, ef-bounded base-layer BFS,
+// INT8 pre-filter, SIMD dot-product dispatch, tombstone filtering, and
+// result extraction). Splitting these into separate files would break the
+// shared inline data flow and add indirection in the hot path. The 800+ LOC
+// is algorithm complexity, not accidental accumulation.
 //! Search operations for HNSW index.
 
 use crate::NodeId;
@@ -432,10 +438,22 @@ impl HnswIndex {
 
         let effective_k = k.min(scored.len());
         if scored.len() > effective_k {
-            scored.select_nth_unstable_by(effective_k - 1, |(_, a), (_, b)| b.cmp(a));
+            // Tie-break by external NodeId to match graph-search determinism.
+            scored.select_nth_unstable_by(effective_k - 1, |(iid_a, a), (iid_b, b)| {
+                match b.cmp(a) {
+                    std::cmp::Ordering::Equal => {
+                        self.external_id(*iid_a).cmp(&self.external_id(*iid_b))
+                    }
+                    other => other,
+                }
+            });
             scored.truncate(effective_k);
         }
-        scored.sort_by(|(_, a), (_, b)| b.cmp(a));
+        // Sort descending by score; equal scores broken by external NodeId (matches graph search).
+        scored.sort_by(|(iid_a, a), (iid_b, b)| match b.cmp(a) {
+            std::cmp::Ordering::Equal => self.external_id(*iid_a).cmp(&self.external_id(*iid_b)),
+            other => other,
+        });
 
         Ok(scored
             .into_iter()
@@ -488,13 +506,15 @@ impl HnswIndex {
 
         let inv_live = 1.0 / live_ratio;
 
+        // Use saturating arithmetic to avoid overflow when inv_live is very large.
+        // Cap at k * 4 and ef_search * 4 using saturating_mul.
         let overscan_k = (k as f64 * inv_live).ceil() as usize;
-        let effective_k = overscan_k.min(k * 4).max(k);
+        let k_cap = k.saturating_mul(4);
+        let effective_k = overscan_k.min(k_cap).max(k);
 
         let overscan_ef = (self.config.ef_search as f64 * inv_live).ceil() as usize;
-        let effective_ef = overscan_ef
-            .min(self.config.ef_search * 4)
-            .max(self.config.ef_search);
+        let ef_cap = self.config.ef_search.saturating_mul(4);
+        let effective_ef = overscan_ef.min(ef_cap).max(self.config.ef_search);
 
         (effective_k, effective_ef)
     }
@@ -553,6 +573,11 @@ impl HnswIndex {
     /// - Inlined distance dispatch: metric resolved to function pointer once
     /// - Batch neighbor processing with software prefetch pipelining
     /// - (Optional) INT8 quantized pre-filter: skip f32 for obviously distant neighbors
+    // REASON: The search inner loop requires query, query_norm, entry points, ef,
+    // layer index, tombstone filter flag, and search context — all are distinct
+    // concerns that cannot be collapsed without introducing a wrapper struct that
+    // would add indirection in the hot path. The argument count reflects the
+    // algorithm's real degrees of freedom.
     #[allow(clippy::too_many_arguments)]
     fn search_layer_inner_ctx(
         &self,

@@ -126,6 +126,7 @@ pub async fn apply_weight_delta(
 /// Use this when the caller loads η from runtime config (e.g., atlas's
 /// `knowledge.toml` override of Channel C's default 0.50). Same algorithm
 /// and transactional guarantees as [`apply_weight_delta`].
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_weight_delta_with_eta(
     conn: &Arc<Mutex<Connection>>,
     namespace: &str,
@@ -149,6 +150,13 @@ pub async fn apply_weight_delta_with_eta(
     if !(0.0..=1.0).contains(&eta) {
         return Err(PersistError::Validation(format!(
             "eta must be in [0.0, 1.0], got {eta}"
+        )));
+    }
+    // Reject non-finite delta to prevent NaN/Inf from being persisted to atom_weights.
+    // A NaN delta would silently corrupt the stored weight on every subsequent read.
+    if !delta.is_finite() {
+        return Err(PersistError::Validation(format!(
+            "delta must be finite, got {delta}"
         )));
     }
     let conn = Arc::clone(conn);
@@ -577,6 +585,56 @@ mod tests {
         assert!(
             matches!(result, Err(PersistError::Validation(_))),
             "expected Validation error for empty namespace, got {result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 7 — NaN delta returns Validation error (prevents DB corruption)
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_apply_weight_delta_rejects_nan_delta() {
+        let conn = make_conn();
+        let lambda = "lambda:test";
+        let atom = Uuid::new_v4();
+
+        let result = apply_weight_delta(
+            &conn,
+            lambda,
+            atom,
+            f32::NAN,
+            WeightChannel::Ambient,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PersistError::Validation(_))),
+            "NaN delta must be rejected with Validation error, got {result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 8 — Inf delta returns Validation error
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_apply_weight_delta_rejects_inf_delta() {
+        let conn = make_conn();
+        let lambda = "lambda:test";
+        let atom = Uuid::new_v4();
+
+        let result = apply_weight_delta(
+            &conn,
+            lambda,
+            atom,
+            f32::INFINITY,
+            WeightChannel::Ambient,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PersistError::Validation(_))),
+            "Inf delta must be rejected with Validation error, got {result:?}"
         );
     }
 }

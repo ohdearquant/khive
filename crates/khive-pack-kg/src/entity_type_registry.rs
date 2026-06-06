@@ -1,28 +1,8 @@
 //! EntityTypeRegistry — validates and normalises `(EntityKind, entity_type)` pairs.
 //!
-//! `entity_type` is a first-class column on the `entities` table but was
-//! previously stored as a free-text string with no validation.  This module
-//! introduces a static registry that:
-//!
-//! 1. Declares the canonical subtypes for every `EntityKind`.
-//! 2. Resolves aliases to canonical names (e.g. `"algo"` → `"algorithm"`).
-//! 3. Infers the `EntityKind` from a bare subtype string (e.g. `"paper"` →
-//!    `(Document, "paper")`), which allows `kind="paper"` at the wire level
-//!    without an explicit `entity_kind`.
-//! 4. Rejects `entity_type` values that don't belong to the supplied kind.
-//! 5. Is extensible: external packs (e.g. `brain`) can call
-//!    [`EntityTypeRegistry::register`] to append their own subtypes.
-//!
-//! # Design notes
-//!
-//! - The registry is kept in `khive-pack-kg`, not `khive-types`, because
-//!   domain-specific subtype names are pack-owned vocabulary.
-//! - A `once_cell::sync::Lazy` global holds the default registry with all
-//!   built-in subtypes pre-populated.  Packs that extend it create a clone,
-//!   add entries, and store the result.  The typical path is to call
-//!   [`EntityTypeRegistry::global`] which returns the built-in registry; the
-//!   handful of packs that extend it can call
-//!   [`EntityTypeRegistry::with_extra`] to derive an extended copy.
+//! Declares canonical subtypes per kind, resolves aliases, infers kind from bare
+//! subtype strings, and is extensible by external packs via [`EntityTypeRegistry::register`].
+//! Kept in pack-kg (not khive-types) because subtype names are pack-owned vocabulary.
 
 use std::collections::HashMap;
 
@@ -34,6 +14,7 @@ use crate::RuntimeError;
 /// together with any accepted aliases.
 #[derive(Clone, Debug)]
 pub struct EntityTypeDef {
+    /// The entity kind this subtype belongs to.
     pub kind: EntityKind,
     /// Canonical name that is written to the DB.
     pub type_name: &'static str,
@@ -351,7 +332,7 @@ impl EntityTypeRegistry {
         Self { lookup, defs }
     }
 
-    /// Return the built-in registry (subtypes from [`BUILTIN_DEFS`]).
+    /// Return the built-in registry with all static subtype definitions.
     pub fn builtin() -> Self {
         Self::new(BUILTIN_DEFS.iter().cloned())
     }

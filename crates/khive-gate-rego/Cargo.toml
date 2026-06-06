@@ -16,7 +16,7 @@ khive-gate = { version = "0.2.5", path = "../khive-gate" }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
-regorus = "0.10"
+regorus = { workspace = true }
 
 [dev-dependencies]
 khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }

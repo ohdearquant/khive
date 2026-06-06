@@ -3,7 +3,13 @@
 use crate::DeterministicScore;
 use std::cmp::Ordering;
 
-/// Ranked item: score descending, ID ascending for ties.
+/// A scored item with deterministic tie-breaking.
+///
+/// `Ranked<T>` implements `Ord` as a **max-heap adapter**: higher score is
+/// `Greater`, lower ID wins ties.  `BinaryHeap<Ranked<T>>` pops the best item
+/// first.  For sorted `Vec` output use [`cmp_desc_then_id`] — `Vec::sort()`
+/// gives ascending order (lowest score first), which is the opposite of ranking
+/// order.  Full ordering semantics are documented in `docs/algorithm.md`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ranked<T: Ord> {
     score: DeterministicScore,
@@ -11,26 +17,31 @@ pub struct Ranked<T: Ord> {
 }
 
 impl<T: Ord> Ranked<T> {
+    /// Construct a `Ranked` item from a score and a tie-breaking ID.
     #[inline]
     pub fn new(score: DeterministicScore, id: T) -> Self {
         Self { score, id }
     }
 
+    /// Return the score component.
     #[inline]
     pub fn score(&self) -> DeterministicScore {
         self.score
     }
 
+    /// Return a reference to the tie-breaking ID.
     #[inline]
     pub fn id(&self) -> &T {
         &self.id
     }
 
+    /// Consume `self` and return the ID.
     #[inline]
     pub fn into_id(self) -> T {
         self.id
     }
 
+    /// Consume `self` and return `(score, id)`.
     #[inline]
     pub fn into_parts(self) -> (DeterministicScore, T) {
         (self.score, self.id)
@@ -38,6 +49,10 @@ impl<T: Ord> Ranked<T> {
 }
 
 impl<T: Ord> Ord for Ranked<T> {
+    /// Max-heap adapter order: higher score is `Greater`; lower ID is `Greater`
+    /// on ties.  This makes `BinaryHeap<Ranked<T>>::pop()` return the best item
+    /// first.  For sorted output (highest score first) use [`cmp_desc_then_id`]
+    /// instead of relying on this `Ord` impl directly.
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.score
@@ -125,5 +140,51 @@ mod tests {
         let (s, id) = ranked.into_parts();
         assert_eq!(s, score);
         assert_eq!(id, 42u64);
+    }
+
+    // ── Ranked Ord is max-heap adapter, not natural sort order ───────────────
+
+    /// `BinaryHeap<Ranked<_>>` must pop best (highest score) first.
+    #[test]
+    fn ranked_heap_pops_highest_score_first() {
+        use std::collections::BinaryHeap;
+        let mut heap = BinaryHeap::new();
+        heap.push(Ranked::new(DeterministicScore::from_f64(0.3), 3u64));
+        heap.push(Ranked::new(DeterministicScore::from_f64(0.9), 1u64));
+        heap.push(Ranked::new(DeterministicScore::from_f64(0.5), 2u64));
+
+        let first = heap.pop().unwrap();
+        assert_eq!(first.score(), DeterministicScore::from_f64(0.9));
+        assert_eq!(first.id(), &1u64);
+    }
+
+    /// `Vec<Ranked<_>>::sort()` produces ascending order (lowest score first)
+    /// because `Ranked::Ord` is a max-heap adapter.  This test documents that
+    /// behaviour — callers who need descending order MUST use `cmp_desc_then_id`.
+    #[test]
+    fn ranked_vec_sort_is_ascending_not_ranking_order() {
+        let mut items = [
+            Ranked::new(DeterministicScore::from_f64(0.9), 1u64),
+            Ranked::new(DeterministicScore::from_f64(0.3), 3u64),
+            Ranked::new(DeterministicScore::from_f64(0.5), 2u64),
+        ];
+        items.sort();
+        // sort() gives ascending (lowest score first) because Ord is max-heap-adapted.
+        assert_eq!(items[0].score(), DeterministicScore::from_f64(0.3));
+        assert_eq!(items[2].score(), DeterministicScore::from_f64(0.9));
+    }
+
+    /// To get descending (ranking) order, use `cmp_desc_then_id`.
+    #[test]
+    fn cmp_desc_then_id_gives_descending_order() {
+        let mut items: Vec<(DeterministicScore, u64)> = vec![
+            (DeterministicScore::from_f64(0.3), 3),
+            (DeterministicScore::from_f64(0.9), 1),
+            (DeterministicScore::from_f64(0.5), 2),
+        ];
+        items.sort_unstable_by(|(sa, ia), (sb, ib)| cmp_desc_then_id(*sa, ia, *sb, ib));
+        assert_eq!(items[0].1, 1); // 0.9 first
+        assert_eq!(items[1].1, 2); // 0.5 second
+        assert_eq!(items[2].1, 3); // 0.3 last
     }
 }

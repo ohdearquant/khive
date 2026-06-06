@@ -1,33 +1,8 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
-//
 //! NDJSON-to-SQLite sync library boundary (ADR-010/ADR-020, finding F106).
 //!
-//! Reads `<repo>/.khive/kg/entities.ndjson` and `<repo>/.khive/kg/edges.ndjson`,
-//! parses each record per the ADR-020 §2 canonical schema, and writes them into
-//! a fresh SQLite database using the runtime's upsert APIs. The resulting DB
-//! has the full khive schema (entities + graph_edges + FTS5 indexes + vector
-//! tables) — the same schema the MCP server uses.
-//!
-//! ## Atomicity
-//!
-//! Builds into `<target>.tmp` then renames over `<target>`. A crash mid-build
-//! leaves the previous DB intact.
-//!
-//! ## F201: Remote archive fetch + hash-pin verification (ADR-037)
-//!
-//! [`run_sync_remote`] fetches NDJSON files from a git remote URL into a local
-//! cache directory, computes the canonical SHA-256 content hash, and compares
-//! it against an optional `sha256:` pin in the caller-supplied [`RemoteConfig`].
-//! A pin mismatch aborts before any cache file is modified (fail-closed). If
-//! no pin is present the hash is still computed and written to `meta.json`.
-//! Pass `repin: true` to skip the pin comparison and have the computed hash
-//! returned for the caller to write back to `schema.yaml`.
-//!
-//! ## Consumers
-//!
-//! `kkernel sync` is the primary consumer. It calls [`run_sync`] and prints the
-//! resulting [`SyncReport`] as JSON. Other callers (e.g. git post-checkout hooks)
-//! can use this library directly.
+//! Rebuilds the SQLite database from `.khive/kg/entities.ndjson` and `edges.ndjson`.
+//! Builds atomically into a `.tmp` file then renames. Also supports remote archive
+//! fetch with SHA-256 pin verification (ADR-037) via [`run_sync_remote`].
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -76,11 +51,13 @@ struct NdjsonEdge {
     // properties: accepted but not yet persisted to the storage-layer Edge
     // struct. Parsed here so existing NDJSON files round-trip without warning.
     #[serde(default)]
+    // REASON: Accepted for NDJSON round-trip compatibility; not yet persisted to the Edge struct.
     #[allow(dead_code)]
     properties: Option<serde_json::Value>,
     #[serde(default)]
     created_at: Option<String>,
     #[serde(default)]
+    // REASON: Accepted for NDJSON round-trip compatibility; edge updated_at is derived from created_at.
     #[allow(dead_code)]
     updated_at: Option<String>,
 }
@@ -205,18 +182,17 @@ pub async fn run_sync_remote(
                 "--no-checkout",
                 "--branch",
                 &remote.git_ref,
-                &remote.url,
-                staging_path.to_str().unwrap(),
             ])
+            .arg(&remote.url)
+            .arg(&staging_path)
             .output()
             .context("running git clone")?;
 
         if !clone_out.status.success() {
             let stderr = String::from_utf8_lossy(&clone_out.stderr);
             return Err(anyhow!(
-                "git clone failed for remote {:?} (url: {}): {}",
+                "git clone failed for remote {:?}: {}",
                 remote.name,
-                remote.url,
                 stderr.trim()
             ));
         }
@@ -256,7 +232,10 @@ pub async fn run_sync_remote(
     // `staging` tempdir is still alive here — we drop it after moving files.
 
     // ── 3. Build KgArchive and compute canonical hash ─────────────────────────
-    let archive = build_kg_archive(&remote.namespace, &entities_ndjson, &edges_ndjson);
+    // build_kg_archive is fallible: an invalid relation causes it to return an
+    // error here, before any cache file is written (fail-closed per ADR-037).
+    let archive = build_kg_archive(&remote.namespace, &entities_ndjson, &edges_ndjson)
+        .with_context(|| format!("validating archive for remote {:?}", remote.name))?;
     let actual_hash = snapshot_id_for_archive(&archive)
         .map_err(|e| anyhow!("hashing archive for remote {:?}: {}", remote.name, e))?;
 
@@ -333,7 +312,15 @@ fn run_git_in(dir: &Path, args: &[&str]) -> Result<()> {
 }
 
 /// Convert the NDJSON record slices into a [`KgArchive`] for hashing.
-fn build_kg_archive(namespace: &str, entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> KgArchive {
+///
+/// Returns an error if any edge carries an unrecognised relation string, so
+/// that invalid edges are rejected *before* the hash is computed and before
+/// any cache or database write occurs (ADR-037 §failure-behaviour-fail-closed).
+fn build_kg_archive(
+    namespace: &str,
+    entities: &[NdjsonEntity],
+    edges: &[NdjsonEdge],
+) -> Result<KgArchive> {
     let now = Utc::now();
     let exported_entities: Vec<ExportedEntity> = entities
         .iter()
@@ -360,28 +347,29 @@ fn build_kg_archive(namespace: &str, entities: &[NdjsonEntity], edges: &[NdjsonE
         })
         .collect();
 
-    let exported_edges: Vec<ExportedEdge> = edges
-        .iter()
-        .filter_map(|e| {
-            let relation: EdgeRelation = e.relation.parse().ok()?;
-            Some(ExportedEdge {
-                edge_id: e.edge_id,
-                source: e.source,
-                target: e.target,
-                relation,
-                weight: e.weight,
-            })
-        })
-        .collect();
+    let mut exported_edges: Vec<ExportedEdge> = Vec::with_capacity(edges.len());
+    for e in edges {
+        let relation: EdgeRelation = e
+            .relation
+            .parse()
+            .map_err(|err| anyhow!("invalid edge relation {:?}: {}", e.relation, err))?;
+        exported_edges.push(ExportedEdge {
+            edge_id: e.edge_id,
+            source: e.source,
+            target: e.target,
+            relation,
+            weight: e.weight,
+        });
+    }
 
-    KgArchive {
+    Ok(KgArchive {
         format: "khive-kg".into(),
         version: "0.1".into(),
         namespace: namespace.to_string(),
         exported_at: now,
         entities: exported_entities,
         edges: exported_edges,
-    }
+    })
 }
 
 /// Write entities to a file as sorted NDJSON (one JSON object per line).
@@ -450,6 +438,19 @@ pub async fn run_sync(repo_root: &Path, db_path: &Path, namespace: &str) -> Resu
         .with_context(|| format!("reading {}", entities_path.display()))?;
     let edge_records =
         read_edges(&edges_path).with_context(|| format!("reading {}", edges_path.display()))?;
+
+    // ── Validate-first gate (ADR-020 §validate-first, ADR-036 §validation-pipeline) ──
+    // Parse every edge relation before creating the temp DB so that an invalid
+    // relation causes a clean error that leaves the existing DB intact.
+    for (i, r) in edge_records.iter().enumerate() {
+        r.relation.parse::<EdgeRelation>().with_context(|| {
+            format!(
+                "invalid edge relation {:?} at record {} — sync aborted before any DB write",
+                r.relation,
+                i + 1
+            )
+        })?;
+    }
 
     let tmp_path = with_extension_suffix(db_path, ".tmp");
     let _ = std::fs::remove_file(&tmp_path);
@@ -648,6 +649,10 @@ async fn upsert_edges(
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// INLINE TEST JUSTIFICATION: Tests access private helpers (build_kg_archive,
+// read_entities, read_edges, compute_pin) that cannot be exposed in crate-level
+// tests/ without promoting them to pub(crate), which would widen the internal API.
+// Production code above this line is ~625 LOC (under the 700-line gate).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,7 +703,7 @@ mod tests {
 
         let entities = read_entities(&kg.join("entities.ndjson")).unwrap();
         let edges = read_edges(&kg.join("edges.ndjson")).unwrap();
-        let archive = build_kg_archive(namespace, &entities, &edges);
+        let archive = build_kg_archive(namespace, &entities, &edges).unwrap();
         snapshot_id_for_archive(&archive).unwrap()
     }
 

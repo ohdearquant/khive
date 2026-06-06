@@ -12,7 +12,9 @@ use crate::error::FoldError;
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SelectorInput<T> {
+    /// Stable string identifier for deterministic tie-breaking.
     pub id: String,
+    /// The item payload carried through selection.
     pub content: T,
     /// Size in the unit of the caller's budget (tokens, bytes, count).
     pub size: usize,
@@ -69,6 +71,10 @@ pub struct SelectorWeights {
 /// An implementation collapses N inputs into a subset that fits a budget,
 /// using weights and an optional query for relevance context.
 pub trait Selector<T>: Send + Sync {
+    /// Select a budget-constrained subset from `inputs`.
+    ///
+    /// # Errors
+    /// Returns [`FoldError`] if the selection operation fails (implementation-defined).
     fn select(
         &self,
         inputs: Vec<SelectorInput<T>>,
@@ -216,6 +222,10 @@ impl<T: Clone> Selector<T> for GreedySelector {
     }
 }
 
+// INLINE TEST JUSTIFICATION: selector tests exercise private helper functions
+// (pragmatic_plus_epistemic, effective_score) and internal sort logic that are
+// not accessible from a separate crate-level tests/ file. Consolidating here
+// avoids duplicating the SelectorInput construction scaffolding.
 #[cfg(test)]
 mod tests {
     use super::*;

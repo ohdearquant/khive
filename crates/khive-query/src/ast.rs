@@ -17,6 +17,7 @@ pub enum QueryValue {
     Blob(Vec<u8>),
 }
 
+/// Top-level GQL query node produced by the parser.
 #[derive(Debug, Clone)]
 pub struct GqlQuery {
     pub pattern: MatchPattern,
@@ -75,6 +76,7 @@ impl WhereExpr {
     }
 }
 
+/// A single item in the RETURN clause — either a bound variable or a property projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnItem {
     Variable(String),
@@ -89,6 +91,7 @@ impl ReturnItem {
     }
 }
 
+/// The MATCH pattern of a GQL query, as an alternating sequence of node and edge elements.
 #[derive(Debug, Clone)]
 pub struct MatchPattern {
     pub elements: Vec<PatternElement>,

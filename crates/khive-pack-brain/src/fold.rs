@@ -1,3 +1,22 @@
+//! Fold implementations for brain profiles (ADR-032, ADR-048).
+//!
+//! `BalancedRecallFold` reduces raw events into the three-scalar Beta-posterior
+//! state used by the built-in `balanced-recall-v1` profile.
+//!
+//! `SectionPosteriorFold` reduces events into per-section Beta posteriors
+//! (ADR-048 Phase 1).
+//!
+//! Hoare triple for `BalancedRecallFold::reduce`:
+//!   Pre:  state is a valid `BalancedRecallState`; event is a valid `Event`.
+//!   Post: state.total_events is incremented by 1; posteriors are updated
+//!         according to the event signal; entity posterior is updated when a
+//!         target_id is present; all posteriors remain positive and finite.
+//!
+//! Hoare triple for `SectionPosteriorFold::reduce`:
+//!   Pre:  state is a valid `SectionPosteriorState`; event is a valid `Event`.
+//!   Post: section posteriors are updated for the sections named in the event
+//!         payload; total_events is incremented; posteriors remain positive.
+
 use khive_fold::{Fold, FoldContext};
 use khive_storage::event::Event;
 

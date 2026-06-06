@@ -1,3 +1,5 @@
+//! Weighted feature-combination reranking for memory recall candidates.
+
 use std::collections::HashMap;
 
 /// Input features available per recall candidate for weighted reranking.

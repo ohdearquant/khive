@@ -1,17 +1,7 @@
 //! pack-gtd — GTD (Getting Things Done) verb pack for khive.
 //!
-//! Adds a single `task` note kind plus five verbs (`assign`, `next`,
-//! `complete`, `tasks`, `transition`) that wrap the notes substrate with
-//! GTD lifecycle semantics:
-//!
-//! ```text
-//! inbox → next | waiting | someday | active | done | cancelled
-//! next  → active | waiting | someday | done | cancelled
-//! ...
-//! ```
-//!
-//! Status, priority, assignee, due/start/end, depends_on and tags live in
-//! `note.properties` — no new schema migration is required.
+//! Adds the `task` note kind and five verbs (`assign`, `next`, `complete`, `tasks`,
+//! `transition`) with GTD lifecycle semantics over the notes substrate.
 
 pub mod handlers;
 pub mod hook;
@@ -53,9 +43,10 @@ impl Pack for GtdPack {
     });
 }
 
-/// ADR-031: GTD opts task notes into `depends_on` between tasks. The base
-/// ADR-002 contract keeps `depends_on` as entity→entity for KG semantics;
-/// this rule additively extends it to task→task so blockers are graph-traversable.
+/// ADR-017 §pack-extensible-edge-endpoints: GTD opts task notes into `depends_on`
+/// between tasks. The base ADR-002 contract keeps `depends_on` as entity→entity
+/// for KG semantics; this rule additively extends it to task→task so blockers are
+/// graph-traversable. ADR-019 documents the GTD task-dependency model.
 static GTD_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
     relation: EdgeRelation::DependsOn,
     source: EndpointKind::NoteOfKind("task"),
@@ -114,7 +105,16 @@ static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
 /// `gtd_lifecycle_audit` records every `transition` (and `complete`) invocation
 /// for replay and compliance auditing.  The table is idempotent (`CREATE TABLE
 /// IF NOT EXISTS`) and is NOT part of the core versioned migration chain.
-pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 3] = [
+///
+/// ADR-017 §schema_plan requires every statement in the exported `PackSchemaPlan`
+/// to be idempotent so the generic boot applier can call them on any database
+/// (fresh or pre-existing) without error.  The `namespace` column is included in
+/// the `CREATE TABLE` definition, so no separate `ALTER TABLE` is needed.
+/// Databases that predate the `namespace` column are handled by the
+/// `ensure_audit_schema` lazy-init path in `handlers.rs`, which swallows the
+/// duplicate-column error produced by the in-process `ALTER` on those older DBs.
+/// The `PackSchemaPlan` export path must remain idempotent for the boot applier.
+pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS gtd_lifecycle_audit (\
         note_id    TEXT NOT NULL,\
         from_state TEXT NOT NULL,\
@@ -125,12 +125,6 @@ pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 3] = [
     )",
     "CREATE INDEX IF NOT EXISTS idx_gtd_audit_note \
         ON gtd_lifecycle_audit(note_id, at DESC)",
-    // Idempotent migration for existing DBs that predate the namespace column.
-    // SQLite ALTER TABLE ADD COLUMN fails with "duplicate column name" if the
-    // column already exists; ensure_audit_schema swallows that specific error.
-    // The column is nullable so legacy rows get NULL (unknown) rather than a
-    // false 'default' attribution. New inserts always supply a concrete namespace.
-    "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT",
 ];
 
 // ADR-025: Illocutionary classification (Searle 1976)
@@ -318,6 +312,7 @@ static GTD_HANDLERS: [HandlerDef; 5] = [
 ];
 
 impl GtdPack {
+    /// Create a new `GtdPack` bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }

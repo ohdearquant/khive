@@ -1,3 +1,5 @@
+//! Query-layer error types for the GQL/SPARQL parse and compile pipeline.
+
 /// Errors produced by the query parsing and compilation pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {

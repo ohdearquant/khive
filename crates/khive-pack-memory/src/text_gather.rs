@@ -3,6 +3,10 @@
 //! Separates term-selection and gather-mode logic from the recall handler so
 //! each concern has a direct test seam. The handler calls into this module;
 //! the module calls into the khive-storage TextSearch trait.
+// FILE SIZE JUSTIFICATION: text_gather.rs includes both select_terms_by_stats and
+// collect_text_hits plus their inline tests; the inline tests use private test fixtures
+// (MockTextSearch) that require access to module-private types and would be duplicated
+// or require pub(crate) promotion if moved to the integration test directory.
 
 use khive_runtime::RuntimeError;
 use khive_storage::types::{TextFilter, TextSearchHit, TextSearchRequest, TextTermStatsRequest};
@@ -74,6 +78,8 @@ pub fn select_terms_by_stats(
 /// - CJK bypass: uses existing ranked all-term path without term selection.
 /// - Term selection by DF/IDF when stats are available.
 /// - gather_mode (Ranked / Unranked / RankWithinCap) via `search_with_options`.
+// REASON: all parameters are independent scalar or slice inputs with distinct types;
+// extracting a struct would require callers to construct a temporary just to call this fn.
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_text_hits(
     searcher: &dyn TextSearch,

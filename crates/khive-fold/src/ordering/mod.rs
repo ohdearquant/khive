@@ -28,6 +28,9 @@ pub use khive_score::{cmp_asc_then_id, cmp_desc_then_id, DeterministicScore, Ran
 #[cfg(test)]
 use canonical::{CANONICAL_NAN_F32, CANONICAL_NAN_F64};
 
+// INLINE TEST JUSTIFICATION: ordering tests require access to CANONICAL_NAN_F32 and
+// CANONICAL_NAN_F64 which are pub(crate) constants not re-exported from the crate
+// root; keeping tests inline avoids making these test-only constants public.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +213,8 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[derive(Debug, Clone)]
+    // REASON: TestCandidate.value is only used to construct test data; the struct
+    // exists to implement HasId for heap ordering tests, not to read `.value`.
     #[allow(dead_code)]
     struct TestCandidate {
         id: Uuid,

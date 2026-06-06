@@ -1,17 +1,12 @@
-//! `khive-vamana` — batch-built Vamana ANN index for pre-normalized `f32` vectors.
+//! Vamana ANN index for batch-built approximate nearest neighbor search.
 //!
-//! All vectors must be unit-normalized before insertion. The crate validates
-//! vector dimensionality but not norms.
+//! All vectors must be unit-normalized before insertion; dimensionality is
+//! validated at every public boundary, but unit-norm is not enforced (the
+//! adjacent bridge normalizes before calling here). Non-finite float values
+//! (`NaN`, `Infinity`) are rejected at [`VamanaIndex::build`],
+//! [`VamanaIndex::search`], and [`VamanaIndex::from_snapshot`].
 //!
-//! # Quick start
-//!
-//! ```rust,ignore
-//! use khive_vamana::{VamanaConfig, build, search};
-//!
-//! let config = VamanaConfig::with_dimensions(128);
-//! let index = build(&vectors, config)?;
-//! let results = search(&index, &query, 10)?;
-//! ```
+//! See ADR-048 for default parameters (`max_degree=64`, `alpha=1.2`).
 
 pub mod config;
 pub mod distance;
@@ -27,10 +22,16 @@ pub use index::{
     VAMANA_SNAPSHOT_VERSION,
 };
 
+/// Build a Vamana index from a flat row-major vector slice and a config.
+///
+/// Delegates to [`VamanaIndex::build`]; see that method for full error contract.
 pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<VamanaIndex> {
     VamanaIndex::build(vectors, config)
 }
 
+/// Search an already-built index for the `k` nearest neighbors of `query`.
+///
+/// Delegates to [`VamanaIndex::search`]; see that method for full error contract.
 pub fn search(index: &VamanaIndex, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
     index.search(query, k)
 }

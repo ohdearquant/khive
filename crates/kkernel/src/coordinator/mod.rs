@@ -1,3 +1,11 @@
+// FILE SIZE JUSTIFICATION: coordinator/mod.rs co-locates BackendRegistry, LocatorCache,
+// SubstrateCoordinator, and their tests because all three types are tightly coupled — LocatorCache
+// holds BackendId values from BackendRegistry, and SubstrateCoordinator owns both. Splitting would
+// require pub(crate) on all internal types and would break the single-invariant test helpers that
+// construct coordinated registry+cache states. The inline tests for D2/D3/D4 phases need access
+// to the #[cfg(test)] fail_backend_id field which cannot be pub(crate) without leaking it to
+// integration tests.
+
 //! SubstrateCoordinator — cross-backend dispatch layer (ADR-003, ADR-029).
 //!
 //! The coordinator lives inside `kkernel` as kernel-internal plumbing. Pack crates
@@ -25,7 +33,7 @@
 //! Sub-modules (`edges`, `traversal`, `curation`, `health`) are reserved per ADR-029
 //! for D5/D6 work that is not yet implemented.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -50,10 +58,10 @@ pub struct BackendEntry {
 /// Registry of all backends known to the coordinator.
 ///
 /// Constructed once at boot from `khive.toml` (ADR-028) and immutable thereafter.
-/// Keyed by [`BackendId`] for O(1) lookup.
+/// Keyed by [`BackendId`] for deterministic ordering in `ids()` / `iter()` output.
 #[derive(Default)]
 pub struct BackendRegistry {
-    backends: HashMap<String, BackendEntry>,
+    backends: BTreeMap<String, BackendEntry>,
     primary: Option<String>,
 }
 
@@ -258,56 +266,9 @@ pub struct BackendSearchResult {
 
 /// Cross-backend dispatch layer (ADR-003 §four-invariants, ADR-029).
 ///
-/// The coordinator owns all cross-backend operations:
-/// - Node-to-backend resolution (D2 locator cache)
-/// - Cross-backend `link()` routing (D3)
-/// - Substrate-kind search fan-out with RRF (D4)
-/// - Cross-backend traversal (D5)
-/// - Partition tolerance (D6)
-///
-/// Pack handlers do NOT see the coordinator; they receive a single-backend
-/// [`KhiveRuntime`] and operate within it. The coordinator routes across backends
-/// above the pack layer.
-///
-/// # D2 — Locator cache
-///
-/// `locate(id, namespace)` checks the in-memory [`LocatorCache`] first. On a miss
-/// it performs a concurrent scan across all backends (one `get_entity`/`get_note`
-/// probe per backend via `tokio::spawn`) and populates the cache on first hit.
-/// Subsequent calls within the TTL avoid re-scanning.
-///
-/// # D3 — Fan-out search
-///
-/// `fan_out_search(query, namespace, limit)` broadcasts `hybrid_search` to all
-/// registered backends in parallel using `futures::future::join_all`. Results are
-/// merged with Reciprocal Rank Fusion (unweighted, k=60). Per-backend errors are
-/// captured in [`BackendSearchResult::error`] — a single failing backend does NOT
-/// abort the fan-out.
-///
-/// When `is_single_backend()` is true, `fan_out_search` degenerates to a single
-/// backend call with no concurrency overhead.
-///
-/// # D4/D5/D6 — Deferred
-///
-/// TODO(D4): Cross-backend traversal — BFS across backend boundaries following
-/// `contains`/`extends`/`depends_on` edges that span backends. Requires
-/// `locate()` to resolve each hop's backend. Complexity: coordinator intercepts
-/// `traverse()` results, checks each returned node's backend via `locate()`,
-/// and recursively fans out to the owning backend. Entry point:
-/// `cross_backend_traverse(roots, max_depth, relations, namespace)`.
-///
-/// TODO(D5): WAL cascade — when a node is hard-deleted, cascade the delete to all
-/// incident cross-backend edges. Requires the coordinator to track cross-backend
-/// edge references in a journal (WAL). On entity delete, look up WAL entries for
-/// the deleted UUID and issue compensating `delete_edge` calls to each referenced
-/// backend. Entry point: `cascade_delete(id, namespace)`.
-///
-/// TODO(D6): Backend health map — coordinator maintains a health score per
-/// backend (derived from consecutive error counts and last successful call
-/// timestamp). `fan_out_search` skips unhealthy backends (score < threshold)
-/// rather than waiting for a timeout. Requires a background health-check loop
-/// and a `BackendHealthMap` struct that can be consulted before dispatch.
-/// Entry point: `health_map()` returning `HashMap<BackendId, BackendHealth>`.
+/// Owns node-to-backend location (D2), cross-backend link routing (D3),
+/// search fan-out with RRF (D4), traversal (D5), and partition tolerance (D6).
+/// See `crates/kkernel/docs/coordinator.md` for architecture detail and deferred phases.
 pub struct SubstrateCoordinator {
     registry: BackendRegistry,
     locator: Arc<LocatorCache>,
@@ -775,6 +736,12 @@ mod futures_util {
         }
     }
 }
+
+// INLINE TEST JUSTIFICATION: Tests require access to the #[cfg(test)] field
+// `fail_backend_id` on SubstrateCoordinator and the private LocatorEntry struct.
+// Those are only accessible from within this module; moving tests to crates/kkernel/tests/
+// would require making internal test scaffolding pub(crate) and exposing the
+// failure-injection mechanism to non-test code.
 
 #[cfg(test)]
 mod tests {

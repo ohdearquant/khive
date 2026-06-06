@@ -4,6 +4,7 @@ use std::fmt;
 
 use thiserror::Error;
 
+/// Convenience alias for `Result<T, RuntimeError>`.
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 /// A single missing pack dependency (ADR-037).
@@ -58,6 +59,11 @@ impl fmt::Display for CircularPackDependency {
 
 impl std::error::Error for CircularPackDependency {}
 
+/// All errors produced by the khive-runtime layer.
+///
+/// Variants cover storage, query, validation, namespace isolation, and permission failures.
+/// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
+/// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("storage: {0}")]

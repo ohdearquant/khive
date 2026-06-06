@@ -29,6 +29,10 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 2] = [
         WHERE deleted_at IS NULL",
 ];
 
+/// Communication pack providing the five `comm.*` verbs (ADR-040).
+///
+/// Stores and queries `message` notes in the standard notes table; message
+/// metadata lives in the `properties` JSON column.
 pub struct CommPack {
     runtime: KhiveRuntime,
 }
@@ -46,7 +50,7 @@ static COMM_HANDLERS: [HandlerDef; 5] = [
         name: "comm.send",
         description: "Send a message, optionally threaded.",
         visibility: Visibility::Verb,
-        category: khive_types::VerbCategory::Directive,
+        category: khive_types::VerbCategory::Commissive,
         params: &[
             ParamDef {
                 name: "to",
@@ -110,7 +114,7 @@ static COMM_HANDLERS: [HandlerDef; 5] = [
         name: "comm.reply",
         description: "Reply to a message, threading linkage.",
         visibility: Visibility::Verb,
-        category: khive_types::VerbCategory::Directive,
+        category: khive_types::VerbCategory::Commissive,
         params: &[
             ParamDef {
                 name: "id",
@@ -149,6 +153,7 @@ static COMM_HANDLERS: [HandlerDef; 5] = [
 ];
 
 impl CommPack {
+    /// Create a new `CommPack` bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }
@@ -322,5 +327,42 @@ mod help_tests {
                 handler.name
             );
         }
+    }
+
+    /// COMM-AUD-001: verb categories must match ADR-040/ADR-025 speech-act classifications.
+    #[test]
+    fn verb_categories_match_adr040() {
+        use khive_types::VerbCategory;
+        let h = |name: &str| -> &'static HandlerDef {
+            CommPack::HANDLERS
+                .iter()
+                .find(|h| h.name == name)
+                .unwrap_or_else(|| panic!("handler {name:?} not found"))
+        };
+        assert_eq!(
+            h("comm.send").category,
+            VerbCategory::Commissive,
+            "comm.send must be Commissive per ADR-040"
+        );
+        assert_eq!(
+            h("comm.inbox").category,
+            VerbCategory::Assertive,
+            "comm.inbox must be Assertive per ADR-040"
+        );
+        assert_eq!(
+            h("comm.read").category,
+            VerbCategory::Declaration,
+            "comm.read must be Declaration per ADR-040"
+        );
+        assert_eq!(
+            h("comm.reply").category,
+            VerbCategory::Commissive,
+            "comm.reply must be Commissive per ADR-040"
+        );
+        assert_eq!(
+            h("comm.thread").category,
+            VerbCategory::Assertive,
+            "comm.thread must be Assertive per ADR-040"
+        );
     }
 }

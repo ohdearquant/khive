@@ -1,6 +1,7 @@
 //! Main fusion entry point.
 
 use khive_score::DeterministicScore;
+use std::cmp::Ordering;
 use std::hash::Hash;
 
 use super::rrf::reciprocal_rank_fusion;
@@ -10,27 +11,11 @@ use super::weighted::weighted_fusion;
 
 /// Fuse multiple ranked result lists into a single ranked list.
 ///
-/// This is the main entry point for rank fusion. It supports multiple fusion
-/// strategies and is generic over the ID type.
+/// Main entry point for rank fusion. Generic over the ID type (`Eq + Hash + Clone + Ord`).
+/// Sources are `(Id, DeterministicScore)` pairs, sorted by score descending.
+/// Returns at most `top_k` results sorted by fused score descending.
 ///
-/// # Arguments
-///
-/// * `sources` - Vector of result lists from different retrievers.
-///   Each list contains `(Id, DeterministicScore)` pairs, already sorted
-///   by score descending (best first).
-/// * `strategy` - The fusion strategy to use.
-/// * `top_k` - Maximum number of results to return.
-///
-/// # Returns
-///
-/// A vector of `(Id, DeterministicScore)` pairs sorted by fused score descending,
-/// truncated to `top_k` results.
-///
-/// # Type Parameters
-///
-/// * `Id` - The identifier type. Must implement `Eq`, `Hash`, `Clone`, and `Ord`.
-///   Works with `EmbeddingId`, `DocumentId`, `String`, `Uuid`, etc.
-///   `Ord` is required for deterministic tie-breaking when scores are equal.
+/// See `docs/algorithm.md` for strategy details, the RRF formula, and weight normalization.
 ///
 /// # Example
 ///
@@ -59,14 +44,56 @@ pub fn fuse<Id: Eq + Hash + Clone + Ord>(
         FusionStrategy::Rrf { k } => reciprocal_rank_fusion(sources, *k),
         FusionStrategy::Weighted { weights } => weighted_fusion(sources, weights),
         FusionStrategy::Union => union_fusion(sources),
-        // VectorOnly / KeywordOnly: the caller is responsible for ensuring only
-        // the relevant source list is passed. Within fuse(), we take the union
-        // (max-score per ID) which is a no-op when there is a single source.
-        FusionStrategy::VectorOnly | FusionStrategy::KeywordOnly => union_fusion(sources),
+        // VectorOnly / KeywordOnly: exactly one source is required.
+        // Multiple sources contradict the "raw single-retriever passthrough" semantics.
+        // Return empty in both debug and release builds so callers get consistent,
+        // detectable behavior instead of silently incorrect results.
+        FusionStrategy::VectorOnly | FusionStrategy::KeywordOnly => {
+            if sources.len() != 1 {
+                // Invalid source count for passthrough strategies: return empty so
+                // callers can detect the wiring error in both debug and release builds.
+                return Vec::new();
+            }
+            // Return the single source sorted by score desc (union_fusion is correct for 1 source).
+            let first = sources.into_iter().next().unwrap_or_default();
+            union_fusion(vec![first])
+        }
     };
 
-    // Truncate to top_k
-    fused.into_iter().take(top_k).collect()
+    truncate_top_k(fused, top_k)
+}
+
+/// Truncate a fused result list to at most `top_k` items, sorted by score
+/// descending with ID-ascending tie-breaking.
+///
+/// Uses `select_nth_unstable_by` (O(n)) to partition the top-k elements, then
+/// sorts only the prefix (O(k log k)), avoiding a full O(n log n) sort when
+/// `top_k << n` (finding #6).
+fn truncate_top_k<Id: Ord>(
+    mut fused: Vec<(Id, DeterministicScore)>,
+    top_k: usize,
+) -> Vec<(Id, DeterministicScore)> {
+    if top_k == 0 || fused.is_empty() {
+        return Vec::new();
+    }
+
+    let cmp = |(id_a, score_a): &(Id, DeterministicScore),
+               (id_b, score_b): &(Id, DeterministicScore)| {
+        match score_b.cmp(score_a) {
+            Ordering::Equal => id_a.cmp(id_b),
+            other => other,
+        }
+    };
+
+    if top_k < fused.len() {
+        // Partition so that fused[..top_k] are the top-k elements (unsorted).
+        fused.select_nth_unstable_by(top_k - 1, cmp);
+        fused.truncate(top_k);
+    }
+
+    // Sort only the (now small) prefix.
+    fused.sort_by(cmp);
+    fused
 }
 
 #[cfg(test)]

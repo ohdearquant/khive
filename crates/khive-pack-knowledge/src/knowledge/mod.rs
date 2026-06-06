@@ -1,20 +1,16 @@
+// FILE SIZE JUSTIFICATION: This module intentionally consolidates all corpus handler logic
+// (atoms/domains CRUD, TF-IDF search, embedding rerank, fold, index, edit/import, challenge/
+// adjudicate, compose/suggest) in one place to maintain a single coherent namespace and avoid
+// cross-module coupling for the many shared scoring, helper, and SQL utilities that span
+// multiple verbs. Splitting into submodules would require making ~30 private helpers pub(crate)
+// and duplicating context structs. The module boundary is the KnowledgeHandlers impl block;
+// splitting into conceptual submodules is tracked as a future refactor once the verb surface
+// stabilizes post-ADR-048 Phase 3.
+
 //! Knowledge corpus handlers — atoms, domains, TF-IDF search, fold, index.
 //!
-//! Atoms and domains are stored in dedicated `knowledge_atoms` /
-//! `knowledge_domains` tables (V19 migration) separate from the notes/entities
-//! substrate. This lets the knowledge corpus scale to hundreds of thousands of
-//! items without polluting the general-purpose store.
-//!
-//! Verbs implemented here:
-//! - `upsert_atoms`  — bulk insert/update atoms by slug
-//! - `upsert_domains` — bulk insert/update domains (named atom groups)
-//! - `knowledge.get`    — fetch one atom or domain by ID or slug
-//! - `knowledge.list`   — paginated listing
-//! - `delete_atoms`     — soft-delete by slug
-//! - `stats`            — corpus statistics
-//! - `index`            — backfill embeddings + FTS for atoms
-//! - `fold`             — budget-constrained knapsack selection
-//! - `knowledge.search` — TF-IDF + embedding rerank (default; opt out with rerank=false)
+//! Atoms and domains live in dedicated `knowledge_atoms` / `knowledge_domains` tables
+//! (V19 migration) separate from the notes/entities substrate.
 
 pub(crate) mod matching;
 pub(crate) mod schema;
@@ -995,6 +991,52 @@ impl KnowledgeHandlers {
     ) -> Result<Value, RuntimeError> {
         let p: FoldParams = deser(params)?;
 
+        // Validate numeric fields at the public request boundary.
+        if let Some(min_score) = p.min_score {
+            if !min_score.is_finite() {
+                return Err(RuntimeError::InvalidInput(
+                    "min_score must be a finite number".into(),
+                ));
+            }
+        }
+        if let Some(bias) = p.diversity_bias {
+            if !bias.is_finite() {
+                return Err(RuntimeError::InvalidInput(
+                    "diversity_bias must be a finite number".into(),
+                ));
+            }
+        }
+        if let Some(ew) = p.epistemic_weight {
+            if !ew.is_finite() {
+                return Err(RuntimeError::InvalidInput(
+                    "epistemic_weight must be a finite number".into(),
+                ));
+            }
+        }
+        if let Some(ref cw) = p.category_weights {
+            for (k, v) in cw {
+                if !v.is_finite() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "category_weights[{k:?}] must be a finite number"
+                    )));
+                }
+            }
+        }
+        for (i, c) in p.candidates.iter().enumerate() {
+            if !c.score.is_finite() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "candidates[{i}].score must be a finite number"
+                )));
+            }
+            if let Some(ig) = c.information_gain {
+                if !ig.is_finite() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "candidates[{i}].information_gain must be a finite number"
+                    )));
+                }
+            }
+        }
+
         if p.candidates.is_empty() {
             return Ok(json!({
                 "selected": [],
@@ -1063,6 +1105,50 @@ impl KnowledgeHandlers {
         let raw_query = p.query.trim().to_string();
         if raw_query.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));
+        }
+
+        // Validate numeric fields at the public request boundary.
+        if let Some(ms) = p.min_score {
+            if !ms.is_finite() {
+                return Err(RuntimeError::InvalidInput(
+                    "min_score must be a finite number".into(),
+                ));
+            }
+        }
+        if let Some(ib) = p.intersection_bonus {
+            if !ib.is_finite() {
+                return Err(RuntimeError::InvalidInput(
+                    "intersection_bonus must be a finite number".into(),
+                ));
+            }
+        }
+        if let Some(ra) = p.rerank_alpha {
+            if !ra.is_finite() {
+                return Err(RuntimeError::InvalidInput(
+                    "rerank_alpha must be a finite number".into(),
+                ));
+            }
+        }
+        if let Some(ref w) = p.weights {
+            let pairs: &[(&str, Option<f64>)] = &[
+                ("w_exact_name", w.w_exact_name),
+                ("w_name", w.w_name),
+                ("w_description", w.w_description),
+                ("w_tags", w.w_tags),
+                ("w_content", w.w_content),
+                ("expand_discount", w.expand_discount),
+                ("coverage_alpha", w.coverage_alpha),
+                ("w_bigram", w.w_bigram),
+            ];
+            for (name, val) in pairs {
+                if let Some(v) = val {
+                    if !v.is_finite() {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "weights.{name} must be a finite number"
+                        )));
+                    }
+                }
+            }
         }
 
         let limit = p.limit.unwrap_or(10).clamp(1, 100);
@@ -2486,6 +2572,9 @@ fn atom_embed_text(atom: &Atom) -> String {
 
 // ─── section helpers ──────────────────────────────────────────────────────────
 
+// REASON: section_from_row and section_to_json are forward-deployed helpers for the
+// section-read verb surface planned in ADR-048 Phase 3; retained so the implementation
+// compiles without gaps when that verb lands.
 #[allow(dead_code)]
 fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
     let id: Uuid = row_str(row, "id")?.parse().ok()?;
@@ -2505,6 +2594,7 @@ fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
     })
 }
 
+// REASON: forward-deployed helper; see comment on section_from_row above.
 #[allow(dead_code)]
 fn section_to_json(s: &Section) -> Value {
     json!({
@@ -3047,6 +3137,19 @@ fn to_slug(stem: &str) -> String {
         .join("-")
 }
 
+/// Extract the `atlas_id:` or `atlas-id:` front-matter value from the first 32 lines.
+fn extract_atlas_id(content: &str) -> Option<String> {
+    content.lines().take(32).find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("atlas_id:")
+            .or_else(|| trimmed.strip_prefix("atlas-id:"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// Parse atlas-format markdown into (title, pre-section body, sections).
 ///
 /// Atlas markdown structure:
@@ -3069,18 +3172,6 @@ fn to_slug(stem: &str) -> String {
 /// `atom_body` is text before the first `##` heading.
 /// Each tuple in the vec is `(SectionType, heading_text, body_text)`.
 /// Headings that don't map to a `SectionType` are classified as `Other`.
-fn extract_atlas_id(content: &str) -> Option<String> {
-    content.lines().take(32).find_map(|line| {
-        let trimmed = line.trim();
-        trimmed
-            .strip_prefix("atlas_id:")
-            .or_else(|| trimmed.strip_prefix("atlas-id:"))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    })
-}
-
 fn parse_atlas_md(content: &str) -> (String, String, Vec<(SectionType, String, String)>) {
     let mut name = String::new();
     let mut pre_body = String::new();

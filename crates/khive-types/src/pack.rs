@@ -155,7 +155,7 @@ impl HandlerDef {
 #[deprecated(since = "0.2.0", note = "Use HandlerDef instead (ADR-023)")]
 pub type VerbDef = HandlerDef;
 
-/// Match spec for one end of an [`EdgeEndpointRule`] (ADR-031).
+/// Match spec for one end of an [`EdgeEndpointRule`] (ADR-017, ADR-002).
 ///
 /// Identifies a substrate + kind pair that the rule applies to. Note that
 /// `kind` strings refer to the pack-declared note kinds / entity kinds — not
@@ -168,7 +168,7 @@ pub enum EndpointKind {
     EntityOfKind(&'static str),
 }
 
-/// A pack-declared endpoint rule for a specific edge relation (ADR-031).
+/// A pack-declared endpoint rule for a specific edge relation (ADR-017, ADR-002).
 ///
 /// Rules are **additive**: they extend the set of allowed
 /// `(source, relation, target)` triples beyond the ADR-002 base contract.
@@ -277,7 +277,7 @@ pub trait Pack {
     /// MCP wire; `Visibility::Subhandler` entries are internal.
     const HANDLERS: &'static [HandlerDef];
 
-    /// Additional edge endpoint rules this pack contributes (ADR-031).
+    /// Additional edge endpoint rules this pack contributes (ADR-017, ADR-002).
     ///
     /// Defaults to empty — packs that introduce no new endpoint pairs (or
     /// only rely on the ADR-002 base contract) can ignore this.

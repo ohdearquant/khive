@@ -1,3 +1,11 @@
+// FILE SIZE JUSTIFICATION: kg.rs implements seven KG subcommands (validate, init, fetch, export,
+// import, status, hook) that all share private helpers (NDJSON I/O, rule evaluation, archive
+// building) and private test fixtures. Splitting across files would require making those helpers
+// pub(crate), increasing the API surface and breaking the invariant that each helper is only used
+// by the one command it supports. The inline test module requires pub(crate) access to private
+// validation functions (check_no_duplicate_uuids, validate_rule_pass, etc.) that are not
+// exposed even as pub(crate) — tests must be co-located to call them without relaxing visibility.
+
 //! `kkernel kg` — KG validation, init, hook management, fetch, export, import,
 //! and status (ADR-034, ADR-035, ADR-037, ADR-010, ADR-020, ADR-036).
 //!
@@ -231,6 +239,7 @@ pub enum HookCommand {
 
 // ── Output types ───────────────────────────────────────────────────────────────
 
+/// Hash-based comparison result between the DB state and on-disk NDJSON files.
 #[derive(Debug, Serialize)]
 pub struct KgStatusReport {
     pub db_hash: String,
@@ -275,6 +284,7 @@ pub struct ValidationSummary {
 
 // ── Entry points ───────────────────────────────────────────────────────────────
 
+/// Dispatch `kkernel kg` subcommands to their implementations.
 pub async fn run_kg(cmd: KgCommand) -> Result<()> {
     match cmd {
         KgCommand::Validate(args) => cmd_validate(args),
@@ -514,12 +524,35 @@ fn adapter_records_to_archive(
     })
 }
 
+/// Validate that a deserialized edge weight is finite and within [0.0, 1.0].
+///
+/// Rejects NaN, positive infinity, negative infinity, and values outside the
+/// accepted edge-weight domain defined in ADR-002.
+fn validate_edge_weight(weight: f64, edge_id: impl std::fmt::Display) -> Result<()> {
+    if !weight.is_finite() {
+        bail!(
+            "edge {} weight {weight} is not finite (NaN or infinity not allowed)",
+            edge_id
+        );
+    }
+    if !(0.0..=1.0).contains(&weight) {
+        bail!(
+            "edge {} weight {weight} is outside the valid range [0.0, 1.0] (ADR-002)",
+            edge_id
+        );
+    }
+    Ok(())
+}
+
 fn validate_archive_entity_kinds(archive: &KgArchive) -> Result<()> {
     for e in &archive.entities {
         let _: EntityKind = e
             .kind
             .parse()
             .map_err(|_| anyhow::anyhow!("unknown entity kind {:?} on entity {}", e.kind, e.id))?;
+    }
+    for edge in &archive.edges {
+        validate_edge_weight(edge.weight, edge.edge_id)?;
     }
     Ok(())
 }
@@ -552,6 +585,7 @@ fn adapter_edge_to_exported(edge: EdgeRecord, entity_ids: &HashSet<Uuid>) -> Res
         .parse()
         .with_context(|| format!("edge {} invalid relation {:?}", edge.edge_id, edge.relation))?;
 
+    validate_edge_weight(edge.weight, edge.edge_id)?;
     Ok(ExportedEdge {
         edge_id: edge.edge_id,
         source,
@@ -656,6 +690,7 @@ fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<KgArchive> {
                 .relation
                 .parse()
                 .with_context(|| format!("invalid relation {:?}", edge.relation))?;
+            validate_edge_weight(edge.weight, edge.edge_id)?;
             Ok(ExportedEdge {
                 edge_id: edge.edge_id,
                 source: edge.source,
@@ -954,33 +989,11 @@ fn check_referential_integrity(entities_path: &Path, edges_path: &Path) -> RuleR
 
 // ── Configurable rule loader (issue #382, ADR-034) ────────────────────────────
 
-/// A single configurable lint rule loaded from `rules.toml`.
+/// A single configurable lint rule loaded from `rules.toml` (ADR-034).
 ///
-/// Rules are checked against entities and edges in the KG. Each rule has:
-/// - `id`        — unique identifier (used in `RuleResult.id`)
-/// - `severity`  — "error" | "warning" | "info"
-/// - `kind`      — "entity" | "edge" (what substrate the rule applies to)
-/// - `condition` — a `key=value` equality predicate evaluated against each record
-///
-/// Example `rules.toml`:
-/// ```toml
-/// [[rules]]
-/// id = "concept-must-have-description"
-/// severity = "warning"
-/// kind = "entity"
-/// # field=value predicate: entity.kind must equal "concept"
-/// condition = "kind=concept"
-/// # require_field: the entity must have a non-empty value for this field
-/// require_field = "description"
-/// message = "Concept entities must have a description"
-///
-/// [[rules]]
-/// id = "no-self-loops"
-/// severity = "error"
-/// kind = "edge"
-/// condition = "source_id=target_id"
-/// message = "Edges must not be self-loops"
-/// ```
+/// Each rule has `id`, `severity` ("error"|"warning"|"info"), `kind` ("entity"|"edge"),
+/// an optional `condition` predicate, an optional `require_field`, and a `message`.
+/// See `crates/kkernel/docs/kg-rules.md` for the full TOML format and examples.
 #[derive(Debug, Deserialize)]
 struct RuleConfig {
     /// Unique rule ID.
@@ -1535,6 +1548,12 @@ fn hook_status(repo: &Path) -> Result<()> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+// INLINE TEST JUSTIFICATION: Tests call private validation functions
+// (check_no_duplicate_uuids, validate_rule_pass, is_safe_remote_name, etc.) and private
+// helpers that require module-private access. Moving them to crates/kkernel/tests/ would
+// require exposing those functions as pub(crate), which widens the API surface beyond what
+// the subcommand architecture intends.
 
 #[cfg(test)]
 mod tests {
@@ -2176,5 +2195,51 @@ message = "bad"
         let db_hash = khive_vcs::hash::snapshot_id_for_archive(&db_archive).unwrap();
         let ndjson_hash = khive_vcs::hash::snapshot_id_for_archive(&ndjson_archive).unwrap();
         assert_eq!(db_hash, ndjson_hash, "hashes must match after sync");
+    }
+
+    // ── edge weight validation ────────────────────────────────────────────────
+
+    #[test]
+    fn validate_edge_weight_valid_boundaries() {
+        assert!(validate_edge_weight(0.0, "edge-a").is_ok());
+        assert!(validate_edge_weight(1.0, "edge-a").is_ok());
+        assert!(validate_edge_weight(0.5, "edge-a").is_ok());
+    }
+
+    #[test]
+    fn validate_edge_weight_nan_is_rejected() {
+        let err = validate_edge_weight(f64::NAN, "edge-x").unwrap_err();
+        assert!(
+            err.to_string().contains("not finite"),
+            "expected 'not finite' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_edge_weight_infinity_is_rejected() {
+        let err = validate_edge_weight(f64::INFINITY, "edge-y").unwrap_err();
+        assert!(
+            err.to_string().contains("not finite"),
+            "expected 'not finite' in error: {err}"
+        );
+        let err = validate_edge_weight(f64::NEG_INFINITY, "edge-y").unwrap_err();
+        assert!(
+            err.to_string().contains("not finite"),
+            "expected 'not finite' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_edge_weight_out_of_range_is_rejected() {
+        let err = validate_edge_weight(1.5, "edge-z").unwrap_err();
+        assert!(
+            err.to_string().contains("outside the valid range"),
+            "expected range error: {err}"
+        );
+        let err = validate_edge_weight(-0.1, "edge-z").unwrap_err();
+        assert!(
+            err.to_string().contains("outside the valid range"),
+            "expected range error: {err}"
+        );
     }
 }

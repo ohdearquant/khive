@@ -37,7 +37,7 @@ uuid = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]

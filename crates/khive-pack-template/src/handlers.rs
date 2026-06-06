@@ -1,25 +1,27 @@
-//! Verb handler stubs for the template pack (ADR-023 §8).
-//!
-//! Replace each `unimplemented!()` with real logic. See `crates/khive-pack-kg/src/handlers.rs`
-//! for a complete reference implementation.
-//!
-//! Handler signature pattern:
-//!   `async fn handle_<verb>(runtime, token, params) -> Result<Value, RuntimeError>`
-//!
-//! Params arrive as `serde_json::Value`; deserialize via `serde_json::from_value`.
-//! Return a JSON `Value` or a `RuntimeError`. Errors are caught by the registry and
-//! returned as `{ ok: false, error: "..." }` without aborting the batch.
+//! Verb handlers for the template pack (ADR-023 §8).
 
 use serde_json::{json, Value};
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 
-/// `my_verb` — replace with real logic.
+/// `template.my_verb` — example verb demonstrating parameter validation.
+///
+/// Accepts `{ "name": "<string>" }` and returns `{ "ok": true, "name": "<string>" }`.
+/// Returns an error when `name` is absent or not a non-empty string.
 pub(crate) async fn handle_my_verb(
     _runtime: &KhiveRuntime,
     _token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    // TODO: implement
-    Ok(json!({ "ok": true, "params": params }))
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "template.my_verb requires a non-empty string field \"name\"".to_string(),
+            )
+        })?;
+
+    Ok(json!({ "ok": true, "name": name }))
 }

@@ -1,9 +1,9 @@
-//! Tests for HNSW index.
+//! Integration tests for khive-hnsw.
 
 #[cfg(test)]
 mod unit_tests {
-    use crate::NodeId;
-    use crate::{DistanceMetric, HnswConfig, HnswIndex};
+    use khive_hnsw::NodeId;
+    use khive_hnsw::{DistanceMetric, HnswConfig, HnswIndex};
     use khive_score::DeterministicScore;
 
     use std::collections::HashSet;
@@ -63,6 +63,45 @@ mod unit_tests {
         let results = index.search(&[0.0, 1.0, 0.0], 1).expect("search");
         assert_eq!(results[0].0, id);
         assert!(results[0].1.to_f64() > 0.99);
+    }
+
+    #[test]
+    fn test_update_tombstoned_node_reconnects() {
+        // When a tombstoned node is re-inserted (updated), the new vector
+        // must be searchable. A plain vector-swap on a tombstoned node leaves
+        // it unreachable because graph edges are missing.
+        let mut index = HnswIndex::new(3);
+
+        let id = make_id(1);
+        let id2 = make_id(2);
+        let id3 = make_id(3);
+
+        index.insert(id, vec![1.0, 0.0, 0.0]).expect("insert");
+        index.insert(id2, vec![0.9, 0.1, 0.0]).expect("insert id2");
+        index.insert(id3, vec![0.0, 1.0, 0.0]).expect("insert id3");
+
+        // Tombstone id
+        assert!(index.delete(id));
+        assert_eq!(index.tombstone_stats().tombstone_count, 1);
+
+        // Re-insert (update) the tombstoned ID with a new vector
+        index
+            .insert(id, vec![0.0, 0.0, 1.0])
+            .expect("re-insert tombstoned");
+
+        // The tombstone count must drop back to 0 for this ID
+        let stats = index.tombstone_stats();
+        assert_eq!(
+            stats.tombstone_count, 0,
+            "tombstone should be cleared after re-insert"
+        );
+
+        // The re-inserted node must be reachable via search
+        let results = index
+            .search(&[0.0, 0.0, 1.0], 1)
+            .expect("search after re-insert");
+        assert!(!results.is_empty(), "re-inserted node must be findable");
+        assert_eq!(results[0].0, id, "re-inserted node must be top result");
     }
 
     #[test]
@@ -457,9 +496,9 @@ mod unit_tests {
 
 #[cfg(test)]
 mod memory_budget_tests {
-    use crate::error::{ErrorKind, RetrievalError};
-    use crate::NodeId;
-    use crate::{HnswConfig, HnswIndex};
+    use khive_hnsw::error::{ErrorKind, RetrievalError};
+    use khive_hnsw::NodeId;
+    use khive_hnsw::{HnswConfig, HnswIndex};
 
     fn make_id(seed: u8) -> NodeId {
         NodeId::new([seed; 16])
@@ -631,8 +670,8 @@ mod memory_budget_tests {
 
 #[cfg(test)]
 mod proptests {
-    use crate::HnswIndex;
-    use crate::NodeId;
+    use khive_hnsw::HnswIndex;
+    use khive_hnsw::NodeId;
 
     use proptest::prelude::*;
 
@@ -748,9 +787,9 @@ mod proptests {
 
 #[cfg(test)]
 mod metrics_tests {
-    use crate::metrics::{names, MetricValue, RecordingSink};
-    use crate::HnswIndex;
-    use crate::NodeId;
+    use khive_hnsw::metrics::{names, MetricValue, RecordingSink};
+    use khive_hnsw::HnswIndex;
+    use khive_hnsw::NodeId;
 
     use std::sync::Arc;
 
@@ -944,9 +983,9 @@ mod metrics_tests {
 
 #[cfg(test)]
 mod search_context_tests {
-    use crate::search_context::HnswSearchContext;
-    use crate::NodeId;
-    use crate::{DistanceMetric, HnswConfig, HnswIndex};
+    use khive_hnsw::HnswSearchContext;
+    use khive_hnsw::NodeId;
+    use khive_hnsw::{DistanceMetric, HnswConfig, HnswIndex};
 
     fn make_id(seed: u8) -> NodeId {
         NodeId::new([seed; 16])
@@ -1330,7 +1369,24 @@ mod search_context_tests {
             .expect("pre-insert");
 
         let result = index.build_batch(vec![(make_id(1), vec![0.0, 1.0, 0.0])]);
-        assert!(result.is_err(), "should reject duplicate ID");
+        assert!(result.is_err(), "should reject ID already in index");
+    }
+
+    #[test]
+    fn test_build_batch_rejects_duplicate_ids_within_batch() {
+        // Duplicate IDs within the batch itself must be rejected before any mutation.
+        let mut index = HnswIndex::new(3);
+        let id = make_id(42);
+        let result = index.build_batch(vec![
+            (id, vec![1.0, 0.0, 0.0]),
+            (id, vec![0.0, 1.0, 0.0]), // same ID, different vector
+        ]);
+        assert!(result.is_err(), "should reject duplicate ID within batch");
+        // Index must not have been mutated.
+        assert!(
+            index.is_empty(),
+            "index should remain empty after rejection"
+        );
     }
 
     #[test]
@@ -1642,8 +1698,8 @@ mod search_context_tests {
 
 #[cfg(test)]
 mod snapshot_tests {
-    use crate::NodeId;
-    use crate::{HnswConfig, HnswIndex};
+    use khive_hnsw::NodeId;
+    use khive_hnsw::{HnswConfig, HnswIndex};
     use std::collections::HashMap;
 
     fn make_id(seed: u8) -> NodeId {
@@ -1810,7 +1866,7 @@ mod snapshot_tests {
             "serialized JSON should contain vectors field"
         );
 
-        let restored_snap: crate::checkpoint::HnswSnapshot =
+        let restored_snap: khive_hnsw::checkpoint::HnswSnapshot =
             serde_json::from_str(&json).expect("deserialize");
         assert_eq!(
             restored_snap.vectors.len(),
@@ -1844,7 +1900,7 @@ mod snapshot_tests {
             "layers": []
         }"#;
 
-        let snap: crate::checkpoint::HnswSnapshot =
+        let snap: khive_hnsw::checkpoint::HnswSnapshot =
             serde_json::from_str(old_json).expect("deserialize old snapshot");
 
         assert_eq!(snap.total_nodes, 1);
@@ -1862,14 +1918,14 @@ mod snapshot_tests {
         let mut index = HnswIndex::with_config(config);
 
         let id1 = make_id(1);
-        let snap = crate::checkpoint::HnswSnapshot {
+        let snap = khive_hnsw::checkpoint::HnswSnapshot {
             vector_count: 0,
             total_nodes: 1,
             live_nodes: 1,
             tombstone_count: 0,
             max_layer: 0,
             entry_point: Some(id1),
-            config: crate::checkpoint::HnswCheckpointConfig {
+            config: khive_hnsw::checkpoint::HnswCheckpointConfig {
                 m: 20,
                 ef_construction: 200,
                 metric: "cosine".to_string(),
@@ -1915,6 +1971,88 @@ mod snapshot_tests {
         assert_eq!(
             retrieved, updated_vector,
             "external vector should override embedded"
+        );
+    }
+
+    /// restore_from_snapshot rejects snapshot with entry_point not in indexed_ids.
+    #[test]
+    fn restore_rejects_entry_point_not_in_indexed_ids() {
+        let config = HnswConfig::with_dimensions(4);
+        let mut index = HnswIndex::with_config(config);
+
+        let id1 = make_id(1);
+        let id2 = make_id(2); // not in indexed_ids
+
+        let snap = khive_hnsw::checkpoint::HnswSnapshot {
+            vector_count: 0,
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstone_count: 0,
+            max_layer: 0,
+            entry_point: Some(id2), // not in indexed_ids!
+            config: khive_hnsw::checkpoint::HnswCheckpointConfig {
+                m: 20,
+                ef_construction: 200,
+                metric: "cosine".to_string(),
+            },
+            indexed_ids: vec![id1],
+            tombstoned_ids: vec![],
+            layers: vec![vec![(id1, vec![])]],
+            vectors: vec![(id1, vec![1.0, 0.0, 0.0, 0.0])],
+        };
+
+        let vectors = HashMap::new();
+        let result = index.restore_from_snapshot(&snap, &vectors);
+        assert!(
+            result.is_err(),
+            "should reject entry_point not in indexed_ids"
+        );
+    }
+
+    /// restore_from_snapshot rejects vectors with wrong dimensions BEFORE clearing.
+    #[test]
+    fn restore_rejects_wrong_dimensions_before_clearing() {
+        let config = HnswConfig::with_dimensions(4);
+        let mut original = HnswIndex::with_config(config.clone());
+
+        let id_orig = make_id(99);
+        original
+            .insert(id_orig, vec![1.0, 0.0, 0.0, 0.0])
+            .expect("insert");
+
+        let id1 = make_id(1);
+        // Snapshot with wrong-dimension vector
+        let snap = khive_hnsw::checkpoint::HnswSnapshot {
+            vector_count: 0,
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstone_count: 0,
+            max_layer: 0,
+            entry_point: Some(id1),
+            config: khive_hnsw::checkpoint::HnswCheckpointConfig {
+                m: 20,
+                ef_construction: 200,
+                metric: "cosine".to_string(),
+            },
+            indexed_ids: vec![id1],
+            tombstoned_ids: vec![],
+            layers: vec![vec![(id1, vec![])]],
+            vectors: vec![(id1, vec![1.0, 0.0])], // wrong dim: 2 instead of 4
+        };
+
+        let vectors = HashMap::new();
+        let result = original.restore_from_snapshot(&snap, &vectors);
+        assert!(result.is_err(), "should reject wrong dimensions");
+
+        // Original index must be unmodified
+        assert_eq!(
+            original.len(),
+            1,
+            "index should be unmodified after failed restore"
+        );
+        assert!(
+            original.get_vector(&id_orig).is_some(),
+            "original node must still be present"
         );
     }
 

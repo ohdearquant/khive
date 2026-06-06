@@ -7,6 +7,9 @@
 //!   1. Roundtrip: entities + edges survive parse → re-serialize
 //!   2. Empty input: valid JSON empty array produces zero records
 //!   3. Malformed input: invalid JSON returns a parse error, no panic
+//!
+//! Tests 9-12 cover the taxonomy and weight validation invariants added for KVA-AUD-001
+//! and KVA-AUD-002.
 
 use khive_vcs_adapters::{
     AdapterError, EdgeRecord, EntityRecord, FormatAdapter, JsonFormatAdapter,
@@ -368,6 +371,105 @@ fn test_json_adapter_edge_properties_no_double_nesting() {
         Some("high")
     );
     assert_eq!(props.get("note").and_then(|v| v.as_str()), Some("verified"));
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 — unknown entity kind returns UnknownKind (KVA-AUD-001)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_unknown_entity_kind_returns_error() {
+    // "gadget" is not in the ADR-001 closed set.
+    let mut adapter = JsonFormatAdapter::new(r#"[{"kind":"gadget","name":"X"}]"#)
+        .expect("structurally valid JSON must construct");
+    let first = adapter.entities().next().expect("one record present");
+    assert!(
+        matches!(first, Err(AdapterError::UnknownKind { kind, .. }) if kind == "gadget"),
+        "unknown kind must produce AdapterError::UnknownKind"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10 — unknown edge relation returns UnknownRelation (KVA-AUD-001)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_unknown_edge_relation_returns_error() {
+    // "related_to" is not in the ADR-002 closed set.
+    let mut adapter =
+        JsonFormatAdapter::new(r#"[{"source":"aa","target":"bb","relation":"related_to"}]"#)
+            .expect("structurally valid JSON must construct");
+    let first = adapter.edges().next().expect("one edge record present");
+    assert!(
+        matches!(first, Err(AdapterError::UnknownRelation { relation, .. }) if relation == "related_to"),
+        "unknown relation must produce AdapterError::UnknownRelation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 11 — missing kind is fatal (KVA-AUD-001)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_missing_kind_is_fatal() {
+    // Missing 'kind' must return MissingField, not silently default to "concept".
+    let mut adapter = JsonFormatAdapter::new(r#"[{"name":"NoKindEntity"}]"#)
+        .expect("structurally valid JSON must construct");
+    let first = adapter.entities().next().expect("one record present");
+    assert!(
+        matches!(first, Err(AdapterError::MissingField { field, .. }) if field == "kind"),
+        "missing 'kind' must produce AdapterError::MissingField"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 12 — edge weight out of [0.0, 1.0] returns InvalidField (KVA-AUD-002)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_edge_weight_out_of_range_returns_error() {
+    // weight < 0.0
+    let mut adapter = JsonFormatAdapter::new(
+        r#"[{
+        "source": "aa", "target": "bb", "relation": "extends", "weight": -0.1
+    }]"#,
+    )
+    .expect("structurally valid JSON");
+    let first = adapter.edges().next().expect("one edge");
+    assert!(
+        matches!(first, Err(AdapterError::InvalidField { field, .. }) if field == "weight"),
+        "weight -0.1 must produce AdapterError::InvalidField"
+    );
+
+    // weight > 1.0
+    let mut adapter2 = JsonFormatAdapter::new(
+        r#"[{
+        "source": "aa", "target": "bb", "relation": "extends", "weight": 1.1
+    }]"#,
+    )
+    .expect("structurally valid JSON");
+    let first2 = adapter2.edges().next().expect("one edge");
+    assert!(
+        matches!(first2, Err(AdapterError::InvalidField { field, .. }) if field == "weight"),
+        "weight 1.1 must produce AdapterError::InvalidField"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 13 — known kind aliases are canonicalized (KVA-AUD-001)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_kind_aliases_canonicalized() {
+    // "paper" is a recognized alias for "document" in EntityKind::from_str.
+    let mut adapter =
+        JsonFormatAdapter::new(r#"[{"kind":"paper","name":"Some Paper"}]"#).expect("valid JSON");
+    let first = adapter.entities().next().expect("one record");
+    let entity = first.expect("alias must parse as valid kind");
+    assert_eq!(
+        entity.kind, "document",
+        "alias 'paper' must canonicalize to 'document'"
+    );
 }
 
 // ---------------------------------------------------------------------------

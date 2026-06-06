@@ -1,3 +1,19 @@
+// FILE SIZE JUSTIFICATION: lib.rs exceeds 700 LOC because all 15 verb handlers
+// share access to private helper types and the `BrainPack` struct fields via
+// `&self` — splitting them across modules would require either `pub(crate)`
+// promotion of internal types or a RefCell/Arc indirection that would obscure the
+// single-Mutex concurrency contract.  The integration test suite is co-located
+// to access `help_tests` metadata and `make_brain_registry` helpers that depend
+// on private construction paths.  A future refactor can extract handlers into
+// `handlers/` submodules when the `BrainPack` field access pattern stabilises.
+
+//! Brain pack — profile-oriented Bayesian auto-tuning for khive (ADR-032).
+//!
+//! Exposes the `brain.*` verb surface over the MCP `request` tool. Profiles
+//! accumulate Beta-posterior evidence from every verb dispatch and from
+//! explicit `brain.feedback` calls. State is persisted per-namespace as
+//! content-addressed snapshots with event-log replay on load.
+
 pub mod event;
 pub mod fold;
 pub mod persist;
@@ -446,6 +462,7 @@ impl Pack for BrainPack {
 }
 
 impl BrainPack {
+    /// Create a new `BrainPack` bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
         let fold = BalancedRecallFold::new(ENTITY_CACHE_CAPACITY);
         let section_fold = SectionPosteriorFold::new();
@@ -635,11 +652,14 @@ impl BrainPack {
             })
             .transpose()?;
 
-        let profiles: Vec<&ProfileRecord> = state
+        // BRAIN-AUD-005: sort by id for deterministic output regardless of
+        // HashMap iteration order.
+        let mut profiles: Vec<&ProfileRecord> = state
             .profiles
             .values()
             .filter(|r| filter_lc.as_ref().is_none_or(|lc| &r.lifecycle == lc))
             .collect();
+        profiles.sort_by(|a, b| a.id.cmp(&b.id));
 
         let items: Vec<Value> = profiles
             .iter()
@@ -1572,6 +1592,10 @@ impl DispatchHook for BrainPack {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// INLINE TEST JUSTIFICATION: tests require direct access to BrainPack private
+// construction helpers (make_pack, make_brain_registry) and the namespace token
+// APIs, which are not re-exported.  Moving to tests/ would require pub(crate)
+// promotion of those helpers, adding coupling.
 mod tests {
     use super::*;
     use khive_runtime::{Namespace, VerbRegistryBuilder};
@@ -2511,6 +2535,13 @@ mod tests {
         let registry = empty_registry();
         let token = rt.authorize(Namespace::local()).unwrap();
 
+        // Step 0: trigger namespace load before any direct state mutations or hook fires,
+        // so ensure_loaded does not reset state after hook events are accumulated.
+        // (BRAIN-AUD-001 fix: ensure_loaded resets to a fresh state for any unloaded namespace.)
+        pack.dispatch("brain.profiles", json!({}), &registry, &token)
+            .await
+            .expect("trigger namespace load");
+
         // Step 1: accumulate state via hook-only updates (no handle_feedback).
         // This simulates the common case where brain observes external pack
         // events rather than explicit feedback calls.
@@ -2907,6 +2938,13 @@ mod tests {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
         let token = rt.authorize(Namespace::local()).unwrap();
+
+        // Trigger ensure_loaded for this namespace first, so the subsequent direct
+        // state mutation is not overwritten when dispatch calls ensure_loaded again.
+        // (BRAIN-AUD-001 fix: ensure_loaded resets state for any unloaded namespace.)
+        pack.dispatch("brain.profiles", json!({}), &registry, &token)
+            .await
+            .expect("trigger namespace load");
 
         // Force a binding directly into state (bypassing handle_bind guard) to simulate
         // a pre-existing binding that was created before the profile was archived.
@@ -4027,6 +4065,69 @@ mod tests {
         assert_eq!(result["emitted"], json!(true));
         assert_eq!(result["target_id"].as_str().unwrap_or("").len(), 36);
     }
+
+    // BRAIN-AUD-001: verify namespace isolation — state from namespace A must
+    // not be visible when dispatching under namespace B.
+    #[tokio::test]
+    async fn namespace_isolation_state_does_not_leak() {
+        use core::convert::TryFrom;
+        use khive_runtime::Namespace;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let pack = BrainPack::new(rt.clone());
+        let registry = empty_registry();
+
+        let ns_a = Namespace::try_from("ns-a").expect("namespace a");
+        let ns_b = Namespace::try_from("ns-b").expect("namespace b");
+        let token_a = rt.authorize(ns_a).expect("token a");
+        let token_b = rt.authorize(ns_b).expect("token b");
+
+        // Create a profile binding in namespace A.
+        pack.dispatch(
+            "brain.bind",
+            json!({
+                "profile_id": "balanced-recall-v1",
+                "actor": "alice-a",
+                "namespace": "ns-a",
+                "consumer_kind": "recall",
+            }),
+            &registry,
+            &token_a,
+        )
+        .await
+        .expect("bind in namespace A");
+
+        // Dispatch under namespace B — it should see a fresh state with no bindings.
+        let bindings_b = pack
+            .dispatch("brain.bindings", json!({}), &registry, &token_b)
+            .await
+            .expect("bindings in namespace B");
+
+        assert_eq!(
+            bindings_b["count"],
+            json!(0u64),
+            "namespace B must see 0 bindings; got: {bindings_b}"
+        );
+
+        // Also verify profiles list in namespace B shows only the built-in default.
+        let profiles_b = pack
+            .dispatch("brain.profiles", json!({}), &registry, &token_b)
+            .await
+            .expect("profiles in namespace B");
+
+        let count_b = profiles_b["count"].as_u64().unwrap_or(0);
+        let profiles_a = pack
+            .dispatch("brain.profiles", json!({}), &registry, &token_a)
+            .await
+            .expect("profiles in namespace A");
+        let count_a = profiles_a["count"].as_u64().unwrap_or(0);
+
+        // Both namespaces see the same built-in default (not each other's custom data).
+        assert_eq!(
+            count_b, count_a,
+            "both namespaces must see only the built-in default profile"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4443,6 +4544,50 @@ mod help_tests {
             remaining["count"],
             json!(1u64),
             "team-b binding must survive the team-a unbind"
+        );
+    }
+
+    // BRAIN-AUD-005: brain.profiles output order must be deterministic.
+    #[tokio::test]
+    async fn profiles_output_is_sorted_by_id() {
+        use khive_runtime::{Namespace, VerbRegistryBuilder};
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let pack = BrainPack::new(rt.clone());
+        let registry = VerbRegistryBuilder::new().build().expect("empty registry");
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // Create multiple profiles so there are several entries to sort.
+        pack.dispatch(
+            "brain.create_profile",
+            json!({ "name": "z-profile" }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("create z-profile");
+
+        pack.dispatch(
+            "brain.create_profile",
+            json!({ "name": "a-profile" }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("create a-profile");
+
+        let result = pack
+            .dispatch("brain.profiles", json!({}), &registry, &token)
+            .await
+            .expect("profiles list");
+
+        let profiles = result["profiles"].as_array().expect("profiles array");
+        let ids: Vec<&str> = profiles.iter().filter_map(|p| p["id"].as_str()).collect();
+
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            ids, sorted,
+            "brain.profiles must return profiles sorted by id"
         );
     }
 }

@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::types::SnapshotId;
 
+/// Errors that can occur in the khive VCS layer (snapshot hashing, NDJSON sync, remote fetch).
 #[derive(Debug, Error)]
 pub enum VcsError {
     /// The archive stored at the remote has a different hash than expected.

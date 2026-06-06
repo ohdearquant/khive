@@ -1,41 +1,18 @@
 //! Reciprocal Rank Fusion (RRF) algorithm.
 //!
-//! # Properties
-//!
-//! - Better rank → higher contribution: r1 < r2 → contrib(r1) > contrib(r2)
-//! - Present documents always outscore absent
-//! - Contribution upper bound: ≤ 1/(k+1)
-//! - Total score ≤ number of sources
-//! - Sum is permutation invariant (order-independent)
-//! - Ties broken by ID for deterministic cross-platform ordering
+//! Rank-based fusion (k=60): score = Σ 1/(k+rank). Permutation-invariant; ties broken by ID.
 
 use khive_score::{rrf_score, DeterministicScore};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-/// Reciprocal Rank Fusion (RRF) algorithm.
+/// Reciprocal Rank Fusion: combines ranked lists using only rank position, ignoring scores.
 ///
-/// Combines ranked lists using only rank information, ignoring original scores.
-/// This makes it robust to different score distributions and outliers.
+/// `score(d) = Σ 1/(k + rank_i(d))` — see `docs/algorithm.md` for derivation and k=60 rationale.
 ///
-/// # Formula
-///
-/// For each document d across all sources:
-/// ```text
-/// score(d) = Σ 1/(k + rank_i(d))
-/// ```
-/// where rank_i(d) is the 1-indexed position of d in source i.
-///
-/// # Arguments
-///
-/// * `sources` - Vector of result lists. Each list should be sorted by
-///   score descending (best first). The scores are ignored; only positions matter.
-/// * `k` - Smoothing constant. Standard value is 60.
-///
-/// # Returns
-///
-/// A vector of `(Id, DeterministicScore)` pairs sorted by RRF score descending.
+/// Sources are sorted by score descending (best first); scores are ignored, only positions matter.
+/// Ties are broken by ID ascending for deterministic cross-platform ordering.
 ///
 /// # Example
 ///
@@ -43,29 +20,12 @@ use std::hash::Hash;
 /// use khive_fusion::reciprocal_rank_fusion;
 /// use khive_score::DeterministicScore;
 ///
-/// let source1 = vec![
-///     ("doc_a", DeterministicScore::from_f64(0.9)),  // rank 1
-///     ("doc_b", DeterministicScore::from_f64(0.8)),  // rank 2
-/// ];
-/// let source2 = vec![
-///     ("doc_b", DeterministicScore::from_f64(0.95)), // rank 1
-///     ("doc_a", DeterministicScore::from_f64(0.7)),  // rank 2
-/// ];
+/// let source1 = vec![("doc_a", DeterministicScore::from_f64(0.9))];
+/// let source2 = vec![("doc_b", DeterministicScore::from_f64(0.95))];
 ///
 /// let fused = reciprocal_rank_fusion(vec![source1, source2], 60);
-///
-/// // doc_a: 1/(60+1) + 1/(60+2) = 1/61 + 1/62 ≈ 0.0326
-/// // doc_b: 1/(60+2) + 1/(60+1) = 1/62 + 1/61 ≈ 0.0326
-/// // Scores are equal since both appear at ranks 1 and 2 (just swapped)
-/// // Ties are broken by ID (lexicographic order) for determinism
+/// assert_eq!(fused.len(), 2);
 /// ```
-///
-/// **Property**: better rank → higher contribution.
-/// Better rank yields higher contribution: r1 < r2 implies 1/(k+r1) > 1/(k+r2).
-///
-/// **Property**: present > absent.
-/// Documents present in any source always outscore documents absent from all sources
-/// (absent documents have score 0, present documents have score > 0).
 pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     k: usize,
@@ -77,12 +37,24 @@ pub fn reciprocal_rank_fusion<Id: Eq + Hash + Clone + Ord>(
     // Ensure k >= 1 to avoid division issues
     let k = k.max(1);
 
-    // Estimate capacity as sum of all source lengths (upper bound on unique IDs)
-    let estimated_capacity: usize = sources.iter().map(|s| s.len()).sum();
+    // Estimate capacity as sum of all source lengths (upper bound on unique IDs).
+    // Use saturating_add to avoid usize overflow on adversarial inputs (finding #6).
+    let estimated_capacity: usize = sources
+        .iter()
+        .map(|s| s.len())
+        .fold(0usize, |acc, n| acc.saturating_add(n));
     let mut combined: HashMap<Id, DeterministicScore> = HashMap::with_capacity(estimated_capacity);
 
     for results in sources {
+        // Deduplicate IDs within the same source: keep only the best (lowest) rank
+        // so one retriever cannot vote multiple times for the same document
+        // (finding #4). We iterate in rank order (best first) and skip duplicates.
+        let mut seen_in_source: HashSet<Id> = HashSet::with_capacity(results.len());
         for (rank_0_indexed, (id, _score)) in results.into_iter().enumerate() {
+            if !seen_in_source.insert(id.clone()) {
+                // Already seen: a later (worse) occurrence — skip it.
+                continue;
+            }
             // rank is 1-indexed per ADR-002
             let rank_1_indexed = rank_0_indexed + 1;
             let contribution = rrf_score(rank_1_indexed, k);

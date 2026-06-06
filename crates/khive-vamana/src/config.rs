@@ -1,10 +1,23 @@
+//! Configuration for the Vamana ANN index.
+//!
+//! [`VamanaConfig`] holds the four algorithm parameters and validates them
+//! before any index construction. ADR-048 defines the production defaults.
+
 use crate::error::{Result, VamanaError};
 
+/// Algorithm parameters for the Vamana index build and search phases.
+///
+/// Validated by [`VamanaConfig::validate`] before any construction or search.
+/// ADR-048 defaults: `dimensions=384`, `max_degree=64`, `search_list_size=128`, `alpha=1.2`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VamanaConfig {
+    /// Dimensionality of vectors; must be > 0.
     pub dimensions: usize,
+    /// Maximum out-degree of any graph node; must be > 0.
     pub max_degree: usize,
+    /// Greedy-search candidate list capacity; must be >= `max_degree`.
     pub search_list_size: usize,
+    /// Robust-prune alpha; must be finite and >= 1.0.
     pub alpha: f64,
 }
 
@@ -20,6 +33,7 @@ impl Default for VamanaConfig {
 }
 
 impl VamanaConfig {
+    /// Validate all configuration parameters, returning an error on the first violation.
     pub fn validate(&self) -> Result<()> {
         if self.dimensions == 0 {
             return Err(VamanaError::invalid_config("dimensions must be > 0".into()));
@@ -47,6 +61,7 @@ impl VamanaConfig {
         Ok(())
     }
 
+    /// Construct and validate a config with the given `dimensions`, returning an error if invalid.
     pub fn try_with_dimensions(dimensions: usize) -> Result<Self> {
         let cfg = Self {
             dimensions,
@@ -56,6 +71,10 @@ impl VamanaConfig {
         Ok(cfg)
     }
 
+    /// Construct a config with the given dimensions. Panics on zero dimensions.
+    ///
+    /// Prefer [`try_with_dimensions`](Self::try_with_dimensions) for fallible construction
+    /// in library code.
     pub fn with_dimensions(dimensions: usize) -> Self {
         assert!(dimensions > 0, "dimensions must be > 0");
         Self {
@@ -64,16 +83,19 @@ impl VamanaConfig {
         }
     }
 
+    /// Return a copy with `dimensions` replaced; does not re-validate.
     #[must_use]
     pub fn set_dimensions(self, dimensions: usize) -> Self {
         Self { dimensions, ..self }
     }
 
+    /// Return a copy with `max_degree` replaced; does not re-validate.
     #[must_use]
     pub fn with_max_degree(self, max_degree: usize) -> Self {
         Self { max_degree, ..self }
     }
 
+    /// Return a copy with `search_list_size` replaced; does not re-validate.
     #[must_use]
     pub fn with_search_list_size(self, search_list_size: usize) -> Self {
         Self {
@@ -82,6 +104,7 @@ impl VamanaConfig {
         }
     }
 
+    /// Return a copy with `alpha` replaced; does not re-validate.
     #[must_use]
     pub fn with_alpha(self, alpha: f64) -> Self {
         Self { alpha, ..self }

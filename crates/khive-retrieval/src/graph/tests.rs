@@ -132,3 +132,79 @@ async fn shortest_path_direct_edge_includes_target() {
     assert_eq!(path[0].entity_id, a);
     assert_eq!(path[1].entity_id, b, "target node must be in path");
 }
+
+#[tokio::test]
+async fn shortest_path_max_depth_zero_returns_none_for_non_adjacent() {
+    // With max_depth=0, A → B should return None (1-hop path exceeds budget).
+    // Regression guard: the old `current_depth > max_depth` check allowed expansion
+    // at depth 0, inserting nodes at depth 1 even when max_depth was 0.
+    let store = MockLinkStore::new();
+    let ctx = test_context();
+
+    let a = EntityRef::External("P".to_string());
+    let b = EntityRef::External("Q".to_string());
+
+    store
+        .link(
+            &ctx,
+            a.clone(),
+            b.clone(),
+            "edge",
+            None::<serde_json::Value>,
+        )
+        .await
+        .unwrap();
+
+    let path = super::shortest::find_shortest_path(&store, &ctx, a.clone(), b.clone(), 0)
+        .await
+        .unwrap();
+
+    assert!(
+        path.is_none(),
+        "max_depth=0 must not return a 1-hop path; got: {path:?}"
+    );
+}
+
+#[tokio::test]
+async fn shortest_path_max_depth_respects_exact_limit() {
+    // Graph: A → B → C. max_depth=2 should find A→B→C; max_depth=1 should return None.
+    let store = MockLinkStore::new();
+    let ctx = test_context();
+
+    let a = EntityRef::External("A2".to_string());
+    let b = EntityRef::External("B2".to_string());
+    let c = EntityRef::External("C2".to_string());
+
+    store
+        .link(
+            &ctx,
+            a.clone(),
+            b.clone(),
+            "edge",
+            None::<serde_json::Value>,
+        )
+        .await
+        .unwrap();
+    store
+        .link(
+            &ctx,
+            b.clone(),
+            c.clone(),
+            "edge",
+            None::<serde_json::Value>,
+        )
+        .await
+        .unwrap();
+
+    // max_depth=2: path of length 2 (A→B→C) should be found.
+    let path = super::shortest::find_shortest_path(&store, &ctx, a.clone(), c.clone(), 2)
+        .await
+        .unwrap();
+    assert!(path.is_some(), "max_depth=2 should find A→B→C");
+
+    // max_depth=1: path requires 2 hops, must return None.
+    let path1 = super::shortest::find_shortest_path(&store, &ctx, a.clone(), c.clone(), 1)
+        .await
+        .unwrap();
+    assert!(path1.is_none(), "max_depth=1 must not find a 2-hop path");
+}

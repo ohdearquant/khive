@@ -142,6 +142,8 @@ impl std::fmt::Display for SectionType {
 // ── Section record (what the SQL stores) ─────────────────────────────────────
 
 #[derive(Debug, Clone)]
+// REASON: section_from_row and section_to_json are forward-deployed helpers retained
+// for the section-read surface planned in ADR-048 Phase 3; not yet wired to a verb.
 #[allow(dead_code)]
 pub(crate) struct Section {
     pub id: uuid::Uuid,
@@ -176,6 +178,8 @@ pub(crate) struct Atom {
     pub finalized: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    // REASON: deleted_at is stored in SQL and read when reconstructing full atom history;
+    // not yet surfaced to callers but required for soft-delete query correctness.
     #[allow(dead_code)]
     pub deleted_at: Option<i64>,
 }
@@ -202,6 +206,8 @@ pub(crate) struct Domain {
     pub members: String,
     pub created_at: i64,
     pub updated_at: i64,
+    // REASON: deleted_at is stored in SQL and read when reconstructing full domain history;
+    // not yet surfaced to callers but required for soft-delete query correctness.
     #[allow(dead_code)]
     pub deleted_at: Option<i64>,
 }
@@ -232,6 +238,9 @@ pub(crate) struct AtomInput {
 pub(crate) struct UpsertAtomsParams {
     pub atoms: Vec<AtomInput>,
     #[serde(default)]
+    // REASON: chunk_size is accepted from callers as a hint for client-side pagination;
+    // server-side chunking is not yet implemented but the field must be deserialized
+    // so callers that send it don't receive unexpected errors.
     #[allow(dead_code)]
     pub chunk_size: Option<usize>,
 }
@@ -284,6 +293,8 @@ pub(crate) struct ListParams {
 pub(crate) struct DeleteAtomsParams {
     pub ids: Vec<String>,
     #[serde(default)]
+    // REASON: cascade is accepted from callers for API forward-compatibility; cascading
+    // delete behavior is not yet implemented (atoms are soft-deleted without affecting sections).
     #[allow(dead_code)]
     pub cascade: Option<bool>,
 }
@@ -458,8 +469,4 @@ pub(crate) struct ImportParams {
     /// (entire file as one atom).
     #[serde(default)]
     pub chunk_strategy: Option<String>,
-    /// Namespace to write into.  Defaults to the caller's namespace.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub namespace: Option<String>,
 }

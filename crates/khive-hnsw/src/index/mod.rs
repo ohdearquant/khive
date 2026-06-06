@@ -1,12 +1,13 @@
+// FILE SIZE JUSTIFICATION: `mod.rs` owns the central `HnswIndex` struct and
+// all methods that span multiple logical modules (construction, quantized arena,
+// metrics wiring, snapshot serialization, accessor helpers, and the test
+// gateway for `#[should_panic]` config tests). Splitting into smaller files
+// would require exposing struct fields across module boundaries, breaking the
+// existing privacy model. The 760 LOC is structural complexity.
 //! HNSW index implementation.
 //!
-//! The core index structure with insert, delete, search, and rebuild operations.
-//!
-//! # Internal ID Scheme
-//!
-//! Internally, nodes are identified by dense `usize` indices into a `Vec<HnswNode>`.
-//! The public API uses `NodeId` (128-bit) -- conversion happens at the boundary.
-//! This gives O(1) array indexing on the search hot path instead of HashMap probing.
+//! Core structure with insert, delete, search, and rebuild operations.
+//! Nodes use dense usize indices internally; NodeId (128-bit) conversion happens at the API boundary.
 
 mod build_batch;
 mod insert;
@@ -327,9 +328,30 @@ impl HnswIndex {
     }
 
     /// Create a new HNSW index with custom configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config` fails validation. This is a programmer-only constructor
+    /// for cases where the caller has already validated the config (e.g. using
+    /// `HnswConfig::default()` or a named preset). External or deserialized
+    /// configs must use [`try_with_config`] instead.
     pub fn with_config(config: HnswConfig) -> Self {
         config.validate().expect("HNSW configuration must be valid");
+        Self::build_from_config(config)
+    }
 
+    /// Create a new HNSW index with custom configuration, returning an error
+    /// if the configuration is invalid.
+    ///
+    /// Use this constructor when the config originates from external input
+    /// (deserialization, user-provided values, etc.).
+    pub fn try_with_config(config: HnswConfig) -> crate::error::Result<Self> {
+        config.validate()?;
+        Ok(Self::build_from_config(config))
+    }
+
+    /// Internal constructor shared by `with_config` and `try_with_config`.
+    fn build_from_config(config: HnswConfig) -> Self {
         // Initialize RNG - seeded if config.seed is Some, otherwise from entropy
         let rng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
@@ -460,7 +482,10 @@ impl HnswIndex {
 
     /// Look up the internal ID for an NodeId, if it exists.
     #[inline]
-    #[allow(dead_code)] // TODO: wire into delta-merge path for cross-index lookups
+    // REASON: `internal_id` is forward-deployed for the delta-merge path
+    // (cross-index lookups for incremental HNSW merge). Not yet wired into a
+    // caller; removing it would require re-adding it when the merge path lands.
+    #[allow(dead_code)]
     pub(crate) fn internal_id(&self, id: &NodeId) -> Option<usize> {
         self.id_to_internal.get(id).copied()
     }
@@ -608,15 +633,19 @@ impl HnswIndex {
     /// - Snapshot config is incompatible with current config
     /// - Snapshot verification fails
     /// - Referenced vectors are missing from both the snapshot and the external map
+    /// - Any vector has incorrect dimensions
+    /// - Entry point is not in indexed_ids
+    /// - Snapshot layer count exceeds MAX_LEVEL
     pub fn restore_from_snapshot(
         &mut self,
         snapshot: &super::checkpoint::HnswSnapshot,
         vectors: &std::collections::HashMap<NodeId, Vec<f32>>,
     ) -> Result<(), crate::error::RetrievalError> {
         use super::checkpoint::HnswCheckpointConfig;
+        use crate::config::MAX_LEVEL;
         use crate::error::RetrievalError;
 
-        // Verify snapshot integrity
+        // Verify snapshot integrity (counts, ID consistency)
         snapshot
             .verify()
             .map_err(|e| RetrievalError::hnsw(format!("Invalid snapshot: {e}")))?;
@@ -628,6 +657,23 @@ impl HnswIndex {
                 "Snapshot config incompatible: expected {:?}, got {:?}",
                 current_config, snapshot.config
             )));
+        }
+
+        // Validate layer count before any mutation
+        if snapshot.max_layer > MAX_LEVEL {
+            return Err(RetrievalError::hnsw(format!(
+                "Snapshot max_layer {} exceeds MAX_LEVEL {}",
+                snapshot.max_layer, MAX_LEVEL
+            )));
+        }
+
+        // Validate entry point membership before any mutation
+        if let Some(ep) = snapshot.entry_point {
+            if !snapshot.indexed_ids.contains(&ep) {
+                return Err(RetrievalError::hnsw(format!(
+                    "Snapshot entry_point {ep:?} is not in indexed_ids"
+                )));
+            }
         }
 
         // Build a merged vector lookup: snapshot-embedded vectors are the base,
@@ -646,7 +692,22 @@ impl HnswIndex {
             merged_vectors.insert(*id, v.clone());
         }
 
-        // Clear current state
+        // Validate ALL vectors exist and have correct dimensions BEFORE clearing.
+        // This ensures the current index is not corrupted on error.
+        let dims = self.config.dimensions;
+        for id in &snapshot.indexed_ids {
+            let vec = merged_vectors
+                .get(id)
+                .ok_or_else(|| RetrievalError::hnsw(format!("Missing vector for ID {id:?}")))?;
+            if vec.len() != dims {
+                return Err(RetrievalError::DimensionMismatch {
+                    expected: dims,
+                    actual: vec.len(),
+                });
+            }
+        }
+
+        // All validation passed — now safe to clear current state.
         self.nodes.clear();
         self.id_to_internal.clear();
         self.internal_to_id.clear();
@@ -661,13 +722,10 @@ impl HnswIndex {
             ext_to_internal.insert(*id, idx);
         }
 
-        // Build nodes with vectors
+        // Build nodes with vectors (all validated above)
         for id in &snapshot.indexed_ids {
-            let vector = merged_vectors
-                .get(id)
-                .ok_or_else(|| RetrievalError::hnsw(format!("Missing vector for ID {id:?}")))?
-                .clone();
-
+            // SAFETY: validated above — unwrap is safe.
+            let vector = merged_vectors[id].clone();
             let level = self.calculate_level_for_restore(&snapshot.layers, id);
             let node = super::node::HnswNode::new(vector, level);
             let iid = self.nodes.len();
@@ -683,7 +741,9 @@ impl HnswIndex {
             .entry_point
             .and_then(|eid| ext_to_internal.get(&eid).copied());
 
-        // Restore neighbor connections from layers -- convert NodeId to internal usize
+        // Restore neighbor connections from layers -- convert NodeId to internal usize.
+        // Unknown neighbor IDs (not in indexed_ids) are silently dropped to handle
+        // snapshots produced by indexes with concurrent deletes.
         for (level, layer) in snapshot.layers.iter().enumerate() {
             for (node_id, neighbors) in layer {
                 if let Some(&iid) = ext_to_internal.get(node_id) {

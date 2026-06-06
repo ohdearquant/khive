@@ -4,9 +4,9 @@
 //! Pure math: no IO, no async. The runtime layer materialises the signal data
 //! and feeds it in via the candidate struct.
 //!
-//! See ADR-061 — Retrieval Infrastructure.
 //! See ADR-033 — Recall Pipeline (NoteCandidate, DecayAwareSalienceObjective,
 //!                                TemporalRecencyObjective, RerankerObjective).
+//! See ADR-030 — Layered Retrieval Architecture (signal composition model).
 
 use std::collections::HashMap;
 
@@ -412,6 +412,9 @@ impl MemoryRecallPipeline {
 
 // ────────────────────────────────────────────────────────────────────────────
 
+// INLINE TEST JUSTIFICATION: tests here exercise the scoring math on internal
+// NoteCandidate fields (raw_score, salience, recency) that are not exported.
+// Moving them to tests/ would require pub-exporting those fields.
 #[cfg(test)]
 mod tests {
     use super::*;

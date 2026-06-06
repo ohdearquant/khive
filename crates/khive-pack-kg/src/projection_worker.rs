@@ -1,24 +1,13 @@
-//! ProposalsProjectionWorker — maintains the `proposals_open` projection table.
+// FILE SIZE JUSTIFICATION: projection_worker.rs implements the full proposals_open projection
+// (Created/Reviewed/Applied/Withdrawn events). Each event handler requires its own SQL batch
+// with CAS guards. Splitting would separate related SQL patterns and the shared helper
+// (build_conditional_event_insert) from the methods that use it. Inline tests require
+// pub(crate) access to the worker's private SQL paths for CAS race coverage.
+
+//! ProposalsProjectionWorker — maintains the `proposals_open` projection table (ADR-046 §4).
 //!
-//! Subscribes to all four proposal EventKinds:
-//! - `ProposalCreated`  → INSERT with status='open'
-//! - `ProposalReviewed` → UPDATE counts; set status based on decision
-//! - `ProposalApplied`  → UPDATE status='applied'  (from 'applying' via pre-apply CAS)
-//! - `ProposalWithdrawn`→ UPDATE status='withdrawn'
-//!
-//! ADR-046 §4: The projection table is the authoritative read surface for
-//! `list(kind=proposal)`. Handlers MUST NOT write to it directly; only this
-//! worker writes projection rows.
-//!
-//! ADR-046 §3 amendment (H1): `'applying'` is a transient state used by the
-//! apply worker.  The state machine is:
-//!   open/changes_requested → approved → applying → applied
-//! `withdraw` cannot land while status='applying'.
-//!
-//! H2 fix: `reviewed_and_emit` / `withdrawn_and_emit` run the projection CAS
-//! UPDATE and the lifecycle event INSERT in a single `execute_batch` transaction,
-//! preserving the ADR-046 invariant that events are the source of truth (a
-//! committed projection state change is always backed by a corresponding event).
+//! Handles the four proposal event kinds (`Created`, `Reviewed`, `Applied`, `Withdrawn`)
+//! and is the sole writer to the projection table. Handlers MUST NOT update it directly.
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{
@@ -192,6 +181,7 @@ pub struct ProposalsProjectionWorker {
 }
 
 impl ProposalsProjectionWorker {
+    /// Create a new projection worker backed by the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }
@@ -487,32 +477,16 @@ impl ProposalsProjectionWorker {
         Ok(())
     }
 
-    /// H2 fix: atomically run the reviewed CAS UPDATE + ProposalReviewed event INSERT.
+    /// Atomically run the reviewed CAS UPDATE and `ProposalReviewed` event INSERT.
     ///
-    /// Uses `execute_batch` which wraps both SQL statements in a single
-    /// `BEGIN IMMEDIATE` / `COMMIT` transaction.  The event INSERT uses a conditional
-    /// `INSERT … SELECT … WHERE (guard)` form: if the CAS UPDATE matched 0 rows
-    /// (race lost), the INSERT is skipped.
+    /// Both statements execute in a single `BEGIN IMMEDIATE` / `COMMIT` transaction
+    /// via `execute_batch`. The CAS guard uses `changes() = 1` — see
+    /// `docs/design.md §"Proposal Projection CAS"` for the full atomicity proof.
     ///
-    /// Codex round-4 guard: `WHERE changes() = 1`.
-    /// `changes()` returns the row count from the immediately-preceding statement on
-    /// the same connection.  Since `execute_batch` runs both statements on the same
-    /// connection with no intervening operations, `changes()` at INSERT time is exactly
-    /// the UPDATE's row count.  If the UPDATE hit 1 row (this connection won the CAS),
-    /// `changes() = 1` is true and the INSERT runs.  If the UPDATE hit 0 rows (CAS
-    /// lost), `changes() = 0` and the INSERT is skipped.
-    ///
-    /// This replaces the round-3 `updated_at = <now>` subquery guard, which was unsafe
-    /// under same-microsecond concurrent calls: two callers can compute identical `now`
-    /// values before either holds the writer lock, so the loser's guard could match the
-    /// winner's committed `updated_at` and insert a duplicate event.  `changes()` is
-    /// connection-local and requires no timestamp uniqueness assumption.
-    ///
-    /// Returns `Ok((cas_hit, event_id))`.
-    /// - `cas_hit` = true when the projection row was updated AND the event was
-    ///   inserted (i.e. total_rows == 2 for state-changing decisions).
-    /// - `cas_hit` = false → no projection update, no event written.
-    /// - For `Comment` decisions (no state change), `cas_hit` is always true.
+    /// Returns `Ok((cas_hit, event_id))`:
+    /// - `cas_hit = true`: projection row was updated and event was inserted.
+    /// - `cas_hit = false`: no projection update, no event written (CAS lost).
+    /// - For `Comment` decisions (no state change), `cas_hit` is always `true`.
     pub async fn reviewed_and_emit(
         &self,
         token: &NamespaceToken,
@@ -721,10 +695,15 @@ impl ProposalsProjectionWorker {
 /// Projection row from `proposals_open`.
 #[derive(Debug, Clone)]
 pub struct ProposalRow {
+    /// UUID of the proposal as a string.
     pub proposal_id: String,
+    /// Identity of the agent that submitted the proposal.
     pub proposer: String,
+    /// Current lifecycle status: `open`, `approved`, `rejected`, `applying`, `applied`, or `withdrawn`.
     pub status: String,
+    /// Number of approve decisions recorded.
     pub approve_count: i64,
+    /// Number of reject decisions recorded.
     pub reject_count: i64,
 }
 

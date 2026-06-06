@@ -18,6 +18,7 @@ use khive_runtime::{KhiveRuntime, RuntimeConfig};
 
 // ── Subcommand tree ────────────────────────────────────────────────────────────
 
+/// Subcommands for `kkernel engine` — embedding model lifecycle management.
 #[derive(Subcommand, Debug)]
 pub enum EngineCommand {
     /// List all engines and their model history.
@@ -121,6 +122,7 @@ pub struct EngineStatus {
 
 // ── Entry point ────────────────────────────────────────────────────────────────
 
+/// Dispatch `kkernel engine` subcommands to their implementations.
 pub async fn run_engine(cmd: EngineCommand) -> Result<()> {
     match cmd {
         EngineCommand::List(args) => cmd_engine_list(args).await,

@@ -8,13 +8,18 @@ use std::string::String;
 
 use khive_types::UnknownVariant;
 
-/// Closed taxonomy for entity classification (ADR-001).
+/// Pack-local entity kind extension including `Resource` (ADR-048).
 ///
 /// `Resource` is the 9th kind added in ADR-048: actionable content agents
 /// consume — atoms, domains, skills, tools. Distinct from `Concept` which
 /// models abstract ideas and their graph relationships.
+///
+/// This type is `pub(crate)` because `khive_types::EntityKind` is the canonical
+/// public type re-exported from this pack. This local variant exists solely to
+/// support `Resource` aliasing in `FromStr` and vocabulary tests; it is not part
+/// of the public pack API.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum EntityKind {
+pub(crate) enum EntityKind {
     #[default]
     Concept,
     Document,
@@ -30,7 +35,11 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    pub const ALL: [Self; 9] = [
+    // REASON: ALL and NAMES are used exclusively in the test module below.
+    // Suppressed here because pub(crate) items in non-test code still trigger
+    // dead_code if they have no callers outside cfg(test).
+    #[allow(dead_code)]
+    pub(crate) const ALL: [Self; 9] = [
         Self::Concept,
         Self::Document,
         Self::Dataset,
@@ -42,12 +51,14 @@ impl EntityKind {
         Self::Resource,
     ];
 
-    pub const NAMES: &'static [&'static str] = &[
+    #[allow(dead_code)]
+    pub(crate) const NAMES: &'static [&'static str] = &[
         "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
         "resource",
     ];
 
-    pub const fn name(self) -> &'static str {
+    #[allow(dead_code)]
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Concept => "concept",
             Self::Document => "document",
@@ -98,15 +109,21 @@ impl std::str::FromStr for EntityKind {
 /// KG pack note kinds. Public note kind validation is canonical-only per ADR-013.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NoteKind {
+    /// A factual record or finding (default).
     #[default]
     Observation,
+    /// A derived understanding or pattern from observations.
     Insight,
+    /// An open question requiring further investigation.
     Question,
+    /// A recorded choice or resolution.
     Decision,
+    /// A pointer to an external source or citation.
     Reference,
 }
 
 impl NoteKind {
+    /// All 5 canonical note kinds in ADR-013 table order.
     pub const ALL: [Self; 5] = [
         Self::Observation,
         Self::Insight,
@@ -115,6 +132,7 @@ impl NoteKind {
         Self::Reference,
     ];
 
+    /// Canonical lowercase name strings for all note kinds.
     pub const NAMES: &'static [&'static str] = &[
         "observation",
         "insight",
@@ -123,6 +141,7 @@ impl NoteKind {
         "reference",
     ];
 
+    /// Return the canonical lowercase wire string for this note kind.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Observation => "observation",

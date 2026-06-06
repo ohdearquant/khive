@@ -1,8 +1,4 @@
-//! Event substrate — universal system log.
-//!
-//! Every verb execution produces an Event. Audit, usage metering, derived
-//! state, and evolutionary learning (edge reinforcement, traversal history)
-//! are all computed via Fold over the Event stream.
+//! Event substrate — append-only log produced by every verb execution.
 
 extern crate alloc;
 use alloc::string::String;
@@ -35,13 +31,17 @@ pub struct Event {
     pub aggregate: Option<AggregateRef>,
 }
 
+/// Outcome of a verb execution recorded in an event log entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum EventOutcome {
+    /// The verb executed successfully.
     #[default]
     Success,
+    /// The verb was denied by a policy check.
     Denied,
+    /// The verb encountered a runtime error.
     Error,
 }
 
@@ -61,35 +61,62 @@ impl fmt::Display for EventOutcome {
     }
 }
 
+/// Discriminant for the 26 typed event variants produced by the verb dispatch path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum EventKind {
+    /// Generic audit event with no structured payload.
     Audit,
+    /// A `recall` verb was executed and results were returned.
     RecallExecuted,
+    /// A rerank pass was applied to search candidates.
     RerankExecuted,
+    /// A `search` verb was executed.
     SearchExecuted,
+    /// A new directed edge was created between two nodes.
     LinkCreated,
+    /// A new entity was created.
     EntityCreated,
+    /// An existing entity was patched.
     EntityUpdated,
+    /// An entity was soft- or hard-deleted.
     EntityDeleted,
+    /// Two entities were merged (deduplication).
     EntityMerged,
+    /// A new note was created.
     NoteCreated,
+    /// An existing note was patched.
     NoteUpdated,
+    /// A note was soft- or hard-deleted.
     NoteDeleted,
+    /// An edge's relation or weight was updated.
     EdgeUpdated,
+    /// An edge was removed.
     EdgeDeleted,
+    /// A GTD task moved between lifecycle states.
     TaskTransitioned,
+    /// An explicit user feedback signal was recorded.
     FeedbackExplicit,
+    /// The brain recommended a profile resolution update.
     ProfileResolutionRecommended,
+    /// Two brain profiles were merged.
     ProfileMerged,
+    /// The active embedding model was changed.
     EmbeddingModelChanged,
+    /// An embedding migration batch completed successfully.
     EmbeddingMigrationCompleted,
+    /// An embedding migration batch failed.
     EmbeddingMigrationFailed,
+    /// Drift was detected between stored and live embeddings.
     EmbeddingDriftDetected,
+    /// A proposal was submitted for review (ADR-046).
     ProposalCreated,
+    /// A reviewer accepted, rejected, or commented on a proposal.
     ProposalReviewed,
+    /// A proposal was applied to the graph.
     ProposalApplied,
+    /// A proposal was withdrawn before it was applied.
     ProposalWithdrawn,
 }
 
@@ -230,13 +257,24 @@ impl core::str::FromStr for EventKind {
     }
 }
 
+/// A reference to the logical aggregate that an event belongs to.
+///
+/// Used to thread related events (e.g. proposal lifecycle events) into a
+/// single auditable chain identified by `kind` and `id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AggregateRef {
+    /// The aggregate type string (e.g. `"proposal"`).
     pub kind: String,
+    /// The aggregate instance identifier.
     pub id: Id128,
 }
 
+/// Typed payload for an [`Event`], dispatched by [`EventKind`].
+///
+/// The `Json` variant is a catch-all for events whose payload has not yet
+/// been promoted to a structured type. All other variants carry a concrete
+/// typed struct that can be pattern-matched without round-tripping through JSON.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
@@ -244,12 +282,18 @@ pub struct AggregateRef {
     serde(tag = "kind", content = "payload", rename_all = "snake_case")
 )]
 pub enum EventPayload {
+    /// Raw JSON payload for untyped events.
     Json(String),
+    /// Structured payload for a rerank pass event.
     RerankExecuted(RerankExecutedPayload),
+    /// Structured payload for a proposal-created event (requires `serde` feature).
     #[cfg(feature = "serde")]
     ProposalCreated(ProposalCreatedPayload),
+    /// Structured payload for a proposal-reviewed event.
     ProposalReviewed(ProposalReviewedPayload),
+    /// Structured payload for a proposal-applied event.
     ProposalApplied(ProposalAppliedPayload),
+    /// Structured payload for a proposal-withdrawn event.
     ProposalWithdrawn(ProposalWithdrawnPayload),
 }
 
@@ -259,17 +303,38 @@ impl Default for EventPayload {
     }
 }
 
+/// Payload for a rerank pass event, recording per-candidate scores.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RerankExecutedPayload {
+    /// Brain profile that served this rerank, if any.
     pub served_by_profile_id: Option<String>,
+    /// Model used for reranking.
     pub model_id: Id128,
+    /// Candidate IDs in input order.
     pub candidates: Vec<Id128>,
+    /// Per-candidate named sub-scores from the reranker.
     pub reranked: Vec<(Id128, Vec<(String, f32)>)>,
+    /// Final aggregated score per candidate.
     pub final_scores: Vec<(Id128, f32)>,
+    /// Wall-clock latency of the rerank operation in microseconds.
     pub latency_us: u64,
+    /// Whether a brain hook was applied during this rerank.
     pub hook_applied: bool,
+    /// Whether the hook matched the intended target.
     pub hook_target_match: bool,
+}
+
+impl RerankExecutedPayload {
+    /// Return `true` if all score values are finite.
+    pub fn is_valid(&self) -> bool {
+        let reranked_ok = self
+            .reranked
+            .iter()
+            .all(|(_, scores)| scores.iter().all(|(_, s)| s.is_finite()));
+        let final_ok = self.final_scores.iter().all(|(_, s)| s.is_finite());
+        reranked_ok && final_ok
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -439,13 +504,18 @@ pub struct ProposalReviewedPayload {
     pub comment: Option<String>,
 }
 
+/// A reviewer's decision on a proposal (ADR-046).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum ProposalDecision {
+    /// The reviewer approved the proposal for application.
     Approve,
+    /// The reviewer rejected the proposal; it will not be applied.
     Reject,
+    /// The reviewer left a comment without blocking the proposal.
     Comment,
+    /// The reviewer requested changes before the proposal can proceed.
     RequestChanges,
 }
 
@@ -507,6 +577,7 @@ pub struct EventBuilder {
 }
 
 impl EventBuilder {
+    /// Create a new builder for an event produced by `verb` acting on `substrate` as `actor`.
     pub fn new(
         verb: impl Into<String>,
         substrate: SubstrateKind,
@@ -524,31 +595,37 @@ impl EventBuilder {
         }
     }
 
+    /// Override the event kind discriminant.
     pub fn kind(mut self, kind: EventKind) -> Self {
         self.kind = kind;
         self
     }
 
+    /// Set the typed payload for this event.
     pub fn payload(mut self, payload: EventPayload) -> Self {
         self.payload = payload;
         self
     }
 
+    /// Set the payload schema version (defaults to 1).
     pub fn payload_schema_version(mut self, version: u32) -> Self {
         self.payload_schema_version = version;
         self
     }
 
+    /// Record the brain profile state version observed at emit time.
     pub fn profile_state_version(mut self, version: u64) -> Self {
         self.profile_state_version = Some(version);
         self
     }
 
+    /// Thread this event into an aggregate chain.
     pub fn aggregate(mut self, aggregate: AggregateRef) -> Self {
         self.aggregate = Some(aggregate);
         self
     }
 
+    /// Consume the builder and produce an [`Event`] with the given `header`.
     pub fn build(self, header: Header) -> Event {
         Event {
             header,

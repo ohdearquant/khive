@@ -31,15 +31,46 @@ fn template_pack_requires_kg() {
 }
 
 #[tokio::test]
-async fn my_verb_returns_ok() {
+async fn my_verb_returns_ok_with_valid_name() {
     let (registry, _rt) = build_registry();
 
     let result = registry
-        .dispatch("my_verb", serde_json::json!({ "hello": "world" }))
+        .dispatch("template.my_verb", serde_json::json!({ "name": "hello" }))
         .await
-        .expect("my_verb dispatches");
+        .expect("template.my_verb dispatches");
 
     assert_eq!(result["ok"], true);
+    assert_eq!(result["name"], "hello");
+}
+
+#[tokio::test]
+async fn my_verb_errors_on_missing_name() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch("template.my_verb", serde_json::json!({}))
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("name"),
+        "error should mention the missing field; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn my_verb_errors_on_empty_name() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch("template.my_verb", serde_json::json!({ "name": "" }))
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("name"),
+        "error should mention the invalid field; got: {err}"
+    );
 }
 
 #[tokio::test]

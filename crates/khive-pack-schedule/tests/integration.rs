@@ -891,3 +891,189 @@ async fn verb_registry_aggregates_schedule_schema_plan() {
         "schedule schema plan must have DDL statements"
     );
 }
+
+// ── SCH-AUD-002 regression: malformed five-field cron rejected ───────────────
+
+#[tokio::test]
+async fn sch_aud_002_malformed_five_field_cron_rejected() {
+    let (registry, _rt) = build_registry();
+
+    // Five fields but all garbage — must be rejected.
+    let err = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({
+                "content": "bad cron",
+                "at": "2099-06-01T09:00:00Z",
+                "repeat": "foo bar baz qux zap"
+            }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("repeat") || msg.contains("cron") || msg.contains("invalid"),
+        "SCH-AUD-002: malformed five-field cron must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sch_aud_002_out_of_range_cron_minute_rejected() {
+    let (registry, _rt) = build_registry();
+
+    // Minute field 99 is out of range (0–59).
+    let err = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({
+                "content": "bad minute",
+                "at": "2099-06-01T09:00:00Z",
+                "repeat": "99 * * * *"
+            }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("minute") || msg.contains("range") || msg.contains("99"),
+        "SCH-AUD-002: out-of-range minute field must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sch_aud_002_valid_wildcard_cron_accepted() {
+    let (registry, _rt) = build_registry();
+
+    // All-wildcard five-field cron must be accepted.
+    let result = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({
+                "content": "wildcard cron",
+                "at": "2099-06-01T09:00:00Z",
+                "repeat": "* * * * *"
+            }),
+        )
+        .await
+        .expect("SCH-AUD-002: all-wildcard cron must be accepted");
+    assert_eq!(result["status"], "pending");
+}
+
+#[tokio::test]
+async fn sch_aud_002_valid_numeric_cron_accepted() {
+    let (registry, _rt) = build_registry();
+
+    // 0 9 * * 1 (every Monday at 09:00) — standard five-field cron.
+    let result = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({
+                "content": "monday morning",
+                "at": "2099-06-01T09:00:00Z",
+                "repeat": "0 9 * * 1"
+            }),
+        )
+        .await
+        .expect("SCH-AUD-002: valid numeric cron must be accepted");
+    assert_eq!(result["status"], "pending");
+}
+
+// ── SCH-AUD-003 regression: agenda limit=0 and limit>200 rejected ────────────
+
+#[tokio::test]
+async fn sch_aud_003_agenda_limit_zero_rejected() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch("schedule.agenda", serde_json::json!({ "limit": 0 }))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("limit") || msg.contains("range") || msg.contains('0'),
+        "SCH-AUD-003: limit=0 must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sch_aud_003_agenda_limit_over_max_rejected() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch("schedule.agenda", serde_json::json!({ "limit": 201 }))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("limit") || msg.contains("range") || msg.contains("201"),
+        "SCH-AUD-003: limit=201 must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sch_aud_003_agenda_limit_boundary_values_accepted() {
+    let (registry, _rt) = build_registry();
+
+    // limit=1 and limit=200 are valid boundary values.
+    for limit in [1u32, 200u32] {
+        registry
+            .dispatch("schedule.agenda", serde_json::json!({ "limit": limit }))
+            .await
+            .unwrap_or_else(|e| panic!("SCH-AUD-003: limit={limit} must be accepted; got: {e}"));
+    }
+}
+
+// ── SCH-AUD-001 regression: cancel non-object properties returns error ────────
+
+#[tokio::test]
+async fn sch_aud_001_cancel_with_string_properties_returns_error() {
+    use khive_runtime::KhiveRuntime;
+    use khive_storage::Note;
+
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let tok = runtime.authorize(khive_types::Namespace::local()).unwrap();
+    let note_store = runtime.notes(&tok).expect("note store accessible");
+
+    // Insert a scheduled_event with string (non-object) properties — simulates
+    // a corrupt row that would previously cause a panic in handle_cancel.
+    let corrupt_id = uuid::Uuid::new_v4();
+    let corrupt = Note {
+        id: corrupt_id,
+        namespace: "local".to_string(),
+        kind: "scheduled_event".to_string(),
+        status: "active".to_string(),
+        name: None,
+        content: "corrupt-props".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        // Properties is a string instead of an object.
+        properties: Some(serde_json::json!("not-an-object")),
+        created_at: chrono::Utc::now().timestamp_micros(),
+        updated_at: chrono::Utc::now().timestamp_micros(),
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(corrupt)
+        .await
+        .expect("corrupt note inserted");
+
+    // cancel must return an error, NOT panic.
+    let err = registry
+        .dispatch(
+            "schedule.cancel",
+            serde_json::json!({ "id": corrupt_id.to_string() }),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("malformed") || msg.contains("properties") || msg.contains("object"),
+        "SCH-AUD-001: cancel with non-object properties must return an error, not panic; got: {msg}"
+    );
+}

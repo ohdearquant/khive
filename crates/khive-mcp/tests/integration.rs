@@ -1,6 +1,14 @@
-//! Integration tests for the request-only khive-mcp surface (ADR-020 + ADR-025).
+//! Integration tests for the request-only khive-mcp surface (ADR-016 + ADR-025).
 //!
 //! Validates the single-tool composition: every verb is reached via `request(ops="…")`.
+//!
+// FILE SIZE JUSTIFICATION: All test groups share the same in-process server
+// helpers (make_server, connect, ok_one, DummyClient, first_text, call).
+// Splitting into multiple files would require a `tests/common/` re-export
+// module and would scatter the shared setup across files without reducing
+// cognitive overhead. The single file makes it easy to verify that every
+// section exercises the same server construction path and that helper changes
+// propagate to all coverage areas simultaneously.
 
 // Force the knowledge pack to be linked (inventory::submit! requires the crate
 // to be linked into the test binary for its PackRegistration to self-register).
@@ -182,7 +190,7 @@ async fn create_entity_via_dsl() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn parallel_batch_of_independent_creates_all_succeed() -> anyhow::Result<()> {
-    // Ops inside `[...]` are dispatched in parallel (ADR-020 §dispatch).
+    // Ops inside `[...]` are dispatched in parallel (ADR-016 §dispatch).
     // This test exercises that contract with independent ops only —
     // dependent ops (e.g. create-then-list) must split across two `request`
     // calls because the list won't see the creates inside the same batch.
@@ -210,7 +218,7 @@ async fn parallel_batch_of_independent_creates_all_succeed() -> anyhow::Result<(
 async fn create_then_list_across_separate_request_calls() -> anyhow::Result<()> {
     // Create-then-read requires two `request` calls because operations inside
     // a single batch run in parallel and have no ordering guarantee
-    // (ADR-020 §dispatch).
+    // (ADR-016 §dispatch).
     let client = connect().await?;
     call(
         &client,
@@ -1859,7 +1867,7 @@ async fn startup_migrations_applied_to_fresh_file_backed_db() -> anyhow::Result<
     // crash with "no such table: proposals_open" on a fresh DB.
     //
     // Use the JSON batch form to pass the nested changeset without DSL quoting
-    // issues — the JSON form is equivalent per ADR-020 §§.
+    // issues — the JSON form is equivalent per ADR-016 §§.
     let ops = serde_json::to_string(&json!([{
         "tool": "propose",
         "args": {

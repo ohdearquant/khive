@@ -55,11 +55,13 @@ impl Note {
     }
 
     pub fn with_salience(mut self, s: f64) -> Self {
+        debug_assert!(s.is_finite(), "salience must be finite, got {s}");
         self.salience = Some(s.clamp(0.0, 1.0));
         self
     }
 
     pub fn with_decay(mut self, d: f64) -> Self {
+        debug_assert!(d.is_finite(), "decay_factor must be finite, got {d}");
         self.decay_factor = Some(d.max(0.0));
         self
     }

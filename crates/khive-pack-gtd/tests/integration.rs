@@ -1,4 +1,10 @@
 //! End-to-end tests for the GTD pack against an in-memory runtime.
+//!
+//! FILE SIZE JUSTIFICATION: All integration tests share a single `Fixture` helper and
+//! a common `pack()` factory that wires KgPack + GtdPack against an in-memory runtime.
+//! Splitting into multiple files would either duplicate this fixture or require exposing
+//! it as a separate test-helper crate. The single-file layout keeps test discovery
+//! straightforward and the shared setup code co-located with the tests that depend on it.
 
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
@@ -32,6 +38,9 @@ impl Fixture {
         self.registry.all_note_kinds()
     }
 
+    // REASON: entity_kinds() is part of the Fixture helper API and may be used in
+    // future tests; suppressing dead_code avoids noisy compiler warnings without
+    // removing useful test infrastructure.
     #[allow(dead_code)]
     fn entity_kinds(&self) -> Vec<&'static str> {
         self.registry.all_entity_kinds()
@@ -2194,5 +2203,33 @@ async fn assign_rejects_malformed_context_entity_id() {
     assert!(
         msg.contains("not-a-uuid"),
         "error must echo the malformed value; got: {msg}"
+    );
+}
+
+/// Regression for GTD-AUD-006: `gtd.next` must produce a stable, deterministic
+/// ordering even when tasks share the same priority and `created_at` timestamp.
+/// The final tie-breaker is UUID ascending so callers always observe the same order.
+#[tokio::test]
+async fn next_ordering_is_deterministic_on_equal_priority_and_timestamp() {
+    let pack = pack(rt());
+
+    // Create two tasks at the same priority. Because in-memory runtime uses
+    // microsecond timestamps, rapid successive creates may produce the same
+    // `created_at`. We create several and verify that repeated calls to
+    // `gtd.next` return them in the same order every time.
+    for title in &["task-a", "task-b", "task-c"] {
+        assign(
+            &pack,
+            json!({"title": title, "status": "next", "priority": "p1"}),
+        )
+        .await;
+    }
+
+    let first = pack.dispatch("gtd.next", json!({})).await.unwrap();
+    let second = pack.dispatch("gtd.next", json!({})).await.unwrap();
+
+    assert_eq!(
+        first, second,
+        "gtd.next must return identical ordering on repeated calls with the same task set"
     );
 }

@@ -8,6 +8,9 @@
 //!   5. `normalize_min_score` — dual-scale input (0.0–1.0 fraction or 0–100 integer).
 //!   6. `is_meaningful_query` — noise gate before embedding compute.
 //!   7. `contains_cjk` — CJK routing decision.
+// FILE SIZE JUSTIFICATION: scoring.rs bundles ScoringConfig, all normalization helpers,
+// CJK routing, and the full test suite for the scoring pipeline. The tests require access
+// to module-private helpers; splitting would require pub(crate) promotion of private fns.
 
 use std::collections::HashMap;
 

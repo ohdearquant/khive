@@ -8,6 +8,7 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
 use khive_types::{HandlerDef, Pack, ParamDef, Visibility};
 
+/// Schedule pack — stores time-triggered reminders and verb dispatches (ADR-040).
 pub struct SchedulePack {
     runtime: KhiveRuntime,
 }
@@ -128,6 +129,7 @@ static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
 ];
 
 impl SchedulePack {
+    /// Create a new `SchedulePack` backed by the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }

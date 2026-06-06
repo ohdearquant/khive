@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Default RRF constant k=60, standard in literature (Craswell et al., 2009).
+/// Default RRF constant k=60, commonly used after Cormack, Clarke,
+/// and Büttcher (SIGIR 2009).
 pub const DEFAULT_RRF_K: usize = 60;
 
 /// Fusion strategy for combining ranked result lists.

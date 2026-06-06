@@ -79,6 +79,9 @@ pub mod helpers;
 mod shortest;
 mod types;
 
+// INLINE TEST JUSTIFICATION: tests access `compat::test_context` and `compat::MockLinkStore`
+// through the module-private `use super::compat::*` import; the graph-legacy feature gate
+// means these types are not re-exported publicly, so test coverage cannot live in tests/.
 #[cfg(test)]
 mod tests;
 

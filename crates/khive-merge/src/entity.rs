@@ -1,13 +1,13 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! Entity-level three-way merge and field-level conflict analysis (ADR-043 §4).
+//! Entity-level three-way merge and field-level conflict analysis.
 
 use std::collections::{HashMap, HashSet};
 
 use khive_runtime::portability::{ExportedEntity, KgArchive};
 use uuid::Uuid;
 
-use khive_vcs::merge_engine::{BranchSide, MergeConflict};
+use crate::merge_types::{BranchSide, MergeConflict};
 
 use crate::diff_local::{diff_entities, EntityChange};
 
@@ -27,6 +27,9 @@ pub fn merge_entities(
         .chain(theirs_diff.keys())
         .copied()
         .collect();
+    // Sort for deterministic output ordering (AUD-006).
+    let mut all_ids_sorted: Vec<Uuid> = all_ids.into_iter().collect();
+    all_ids_sorted.sort();
 
     let mut merged: Vec<ExportedEntity> = Vec::new();
     let mut conflicts: Vec<MergeConflict> = Vec::new();
@@ -34,7 +37,7 @@ pub fn merge_entities(
     let base_map: HashMap<Uuid, &ExportedEntity> =
         base.entities.iter().map(|e| (e.id, e)).collect();
 
-    for id in &all_ids {
+    for id in &all_ids_sorted {
         let ours_change = ours_diff.get(id);
         let theirs_change = theirs_diff.get(id);
 
@@ -233,8 +236,10 @@ fn merge_properties(
             let mut merged: Map<String, Value> = o.clone();
             let mut conflicts = Vec::new();
             let all_keys: HashSet<&String> = o.keys().chain(t.keys()).collect();
+            let mut all_keys_sorted: Vec<&String> = all_keys.into_iter().collect();
+            all_keys_sorted.sort();
 
-            for key in all_keys {
+            for key in all_keys_sorted {
                 match (o.get(key), t.get(key)) {
                     (Some(ov), Some(tv)) if ov != tv => {
                         // Conflict: keep ours in the merged map; report both values.
@@ -305,6 +310,7 @@ mod tests {
             tags: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            entity_type: None,
         }
     }
 

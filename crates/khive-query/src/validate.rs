@@ -1,22 +1,8 @@
 //! AST validation per ADR-008 §Validation Rules.
 //!
-//! `validate` normalises an AST in place and rejects queries that violate the
-//! closed edge ontology or attempt to subvert namespace scoping:
-//!
-//! 1. **Edge relations** must parse to one of the 13 canonical [`EdgeRelation`]
-//!    variants (ADR-002). Aliases and case differences are normalised to the
-//!    canonical snake_case form stored in the database. Applies to edge
-//!    patterns *and* `WHERE e.relation = '…'` constraints.
-//! 2. **Node kinds** pass through unchanged — the query layer is pack-agnostic
-//!    (ADR-025). Kind validation is the responsibility of the service boundary,
-//!    not the query compiler.
-//! 3. **Namespace scoping is a trusted parameter only.** Queries must not name
-//!    `namespace` in node property maps or `WHERE` conditions — the only valid
-//!    source of namespace filtering is `CompileOptions::scopes`. This matches
-//!    ADR-008 §Validation: "never trust query strings to set namespaces."
-//! 4. **Traversal depth** is limited to [`MAX_DEPTH`] (10 hops). Requests that
-//!    exceed the cap are rejected with [`QueryError::InvalidInput`] at validation
-//!    time (ADR-008 §"Depth limits").
+//! Normalises edge relation aliases to canonical snake_case, rejects `namespace`
+//! in query strings (scoping is `CompileOptions::scopes` only), and caps traversal
+//! depth at [`MAX_DEPTH`] (10 hops).
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -25,6 +11,16 @@ use khive_types::EdgeRelation;
 
 use crate::ast::{Condition, ConditionValue, GqlQuery, PatternElement};
 use crate::error::QueryError;
+
+/// Closed set of valid synthetic ADR-041 observation relations.
+/// Any `observed_as_*` string not in this set is an unknown relation and must
+/// be rejected — the prefix alone does not confer validity.
+const SYNTHETIC_RELATIONS: &[&str] = &[
+    "observed_as_candidate",
+    "observed_as_selected",
+    "observed_as_target",
+    "observed_as_signal",
+];
 
 /// Maximum traversal depth allowed by the query layer (ADR-008 §Validation).
 pub const MAX_DEPTH: usize = 10;
@@ -37,6 +33,40 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
     validate_with_warnings(query).map(|_| ())
 }
 
+/// Validate the structural shape of a pattern.
+///
+/// A well-formed pattern must alternate Node/Edge/Node: odd indices are nodes,
+/// even indices (when counting from 1) are edges, and the total length is odd.
+/// A pattern with only a single node (length 1) is also valid.
+///
+/// Called both from `validate_with_warnings` (for parser-produced ASTs) and
+/// from `compile` (public API boundary — protects against hand-constructed ASTs
+/// that skip parsing).
+pub fn validate_pattern_shape(elements: &[PatternElement]) -> Result<(), QueryError> {
+    if elements.is_empty() {
+        // Empty pattern: caught separately by the compiler as "empty pattern".
+        return Ok(());
+    }
+    if elements.len().is_multiple_of(2) {
+        return Err(QueryError::Validation(
+            "pattern must alternate Node, Edge, Node, … (even element count is invalid)".into(),
+        ));
+    }
+    for (i, element) in elements.iter().enumerate() {
+        match (i % 2, element) {
+            (0, PatternElement::Node(_)) => {}
+            (1, PatternElement::Edge(_)) => {}
+            _ => {
+                return Err(QueryError::Validation(
+                    "pattern must alternate Node, Edge, Node, … (wrong element type at position)"
+                        .into(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate and normalise an AST in place, returning any warnings generated.
 ///
 /// Returns an empty `Vec<String>` for forward compatibility; no warning paths
@@ -44,6 +74,9 @@ pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
 /// rather than clamping and warning.
 pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, QueryError> {
     let warnings: Vec<String> = Vec::new();
+
+    // Structural shape check: must alternate Node/Edge/Node.
+    validate_pattern_shape(&query.pattern.elements)?;
 
     // Pattern variables are bindings — the same variable name appearing twice
     // would mean "same node/edge" and require alias-equality predicates in
@@ -90,7 +123,17 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
                     // in the closed EdgeRelation enum — skip taxonomy validation
                     // for them and leave the string unchanged.  The SQL compiler
                     // handles them via the event_observations join path.
+                    // Only the four known synthetic relations are valid; an unknown
+                    // observed_as_* string must be rejected (closes the bypass that
+                    // allowed arbitrary observed_as_bogus strings to compile as
+                    // canonical graph_edges queries).
                     if relation.starts_with("observed_as_") {
+                        if !SYNTHETIC_RELATIONS.contains(&relation.as_str()) {
+                            return Err(QueryError::Validation(format!(
+                                "unknown synthetic relation '{relation}'; valid synthetic relations: {}",
+                                SYNTHETIC_RELATIONS.join(", ")
+                            )));
+                        }
                         continue;
                     }
                     let parsed = EdgeRelation::from_str(relation)
@@ -198,6 +241,9 @@ fn validate_condition(cond: &mut Condition, is_edge: bool) -> Result<(), QueryEr
     }
 }
 
+// INLINE TEST JUSTIFICATION: Tests exercise the private VarKind enum and the
+// validate_condition helper; moving them to crates/khive-query/tests/ would require
+// making those items pub, widening the internal API surface unnecessarily.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +495,102 @@ mod tests {
             matches!(err, QueryError::InvalidInput(_)),
             "expected InvalidInput, got {err:?}"
         );
+    }
+
+    // --- Regression: observed_as_* bypass fix ---
+
+    #[test]
+    fn rejects_unknown_synthetic_relation() {
+        // observed_as_bogus is not in SYNTHETIC_RELATIONS — must be rejected, not
+        // silently compiled as a graph_edges query (closed-ontology bypass fix).
+        let mut q = gql::parse("MATCH (a)-[:observed_as_bogus]->(b) RETURN a").unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Validation(_)),
+            "expected Validation error for unknown synthetic relation, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("observed_as_bogus"),
+            "error must name the unknown relation: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_known_synthetic_relation() {
+        // All four known observed_as_* relations must pass validation.
+        for rel in &[
+            "observed_as_candidate",
+            "observed_as_selected",
+            "observed_as_target",
+            "observed_as_signal",
+        ] {
+            let input = format!("MATCH (ev)-[:{rel}]->(m) RETURN ev, m");
+            let mut q = gql::parse(&input).unwrap();
+            validate(&mut q).unwrap_or_else(|_| {
+                panic!("known synthetic relation '{rel}' must pass validation")
+            });
+        }
+    }
+
+    // --- Regression: public AST pattern shape fix ---
+
+    #[test]
+    fn validate_pattern_shape_rejects_even_element_count() {
+        use crate::ast::{EdgeDirection, EdgePattern, PatternElement};
+        // A hand-constructed AST with only an Edge element (no surrounding nodes) is malformed.
+        let elements = vec![PatternElement::Edge(EdgePattern {
+            variable: None,
+            relations: vec!["extends".to_string()],
+            direction: EdgeDirection::Out,
+            min_hops: 1,
+            max_hops: 1,
+        })];
+        let err = validate_pattern_shape(&elements).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Validation(_)),
+            "expected Validation error for even element count, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pattern_shape_rejects_wrong_type_at_position() {
+        use crate::ast::{EdgeDirection, EdgePattern, NodePattern, PatternElement};
+        use std::collections::HashMap;
+        // Edge, Node, Edge — wrong: index 0 must be Node, index 2 must be Node.
+        let make_node = || {
+            PatternElement::Node(NodePattern {
+                variable: None,
+                kind: None,
+                entity_type: None,
+                properties: HashMap::new(),
+            })
+        };
+        let make_edge = || {
+            PatternElement::Edge(EdgePattern {
+                variable: None,
+                relations: vec!["extends".to_string()],
+                direction: EdgeDirection::Out,
+                min_hops: 1,
+                max_hops: 1,
+            })
+        };
+        // Node, Node, Node — two nodes in a row at odd index is wrong
+        let elements = vec![make_node(), make_node(), make_node()];
+        let err = validate_pattern_shape(&elements).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Validation(_)),
+            "expected Validation error for Node at odd index, got {err:?}"
+        );
+        // Edge, Node, Edge — edge at even index is wrong
+        let elements2 = vec![make_edge(), make_node(), make_edge()];
+        let err2 = validate_pattern_shape(&elements2).unwrap_err();
+        assert!(
+            matches!(err2, QueryError::Validation(_)),
+            "expected Validation error for Edge at even index, got {err2:?}"
+        );
+        // Valid: Node, Edge, Node
+        let elements3 = vec![make_node(), make_edge(), make_node()];
+        validate_pattern_shape(&elements3).expect("Node, Edge, Node must be valid");
     }
 
     #[test]

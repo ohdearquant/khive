@@ -2,6 +2,14 @@
 //!
 //! Each handler: deserialize params from Value → validate → mutate via runtime
 //! → serialize a stable response shape (`id` short hex + `full_id` UUID).
+//!
+//! FILE SIZE JUSTIFICATION: All five GTD verb handlers (`assign`, `next`, `complete`,
+//! `tasks`, `transition`) share internal helpers (`load_task`, `atomic_gtd_transition`,
+//! `ensure_audit_schema`, `write_audit_record`) that access `pub(crate)` symbols and
+//! must stay co-located to avoid circular imports within the crate. Splitting by verb
+//! would require either making those helpers `pub` (which widens the API surface) or
+//! duplicating them. The file is reviewed against this invariant at each significant
+//! change; see ADR-019 for the GTD lifecycle contract.
 
 use std::str::FromStr;
 
@@ -39,11 +47,6 @@ async fn ensure_audit_schema(runtime: &KhiveRuntime) {
     };
     for stmt in &crate::GTD_SCHEMA_PLAN_STMTS {
         if let Err(e) = w.execute_script(stmt.to_string()).await {
-            // Swallow "duplicate column name" from the idempotent ALTER on existing DBs.
-            let msg = e.to_string();
-            if msg.contains("duplicate column name") {
-                continue;
-            }
             tracing::warn!(error = %e, stmt, "gtd: failed to apply lifecycle_audit schema stmt (non-fatal)");
         }
     }
@@ -726,11 +729,15 @@ impl GtdPack {
             })
             .collect();
 
-        // Sort: priority ascending (p0 first), then created_at descending (recent first).
+        // Sort: priority ascending (p0 first), then created_at descending (recent first),
+        // then UUID ascending as a deterministic tie-breaker for equal-priority equal-timestamp
+        // tasks so callers always observe a stable ordering.
         actionable.sort_by(|a, b| {
             let ap = priority_rank(a.properties.as_ref());
             let bp = priority_rank(b.properties.as_ref());
-            ap.cmp(&bp).then(b.created_at.cmp(&a.created_at))
+            ap.cmp(&bp)
+                .then(b.created_at.cmp(&a.created_at))
+                .then(a.id.cmp(&b.id))
         });
         actionable.truncate(limit as usize);
 
@@ -998,7 +1005,7 @@ impl GtdPack {
             )));
         }
 
-        // ADR-019 + ADR-101: write lifecycle audit record (best-effort).
+        // ADR-019: write lifecycle audit record (best-effort).
         ensure_audit_schema(self.runtime()).await;
         write_audit_record(
             self.runtime(),

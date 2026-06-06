@@ -1,5 +1,11 @@
 // Licensed under the Apache License, Version 2.0.
 
+// FILE SIZE JUSTIFICATION: curation.rs holds entity/note/edge patch types alongside
+// their update and merge implementations. The implementations share private helpers
+// (merge_properties, namespace checks, dedup policy) that need pub(crate) access to
+// runtime internals. Inline tests cover merge semantics that require direct access to
+// those helpers. Split plan: extract patch types into `curation/patch.rs` and merge
+// logic into `curation/merge.rs` once the dedup policy API stabilises.
 //! Curation operations: entity update/merge and edge-list filter type.
 //!
 //! See ADR-014 for the full specification and semantics.
@@ -471,10 +477,27 @@ impl KhiveRuntime {
             note.content = content;
         }
         if let Some(salience_patch) = patch.salience {
-            note.salience = salience_patch.map(|s| s.clamp(0.0, 1.0));
+            // Reject non-finite or out-of-range salience at the runtime boundary
+            // rather than silently clamping invalid caller input (coding-standards §608-622).
+            if let Some(s) = salience_patch {
+                if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                    return Err(crate::RuntimeError::InvalidInput(format!(
+                        "salience must be a finite value in [0.0, 1.0]; got {s}"
+                    )));
+                }
+            }
+            note.salience = salience_patch;
         }
         if let Some(decay_patch) = patch.decay_factor {
-            note.decay_factor = decay_patch.map(|d| d.max(0.0));
+            // Reject non-finite or negative decay_factor at the runtime boundary.
+            if let Some(d) = decay_patch {
+                if !d.is_finite() || d < 0.0 {
+                    return Err(crate::RuntimeError::InvalidInput(format!(
+                        "decay_factor must be a finite value >= 0.0; got {d}"
+                    )));
+                }
+            }
+            note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
             let (merged, _) = merge_properties(
@@ -1555,7 +1578,11 @@ fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests
+// INLINE TEST JUSTIFICATION: tests here exercise patch/merge helpers and the
+// update_note/update_entity paths that share private merge_properties logic.
+// Moving them to tests/ would require pub-exporting merge_properties, which is
+// an internal invariant not suitable for the public API surface. Broad
+// behavioral curation tests live in tests/integration.rs.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

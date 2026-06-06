@@ -1,20 +1,14 @@
+// FILE SIZE JUSTIFICATION: lib.rs declares the full KG_HANDLERS table (16 HandlerDef entries),
+// KG_EDGE_RULES, and the Pack/PackRuntime impl. The HandlerDef table is a single flat array of
+// static data — splitting it across files would require unsafe static refs or separate crates
+// without any architectural benefit. The inline test section at the bottom of this file tests
+// the KgPack dispatch surface and requires access to pack internals unavailable in a separate
+// integration test crate.
+
 //! pack-kg — Knowledge Graph verb pack for khive.
 //!
-//! Provides 15 verbs for managing entities, notes, edges, graph queries, and
-//! event-sourced proposals (ADR-046) in a research knowledge graph. This is
-//! the first-party pack shipped with the khive binary.
-//!
-//! ## Proposal worker architecture (ADR-046 §5)
-//!
-//! Proposal side-effects are handled by two workers:
-//!
-//! - [`apply_worker::ProposalApplyWorker`]: subscribes to approved proposals,
-//!   applies the changeset, emits `ProposalApplied`.
-//! - [`projection_worker::ProposalsProjectionWorker`]: maintains the
-//!   `proposals_open` projection table from all four proposal EventKinds.
-//!
-//! The KG handlers emit events first, then call the workers. Handlers do NOT
-//! update `proposals_open` directly.
+//! Provides 16 verbs for managing entities, notes, edges, graph queries, and
+//! event-sourced proposals (ADR-046). First-party pack shipped with the khive binary.
 
 pub mod apply_worker;
 pub mod entity_type_registry;
@@ -105,27 +99,10 @@ impl Pack for KgPack {
 //
 // Verbs 12-14 (propose, review, withdraw) added per ADR-046 (cluster-22).
 // Verb 15 (verbs) added for top-level verb discovery (ue-help-introspection H5).
+// Verb 16 (stats) added for namespace statistics.
 //
-// Issue #497 — Visibility audit:
-//   All 16 KG handlers are intentionally `Visibility::Verb` (agent-callable via
-//   the MCP `request` DSL).  There are NO `Visibility::Subhandler` entries in
-//   this pack.  Rationale:
-//
-//   - The KG pack has no operator-only introspection or internal plumbing that
-//     needs to be hidden from the agent surface.  Every verb is a first-class
-//     operation that agents are expected to invoke directly.
-//   - propose / review / withdraw (ADR-046) are deliberate agent-facing verbs:
-//     proposals flow from agents who must be able to call all three steps.  If a
-//     future requirement introduces an operator-only "admin_apply" or "force_reject"
-//     escape hatch it should be added as Visibility::Subhandler at that point.
-//   - The `verbs` introspection verb is agent-callable by design: it implements
-//     the self-describing verb catalog (ue-help-introspection H5) and explicitly
-//     filters out Subhandler entries before responding, so adding any future
-//     Subhandler entries here would automatically hide them from that output.
-//
-//   Packs with confirmed Subhandler entries as of this audit:
-//   - pack-memory: recall_embed, recall_candidates, recall_fuse, recall_rerank, recall_score
-//   - pack-brain: brain.state, brain.config, brain.events, brain.emit (deprecated)
+// Issue #497 — Visibility audit: all 16 handlers are Visibility::Verb.
+// Full rationale in docs/design.md §"Verb Visibility Audit".
 static KG_HANDLERS: [HandlerDef; 16] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
@@ -819,6 +796,7 @@ fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Value, Runtime
 }
 
 impl KgPack {
+    /// Create a new KG pack backed by the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }

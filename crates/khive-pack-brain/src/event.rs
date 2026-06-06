@@ -1,3 +1,8 @@
+//! Brain event interpretation — converts raw `Event` records into feedback signals.
+//!
+//! `interpret` maps every verb+outcome combination to a typed `BrainSignal` that
+//! the fold implementations consume. No mutable state lives here.
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

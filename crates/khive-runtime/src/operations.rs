@@ -1,3 +1,11 @@
+// FILE SIZE JUSTIFICATION: operations.rs is the single coherent surface for all
+// runtime verb implementations (create, get, list, search, link, traverse, query,
+// recall, etc.). All verbs share internal helpers (namespace checks, edge validation,
+// canonical-endpoint logic) that require pub(crate) access — splitting into submodules
+// would require pub(crate) re-exports across every helper or circular dependencies.
+// Inline tests exercise those private helpers directly. Split plan: once the verb
+// surface stabilises post-ADR-030 retrieval refactor, group by substrate (entity,
+// note, edge, search) into submodules under an `operations/` directory.
 //! High-level operations composing storage capabilities into user-facing verbs.
 
 use std::collections::HashMap;
@@ -730,6 +738,12 @@ impl KhiveRuntime {
         weight: f64,
         metadata: Option<serde_json::Value>,
     ) -> RuntimeResult<Edge> {
+        // Reject non-finite or out-of-range weight before any storage write.
+        if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "link weight must be a finite value in [0.0, 1.0]; got {weight}"
+            )));
+        }
         self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
@@ -1108,6 +1122,23 @@ impl KhiveRuntime {
             if !self.substrate_exists_in_ns(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(
                     "create_note annotates target {target_id} not found in namespace"
+                )));
+            }
+        }
+
+        // Reject non-finite or out-of-range salience/decay at the runtime boundary
+        // rather than letting storage silently clamp them (coding-standards §508-516).
+        if let Some(s) = salience {
+            if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "salience must be a finite value in [0.0, 1.0]; got {s}"
+                )));
+            }
+        }
+        if let Some(d) = decay_factor {
+            if !d.is_finite() || d < 0.0 {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "decay_factor must be a finite value >= 0.0; got {d}"
                 )));
             }
         }
@@ -1924,7 +1955,14 @@ impl KhiveRuntime {
             changed_fields.push("relation");
         }
         if let Some(w) = patch.weight {
-            edge.weight = w.clamp(0.0, 1.0);
+            // Reject non-finite or out-of-range weight explicitly; do not silently
+            // clamp invalid caller input (coding-standards §608-622).
+            if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "edge weight must be a finite value in [0.0, 1.0]; got {w}"
+                )));
+            }
+            edge.weight = w;
             changed_fields.push("weight");
         }
         if let Some(props) = patch.properties {
@@ -2292,6 +2330,11 @@ pub struct LinkSpec {
     pub metadata: Option<serde_json::Value>,
 }
 
+// INLINE TEST JUSTIFICATION: tests here exercise private helpers (canonical_edge_endpoints,
+// validate_edge_metadata, merge_dependency_kind, link-fail injection) and runtime methods
+// that require pub(crate) KhiveRuntime construction. Moving them to tests/ would require
+// pub-exporting those private helpers, which would widen the crate's public API surface
+// undesirably. Broad behavioral tests live in tests/integration.rs.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,6 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! Last-write-wins shortcut strategies (ADR-043 §8).
+//! Last-write-wins shortcut strategies.
 
 use khive_runtime::portability::KgArchive;
 
@@ -92,6 +92,7 @@ mod tests {
             tags: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            entity_type: None,
         }
     }
 

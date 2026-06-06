@@ -1,7 +1,4 @@
-//! Core `DeterministicScore` — fixed-point integer scoring (ADR-006).
-//!
-//! Cross-platform deterministic by converting f64 to i64 with 2^32 scaling.
-//! NaN → 0 (neutral ranking), +Inf → MAX, -Inf → NEG_INF.
+//! `DeterministicScore` — f64-to-i64 fixed-point scoring with cross-platform determinism (ADR-006).
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -10,14 +7,35 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, Div, Mul, Sub};
 
+/// Fixed-point score with cross-platform deterministic ordering (ADR-006).
+///
+/// Wraps an `i64` scaled by `2^32`; use [`from_f64`][Self::from_f64] /
+/// [`to_f64`][Self::to_f64] to convert, and prefer arithmetic methods to raw
+/// integer manipulation.
 #[derive(Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 #[repr(transparent)]
 pub struct DeterministicScore(i64);
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for DeterministicScore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = i64::deserialize(deserializer)?;
+        DeterministicScore::from_raw_checked(raw).ok_or_else(|| {
+            serde::de::Error::custom(
+                "DeterministicScore raw value i64::MIN is the reserved sentinel and cannot be stored as a runtime value"
+            )
+        })
+    }
+}
 
 impl DeterministicScore {
     const SCALE: f64 = 4_294_967_296.0; // 2^32
 
+    /// Highest representable score (`i64::MAX`); maps to `+Infinity` in float conversion.
     pub const MAX: Self = Self(i64::MAX);
     /// Reserved raw sentinel at `i64::MIN`. Public arithmetic and float conversion
     /// never produce this value — see `NEG_INF` for the lowest reachable score.
@@ -27,18 +45,59 @@ impl DeterministicScore {
     /// Lowest reachable runtime score (= `i64::MIN + 1`). Underflow clamps here,
     /// `-Infinity` maps here. Distinct from `MIN`, which is reserved.
     pub const NEG_INF: Self = Self(i64::MIN + 1);
+    /// Score of exactly zero.
     pub const ZERO: Self = Self(0);
 
+    /// Construct from a raw `i64` value without validation.
+    ///
+    /// # Warning
+    ///
+    /// Passing `i64::MIN` constructs the reserved `MIN` sentinel, which violates
+    /// the "runtime values exclude MIN" proof boundary (ADR-006).  Serialized
+    /// data from untrusted sources MUST NOT use this constructor.
+    ///
+    /// Prefer [`from_raw_saturating`][Self::from_raw_saturating] (maps `i64::MIN`
+    /// to `NEG_INF`) or [`from_raw_checked`][Self::from_raw_checked] (returns
+    /// `None` for `i64::MIN`) for safe construction from untrusted values.
     #[inline]
     pub const fn from_raw(raw: i64) -> Self {
         Self(raw)
     }
 
+    /// Construct from a raw `i64`, mapping the reserved `i64::MIN` sentinel to
+    /// [`NEG_INF`][Self::NEG_INF].
+    ///
+    /// Use this when reading from storage or deserializing data where `i64::MIN`
+    /// should be treated as "negative infinity" rather than an invalid sentinel.
+    #[inline]
+    pub const fn from_raw_saturating(raw: i64) -> Self {
+        if raw == i64::MIN {
+            Self::NEG_INF
+        } else {
+            Self(raw)
+        }
+    }
+
+    /// Construct from a raw `i64`, returning `None` if `raw == i64::MIN`.
+    ///
+    /// Use this for strict invariant enforcement at deserialization boundaries
+    /// where `i64::MIN` is always a protocol error.
+    #[inline]
+    pub const fn from_raw_checked(raw: i64) -> Option<Self> {
+        if raw == i64::MIN {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
+
+    /// Return the underlying `i64` fixed-point representation.
     #[inline]
     pub const fn to_raw(self) -> i64 {
         self.0
     }
 
+    /// Convert an `f64` to a `DeterministicScore` (NaN → ZERO, ±Inf → MAX/NEG_INF).
     #[inline]
     pub fn from_f64(val: f64) -> Self {
         if val.is_nan() {
@@ -56,11 +115,13 @@ impl DeterministicScore {
         Self::from_rounded_arithmetic(scaled)
     }
 
+    /// Convert an `f32` to a `DeterministicScore` via `from_f64`.
     #[inline]
     pub fn from_f32(val: f32) -> Self {
         Self::from_f64(val as f64)
     }
 
+    /// Convert this score back to `f64` (sentinels map to ±Infinity).
     #[inline]
     pub fn to_f64(self) -> f64 {
         if self.0 == Self::MAX.0 {
@@ -72,6 +133,7 @@ impl DeterministicScore {
         self.0 as f64 / Self::SCALE
     }
 
+    /// Return `true` if the score is the `MAX` or `NEG_INF` sentinel.
     #[inline]
     pub const fn is_infinite(self) -> bool {
         self.0 == Self::MAX.0 || self.0 == Self::NEG_INF.0
@@ -384,5 +446,80 @@ mod tests {
         let result = DeterministicScore::from_raw(i64::MIN + 1) - DeterministicScore::from_raw(1);
         assert_eq!(result, DeterministicScore::NEG_INF);
         assert_ne!(result, DeterministicScore::MIN);
+    }
+
+    // ── from_raw_saturating / from_raw_checked ────────────────────────────────
+
+    #[test]
+    fn from_raw_saturating_min_maps_to_neg_inf() {
+        let s = DeterministicScore::from_raw_saturating(i64::MIN);
+        assert_eq!(
+            s,
+            DeterministicScore::NEG_INF,
+            "i64::MIN must saturate to NEG_INF, not the reserved MIN sentinel"
+        );
+    }
+
+    #[test]
+    fn from_raw_saturating_neg_inf_raw_is_identity() {
+        let s = DeterministicScore::from_raw_saturating(i64::MIN + 1);
+        assert_eq!(s, DeterministicScore::NEG_INF);
+    }
+
+    #[test]
+    fn from_raw_saturating_normal_value_is_identity() {
+        let s = DeterministicScore::from_raw_saturating(42);
+        assert_eq!(s.to_raw(), 42);
+    }
+
+    #[test]
+    fn from_raw_checked_min_returns_none() {
+        assert!(
+            DeterministicScore::from_raw_checked(i64::MIN).is_none(),
+            "i64::MIN should be rejected by from_raw_checked"
+        );
+    }
+
+    #[test]
+    fn from_raw_checked_valid_value_returns_some() {
+        let s = DeterministicScore::from_raw_checked(i64::MIN + 1).unwrap();
+        assert_eq!(s, DeterministicScore::NEG_INF);
+    }
+
+    #[test]
+    fn from_raw_checked_zero_returns_some() {
+        let s = DeterministicScore::from_raw_checked(0).unwrap();
+        assert_eq!(s, DeterministicScore::ZERO);
+    }
+
+    // ── serde: custom Deserialize rejects i64::MIN ────────────────────────────
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_deserialize_rejects_i64_min() {
+        let raw_json = format!("{}", i64::MIN);
+        let result: Result<DeterministicScore, _> = serde_json::from_str(&raw_json);
+        assert!(
+            result.is_err(),
+            "deserializing i64::MIN must fail: got {:?}",
+            result
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_deserialize_accepts_neg_inf_raw() {
+        let raw_json = format!("{}", i64::MIN + 1);
+        let s: DeterministicScore = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(s, DeterministicScore::NEG_INF);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_roundtrip_zero() {
+        let original = DeterministicScore::ZERO;
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: DeterministicScore = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
     }
 }

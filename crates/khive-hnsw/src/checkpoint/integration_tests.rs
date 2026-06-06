@@ -1,3 +1,7 @@
+// INLINE TEST JUSTIFICATION: Checkpoint integration tests access non-public
+// snapshot fields and internal store types. The `checkpoint` feature gate
+// means the relevant types only exist in this module; moving to `tests/` would
+// require re-exporting internals or losing the feature-gated coverage.
 use super::*;
 use khive_fold::{Checkpoint, CheckpointStore, FoldContext, InMemoryCheckpointStore};
 use uuid::Uuid;

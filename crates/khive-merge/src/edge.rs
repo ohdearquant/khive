@@ -1,13 +1,13 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! Edge-level three-way merge and dangling-edge validation (ADR-043 §5).
+//! Edge-level three-way merge and dangling-edge validation.
 
 use std::collections::{HashMap, HashSet};
 
 use khive_runtime::portability::{ExportedEdge, KgArchive};
 use uuid::Uuid;
 
-use khive_vcs::merge_engine::{BranchSide, MergeConflict};
+use crate::merge_types::{BranchSide, MergeConflict};
 use khive_vcs::VcsError;
 
 use crate::diff_local::{diff_edges, EdgeChange, EdgeKey};
@@ -33,12 +33,20 @@ pub fn merge_edges(
         .chain(theirs_diff.keys())
         .cloned()
         .collect();
+    // Sort for deterministic output ordering (AUD-006).
+    let mut all_keys_sorted: Vec<EdgeKey> = all_keys.into_iter().collect();
+    all_keys_sorted.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then(a.target.cmp(&b.target))
+            .then(a.relation.cmp(&b.relation))
+    });
 
     let mut merged: Vec<ExportedEdge> = Vec::new();
     let mut conflicts: Vec<MergeConflict> = Vec::new();
 
     // Build edge lookups so we can retrieve the original edge_id when
-    // constructing merged edges (ADR-048 D1: preserve edge identity).
+    // constructing merged edges (edge identity must survive merge/diff cycles).
     let base_edge_map: HashMap<EdgeKey, &ExportedEdge> = base
         .edges
         .iter()
@@ -55,7 +63,7 @@ pub fn merge_edges(
         .map(|e| (EdgeKey::from_edge(e), e))
         .collect();
 
-    for key in &all_keys {
+    for key in &all_keys_sorted {
         let ours_change = ours_diff.get(key);
         let theirs_change = theirs_diff.get(key);
 
@@ -81,7 +89,7 @@ pub fn merge_edges(
 
             // Added in both with same weight → include once.
             (Some(EdgeChange::Added(e_ours)), Some(EdgeChange::Added(e_theirs))) => {
-                // Auto-resolve: max weight wins (ADR-017 §6.2 `duplicate_edge_weight`).
+                // Auto-resolve: max weight wins (last-write-wins on weight conflicts).
                 let weight = f64::max(e_ours.weight, e_theirs.weight);
                 let mut edge = e_ours.clone();
                 edge.weight = weight;

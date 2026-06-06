@@ -1,3 +1,10 @@
+// FILE SIZE JUSTIFICATION: This file tests 8 specific audit fix scenarios (W1, D1, W5, W6,
+// W8, W9, W10, S4, F1) that each require independent runtime setup and teardown. Each test
+// verifies a distinct invariant (namespace isolation, upsert dedup, delete, edit, challenge,
+// adjudicate, fold, search) that spans multiple handler interactions. Grouping these into a
+// single file ensures shared helper utilities (runtime setup, pack registration) are not
+// duplicated, and each scenario remains traceable to its originating audit item.
+
 //! Integration tests for the 8 audit fixes: W1, D1, W5, W6, W8, W9, W10, S4, F1.
 //!
 //! All tests use fresh in-memory runtimes — no shared state, no production DB.

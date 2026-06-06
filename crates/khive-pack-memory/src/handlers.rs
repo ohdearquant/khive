@@ -1,3 +1,12 @@
+//! Verb handler implementations for `memory.remember` and `memory.recall` pipeline stages.
+// FILE SIZE JUSTIFICATION: handlers.rs implements the full recall pipeline as a single
+// coherent unit — parameter parsing, candidate collection, FTS/ANN retrieval, fusion,
+// reranking, and scoring are deeply coupled through shared intermediate types (NoteCandidate,
+// RerankFeatures, ScoreBreakdown). Splitting into sub-modules would require pub(crate)
+// exports of dozens of internal types that are intentionally private, and would fragment
+// the pipeline in a way that makes ADR-021/ADR-033 contract auditing harder. Refactoring
+// is tracked as a longer-term work item; this file should not grow beyond its current size.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -386,7 +395,8 @@ fn search_source_label(source: SearchSource) -> &'static str {
 /// (~12ms of the 15ms p50 warm path at 10k).  Only diagnostic verbs that surface
 /// snippet text to callers should use `Include`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TextSnippetPolicy {
+#[doc(hidden)]
+pub enum TextSnippetPolicy {
     Omit,
     Include { chars: usize },
 }
@@ -624,7 +634,8 @@ const RECALL_FTS_TERM_FANOUT_LIMIT: usize = 10;
 /// MATCH probes so that notes containing ANY single term enter the candidate
 /// pool — whereas a plain conjunction MATCH only returns notes containing ALL
 /// terms.
-fn recall_text_terms(query: &str) -> Vec<String> {
+#[doc(hidden)]
+pub fn recall_text_terms(query: &str) -> Vec<String> {
     recall_text_terms_with_limit(query, RECALL_FTS_TERM_FANOUT_LIMIT)
 }
 
@@ -654,6 +665,9 @@ impl MemoryPack {
     /// When fts_gather.enabled, delegates term selection and gather-mode
     /// routing to `text_gather::collect_text_hits`. Otherwise uses the
     /// existing ranked AnyTerm path.
+    // REASON: the signature is dictated by the caller's independent arguments (token,
+    // query string, namespace, limit, snippet policy, CJK flag, gather config); a
+    // parameter struct would add boilerplate without improving clarity at call sites.
     #[allow(clippy::too_many_arguments)]
     async fn collect_recall_text_hits(
         &self,
@@ -1086,11 +1100,12 @@ impl MemoryPack {
             Some(v) => v,
             None => 0.5,
         };
-        // F108: decay_factor must be >= 0; no upper clamp per ADR-021
+        // F108: decay_factor must be finite and >= 0; no upper clamp per ADR-021.
+        // NaN and Infinity are rejected because they would corrupt decay calculations.
         let decay_factor = match p.decay_factor {
-            Some(v) if v < 0.0 => {
+            Some(v) if !v.is_finite() || v < 0.0 => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "decay_factor must be >= 0, got {v}"
+                    "decay_factor must be a finite number >= 0, got {v}"
                 )));
             }
             Some(v) => v,
@@ -2189,6 +2204,19 @@ impl MemoryPack {
             config: Option<RecallConfig>,
         }
         let p: ScoreParams = deser(params)?;
+        // Reject non-finite feature values that would corrupt scoring output.
+        for (name, val) in [
+            ("rrf", p.rrf),
+            ("salience", p.salience),
+            ("decay_factor", p.decay_factor),
+            ("age_days", p.age_days),
+        ] {
+            if !val.is_finite() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "{name} must be a finite number, got {val}"
+                )));
+            }
+        }
         let cfg = p.config.unwrap_or_else(|| self.active_config());
         cfg.validate()?;
         let pipeline = make_pipeline(&cfg);
@@ -2209,6 +2237,10 @@ impl MemoryPack {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// INLINE TEST JUSTIFICATION: these tests exercise private helper functions
+// (TextSnippetPolicy, recall_text_terms, normalize_min_score, compute_score)
+// that are not exposed through the public API and require access to pub(crate)
+// or module-private types that cannot be reached from crates/khive-pack-memory/tests/.
 #[cfg(test)]
 mod tests {
     use super::*;

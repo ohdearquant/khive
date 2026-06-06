@@ -1,16 +1,8 @@
 //! khive-fold: Cognitive primitives — Fold, Anchor, Objective, Selector.
 //!
-//! Four cognitive primitives that form the "paper-folding" operation:
-//!
-//! - **Fold**: `entries → derived state` (deterministic reduce)
-//! - **Anchor**: causal graph traversal (provenance chains)
-//! - **Objective**: score candidates and select best
-//! - **Selector**: budget-constrained pack (many → subset)
-//!
-//! Plus deterministic ordering primitives, composition combinators,
-//! and common strategies (Recency, Relevance, Weighted, etc.).
-//!
-//! # Quick Start
+//! Fold, Anchor, Objective, and Selector primitives plus deterministic ordering
+//! and composition combinators. See [`docs/design.md`](../docs/design.md) for
+//! module map, invariants, dependency boundary, and failure modes.
 //!
 //! ```
 //! use khive_fold::{fold_fn, Fold, FoldContext};
@@ -19,9 +11,7 @@
 //!     |_ctx| 0usize,
 //!     |count, _entry: &i32, _ctx| count + 1,
 //! );
-//!
-//! let entries = [1, 2, 3, 4, 5];
-//! let result = counter.derive(entries.iter(), &FoldContext::new());
+//! let result = counter.derive([1, 2, 3, 4, 5].iter(), &FoldContext::new());
 //! assert_eq!(result.state, 5);
 //! ```
 
@@ -87,8 +77,11 @@ pub use ordering::{
 
 /// Pipeline that scores candidates with an objective then packs to budget via a selector.
 pub struct ComposePipeline<T> {
+    /// Graph anchor used for causal provenance traversal before scoring.
     pub anchor: Box<dyn Anchor>,
+    /// Objective that assigns scores to each candidate.
     pub objective: Box<dyn Objective<T>>,
+    /// Selector that packs the scored candidates under a budget.
     pub selector: Box<dyn Selector<T>>,
 }
 

@@ -2,66 +2,8 @@
 //! backend for [`khive_gate::Gate`], powered by
 //! [`regorus`](https://crates.io/crates/regorus).
 //!
-//! # Policy contract
-//!
-//! Policies see `GateRequest` as JSON on `input`:
-//!
-//! ```text
-//! input.actor.kind        # "user" | "agent" | "lambda" | "anonymous" | ...
-//! input.actor.id          # caller id
-//! input.namespace         # khive namespace as a string
-//! input.verb              # verb being dispatched
-//! input.args              # raw JSON args for the verb
-//! input.context.session_id   # optional
-//! input.context.timestamp    # optional RFC3339
-//! input.context.source       # optional ("mcp", "cli", ...)
-//! ```
-//!
-//! Policies MUST define a `decision` rule under package `khive.gate` (or
-//! a custom entrypoint set via [`RegoGate::with_entrypoint`]). The rule
-//! must produce an object matching
-//! [`GateDecision`](khive_gate::GateDecision)'s JSON shape:
-//!
-//! ```rego
-//! package khive.gate
-//!
-//! import rego.v1
-//!
-//! default decision := {"decision": "deny", "reason": "no rule matched"}
-//!
-//! decision := {"decision": "allow", "obligations": []} if {
-//!     input.actor.kind == "user"
-//!     input.namespace  == "ocean"
-//! }
-//! ```
-//!
-//! # Quick start
-//!
-//! ```
-//! use std::sync::Arc;
-//! use khive_gate::{ActorRef, Gate, GateRef, GateRequest};
-//! use khive_gate_rego::RegoGate;
-//! use khive_types::Namespace;
-//! use serde_json::json;
-//!
-//! let policy = r#"
-//!     package khive.gate
-//!     import rego.v1
-//!     default decision := {"decision": "deny", "reason": "default"}
-//!     decision := {"decision": "allow", "obligations": []} if {
-//!         input.verb == "search"
-//!     }
-//! "#;
-//!
-//! let gate: GateRef = Arc::new(RegoGate::from_policy_str(policy).unwrap());
-//! let req = GateRequest::new(
-//!     ActorRef::anonymous(),
-//!     Namespace::local(),
-//!     "search",
-//!     json!({"query": "LoRA"}),
-//! );
-//! assert!(gate.check(&req).unwrap().is_allow());
-//! ```
+//! See [`docs/protocol.md`](../docs/protocol.md) for the full policy contract,
+//! input/decision shape, entrypoint rules, and fail-open semantics (ADR-018).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -78,8 +20,9 @@ const INLINE_POLICY_NAME: &str = "inline.rego";
 ///
 /// Construct with [`Self::from_policy_str`] for a single inline policy or
 /// [`Self::from_dir`] to load every `.rego` file under a directory. Override
-/// the rule path with [`Self::with_entrypoint`] if your policy doesn't use
-/// the default `data.khive.gate.decision` package.
+/// the rule path with [`Self::try_with_entrypoint`] (operator configuration) or
+/// [`Self::with_entrypoint`] (programmatic, pre-validated use) when your policy
+/// doesn't use the default `data.khive.gate.decision` package.
 ///
 /// The engine is held behind a `Mutex` because `regorus::Engine::eval_rule`
 /// requires `&mut self`. This serializes evaluations on the dispatch hot path;
@@ -122,7 +65,13 @@ impl RegoGate {
             .map_err(|e| GateError::Policy(format!("read_dir {dir}: {e}", dir = dir.display())))?;
 
         let mut paths: Vec<_> = read
-            .filter_map(Result::ok)
+            .map(|entry| {
+                entry.map_err(|e| {
+                    GateError::Policy(format!("read_dir entry in {dir}: {e}", dir = dir.display()))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|ext| ext == "rego"))
             .collect();
@@ -149,9 +98,40 @@ impl RegoGate {
 
     /// Override the rule path the gate evaluates (default
     /// `data.khive.gate.decision`).
+    ///
+    /// This method is infallible and intended for programmatic use with
+    /// already-validated entrypoints. For operator-supplied configuration
+    /// use [`Self::try_with_entrypoint`] instead, which rejects empty,
+    /// whitespace-only, or non-`data.`-prefixed strings before the gate
+    /// is installed — preventing a misconfigured entrypoint from causing
+    /// fail-open dispatch errors at runtime (ADR-018).
     pub fn with_entrypoint(mut self, entrypoint: impl Into<String>) -> Self {
         self.entrypoint = entrypoint.into();
         self
+    }
+
+    /// Override the rule path with validation, returning `Err` for empty,
+    /// whitespace-only, or non-`data.`-prefixed entrypoints.
+    ///
+    /// Prefer this over [`Self::with_entrypoint`] for operator-supplied
+    /// configuration. A misconfigured entrypoint discovered at construction
+    /// time produces a deterministic `GateError::Policy` rather than a
+    /// dispatch-time `GateError::Evaluation` that would be treated as
+    /// fail-open by ADR-018 semantics.
+    pub fn try_with_entrypoint(self, entrypoint: impl Into<String>) -> Result<Self, GateError> {
+        let ep = entrypoint.into();
+        let trimmed = ep.trim();
+        if trimmed.is_empty() {
+            return Err(GateError::Policy(
+                "entrypoint must not be empty or whitespace".to_string(),
+            ));
+        }
+        if !trimmed.starts_with("data.") {
+            return Err(GateError::Policy(format!(
+                "entrypoint must begin with 'data.' (got: {trimmed:?})"
+            )));
+        }
+        Ok(self.with_entrypoint(ep))
     }
 }
 

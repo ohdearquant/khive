@@ -1,20 +1,6 @@
 //! khive-pack-template — reference scaffold for new packs (ADR-023 §8).
 //!
-//! # How to create a new pack
-//!
-//! 1. Copy this crate directory to `crates/khive-pack-<name>/`.
-//! 2. Rename the crate in `Cargo.toml` (name, description).
-//! 3. Set `PACK_NAME` to your pack's canonical name (e.g. `"exp"`).
-//! 4. Update `NOTE_KINDS` / `ENTITY_KINDS` in `vocab.rs`.
-//! 5. Add your verbs to `HANDLERS` below; fill in `handlers.rs`.
-//! 6. Add the crate to the workspace `Cargo.toml`.
-//! 7. Force-link in `khive-mcp/src/pack.rs` and `kkernel/src/lib.rs`.
-//! 8. Add the crate dep to `khive-mcp/Cargo.toml` and `kkernel/Cargo.toml`.
-//!
-//! Reference implementation: `crates/khive-pack-kg/`.
-//!
-//! No macros, no DSLs. Plain Rust — rust-analyzer, debugger, and LLMs all
-//! work directly on this code without expansion.
+//! See `docs/design.md` for the step-by-step guide to creating a new pack.
 
 pub mod handlers;
 pub mod vocab;
@@ -51,18 +37,18 @@ impl Pack for TemplatePack {
 /// `Visibility::Verb`       = exposed on the MCP `request` tool (agent-facing).
 /// `Visibility::Subhandler` = CLI-only / internal; not on the MCP wire.
 static TEMPLATE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
-    name: "my_verb",
-    description: "Replace with your verb's description.",
+    name: "template.my_verb",
+    description: "Example pack-prefixed verb (ADR-023: non-kg packs must use pack.verb naming).",
     visibility: Visibility::Verb,
     category: khive_types::VerbCategory::Directive,
     params: &[],
 }];
 
 impl TemplatePack {
+    /// Constructs the template pack with a runtime handle.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }
-    #[allow(dead_code)]
     fn runtime(&self) -> &KhiveRuntime {
         &self.runtime
     }
@@ -118,7 +104,7 @@ impl PackRuntime for TemplatePack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "my_verb" => handlers::handle_my_verb(self.runtime(), token, params).await,
+            "template.my_verb" => handlers::handle_my_verb(self.runtime(), token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "{PACK_NAME} pack does not handle verb {verb:?}"
             ))),

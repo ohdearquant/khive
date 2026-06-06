@@ -1,30 +1,13 @@
 //! Distance computation for HNSW.
 //!
-//! # Formal Verification
-//!
-//! This implementation corresponds to the formal proofs in
-//! `proofs/Retrieval/Distance.lean` (ADR-030 §Phase 2). Key theorems:
-//!
-//! ## Metric Axioms (Euclidean)
-//! - `euclidean_nonneg`: d(x,y) ≥ 0
-//! - `euclidean_self`: d(x,x) = 0
-//! - `euclidean_symm`: d(x,y) = d(y,x)
-//! - `euclidean_triangle`: d(x,z) ≤ d(x,y) + d(y,z)
-//!
-//! ## Cosine Properties
-//! - `cosine_range`: -1 ≤ cos(x,y) ≤ 1 for unit vectors
-//! - `cosine_not_metric`: cosine does NOT satisfy triangle inequality
-//!
-//! ## Dot Product
-//! - `dot_eq_inner`: bridges to Mathlib inner product space
-//!
-//! ## Distance-Similarity Conversion
-//! - `distanceToSimilarity`: sim = 1/(1+d) for Euclidean
-//! - `similarity_nonneg`: similarity ≥ 0
-//! - `similarity_bounded`: 0 ≤ sim ≤ 1 for d ≥ 0
+//! Cosine, Dot, and L2 metrics with SIMD-friendly scalar loops.
+//! See `docs/distance.md` for metric property references.
 
 use super::config::DistanceMetric;
-pub(crate) use khive_score::score_from_distance;
+// Use the lossy variant: input vectors are validated as finite at the insert boundary,
+// so NaN distances from valid inputs are not expected. `score_from_distance_lossy` maps
+// NaN → 0 rather than a perfect score, which is the safer backstop for any residual case.
+pub(crate) use khive_score::score_from_distance_lossy as score_from_distance;
 
 /// Compute cosine distance from pre-computed dot product and norms.
 ///
@@ -173,7 +156,10 @@ impl Ord for OrderedF32 {
 impl OrderedF32 {
     /// Check if the wrapped value is NaN.
     #[inline]
-    #[allow(dead_code)] // TODO(#2640): wire or remove when use case is defined
+    // REASON: `is_nan` is a predicate helper for callers that need to detect
+    // NaN-valued distances (e.g. debug assertions, test helpers). Not yet wired
+    // into a production caller but useful as a test utility alongside `OrderedF32`.
+    #[allow(dead_code)]
     pub fn is_nan(&self) -> bool {
         self.0.is_nan()
     }
@@ -255,6 +241,7 @@ mod tests {
 
     #[test]
     fn test_score_from_distance() {
+        use khive_score::DeterministicScore;
         // f32 input loses precision on widening to f64; use 1e-6 tolerance.
         // Cosine: similarity = 1 - distance
         assert!((score_from_distance(0.2, DistanceMetric::Cosine).to_f64() - 0.8).abs() < 1e-6);
@@ -265,9 +252,11 @@ mod tests {
         // Euclidean: similarity = 1/(1+distance)
         assert!((score_from_distance(1.0, DistanceMetric::L2).to_f64() - 0.5).abs() < 1e-6);
 
-        // NaN input maps to 0 distance, then cosine gives 1.0
-        assert!(
-            (score_from_distance(f32::NAN, DistanceMetric::Cosine).to_f64() - 1.0).abs() < 1e-6
+        // NaN input: score_from_distance_lossy maps invalid distance to NEG_INF
+        // (ranks last rather than getting a spurious perfect score).
+        assert_eq!(
+            score_from_distance(f32::NAN, DistanceMetric::Cosine),
+            DeterministicScore::NEG_INF
         );
     }
 

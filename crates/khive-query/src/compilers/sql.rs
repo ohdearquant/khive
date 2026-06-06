@@ -1,3 +1,9 @@
+// FILE SIZE JUSTIFICATION: The two compilation paths (fixed-length JOIN chain and
+// variable-length recursive CTE) plus the synthetic-edge (ADR-041) lowering share
+// helper logic (namespace_filter, condition compilation, property predicate emission)
+// that cannot be cleanly split without either duplicating that logic or introducing a
+// separate internal crate.  Extraction is tracked as future work once the compiler
+// stabilizes.
 //! Compile GQL AST to parameterized SQL.
 //!
 //! Two compilation paths:
@@ -40,6 +46,7 @@ fn synthetic_role(rel: &str) -> Option<&'static str> {
     }
 }
 
+/// Parameterized SQL emitted by the compiler, ready for execution by the runtime.
 #[derive(Debug)]
 pub struct CompiledQuery {
     pub sql: String,
@@ -48,6 +55,7 @@ pub struct CompiledQuery {
     pub warnings: Vec<String>,
 }
 
+/// Runtime options injected by the caller to scope and cap query execution.
 pub struct CompileOptions {
     /// Namespace scope. Empty = cross-namespace (all). Non-empty = filter to these namespaces.
     pub scopes: Vec<String>,
@@ -64,6 +72,7 @@ impl Default for CompileOptions {
     }
 }
 
+/// Compile a `GqlQuery` AST to a parameterized SQL string and bound parameters.
 pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery, QueryError> {
     if query.pattern.elements.is_empty() {
         return Err(QueryError::Compile("empty pattern".into()));
@@ -240,7 +249,9 @@ fn compile_fixed_length(
                         ));
                     }
 
-                    for (key, val) in &np.properties {
+                    let mut props: Vec<_> = np.properties.iter().collect();
+                    props.sort_by_key(|(k, _)| k.as_str());
+                    for (key, val) in props {
                         params.push(QueryValue::Text(val.clone()));
                         if key == "name" || key == "content" {
                             where_parts
@@ -271,7 +282,9 @@ fn compile_fixed_length(
                         where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
                     }
 
-                    for (key, val) in &np.properties {
+                    let mut props: Vec<_> = np.properties.iter().collect();
+                    props.sort_by_key(|(k, _)| k.as_str());
+                    for (key, val) in props {
                         params.push(QueryValue::Text(val.clone()));
                         if key == "name" {
                             where_parts
@@ -496,7 +509,9 @@ fn compile_fixed_length(
     }
 
     let limit = query.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
-    params.push(QueryValue::Integer(limit as i64));
+    let limit_i64 = i64::try_from(limit)
+        .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
+    params.push(QueryValue::Integer(limit_i64));
 
     let sql = format!(
         "SELECT {} FROM {} {} WHERE {} LIMIT ?{}",
@@ -632,6 +647,11 @@ fn compile_single_condition(
             format!("{col_expr} {op_str} ?{}{}", params.len(), collate)
         }
         ConditionValue::Number(n) => {
+            if !n.is_finite() {
+                return Err(QueryError::InvalidInput(
+                    "non-finite float (NaN or Infinity) is not a valid query parameter".into(),
+                ));
+            }
             params.push(QueryValue::Float(*n));
             format!("{col_expr} {op_str} ?{}", params.len())
         }
@@ -763,6 +783,11 @@ fn compile_var_len_condition(
             format!("{col_expr} {op_str} ?{}{collate}", params.len())
         }
         ConditionValue::Number(n) => {
+            if !n.is_finite() {
+                return Err(QueryError::InvalidInput(
+                    "non-finite float (NaN or Infinity) is not a valid query parameter".into(),
+                ));
+            }
             params.push(QueryValue::Float(*n));
             format!("{col_expr} {op_str} ?{}", params.len())
         }
@@ -925,6 +950,18 @@ fn compile_variable_length(
     let edge = &edges[0];
     let end = &nodes[1];
 
+    // Synthetic observed_as_* edges join event_observations, which has no
+    // recursive path structure — reject them in variable-length patterns before
+    // attempting CTE compilation (would produce a CTE over graph_edges with an
+    // invalid relation string).
+    if edge.relations.iter().any(|r| is_synthetic(r)) {
+        return Err(QueryError::Unsupported(
+            "synthetic observed_as_* edges cannot be variable-length; \
+             use a fixed-length edge pattern instead"
+                .into(),
+        ));
+    }
+
     // MAJ-2: depth cap — always parameterized, never injected as literal
     let max_depth = edge.max_hops.min(MAX_DEPTH);
     let min_depth = edge.min_hops;
@@ -944,7 +981,9 @@ fn compile_variable_length(
         params.push(QueryValue::Text(et.clone()));
         start_conditions.push(format!("s.entity_type = ?{}", params.len()));
     }
-    for (key, val) in &start.properties {
+    let mut start_props: Vec<_> = start.properties.iter().collect();
+    start_props.sort_by_key(|(k, _)| k.as_str());
+    for (key, val) in start_props {
         params.push(QueryValue::Text(val.clone()));
         if key == "name" {
             start_conditions.push(format!("s.name = ?{} COLLATE NOCASE", params.len()));
@@ -1001,7 +1040,15 @@ fn compile_variable_length(
         ),
     };
 
-    params.push(QueryValue::Integer(max_depth as i64));
+    // Build the next-intermediate-node namespace filter.
+    // This is applied in the recursive CTE member to prevent traversal through
+    // deleted or out-of-scope intermediate nodes.  Without it, a path like
+    // A -> B_deleted -> C would be returned even when B is soft-deleted.
+    let next_node_ns_filter = namespace_filter("next_node", opts, &mut params);
+
+    let max_depth_i64 = i64::try_from(max_depth)
+        .map_err(|_| QueryError::InvalidInput("max_depth exceeds i64::MAX".into()))?;
+    params.push(QueryValue::Integer(max_depth_i64));
     let depth_param = params.len();
 
     // End-node conditions (applied in outer WHERE). `r` is always joined
@@ -1020,7 +1067,9 @@ fn compile_variable_length(
         params.push(QueryValue::Text(et.clone()));
         end_conditions.push(format!("r.entity_type = ?{}", params.len()));
     }
-    for (key, val) in &end.properties {
+    let mut end_props: Vec<_> = end.properties.iter().collect();
+    end_props.sort_by_key(|(k, _)| k.as_str());
+    for (key, val) in end_props {
         params.push(QueryValue::Text(val.clone()));
         if key == "name" {
             end_conditions.push(format!("r.name = ?{} COLLATE NOCASE", params.len()));
@@ -1057,12 +1106,16 @@ fn compile_variable_length(
 
     // MAJ-2: min_depth is always a bound parameter, never a literal
     if min_depth > 0 {
-        params.push(QueryValue::Integer(min_depth as i64));
+        let min_depth_i64 = i64::try_from(min_depth)
+            .map_err(|_| QueryError::InvalidInput("min_depth exceeds i64::MAX".into()))?;
+        params.push(QueryValue::Integer(min_depth_i64));
         end_conditions.push(format!("t.depth >= ?{}", params.len()));
     }
 
     let limit = query.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
-    params.push(QueryValue::Integer(limit as i64));
+    let limit_i64 = i64::try_from(limit)
+        .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
+    params.push(QueryValue::Integer(limit_i64));
     let limit_param = params.len();
 
     // Register variables
@@ -1177,6 +1230,14 @@ fn compile_variable_length(
     };
     let join_end = "JOIN entities r ON r.id = t.current_id";
 
+    // Build the next-node namespace filter clause (may be empty).
+    // Already pushed into params by namespace_filter above.
+    let next_node_ns_and = if next_node_ns_filter.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", next_node_ns_filter.trim_start_matches(" AND "))
+    };
+
     let sql = format!(
         "WITH RECURSIVE traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight) AS (\
              SELECT s.id, {seed_next}, 1, s.id || ',' || {seed_next}, e.weight, \
@@ -1191,6 +1252,8 @@ fn compile_variable_length(
                     e.id, e.relation, e.weight \
              FROM traverse t \
              JOIN graph_edges e ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
+             JOIN entities next_node ON next_node.id = ({recurse_next}) \
+                    AND next_node.deleted_at IS NULL{next_node_ns_and} \
              WHERE t.depth < ?{depth_param} \
                AND (',' || t.path || ',') NOT LIKE '%,' || {recurse_next} || ',%' \
          ) \
@@ -1198,7 +1261,7 @@ fn compile_variable_length(
          FROM traverse t \
          {join_start} {join_end} \
          WHERE {end_where} \
-         ORDER BY t.depth, t.total_weight DESC \
+         ORDER BY t.depth, t.total_weight DESC, t.start_id, t.current_id \
          LIMIT ?{limit_param}",
         seed_next = seed_next,
         seed_join = seed_join,
@@ -1207,6 +1270,7 @@ fn compile_variable_length(
         start_where = start_conditions.join(" AND "),
         recurse_next = recurse_next,
         recurse_join = recurse_join,
+        next_node_ns_and = next_node_ns_and,
         depth_param = depth_param,
         select_cols = select_parts.join(", "),
         join_start = join_start,
@@ -1293,6 +1357,10 @@ fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, Quer
     }
 }
 
+// INLINE TEST JUSTIFICATION: Tests access private helpers (compile_fixed_length,
+// compile_variable_length, compile_single_condition, compile_var_len_condition) and
+// internal types (VarKind) via pub(crate) visibility; moving to crates/khive-query/tests/
+// would require making those items pub, which would widen the public API surface.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1997,6 +2065,166 @@ mod tests {
         assert!(
             has_lora && has_concept,
             "both AND values must be bound params"
+        );
+    }
+
+    // --- Regression tests for P0/P1 correctness fixes ---
+
+    /// max_limit overflow: usize::MAX as i64 == -1 on 64-bit, defeating the cap.
+    #[test]
+    fn max_limit_overflow_returns_error() {
+        let q = gql::parse("MATCH (a)-[:extends]->(b) RETURN a").unwrap();
+        let opts = CompileOptions {
+            scopes: vec![],
+            max_limit: usize::MAX,
+        };
+        // On 64-bit: usize::MAX > i64::MAX, so try_from must return Err.
+        // On 32-bit: usize::MAX == u32::MAX which fits in i64, so this may succeed —
+        // either way we must not produce a negative limit.
+        let result = compile(&q, &opts);
+        match result {
+            Err(QueryError::InvalidInput(_)) => {
+                // Expected on 64-bit: overflow detected, error returned.
+            }
+            Ok(compiled) => {
+                // On 32-bit: limit fits in i64 — verify it is non-negative.
+                let limit_param = compiled.params.last().unwrap();
+                assert!(
+                    matches!(limit_param, QueryValue::Integer(n) if *n >= 0),
+                    "limit must never be negative; got {limit_param:?}"
+                );
+            }
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    /// max_limit=0 with no query limit: query limit defaults to 0, no crash.
+    #[test]
+    fn max_limit_zero_compiles() {
+        let q = gql::parse("MATCH (a)-[:extends]->(b) RETURN a").unwrap();
+        let opts = CompileOptions {
+            scopes: vec![],
+            max_limit: 0,
+        };
+        let compiled = compile(&q, &opts).unwrap();
+        let limit_param = compiled.params.last().unwrap();
+        assert!(
+            matches!(limit_param, QueryValue::Integer(0)),
+            "max_limit=0 should produce LIMIT 0; got {limit_param:?}"
+        );
+    }
+
+    /// Variable-length synthetic edges must be rejected.
+    #[test]
+    fn variable_length_synthetic_edge_rejected() {
+        // observed_as_selected*1..3 must be rejected — the recursive CTE targets
+        // graph_edges, which has no event_observations data.
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected*1..3]->(m) RETURN m").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Unsupported(_)),
+            "variable-length synthetic edge must return Unsupported; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("synthetic") || err.to_string().contains("observed_as"),
+            "error should mention synthetic edges: {err}"
+        );
+    }
+
+    /// Variable-length traversal must not pass through deleted intermediate nodes.
+    /// The compiled SQL must join entities for the next node in the recursive member.
+    #[test]
+    fn variable_length_recursive_member_joins_next_node_for_deleted_filter() {
+        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        // The recursive CTE member must join next_node to filter deleted intermediates.
+        assert!(
+            compiled.sql.contains("JOIN entities next_node"),
+            "recursive CTE must join entities next_node for deleted-intermediate filtering; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("next_node.deleted_at IS NULL"),
+            "recursive CTE must filter next_node.deleted_at IS NULL; sql: {}",
+            compiled.sql
+        );
+    }
+
+    /// Variable-length traversal with namespace scope: the next_node join must
+    /// also apply the namespace filter to prevent namespace-crossing intermediates.
+    #[test]
+    fn variable_length_recursive_member_namespace_scopes_intermediates() {
+        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b").unwrap();
+        let compiled = compile(&q, &scoped("test-ns")).unwrap();
+        // The next_node join must include a namespace condition.
+        assert!(
+            compiled.sql.contains("next_node.namespace"),
+            "recursive CTE next_node join must filter namespace; sql: {}",
+            compiled.sql
+        );
+    }
+
+    /// Public AST panic: compile must return an error for a malformed AST instead
+    /// of panicking with an out-of-bounds index.
+    #[test]
+    fn compile_malformed_ast_returns_error_not_panic() {
+        use crate::ast::{EdgeDirection, EdgePattern, GqlQuery, MatchPattern, PatternElement};
+        // An AST that starts with an Edge (no leading Node) is malformed.
+        let q = GqlQuery {
+            pattern: MatchPattern {
+                elements: vec![PatternElement::Edge(EdgePattern {
+                    variable: None,
+                    relations: vec!["extends".to_string()],
+                    direction: EdgeDirection::Out,
+                    min_hops: 1,
+                    max_hops: 1,
+                })],
+            },
+            where_clause: WhereExpr::True,
+            return_items: vec![],
+            limit: None,
+        };
+        let result = compile(&q, &opts());
+        assert!(
+            result.is_err(),
+            "malformed AST (starts with Edge) must return error, not panic"
+        );
+    }
+
+    /// GQL edge pattern suffix fix: `(a)-[e:extends](b)` must be rejected because
+    /// the `-` suffix after `]` is required.
+    #[test]
+    fn edge_pattern_without_suffix_dash_rejected() {
+        let result = gql::parse("MATCH (a)-[e:extends](b) RETURN a");
+        assert!(
+            result.is_err(),
+            "edge pattern without suffix '-' must be rejected as a parse error"
+        );
+    }
+
+    /// Duplicate inline property rejection.
+    #[test]
+    fn duplicate_inline_property_rejected() {
+        let result = gql::parse("MATCH (n {name: 'A', name: 'B'}) RETURN n");
+        assert!(
+            result.is_err(),
+            "duplicate property 'name' in node props must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate") || err.contains("name"),
+            "error should mention duplicate or key name: {err}"
+        );
+    }
+
+    /// Unknown synthetic relation must be rejected at validation.
+    #[test]
+    fn unknown_synthetic_relation_rejected_at_compile() {
+        let q = gql::parse("MATCH (a)-[:observed_as_bogus]->(b) RETURN a").unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::Validation(_)),
+            "unknown synthetic relation must return Validation error; got {err:?}"
         );
     }
 }

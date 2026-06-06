@@ -1,31 +1,8 @@
-//! TOML-based embedding engine configuration for khive.
+//! TOML-based embedding engine configuration for khive (ADR-031 §D3).
 //!
-//! Loads `./.khive/config.toml` (or a path from `--config` / `KHIVE_CONFIG`)
-//! and exposes an `[[engines]]` array that drives arbitrary-N embedding engine
-//! registration per ADR-031 §D3.
-//!
-//! # Config file format
-//!
-//! ```toml
-//! [[engines]]
-//! name = "default"
-//! model = "all-minilm-l6-v2"
-//! default = true
-//! fusion_weight = 0.5
-//!
-//! [[engines]]
-//! name = "paraphrase"
-//! model = "paraphrase-multilingual-minilm-l12-v2"
-//! fusion_weight = 0.5
-//! ```
-//!
-//! # Resolution order
-//!
-//! 1. Config file (from `--config` / `KHIVE_CONFIG` / `./.khive/config.toml`)
-//! 2. Env-var fallback (`KHIVE_EMBEDDING_MODEL` + `KHIVE_ADDITIONAL_EMBEDDING_MODELS`)
-//!    when no config file is present
-//!
-//! If both file and env vars are present, the file wins and a warning is emitted.
+//! Loads `.khive/config.toml` (or `--config` / `KHIVE_CONFIG`) and exposes an
+//! `[[engines]]` array for arbitrary-N embedding engine registration. Falls back
+//! to `KHIVE_EMBEDDING_MODEL` env vars when no config file is present.
 
 use std::path::{Path, PathBuf};
 
@@ -294,10 +271,12 @@ impl KhiveConfig {
             });
         }
 
-        // Positive fusion_weight when present
+        // Positive, finite fusion_weight when present.
+        // NaN does not satisfy `w <= 0.0`, and positive infinity is unbounded,
+        // so reject all non-finite values explicitly before the range check.
         for engine in &self.engines {
             if let Some(w) = engine.fusion_weight {
-                if w <= 0.0 {
+                if !w.is_finite() || w <= 0.0 {
                     return Err(ConfigError::InvalidFusionWeight {
                         name: engine.name.clone(),
                         value: w,
@@ -380,6 +359,10 @@ pub fn config_from_env() -> KhiveConfig {
 
 // ---- Tests ----
 
+// INLINE TEST JUSTIFICATION: tests here cover config validation error paths that
+// rely on private ConfigError variants and temp-file helpers shared with the
+// config loader. Moving them to tests/ would require pub-exporting ConfigError
+// internals that are not part of the stable public API.
 #[cfg(test)]
 mod tests {
     use super::*;

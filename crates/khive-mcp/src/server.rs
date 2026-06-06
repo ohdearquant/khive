@@ -1,21 +1,15 @@
-//! KhiveMcpServer — rmcp-based MCP server exposing a single `request` tool.
+//! KhiveMcpServer — rmcp-based MCP server exposing a single `request` tool (ADR-016).
 //!
-//! The MCP surface is intentionally minimal: one tool (`request`) that accepts
-//! a function-call DSL or JSON form (ADR-020) and dispatches each parsed
-//! operation through the [`VerbRegistry`] built from the packs declared in
-//! [`khive_runtime::RuntimeConfig::packs`].
+//! Accepts the function-call DSL or JSON form and dispatches each parsed operation
+//! through the [`VerbRegistry`] built from the configured packs.
 //!
-//! ## Why a single tool
-//!
-//! As of v0.2 the verb-flat surface (ADR-023) is folded behind `request`. The
-//! verb catalog lives in:
-//!
-//! - the `request` tool's description (terse list, per-pack);
-//! - each pack's marketplace plugin SKILL.md files (rich usage guides).
-//!
-//! Tool discovery happens once per session anyway, so collapsing 16+ flat tools
-//! into one keeps tool-list latency low and frees agent context budget while
-//! preserving expressiveness through the DSL.
+// FILE SIZE JUSTIFICATION: `run_parsed` is long because it encodes the
+// ADR-016 execution-mode contract (Single/Parallel/Chain) as a single match
+// expression. Splitting the three branches into separate functions would
+// scatter the ADR-016 contract invariants (summary shape, aborted semantics,
+// $prev substitution ordering) across files, making them harder to review
+// against the spec. The module is the authoritative implementation of ADR-016
+// dispatch and is intentionally co-located.
 
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -421,7 +415,8 @@ impl KhiveMcpServer {
     ) -> Value {
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
             .unwrap_or(0);
 
         // Resolve per-op presentation mode: per-op entry overrides batch default.
@@ -766,7 +761,7 @@ impl ServerHandler for KhiveMcpServer {
         let catalog = self.verb_catalog();
         let builtins = builtin_pack_names().join(", ");
         let instructions = format!(
-            "khive — request-only MCP surface (ADR-020 + ADR-027). One tool, `request`, \
+            "khive — request-only MCP surface (ADR-016 + ADR-027). One tool, `request`, \
              dispatches verbs through the loaded pack registry. Configure packs via \
              KHIVE_PACKS or --pack (built-ins: {builtins}). Verbs registered on this \
              server:\n{catalog}\nFor detailed usage of each verb, see the corresponding \

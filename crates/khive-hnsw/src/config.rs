@@ -1,22 +1,8 @@
 //! HNSW configuration types.
 //!
-//! See ADR-003 for recommended parameter values.
-//!
-//! # RETRIEVAL-05: Embedding Key Validation
-//!
-//! The current implementation uses `EmbeddingId` (from khive-db) as the key type,
-//! which provides type-safe, validated embedding identifiers. The validation occurs
-//! at ID construction time (in khive-db), not in HnswConfig.
-//!
-//! **Design decision**: Validation is NOT duplicated in HnswConfig because:
-//! 1. `EmbeddingId` is already a newtype that enforces validity
-//! 2. Double validation would add overhead without security benefit
-//! 3. The type system already prevents invalid keys at compile time
-//!
-//! If custom key types are needed in the future, add a `K: EmbeddingKey` trait
-//! bound with validation methods.
+//! See ADR-003 for recommended parameter values (ef_construction, M, max_layers).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Result, RetrievalError};
 
@@ -35,7 +21,11 @@ pub const DEFAULT_REBUILD_THRESHOLD: f64 = 0.10;
 pub use khive_types::vector::DistanceMetric;
 
 /// HNSW configuration parameters per ADR-003.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deserialization validates all invariants before returning. Invalid configs
+/// (e.g. `dimensions=0`, non-finite `ml`, `m_max0 < m`) are rejected with a
+/// descriptive error at the deserialization boundary.
+#[derive(Debug, Clone, Serialize)]
 pub struct HnswConfig {
     /// Maximum number of connections per node per layer (M).
     /// Higher = better recall, more memory, slower build.
@@ -86,6 +76,49 @@ pub struct HnswConfig {
     pub memory_budget: Option<usize>,
 }
 
+/// Wire-format mirror used only for deserialization.
+///
+/// Derives `Deserialize` without invariant checks; the `Deserialize` impl for
+/// `HnswConfig` uses this to deserialize then validate in one step.
+#[derive(Deserialize)]
+struct HnswConfigWire {
+    m: usize,
+    m_max0: usize,
+    ef_construction: usize,
+    ml: f64,
+    ef_search: usize,
+    dimensions: usize,
+    metric: DistanceMetric,
+    rebuild_threshold: f64,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    memory_budget: Option<usize>,
+}
+
+impl<'de> Deserialize<'de> for HnswConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = HnswConfigWire::deserialize(deserializer)?;
+        let config = HnswConfig {
+            m: wire.m,
+            m_max0: wire.m_max0,
+            ef_construction: wire.ef_construction,
+            ml: wire.ml,
+            ef_search: wire.ef_search,
+            dimensions: wire.dimensions,
+            metric: wire.metric,
+            rebuild_threshold: wire.rebuild_threshold,
+            seed: wire.seed,
+            memory_budget: wire.memory_budget,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
 impl Default for HnswConfig {
     /// Creates default configuration per ADR-003.
     ///
@@ -115,6 +148,37 @@ impl HnswConfig {
             return Err(RetrievalError::Configuration(
                 "dimensions: HNSW dimensions must be greater than zero".to_string(),
             ));
+        }
+        if self.m == 0 {
+            return Err(RetrievalError::Configuration(
+                "m: must be greater than zero".to_string(),
+            ));
+        }
+        if self.m_max0 < self.m {
+            return Err(RetrievalError::Configuration(format!(
+                "m_max0 ({}) must be >= m ({})",
+                self.m_max0, self.m
+            )));
+        }
+        if self.ef_search == 0 {
+            return Err(RetrievalError::Configuration(
+                "ef_search: must be greater than zero".to_string(),
+            ));
+        }
+        if !self.ml.is_finite() || self.ml <= 0.0 {
+            return Err(RetrievalError::Configuration(format!(
+                "ml: must be a positive finite value, got {}",
+                self.ml
+            )));
+        }
+        if !self.rebuild_threshold.is_finite()
+            || self.rebuild_threshold < 0.0
+            || self.rebuild_threshold > 1.0
+        {
+            return Err(RetrievalError::Configuration(format!(
+                "rebuild_threshold: must be in [0.0, 1.0], got {}",
+                self.rebuild_threshold
+            )));
         }
         Ok(())
     }
@@ -229,6 +293,86 @@ mod tests {
     fn test_try_with_dimensions_rejects_zero() {
         let result = HnswConfig::try_with_dimensions(0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_m_zero() {
+        let config = HnswConfig {
+            m: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_m_max0_less_than_m() {
+        let config = HnswConfig {
+            m: 20,
+            m_max0: 10,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_ef_search_zero() {
+        let config = HnswConfig {
+            ef_search: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_non_finite_ml() {
+        let config = HnswConfig {
+            ml: f64::NAN,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        let config2 = HnswConfig {
+            ml: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(config2.validate().is_err());
+        let config3 = HnswConfig {
+            ml: -1.0,
+            ..Default::default()
+        };
+        assert!(config3.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_rebuild_threshold() {
+        let config = HnswConfig {
+            rebuild_threshold: f64::NAN,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        let config2 = HnswConfig {
+            rebuild_threshold: -0.1,
+            ..Default::default()
+        };
+        assert!(config2.validate().is_err());
+        let config3 = HnswConfig {
+            rebuild_threshold: 1.1,
+            ..Default::default()
+        };
+        assert!(config3.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_accepts_boundary_rebuild_threshold() {
+        let config0 = HnswConfig {
+            rebuild_threshold: 0.0,
+            ..Default::default()
+        };
+        assert!(config0.validate().is_ok());
+        let config1 = HnswConfig {
+            rebuild_threshold: 1.0,
+            ..Default::default()
+        };
+        assert!(config1.validate().is_ok());
     }
 
     #[test]

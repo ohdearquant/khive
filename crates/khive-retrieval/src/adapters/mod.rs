@@ -1,36 +1,7 @@
-//! Adapters bridging `khive-storage-traits` backends to retrieval search traits.
+//! Adapters bridging khive-storage-traits backends to retrieval search traits.
 //!
-//! The retrieval crate defines [`VectorSearch`] and [`KeywordSearch`] as async
-//! traits with an associated `Id` type. The `khive-storage-traits` crate defines
-//! [`VectorStore`] and [`TextSearch`] as async persistence traits using `Uuid`.
-//!
-//! This module provides adapter types that implement the retrieval search traits
-//! by delegating to storage-traits backends:
-//!
-//! - [`StorageVectorSearch`]: wraps `Arc<dyn VectorStore>` -> `VectorSearch<Id = Uuid>`
-//! - [`StorageKeywordSearch`]: wraps `Arc<dyn TextSearch>` -> `KeywordSearch<Id = Uuid>`
-//!
-//! This makes [`HybridSearcher`] work with persistent backends (sqlite-vec, FTS5)
-//! alongside the existing in-memory backends (HNSW, BM25).
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use khive_db::StorageBackend;
-//! use khive_retrieval::adapters::{StorageVectorSearch, StorageKeywordSearch};
-//! use khive_retrieval::hybrid::{VectorSearch, KeywordSearch};
-//!
-//! let backend = StorageBackend::memory().unwrap();
-//! let vec_store = backend.vectors("model", 384).unwrap();
-//! let text_store = backend.text("docs").unwrap();
-//!
-//! let vector_search = StorageVectorSearch::new(vec_store);
-//! let keyword_search = StorageKeywordSearch::new(text_store);
-//!
-//! // Both implement the retrieval search traits with Id = Uuid
-//! let hits = vector_search.vector_search(&query_embedding, 10).await?;
-//! let kw_hits = keyword_search.keyword_search("some query", 10).await?;
-//! ```
+//! StorageVectorSearch wraps Arc<dyn VectorStore> and StorageKeywordSearch wraps
+//! Arc<dyn TextSearch>, both implementing retrieval traits with Id = Uuid.
 
 use std::sync::Arc;
 
@@ -50,29 +21,36 @@ use crate::hybrid::{KeywordSearch, VectorSearch};
 /// Convert a `StorageError` into a `RetrievalError`.
 ///
 /// Maps storage-level errors to the closest retrieval error variant:
-/// - Vector-related storage errors -> `Hnsw` (vector search context)
-/// - Text-related storage errors -> `Bm25` (keyword search context)
-/// - Timeout/pool errors -> transient retrieval errors
-/// - Everything else -> generic error string
+/// - Timeout errors -> `QueryTimeout` (transient, retryable)
+/// - InvalidInput errors -> `InvalidQuery` (permanent)
+/// - Keyword-context errors -> `Bm25` (permanent)
+/// - Everything else -> `Hnsw` (permanent)
 fn storage_err_to_retrieval(
     err: khive_storage::StorageError,
     context: &'static str,
 ) -> RetrievalError {
     use khive_storage::StorageError;
 
-    match &err {
+    match err {
         StorageError::Timeout { .. } => {
-            // Map to a transient retrieval error
-            RetrievalError::Hnsw(format!("{context}: {err}"))
+            // Storage timeouts are transient — map to QueryTimeout so retry logic works.
+            RetrievalError::QueryTimeout { elapsed_ms: 0 }
         }
         StorageError::InvalidInput { message, .. } => {
             RetrievalError::InvalidQuery(format!("{context}: {message}"))
         }
-        _ => {
-            // Generic mapping -- preserve the full error message
-            RetrievalError::Hnsw(format!("{context}: {err}"))
-        }
+        other if context.contains("keyword") => RetrievalError::Bm25(format!("{context}: {other}")),
+        other => RetrievalError::Hnsw(format!("{context}: {other}")),
     }
+}
+
+/// Convert `top_k: usize` to `u32`, returning `InvalidQuery` on overflow.
+///
+/// `u32::MAX` is 4_294_967_295; any `top_k` larger than that silently wrapped
+/// before this fix, turning a huge request into a tiny or zero-result request.
+fn checked_top_k(top_k: usize) -> crate::error::Result<u32> {
+    u32::try_from(top_k)
+        .map_err(|_| RetrievalError::InvalidQuery(format!("top_k exceeds u32::MAX: {top_k}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +85,7 @@ impl VectorSearch for StorageVectorSearch {
     ) -> Result<Vec<(Uuid, DeterministicScore)>> {
         let request = VectorSearchRequest {
             query_vectors: vec![embedding.to_vec()],
-            top_k: top_k as u32,
+            top_k: checked_top_k(top_k)?,
             namespace: None,
             kind: None,
             embedding_model: None,
@@ -163,7 +141,7 @@ impl KeywordSearch for StorageKeywordSearch {
             query: text.to_string(),
             mode: TextQueryMode::Plain,
             filter: None,
-            top_k: top_k as u32,
+            top_k: checked_top_k(top_k)?,
             snippet_chars: 0, // retrieval only needs IDs + scores
         };
 
@@ -203,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn vector_search_basic_roundtrip() {
         let backend = test_backend();
-        let store = backend.vectors("test_vs", 3).unwrap();
+        let store = backend.vectors("test_vs", "test-model", 3).unwrap();
 
         // Insert two vectors
         let id1 = Uuid::new_v4();
@@ -243,7 +221,7 @@ mod tests {
     #[tokio::test]
     async fn vector_search_respects_top_k() {
         let backend = test_backend();
-        let store = backend.vectors("test_topk", 3).unwrap();
+        let store = backend.vectors("test_topk", "test-model", 3).unwrap();
 
         // Insert 5 vectors
         for _ in 0..5 {
@@ -268,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn vector_search_empty_store() {
         let backend = test_backend();
-        let store = backend.vectors("test_empty", 3).unwrap();
+        let store = backend.vectors("test_empty", "test-model", 3).unwrap();
 
         let adapter = StorageVectorSearch::new(store);
         let hits = adapter.vector_search(&[1.0, 0.0, 0.0], 5).await.unwrap();
@@ -279,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn vector_search_returns_deterministic_scores() {
         let backend = test_backend();
-        let store = backend.vectors("test_det", 3).unwrap();
+        let store = backend.vectors("test_det", "test-model", 3).unwrap();
 
         let id = Uuid::new_v4();
         store
@@ -420,6 +398,72 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Regression tests: error mapping + overflow guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn storage_err_timeout_maps_to_query_timeout() {
+        use khive_storage::StorageError;
+        let err = StorageError::Timeout {
+            operation: std::borrow::Cow::Borrowed("search"),
+        };
+        let ret = storage_err_to_retrieval(err, "vector search");
+        assert!(
+            matches!(ret, RetrievalError::QueryTimeout { .. }),
+            "storage Timeout must map to QueryTimeout (transient), got: {ret:?}"
+        );
+        assert!(
+            ret.is_transient(),
+            "QueryTimeout must be classified as transient for retry logic"
+        );
+    }
+
+    #[test]
+    fn storage_err_keyword_context_maps_to_bm25() {
+        use khive_storage::StorageError;
+        let err = StorageError::Pool {
+            operation: std::borrow::Cow::Borrowed("search"),
+            message: "pool full".to_string(),
+        };
+        let ret = storage_err_to_retrieval(err, "keyword search operation");
+        assert!(
+            matches!(ret, RetrievalError::Bm25(_)),
+            "keyword-context errors must map to Bm25, got: {ret:?}"
+        );
+    }
+
+    #[test]
+    fn storage_err_vector_context_maps_to_hnsw() {
+        use khive_storage::StorageError;
+        let err = StorageError::Pool {
+            operation: std::borrow::Cow::Borrowed("search"),
+            message: "pool full".to_string(),
+        };
+        let ret = storage_err_to_retrieval(err, "vector search");
+        assert!(
+            matches!(ret, RetrievalError::Hnsw(_)),
+            "non-keyword errors must map to Hnsw, got: {ret:?}"
+        );
+    }
+
+    #[test]
+    fn checked_top_k_overflow_returns_invalid_query() {
+        // usize::MAX definitely overflows u32::MAX on 64-bit platforms
+        let result = checked_top_k(usize::MAX);
+        assert!(
+            matches!(result, Err(RetrievalError::InvalidQuery(_))),
+            "top_k overflow must return InvalidQuery, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn checked_top_k_valid_values_succeed() {
+        assert_eq!(checked_top_k(0).unwrap(), 0u32);
+        assert_eq!(checked_top_k(10).unwrap(), 10u32);
+        assert_eq!(checked_top_k(u32::MAX as usize).unwrap(), u32::MAX);
+    }
+
+    // -----------------------------------------------------------------------
     // Integration: both adapters with fusion
     // -----------------------------------------------------------------------
 
@@ -428,7 +472,7 @@ mod tests {
         use crate::hybrid::{fuse_search_results, HybridConfig};
 
         let backend = test_backend();
-        let vec_store = backend.vectors("test_fuse", 3).unwrap();
+        let vec_store = backend.vectors("test_fuse", "test-model", 3).unwrap();
         let text_store = backend.text("test_fuse").unwrap();
 
         let id = Uuid::new_v4();

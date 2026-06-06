@@ -182,12 +182,18 @@ impl RecencyObjective {
         }
     }
 
-    /// Create with hour half-life
+    /// Create with hour half-life.
+    ///
+    /// # Panics
+    /// Panics if `hours` is not positive and finite.
     pub fn hours(hours: f64) -> Self {
         Self::new(hours * 3600.0)
     }
 
-    /// Create with day half-life
+    /// Create with day half-life.
+    ///
+    /// # Panics
+    /// Panics if `days` is not positive and finite.
     pub fn days(days: f64) -> Self {
         Self::new(days * 86400.0)
     }
@@ -271,7 +277,10 @@ impl RelevanceObjective {
         }
     }
 
-    /// Create with default weights (0.5 each)
+    /// Create with default weights (0.5 each).
+    ///
+    /// # Panics
+    /// Panics if `recency_half_life` is not positive and finite (delegated to [`RelevanceObjective::new`]).
     pub fn balanced(recency_half_life: f64) -> Self {
         Self::new(recency_half_life, 0.5, 0.5)
     }

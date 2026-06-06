@@ -239,6 +239,14 @@ pub trait Reranker<Id: Send + Sync + 'static>: Send + Sync {
 /// from their [`VectorSearch`] and [`KeywordSearch`] implementations.
 ///
 /// `Ord` is required for deterministic tie-breaking when scores are equal.
+///
+/// # Weighted strategy validation
+///
+/// When `config.fusion_strategy` is `Weighted`, this function validates that
+/// exactly 2 sources are provided in all builds. If the source count does not
+/// match the weight vector length, the function falls back to RRF to prevent
+/// silent data corruption. Use [`fuse_search_results_checked`] if you need an
+/// explicit error instead of a fallback.
 pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     config: &HybridConfig,
@@ -259,14 +267,17 @@ pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
     // Determine fusion strategy
     let strategy = match &config.fusion_strategy {
         FusionStrategy::Weighted { .. } => {
-            // Use configured weights — constrained to exactly 2 sources (vector + keyword)
-            debug_assert_eq!(
-                sources.len(),
-                2,
-                "Weighted fusion expects exactly 2 sources"
-            );
-            let (v, k) = config.normalized_weights();
-            FusionStrategy::weighted(vec![v, k])
+            // Weighted fusion uses exactly 2 weight values (vector + keyword).
+            // Validate in all builds — debug_assert was insufficient because
+            // 3+ sources could silently fuse with only 2 weights in release builds.
+            if sources.len() != 2 {
+                // Fall back to RRF rather than silently mis-weight the results.
+                // Callers that need a hard error should use fuse_search_results_checked.
+                FusionStrategy::rrf()
+            } else {
+                let (v, k) = config.normalized_weights();
+                FusionStrategy::weighted(vec![v, k])
+            }
         }
         other => other.clone(),
     };
@@ -280,6 +291,25 @@ pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
     }
 
     fused
+}
+
+/// Like [`fuse_search_results`] but returns `Err` when `Weighted` fusion is
+/// configured with a source count that doesn't match the expected 2 weights.
+///
+/// Use this in code paths that should not silently fall back to RRF.
+pub fn fuse_search_results_checked<Id: Eq + Hash + Clone + Ord>(
+    sources: Vec<Vec<(Id, DeterministicScore)>>,
+    config: &HybridConfig,
+) -> Result<Vec<(Id, DeterministicScore)>> {
+    if let FusionStrategy::Weighted { .. } = &config.fusion_strategy {
+        if sources.len() != 2 {
+            return Err(crate::error::RetrievalError::Fusion(format!(
+                "Weighted fusion requires exactly 2 sources, got {}",
+                sources.len()
+            )));
+        }
+    }
+    Ok(fuse_search_results(sources, config))
 }
 
 #[cfg(test)]
@@ -355,5 +385,57 @@ mod tests {
         let results = fuse_search_results(sources, &config);
 
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_fuse_weighted_three_sources_falls_back_to_rrf() {
+        // Regression guard: Weighted with 3 sources previously used debug_assert
+        // which was a no-op in release builds. Now it must fall back to RRF (not panic).
+        use khive_fusion::FusionStrategy;
+        let source1 = vec![("a".to_string(), DeterministicScore::from_f64(0.9))];
+        let source2 = vec![("b".to_string(), DeterministicScore::from_f64(0.8))];
+        let source3 = vec![("c".to_string(), DeterministicScore::from_f64(0.7))];
+
+        let config =
+            HybridConfig::new(10).with_fusion_strategy(FusionStrategy::weighted(vec![0.5, 0.5]));
+
+        // Must not panic — falls back to RRF silently.
+        let results = fuse_search_results(vec![source1, source2, source3], &config);
+        assert_eq!(
+            results.len(),
+            3,
+            "all 3 results should survive RRF fallback"
+        );
+    }
+
+    #[test]
+    fn test_fuse_search_results_checked_weighted_wrong_count_returns_err() {
+        use khive_fusion::FusionStrategy;
+        let config =
+            HybridConfig::new(10).with_fusion_strategy(FusionStrategy::weighted(vec![0.5, 0.5]));
+
+        let source1 = vec![("a".to_string(), DeterministicScore::from_f64(0.9))];
+        let source2 = vec![("b".to_string(), DeterministicScore::from_f64(0.8))];
+        let source3 = vec![("c".to_string(), DeterministicScore::from_f64(0.7))];
+
+        let result = fuse_search_results_checked(vec![source1, source2, source3], &config);
+        assert!(
+            result.is_err(),
+            "checked variant must return Err for 3-source Weighted fusion"
+        );
+    }
+
+    #[test]
+    fn test_fuse_search_results_checked_weighted_two_sources_ok() {
+        use khive_fusion::FusionStrategy;
+        let config =
+            HybridConfig::new(10).with_fusion_strategy(FusionStrategy::weighted(vec![0.5, 0.5]));
+
+        let source1 = vec![("a".to_string(), DeterministicScore::from_f64(0.9))];
+        let source2 = vec![("b".to_string(), DeterministicScore::from_f64(0.8))];
+
+        let result = fuse_search_results_checked(vec![source1, source2], &config);
+        assert!(result.is_ok(), "2-source Weighted must succeed");
+        assert_eq!(result.unwrap().len(), 2);
     }
 }

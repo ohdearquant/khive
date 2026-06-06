@@ -16,3 +16,11 @@ serde = ["dep:serde"]
 [dependencies]
 khive-types = { version = "0.2.5", path = "../khive-types" }
 serde = { workspace = true, optional = true, features = ["derive"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "score_ops"
+harness = false

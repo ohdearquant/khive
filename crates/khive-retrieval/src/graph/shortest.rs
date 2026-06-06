@@ -85,7 +85,9 @@ pub async fn find_shortest_path<S: LinkStore>(
     // find the meeting node with the smallest total distance, not just the
     // first one encountered (which depends on HashMap iteration order).
     while !forward_queue.is_empty() || !backward_queue.is_empty() {
-        if current_depth > max_depth {
+        // Stop expanding once we've reached max_depth — any neighbor would be
+        // at depth current_depth + 1 = max_depth + 1, exceeding the budget.
+        if current_depth >= max_depth {
             break;
         }
 
@@ -109,10 +111,13 @@ pub async fn find_shortest_path<S: LinkStore>(
                         );
                         forward_queue.push_back(neighbor.clone());
 
-                        // Check if we've met the backward search
+                        // Check if we've met the backward search.
+                        // Only accept meetings whose total path length ≤ max_depth.
                         if let Some((bwd_dist, _, _)) = backward_visited.get(&neighbor) {
                             let total = fwd_dist + bwd_dist;
-                            if best_meeting.as_ref().is_none_or(|&(_, best)| total < best) {
+                            if total <= max_depth
+                                && best_meeting.as_ref().is_none_or(|&(_, best)| total < best)
+                            {
                                 best_meeting = Some((neighbor, total));
                             }
                         }
@@ -148,10 +153,13 @@ pub async fn find_shortest_path<S: LinkStore>(
                         );
                         backward_queue.push_back(neighbor.clone());
 
-                        // Check if we've met the forward search
+                        // Check if we've met the forward search.
+                        // Only accept meetings whose total path length ≤ max_depth.
                         if let Some((fwd_dist, _, _)) = forward_visited.get(&neighbor) {
                             let total = fwd_dist + bwd_dist;
-                            if best_meeting.as_ref().is_none_or(|&(_, best)| total < best) {
+                            if total <= max_depth
+                                && best_meeting.as_ref().is_none_or(|&(_, best)| total < best)
+                            {
                                 best_meeting = Some((neighbor, total));
                             }
                         }
@@ -226,7 +234,7 @@ fn reconstruct_path(
         // lacked an entry for `current` (shouldn't happen in a consistent
         // graph, but guards against any map skew), include `current` so
         // the target node is never silently dropped.
-        if backward_entities.last().map_or(true, |e| e != &current) {
+        if backward_entities.last() != Some(&current) {
             backward_entities.push(current.clone());
         }
     }

@@ -72,6 +72,10 @@ fn note_to_message_json(note: &Note) -> Value {
 /// copies.
 ///
 /// Returns the outbound `Note` on success.
+// REASON: dual_write_message mirrors the ADR-040 §send wire shape exactly (from, to, subject,
+// content, thread_id, sent_at) plus the two context args (runtime, token). Grouping them into
+// a struct would not reduce overall complexity and would require an extra allocation on the
+// hot path; the current flat signature is intentional.
 #[allow(clippy::too_many_arguments)]
 async fn dual_write_message(
     runtime: &KhiveRuntime,
@@ -234,6 +238,7 @@ pub(crate) struct ReplyParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ThreadParams {
     /// Thread root ID: accepts either an 8-char short prefix or a full UUID.
     /// Returns all messages whose `properties.thread_id` matches this value,
@@ -272,6 +277,14 @@ pub(crate) async fn handle_send(
         return Err(RuntimeError::InvalidInput(
             "send: `content` must not be empty".into(),
         ));
+    }
+    // Validate thread_id is a well-formed UUID when supplied (ADR-040: thread_id is a root UUID).
+    if let Some(ref tid) = p.thread_id {
+        if tid.parse::<Uuid>().is_err() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "send: `thread_id` must be a valid UUID, got: {tid:?}"
+            )));
+        }
     }
 
     let from = token.namespace().as_str().to_string();

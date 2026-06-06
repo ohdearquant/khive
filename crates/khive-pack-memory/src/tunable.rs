@@ -1,3 +1,5 @@
+//! Brain-tunable parameter surface for the memory pack's recall scoring pipeline.
+
 use khive_pack_brain::state::BalancedRecallState;
 use khive_pack_brain::tunable::{PackTunable, ParameterDef, ParameterSpace};
 use khive_runtime::RuntimeError;

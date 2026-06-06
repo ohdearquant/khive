@@ -1,18 +1,7 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
-//
-//! KG export / import — portable JSON archive for namespace-scoped knowledge graphs.
+//! KG export / import — portable JSON archive for namespace-scoped knowledge graphs (ADR-010).
 //!
-//! Implements the v1 portability format described in ADR-010. Embeddings are
-//! intentionally excluded: they are regenerable from the embedding model + text
-//! and their inclusion would lock the format to a specific model.
-//!
-//! # Edge namespace enumeration
-//!
-//! `GraphStore::query_edges` has no namespace column — edges are linked to entities,
-//! not namespaces. Export collects all entity IDs in the namespace first, then
-//! queries edges where source_id is in that set. This covers every edge whose
-//! source entity belongs to the namespace, which is the correct definition of
-//! "edges in a namespace" for an export that preserves referential integrity.
+//! Embeddings are excluded (regenerable from text + model). Edges are collected by
+//! querying all entity IDs in the namespace first, then fetching incident edges.
 
 use std::collections::HashSet;
 
@@ -326,6 +315,9 @@ impl KhiveRuntime {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// INLINE TEST JUSTIFICATION: tests here exercise portability serialisation
+// helpers and byte-level round-trip invariants that access private encoding
+// functions. Moving them to tests/ would require pub-exporting those helpers.
 #[cfg(test)]
 mod tests {
     use super::*;

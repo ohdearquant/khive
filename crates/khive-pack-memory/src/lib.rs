@@ -1,10 +1,16 @@
+//! Memory pack — `memory.remember` and `memory.recall` verbs with decay-aware ranking.
+//!
+//! Registers the `memory` note kind, depends on the `kg` pack, and routes
+//! recall through FTS + vector fusion with configurable decay and reranking.
+
 pub(crate) mod ann;
 pub mod config;
 pub mod handlers;
 pub(crate) mod query_cache;
 pub mod rerank;
 pub mod scoring;
-pub(crate) mod text_gather;
+#[doc(hidden)]
+pub mod text_gather;
 pub mod tunable;
 
 use std::sync::Mutex;
@@ -20,6 +26,7 @@ use crate::ann::{new_shared, SharedAnn};
 use crate::config::RecallConfig;
 use crate::query_cache::QueryEmbeddingCache;
 
+/// Pack implementation providing `memory.remember` and `memory.recall` verbs.
 pub struct MemoryPack {
     runtime: KhiveRuntime,
     /// Active recall config.
@@ -239,6 +246,7 @@ static MEMORY_HANDLERS: [HandlerDef; 7] = [
 ];
 
 impl MemoryPack {
+    /// Create a new `MemoryPack` backed by the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self {
             runtime,

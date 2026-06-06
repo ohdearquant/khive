@@ -1,40 +1,4 @@
 //! Timeout and cancellation support for search operations.
-//!
-//! Provides utilities for wrapping search futures with timeout and cancellation
-//! semantics. Uses `tokio::time::timeout` for deadline enforcement and
-//! `tokio_util::sync::CancellationToken` for cooperative cancellation.
-//!
-//! # Design
-//!
-//! Timeout and cancellation are applied at the search entry points (hybrid search,
-//! graph traversal) rather than at every internal function call. This keeps the
-//! internal algorithms clean while providing operational safety at the boundaries.
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use std::time::Duration;
-//! use khive_retrieval::timeout::{search_with_timeout, search_with_cancellation};
-//! use tokio_util::sync::CancellationToken;
-//!
-//! // Timeout: cancel if search takes longer than 5 seconds
-//! let results = search_with_timeout(
-//!     searcher.hybrid_search(&query, &config),
-//!     Duration::from_secs(5),
-//! ).await?;
-//!
-//! // Cancellation: cancel via token (e.g., from a request handler)
-//! let token = CancellationToken::new();
-//! let results = search_with_cancellation(
-//!     searcher.hybrid_search(&query, &config),
-//!     token.clone(),
-//! ).await?;
-//!
-//! // From another task:
-//! token.cancel();
-//! ```
-//!
-//! See also: [`HybridConfig::timeout`] for declarative timeout configuration.
 
 use std::future::Future;
 use std::time::Duration;
@@ -74,9 +38,16 @@ where
 {
     match tokio::time::timeout(duration, future).await {
         Ok(result) => result,
-        Err(_elapsed) => Err(RetrievalError::QueryTimeout {
-            elapsed_ms: duration.as_millis() as u64,
-        }),
+        Err(_elapsed) => {
+            // as-cast is safe for all realistic timeout values (u64::MAX ms ≈ 585M years).
+            debug_assert!(
+                duration.as_millis() <= u64::MAX as u128,
+                "timeout duration overflows u64 milliseconds"
+            );
+            Err(RetrievalError::QueryTimeout {
+                elapsed_ms: duration.as_millis() as u64,
+            })
+        }
     }
 }
 
@@ -181,9 +152,15 @@ where
                 result = tokio::time::timeout(duration, future) => {
                     match result {
                         Ok(inner) => inner,
-                        Err(_elapsed) => Err(RetrievalError::QueryTimeout {
-                            elapsed_ms: duration.as_millis() as u64,
-                        }),
+                        Err(_elapsed) => {
+                            debug_assert!(
+                                duration.as_millis() <= u64::MAX as u128,
+                                "timeout duration overflows u64 milliseconds"
+                            );
+                            Err(RetrievalError::QueryTimeout {
+                                elapsed_ms: duration.as_millis() as u64,
+                            })
+                        }
                     }
                 }
                 _ = token.cancelled() => Err(RetrievalError::QueryCancelled),
@@ -212,7 +189,14 @@ pub(crate) mod serde_opt_duration {
         S: Serializer,
     {
         match value {
-            Some(d) => DurationMs(d.as_millis() as u64).serialize(serializer),
+            Some(d) => {
+                // as-cast is safe for all realistic timeout values (u64::MAX ms ≈ 585M years).
+                debug_assert!(
+                    d.as_millis() <= u64::MAX as u128,
+                    "timeout duration overflows u64 milliseconds"
+                );
+                DurationMs(d.as_millis() as u64).serialize(serializer)
+            }
             None => serializer.serialize_none(),
         }
     }

@@ -1,3 +1,6 @@
+//! khive-mcp binary entry point — parses CLI args, builds a `KhiveRuntime`,
+//! and serves over stdio (or runs as a daemon with `--daemon` on Unix).
+
 use std::path::PathBuf;
 
 use clap::Parser;

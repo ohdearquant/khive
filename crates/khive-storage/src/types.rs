@@ -11,8 +11,10 @@ use khive_types::{EdgeRelation, SubstrateKind};
 
 use crate::error::StorageError;
 
+/// Convenience alias for `Result<T, StorageError>` used throughout this crate.
 pub type StorageResult<T> = Result<T, StorageError>;
 
+/// Aggregate outcome of a batch write operation.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BatchWriteSummary {
     pub attempted: u64,
@@ -22,15 +24,19 @@ pub struct BatchWriteSummary {
     pub first_error: String,
 }
 
+/// Controls whether a delete operation removes the record immediately or marks it as deleted.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeleteMode {
+    /// Mark `deleted_at`; record remains queryable with explicit soft-delete filter.
     Soft,
+    /// Physically remove the row and cascade incident edges.
     Hard,
 }
 
 // -- SQL primitives --
 
+/// A tagged SQL column value that can round-trip through serde and SQLite bindings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SqlValue {
@@ -45,6 +51,7 @@ pub enum SqlValue {
     Timestamp(DateTime<Utc>),
 }
 
+/// A parameterized SQL statement with optional diagnostic label.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SqlStatement {
     pub sql: String,
@@ -52,12 +59,14 @@ pub struct SqlStatement {
     pub label: Option<String>,
 }
 
+/// A single named column in a SQL result row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SqlColumn {
     pub name: String,
     pub value: SqlValue,
 }
 
+/// A row of named columns returned by a raw SQL query.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SqlRow {
     pub columns: Vec<SqlColumn>,
@@ -72,6 +81,7 @@ impl SqlRow {
     }
 }
 
+/// Transaction isolation level hint for SQL backends that support it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SqlIsolation {
@@ -81,6 +91,7 @@ pub enum SqlIsolation {
     Serializable,
 }
 
+/// Options passed to a SQL transaction begin call.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SqlTxOptions {
     pub read_only: bool,
@@ -100,6 +111,7 @@ impl Default for SqlTxOptions {
 
 // -- Vector types --
 
+/// Discriminant for the ANN index algorithm used by a vector backend.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorIndexKind {
@@ -174,6 +186,7 @@ pub enum PropertyOp {
     Exists,
 }
 
+/// A single vector embedding record for bulk insert operations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorRecord {
     pub subject_id: Uuid,
@@ -188,6 +201,7 @@ pub struct VectorRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Parameters for a nearest-neighbor similarity search.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorSearchRequest {
     /// One or many query vectors; sqlite-vec backends enforce `query_vectors.len() == 1`.
@@ -202,6 +216,31 @@ pub struct VectorSearchRequest {
     pub filter: Option<VectorMetadataFilter>,
     /// Backend-specific hints (opaque JSON blob, ignored by default).
     pub backend_hints: Option<serde_json::Value>,
+}
+
+impl VectorSearchRequest {
+    /// Validate documented invariants: non-empty query vectors, finite values,
+    /// and non-zero `top_k`.
+    ///
+    /// Returns `Err` with a human-readable description of the first violation.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.query_vectors.is_empty() {
+            return Err("VectorSearchRequest: query_vectors must not be empty".into());
+        }
+        if self.top_k == 0 {
+            return Err("VectorSearchRequest: top_k must be > 0".into());
+        }
+        for (qi, qvec) in self.query_vectors.iter().enumerate() {
+            for (vi, &v) in qvec.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(format!(
+                        "VectorSearchRequest: query_vectors[{qi}][{vi}] is non-finite ({v})"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for an orphan-sweep pass (ADR-044).
@@ -237,6 +276,37 @@ pub struct SparseVector {
     pub values: Vec<f32>,
 }
 
+impl SparseVector {
+    /// Validate the documented invariants: equal-length arrays, strictly
+    /// increasing indices, and all values finite.
+    ///
+    /// Returns `Err` with a human-readable description of the first violation.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.indices.len() != self.values.len() {
+            return Err(format!(
+                "SparseVector: indices.len() ({}) != values.len() ({})",
+                self.indices.len(),
+                self.values.len()
+            ));
+        }
+        for (i, &val) in self.values.iter().enumerate() {
+            if !val.is_finite() {
+                return Err(format!("SparseVector: values[{i}] is non-finite ({val})"));
+            }
+        }
+        for w in self.indices.windows(2) {
+            if w[0] >= w[1] {
+                return Err(format!(
+                    "SparseVector: indices not strictly increasing at [{}, {}]",
+                    w[0], w[1]
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A single sparse vector embedding record for bulk insert operations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SparseRecord {
     pub subject_id: Uuid,
@@ -247,6 +317,7 @@ pub struct SparseRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Parameters for a sparse nearest-neighbor similarity search.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SparseSearchRequest {
     pub query: SparseVector,
@@ -255,6 +326,7 @@ pub struct SparseSearchRequest {
     pub kind: Option<SubstrateKind>,
 }
 
+/// A single ranked result from a sparse similarity search.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SparseSearchHit {
     pub subject_id: Uuid,
@@ -262,6 +334,7 @@ pub struct SparseSearchHit {
     pub rank: u32,
 }
 
+/// A single ranked result from a dense vector similarity search.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorSearchHit {
     pub subject_id: Uuid,
@@ -269,6 +342,7 @@ pub struct VectorSearchHit {
     pub rank: u32,
 }
 
+/// Metadata and health summary for a vector index backend.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorStoreInfo {
     pub model_name: String,
@@ -281,6 +355,7 @@ pub struct VectorStoreInfo {
 
 // -- Text gather types (candidate-gather optimization, additive) --
 
+/// Controls how BM25 candidate rows are gathered before final ranking.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TextGatherMode {
@@ -293,6 +368,7 @@ pub enum TextGatherMode {
     RankWithinCap,
 }
 
+/// Options that tune the two-stage gather + rank strategy for text search.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TextSearchOptions {
     pub gather_mode: TextGatherMode,
@@ -310,6 +386,7 @@ impl Default for TextSearchOptions {
     }
 }
 
+/// Request to compute per-term document frequency and IDF statistics.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextTermStatsRequest {
     pub terms: Vec<String>,
@@ -328,6 +405,7 @@ pub struct TextTermStats {
 
 // -- Text search types --
 
+/// A text document to be indexed for full-text search.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextDocument {
     pub subject_id: Uuid,
@@ -340,6 +418,7 @@ pub struct TextDocument {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Filter to restrict text search results to a specific set of documents.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TextFilter {
     pub ids: Vec<Uuid>,
@@ -347,6 +426,7 @@ pub struct TextFilter {
     pub namespaces: Vec<String>,
 }
 
+/// Controls how the query string is parsed and matched against the FTS index.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TextQueryMode {
@@ -357,6 +437,7 @@ pub enum TextQueryMode {
     AnyTerm,
 }
 
+/// Parameters for a full-text similarity search.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextSearchRequest {
     pub query: String,
@@ -366,6 +447,7 @@ pub struct TextSearchRequest {
     pub snippet_chars: usize,
 }
 
+/// A single ranked result from a full-text search.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextSearchHit {
     pub subject_id: Uuid,
@@ -375,6 +457,7 @@ pub struct TextSearchHit {
     pub snippet: Option<String>,
 }
 
+/// Metadata and health summary for a text index backend.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextIndexStats {
     pub document_count: u64,
@@ -382,6 +465,7 @@ pub struct TextIndexStats {
     pub last_rebuild_at: Option<DateTime<Utc>>,
 }
 
+/// Controls which entries are included in an index rebuild operation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexRebuildScope {
@@ -391,6 +475,7 @@ pub enum IndexRebuildScope {
 
 // -- Pagination --
 
+/// Offset-based pagination cursor for list operations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PageRequest {
     pub offset: u64,
@@ -406,6 +491,7 @@ impl Default for PageRequest {
     }
 }
 
+/// A paginated result slice with an optional total count.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -452,6 +538,7 @@ pub struct Edge {
     pub target_backend: Option<String>,
 }
 
+/// Edge traversal direction relative to the source node.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -461,12 +548,14 @@ pub enum Direction {
     Both,
 }
 
+/// An inclusive time window for filtering records by timestamp.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TimeRange {
     pub start: Option<DateTime<Utc>>,
     pub end: Option<DateTime<Utc>>,
 }
 
+/// Filter to restrict a graph edge query to a matching subset.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EdgeFilter {
     pub ids: Vec<LinkId>,
@@ -478,6 +567,31 @@ pub struct EdgeFilter {
     pub created_at: Option<TimeRange>,
 }
 
+impl EdgeFilter {
+    /// Validate that weight bounds are finite and ordered correctly.
+    ///
+    /// Returns `Err` with a human-readable description of the first violation.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(w) = self.min_weight {
+            if !w.is_finite() {
+                return Err(format!("EdgeFilter: min_weight is non-finite ({w})"));
+            }
+        }
+        if let Some(w) = self.max_weight {
+            if !w.is_finite() {
+                return Err(format!("EdgeFilter: max_weight is non-finite ({w})"));
+            }
+        }
+        if let (Some(lo), Some(hi)) = (self.min_weight, self.max_weight) {
+            if lo > hi {
+                return Err(format!("EdgeFilter: min_weight ({lo}) > max_weight ({hi})"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Selects which edge attribute is used for sorting results.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeSortField {
@@ -486,6 +600,7 @@ pub enum EdgeSortField {
     Relation,
 }
 
+/// Ascending or descending sort order.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SortDirection {
@@ -493,12 +608,14 @@ pub enum SortDirection {
     Desc,
 }
 
+/// A sort specification pairing a field discriminant with a direction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SortOrder<F> {
     pub field: F,
     pub direction: SortDirection,
 }
 
+/// Parameters for a single-hop graph neighbor lookup.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NeighborQuery {
     pub direction: Direction,
@@ -529,6 +646,7 @@ pub struct NeighborHit {
     pub kind: Option<String>,
 }
 
+/// BFS traversal configuration controlling depth, direction, and edge filters.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TraversalOptions {
     pub max_depth: usize,
@@ -552,6 +670,7 @@ impl TraversalOptions {
     }
 }
 
+/// A graph traversal request from a set of root nodes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TraversalRequest {
     pub roots: Vec<Uuid>,
@@ -575,6 +694,7 @@ pub struct PathNode {
     pub kind: Option<String>,
 }
 
+/// A complete traversal path from one root node to its reachable descendants.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GraphPath {
     pub root_id: Uuid,

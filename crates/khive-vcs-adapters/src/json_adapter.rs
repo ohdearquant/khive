@@ -1,24 +1,13 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
 //! JSON array format adapter (ADR-036 §2 "JSON array").
-//!
-//! Accepts a JSON array of objects at the top level. Objects with both `source`
-//! and `target` keys are treated as edge records; all other objects are treated
-//! as entity records. Unknown keys on entity objects are collected into
-//! `properties`.
-//!
-//! ## Parse strategy
-//!
-//! The P0 JSON adapter uses eager `serde_json::from_str` — the full source is
-//! loaded into memory before iteration begins.  ADR-036 §7 calls for streaming
-//! parsers; that requirement is deferred to P1 for this adapter.
-//! TODO(P1): replace with `serde_json::Deserializer::from_reader` streaming
-//! parse once the CLI pipeline wires in an `impl Read` source.
 
 use crate::adapter::FormatAdapter;
 use crate::error::AdapterError;
 use crate::record::{EdgeRecord, EntityRecord};
+use khive_types::{EdgeRelation, EntityKind};
 use serde_json::Value;
+use std::str::FromStr;
 use uuid::Uuid;
 
 /// A [`FormatAdapter`] that parses a JSON array of objects.
@@ -155,9 +144,16 @@ fn parse_entity(
         }
     };
 
-    // Required: kind (falls back to warning + "concept" when absent; case-insensitive)
+    // Required: kind — must be one of the 8 ADR-001 canonical kinds (case-insensitive).
+    // Missing kind is a fatal error; callers must supply an explicit kind.
     let kind = match remove_ci(&mut obj, "kind") {
-        Some((_, Value::String(s))) if !s.is_empty() => s,
+        Some((_, Value::String(s))) if !s.is_empty() => EntityKind::from_str(&s)
+            .map_err(|_| AdapterError::UnknownKind {
+                index,
+                kind: s.clone(),
+            })?
+            .name()
+            .to_owned(),
         Some(_) => {
             return Err(AdapterError::InvalidField {
                 index,
@@ -166,10 +162,10 @@ fn parse_entity(
             })
         }
         None => {
-            warnings.push(format!(
-                "record {index}: missing 'kind'; defaulting to 'concept'"
-            ));
-            "concept".into()
+            return Err(AdapterError::MissingField {
+                index,
+                field: "kind".into(),
+            })
         }
     };
 
@@ -272,8 +268,15 @@ fn parse_edge(
             field: "target".into(),
         })?;
 
+    // Required: relation — must be one of the 15 ADR-002 canonical relations (case-insensitive).
     let relation = match remove_ci(&mut obj, "relation") {
-        Some((_, Value::String(s))) if !s.is_empty() => s,
+        Some((_, Value::String(s))) if !s.is_empty() => EdgeRelation::from_str(&s)
+            .map_err(|_| AdapterError::UnknownRelation {
+                index,
+                relation: s.clone(),
+            })?
+            .as_str()
+            .to_owned(),
         Some(_) => {
             return Err(AdapterError::InvalidField {
                 index,
@@ -307,12 +310,23 @@ fn parse_edge(
         None => Uuid::new_v4(),
     };
 
+    // Optional: weight — must be finite and in [0.0, 1.0] per ADR-002 edge weight invariant.
     let weight = match remove_ci(&mut obj, "weight") {
-        Some((_, Value::Number(n))) => n.as_f64().ok_or_else(|| AdapterError::InvalidField {
-            index,
-            field: "weight".into(),
-            reason: "weight is not a finite f64".into(),
-        })?,
+        Some((_, Value::Number(n))) => {
+            let w = n.as_f64().ok_or_else(|| AdapterError::InvalidField {
+                index,
+                field: "weight".into(),
+                reason: "weight is not a finite f64".into(),
+            })?;
+            if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                return Err(AdapterError::InvalidField {
+                    index,
+                    field: "weight".into(),
+                    reason: format!("must be finite and in [0.0, 1.0], got {w}"),
+                });
+            }
+            w
+        }
         Some(_) => {
             return Err(AdapterError::InvalidField {
                 index,

@@ -223,7 +223,12 @@ impl<'a, T: Copy> ArenaVec<'a, T> {
     /// Allocates a new region from the arena and copies existing elements.
     /// The old region is leaked in the arena -- reclaimed on reset().
     fn grow(&mut self) {
-        let new_cap = if self.cap == 0 { 8 } else { self.cap * 2 };
+        let new_cap = if self.cap == 0 {
+            8
+        } else {
+            // Use saturating_mul to avoid overflow on pathologically large arenas.
+            self.cap.saturating_mul(2)
+        };
         let new_ptr = self.arena.alloc::<T>(new_cap);
         if self.len > 0 {
             // SAFETY: copying len elements from old region (ptr, len elements)

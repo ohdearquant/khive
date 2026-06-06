@@ -157,6 +157,13 @@ impl fmt::Display for EdgeRelation {
 impl FromStr for EdgeRelation {
     type Err = crate::error::UnknownVariant;
 
+    /// Parse a string into an `EdgeRelation`.
+    ///
+    /// Accepts the 15 canonical ADR-002 relation names (case-insensitive, with
+    /// hyphens normalised to underscores) and also squashed forms that omit the
+    /// separator (e.g. `"partof"`, `"derivedfrom"`).  The squashed forms exist
+    /// for ergonomic DSL entry; they are **not** stored on the wire, which always
+    /// uses the canonical snake_case form produced by [`EdgeRelation::as_str`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let normalised: String = s
             .chars()

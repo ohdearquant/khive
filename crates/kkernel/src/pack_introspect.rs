@@ -5,9 +5,9 @@
 //! set. They return data — JSON for machines, a table for humans — without
 //! invoking any handler.
 //!
-//! ADR-076 establishes that pack registration eventually lives in the kernel.
-//! For now both binaries collect the same set via `inventory!`; this module
-//! consumes whatever is registered and prints it.
+//! Pack registration is governed by ADR-027 (dynamic pack loading via
+//! self-registration). This module consumes whatever is registered via
+//! `inventory!` and prints it.
 
 use anyhow::{anyhow, Context, Result};
 use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder, Visibility};

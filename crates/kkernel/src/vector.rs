@@ -77,6 +77,7 @@ pub struct CapabilitiesReport {
 
 // ── Entry point ────────────────────────────────────────────────────────────────
 
+/// Dispatch `kkernel vector` subcommands to their implementations.
 pub fn run_vector(cmd: VectorCommand) -> Result<()> {
     match cmd {
         VectorCommand::Capabilities(args) => cmd_vector_capabilities(args),

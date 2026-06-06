@@ -1,10 +1,6 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! The `FormatAdapter` trait (ADR-036 §Implementation §Crate structure).
-//!
-//! Adapters are stateful pure transforms: they hold streaming parser state and
-//! produce [`EntityRecord`]/[`EdgeRecord`] streams. They have no dependency on
-//! the database layer.
+//! The [`FormatAdapter`] trait — stateful pure transform producing entity and edge record streams (ADR-036).
 
 use crate::error::AdapterError;
 use crate::record::{EdgeRecord, EntityRecord};

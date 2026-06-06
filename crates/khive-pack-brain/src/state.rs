@@ -1,3 +1,17 @@
+// FILE SIZE JUSTIFICATION: state.rs exceeds 1000 LOC because all domain types
+// share a single module to avoid circular imports — BetaPosterior is used by
+// EntityPosteriors, BalancedRecallState, and SectionPosteriorState, and
+// BrainState references all three.  Splitting into sub-modules would require
+// a re-export facade that adds no semantic value.  The inline test section is
+// kept here for direct access to private arithmetic invariants.
+
+//! Brain domain types — posteriors, profile records, bindings, and state snapshots.
+//!
+//! `BetaPosterior` is the shared probabilistic primitive. `BrainState` is the
+//! runtime registry of profiles and their live state. Serializable snapshots
+//! (`BrainStateSnapshot`, `BalancedRecallSnapshot`, `SectionPosteriorSnapshot`)
+//! are used for persistence. `validate_brain_state_snapshot` guards the load path.
+
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::str::FromStr;
@@ -99,6 +113,31 @@ pub struct BetaPosterior {
 impl BetaPosterior {
     pub fn new(alpha: f64, beta: f64) -> Self {
         Self { alpha, beta }
+    }
+
+    /// Validated constructor. Returns `Err` when either parameter is non-positive
+    /// or non-finite so callers can reject corrupt or programmatically invalid
+    /// posteriors without propagating NaN or zero-division through downstream math.
+    pub fn try_new(alpha: f64, beta: f64) -> Result<Self, String> {
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err(format!(
+                "BetaPosterior: alpha must be finite and positive, got {alpha}"
+            ));
+        }
+        if !beta.is_finite() || beta <= 0.0 {
+            return Err(format!(
+                "BetaPosterior: beta must be finite and positive, got {beta}"
+            ));
+        }
+        Ok(Self { alpha, beta })
+    }
+
+    /// Validate the current field values, returning an error message if invalid.
+    ///
+    /// Used after snapshot deserialization to catch corrupt persisted data before
+    /// it propagates into mean/variance/softmax computations.
+    pub fn validate(&self) -> Result<(), String> {
+        Self::try_new(self.alpha, self.beta).map(|_| ())
     }
 
     pub fn mean(&self) -> f64 {
@@ -316,6 +355,60 @@ impl BalancedRecallState {
             exploration_epoch: snapshot.exploration_epoch,
         }
     }
+}
+
+/// Validate all `BetaPosterior` values inside a `BrainStateSnapshot`.
+///
+/// Returns the first validation error encountered, or `Ok(())` when all
+/// posteriors are finite and positive. Call this after deserializing a
+/// persisted snapshot before handing it to `BrainState::from_snapshot`.
+pub fn validate_brain_state_snapshot(snapshot: &BrainStateSnapshot) -> Result<(), String> {
+    // Built-in profile scalars.
+    let br = &snapshot.balanced_recall;
+    br.relevance
+        .validate()
+        .map_err(|e| format!("balanced_recall.relevance: {e}"))?;
+    br.salience
+        .validate()
+        .map_err(|e| format!("balanced_recall.salience: {e}"))?;
+    br.temporal
+        .validate()
+        .map_err(|e| format!("balanced_recall.temporal: {e}"))?;
+    for (id, p) in &br.entity_posteriors {
+        p.validate()
+            .map_err(|e| format!("balanced_recall.entity_posteriors[{id}]: {e}"))?;
+    }
+
+    // User-created profile snapshots.
+    for (pid, ps) in &snapshot.profile_states {
+        ps.relevance
+            .validate()
+            .map_err(|e| format!("profile_states[{pid}].relevance: {e}"))?;
+        ps.salience
+            .validate()
+            .map_err(|e| format!("profile_states[{pid}].salience: {e}"))?;
+        ps.temporal
+            .validate()
+            .map_err(|e| format!("profile_states[{pid}].temporal: {e}"))?;
+        for (id, p) in &ps.entity_posteriors {
+            p.validate()
+                .map_err(|e| format!("profile_states[{pid}].entity_posteriors[{id}]: {e}"))?;
+        }
+    }
+
+    // Section posteriors.
+    for (pid, ss) in &snapshot.section_states {
+        for (st, p) in &ss.posteriors {
+            p.validate()
+                .map_err(|e| format!("section_states[{pid}].posteriors[{st:?}]: {e}"))?;
+        }
+        for (st, p) in &ss.priors {
+            p.validate()
+                .map_err(|e| format!("section_states[{pid}].priors[{st:?}]: {e}"))?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Serializable snapshot of `BalancedRecallState`.
@@ -896,6 +989,9 @@ pub struct BrainStateSnapshot {
 }
 
 #[cfg(test)]
+// INLINE TEST JUSTIFICATION: tests exercise private arithmetic invariants
+// (merge formula, ESS cap, floored mean) that operate directly on BetaPosterior
+// fields not re-exported to integration tests.
 mod tests {
     use super::*;
 
@@ -1298,5 +1394,51 @@ mod tests {
     fn beta_posterior_weighted_failure_rejects_negative_weight() {
         let mut p = BetaPosterior::new(1.0, 1.0);
         p.update_failure_weighted(-1.0);
+    }
+
+    // BRAIN-AUD-002: validate try_new and snapshot validation boundaries.
+    #[test]
+    fn try_new_rejects_zero_alpha() {
+        assert!(BetaPosterior::try_new(0.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn try_new_rejects_negative_beta() {
+        assert!(BetaPosterior::try_new(1.0, -1.0).is_err());
+    }
+
+    #[test]
+    fn try_new_rejects_nan_alpha() {
+        assert!(BetaPosterior::try_new(f64::NAN, 1.0).is_err());
+    }
+
+    #[test]
+    fn try_new_rejects_inf_beta() {
+        assert!(BetaPosterior::try_new(1.0, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn try_new_accepts_valid_values() {
+        assert!(BetaPosterior::try_new(7.0, 3.0).is_ok());
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_rejects_invalid_alpha() {
+        let mut snapshot = BrainState::new(10).to_snapshot();
+        snapshot.balanced_recall.relevance.alpha = 0.0;
+        assert!(validate_brain_state_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_rejects_nan_posterior() {
+        let mut snapshot = BrainState::new(10).to_snapshot();
+        snapshot.balanced_recall.salience.beta = f64::NAN;
+        assert!(validate_brain_state_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn validate_brain_state_snapshot_accepts_valid_default() {
+        let snapshot = BrainState::new(10).to_snapshot();
+        assert!(validate_brain_state_snapshot(&snapshot).is_ok());
     }
 }

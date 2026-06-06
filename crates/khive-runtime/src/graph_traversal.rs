@@ -325,6 +325,9 @@ impl KhiveRuntime {
     }
 }
 
+// INLINE TEST JUSTIFICATION: tests here exercise graph traversal helper functions
+// (BFS ordering, cycle detection) that access private traversal state. Moving them
+// to tests/ would require pub-exporting that state, widening the API surface.
 #[cfg(test)]
 mod tests {
     use super::*;

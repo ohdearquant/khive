@@ -584,6 +584,8 @@ mod tests {
 
     #[test]
     fn test_boxed_fold_derive() {
+        // REASON: box_default fires because CountFold implements Default, but the test
+        // explicitly exercises the BoxedFold type alias which requires Box::new().
         #[allow(clippy::box_default)]
         let counter: BoxedFold<i32, usize> = Box::new(CountFold::new());
         let entries = [1, 2, 3, 4];

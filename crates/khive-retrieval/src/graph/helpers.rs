@@ -124,19 +124,23 @@ pub fn proximity_score(depth: usize, max_depth: usize) -> DeterministicScore {
 ///
 /// # Returns
 ///
-/// The entity at the "other end" of the link relative to the traversal direction.
-pub fn get_neighbor_entity(link: &Link, current: &EntityRef, direction: &Direction) -> EntityRef {
+/// `Some(neighbor)` when `current` is a valid endpoint for the given direction,
+/// or `None` when `current` is not an endpoint of the link. Callers must handle
+/// `None` by skipping the link; the old signature that always returned an entity
+/// silently promoted unrelated nodes in `Direction::Both` when `current` was
+/// neither source nor target (e.g., due to a buggy backend).
+pub fn get_neighbor_entity(
+    link: &Link,
+    current: &EntityRef,
+    direction: &Direction,
+) -> Option<EntityRef> {
     match direction {
-        Direction::Out => link.target.clone(),
-        Direction::In => link.source.clone(),
-        Direction::Both => {
-            // In bidirectional mode, return the "other end" of the link
-            if &link.source == current {
-                link.target.clone()
-            } else {
-                link.source.clone()
-            }
-        }
+        Direction::Out if &link.source == current => Some(link.target.clone()),
+        Direction::In if &link.target == current => Some(link.source.clone()),
+        Direction::Both if &link.source == current => Some(link.target.clone()),
+        Direction::Both if &link.target == current => Some(link.source.clone()),
+        // current is not an endpoint of this link — skip it.
+        _ => None,
     }
 }
 
@@ -203,22 +207,57 @@ mod tests {
         let target = EntityRef::External("target".to_string());
         let link = Link::new(LinkId::NIL, source.clone(), target.clone(), "test");
 
-        // Outgoing: return target
-        assert_eq!(get_neighbor_entity(&link, &source, &Direction::Out), target);
-
-        // Incoming: return source
-        assert_eq!(get_neighbor_entity(&link, &target, &Direction::In), source);
-
-        // Both from source: return target (other end)
+        // Outgoing from source: return Some(target)
         assert_eq!(
-            get_neighbor_entity(&link, &source, &Direction::Both),
-            target
+            get_neighbor_entity(&link, &source, &Direction::Out),
+            Some(target.clone())
         );
 
-        // Both from target: return source (other end)
+        // Incoming from target: return Some(source)
+        assert_eq!(
+            get_neighbor_entity(&link, &target, &Direction::In),
+            Some(source.clone())
+        );
+
+        // Both from source: return Some(target) (other end)
+        assert_eq!(
+            get_neighbor_entity(&link, &source, &Direction::Both),
+            Some(target.clone())
+        );
+
+        // Both from target: return Some(source) (other end)
         assert_eq!(
             get_neighbor_entity(&link, &target, &Direction::Both),
-            source
+            Some(source.clone())
+        );
+    }
+
+    #[test]
+    fn test_get_neighbor_entity_unrelated_node_returns_none() {
+        let source = EntityRef::External("source".to_string());
+        let target = EntityRef::External("target".to_string());
+        let unrelated = EntityRef::External("unrelated".to_string());
+        let link = Link::new(LinkId::NIL, source.clone(), target.clone(), "test");
+
+        // Outgoing from an unrelated node: link.source != unrelated → None
+        assert_eq!(
+            get_neighbor_entity(&link, &unrelated, &Direction::Out),
+            None,
+            "Out direction: current must be source; unrelated node must return None"
+        );
+
+        // Incoming from an unrelated node: link.target != unrelated → None
+        assert_eq!(
+            get_neighbor_entity(&link, &unrelated, &Direction::In),
+            None,
+            "In direction: current must be target; unrelated node must return None"
+        );
+
+        // Both from an unrelated node: current is neither source nor target → None
+        assert_eq!(
+            get_neighbor_entity(&link, &unrelated, &Direction::Both),
+            None,
+            "Both direction: unrelated node must return None"
         );
     }
 

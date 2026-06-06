@@ -1,3 +1,8 @@
+//! Section weight derivation helpers — Thompson sampling and deterministic fallback.
+//!
+//! Public entry points are `derive_weights` (stochastic, exploration-phase) and
+//! `derive_deterministic_weights` (exploit-phase, epoch == 0).
+
 use std::collections::HashMap;
 
 use rand::Rng;

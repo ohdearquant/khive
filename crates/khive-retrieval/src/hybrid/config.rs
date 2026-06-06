@@ -115,10 +115,13 @@ impl Default for HybridConfig {
 
 impl HybridConfig {
     /// Create a new config with specified top_k.
+    ///
+    /// The candidate pool size is `top_k * DEFAULT_POOL_MULTIPLIER`, saturating
+    /// at `usize::MAX` on overflow (rather than wrapping or panicking in debug).
     pub fn new(top_k: usize) -> Self {
         Self {
             top_k,
-            candidate_pool_size: top_k * DEFAULT_POOL_MULTIPLIER,
+            candidate_pool_size: top_k.saturating_mul(DEFAULT_POOL_MULTIPLIER),
             ..Default::default()
         }
     }
@@ -147,8 +150,20 @@ impl HybridConfig {
     /// Set weights for weighted fusion.
     ///
     /// Weights are clamped to [0.0, 1.0].
+    ///
+    /// # Panics (debug)
+    ///
+    /// Asserts that both weights are finite in debug builds. NaN or infinity are not valid weights.
     #[must_use]
     pub fn with_weights(mut self, vector: f64, keyword: f64) -> Self {
+        debug_assert!(
+            vector.is_finite(),
+            "vector weight must be finite, got {vector}"
+        );
+        debug_assert!(
+            keyword.is_finite(),
+            "keyword weight must be finite, got {keyword}"
+        );
         self.vector_weight = vector.clamp(0.0, 1.0);
         self.keyword_weight = keyword.clamp(0.0, 1.0);
         self
@@ -166,10 +181,10 @@ impl HybridConfig {
 
     /// Get normalized weights that sum to 1.0.
     ///
-    /// If both weights are zero, returns equal weights (0.5, 0.5).
+    /// If both weights are zero or their sum is non-finite, returns equal weights (0.5, 0.5).
     pub fn normalized_weights(&self) -> (f64, f64) {
         let sum = self.vector_weight + self.keyword_weight;
-        if sum <= 0.0 {
+        if sum <= 0.0 || !sum.is_finite() {
             (0.5, 0.5)
         } else {
             (self.vector_weight / sum, self.keyword_weight / sum)

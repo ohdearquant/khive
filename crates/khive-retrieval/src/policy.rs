@@ -1,27 +1,7 @@
 //! Policy integration for access-controlled retrieval.
 //!
-//! # RETRIEVAL-03: Policy Integration
-//!
-//! This module provides policy-based filtering of search results, ensuring
-//! that callers only see documents they are authorized to access.
-//!
-//! # Architecture
-//!
-//! ```text
-//! Query -> Retrieval -> Policy Filter -> Results
-//!                            |
-//!                            v
-//!                      PolicyEngine
-//! ```
-//!
-//! # Example
-//!
-//! ```ignore
-//! use khive_retrieval::policy::{SearchPolicy, filter_by_policy};
-//!
-//! let policy = SearchPolicy::new(ClearanceLevel::Internal);
-//! let filtered = filter_by_policy(results, &policy, |id| get_doc_clearance(id));
-//! ```
+//! Post-retrieval clearance filter: callers only see documents at or below their
+//! ClearanceLevel. See RETRIEVAL-03.
 
 use khive_score::DeterministicScore;
 use std::hash::Hash;

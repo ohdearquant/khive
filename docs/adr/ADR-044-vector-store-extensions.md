@@ -525,6 +525,60 @@ the capability flag is `false`. Existing backends continue to compile unchanged.
 
 ---
 
+## Amendment A1: `supports_multi_field` and `batch_exists` (2026-06-06)
+
+Two additional items were added to the `VectorStore` surface after the initial ADR was accepted.
+This amendment brings them under formal ADR coverage.
+
+### `supports_multi_field` — capability flag on `VectorStoreCapabilities`
+
+```rust
+/// Whether this backend stores multiple named fields per subject
+/// (e.g. `entity.title` and `entity.body` as separate vectors).
+/// sqlite-vec backends use `subject_id PRIMARY KEY` and therefore support
+/// only one vector per subject per namespace; this flag is `false` for them.
+#[serde(default)]
+pub supports_multi_field: bool,
+```
+
+**Semantics**: When `false` (the default), backends silently collapse multi-field inserts
+to the last vector written for a given `subject_id`. When `true`, backends must store each
+`(subject_id, field)` pair independently. The retrieval layer uses this flag to decide
+whether field-disambiguated recall is available without a runtime probe.
+
+**Compliance**: No backend currently sets this to `true`. It is declared `#[serde(default)]`
+so existing serialized capability blobs deserialize correctly.
+
+### `batch_exists` — default method on `VectorStore`
+
+```rust
+/// Check which of the given subject IDs already have embeddings in this store
+/// for the specified namespace.
+///
+/// Returns a [`HashSet`] of IDs that are present. IDs not in the returned set
+/// have no embedding. Default returns [`StorageError::Unsupported`]; backends
+/// that support fast bulk existence checks should override this method.
+async fn batch_exists(
+    &self,
+    ids: &[Uuid],
+    namespace: &str,
+) -> StorageResult<HashSet<Uuid>>;
+```
+
+**Semantics**: Returns the subset of `ids` that have at least one embedding in the given
+namespace. The default implementation returns `StorageError::Unsupported`. Backends that
+implement it should do so as a single SQL `IN (...)` query for efficiency.
+
+**Consumer**: `kkernel::reindex` uses `batch_exists` to skip re-embedding of entries that
+already have up-to-date vectors, falling back gracefully when unsupported.
+
+**No capability flag**: Unlike the methods in §1–5, `batch_exists` does not have a
+corresponding `supports_batch_exists` capability flag. Callers must use the error-type
+pattern (`StorageError::Unsupported`) to detect absence. A future ADR may add the flag
+if widespread adoption justifies it.
+
+---
+
 ## References
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — base `VectorStore` trait; this ADR amends it

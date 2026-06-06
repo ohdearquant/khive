@@ -1,6 +1,6 @@
 // Copyright 2026 khive contributors. Licensed under Apache-2.0.
 //
-//! Minimal entity+edge diff computation for the merge use case (ADR-043 §3).
+//! Minimal entity+edge diff computation for the merge use case.
 //!
 //! This is a private implementation used only by `khive-merge`. It does NOT
 //! implement the full `GraphDiff` format from ADR-017 — it produces the
@@ -30,6 +30,10 @@ pub enum EntityChange {
     Deleted,
     /// Modified in branch (fields differ from base).
     Modified {
+        // REASON: base is retained for future conflict-resolution UX (show "was → now").
+        // Currently only `branch` is read in merge patterns; `base` is present for
+        // completeness and will be used when we add a diff display path.
+        #[allow(dead_code)]
         base: ExportedEntity,
         branch: ExportedEntity,
     },
@@ -46,6 +50,9 @@ pub enum EdgeChange {
     Deleted,
     /// Weight modified.
     WeightModified {
+        // REASON: base_weight is retained for future diff display (show "was → now").
+        // Currently only `branch_weight` is read in merge patterns.
+        #[allow(dead_code)]
         base_weight: f64,
         branch_weight: f64,
     },
@@ -77,9 +84,12 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
         branch.entities.iter().map(|e| (e.id, e)).collect();
 
     let all_ids: HashSet<Uuid> = base_map.keys().chain(branch_map.keys()).copied().collect();
+    // Sort for deterministic output ordering (AUD-006).
+    let mut all_ids_sorted: Vec<Uuid> = all_ids.into_iter().collect();
+    all_ids_sorted.sort();
     let mut result = HashMap::new();
 
-    for id in all_ids {
+    for id in all_ids_sorted {
         let change = match (base_map.get(&id), branch_map.get(&id)) {
             (None, Some(b)) => EntityChange::Added((*b).clone()),
             (Some(_), None) => EntityChange::Deleted,
@@ -122,9 +132,17 @@ pub fn diff_edges(
         .collect();
 
     let all_keys: HashSet<EdgeKey> = base_map.keys().chain(branch_map.keys()).cloned().collect();
+    // Sort for deterministic output ordering (AUD-006).
+    let mut all_keys_sorted: Vec<EdgeKey> = all_keys.into_iter().collect();
+    all_keys_sorted.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then(a.target.cmp(&b.target))
+            .then(a.relation.cmp(&b.relation))
+    });
     let mut result = HashMap::new();
 
-    for key in all_keys {
+    for key in all_keys_sorted {
         let change = match (base_map.get(&key), branch_map.get(&key)) {
             // Added in branch: carry the branch edge verbatim to preserve edge_id.
             (None, Some(branch_e)) => EdgeChange::Added((*branch_e).clone()),
@@ -197,6 +215,7 @@ mod tests {
             tags: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            entity_type: None,
         }
     }
 

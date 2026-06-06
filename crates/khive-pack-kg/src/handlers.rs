@@ -1,3 +1,11 @@
+// FILE SIZE JUSTIFICATION: handlers.rs implements all 16 KG verb handlers. Each handler is a
+// self-contained request/response unit with distinct validation, runtime calls, and serialization
+// logic. Splitting by verb group would scatter tightly-coupled parameter structs, timestamp
+// normalization helpers, and shared constants across multiple files, increasing cross-file coupling
+// with no architectural benefit. The large inline test section requires pub(crate) access to
+// private helpers (walk_timestamps, micros_to_iso). Inline tests stay co-located with production
+// code for that access.
+
 //! Verb handlers for the KG pack.
 //!
 //! Each handler: deserialize params from Value → validate → call runtime → serialize result.
@@ -354,6 +362,9 @@ struct MergeParams {
     strategy: Option<String>,
     content_strategy: Option<String>,
     dry_run: Option<bool>,
+    // REASON: `verbose` is accepted at the wire level for forward compatibility but is not
+    // yet consumed by the merge handler. Keeping the field prevents serde rejections when
+    // callers pass `verbose=true` alongside other merge params.
     #[allow(dead_code)]
     verbose: Option<bool>,
 }
@@ -1023,12 +1034,17 @@ const TIMESTAMP_KEYS: &[&str] = &[
 /// Accepts both `u64` (serde repr of `khive_types::Timestamp`) and `i64`
 /// (stored epoch microseconds on storage-layer structs). String values and
 /// `null` are left unchanged — they are already converted or absent.
+/// `u64` values above `i64::MAX` are silently skipped (out-of-range timestamps
+/// cannot have originated from khive and are left as-is).
 fn walk_timestamps(v: &mut Value) {
     match v {
         Value::Object(obj) => {
             for (key, val) in obj.iter_mut() {
                 if TIMESTAMP_KEYS.contains(&key.as_str()) {
-                    let micros_opt = val.as_u64().map(|n| n as i64).or_else(|| val.as_i64());
+                    let micros_opt = val
+                        .as_u64()
+                        .and_then(|n| i64::try_from(n).ok())
+                        .or_else(|| val.as_i64());
                     if let Some(micros) = micros_opt {
                         *val = Value::String(micros_to_iso(micros));
                         // Already a scalar now — no need to recurse into it.
@@ -3940,6 +3956,21 @@ mod tests {
             "non-timestamp number must be unchanged"
         );
         assert!(v["created_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn walk_timestamps_u64_max_left_unchanged() {
+        use super::walk_timestamps;
+        // u64::MAX overflows i64 — the value must be left as a number (not
+        // converted), because checked try_from rejects it gracefully.
+        let mut v = json!({ "created_at": u64::MAX });
+        walk_timestamps(&mut v);
+        // The value must remain a number — not turned into a string.
+        assert!(
+            v["created_at"].is_number(),
+            "out-of-range u64 timestamp must be left unchanged, got: {:?}",
+            v["created_at"]
+        );
     }
 
     #[test]

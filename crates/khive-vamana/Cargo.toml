@@ -10,12 +10,17 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-rayon = "1.10"
-memmap2 = "0.9"
-bytemuck = "1.16"
-rand = "0.8"
+rayon = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "vamana_bench"
+harness = false

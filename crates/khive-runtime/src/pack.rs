@@ -1,15 +1,14 @@
+// FILE SIZE JUSTIFICATION: pack.rs is the load-bearing dispatch core — VerbRegistry,
+// VerbRegistryBuilder, PackRuntime, DispatchHook, and their test scaffolding all
+// share internal state (packs Vec, gate, event_store) that cannot be cleanly split
+// without exposing private fields or duplicating the scaffolding. Inline tests cover
+// collision detection and dispatch path that require direct access to VerbRegistry
+// internals. Split plan: when the verb surface reaches a stable v1 API, extract
+// VerbRegistryBuilder into `pack/builder.rs` and gate/event logic into `pack/dispatch.rs`.
 //! Pack runtime trait and verb registry (ADR-025 step 2).
 //!
-//! Packs register verbs into the runtime. The registry routes verb calls
-//! to the pack that declares them.
-//!
-//! `Pack` (in khive-types) uses const associated items which are not
-//! object-safe. `PackRuntime` mirrors that metadata as methods so the
-//! registry can store packs as trait objects. See ADR-025 §PackRuntime.
-//!
-//! Lifecycle: build with `VerbRegistryBuilder`, then call `.build()` to
-//! get a cheaply-cloneable `VerbRegistry`. Registration is only possible
-//! through the builder.
+//! `PackRuntime` mirrors `Pack`'s const associated items as methods for object safety.
+//! Build a [`VerbRegistry`] via `VerbRegistryBuilder::build()`; registration is builder-only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -284,6 +283,7 @@ pub struct VerbRegistryBuilder {
 }
 
 impl VerbRegistryBuilder {
+    /// Create a builder with no packs, `AllowAllGate`, and the local namespace as default.
     pub fn new() -> Self {
         Self {
             packs: Vec::new(),
@@ -585,31 +585,10 @@ pub struct VerbRegistry {
 impl VerbRegistry {
     /// Return the help schema envelope for a verb (issue #287).
     ///
-    /// Called by `dispatch` when `params["help"] == true`. Walks all registered
-    /// packs to find the first `HandlerDef` whose `name` matches `verb`, then
-    /// returns a structured envelope:
-    ///
-    /// ```json
-    /// {
-    ///   "verb": "recall",
-    ///   "pack": "memory",
-    ///   "description": "...",
-    ///   "category": "Assertive",
-    ///   "params": [
-    ///     { "name": "query", "type": "string", "required": true, "description": "..." },
-    ///     ...
-    ///   ]
-    /// }
-    /// ```
-    ///
-    /// For `Visibility::Subhandler` handlers the envelope carries
-    /// `"visibility": "internal"` and `"callable_via_mcp": false` so that
-    /// callers who discover the schema via `help=true` see the same
-    /// non-callable status that dispatch would enforce (ue-help-introspection C1).
-    ///
-    /// Returns `Err(RuntimeError::InvalidInput(...))` when the verb is unknown
-    /// to all loaded packs — identical to the error the normal dispatch path
-    /// would emit (so callers get consistent feedback for unknown verbs).
+    /// Walks registered packs for the first matching `HandlerDef` and returns a
+    /// structured JSON envelope. Subhandlers carry `callable_via_mcp: false`.
+    /// Unknown verbs return `RuntimeError::InvalidInput`. Full shape documented
+    /// in `docs/protocol.md` §Request Schema.
     pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
         for pack in self.packs.iter() {
             for handler in pack.handlers().iter() {
@@ -672,40 +651,9 @@ impl VerbRegistry {
 
     /// Dispatch a verb to the first pack that handles it.
     ///
-    /// When multiple packs declare the same verb, the first registered pack wins.
-    ///
-    /// **`help=true` interception (issue #287)**: when `params` contains
-    /// `"help": true`, dispatch is short-circuited before gate evaluation and
-    /// pack invocation. The call returns a schema envelope for the verb:
-    /// `{ verb, pack, description, category, params: [{name, type, required, description}] }`.
-    /// This is a read-only introspection path; no side effects occur.
-    ///
-    /// The configured [`Gate`](khive_gate::Gate) is consulted before dispatch
-    /// (ADR-018). `Deny` decisions return
-    /// [`RuntimeError::PermissionDenied`] immediately — the pack is never
-    /// invoked. `Allow` decisions proceed to pack dispatch as before.
-    ///
-    /// Every gate consultation emits one `tracing::info!(... "gate.check")` event
-    /// with a structured `audit_event` field (ADR-018). When a [`EventStore`]
-    /// is configured via [`VerbRegistryBuilder::with_event_store`], an `Event`
-    /// is also persisted to the `Event` substrate (ADR-018; ADR-004/ADR-005). Storage errors are logged
-    /// via `tracing::warn!` and never propagated.
-    ///
-    /// When `gate.check` itself returns an error (gate infrastructure failure),
-    /// the error is logged via `tracing::warn!` and dispatch proceeds (fail-open,
-    /// consistent with ADR-018 "Fail-open on gate Err"). No audit event
-    /// is persisted for an errored gate check — no decision was produced.
-    ///
-    /// The synthesized `GateRequest` carries `ActorRef::anonymous()` and the
-    /// operation's namespace — pulled from `params["namespace"]` when present
-    /// (including an explicit empty string, which `KhiveRuntime::ns` also
-    /// preserves), otherwise the registry's default namespace (configured via
-    /// [`VerbRegistryBuilder::with_default_namespace`]). Gate-visible
-    /// namespace and runtime-visible namespace MUST stay aligned; coercing an
-    /// empty string here while the runtime keeps `""` would create an
-    /// authorization/audit blind spot on the namespace field governed by ADR-018.
-    /// Transports that have richer caller context (auth headers, session
-    /// info) will gain a sibling dispatch path in a follow-up.
+    /// Routes through gate (ADR-018), then invokes the matching pack handler. When
+    /// `params["help"] == true`, short-circuits to `describe_verb` with no side effects.
+    /// Gate errors are fail-open. Full dispatch flow documented in `docs/protocol.md`.
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
         // help=true interception (issue #287) — short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
@@ -1006,7 +954,7 @@ impl VerbRegistry {
     ///
     /// Returns `None` if no pack with `name` is registered. Each `HandlerDef`
     /// carries name + description + visibility — sufficient for introspection
-    /// clients like `kkernel pack handler` (ADR-076).
+    /// clients (ADR-023 §verb-surface, ADR-017 §Pack-standard).
     pub fn pack_verbs(&self, name: &str) -> Option<&'static [HandlerDef]> {
         self.packs
             .iter()
@@ -1283,6 +1231,11 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
         .and_then(|s| s.parse::<uuid::Uuid>().ok())
 }
 
+// INLINE TEST JUSTIFICATION: tests here exercise VerbRegistry collision detection,
+// gate enforcement, and dispatch ordering that depend on direct access to the
+// registry's private `packs` Vec and gate field. Moving them to tests/ would
+// require pub-exporting registry internals. Broad behavioral dispatch tests
+// live in tests/integration.rs.
 #[cfg(test)]
 mod tests {
     use super::*;

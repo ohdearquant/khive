@@ -1,3 +1,10 @@
+// FILE SIZE JUSTIFICATION: all five replay primitives (weights_as_of, replay, diff,
+// rank_history, regression_check) share a single SQLite connection type and the same
+// weight_events schema; splitting them would duplicate schema definitions and connection
+// wiring. The drift-metrics sub-functions (jaccard_stability_7d, atom_rank_variance,
+// adjustment_rate_per_day) are tightly coupled to the same table and cannot be moved
+// without duplicating the SQL helpers. Co-location is intentional and reviewed by ADR-030.
+
 //! Temporal replay APIs — Three Observables Feedback Loop (Phase 3).
 //!
 //! Provides four primitives for diffing past vs. present weight state:
@@ -31,8 +38,8 @@
 //! [`metrics::adjustment_rate_per_day`] — count of weight_events rows per day,
 //! useful for detecting runaway adjustment patterns.
 
-// The `engine` feature is a future integration point (EmbeddedEngine not yet ported).
-// Silence the cfg warning — the feature gate is intentionally undeclared so it never activates.
+// REASON: the `engine` feature is a future integration point (EmbeddedEngine not yet ported);
+// the cfg is intentionally undeclared so the gate never activates during normal builds.
 #![allow(unexpected_cfgs)]
 
 use std::collections::{HashMap, HashSet};
@@ -49,6 +56,8 @@ use uuid::Uuid;
 use crate::persist::PersistError as EngineError;
 use crate::weights::WEIGHT_FLOOR;
 // TODO(port-engine): EmbeddedEngine not yet in khive-retrieval scope; stub for compilation.
+// Tracked: port blocked on khive-inference crate landing; see ADR-030 §"engine" integration point.
+// REASON: type alias is referenced by `#[cfg(feature = "engine")]` items that are not compiled by default
 #[allow(dead_code)]
 type EmbeddedEngine = ();
 
@@ -203,7 +212,9 @@ pub async fn weights_as_of(
 /// namespace).  Without this post-filter, `replay()` would return atoms from
 /// any namespace that happen to be semantically close to the query, leaking
 /// cross-tenant atom UUIDs to the requesting lambda.
-#[allow(dead_code)] // used only when feature = "engine" is active
+// REASON: called only from the `#[cfg(feature = "engine")]` replay() function; without the
+// feature gate the caller is compiled out, making this function appear dead to rustc.
+#[allow(dead_code)]
 fn filter_atoms_by_namespace(
     conn: &Connection,
     namespace: &str,
@@ -299,13 +310,15 @@ pub async fn replay(
     };
 
     // Step 3: resolve weights for the candidate atom IDs.
+    // Propagate DB errors instead of silently falling back to all-1.0 weights:
+    // unwrap_or_default here would silently change rankings whenever the DB is
+    // temporarily unavailable, making drift look like genuine weight changes.
     let candidate_ids: Vec<Uuid> = raw_results.iter().map(|h| h.id).collect();
     let weights: HashMap<Uuid, f32> = match at_time {
         Some(t) => weights_as_of(&engine.store().conn(), namespace, t).await?,
         None => {
             crate::weights::batch_load_weights(&engine.store().conn(), namespace, &candidate_ids)
-                .await
-                .unwrap_or_default()
+                .await?
         }
     };
 
@@ -326,7 +339,8 @@ pub async fn replay(
 }
 
 /// Build a [`DiffReport`] from two ordered atom lists.
-#[allow(dead_code)] // used only when feature = "engine" is active
+// REASON: called only from the `#[cfg(feature = "engine")]` diff() function which is not yet active.
+#[allow(dead_code)]
 fn compute_diff_report(top_k_at_t1: Vec<Uuid>, top_k_at_t2: Vec<Uuid>) -> DiffReport {
     use std::collections::HashSet;
 

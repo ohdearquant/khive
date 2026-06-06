@@ -75,6 +75,12 @@ pub async fn bfs_traverse<S: LinkStore>(
         .min(MAX_TRAVERSAL_RESULTS);
     let min_weight = options.min_weight.unwrap_or(f64::NEG_INFINITY);
 
+    // An explicit limit of 0 means "return nothing" — return immediately so
+    // the start node is never pushed into results.
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     // **PROOF CORRESPONDENCE**: `khive.Retrieval.Graph.visited_mono`
     // Visited set only grows (insert-only); never shrinks during traversal.
     // EntityRef implements Hash + Eq, enabling direct use as HashMap key.
@@ -108,14 +114,21 @@ pub async fn bfs_traverse<S: LinkStore>(
                 continue;
             }
 
-            // Get edge weight and filter
+            // Get edge weight and filter.
+            // Reject NaN/Inf: non-finite weights propagate into path_weight and
+            // corrupt ranking. NaN comparisons are always false, so the
+            // min_weight check alone would silently let NaN through.
             let edge_weight = get_edge_weight(&link);
-            if edge_weight < min_weight {
+            if !edge_weight.is_finite() || edge_weight < min_weight {
                 continue;
             }
 
-            // Determine neighbor entity based on direction
-            let neighbor = get_neighbor_entity(&link, &current, &options.direction);
+            // Determine neighbor entity based on direction.
+            // Returns None when current is not a valid endpoint for this link
+            // (e.g., a backend returned a link that doesn't involve current).
+            let Some(neighbor) = get_neighbor_entity(&link, &current, &options.direction) else {
+                continue;
+            };
 
             // Skip if already visited (EntityRef implements Hash + Eq)
             if visited.contains(&neighbor) {

@@ -100,10 +100,12 @@ impl NamespaceToken {
         Self::mint_authorized(ns, ActorRef::anonymous())
     }
 
+    /// Return the namespace this token authorises access to.
     pub fn namespace(&self) -> &Namespace {
         &self.namespace
     }
 
+    /// Return the actor reference embedded in this token.
     pub fn actor(&self) -> &ActorRef {
         &self.actor
     }
@@ -919,6 +921,9 @@ pub(crate) fn parse_embedding_model_alias(name: &str) -> Option<EmbeddingModel> 
     }
 }
 
+// INLINE TEST JUSTIFICATION: tests here cover KhiveRuntime construction helpers
+// (in-memory backend wiring, NamespaceToken::for_namespace) that are
+// pub(crate)-only and cannot be called from the integration test crate.
 #[cfg(test)]
 mod tests {
     use super::*;

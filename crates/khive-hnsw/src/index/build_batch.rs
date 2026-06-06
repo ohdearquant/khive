@@ -8,6 +8,8 @@
 //! 2. **Search phase**: For remaining nodes, find neighbors against the frozen
 //!    seed graph, then merge results sequentially.
 
+use std::collections::HashSet;
+
 use super::HnswIndex;
 use crate::error::{Result, RetrievalError};
 use crate::node::HnswNode;
@@ -62,7 +64,10 @@ impl HnswIndex {
             return Ok(());
         }
 
-        // Validate dimensions upfront to avoid partial builds
+        // Pre-scan for duplicates within the input batch before any mutation.
+        // Duplicate IDs in items would corrupt id_to_internal (last writer wins,
+        // but multiple internal nodes would exist for the same external ID).
+        let mut seen_in_batch: HashSet<NodeId> = HashSet::with_capacity(items.len());
         for (id, vector) in &items {
             if vector.len() != self.config.dimensions {
                 return Err(RetrievalError::DimensionMismatch {
@@ -76,14 +81,21 @@ impl HnswIndex {
                     "build_batch does not support updates: ID {id:?} already exists"
                 )));
             }
+            // Check for duplicates within the batch itself
+            if !seen_in_batch.insert(*id) {
+                return Err(RetrievalError::hnsw(format!(
+                    "build_batch: duplicate ID {id:?} within the input batch"
+                )));
+            }
         }
 
-        // Budget check for entire batch
+        // Budget check for entire batch -- use checked arithmetic to avoid overflow.
         if let Some(limit) = self.config.memory_budget {
             let current = self.memory_usage();
             let cost_per_node = self.estimate_insert_cost();
-            let total_cost = cost_per_node * items.len();
-            if current + total_cost > limit {
+            // cost_per_node * items.len() can overflow for very large batches.
+            let total_cost = cost_per_node.saturating_mul(items.len());
+            if current.saturating_add(total_cost) > limit {
                 return Err(RetrievalError::budget_exceeded(current, total_cost, limit));
             }
         }

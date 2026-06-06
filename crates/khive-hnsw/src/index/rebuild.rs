@@ -265,6 +265,8 @@ impl HnswIndex {
     }
 
     /// Update entry point to the node with the highest max_layer.
+    // REASON: Called by rebuild in manual mode; not dead in all compile paths.
+    // Kept here to avoid split of rebuild state management across modules.
     #[allow(dead_code)]
     pub(super) fn update_entry_point(&mut self) {
         let new_entry = self

@@ -1,3 +1,9 @@
+//! Recall configuration types — scoring weights, decay models, and FTS gather options.
+// FILE SIZE JUSTIFICATION: config.rs holds all tightly-coupled recall configuration types
+// (RecallConfig, DecayModel, RecallFtsGatherConfig, BrainProfileHint) plus their Default,
+// validation, and env-var parsing impls. Splitting would require cross-module type references
+// for the many inter-dependent fields and validation logic that references multiple types.
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -436,19 +442,19 @@ impl RecallConfig {
     /// - All three base weights summing to zero (no scoring signal)
     /// - Non-positive temporal half-life
     pub fn validate(&self) -> Result<(), RuntimeError> {
-        if self.relevance_weight < 0.0 {
+        if !self.relevance_weight.is_finite() || self.relevance_weight < 0.0 {
             return Err(RuntimeError::InvalidInput(
-                "relevance_weight must be non-negative".to_string(),
+                "relevance_weight must be a finite non-negative number".to_string(),
             ));
         }
-        if self.salience_weight < 0.0 {
+        if !self.salience_weight.is_finite() || self.salience_weight < 0.0 {
             return Err(RuntimeError::InvalidInput(
-                "salience_weight must be non-negative".to_string(),
+                "salience_weight must be a finite non-negative number".to_string(),
             ));
         }
-        if self.temporal_weight < 0.0 {
+        if !self.temporal_weight.is_finite() || self.temporal_weight < 0.0 {
             return Err(RuntimeError::InvalidInput(
-                "temporal_weight must be non-negative".to_string(),
+                "temporal_weight must be a finite non-negative number".to_string(),
             ));
         }
         let weight_sum = self.relevance_weight + self.salience_weight + self.temporal_weight;
@@ -458,16 +464,25 @@ impl RecallConfig {
             ));
         }
         for (name, &weight) in &self.reranker_weights {
-            if weight < 0.0 {
+            if !weight.is_finite() || weight < 0.0 {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "reranker_weights[{name:?}] must be non-negative"
+                    "reranker_weights[{name:?}] must be a finite non-negative number"
                 )));
             }
         }
-        if self.temporal_half_life_days <= 0.0 {
+        if !self.temporal_half_life_days.is_finite() || self.temporal_half_life_days <= 0.0 {
             return Err(RuntimeError::InvalidInput(
-                "temporal_half_life_days must be positive".to_string(),
+                "temporal_half_life_days must be a finite positive number".to_string(),
             ));
+        }
+        // Validate PowerLaw half_life_days if that decay model is active.
+        if let DecayModel::PowerLaw { half_life_days } = self.decay_model {
+            if !half_life_days.is_finite() || half_life_days <= 0.0 {
+                return Err(RuntimeError::InvalidInput(
+                    "decay_model.power_law.half_life_days must be a finite positive number"
+                        .to_string(),
+                ));
+            }
         }
         if self.candidate_limit == Some(0) {
             return Err(RuntimeError::InvalidInput(
@@ -485,6 +500,18 @@ impl RecallConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Deserialize from a JSON value and validate in one step.
+    ///
+    /// Callers that receive untrusted JSON should prefer this over raw
+    /// `serde_json::from_value` + a separate `.validate()` call, so invalid
+    /// config states cannot escape into caller code.
+    pub fn try_from_value(v: serde_json::Value) -> Result<Self, RuntimeError> {
+        let cfg: Self =
+            serde_json::from_value(v).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 }
 
@@ -569,6 +596,8 @@ pub struct WeightedContributions {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// INLINE TEST JUSTIFICATION: tests exercise private validation methods and
+// DecayModel::apply, which are not accessible from the integration test harness.
 #[cfg(test)]
 mod tests {
     use super::*;

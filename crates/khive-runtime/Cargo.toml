@@ -31,13 +31,12 @@ tracing = { workspace = true }
 lattice-embed = { workspace = true }
 parking_lot = { workspace = true }
 toml = { workspace = true }
-rusqlite = { version = "0.33" }
-libc = "0.2"
+rusqlite = { workspace = true }
+libc = { workspace = true }
 anyhow = { workspace = true }
-tempfile = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tempfile = "3"
+tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
-serial_test = "3"
+serial_test = { workspace = true }

@@ -1,21 +1,7 @@
 //! SPARQL-inspired syntax parser.
 //!
-//! Parses a practical subset of SPARQL into the same AST as the GQL parser,
-//! so the SQL compiler works unchanged.
-//!
-//! Supported:
-//!   SELECT ?a ?b WHERE { ?a a :concept . ?a :extends+ ?b . } LIMIT 10
-//!   SELECT ?a WHERE { ?a :name "LoRA" . ?a :extends{1,3} ?b . } LIMIT 5
-//!
-//! Grammar:
-//!   query     = SELECT vars WHERE '{' triples '}' [LIMIT number]
-//!   vars      = var+
-//!   var       = '?' ident
-//!   triples   = triple ('.' triple)* '.'?
-//!   triple    = var predicate object
-//!   predicate = 'a' | ':' ident [path_mod]
-//!   path_mod  = '+' | '*' | '?' | '{' min ',' max '}'
-//!   object    = var | ':' ident | string_literal | number
+//! Parses a practical SPARQL subset (`SELECT … WHERE { triples } LIMIT n`) into
+//! the same AST as the GQL parser, so the SQL compiler works unchanged.
 
 use crate::ast::*;
 use crate::error::QueryError;

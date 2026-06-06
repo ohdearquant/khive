@@ -41,6 +41,7 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
+    /// All 8 canonical entity kinds in ADR-001 table order.
     pub const ALL: [Self; 8] = [
         Self::Concept,
         Self::Document,
@@ -52,6 +53,7 @@ impl EntityKind {
         Self::Service,
     ];
 
+    /// Return the canonical lowercase string for this kind, as stored on the wire.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Concept => "concept",
@@ -72,6 +74,7 @@ impl fmt::Display for EntityKind {
     }
 }
 
+// Canonical entity kind strings listed in ADR-001.
 const ENTITY_KIND_VALID: &[&str] = &[
     "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
 ];
@@ -79,6 +82,18 @@ const ENTITY_KIND_VALID: &[&str] = &[
 impl FromStr for EntityKind {
     type Err = crate::error::UnknownVariant;
 
+    /// Parse a string into an `EntityKind`.
+    ///
+    /// Accepts the 8 canonical ADR-001 kind names (case-insensitive) plus a set
+    /// of convenience aliases to aid human-authored DSL requests (e.g. `"paper"`
+    /// resolves to `Document`, `"repo"` to `Project`).
+    ///
+    /// **Note on subtype aliasing**: when `kind="paper"` is parsed here, only the
+    /// base `EntityKind::Document` is returned.  Callers that need to preserve the
+    /// `entity_type` subtoken (per ADR-001 §pack-declared subtypes) must use the
+    /// pack registry resolution path, which returns both the base kind and the
+    /// subtype string.  `from_str` is intentionally base-kind-only for use in
+    /// contexts where the subtype is carried separately (e.g. `Entity.entity_type`).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "concept" => Ok(Self::Concept),
@@ -102,16 +117,23 @@ impl FromStr for EntityKind {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Entity {
+    /// Identity and namespace metadata shared by all substrate records.
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub header: Header,
+    /// Closed base kind (ADR-001) that classifies this entity.
     pub kind: EntityKind,
     /// Pack-governed subtype token (e.g. `"paper"`, `"snapshot"`). Never stored
     /// raw in `properties` — queries compile this to `entities.entity_type = ?`.
     pub entity_type: Option<String>,
+    /// Human-readable display name (required; must be non-empty).
     pub name: String,
+    /// Optional long-form description of this entity.
     pub description: Option<String>,
+    /// Arbitrary structured metadata as key-value pairs.
     pub properties: BTreeMap<String, PropertyValue>,
+    /// Categorical labels for filtering and retrieval.
     pub tags: Vec<String>,
+    /// Set when the entity is soft-deleted; absent means active.
     pub deleted_at: Option<Timestamp>,
 }
 
@@ -119,16 +141,35 @@ pub struct Entity {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Link {
+    /// Unique edge identifier.
     pub id: Id128,
+    /// Namespace that owns and isolates this edge.
     pub namespace: String,
+    /// Source node identifier.
     pub source: Id128,
+    /// Target node identifier.
     pub target: Id128,
+    /// Closed relation type (ADR-002) that semantically describes this edge.
     pub relation: EdgeRelation,
+    /// Arbitrary structured metadata attached to this edge.
     pub properties: BTreeMap<String, PropertyValue>,
+    /// Numeric edge weight in the range [0.0, 1.0]; 1.0 means definitional strength.
     pub weight: f64,
+    /// Wall-clock time when this edge was created.
     pub created_at: Timestamp,
+    /// Wall-clock time of the most recent update.
     pub updated_at: Timestamp,
+    /// Set when the edge is soft-deleted; absent means active.
     pub deleted_at: Option<Timestamp>,
+}
+
+impl Link {
+    /// Return `true` if all numeric fields carry finite, domain-valid values.
+    ///
+    /// - `weight` must be finite and in `[0.0, 1.0]`.
+    pub fn is_valid(&self) -> bool {
+        self.weight.is_finite() && self.weight >= 0.0 && self.weight <= 1.0
+    }
 }
 
 /// Property values stored on entities, links, and notes.

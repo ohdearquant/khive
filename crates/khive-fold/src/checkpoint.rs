@@ -1,34 +1,8 @@
-//! Checkpoint protocol for fold-based index persistence.
+//! Generic checkpoint envelope and in-memory store for fold-managed indexes.
 //!
-//! Provides generic snapshot envelopes and in-memory storage for use
-//! by HNSW and other fold-managed indexes.
-//!
-//! # Formal proof reference
-//!
-//! `proofs/Retrieval/HNSW.lean` — checkpoint correctness guarantees
-//! used in HNSW snapshot/restore cycles
-//! (khive.Retrieval.HNSW.checkpoint_correctness).
-//!
-//! # Architecture
-//!
-//! ```text
-//! HnswIndex ──snapshot──> HnswSnapshot ──wrap──> Checkpoint<HnswSnapshot>
-//!                                                       │
-//!                                         CheckpointStore::save(...)
-//! ```
-//!
-//! The snapshot types and this checkpoint envelope are always available;
-//! the fold feature flag in consuming crates gates whether they are exposed
-//! to callers.
-//!
-//! # Integrity model
-//!
-//! `save` serializes `state` to canonical JSON, computes a BLAKE3 hash, and
-//! stores it in `Checkpoint.hash`.  `load` recomputes the hash from the stored
-//! bytes and returns `FoldError::IntegrityMismatch` if they disagree.  The hash
-//! field is therefore always meaningful — `Hash32::ZERO` is only valid if the
-//! canonical serialization of `state` actually hashes to zero (practically
-//! impossible).
+//! Integrity: `save` hashes `state` via BLAKE3; `load` recomputes and returns
+//! [`FoldError::IntegrityMismatch`] on mismatch. Proof: `proofs/Retrieval/HNSW.lean`.
+//! See [`docs/design.md`](../../docs/design.md) for architecture and failure modes.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -83,6 +57,9 @@ impl<S: Serialize> Checkpoint<S> {
     /// Create a new checkpoint, computing the BLAKE3 hash of the state.
     ///
     /// Returns `FoldError::Serialization` if `state` cannot be serialized to JSON.
+    // REASON: Checkpoint::new requires id, state, uuid, entries_processed, context, and
+    // fold_version — each is a semantically distinct field with no natural grouping into
+    // a builder or sub-struct without breaking the public API.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: impl Into<String>,
@@ -112,6 +89,8 @@ impl<S: Serialize> Checkpoint<S> {
     ///
     /// Callers are responsible for ensuring `hash` is consistent with `state`.
     /// Prefer [`Checkpoint::new`] for production use.
+    // REASON: with_hash mirrors the new() parameter set (minus auto-computed hash) for
+    // deserialization and testing; same structural constraint as new() above.
     #[allow(clippy::too_many_arguments)]
     pub fn with_hash(
         id: impl Into<String>,

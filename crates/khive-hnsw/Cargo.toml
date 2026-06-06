@@ -8,26 +8,35 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "HNSW (Hierarchical Navigable Small World) vector index with INT8 quantized two-phase search — formally verified in Lean4"
+description = "HNSW (Hierarchical Navigable Small World) vector index with INT8 quantized two-phase search"
 
 [dependencies]
-khive-score = { version = "0.2.5", path = "../khive-score" }
-khive-types = { version = "0.2.5", path = "../khive-types", features = ["serde"] }
-khive-fold = { version = "0.2.5", path = "../khive-fold", optional = true }
+khive-score = { version = "0.2.6", path = "../khive-score" }
+khive-types = { version = "0.2.6", path = "../khive-types", features = ["serde"] }
+khive-fold = { version = "0.2.6", path = "../khive-fold", optional = true }
 lattice-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
-rand = "0.8"
-rayon = "1.10"
+rand = { workspace = true }
+rayon = { workspace = true }
 ulid = "1.1"
 
 [dev-dependencies]
 blake3 = "1"
 proptest = "1"
 uuid = { workspace = true }
+criterion = { workspace = true }
+lattice-embed = { workspace = true }
+
+[[bench]]
+name = "hnsw_bench"
+harness = false
+
+[[test]]
+name = "hnsw_tests"
 
 [features]
 checkpoint = ["dep:khive-fold"]

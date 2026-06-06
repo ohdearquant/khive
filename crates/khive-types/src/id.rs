@@ -1,31 +1,34 @@
-//! 128-bit identifier — universal ID primitive.
-//!
-//! Wire format: canonical hyphenated UUID (8-4-4-4-12).
-//! Parses both hyphenated (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
-//! and simple (`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`) forms.
-//! Hashable, totally ordered, has a nil sentinel.
+//! 128-bit identifier — wire format is canonical hyphenated UUID, nil sentinel at all-zeros.
 
+// REASON: `manual_range_contains` fires on the `b'0'..=b'9'` byte-range matches
+// in `hex_val`. The range-contains form (`c >= b'0' && c <= b'9'`) is less
+// readable for byte-literal matching and offers no correctness benefit here.
 #![allow(clippy::manual_range_contains)]
 
 use core::fmt;
 use core::str::FromStr;
 
+/// A 128-bit opaque identifier stored as 16 bytes, formatted as a hyphenated UUID string.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id128([u8; 16]);
 
 impl Id128 {
+    /// The all-zeros nil identifier, used as a sentinel for "no record".
     pub const NIL: Self = Self([0; 16]);
 
+    /// Construct an `Id128` from its raw 16-byte representation.
     #[inline]
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
 
+    /// Return a reference to the underlying 16-byte array.
     #[inline]
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
 
+    /// Return `true` if all 16 bytes are zero (the nil sentinel).
     #[inline]
     pub const fn is_nil(&self) -> bool {
         let b = &self.0;
@@ -39,11 +42,13 @@ impl Id128 {
         true
     }
 
+    /// Construct an `Id128` from a `u128` in big-endian byte order.
     #[inline]
     pub const fn from_u128(v: u128) -> Self {
         Self(v.to_be_bytes())
     }
 
+    /// Convert the identifier back to its `u128` big-endian representation.
     #[inline]
     pub const fn to_u128(&self) -> u128 {
         u128::from_be_bytes(self.0)
@@ -81,9 +86,12 @@ impl fmt::Debug for Id128 {
     }
 }
 
+/// Error returned when an `Id128` string cannot be parsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseIdError {
+    /// The input was not 32 hex chars or 36 chars with hyphens.
     InvalidLength,
+    /// The input contained a character that is not a valid hex digit.
     InvalidHex,
 }
 

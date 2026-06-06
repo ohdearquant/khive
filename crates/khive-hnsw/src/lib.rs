@@ -1,37 +1,8 @@
 //! HNSW (Hierarchical Navigable Small World) vector index.
 //!
-//! High-performance approximate nearest neighbor search with O(log N) complexity.
-//! See ADR-003 for configuration and performance characteristics.
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use khive_hnsw::{HnswConfig, HnswIndex, NodeId};
-//!
-//! // Create index with default config
-//! let config = HnswConfig::default();
-//! let mut index = HnswIndex::new(768);
-//!
-//! // Insert vectors
-//! let id = NodeId::new([1u8; 16]);
-//! index.insert(id, vec![0.1; 768])?;
-//!
-//! // Search for k nearest neighbors
-//! let results = index.search(&query_vector, 10)?;
-//! for (id, score) in results {
-//!     println!("{}: {}", id, score);
-//! }
-//! ```
-//!
-//! # Algorithm
-//!
-//! HNSW builds a multi-layer graph where:
-//! - Higher layers have fewer nodes (exponentially distributed)
-//! - Search starts from top layer and descends
-//! - Each layer uses greedy search to find nearest neighbors
-//!
-//! Reference: Malkov & Yashunin, "Efficient and robust approximate nearest
-//! neighbor search using Hierarchical Navigable Small World graphs" (2018)
+//! Approximate nearest neighbor search with O(log N) complexity. See ADR-003
+//! for configuration and `docs/algorithm.md` for the multi-layer graph design,
+//! parameter guide, arena allocator rationale, and tombstone/checkpoint behavior.
 
 pub mod alias;
 pub mod arena;
@@ -42,11 +13,8 @@ pub mod error;
 mod index;
 pub mod metrics;
 mod node;
-pub(crate) mod search_context;
+pub mod search_context;
 mod stats;
-
-#[cfg(test)]
-mod tests;
 
 // Re-export public types
 #[cfg(feature = "checkpoint")]

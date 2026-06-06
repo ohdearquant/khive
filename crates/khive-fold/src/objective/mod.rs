@@ -12,6 +12,10 @@ pub use error::{ObjectiveError, ObjectiveResult};
 pub use selection::Selection;
 pub use traits::{objective_fn, DeterministicObjective, Objective};
 
+// INLINE TEST JUSTIFICATION: objective tests cover pub(crate) trait method defaults
+// (batch_score, passes_score, precision) that require access to the trait impls
+// defined in the same module tree. Moving them out would require pub(crate) exposure
+// of internal types (RankedIndex, WorstRankedIndex) through the module boundary.
 #[cfg(test)]
 mod tests {
     use super::*;

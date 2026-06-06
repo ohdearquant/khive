@@ -21,6 +21,7 @@ pub enum NoteStatus {
 }
 
 impl NoteStatus {
+    /// Return the canonical lowercase string for this status, as stored on the wire.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -56,17 +57,45 @@ impl core::str::FromStr for NoteStatus {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Note {
+    /// Identity and namespace metadata shared by all substrate records.
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub header: Header,
+    /// Pack-declared kind string (e.g. `"observation"`, `"task"`, `"memory"`).
     pub kind: String,
+    /// Cross-cutting lifecycle status.
     pub status: NoteStatus,
+    /// Main textual body of the note.
     pub content: String,
+    /// Arbitrary structured metadata as key-value pairs.
     pub properties: BTreeMap<String, PropertyValue>,
+    /// Categorical labels for filtering and retrieval.
     pub tags: Vec<String>,
+    /// Retrieval priority weight in [0.0, 1.0]; higher values surface the note sooner.
     pub salience: Option<f64>,
+    /// Exponential decay rate applied to salience over time; 0.0 means no decay.
     pub decay_factor: Option<f64>,
+    /// Optional expiry timestamp after which the note is treated as inactive.
     pub expires_at: Option<Timestamp>,
+    /// Set when the note is soft-deleted; absent means active.
     pub deleted_at: Option<Timestamp>,
+}
+
+impl Note {
+    /// Return `true` if all numeric fields carry finite, domain-valid values.
+    ///
+    /// - `salience`, if present, must be finite and in `[0.0, 1.0]`.
+    /// - `decay_factor`, if present, must be finite and non-negative.
+    pub fn is_valid(&self) -> bool {
+        let salience_ok = self
+            .salience
+            .map(|s| s.is_finite() && (0.0..=1.0).contains(&s))
+            .unwrap_or(true);
+        let decay_ok = self
+            .decay_factor
+            .map(|d| d.is_finite() && d >= 0.0)
+            .unwrap_or(true);
+        salience_ok && decay_ok
+    }
 }
 
 #[cfg(test)]

@@ -88,7 +88,12 @@ fn fuse_sources(
         })
         .collect();
 
-    khive_fusion::fuse(vec![text_source, vector_source], strategy, limit)
+    let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![text_source, vector_source]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    khive_fusion::fuse(sources, strategy, limit)
         .into_iter()
         .filter_map(|(id, score)| {
             let mut hit = metadata.remove(&id)?;

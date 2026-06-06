@@ -1,3 +1,11 @@
+// FILE SIZE JUSTIFICATION: This module exceeds the 700-line soft target because it owns
+// the complete Vamana ANN lifecycle for knowledge search: SharedAnn type, AnnKey, snapshot
+// persistence (warm_known_snapshots / ensure_ann_background), index build (build_ann),
+// search (search_loaded), and all associated SQL queries and serialization logic. These
+// responsibilities are tightly coupled through the shared AnnState and cannot be split
+// without breaking the atomic lock protocol. Refactoring is deferred until ADR-049
+// defines a stable snapshot format and the warm-start contract stabilizes.
+
 //! Vamana ANN bridge — parallel semantic signal for `knowledge.search`.
 //!
 //! Wraps `khive_vamana::VamanaIndex` with an ID map (u32 → UUID) so search

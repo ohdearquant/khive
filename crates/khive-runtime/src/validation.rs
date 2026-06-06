@@ -1,24 +1,8 @@
 //! Validation pipeline types for pack-contributed KG rules (ADR-034).
 //!
-//! This module defines the trait surface and supporting types used by packs
-//! to contribute domain-specific validation rules. Rules are compiled into the
-//! pack binary and collected at boot time via the `Pack::VALIDATION_RULES` IDs
-//! plus runtime rule implementations registered through `PackRuntime`.
-//!
-//! # Two rule shapes
-//!
-//! ADR-034 §9a defines two complementary rule shapes:
-//!
-//! - **`CorpusCheck`**: whole-corpus rules that receive all entities and edges
-//!   together. Right for rules that need cross-entity joins (referential
-//!   integrity, remote resolution, min-edge-density).
-//!
-//! - **`StreamingRule`**: per-record rules that evaluate one record at a time.
-//!   Cheaper for rules that check individual entities or edges without joins
-//!   (required properties, naming conventions, no-self-loops).
-//!
-//! Both shapes return `Vec<Violation>` per invocation. The validator aggregates
-//! them into a `ValidationReport`.
+//! Defines the trait surface for `CorpusCheck` (whole-corpus, cross-entity joins)
+//! and `StreamingRule` (per-record) shapes. Both return `Vec<Violation>` aggregated
+//! into a `ValidationReport`.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +43,7 @@ pub struct GraphSnapshot {
 
 /// Context passed to all rule implementations.
 ///
-/// Carries configuration overrides from `.khive/kg/rules.yaml` merged with
+/// Carries configuration overrides from `.khive/kg/rules.toml` (ADR-034) merged with
 /// pack defaults. Rules read per-rule config from `config[rule_id]`.
 #[non_exhaustive]
 pub struct ValidationContext<'a> {
@@ -139,34 +123,12 @@ pub struct GraphPatch;
 
 /// A pack-contributed validation rule (ADR-034 §9).
 ///
-/// Pack authors declare an array of these in their `Pack` implementation
-/// (through the runtime `PackRuntime::validation_rules()` method). Rule IDs
-/// must follow the `<pack>/<rule-id>` namespace convention.
-///
-/// # Example
-///
-/// ```ignore
-/// use khive_runtime::validation::{ValidationRule, Severity};
-///
-/// fn check_taxa(ctx: &ValidationContext<'_>) -> Vec<Violation> {
-///     // ... domain-specific check ...
-///     vec![]
-/// }
-///
-/// pub const RULES: &[ValidationRule] = &[
-///     ValidationRule {
-///         id: "biology/required-taxa-rank",
-///         severity: Severity::Warning,
-///         description: "All species entities must carry a taxa_rank property",
-///         check: check_taxa,
-///         fix: None,
-///     },
-/// ];
-/// ```
+/// Rule IDs must follow the `<pack>/<rule-id>` namespace convention.
+/// See `docs/validation.md` for declaration examples and severity override rules.
 pub struct ValidationRule {
     /// Stable rule identifier in `<pack>/<rule-id>` format.
     pub id: RuleId,
-    /// Default severity; can be overridden in `.khive/kg/rules.yaml`.
+    /// Default severity; can be overridden in `.khive/kg/rules.toml` (ADR-034).
     pub severity: Severity,
     /// Human-readable description shown in `kkernel kg validate` output.
     pub description: &'static str,

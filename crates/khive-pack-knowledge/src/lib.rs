@@ -1,33 +1,11 @@
 //! pack-knowledge — knowledge corpus verbs for khive.
 //!
-//! Two tiers of functionality in one pack:
-//!
-//! **Corpus tier** (lore port — atoms + domains):
-//! - `knowledge.upsert_atoms`    — bulk insert/update slug-keyed knowledge atoms
-//! - `knowledge.upsert_domains`  — bulk insert/update domain groupings of atoms
-//! - `knowledge.get`             — fetch one atom or domain by ID or slug
-//! - `knowledge.list`            — paginated listing of atoms or domains
-//! - `knowledge.delete_atoms`    — soft-delete atoms by slug
-//! - `knowledge.stats`           — corpus statistics (counts, coverage)
-//! - `knowledge.index`           — backfill embeddings + FTS for atoms
-//! - `knowledge.fold`            — budget-constrained knapsack selection (token budgeting)
-//! - `knowledge.search`          — TF-IDF + embedding rerank (default when embedder configured) over the corpus
-//! - `knowledge.suggest`         — orientation: ranked domain suggestions for a query
-//! - `knowledge.compose`         — orientation: markdown briefing from domains and atoms
-//!
-//! **Section tier** (ADR-048 Phase 2):
-//! - `knowledge.edit`   — upsert sections for an atom (section-level, non-destructive)
-//! - `knowledge.import` — ingest atlas markdown files as atoms with parsed sections
-//!
-//! **Concept tier** (KG sugar):
-//! - `knowledge.learn`  — register a concept entity (commissive)
-//! - `knowledge.cite`   — link a concept to its source paper via `introduced_by`
-//! - `knowledge.topic`  — list/search concepts, optionally filtered by domain
-//!
+//! Manages slug-keyed atoms and domain groupings (corpus tier), atom sections
+//! (section tier, ADR-048), and KG concept sugar (`learn`, `cite`, `topic`).
 //! Load with `KHIVE_PACKS=kg,knowledge` or `--pack knowledge`.
 
-pub mod handlers;
-pub mod knowledge;
+pub(crate) mod handlers;
+pub(crate) mod knowledge;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -39,6 +17,7 @@ use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 use crate::knowledge::vamana;
 use crate::knowledge::KnowledgeHandlers;
 
+/// Knowledge corpus pack — atoms, domains, TF-IDF search, fold, import, and KG concept verbs.
 pub struct KnowledgePack {
     pub(crate) runtime: KhiveRuntime,
     pub(crate) ann: vamana::SharedAnn,
@@ -378,12 +357,6 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
                 required: false,
                 description: "\"section\" (one section per atom, default) or \"atom\" (entire file as one atom)",
             },
-            ParamDef {
-                name: "namespace",
-                param_type: "string",
-                required: false,
-                description: "Namespace to write into; defaults to caller namespace",
-            },
         ],
     },
     // ── section review tier (ADR-049) ────────────────────────────────────────
@@ -527,6 +500,7 @@ static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
 ];
 
 impl KnowledgePack {
+    /// Create a new `KnowledgePack` bound to the given runtime, initializing a shared ANN index.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self {
             runtime,

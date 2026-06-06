@@ -1,27 +1,6 @@
 //! khive-gate — pluggable authorization gate for verb dispatch.
 //!
-//! The runtime consults a `Gate` impl before dispatching each verb. The default
-//! `AllowAllGate` is permissive (suitable for personal/local deployments). For
-//! production policy enforcement, plug a Rego-backed or capability-witness-backed
-//! impl into `RuntimeConfig.gate`.
-//!
-//! # Quick start
-//!
-//! ```
-//! use std::sync::Arc;
-//! use khive_gate::{AllowAllGate, Gate, GateRef, GateRequest, ActorRef};
-//! use khive_types::Namespace;
-//! use serde_json::json;
-//!
-//! let gate: GateRef = Arc::new(AllowAllGate);
-//! let req = GateRequest::new(
-//!     ActorRef::anonymous(),
-//!     Namespace::local(),
-//!     "search",
-//!     json!({"query": "LoRA"}),
-//! );
-//! assert!(gate.check(&req).unwrap().is_allow());
-//! ```
+//! See `docs/gate.md` for wire shapes, quick-start example, and ADR-018 contract.
 
 use std::sync::Arc;
 
@@ -40,6 +19,7 @@ pub struct ActorRef {
 }
 
 impl ActorRef {
+    /// Creates an `ActorRef` with the given actor kind and identifier.
     pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
@@ -87,6 +67,7 @@ pub struct GateRequest {
 }
 
 impl GateRequest {
+    /// Builds a `GateRequest` with default (empty) context.
     pub fn new(
         actor: ActorRef,
         namespace: Namespace,
@@ -102,6 +83,7 @@ impl GateRequest {
         }
     }
 
+    /// Attaches a `GateContext` (session, timestamp, source) to this request.
     pub fn with_context(mut self, context: GateContext) -> Self {
         self.context = context;
         self
@@ -137,6 +119,7 @@ pub enum Obligation {
 
 // ---------- Decision ----------
 
+/// Outcome of a gate check: either allow (with optional obligations) or deny (with a reason).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum GateDecision {
@@ -150,22 +133,26 @@ pub enum GateDecision {
 }
 
 impl GateDecision {
+    /// Returns an unconditional `Allow` with no obligations.
     pub fn allow() -> Self {
         Self::Allow {
             obligations: Vec::new(),
         }
     }
 
+    /// Returns an `Allow` with the given policy obligations attached.
     pub fn allow_with(obligations: Vec<Obligation>) -> Self {
         Self::Allow { obligations }
     }
 
+    /// Returns a `Deny` with the given human-readable reason.
     pub fn deny(reason: impl Into<String>) -> Self {
         Self::Deny {
             reason: reason.into(),
         }
     }
 
+    /// Returns `true` when the decision is `Allow`.
     pub fn is_allow(&self) -> bool {
         matches!(self, Self::Allow { .. })
     }
@@ -173,6 +160,7 @@ impl GateDecision {
 
 // ---------- Error ----------
 
+/// Errors returned by [`Gate::check`].
 #[derive(Error, Debug)]
 pub enum GateError {
     #[error("policy error: {0}")]
@@ -189,18 +177,21 @@ pub enum GateError {
 ///
 /// Implementations live downstream:
 /// - `AllowAllGate` (this crate) — permissive default
-/// - `RegoGate` (Apache-2.0 sibling crate `khive-gate-rego`, ADR-032) —
+/// - `RegoGate` (Apache-2.0 sibling crate `khive-gate-rego`, ADR-018) —
 ///   regorus-backed Rego eval
 /// - `LionGate<G>` (khive-cloud, BUSL) — wraps any `Gate` with lion-core
 ///   capability witnesses for verifiable enforcement.
 pub trait Gate: Send + Sync + std::fmt::Debug {
+    /// Evaluates the authorization policy for `req` and returns a decision.
     fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError>;
 
     /// Short name of this backend — surfaced in audit events (ADR-018) so
     /// downstream tooling can tell `RegoGate` results apart from
     /// `LionGate<RegoGate>` results without parsing the type.
+    ///
+    /// Defaults to `std::any::type_name::<Self>()` per ADR-018.
     fn impl_name(&self) -> &'static str {
-        "Gate"
+        std::any::type_name::<Self>()
     }
 }
 
@@ -536,5 +527,108 @@ mod tests {
         assert_eq!(allow, "allow");
         let deny = serde_json::to_value(AuditDecision::Deny).unwrap();
         assert_eq!(deny, "deny");
+    }
+
+    // ---- GATE-AUD-001: impl_name() default (ADR-018) ----
+
+    // A gate that does NOT override impl_name() — default must return type_name.
+    #[derive(Debug)]
+    struct CustomTestGate;
+
+    impl Gate for CustomTestGate {
+        fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+            Ok(GateDecision::allow())
+        }
+        // impl_name intentionally NOT overridden — tests the default.
+    }
+
+    #[test]
+    fn impl_name_default_returns_type_name() {
+        let gate = CustomTestGate;
+        // The default must use std::any::type_name per ADR-018, not the literal "Gate".
+        assert_ne!(
+            gate.impl_name(),
+            "Gate",
+            "default impl_name must not return literal \"Gate\""
+        );
+        assert!(
+            gate.impl_name().contains("CustomTestGate"),
+            "default impl_name must contain the concrete type name, got: {}",
+            gate.impl_name()
+        );
+    }
+
+    #[test]
+    fn allow_all_gate_impl_name_is_overridden() {
+        let gate = AllowAllGate;
+        assert_eq!(gate.impl_name(), "AllowAllGate");
+    }
+
+    // ---- GATE-AUD-002: invalid-input tests for gate wire types ----
+
+    #[test]
+    fn actor_ref_deserializes_empty_fields() {
+        // Deserialization of empty kind/id is currently permitted by serde;
+        // callers must validate before use. This test documents the current
+        // boundary and will fail if a future validation layer rejects empty fields.
+        let json = r#"{"kind":"","id":""}"#;
+        let a: ActorRef = serde_json::from_str(json).expect("serde should parse empty strings");
+        assert_eq!(a.kind, "");
+        assert_eq!(a.id, "");
+    }
+
+    #[test]
+    fn gate_request_deserializes_empty_verb() {
+        // Empty verb is currently accepted by serde — documents the current
+        // boundary so a future validator can catch this.
+        let json = r#"{
+            "actor":{"kind":"user","id":"x"},
+            "namespace":"local",
+            "verb":"",
+            "args":{}
+        }"#;
+        let req: GateRequest = serde_json::from_str(json).expect("serde should parse empty verb");
+        assert_eq!(req.verb, "");
+    }
+
+    #[test]
+    fn gate_decision_deny_empty_reason_deserializes() {
+        // Empty deny reason is currently permitted; documents the boundary.
+        let json = r#"{"decision":"deny","reason":""}"#;
+        let d: GateDecision = serde_json::from_str(json).expect("serde should parse empty reason");
+        assert!(!d.is_allow());
+    }
+
+    #[test]
+    fn obligation_rate_limit_zero_window_deserializes() {
+        // Zero-duration rate limit is accepted by serde; documents the boundary.
+        let json = r#"{"kind":"rate_limit","window_secs":0,"max":0}"#;
+        let o: Obligation = serde_json::from_str(json).expect("serde should parse zero values");
+        match o {
+            Obligation::RateLimit { window_secs, max } => {
+                assert_eq!(window_secs, 0);
+                assert_eq!(max, 0);
+            }
+            _ => panic!("expected RateLimit"),
+        }
+    }
+
+    #[test]
+    fn gate_decision_unknown_kind_rejects() {
+        // Ensures the serde tag discriminant rejects unknown decision kinds.
+        let json = r#"{"decision":"maybe","reason":"nope"}"#;
+        assert!(
+            serde_json::from_str::<GateDecision>(json).is_err(),
+            "unknown decision tag must be rejected"
+        );
+    }
+
+    #[test]
+    fn obligation_unknown_kind_rejects() {
+        let json = r#"{"kind":"unknown_obligation","value":1}"#;
+        assert!(
+            serde_json::from_str::<Obligation>(json).is_err(),
+            "unknown obligation kind must be rejected"
+        );
     }
 }

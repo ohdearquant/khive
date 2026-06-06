@@ -1,57 +1,7 @@
 //! Retrieval index persistence using SQLite.
 //!
-//! This module provides SQLite-based persistence for HNSW and BM25 indexes,
-//! following the write-through pattern established in khive-engine:
-//!
-//! 1. Persist snapshots to SQLite (point of no return)
-//! 2. Rebuild in-memory indexes on cold start
-//!
-//! # Architecture
-//!
-//! ```text
-//! HnswIndex ──snapshot──> HnswSnapshot ──serialize──> SQLite BLOB
-//!                                                         │
-//! HnswIndex <──restore───────────────────────────────────┘
-//! ```
-//!
-//! # Feature Flag
-//!
-//! This module requires the `persist` feature flag:
-//!
-//! ```toml
-//! khive-retrieval = { path = "../khive-retrieval", features = ["persist"] }
-//! ```
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use khive_retrieval::persist::RetrievalPersistence;
-//! use khive_retrieval::HnswIndex;
-//! use rusqlite::Connection;
-//! use std::sync::Arc;
-//! use tokio::sync::Mutex;
-//!
-//! async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Open a file-based SQLite connection
-//!     let conn = Connection::open("retrieval.db")?;
-//!     let conn = Arc::new(Mutex::new(conn));
-//!
-//!     let persist = RetrievalPersistence::new(conn, "default");
-//!
-//!     // Initialize schema before use
-//!     persist.init_schema().await?;
-//!
-//!     // Persist an HNSW index
-//!     let index = HnswIndex::new(384);
-//!     persist.persist_hnsw_snapshot(&index).await?;
-//!
-//!     // Restore on cold start
-//!     if let Some(snapshot) = persist.load_hnsw_snapshot().await? {
-//!         // Rebuild index from snapshot
-//!     }
-//!     Ok(())
-//! }
-//! ```
+//! Write-through snapshots for HNSW and BM25 indexes; rebuild from snapshot on cold start.
+//! Requires the `persist` feature flag.
 
 use std::sync::Arc;
 
@@ -64,6 +14,9 @@ mod bm25;
 mod hnsw;
 mod shadow;
 
+// INLINE TEST JUSTIFICATION: tests require access to private `setup_test_persistence()` and
+// internal `RetrievalPersistence` constructor; moving them to crates/tests/ would require
+// making those items pub(crate) and restructuring the internal schema helpers.
 #[cfg(test)]
 mod tests;
 

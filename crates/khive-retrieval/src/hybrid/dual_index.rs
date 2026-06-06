@@ -197,9 +197,9 @@ where
 
     /// Get the candidate pool size for each index.
     ///
-    /// Returns `top_k * pool_multiplier`.
+    /// Returns `top_k * pool_multiplier`, saturating at `usize::MAX` on overflow.
     pub fn pool_size(&self, top_k: usize) -> usize {
-        top_k * self.config.pool_multiplier
+        top_k.saturating_mul(self.config.pool_multiplier)
     }
 
     /// Merge results from primary and legacy indexes.

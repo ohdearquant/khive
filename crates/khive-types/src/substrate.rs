@@ -22,15 +22,18 @@ pub enum SubstrateKind {
     Event = 2,
 }
 
+/// Total number of substrate kinds. Matches the length of [`SubstrateKind::ALL`].
 pub const SUBSTRATE_COUNT: usize = 3;
 
 impl SubstrateKind {
+    /// All substrate kinds in discriminant order.
     pub const ALL: [SubstrateKind; SUBSTRATE_COUNT] = [
         SubstrateKind::Note,
         SubstrateKind::Entity,
         SubstrateKind::Event,
     ];
 
+    /// Return the canonical lowercase name for this substrate, as stored on the wire.
     #[inline]
     pub const fn name(self) -> &'static str {
         match self {
@@ -40,6 +43,7 @@ impl SubstrateKind {
         }
     }
 
+    /// Construct a `SubstrateKind` from its `u8` discriminant, or `None` if out of range.
     #[inline]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {

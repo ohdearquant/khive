@@ -1,22 +1,15 @@
-//! ProposalApplyWorker — applies approved proposal changesets to the KG.
+// FILE SIZE JUSTIFICATION: apply_worker.rs contains the full proposal application pipeline
+// (load changeset, dispatch each arm, emit ProposalApplied, update projection). Each arm
+// (create/update/delete/link) has non-trivial validation and runtime call sequences. Splitting
+// into sub-modules would fragment the sequential flow that must be read and reasoned about as a
+// unit. The inline test section requires access to private helpers and internal state.
+
+//! ProposalApplyWorker — applies approved proposal changesets to the KG (ADR-046 §5).
 //!
-//! Called from `handle_review` after a `ProposalReviewed` event is emitted.
-//! When the approval threshold is met (default: 1 approve, no rejects,
-//! status='approved'), the worker:
-//!
-//! 1. Reads the `ProposalCreated` event from the event log to get the changeset.
-//! 2. Dispatches each `ProposalChangeset` arm to the existing runtime API.
-//! 3. Emits a `ProposalApplied` event (success or failure).
-//! 4. Calls the projection worker to update status='applied'.
-//!
-//! ADR-046 §5: apply runs as a side-effect consumer, not synchronously inside
-//! `review`. In this v1 implementation the consumer is called synchronously
-//! from the handler (PackEventConsumer infrastructure is not yet shipped).
-//! The semantic contract — event emitted first, apply second — is preserved.
-//!
-//! ADR-046 §2 Compound changeset atomicity: all steps run in the same SQLite
-//! write session. On any step failure, the worker emits
-//! `ProposalApplied { Failed }` and returns without updating projection status.
+//! Called from `handle_review` when the approval threshold is met. Reads the
+//! changeset from the event log, dispatches each arm to the runtime API, emits
+//! `ProposalApplied`, and updates projection status. All steps run atomically;
+//! any failure emits `ProposalApplied { Failed }` without touching the projection.
 
 use std::str::FromStr;
 
@@ -97,6 +90,7 @@ pub struct ProposalApplyWorker {
 }
 
 impl ProposalApplyWorker {
+    /// Create a new apply worker backed by the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
         let projection = ProposalsProjectionWorker::new(runtime.clone());
         Self {

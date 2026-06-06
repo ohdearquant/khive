@@ -1,20 +1,8 @@
 //! Pack registration helpers for `khive-mcp` (ADR-027).
 //!
-//! Pack discovery is handled by `inventory`-based self-registration: each pack
-//! crate submits a `PackRegistration` at link time (via `inventory::submit!`),
-//! and [`PackRegistry::register_packs`] walks the collected slice to instantiate
-//! the requested packs.
-//!
-//! This module pulls in the pack crate types by name so the linker includes
-//! their object files — and therefore their `inventory::submit!` constructors —
-//! in the final binary. Without at least one symbol reference per crate the
-//! linker may dead-strip the crate entirely and the inventory constructors will
-//! not run.
-//!
-//! To add a new first-party pack: (1) add its crate as a `[dependency]` in
-//! `khive-mcp/Cargo.toml`, (2) add a `pub use` line below referencing any
-//! public type from the crate — this is the force-link anchor that keeps the
-//! linker from stripping the `inventory::submit!` constructor.
+//! Force-references one public symbol per pack crate so the linker includes their
+//! `inventory::submit!` constructors in the final binary. To add a new pack: add
+//! the crate as a dependency and add a `pub use` line referencing any public type.
 
 pub use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
 

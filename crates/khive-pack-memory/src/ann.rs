@@ -14,6 +14,11 @@
 //! Snapshot fingerprints use a COUNT query scoped to `kind='note'` /
 //! `field='note.content'` vectors so knowledge-atom counts cannot trigger
 //! false-stale rebuilds.
+// FILE SIZE JUSTIFICATION: ann.rs implements the full ANN index lifecycle — build,
+// persist, restore, invalidate, search, and fallback logic — plus the shared state
+// types (SharedAnn, AnnState, AnnKey). These are tightly coupled: split into sub-modules
+// would require re-exporting nearly every type, breaking the intentional encapsulation
+// that lets handlers.rs treat the ANN as a black-box cache.
 
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]

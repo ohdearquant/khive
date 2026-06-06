@@ -28,14 +28,18 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-rusqlite = { version = "0.33", optional = true }
+rusqlite = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
-rand = { version = "0.8", optional = true }
+rand = { workspace = true, optional = true }
 
 [features]
+# ADR-030 originally marked checkpoint/persist/embed/storage-adapters as default-on.
+# The current default = [] reflects a deliberate decision to keep the base crate lightweight
+# and avoid pulling in rusqlite/lattice-embed/khive-storage unless explicitly requested.
+# This deviation is tracked as a known gap pending an ADR-030 amendment.
 default = []
 # Policy-based access control for search results (uses khive-gate API)
 policy = ["khive-gate"]
@@ -53,3 +57,13 @@ native-rerank = []
 embed = []
 # Legacy graph traversal module (depends on old EntityRef/LinkStore API; not yet ported)
 graph-legacy = []
+
+[dev-dependencies]
+criterion = { workspace = true }
+khive-score = { version = "0.2.5", path = "../khive-score" }
+khive-fusion = { version = "0.2.5", path = "../khive-fusion" }
+
+[[bench]]
+name = "fusion_bench"
+path = "benches/fusion_bench.rs"
+harness = false

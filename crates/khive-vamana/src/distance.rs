@@ -1,5 +1,21 @@
+//! Distance primitives for the Vamana ANN index.
+//!
+//! Provides L2 squared distance (the Vamana search kernel) and a conversion
+//! from L2² to cosine similarity for unit-normalized vectors.
+
+use crate::error::{Result, VamanaError};
+
+/// Compute the squared L2 distance between two equal-length slices.
+///
+/// This is the crate-internal hot path; callers must guarantee equal lengths.
+/// For a fallible public variant, use [`try_l2_squared`].
+///
+/// # Panics
+///
+/// Panics if `a.len() != b.len()`. This function is `pub(crate)` and its
+/// callers are required to validate lengths before calling it.
 #[inline]
-pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "l2_squared requires equal-length slices");
 
     let mut s0 = 0.0f32;
@@ -43,6 +59,23 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Compute squared L2 distance between two slices, returning an error on length mismatch.
+///
+/// Returns `VamanaError::DimensionMismatch` if `a.len() != b.len()`.
+#[inline]
+pub fn try_l2_squared(a: &[f32], b: &[f32]) -> Result<f32> {
+    if a.len() != b.len() {
+        return Err(VamanaError::DimensionMismatch {
+            expected: a.len(),
+            actual: b.len(),
+        });
+    }
+    Ok(l2_squared(a, b))
+}
+
+/// Convert a squared L2 distance to cosine similarity for unit-normalized vectors.
+///
+/// For unit vectors, `cosine = 1 - l2sq / 2`. The result is in `[-1.0, 1.0]`.
 #[inline]
 pub fn cosine_from_l2sq(l2sq: f32) -> f32 {
     1.0 - (0.5 * l2sq)
@@ -89,9 +122,29 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "l2_squared requires equal-length slices")]
-    fn l2_squared_panics_on_length_mismatch_debug() {
-        l2_squared(&[1.0], &[1.0, 2.0]);
+    fn try_l2_squared_returns_err_on_length_mismatch() {
+        use crate::error::VamanaError;
+        assert!(matches!(
+            try_l2_squared(&[1.0], &[1.0, 2.0]),
+            Err(VamanaError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn try_l2_squared_returns_err_empty_vs_nonempty() {
+        use crate::error::VamanaError;
+        assert!(matches!(
+            try_l2_squared(&[1.0], &[]),
+            Err(VamanaError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn try_l2_squared_matches_naive_loop() {
+        let a: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f32> = (0..8).map(|i| i as f32 * 0.15 + 0.03).collect();
+        let naive: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum();
+        let fast = try_l2_squared(&a, &b).unwrap();
+        assert!((fast - naive).abs() < 1e-5, "fast={fast} naive={naive}");
     }
 }

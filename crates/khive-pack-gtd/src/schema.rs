@@ -39,10 +39,12 @@ pub fn normalize_status(s: &str) -> &str {
     }
 }
 
+/// Return `true` when `s` (or its normalized alias) is a recognized GTD status.
 pub fn is_valid_status(s: &str) -> bool {
     TASK_STATUSES.contains(&normalize_status(s))
 }
 
+/// Return `true` when `p` is a recognized priority level (`p0`..`p3`).
 pub fn is_valid_priority(p: &str) -> bool {
     VALID_PRIORITIES.contains(&p.to_ascii_lowercase().as_str())
 }
@@ -78,6 +80,14 @@ pub fn is_terminal(s: &str) -> bool {
 /// - `someday`   → next | active | done | cancelled
 /// - `done`      → (terminal — no outgoing transitions)
 /// - `cancelled` → (terminal — no outgoing transitions)
+///
+/// **Design decision (GTD-AUD-001 / issue #273)**: `done` and `cancelled` are
+/// permanently terminal — they have no outgoing transitions.  ADR-019 was
+/// written with reopen semantics in mind, but the implementation explicitly
+/// closes terminal states to prevent accidental resurrection of completed or
+/// abandoned work.  This is the authoritative contract; ADR-019 is to be
+/// amended to reflect the no-reopen rule.  Use `gtd.assign` to create a new
+/// task if reopening semantics are required.
 pub fn allowed_transitions(from: &str) -> &'static [&'static str] {
     match from {
         "inbox" => &["next", "waiting", "someday", "active", "done", "cancelled"],
@@ -91,6 +101,7 @@ pub fn allowed_transitions(from: &str) -> &'static [&'static str] {
     }
 }
 
+/// Return `true` when the GTD lifecycle permits a direct transition from `from` to `to`.
 pub fn can_transition(from: &str, to: &str) -> bool {
     allowed_transitions(from).contains(&to)
 }

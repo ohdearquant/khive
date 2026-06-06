@@ -1,13 +1,7 @@
 //! Metrics infrastructure for HNSW observability.
 //!
-//! Consumers attach a `MetricsSink` implementation to an `HnswIndex` to
-//! receive structured telemetry from insert, search, and rebuild operations.
-//!
-//! # Design
-//!
-//! The trait is object-safe (`Arc<dyn MetricsSink>`) so a single sink can be
-//! shared across multiple index instances. The `emit` helper handles the
-//! `None` case (no sink attached) at call sites.
+//! Pluggable MetricsSink trait for insert, search, and rebuild telemetry.
+//! Object-safe via Arc<dyn MetricsSink> so one sink can serve multiple index instances.
 
 use std::sync::{Arc, Mutex};
 

@@ -21,9 +21,9 @@ khive-pack-comm = { version = "0.2.5", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.2.5", path = "../khive-pack-schedule" }
 khive-pack-knowledge = { version = "0.2.5", path = "../khive-pack-knowledge" }
 inventory = { workspace = true }
-rmcp = { version = "1.7", features = ["server", "transport-io"] }
+rmcp = { workspace = true, features = ["server", "transport-io"] }
 tokio = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -34,11 +34,11 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-rmcp = { version = "1.7", features = ["server", "transport-io", "client"] }
+rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 khive-types = { version = "0.2.5", path = "../khive-types" }
 async-trait = { workspace = true }
-tempfile = "3"
-serial_test = "3"
+tempfile = { workspace = true }
+serial_test = { workspace = true }
 khive-pack-knowledge = { version = "0.2.5", path = "../khive-pack-knowledge" }
 
 [[bin]]

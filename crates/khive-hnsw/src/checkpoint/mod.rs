@@ -1,45 +1,7 @@
-//! HNSW index checkpointing using khive-fold checkpoint system.
+//! HNSW index checkpointing.
 //!
-//! Provides periodic snapshots of the HNSW index for crash recovery
-//! and incremental rebuilds.
-//!
-//! # Architecture
-//!
-//! The snapshot types ([`HnswSnapshot`], [`HnswCheckpointConfig`]) are always
-//! available and carry no extra dependencies. They are plain serializable data.
-//!
-//! When the `checkpoint` feature is enabled, this module also provides type
-//! aliases that integrate with `khive-fold`'s [`Checkpoint`] and
-//! [`InMemoryCheckpointStore`] for a complete checkpoint lifecycle.
-//!
-//! ```text
-//! HnswIndex ──snapshot──> HnswSnapshot ──wrap──> Checkpoint<HnswSnapshot>
-//!                                                       │
-//!                                         CheckpointStore::save(...)
-//! ```
-//!
-//! # Tombstone Tracking
-//!
-//! Snapshots track both live and tombstoned nodes to ensure accurate restore:
-//! - `total_nodes`: All nodes (live + tombstoned)
-//! - `live_nodes`: Non-tombstoned nodes only
-//! - `tombstone_count`: Number of tombstoned nodes
-//! - `tombstoned_ids`: IDs of tombstoned vectors for restore
-//!
-//! The invariant `total_nodes == live_nodes + tombstone_count` is enforced
-//! via the [`HnswSnapshot::verify`] method.
-//!
-//! # Determinism
-//!
-//! All ID lists (`indexed_ids`, `tombstoned_ids`) and layer node entries are
-//! stored in sorted order by NodeId bytes to ensure deterministic snapshots
-//! across runs. This is critical for:
-//! - Reproducible checkpoint hashes
-//! - Stable index-based encoding (e.g., tombstone bitsets)
-//! - Test reproducibility
-//!
-//! Use [`HnswSnapshot::canonicalize`] to ensure snapshots are in canonical form
-//! before serialization, or [`HnswSnapshot::is_canonical`] to verify ordering.
+//! Serializable snapshots for crash recovery and warm-start restores.
+//! See `docs/checkpoint.md` for tombstone tracking, determinism, and khive-fold integration.
 
 use std::collections::HashSet;
 

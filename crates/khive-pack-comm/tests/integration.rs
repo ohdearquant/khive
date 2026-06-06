@@ -1,4 +1,9 @@
 //! Smoke tests for the comm pack (ADR-040).
+//!
+//! INLINE TEST JUSTIFICATION: all five comm verbs (send, inbox, read, reply, thread) share a
+//! single in-memory runtime fixture. Splitting into per-verb files would require duplicating
+//! the fixture and lose cross-verb invariant tests (e.g. send→inbox→read→reply→thread
+//! roundtrip and thread-isolation assertions) that exercise interactions between verbs.
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{KhiveRuntime, Namespace, VerbRegistry, VerbRegistryBuilder};
@@ -2151,4 +2156,85 @@ async fn test_inbox_read_filter_json_type_truth_table() {
             .collect::<Vec<_>>()
     );
     assert_eq!(read_page.items[0].content, "read=true");
+}
+
+// ── COMM-AUD-003: thread_id validation at verb boundary ───────────────────────
+
+/// send with a malformed thread_id must return InvalidInput, not persist garbage.
+#[tokio::test]
+async fn send_rejects_malformed_thread_id() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let err = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "hi", "thread_id": "not-a-uuid" }),
+        )
+        .await;
+    assert!(
+        err.is_err(),
+        "send with malformed thread_id must fail; got: {err:?}"
+    );
+}
+
+/// send with a valid UUID thread_id must succeed.
+#[tokio::test]
+async fn send_accepts_valid_uuid_thread_id() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    // First send to get a real thread root UUID.
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root message" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let thread_uuid = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id present");
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "threaded reply", "thread_id": thread_uuid }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "send with valid UUID thread_id must succeed; got: {result:?}"
+    );
+}
+
+// ── COMM-AUD-004: ThreadParams deny_unknown_fields ────────────────────────────
+
+/// comm.thread with an unknown argument must return an error, not silently ignore it.
+#[tokio::test]
+async fn thread_rejects_unknown_field() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    // Send a root message so there is a valid id to use.
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("send succeeds");
+    let root_id = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id present");
+
+    let err = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_id, "typo_arg": "oops" }),
+        )
+        .await;
+    assert!(
+        err.is_err(),
+        "comm.thread with unknown field must fail; got: {err:?}"
+    );
 }

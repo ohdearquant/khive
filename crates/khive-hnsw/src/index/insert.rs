@@ -78,18 +78,40 @@ impl HnswIndex {
                 actual: vector.len(),
             });
         }
+        if vector.iter().any(|v| !v.is_finite()) {
+            return Err(RetrievalError::Configuration(
+                "vector contains non-finite values (NaN or Infinity)".to_string(),
+            ));
+        }
 
-        // If updating existing node, just update the vector (bypasses budget)
+        // If updating an existing node that is tombstoned, perform delete + fresh insert
+        // so that the new vector is properly reconnected in the graph. A simple
+        // vector-only update on a tombstoned node leaves it unreachable (the
+        // tombstone prevents graph traversal to it and the in-edges were not
+        // added back).
         if let Some(&iid) = self.id_to_internal.get(&id) {
-            self.nodes[iid].update_vector(vector.clone());
-            // Update quantized arena to stay in sync
-            self.quantized.update(iid, &vector, self.nodes[iid].norm);
-            // Remove from tombstones if it was marked
-            if iid < self.tombstones.len() && self.tombstones[iid] {
+            let is_tombstoned = iid < self.tombstones.len() && self.tombstones[iid];
+            if is_tombstoned {
+                // Undo the tombstone so `delete` does not double-count it,
+                // and so the fresh insert below sees the ID as gone.
                 self.tombstones[iid] = false;
                 self.tombstone_count -= 1;
+                // Remove from the ID maps so insert_inner treats this as a new node.
+                // The internal slot (iid) becomes a permanent hole (like any deleted node).
+                self.id_to_internal.remove(&id);
+                // internal_to_id still holds the old external ID at position iid;
+                // leave it in place — the slot is effectively dead (tombstoned above).
+                // Fall through to the fresh-insert path below.
+            } else {
+                // Live node update: just swap the vector. Graph edges remain valid
+                // because neighbors were chosen by proximity; after an in-place
+                // vector update the edges may be slightly stale but the node
+                // stays reachable and participates in search.
+                self.nodes[iid].update_vector(vector.clone());
+                // Update quantized arena to stay in sync
+                self.quantized.update(iid, &vector, self.nodes[iid].norm);
+                return Ok(());
             }
-            return Ok(());
         }
 
         // Budget check before allocating a new node
@@ -278,6 +300,8 @@ impl HnswIndex {
     /// Sort a node's neighbor list by distance to the node.
     ///
     /// Available for batch operations like post-rebuild optimization.
+    // REASON: Kept for future batch post-rebuild neighbor sorting; not yet
+    // wired into the rebuild path but part of the planned graph optimization pass.
     #[allow(dead_code)]
     pub(super) fn sort_neighbors(&mut self, id: usize, layer: usize) {
         use crate::distance::OrderedF32;

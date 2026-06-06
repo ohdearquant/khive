@@ -196,7 +196,9 @@ impl Parser {
             let key = self.parse_ident()?;
             self.expect_char(':')?;
             let val = self.parse_string_literal()?;
-            props.insert(key, val);
+            if props.insert(key.clone(), val).is_some() {
+                return Err(self.err(format!("duplicate property '{key}'")));
+            }
         }
         Ok(props)
     }
@@ -321,25 +323,23 @@ impl Parser {
 
         self.expect_char(']')?;
 
-        // Direction suffix
-        let direction = if self.peek() == Some('-') {
+        // Direction suffix: a `-` is required after `]` to close the edge pattern.
+        // Without it, patterns like `(a)-[e:extends](b)` would be silently accepted
+        // with an arbitrary direction — reject instead.
+        self.expect_char('-')?;
+        let direction = if self.peek() == Some('>') {
             self.advance();
-            if self.peek() == Some('>') {
-                self.advance();
-                if direction_start == EdgeDirection::In {
-                    EdgeDirection::Both
-                } else {
-                    EdgeDirection::Out
-                }
+            if direction_start == EdgeDirection::In {
+                EdgeDirection::Both
             } else {
-                if direction_start == EdgeDirection::In {
-                    EdgeDirection::In
-                } else {
-                    EdgeDirection::Both
-                }
+                EdgeDirection::Out
             }
         } else {
-            direction_start
+            if direction_start == EdgeDirection::In {
+                EdgeDirection::In
+            } else {
+                EdgeDirection::Both
+            }
         };
 
         Ok(EdgePattern {

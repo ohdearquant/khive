@@ -114,7 +114,11 @@ impl SearchArena {
     /// is dropped. The caller must not use the pointer after either event.
     /// This is enforced by the lifetime parameter on `ArenaVec`.
     pub(super) fn alloc<T>(&self, count: usize) -> *mut T {
-        let size = std::mem::size_of::<T>() * count;
+        // Use checked arithmetic to avoid overflow: size_of::<T>() * count can
+        // overflow for large `count` values on 32-bit platforms or huge allocations.
+        let size = std::mem::size_of::<T>()
+            .checked_mul(count)
+            .expect("arena alloc size overflow");
         let align = std::mem::align_of::<T>();
 
         if size == 0 {
@@ -154,6 +158,9 @@ impl SearchArena {
     ///
     /// Useful for bulk-copying data into the arena. Allocates space for
     /// `src.len()` elements, copies them in, and returns a pointer to the copy.
+    // REASON: `alloc_copy` is a convenience primitive available for future
+    // arena consumers (e.g. arena-pinned neighbor buffers). Currently unused
+    // but kept to avoid re-implementing the unsafe copy pattern at each call site.
     #[allow(dead_code)]
     pub(super) fn alloc_copy<T: Copy>(&self, src: &[T]) -> *mut T {
         if src.is_empty() {

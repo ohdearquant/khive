@@ -1,3 +1,11 @@
+// FILE SIZE JUSTIFICATION: This file covers the full public verb surface of the knowledge
+// pack (upsert_atoms, upsert_domains, get, list, delete_atoms, stats, index, fold, search,
+// suggest, compose, edit, import, challenge, adjudicate, learn, cite, topic) with multiple
+// scenarios per verb (happy path, edge cases, namespace isolation, pagination). Each test
+// requires a fresh in-memory runtime, making per-verb test file splitting impractical without
+// re-creating the same setup boilerplate in every file. Splitting is deferred until shared
+// test fixtures can be extracted into a crate-level test helper module.
+
 //! Integration tests for the knowledge pack against an in-memory runtime.
 
 use khive_pack_kg::KgPack;
