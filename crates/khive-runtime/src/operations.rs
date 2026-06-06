@@ -266,7 +266,7 @@ fn merge_dependency_kind(
     Some(obj)
 }
 
-/// Valid `dependency_kind` values for `depends_on` edges (ADR-002).
+/// Valid `dependency_kind` values for `depends_on` edges.
 const VALID_DEPENDENCY_KINDS: &[&str] = &["build", "runtime", "data", "artifact", "tooling"];
 
 /// Validate that an edge weight is finite and within `[0.0, 1.0]`.
@@ -283,7 +283,7 @@ pub(crate) fn validate_edge_weight(weight: f64) -> RuntimeResult<()> {
     Ok(())
 }
 
-/// Validate governed edge metadata keys (ADR-002 §Edge Metadata).
+/// Validate governed edge metadata keys.
 ///
 /// Currently enforces:
 /// - `dependency_kind` is only valid on `depends_on` edges.
@@ -1127,7 +1127,7 @@ impl KhiveRuntime {
         self.validate_note_kind(kind)?;
         let ns = token.namespace().as_str();
 
-        // Validate all annotates targets before any write (ADR-024:295 atomicity).
+        // Validate all annotates targets before any write (atomicity: all-or-nothing).
         for &target_id in &annotates {
             if !self.substrate_exists_in_ns(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(

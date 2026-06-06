@@ -240,7 +240,7 @@ pub struct KhiveRuntime {
     /// construction; packs may add more via [`PackRuntime::register_embedders`].
     embedder_registry: Arc<std::sync::RwLock<crate::embedder_registry::EmbedderRegistry>>,
     default_embedder_name: Arc<str>,
-    /// Pack-extensible edge endpoint rules (ADR-031). Shared across clones
+    /// Pack-extensible edge endpoint rules. Shared across clones
     /// via `Arc<RwLock<_>>`; installed once by the transport after the
     /// `VerbRegistry` is built. Empty until installed
     edge_rules: Arc<RwLock<Vec<EdgeEndpointRule>>>,
@@ -540,11 +540,10 @@ impl KhiveRuntime {
         }
     }
 
-    /// Install the pack-aggregated edge endpoint rules (ADR-031).
+    /// Install the pack-aggregated edge endpoint rules.
     ///
     /// Called by the transport layer after the `VerbRegistry` is built so
-    /// that runtime-layer edge validation (in `validate_edge_relation_endpoints`)
-    /// can consult pack rules in addition to the ADR-002 base contract. Idempotent:
+    /// that runtime-layer edge validation can consult pack rules. Idempotent:
     /// later calls overwrite the previous rule set.
     pub fn install_edge_rules(&self, rules: Vec<EdgeEndpointRule>) {
         if let Ok(mut guard) = self.edge_rules.write() {
@@ -552,7 +551,7 @@ impl KhiveRuntime {
         }
     }
 
-    /// Install the pack-aggregated valid entity and note kinds (ADR-001, ADR-013, ADR-017).
+    /// Install the pack-aggregated valid entity and note kinds.
     ///
     /// Called by the transport layer after the `VerbRegistry` is built so that
     /// runtime-layer entity/note creation and import validate kind strings against
