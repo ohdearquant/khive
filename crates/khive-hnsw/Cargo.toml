@@ -22,7 +22,6 @@ parking_lot = { workspace = true }
 tokio = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
-ulid = "1.1"
 
 [dev-dependencies]
 blake3 = "1"

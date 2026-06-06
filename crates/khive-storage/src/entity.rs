@@ -90,7 +90,7 @@ pub struct EntityFilter {
     pub tags_any: Vec<String>,
 }
 
-/// Graph-node CRUD over the entities substrate table.
+/// Entity CRUD operations over the entities substrate table.
 #[async_trait]
 pub trait EntityStore: Send + Sync + 'static {
     /// Insert or update a single entity.
@@ -101,13 +101,13 @@ pub trait EntityStore: Send + Sync + 'static {
     async fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>>;
     /// Delete an entity by UUID using the specified delete mode.
     async fn delete_entity(&self, id: Uuid, mode: DeleteMode) -> StorageResult<bool>;
-    /// Query entities matching a filter within a namespace, with pagination.
+    /// Query entities by namespace with filter and pagination.
     async fn query_entities(
         &self,
         namespace: &str,
         filter: EntityFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Entity>>;
-    /// Count entities matching a filter within a namespace.
+    /// Count entities in a namespace matching the given filter.
     async fn count_entities(&self, namespace: &str, filter: EntityFilter) -> StorageResult<u64>;
 }

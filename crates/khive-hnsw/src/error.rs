@@ -38,6 +38,13 @@ pub enum RetrievalError {
     #[error("hnsw error: {0}")]
     Hnsw(String),
 
+    /// Vector contains non-finite values (NaN, Infinity, or -Infinity).
+    #[error("non-finite vector: {reason}")]
+    NonFiniteVector {
+        /// Description of the issue.
+        reason: String,
+    },
+
     /// Configuration error.
     #[error("configuration error: {0}")]
     Configuration(String),
@@ -81,3 +88,20 @@ impl RetrievalError {
 
 /// Convenience `Result` alias for HNSW operations.
 pub type Result<T> = std::result::Result<T, RetrievalError>;
+
+/// Validate that a vector contains only finite values.
+///
+/// Rejects `NaN`, `Infinity`, and `-Infinity`. Used at every public boundary
+/// (insert, build_batch, search, search_with_context) to prevent malformed
+/// vectors from entering the index or producing silent garbage results.
+#[inline]
+pub fn validate_finite_vector(vector: &[f32]) -> Result<()> {
+    for (i, &v) in vector.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(RetrievalError::NonFiniteVector {
+                reason: format!("element at index {i} is {v}"),
+            });
+        }
+    }
+    Ok(())
+}

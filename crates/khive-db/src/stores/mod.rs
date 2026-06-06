@@ -1,4 +1,7 @@
-//! SQLite-backed store implementations for each storage capability trait.
+//! Per-substrate SQLite store implementations.
+//!
+//! Each module provides a concrete store struct implementing one or more
+//! `khive-storage` capability traits against the shared connection pool.
 
 pub mod entity;
 pub mod event;

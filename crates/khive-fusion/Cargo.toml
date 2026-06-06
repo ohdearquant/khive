@@ -13,6 +13,7 @@ description = "Rank fusion strategies (RRF, Weighted, Union) with deterministic 
 [dependencies]
 khive-score = { version = "0.2.5", path = "../khive-score" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -56,24 +56,163 @@ impl Note {
         self
     }
 
-    /// Set salience, clamped to `[0.0, 1.0]`. Panics in debug on non-finite input.
+    /// Set salience (infallible). Rejects non-finite values by returning `self`
+    /// unchanged; clamps finite values to `[0.0, 1.0]`. Prefer
+    /// [`try_with_salience`](Self::try_with_salience) at public boundaries.
     pub fn with_salience(mut self, s: f64) -> Self {
-        debug_assert!(s.is_finite(), "salience must be finite, got {s}");
+        if !s.is_finite() {
+            return self;
+        }
         self.salience = Some(s.clamp(0.0, 1.0));
         self
     }
 
-    /// Set decay factor, floored at `0.0`. Panics in debug on non-finite input.
+    /// Set decay factor (infallible). Rejects non-finite values by returning
+    /// `self` unchanged; floors finite values at `0.0`. Prefer
+    /// [`try_with_decay`](Self::try_with_decay) at public boundaries.
     pub fn with_decay(mut self, d: f64) -> Self {
-        debug_assert!(d.is_finite(), "decay_factor must be finite, got {d}");
+        if !d.is_finite() {
+            return self;
+        }
         self.decay_factor = Some(d.max(0.0));
         self
+    }
+
+    /// Set salience with validation. Returns an error for non-finite or
+    /// out-of-range `[0.0, 1.0]` values.
+    pub fn try_with_salience(mut self, s: f64) -> Result<Self, String> {
+        if !s.is_finite() {
+            return Err(format!("salience must be finite, got {s}"));
+        }
+        if !(0.0..=1.0).contains(&s) {
+            return Err(format!("salience must be in [0.0, 1.0], got {s}"));
+        }
+        self.salience = Some(s);
+        Ok(self)
+    }
+
+    /// Set decay factor with validation. Returns an error for non-finite or
+    /// negative values.
+    pub fn try_with_decay(mut self, d: f64) -> Result<Self, String> {
+        if !d.is_finite() {
+            return Err(format!("decay_factor must be finite, got {d}"));
+        }
+        if d < 0.0 {
+            return Err(format!("decay_factor must be >= 0.0, got {d}"));
+        }
+        self.decay_factor = Some(d);
+        Ok(self)
     }
 
     /// Set the note properties JSON blob.
     pub fn with_properties(mut self, p: Value) -> Self {
         self.properties = Some(p);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_note() -> Note {
+        Note::new("ns:test", "memory", "hello world")
+    }
+
+    // -- with_salience --
+
+    #[test]
+    fn with_salience_clamps_to_range() {
+        let n = base_note().with_salience(1.5);
+        assert_eq!(n.salience, Some(1.0));
+        let n = base_note().with_salience(-0.1);
+        assert_eq!(n.salience, Some(0.0));
+        let n = base_note().with_salience(0.7);
+        assert_eq!(n.salience, Some(0.7));
+    }
+
+    #[test]
+    fn with_salience_ignores_nan() {
+        let n = base_note().with_salience(f64::NAN);
+        assert_eq!(n.salience, None, "NaN must not set salience");
+    }
+
+    #[test]
+    fn with_salience_ignores_inf() {
+        let n = base_note().with_salience(f64::INFINITY);
+        assert_eq!(n.salience, None, "+Inf must not set salience");
+        let n = base_note().with_salience(f64::NEG_INFINITY);
+        assert_eq!(n.salience, None, "-Inf must not set salience");
+    }
+
+    // -- with_decay --
+
+    #[test]
+    fn with_decay_floors_at_zero() {
+        let n = base_note().with_decay(-1.0);
+        assert_eq!(n.decay_factor, Some(0.0));
+        let n = base_note().with_decay(0.5);
+        assert_eq!(n.decay_factor, Some(0.5));
+    }
+
+    #[test]
+    fn with_decay_ignores_nan() {
+        let n = base_note().with_decay(f64::NAN);
+        assert_eq!(n.decay_factor, None, "NaN must not set decay_factor");
+    }
+
+    #[test]
+    fn with_decay_ignores_inf() {
+        let n = base_note().with_decay(f64::INFINITY);
+        assert_eq!(n.decay_factor, None, "+Inf must not set decay_factor");
+    }
+
+    // -- try_with_salience --
+
+    #[test]
+    fn try_with_salience_accepts_valid_range() {
+        let n = base_note().try_with_salience(0.0).unwrap();
+        assert_eq!(n.salience, Some(0.0));
+        let n = base_note().try_with_salience(1.0).unwrap();
+        assert_eq!(n.salience, Some(1.0));
+        let n = base_note().try_with_salience(0.85).unwrap();
+        assert_eq!(n.salience, Some(0.85));
+    }
+
+    #[test]
+    fn try_with_salience_rejects_nan() {
+        let err = base_note().try_with_salience(f64::NAN).unwrap_err();
+        assert!(err.contains("finite"), "error must mention finite: {err}");
+    }
+
+    #[test]
+    fn try_with_salience_rejects_out_of_range() {
+        let err = base_note().try_with_salience(1.1).unwrap_err();
+        assert!(err.contains("1.0"), "error must mention bound: {err}");
+        let err = base_note().try_with_salience(-0.01).unwrap_err();
+        assert!(err.contains("0.0"), "error must mention bound: {err}");
+    }
+
+    // -- try_with_decay --
+
+    #[test]
+    fn try_with_decay_accepts_valid_values() {
+        let n = base_note().try_with_decay(0.0).unwrap();
+        assert_eq!(n.decay_factor, Some(0.0));
+        let n = base_note().try_with_decay(2.5).unwrap();
+        assert_eq!(n.decay_factor, Some(2.5));
+    }
+
+    #[test]
+    fn try_with_decay_rejects_nan() {
+        let err = base_note().try_with_decay(f64::NAN).unwrap_err();
+        assert!(err.contains("finite"), "error must mention finite: {err}");
+    }
+
+    #[test]
+    fn try_with_decay_rejects_negative() {
+        let err = base_note().try_with_decay(-0.1).unwrap_err();
+        assert!(err.contains("0.0"), "error must mention bound: {err}");
     }
 }
 

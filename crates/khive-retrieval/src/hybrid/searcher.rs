@@ -264,26 +264,24 @@ pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
         return results;
     }
 
-    // Determine fusion strategy
+    // Determine fusion strategy — Custom falls back to RRF (same as Weighted
+    // mismatch).  Callers that need a hard error use fuse_search_results_checked.
     let strategy = match &config.fusion_strategy {
         FusionStrategy::Weighted { .. } => {
-            // Weighted fusion uses exactly 2 weight values (vector + keyword).
-            // Validate in all builds — debug_assert was insufficient because
-            // 3+ sources could silently fuse with only 2 weights in release builds.
             if sources.len() != 2 {
-                // Fall back to RRF rather than silently mis-weight the results.
-                // Callers that need a hard error should use fuse_search_results_checked.
                 FusionStrategy::rrf()
             } else {
                 let (v, k) = config.normalized_weights();
                 FusionStrategy::weighted(vec![v, k])
             }
         }
+        FusionStrategy::Custom { .. } => FusionStrategy::rrf(),
         other => other.clone(),
     };
 
-    // Fuse results
-    let mut fused = fuse(sources, &strategy, config.top_k);
+    // Fuse results — strategy is guaranteed non-Custom after the match above.
+    let mut fused =
+        fuse(sources, &strategy, config.top_k).expect("non-Custom strategies are infallible");
 
     // Apply minimum score filter
     if let Some(min_score) = config.min_score {
@@ -301,13 +299,19 @@ pub fn fuse_search_results_checked<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     config: &HybridConfig,
 ) -> Result<Vec<(Id, DeterministicScore)>> {
-    if let FusionStrategy::Weighted { .. } = &config.fusion_strategy {
-        if sources.len() != 2 {
+    match &config.fusion_strategy {
+        FusionStrategy::Custom { name, .. } => {
+            return Err(crate::error::RetrievalError::Fusion(format!(
+                "Custom strategy {name:?} requires runtime dispatch"
+            )));
+        }
+        FusionStrategy::Weighted { .. } if sources.len() != 2 => {
             return Err(crate::error::RetrievalError::Fusion(format!(
                 "Weighted fusion requires exactly 2 sources, got {}",
                 sources.len()
             )));
         }
+        _ => {}
     }
     Ok(fuse_search_results(sources, config))
 }

@@ -1,7 +1,21 @@
 //! `khive-query` — backend-agnostic GQL/SPARQL parsing and SQL compilation.
 //!
-//! Use `parse_auto` to detect syntax (SELECT → SPARQL, MATCH → GQL), or call
-//! `parse(QueryLanguage::Gql/Sparql, …)` explicitly, then `compile(&ast, &opts)`.
+//! # Two entry points
+//!
+//! ## Explicit language
+//! ```ignore
+//! use khive_query::{QueryLanguage, parse, compile, CompileOptions};
+//!
+//! let ast = parse(QueryLanguage::Gql, "MATCH (a:concept)-[:extends]->(b) RETURN b LIMIT 10")?;
+//! let compiled = compile(&ast, &CompileOptions::default())?;
+//! ```
+//!
+//! ## Auto-detect (SELECT → SPARQL, MATCH → GQL)
+//! ```ignore
+//! use khive_query::parse_auto;
+//!
+//! let ast = parse_auto("SELECT ?a ?b WHERE { ?a :extends ?b . }")?;
+//! ```
 
 pub mod ast;
 pub mod compilers;

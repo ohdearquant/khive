@@ -1,4 +1,4 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
 //! KG import/export format adapters. See `docs/protocol.md` for the
 //! full pipeline description, parse strategy notes, and deferred format list.

@@ -93,6 +93,9 @@ pub enum RuntimeError {
     #[error("ambiguous: {0}")]
     Ambiguous(String),
 
+    #[error("fusion: {0}")]
+    Fusion(#[from] khive_fusion::FuseError),
+
     #[error("internal: {0}")]
     Internal(String),
 

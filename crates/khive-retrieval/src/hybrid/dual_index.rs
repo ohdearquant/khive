@@ -234,13 +234,17 @@ where
             }
             DualIndexStrategy::Both { fusion } => {
                 let sources = vec![primary_results, legacy_results];
-                fuse(sources, fusion, top_k)
+                let safe = match fusion {
+                    FusionStrategy::Custom { .. } => &FusionStrategy::default(),
+                    s => s,
+                };
+                fuse(sources, safe, top_k).expect("non-Custom strategies are infallible")
             }
             DualIndexStrategy::Weighted { primary_weight } => {
                 let w = primary_weight.clamp(0.0, 1.0);
                 let strategy = FusionStrategy::weighted(vec![w, 1.0 - w]);
                 let sources = vec![primary_results, legacy_results];
-                fuse(sources, &strategy, top_k)
+                fuse(sources, &strategy, top_k).expect("Weighted is infallible")
             }
         }
     }

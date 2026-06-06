@@ -73,14 +73,14 @@ pub enum SnapshotError {
 /// # Warm Start
 ///
 /// When `vectors` is non-empty the snapshot is self-contained: call
-/// [`HnswIndex::restore_from_snapshot_embedded`] to restore without supplying
-/// an external vector map.  Snapshots produced by [`HnswIndex::snapshot`]
+/// `HnswIndex::restore_from_snapshot_embedded` to restore without supplying
+/// an external vector map.  Snapshots produced by `HnswIndex::snapshot`
 /// always include the full f32 vector data.
 ///
 /// The estimated size overhead is `dimensions × 4 bytes × node_count`.
 /// For 384-dim embeddings with 10 K nodes this is ~15 MB — well within
 /// typical checkpoint budgets.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HnswSnapshot {
     /// Legacy field for backward compatibility with v1 snapshots.
     /// New code should use `total_nodes` and `live_nodes` instead.
@@ -125,7 +125,7 @@ pub struct HnswSnapshot {
     ///
     /// Maps each `NodeId` to its raw embedding vector.  When non-empty, the
     /// snapshot is self-contained and can be restored via
-    /// [`HnswIndex::restore_from_snapshot_embedded`] without supplying a
+    /// `HnswIndex::restore_from_snapshot_embedded` without supplying a
     /// separate vector map.
     ///
     /// Defaults to empty for backward compatibility with snapshots that
@@ -307,5 +307,81 @@ impl HnswSnapshot {
         for layer in &mut self.layers {
             layer.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
         }
+    }
+}
+
+// ── Wire type for validated deserialization ─────────────────────────────
+
+/// Raw wire representation of [`HnswSnapshot`] for serde.
+///
+/// Deserialization goes through this type, which normalizes v1 backward-compat
+/// fields and verifies invariants before returning a valid `HnswSnapshot`.
+#[derive(Serialize, Deserialize)]
+struct RawHnswSnapshot {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    vector_count: usize,
+    #[serde(default)]
+    total_nodes: usize,
+    #[serde(default)]
+    live_nodes: usize,
+    #[serde(default)]
+    tombstone_count: usize,
+    max_layer: usize,
+    entry_point: Option<NodeId>,
+    config: HnswCheckpointConfig,
+    indexed_ids: Vec<NodeId>,
+    #[serde(default)]
+    tombstoned_ids: Vec<NodeId>,
+    layers: Vec<Vec<(NodeId, Vec<NodeId>)>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    vectors: Vec<(NodeId, Vec<f32>)>,
+}
+
+impl TryFrom<RawHnswSnapshot> for HnswSnapshot {
+    type Error = SnapshotError;
+
+    fn try_from(mut raw: RawHnswSnapshot) -> Result<Self, SnapshotError> {
+        // Normalize v1 backward-compat fields before validation.
+        if raw.total_nodes == 0 {
+            if raw.vector_count > 0 {
+                raw.total_nodes = raw.vector_count;
+                raw.live_nodes = raw.vector_count;
+                raw.tombstone_count = 0;
+            } else if !raw.indexed_ids.is_empty() {
+                raw.total_nodes = raw.indexed_ids.len();
+                raw.live_nodes = raw.indexed_ids.len() - raw.tombstoned_ids.len();
+                raw.tombstone_count = raw.tombstoned_ids.len();
+            }
+        }
+        if raw.tombstone_count == 0 && !raw.tombstoned_ids.is_empty() {
+            raw.tombstone_count = raw.tombstoned_ids.len();
+        }
+
+        let snap = HnswSnapshot {
+            vector_count: raw.vector_count,
+            total_nodes: raw.total_nodes,
+            live_nodes: raw.live_nodes,
+            tombstone_count: raw.tombstone_count,
+            max_layer: raw.max_layer,
+            entry_point: raw.entry_point,
+            config: raw.config,
+            indexed_ids: raw.indexed_ids,
+            tombstoned_ids: raw.tombstoned_ids,
+            layers: raw.layers,
+            vectors: raw.vectors,
+        };
+
+        snap.verify()?;
+        Ok(snap)
+    }
+}
+
+impl<'de> Deserialize<'de> for HnswSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawHnswSnapshot::deserialize(deserializer)?;
+        HnswSnapshot::try_from(raw).map_err(serde::de::Error::custom)
     }
 }

@@ -87,7 +87,7 @@ mod integration_tests {
         ];
 
         for _ in 0..10 {
-            let fused = fuse(vec![source.clone()], &FusionStrategy::union(), 10);
+            let fused = fuse(vec![source.clone()], &FusionStrategy::union(), 10).unwrap();
 
             assert_eq!(fused.len(), 4);
             // All have same score, should be in lexicographic order
@@ -110,7 +110,7 @@ mod integration_tests {
             })
             .collect();
 
-        let fused = fuse(vec![source], &FusionStrategy::rrf(), 100);
+        let fused = fuse(vec![source], &FusionStrategy::rrf(), 100).unwrap();
 
         assert_eq!(fused.len(), 100);
         assert_eq!(fused[0].0, "doc_0");
@@ -485,35 +485,12 @@ mod regression_tests {
         );
     }
 
-    // ── Finding #5: VectorOnly/KeywordOnly multi-source returns empty ──────────
-
-    #[test]
-    fn vector_only_empty_on_multiple_sources() {
-        let a = make_results(vec![("a", 0.9)]);
-        let b = make_results(vec![("b", 0.8)]);
-        // Multi-source is invalid for passthrough strategies; both builds return empty.
-        let out = fuse(vec![a, b], &FusionStrategy::VectorOnly, 10);
-        assert!(
-            out.is_empty(),
-            "VectorOnly with multiple sources must return empty (consistent behavior)"
-        );
-    }
-
-    #[test]
-    fn keyword_only_empty_on_multiple_sources() {
-        let a = make_results(vec![("a", 0.9)]);
-        let b = make_results(vec![("b", 0.8)]);
-        let out = fuse(vec![a, b], &FusionStrategy::KeywordOnly, 10);
-        assert!(
-            out.is_empty(),
-            "KeywordOnly with multiple sources must return empty (consistent behavior)"
-        );
-    }
+    // ── Finding #5: VectorOnly/KeywordOnly use union_fusion ───────────────────
 
     #[test]
     fn vector_only_single_source_passes_through() {
         let src = make_results(vec![("a", 0.9), ("b", 0.7)]);
-        let out = fuse(vec![src], &FusionStrategy::VectorOnly, 10);
+        let out = fuse(vec![src], &FusionStrategy::VectorOnly, 10).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, "a");
     }
@@ -521,7 +498,7 @@ mod regression_tests {
     #[test]
     fn keyword_only_single_source_passes_through() {
         let src = make_results(vec![("x", 0.8), ("y", 0.6)]);
-        let out = fuse(vec![src], &FusionStrategy::KeywordOnly, 10);
+        let out = fuse(vec![src], &FusionStrategy::KeywordOnly, 10).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, "x");
     }
@@ -537,7 +514,7 @@ mod regression_tests {
             ("b", DeterministicScore::from_f64(0.8)),
             ("a", DeterministicScore::from_f64(0.9)),
         ];
-        let out = fuse(vec![src], &FusionStrategy::rrf(), 3);
+        let out = fuse(vec![src], &FusionStrategy::rrf(), 3).unwrap();
         assert_eq!(out.len(), 3);
         // RRF ranks by input position: "e" is rank 1, "d" rank 2, "c" rank 3
         assert_eq!(out[0].0, "e");

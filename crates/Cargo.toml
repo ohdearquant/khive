@@ -30,10 +30,11 @@ members = [
     "kkernel",
     "khive-retrieval",
 ]
-# khive-merge is forward-deployed v2 infrastructure (ADR-043), not removed or
+exclude = ["khive-merge"]
+# khive-merge is forward-deployed v2 infrastructure (ADR-039), not removed or
 # superseded. It is excluded from workspace members because it is ahead of the
-# restructured khive-vcs crate until ADR-043 integration lands. The v1 merge path
-# remains git line-merge on sorted NDJSON (ADR-010, ADR-020); ADR-043's conflict
+# restructured khive-vcs crate until ADR-039 integration lands. The v1 merge path
+# remains git line-merge on sorted NDJSON (ADR-010, ADR-020); ADR-039's conflict
 # taxonomy and semantic merge are retained for v2. Keep the crate directory and
 # keep this exclusion from members.
 

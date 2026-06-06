@@ -911,3 +911,80 @@ fn write_keys_for_op_pub_link() {
     };
     assert_eq!(write_keys_for_op_pub(&op), vec!["edge-natural:a:b:extends"]);
 }
+
+// ── ADR-045: reserved envelope args rejected inside verb args ─────────────────
+
+#[test]
+fn presentation_in_fn_call_args_rejected() {
+    let err = parse_request(r#"list(kind="task", presentation="agent")"#).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            DslError::ReservedEnvelopeArg { arg_name, verb }
+            if arg_name == "presentation" && verb == "list"
+        ),
+        "expected ReservedEnvelopeArg, got {err:?}"
+    );
+}
+
+#[test]
+fn presentation_per_op_in_fn_call_args_rejected() {
+    let err = parse_request(r#"list(kind="task", presentation_per_op="verbose")"#).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            DslError::ReservedEnvelopeArg { arg_name, verb }
+            if arg_name == "presentation_per_op" && verb == "list"
+        ),
+        "expected ReservedEnvelopeArg, got {err:?}"
+    );
+}
+
+#[test]
+fn presentation_in_json_form_args_rejected() {
+    let err = parse_request(r#"{"tool":"list","args":{"kind":"task","presentation":"agent"}}"#)
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            DslError::ReservedEnvelopeArg { arg_name, verb }
+            if arg_name == "presentation" && verb == "list"
+        ),
+        "expected ReservedEnvelopeArg, got {err:?}"
+    );
+}
+
+#[test]
+fn presentation_in_fn_batch_args_rejected() {
+    let err = parse_request(r#"[list(kind="task", presentation="agent"), search(query="x")]"#)
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            DslError::ReservedEnvelopeArg { arg_name, verb }
+            if arg_name == "presentation" && verb == "list"
+        ),
+        "expected ReservedEnvelopeArg, got {err:?}"
+    );
+}
+
+#[test]
+fn presentation_in_chain_args_rejected() {
+    let err = parse_request(r#"list(kind="task") | get(id=$prev.id, presentation="verbose")"#)
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            DslError::ReservedEnvelopeArg { arg_name, verb }
+            if arg_name == "presentation" && verb == "get"
+        ),
+        "expected ReservedEnvelopeArg, got {err:?}"
+    );
+}
+
+#[test]
+fn non_reserved_presentation_like_arg_accepted() {
+    let r = req(r#"list(kind="task", present="yes")"#);
+    assert_eq!(r.mode, ExecutionMode::Single);
+    assert_eq!(val(&r.ops[0].args["present"]), &json!("yes"));
+}

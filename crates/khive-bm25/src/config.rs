@@ -1,11 +1,39 @@
 //! BM25 configuration types.
+//!
+//! Invariants are enforced at deserialization via `#[serde(try_from)]`.
 
 use serde::{Deserialize, Serialize};
+
+/// Raw wire format for [`Bm25Config`], used by `TryFrom` validation.
+#[derive(Deserialize)]
+struct RawBm25Config {
+    k1: f64,
+    b: f64,
+    #[serde(default)]
+    memory_budget: Option<usize>,
+}
+
+impl TryFrom<RawBm25Config> for Bm25Config {
+    type Error = String;
+
+    fn try_from(raw: RawBm25Config) -> Result<Self, Self::Error> {
+        let config = Bm25Config {
+            k1: raw.k1,
+            b: raw.b,
+            memory_budget: raw.memory_budget,
+        };
+        config.validate().map_err(|e| e.to_string())?;
+        Ok(config)
+    }
+}
 
 /// BM25 configuration parameters.
 ///
 /// Default values (k1=1.2, b=0.75) work well for most use cases.
+/// Invariants (k1 finite and >= 0, b finite and in [0,1]) are enforced at
+/// construction and deserialization boundaries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawBm25Config")]
 pub struct Bm25Config {
     /// Term saturation parameter.
     ///
@@ -134,5 +162,62 @@ mod tests {
         let config = Bm25Config::new(2.0, 0.5);
         assert!((config.k1 - 2.0).abs() < f64::EPSILON);
         assert!((config.b - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_serde_rejects_negative_k1() {
+        let json = r#"{"k1": -0.5, "b": 0.75}"#;
+        let result: Result<Bm25Config, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "negative k1 must be rejected at deserialization"
+        );
+    }
+
+    #[test]
+    fn test_serde_rejects_b_above_one() {
+        let json = r#"{"k1": 1.2, "b": 1.5}"#;
+        let result: Result<Bm25Config, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "b > 1.0 must be rejected at deserialization"
+        );
+    }
+
+    #[test]
+    fn test_serde_rejects_b_below_zero() {
+        let json = r#"{"k1": 1.2, "b": -0.1}"#;
+        let result: Result<Bm25Config, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "b < 0.0 must be rejected at deserialization"
+        );
+    }
+
+    #[test]
+    fn test_serde_accepts_valid_config() {
+        let json = r#"{"k1": 2.0, "b": 0.5}"#;
+        let config: Bm25Config = serde_json::from_str(json).expect("valid config");
+        assert!((config.k1 - 2.0).abs() < f64::EPSILON);
+        assert!((config.b - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_preserves_budget() {
+        let config = Bm25Config::default().with_memory_budget(10_000);
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: Bm25Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.memory_budget, Some(10_000));
+    }
+
+    #[test]
+    fn test_serde_accepts_boundary_values() {
+        // k1=0 and b=0 are valid
+        let json = r#"{"k1": 0.0, "b": 0.0}"#;
+        assert!(serde_json::from_str::<Bm25Config>(json).is_ok());
+
+        // b=1.0 is valid
+        let json = r#"{"k1": 1.2, "b": 1.0}"#;
+        assert!(serde_json::from_str::<Bm25Config>(json).is_ok());
     }
 }

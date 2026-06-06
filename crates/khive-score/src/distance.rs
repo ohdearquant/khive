@@ -1,5 +1,17 @@
-//! Canonical distance-to-similarity conversion for all vector retrieval backends.
-//! Formulas and proof correspondence documented in `docs/distance-conversion.md`.
+//! Canonical distance-to-similarity conversion
+//!
+//! `score_from_distance` is the single authoritative place that converts a raw
+//! floating-point distance produced by a vector index into a `DeterministicScore`.
+//! Centralising the conversion here ensures that all retrieval back-ends (HNSW,
+//! flat-scan, future IVF …) produce identical scores for identical inputs.
+//!
+//! ## Conversion formulas (per `DistanceMetric`)
+//!
+//! | Metric  | Distance d        | Similarity            | Notes                        |
+//! |---------|-------------------|-----------------------|------------------------------|
+//! | Cosine  | 1 − cos(x,y) ∈ \[0,2\] | 1 − d              | linear inversion             |
+//! | Dot     | −⟨x,y⟩            | −d                    | negated for min-heap storage |
+//! | L2      | ‖x−y‖₂            | 1 / (1 + d)           | always positive              |
 
 use crate::{DeterministicScore, ScoreError};
 use khive_types::DistanceMetric;

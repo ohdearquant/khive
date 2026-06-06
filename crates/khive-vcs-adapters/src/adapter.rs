@@ -1,4 +1,4 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
 //! The [`FormatAdapter`] trait — stateful pure transform producing entity and edge record streams.
 

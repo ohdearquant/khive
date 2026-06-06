@@ -4,7 +4,7 @@ use serde_json::json;
 
 use crate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
-    GateRef, GateRequest, Obligation,
+    GateRef, GateRequest, GateValidationError, Obligation,
 };
 use khive_types::Namespace;
 
@@ -276,58 +276,54 @@ fn allow_all_gate_impl_name_is_overridden() {
     assert_eq!(gate.impl_name(), "AllowAllGate");
 }
 
-// ---- GATE-AUD-002: invalid-input tests for gate wire types ----
+// ---- GATE-AUD-002: validation rejection at deserialization boundary ----
 
 #[test]
-fn actor_ref_deserializes_empty_fields() {
-    // Deserialization of empty kind/id is currently permitted by serde;
-    // callers must validate before use. This test documents the current
-    // boundary and will fail if a future validation layer rejects empty fields.
-    let json = r#"{"kind":"","id":""}"#;
-    let a: ActorRef = serde_json::from_str(json).expect("serde should parse empty strings");
-    assert_eq!(a.kind, "");
-    assert_eq!(a.id, "");
+fn deserialize_rejects_empty_actor_kind() {
+    let json = r#"{"kind":"","id":"x"}"#;
+    let err = serde_json::from_str::<ActorRef>(json).unwrap_err();
+    assert!(err.to_string().contains("actor kind must not be empty"));
 }
 
 #[test]
-fn gate_request_deserializes_empty_verb() {
-    // Empty verb is currently accepted by serde — documents the current
-    // boundary so a future validator can catch this.
-    let json = r#"{
-        "actor":{"kind":"user","id":"x"},
-        "namespace":"local",
-        "verb":"",
-        "args":{}
-    }"#;
-    let req: GateRequest = serde_json::from_str(json).expect("serde should parse empty verb");
-    assert_eq!(req.verb, "");
+fn deserialize_rejects_empty_actor_id() {
+    let json = r#"{"kind":"user","id":""}"#;
+    let err = serde_json::from_str::<ActorRef>(json).unwrap_err();
+    assert!(err.to_string().contains("actor id must not be empty"));
 }
 
 #[test]
-fn gate_decision_deny_empty_reason_deserializes() {
-    // Empty deny reason is currently permitted; documents the boundary.
+fn deserialize_rejects_empty_verb() {
+    let json = r#"{"actor":{"kind":"user","id":"x"},"namespace":"local","verb":"","args":{}}"#;
+    let err = serde_json::from_str::<GateRequest>(json).unwrap_err();
+    assert!(err.to_string().contains("verb must not be empty"));
+}
+
+#[test]
+fn deserialize_rejects_empty_deny_reason() {
     let json = r#"{"decision":"deny","reason":""}"#;
-    let d: GateDecision = serde_json::from_str(json).expect("serde should parse empty reason");
-    assert!(!d.is_allow());
+    let err = serde_json::from_str::<GateDecision>(json).unwrap_err();
+    assert!(err.to_string().contains("deny reason must not be empty"));
 }
 
 #[test]
-fn obligation_rate_limit_zero_window_deserializes() {
-    // Zero-duration rate limit is accepted by serde; documents the boundary.
-    let json = r#"{"kind":"rate_limit","window_secs":0,"max":0}"#;
-    let o: Obligation = serde_json::from_str(json).expect("serde should parse zero values");
-    match o {
-        Obligation::RateLimit { window_secs, max } => {
-            assert_eq!(window_secs, 0);
-            assert_eq!(max, 0);
-        }
-        _ => panic!("expected RateLimit"),
-    }
+fn deserialize_rejects_zero_rate_limit_window() {
+    let json = r#"{"kind":"rate_limit","window_secs":0,"max":10}"#;
+    let err = serde_json::from_str::<Obligation>(json).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("rate limit window_secs must be > 0"));
+}
+
+#[test]
+fn deserialize_rejects_zero_rate_limit_max() {
+    let json = r#"{"kind":"rate_limit","window_secs":60,"max":0}"#;
+    let err = serde_json::from_str::<Obligation>(json).unwrap_err();
+    assert!(err.to_string().contains("rate limit max must be > 0"));
 }
 
 #[test]
 fn gate_decision_unknown_kind_rejects() {
-    // Ensures the serde tag discriminant rejects unknown decision kinds.
     let json = r#"{"decision":"maybe","reason":"nope"}"#;
     assert!(
         serde_json::from_str::<GateDecision>(json).is_err(),
@@ -342,4 +338,47 @@ fn obligation_unknown_kind_rejects() {
         serde_json::from_str::<Obligation>(json).is_err(),
         "unknown obligation kind must be rejected"
     );
+}
+
+// ---- try_new constructor validation ----
+
+#[test]
+fn actor_ref_try_new_rejects_empty_kind() {
+    assert_eq!(
+        ActorRef::try_new("", "id"),
+        Err(GateValidationError::EmptyActorKind)
+    );
+}
+
+#[test]
+fn actor_ref_try_new_rejects_empty_id() {
+    assert_eq!(
+        ActorRef::try_new("user", ""),
+        Err(GateValidationError::EmptyActorId)
+    );
+}
+
+#[test]
+fn gate_request_try_new_rejects_empty_verb() {
+    let err =
+        GateRequest::try_new(ActorRef::anonymous(), Namespace::local(), "", json!({})).unwrap_err();
+    assert_eq!(err, GateValidationError::EmptyVerb);
+}
+
+#[test]
+fn deny_try_deny_rejects_empty_reason() {
+    let err = GateDecision::try_deny("").unwrap_err();
+    assert_eq!(err, GateValidationError::EmptyDenyReason);
+}
+
+#[test]
+fn rate_limit_try_rejects_zero_window() {
+    let err = Obligation::try_rate_limit(0, 10).unwrap_err();
+    assert_eq!(err, GateValidationError::ZeroRateLimitWindow);
+}
+
+#[test]
+fn rate_limit_try_rejects_zero_max() {
+    let err = Obligation::try_rate_limit(60, 0).unwrap_err();
+    assert_eq!(err, GateValidationError::ZeroRateLimitMax);
 }

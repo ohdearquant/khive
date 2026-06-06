@@ -307,8 +307,11 @@ impl Default for EventPayload {
 }
 
 /// Payload for a rerank pass event, recording per-candidate scores.
+///
+/// All score values (`reranked` section scores, `final_scores`) must be finite.
+/// When the `serde` feature is enabled, deserialization rejects non-finite scores.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RerankExecutedPayload {
     /// Brain profile that served this rerank, if any.
     pub served_by_profile_id: Option<String>,
@@ -337,6 +340,56 @@ impl RerankExecutedPayload {
             .all(|(_, scores)| scores.iter().all(|(_, s)| s.is_finite()));
         let final_ok = self.final_scores.iter().all(|(_, s)| s.is_finite());
         reranked_ok && final_ok
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for RerankExecutedPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            served_by_profile_id: Option<String>,
+            model_id: Id128,
+            candidates: Vec<Id128>,
+            reranked: Vec<(Id128, Vec<(String, f32)>)>,
+            final_scores: Vec<(Id128, f32)>,
+            latency_us: u64,
+            hook_applied: bool,
+            hook_target_match: bool,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        for (_, score) in &raw.final_scores {
+            if !score.is_finite() {
+                return Err(serde::de::Error::custom(alloc::format!(
+                    "RerankExecutedPayload final_scores must be finite, got {score}"
+                )));
+            }
+        }
+        for (_, sections) in &raw.reranked {
+            for (section_name, score) in sections {
+                if !score.is_finite() {
+                    return Err(serde::de::Error::custom(alloc::format!(
+                        "RerankExecutedPayload reranked section '{section_name}' score must be finite, got {score}"
+                    )));
+                }
+            }
+        }
+
+        Ok(RerankExecutedPayload {
+            served_by_profile_id: raw.served_by_profile_id,
+            model_id: raw.model_id,
+            candidates: raw.candidates,
+            reranked: raw.reranked,
+            final_scores: raw.final_scores,
+            latency_us: raw.latency_us,
+            hook_applied: raw.hook_applied,
+            hook_target_match: raw.hook_target_match,
+        })
     }
 }
 
@@ -441,10 +494,10 @@ mod serde_opt_opt {
 }
 
 #[cfg(feature = "serde")]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProposalChangeset {
-    /// Add a new entity. `entity.kind` validated against the closed 8-kind taxonomy at apply time.
+    /// Add a new entity. `entity.kind` validated against ADR-001 at apply time.
     AddEntity {
         entity: EntityDraft,
     },
@@ -453,6 +506,7 @@ pub enum ProposalChangeset {
         id: Id128,
         patch: ProposalEntityPatch,
     },
+    /// Add a typed edge. `weight` must be finite and in `[0.0, 1.0]` if present.
     AddEdge {
         source: Id128,
         target: Id128,
@@ -474,6 +528,103 @@ pub enum ProposalChangeset {
     Compound {
         steps: Vec<ProposalChangeset>,
     },
+}
+
+#[cfg(feature = "serde")]
+impl ProposalChangeset {
+    fn validate(&self) -> Result<(), alloc::string::String> {
+        match self {
+            Self::AddEdge { weight, .. } => {
+                if let Some(w) = weight {
+                    if !w.is_finite() {
+                        return Err(alloc::format!(
+                            "ProposalChangeset AddEdge weight must be finite, got {w}"
+                        ));
+                    }
+                    if !(*w >= 0.0 && *w <= 1.0) {
+                        return Err(alloc::format!(
+                            "ProposalChangeset AddEdge weight must be in [0.0, 1.0], got {w}"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Self::Compound { steps } => {
+                for step in steps {
+                    step.validate()?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ProposalChangeset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum ProposalChangesetRaw {
+            AddEntity {
+                entity: EntityDraft,
+            },
+            UpdateEntity {
+                id: Id128,
+                patch: ProposalEntityPatch,
+            },
+            AddEdge {
+                source: Id128,
+                target: Id128,
+                relation: crate::EdgeRelation,
+                weight: Option<f32>,
+            },
+            AddNote {
+                note: NoteDraft,
+            },
+            MergeEntities {
+                into: Id128,
+                from: Id128,
+            },
+            SupersedeEntity {
+                old: Id128,
+                new: Id128,
+            },
+            Compound {
+                steps: Vec<ProposalChangeset>,
+            },
+        }
+
+        let raw = ProposalChangesetRaw::deserialize(deserializer)?;
+        let cs = match raw {
+            ProposalChangesetRaw::AddEntity { entity } => Self::AddEntity { entity },
+            ProposalChangesetRaw::UpdateEntity { id, patch } => Self::UpdateEntity { id, patch },
+            ProposalChangesetRaw::AddEdge {
+                source,
+                target,
+                relation,
+                weight,
+            } => Self::AddEdge {
+                source,
+                target,
+                relation,
+                weight,
+            },
+            ProposalChangesetRaw::AddNote { note } => Self::AddNote { note },
+            ProposalChangesetRaw::MergeEntities { into, from } => {
+                Self::MergeEntities { into, from }
+            }
+            ProposalChangesetRaw::SupersedeEntity { old, new } => {
+                Self::SupersedeEntity { old, new }
+            }
+            ProposalChangesetRaw::Compound { steps } => Self::Compound { steps },
+        };
+        cs.validate().map_err(serde::de::Error::custom)?;
+        Ok(cs)
+    }
 }
 
 #[cfg(not(feature = "serde"))]
@@ -650,6 +801,8 @@ mod tests {
 
     use super::*;
     use crate::{Namespace, Timestamp};
+    #[cfg(feature = "serde")]
+    use alloc::string::ToString;
 
     fn header() -> Header {
         Header::new(
@@ -759,5 +912,88 @@ mod tests {
             matches!(cs, ProposalChangeset::SupersedeEntity { .. }),
             "expected SupersedeEntity"
         );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn proposal_changeset_rejects_invalid_edge_weight() {
+        let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
+        let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
+
+        let v = serde_json::json!({
+            "kind": "add_edge",
+            "source": uuid, "target": uuid2,
+            "relation": "extends", "weight": 2.0
+        });
+        let result: Result<ProposalChangeset, _> = serde_json::from_value(v);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("[0.0, 1.0]"),
+            "error should mention range: {err}"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn proposal_changeset_accepts_null_edge_weight() {
+        let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
+        let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
+
+        let v = serde_json::json!({
+            "kind": "add_edge",
+            "source": uuid, "target": uuid2,
+            "relation": "extends", "weight": null
+        });
+        let cs: ProposalChangeset =
+            serde_json::from_value(v).expect("null weight should be accepted");
+        assert!(matches!(
+            cs,
+            ProposalChangeset::AddEdge { weight: None, .. }
+        ));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn rerank_payload_serde_rejects_non_finite_score() {
+        let json = serde_json::json!({
+            "served_by_profile_id": null,
+            "model_id": "00000000-0000-0000-0000-000000000001",
+            "candidates": [],
+            "reranked": [],
+            "final_scores": [["00000000-0000-0000-0000-000000000001", "Infinity"]],
+            "latency_us": 100,
+            "hook_applied": false,
+            "hook_target_match": false
+        });
+        let result: Result<RerankExecutedPayload, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rerank_payload_is_valid_checks_finite() {
+        let p = RerankExecutedPayload {
+            served_by_profile_id: None,
+            model_id: Id128::from_u128(1),
+            candidates: Vec::new(),
+            reranked: Vec::new(),
+            final_scores: alloc::vec![(Id128::from_u128(1), 0.5)],
+            latency_us: 100,
+            hook_applied: false,
+            hook_target_match: false,
+        };
+        assert!(p.is_valid());
+
+        let p_inf = RerankExecutedPayload {
+            served_by_profile_id: None,
+            model_id: Id128::from_u128(1),
+            candidates: Vec::new(),
+            reranked: Vec::new(),
+            final_scores: alloc::vec![(Id128::from_u128(1), f32::INFINITY)],
+            latency_us: 100,
+            hook_applied: false,
+            hook_target_match: false,
+        };
+        assert!(!p_inf.is_valid());
     }
 }

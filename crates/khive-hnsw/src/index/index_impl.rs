@@ -127,7 +127,7 @@ impl HnswIndex {
     /// Panics if `config` fails validation. This is a programmer-only constructor
     /// for cases where the caller has already validated the config (e.g. using
     /// `HnswConfig::default()` or a named preset). External or deserialized
-    /// configs must use [`try_with_config`] instead.
+    /// configs must use `try_with_config` instead.
     pub fn with_config(config: HnswConfig) -> Self {
         config.validate().expect("HNSW configuration must be valid");
         Self::build_from_config(config)
@@ -176,7 +176,7 @@ impl HnswIndex {
 
     /// Attach a metrics sink (builder pattern).
     ///
-    /// The sink receives [`MetricEvent`]s from `search`, `insert`, and `rebuild`
+    /// The sink receives `MetricEvent`s from `search`, `insert`, and `rebuild`
     /// operations. Pass an `Arc<dyn MetricsSink>` to share a single sink across
     /// multiple indices.
     #[must_use]
@@ -307,7 +307,7 @@ impl HnswIndex {
     ///
     /// The returned snapshot includes the full vector data in the `vectors`
     /// field, making it self-contained for warm-start restores.  Use
-    /// [`restore_from_snapshot_embedded`] to restore directly from the
+    /// Use `restore_from_snapshot_embedded` to restore directly from the
     /// snapshot without supplying a separate vector map.
     ///
     /// Size estimate: `dimensions × 4 bytes × node_count`.
@@ -375,7 +375,7 @@ impl HnswIndex {
 
     /// Restore index topology from a snapshot using embedded vector data.
     ///
-    /// Convenience wrapper for snapshots produced by [`snapshot`] (which embed
+    /// Convenience wrapper for snapshots produced by `snapshot` (which embed
     /// the full f32 vectors).  No external vector map is required.
     ///
     /// # Errors
@@ -405,8 +405,8 @@ impl HnswIndex {
     ///
     /// This rebuilds the neighbor connections from the snapshot. The caller
     /// must supply vector data via the `vectors` map.  If the snapshot was
-    /// produced by [`snapshot`] it already embeds vector data in
-    /// `snapshot.vectors`; you can use [`restore_from_snapshot_embedded`]
+    /// produced by `snapshot` it already embeds vector data in
+    /// `snapshot.vectors`; you can use `restore_from_snapshot_embedded`
     /// instead in that case.
     ///
     /// When both the snapshot's embedded `vectors` field and the caller-supplied

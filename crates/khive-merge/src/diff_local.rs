@@ -1,4 +1,4 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
 //! Minimal entity+edge diff computation for the merge use case.
 //!
@@ -11,13 +11,9 @@
 use std::collections::{HashMap, HashSet};
 
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
-use khive_vcs::VcsError;
 use uuid::Uuid;
 
-/// Snapshot reader trait for `find_lca` (so the algorithm can be tested independently).
-pub trait SnapshotReader: Send + Sync {
-    fn parent_of(&self, id: &str) -> Option<String>;
-}
+use crate::types::MergeError;
 
 /// Per-entity change classification between base and a branch.
 #[derive(Debug, Clone)]
@@ -119,7 +115,7 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
 pub fn diff_edges(
     base: &KgArchive,
     branch: &KgArchive,
-) -> Result<HashMap<EdgeKey, EdgeChange>, VcsError> {
+) -> Result<HashMap<EdgeKey, EdgeChange>, MergeError> {
     let base_map: HashMap<EdgeKey, &ExportedEdge> = base
         .edges
         .iter()

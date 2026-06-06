@@ -123,7 +123,6 @@ mod tests {
 
     #[test]
     fn try_l2_squared_returns_err_on_length_mismatch() {
-        use crate::error::VamanaError;
         assert!(matches!(
             try_l2_squared(&[1.0], &[1.0, 2.0]),
             Err(VamanaError::DimensionMismatch { .. })
@@ -132,7 +131,6 @@ mod tests {
 
     #[test]
     fn try_l2_squared_returns_err_empty_vs_nonempty() {
-        use crate::error::VamanaError;
         assert!(matches!(
             try_l2_squared(&[1.0], &[]),
             Err(VamanaError::DimensionMismatch { .. })

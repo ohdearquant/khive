@@ -110,7 +110,7 @@ impl Event {
     }
 }
 
-/// Substrate type of an observation referent.
+/// Which substrate (entity or note) the referent record lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferentKind {
@@ -128,7 +128,7 @@ impl ReferentKind {
     }
 }
 
-/// Role of an entity in an event observation (candidate, selected, target, signal).
+/// Role of a referent in a brain observation (candidate, selected, target, signal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationRole {

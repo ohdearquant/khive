@@ -1,4 +1,4 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
 //! Edge-level three-way merge and dangling-edge validation.
 
@@ -7,10 +7,8 @@ use std::collections::{HashMap, HashSet};
 use khive_runtime::portability::{ExportedEdge, KgArchive};
 use uuid::Uuid;
 
-use crate::merge_types::{BranchSide, MergeConflict};
-use khive_vcs::VcsError;
-
 use crate::diff_local::{diff_edges, EdgeChange, EdgeKey};
+use crate::types::{BranchSide, MergeConflict, MergeError};
 
 /// Merge edges from base, ours, and theirs.
 ///
@@ -24,7 +22,7 @@ pub fn merge_edges(
     base: &KgArchive,
     ours: &KgArchive,
     theirs: &KgArchive,
-) -> Result<(Vec<ExportedEdge>, Vec<MergeConflict>), VcsError> {
+) -> Result<(Vec<ExportedEdge>, Vec<MergeConflict>), MergeError> {
     let ours_diff = diff_edges(base, ours)?;
     let theirs_diff = diff_edges(base, theirs)?;
 
@@ -215,11 +213,11 @@ fn build_edge(
     key: &EdgeKey,
     weight: f64,
     existing_id: Option<Uuid>,
-) -> Result<ExportedEdge, VcsError> {
+) -> Result<ExportedEdge, MergeError> {
     let relation = key
         .relation
         .parse::<khive_storage::EdgeRelation>()
-        .map_err(|e| VcsError::Internal(e.to_string()))?;
+        .map_err(|e| MergeError::Internal(e.to_string()))?;
     Ok(ExportedEdge {
         edge_id: existing_id.unwrap_or_else(Uuid::new_v4),
         source: key.source,

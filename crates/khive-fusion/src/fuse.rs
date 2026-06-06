@@ -1,7 +1,6 @@
 //! Main fusion entry point.
 
 use khive_score::DeterministicScore;
-use std::cmp::Ordering;
 use std::hash::Hash;
 
 use super::rrf::reciprocal_rank_fusion;
@@ -11,13 +10,11 @@ use super::weighted::weighted_fusion;
 
 /// Fuse multiple ranked result lists into a single ranked list.
 ///
-/// Main entry point for rank fusion. Generic over the ID type (`Eq + Hash + Clone + Ord`).
-/// Sources are `(Id, DeterministicScore)` pairs, sorted by score descending.
-/// Returns at most `top_k` results sorted by fused score descending.
+/// Dispatches to the appropriate algorithm based on strategy.
+/// `Custom` strategies return [`FuseError::CustomRequiresRuntime`] --
+/// use the runtime `FusionRegistry` for custom dispatch (ADR-012).
 ///
-/// See `docs/algorithm.md` for strategy details, the RRF formula, and weight normalization.
-///
-/// # Example
+/// Returns `Ok(results)` sorted by fused score descending, truncated to `top_k`.
 ///
 /// ```rust
 /// use khive_fusion::{fuse, FusionStrategy};
@@ -27,74 +24,53 @@ use super::weighted::weighted_fusion;
 ///     vec![("a", DeterministicScore::from_f64(0.9))],
 ///     vec![("a", DeterministicScore::from_f64(0.8))],
 /// ];
-///
-/// let results = fuse(sources, &FusionStrategy::default(), 10);
+/// let results = fuse(sources, &FusionStrategy::default(), 10).unwrap();
 /// assert_eq!(results.len(), 1);
 /// ```
 pub fn fuse<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     strategy: &FusionStrategy,
     top_k: usize,
-) -> Vec<(Id, DeterministicScore)> {
+) -> Result<Vec<(Id, DeterministicScore)>, FuseError> {
     if sources.is_empty() || top_k == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let fused = match strategy {
         FusionStrategy::Rrf { k } => reciprocal_rank_fusion(sources, *k),
         FusionStrategy::Weighted { weights } => weighted_fusion(sources, weights),
         FusionStrategy::Union => union_fusion(sources),
-        // VectorOnly / KeywordOnly: exactly one source is required.
-        // Multiple sources contradict the "raw single-retriever passthrough" semantics.
-        // Return empty in both debug and release builds so callers get consistent,
-        // detectable behavior instead of silently incorrect results.
-        FusionStrategy::VectorOnly | FusionStrategy::KeywordOnly => {
-            if sources.len() != 1 {
-                // Invalid source count for passthrough strategies: return empty so
-                // callers can detect the wiring error in both debug and release builds.
-                return Vec::new();
+        FusionStrategy::VectorOnly | FusionStrategy::KeywordOnly => union_fusion(sources),
+        FusionStrategy::Custom { name, .. } => {
+            return Err(FuseError::CustomRequiresRuntime(name.clone()));
+        }
+    };
+
+    Ok(fused.into_iter().take(top_k).collect())
+}
+
+/// Error from the [`fuse`] entry point.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FuseError {
+    /// Custom strategies must be dispatched through the runtime registry.
+    CustomRequiresRuntime(String),
+}
+
+impl std::fmt::Display for FuseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CustomRequiresRuntime(name) => {
+                write!(
+                    f,
+                    "custom strategy '{}' requires runtime FusionRegistry dispatch",
+                    name
+                )
             }
-            // Return the single source sorted by score desc (union_fusion is correct for 1 source).
-            let first = sources.into_iter().next().unwrap_or_default();
-            union_fusion(vec![first])
         }
-    };
-
-    truncate_top_k(fused, top_k)
+    }
 }
 
-/// Truncate a fused result list to at most `top_k` items, sorted by score
-/// descending with ID-ascending tie-breaking.
-///
-/// Uses `select_nth_unstable_by` (O(n)) to partition the top-k elements, then
-/// sorts only the prefix (O(k log k)), avoiding a full O(n log n) sort when
-/// `top_k << n` (finding #6).
-fn truncate_top_k<Id: Ord>(
-    mut fused: Vec<(Id, DeterministicScore)>,
-    top_k: usize,
-) -> Vec<(Id, DeterministicScore)> {
-    if top_k == 0 || fused.is_empty() {
-        return Vec::new();
-    }
-
-    let cmp = |(id_a, score_a): &(Id, DeterministicScore),
-               (id_b, score_b): &(Id, DeterministicScore)| {
-        match score_b.cmp(score_a) {
-            Ordering::Equal => id_a.cmp(id_b),
-            other => other,
-        }
-    };
-
-    if top_k < fused.len() {
-        // Partition so that fused[..top_k] are the top-k elements (unsorted).
-        fused.select_nth_unstable_by(top_k - 1, cmp);
-        fused.truncate(top_k);
-    }
-
-    // Sort only the (now small) prefix.
-    fused.sort_by(cmp);
-    fused
-}
+impl std::error::Error for FuseError {}
 
 #[cfg(test)]
 mod tests {
@@ -110,7 +86,7 @@ mod tests {
     #[test]
     fn test_fuse_rrf_strategy() {
         let source = make_results(vec![("doc_a", 0.9), ("doc_b", 0.8)]);
-        let fused = fuse(vec![source], &FusionStrategy::rrf(), 10);
+        let fused = fuse(vec![source], &FusionStrategy::rrf(), 10).unwrap();
 
         assert_eq!(fused.len(), 2);
     }
@@ -118,7 +94,7 @@ mod tests {
     #[test]
     fn test_fuse_weighted_strategy() {
         let source = make_results(vec![("doc_a", 1.0)]);
-        let fused = fuse(vec![source], &FusionStrategy::weighted(vec![1.0]), 10);
+        let fused = fuse(vec![source], &FusionStrategy::weighted(vec![1.0]), 10).unwrap();
 
         assert_eq!(fused.len(), 1);
     }
@@ -126,7 +102,7 @@ mod tests {
     #[test]
     fn test_fuse_union_strategy() {
         let source = make_results(vec![("doc_a", 0.9)]);
-        let fused = fuse(vec![source], &FusionStrategy::union(), 10);
+        let fused = fuse(vec![source], &FusionStrategy::union(), 10).unwrap();
 
         assert_eq!(fused.len(), 1);
     }
@@ -141,7 +117,7 @@ mod tests {
             ("doc_e", 0.5),
         ]);
 
-        let fused = fuse(vec![source], &FusionStrategy::rrf(), 3);
+        let fused = fuse(vec![source], &FusionStrategy::rrf(), 3).unwrap();
 
         assert_eq!(fused.len(), 3);
         assert_eq!(fused[0].0, "doc_a");
@@ -152,21 +128,22 @@ mod tests {
     #[test]
     fn test_fuse_top_k_zero() {
         let source = make_results(vec![("doc_a", 0.9)]);
-        let fused = fuse(vec![source], &FusionStrategy::rrf(), 0);
+        let fused = fuse(vec![source], &FusionStrategy::rrf(), 0).unwrap();
 
         assert!(fused.is_empty());
     }
 
     #[test]
     fn test_fuse_empty_sources() {
-        let fused: Vec<(&str, DeterministicScore)> = fuse(vec![], &FusionStrategy::rrf(), 10);
+        let fused: Vec<(&str, DeterministicScore)> =
+            fuse(vec![], &FusionStrategy::rrf(), 10).unwrap();
         assert!(fused.is_empty());
     }
 
     #[test]
     fn test_fuse_top_k_larger_than_results() {
         let source = make_results(vec![("doc_a", 0.9), ("doc_b", 0.8)]);
-        let fused = fuse(vec![source], &FusionStrategy::rrf(), 100);
+        let fused = fuse(vec![source], &FusionStrategy::rrf(), 100).unwrap();
 
         assert_eq!(fused.len(), 2);
     }
@@ -178,7 +155,7 @@ mod tests {
             ("doc_b".to_string(), DeterministicScore::from_f64(0.8)),
         ];
 
-        let fused = fuse(vec![source], &FusionStrategy::rrf(), 10);
+        let fused = fuse(vec![source], &FusionStrategy::rrf(), 10).unwrap();
 
         assert_eq!(fused.len(), 2);
         assert_eq!(fused[0].0, "doc_a");
@@ -191,9 +168,23 @@ mod tests {
             (2, DeterministicScore::from_f64(0.8)),
         ];
 
-        let fused = fuse(vec![source], &FusionStrategy::rrf(), 10);
+        let fused = fuse(vec![source], &FusionStrategy::rrf(), 10).unwrap();
 
         assert_eq!(fused.len(), 2);
         assert_eq!(fused[0].0, 1);
+    }
+
+    #[test]
+    fn test_fuse_custom_returns_error() {
+        let source = make_results(vec![("doc_a", 0.9)]);
+        let strategy =
+            FusionStrategy::try_custom("decay_weighted".to_string(), serde_json::json!({}))
+                .unwrap();
+        let result = fuse(vec![source], &strategy, 10);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            FuseError::CustomRequiresRuntime("decay_weighted".to_string())
+        );
     }
 }

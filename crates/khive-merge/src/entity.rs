@@ -1,4 +1,4 @@
-// Copyright 2026 khive contributors. Licensed under Apache-2.0.
+// Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
 //! Entity-level three-way merge and field-level conflict analysis.
 
@@ -7,9 +7,8 @@ use std::collections::{HashMap, HashSet};
 use khive_runtime::portability::{ExportedEntity, KgArchive};
 use uuid::Uuid;
 
-use crate::merge_types::{BranchSide, MergeConflict};
-
 use crate::diff_local::{diff_entities, EntityChange};
+use crate::types::{BranchSide, MergeConflict};
 
 /// Categorize all entity UUIDs across base, ours, theirs and produce:
 /// - A set of entities to include in the merged archive (no conflict).
@@ -61,9 +60,19 @@ pub fn merge_entities(
                 merged.push(e.clone());
             }
 
-            // Added in both (duplicate UUID) → auto-resolve field-by-field.
+            // Added in both (duplicate UUID): conflict per ADR-020 (same UUID,
+            // different content is a conflict). Identical content is auto-resolved.
             (Some(EntityChange::Added(e_ours)), Some(EntityChange::Added(e_theirs))) => {
-                merged.push(merge_entity_fields(e_ours, e_theirs));
+                let diffs = detect_entity_diffs(e_ours, e_theirs);
+                if diffs.is_empty() {
+                    merged.push(e_ours.clone());
+                } else {
+                    conflicts.push(MergeConflict::DuplicateAddition {
+                        entity_id: *id,
+                        differing_fields: diffs,
+                    });
+                    merged.push(e_ours.clone());
+                }
             }
 
             // Deleted in both → do not include (no conflict).
@@ -264,19 +273,29 @@ fn merge_properties(
     }
 }
 
-/// Auto-merge an entity where both branches added the same UUID.
-/// Scalars → ours wins; tags → union.
-fn merge_entity_fields(ours: &ExportedEntity, theirs: &ExportedEntity) -> ExportedEntity {
-    let mut result = ours.clone();
-    // Tags: union.
-    let mut tag_set: HashSet<String> = ours.tags.iter().cloned().collect();
-    for t in &theirs.tags {
-        tag_set.insert(t.clone());
+/// Detect which fields differ between two entities with the same UUID.
+fn detect_entity_diffs(ours: &ExportedEntity, theirs: &ExportedEntity) -> Vec<String> {
+    let mut diffs = Vec::new();
+    if ours.name != theirs.name {
+        diffs.push("name".into());
     }
-    let mut tags: Vec<String> = tag_set.into_iter().collect();
-    tags.sort();
-    result.tags = tags;
-    result
+    if ours.kind != theirs.kind {
+        diffs.push("kind".into());
+    }
+    if ours.description != theirs.description {
+        diffs.push("description".into());
+    }
+    if !properties_equal(&ours.properties, &theirs.properties) {
+        diffs.push("properties".into());
+    }
+    let mut ours_tags = ours.tags.clone();
+    let mut theirs_tags = theirs.tags.clone();
+    ours_tags.sort();
+    theirs_tags.sort();
+    if ours_tags != theirs_tags {
+        diffs.push("tags".into());
+    }
+    diffs
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -12,7 +12,9 @@ pub(crate) use scan::scan_string_end;
 
 use scan::{char_label, find_prev_ref_pos, json_value_contains_prev_ref};
 
-use crate::types::{ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest, MAX_OPS};
+use crate::types::{
+    ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest, MAX_OPS, RESERVED_ENVELOPE_ARGS,
+};
 
 /// Parse a request input string, returning either a single op or a batch.
 pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
@@ -53,6 +55,7 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
         if let Some(pos) = find_prev_ref_pos(&first_op) {
             return Err(DslError::PrevRefOutsideChain { pos });
         }
+        reject_reserved_args(&first_op)?;
         return Ok(ParsedRequest {
             ops: vec![first_op],
             mode: ExecutionMode::Single,
@@ -74,6 +77,7 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
 
 /// Parse the rest of a chain after the first op has been consumed.
 fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedRequest, DslError> {
+    reject_reserved_args(&first_op)?;
     let mut ops = vec![first_op];
     while p.peek() == Some('|') {
         if ops.len() >= MAX_OPS {
@@ -85,6 +89,7 @@ fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedReque
         p.advance(1); // consume '|'
         p.skip_ws();
         let op = p.parse_op()?;
+        reject_reserved_args(&op)?;
         ops.push(op);
         p.skip_ws();
     }
@@ -161,7 +166,9 @@ fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
             }
             args.insert(k, ArgValue::Value(v));
         }
-        ops.push(ParsedOp { tool, args });
+        let op = ParsedOp { tool, args };
+        reject_reserved_args(&op)?;
+        ops.push(op);
     }
     let mode = if is_single {
         ExecutionMode::Single
@@ -223,11 +230,25 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
         if let Some(pos) = find_prev_ref_pos(op) {
             return Err(DslError::PrevRefOutsideChain { pos });
         }
+        reject_reserved_args(op)?;
     }
     Ok(ParsedRequest {
         ops,
         mode: ExecutionMode::Parallel,
     })
+}
+
+/// Reject reserved envelope-level args inside a verb's argument list.
+fn reject_reserved_args(op: &ParsedOp) -> Result<(), DslError> {
+    for reserved in RESERVED_ENVELOPE_ARGS {
+        if op.args.contains_key(*reserved) {
+            return Err(DslError::ReservedEnvelopeArg {
+                arg_name: (*reserved).to_owned(),
+                verb: op.tool.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 // -- recursive-descent parser -------------------------------------------------

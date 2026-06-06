@@ -7,19 +7,30 @@ use std::num::NonZeroUsize;
 /// Errors produced by score aggregation and distance conversion operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScoreError {
+    /// The two input slices have different lengths.
     LengthMismatch {
+        /// Human-readable description of which two slices were compared.
         expected_desc: &'static str,
+        /// Length of the first slice.
         first_len: usize,
+        /// Length of the second slice.
         second_len: usize,
     },
+    /// A weight at the given index is NaN or infinite.
     NonFiniteWeight {
+        /// Zero-based index of the offending weight.
         index: usize,
     },
+    /// The distance value is NaN, `+Inf`, or `-Inf`.
     NonFiniteDistance,
+    /// The distance is finite but outside the valid range for the metric.
     InvalidDistanceRange {
+        /// The metric whose range was violated.
         metric_name: &'static str,
+        /// Bit-representation of the out-of-range distance for diagnostics.
         dist_bits: u32,
     },
+    /// The distance metric is not one of the three currently supported variants.
     UnsupportedMetric,
 }
 
@@ -181,6 +192,17 @@ pub fn rrf_score_zero_based(index: usize, k: usize) -> DeterministicScore {
 
 const SCALE_RAW: i128 = 4_294_967_296; // 2^32 — matches DeterministicScore::SCALE
 
+/// Compute the weighted sum of `scores` using the given `weights`.
+///
+/// Each score is multiplied by its corresponding weight (converted to
+/// fixed-point) and accumulated with i128 intermediates to avoid overflow.
+/// The result is clamped to `[NEG_INF, MAX]`.
+///
+/// # Errors
+///
+/// Returns [`ScoreError::LengthMismatch`] if `scores` and `weights` differ
+/// in length, or [`ScoreError::NonFiniteWeight`] if any weight is NaN or
+/// infinite.
 #[inline]
 pub fn weighted_sum(
     scores: &[DeterministicScore],

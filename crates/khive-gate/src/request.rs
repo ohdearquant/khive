@@ -1,7 +1,7 @@
 use khive_types::Namespace;
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorRef, GateContext};
+use crate::{ActorRef, GateContext, GateValidationError};
 
 // ---------- Request ----------
 
@@ -10,7 +10,10 @@ use crate::{ActorRef, GateContext};
 /// The JSON projection of this struct is the input shape policies receive
 /// (e.g. Rego's `input.actor`, `input.verb`, `input.args`). The shape is a
 /// public contract — changing field names is a breaking change.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// Invariant: `verb` must be non-empty. `actor` is validated by [`ActorRef`].
+/// Enforced at construction and deserialization.
+#[derive(Clone, Debug, Serialize)]
 pub struct GateRequest {
     pub actor: ActorRef,
     pub namespace: Namespace,
@@ -20,21 +23,79 @@ pub struct GateRequest {
     pub context: GateContext,
 }
 
+/// Raw deserialization target for [`GateRequest`] — validated via `TryFrom`.
+#[derive(Deserialize)]
+struct RawGateRequest {
+    actor: ActorRef,
+    namespace: Namespace,
+    verb: String,
+    args: serde_json::Value,
+    #[serde(default)]
+    context: GateContext,
+}
+
+impl TryFrom<RawGateRequest> for GateRequest {
+    type Error = GateValidationError;
+
+    fn try_from(raw: RawGateRequest) -> Result<Self, Self::Error> {
+        if raw.verb.is_empty() {
+            return Err(GateValidationError::EmptyVerb);
+        }
+        Ok(Self {
+            actor: raw.actor,
+            namespace: raw.namespace,
+            verb: raw.verb,
+            args: raw.args,
+            context: raw.context,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for GateRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawGateRequest::deserialize(deserializer)?;
+        GateRequest::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
 impl GateRequest {
+    /// Create a validated `GateRequest`. Returns `Err` if `verb` is empty.
+    pub fn try_new(
+        actor: ActorRef,
+        namespace: Namespace,
+        verb: impl Into<String>,
+        args: serde_json::Value,
+    ) -> Result<Self, GateValidationError> {
+        let verb = verb.into();
+        if verb.is_empty() {
+            return Err(GateValidationError::EmptyVerb);
+        }
+        Ok(Self {
+            actor,
+            namespace,
+            verb,
+            args,
+            context: GateContext::default(),
+        })
+    }
+
     /// Builds a `GateRequest` with default (empty) context.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `verb` is empty. Prefer [`try_new`](Self::try_new) at
+    /// deserialization or untrusted-input boundaries.
     pub fn new(
         actor: ActorRef,
         namespace: Namespace,
         verb: impl Into<String>,
         args: serde_json::Value,
     ) -> Self {
-        Self {
-            actor,
-            namespace,
-            verb: verb.into(),
-            args,
-            context: GateContext::default(),
-        }
+        Self::try_new(actor, namespace, verb, args)
+            .expect("GateRequest::new: verb must not be empty")
     }
 
     /// Attaches a `GateContext` (session, timestamp, source) to this request.

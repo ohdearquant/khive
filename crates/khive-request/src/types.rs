@@ -7,6 +7,10 @@ use serde_json::Value;
 /// unbounded memory growth and ensures latency stays predictable.
 pub const MAX_OPS: usize = 100;
 
+/// These names are reserved at the request-envelope level and rejected if they
+/// appear inside verb args in either function-call or JSON form.
+pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
+
 /// Execution mode for a [`ParsedRequest`].
 ///
 /// - `Single`: one operation, no batching.
@@ -216,6 +220,12 @@ pub enum DslError {
         /// Name of the second op that conflicts.
         second_op: String,
     },
+    /// `presentation` and `presentation_per_op` are envelope-only fields and
+    /// must not appear inside individual verb argument lists.
+    ReservedEnvelopeArg {
+        arg_name: String,
+        verb: String,
+    },
 }
 
 impl fmt::Display for DslError {
@@ -290,6 +300,13 @@ impl fmt::Display for DslError {
                     f,
                     "write-key conflict: id {id:?} is targeted by both {first_op:?} and \
                      {second_op:?} in the same batch; split into separate requests"
+                )
+            }
+            DslError::ReservedEnvelopeArg { arg_name, verb } => {
+                write!(
+                    f,
+                    "argument {arg_name:?} in verb {verb:?} is reserved for the request \
+                     envelope (ADR-045); pass it at the envelope level, not inside verb args"
                 )
             }
         }

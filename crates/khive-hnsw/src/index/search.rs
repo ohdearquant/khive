@@ -12,7 +12,7 @@ use khive_score::DeterministicScore;
 use super::HnswIndex;
 use crate::config::DistanceMetric;
 use crate::distance::{cosine_distance_from_parts, score_from_distance, OrderedF32};
-use crate::error::{Result, RetrievalError};
+use crate::error::{validate_finite_vector, Result, RetrievalError};
 use crate::metrics::{self, MetricEvent, MetricValue};
 use crate::search_context::HnswSearchContext;
 
@@ -270,6 +270,7 @@ impl HnswIndex {
                 actual: query.len(),
             });
         }
+        validate_finite_vector(query)?;
 
         if self.nodes.is_empty() {
             return Ok(Vec::new());

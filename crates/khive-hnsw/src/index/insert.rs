@@ -6,7 +6,7 @@ use rand::Rng;
 use super::HnswIndex;
 use crate::config::MAX_LEVEL;
 use crate::distance::compute_ordering_distance;
-use crate::error::{Result, RetrievalError};
+use crate::error::{validate_finite_vector, Result, RetrievalError};
 use crate::metrics::{self, MetricEvent, MetricValue};
 use crate::node::HnswNode;
 
@@ -78,11 +78,7 @@ impl HnswIndex {
                 actual: vector.len(),
             });
         }
-        if vector.iter().any(|v| !v.is_finite()) {
-            return Err(RetrievalError::Configuration(
-                "vector contains non-finite values (NaN or Infinity)".to_string(),
-            ));
-        }
+        validate_finite_vector(&vector)?;
 
         // If updating an existing node that is tombstoned, perform delete + fresh insert
         // so that the new vector is properly reconnected in the graph. A simple

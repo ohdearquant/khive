@@ -4,7 +4,7 @@ use serde_json::json;
 
 use khive_gate::{
     ActorRef, AllowAllGate, AuditDecision, AuditEvent, Gate, GateContext, GateDecision, GateError,
-    GateRef, GateRequest, Obligation,
+    GateRef, GateRequest, GateValidationError, Obligation,
 };
 use khive_types::Namespace;
 
@@ -16,6 +16,22 @@ fn sample_request() -> GateRequest {
         json!({"query": "LoRA"}),
     )
 }
+
+fn sample_req_with_session() -> GateRequest {
+    GateRequest::new(
+        ActorRef::new("user", "ocean"),
+        Namespace::local(),
+        "create",
+        json!({"kind": "concept"}),
+    )
+    .with_context(GateContext {
+        session_id: Some("sess-abc".into()),
+        timestamp: None,
+        source: Some("mcp".into()),
+    })
+}
+
+// ---- AllowAllGate ----
 
 #[test]
 fn allow_all_gate_allows() {
@@ -31,18 +47,15 @@ fn allow_all_gate_through_dyn() {
     assert!(decision.is_allow());
 }
 
-#[test]
-fn actor_ref_anonymous() {
-    let a = ActorRef::anonymous();
-    assert_eq!(a.kind, "anonymous");
-    assert_eq!(a.id, "local");
-}
+// ---- Decision helpers ----
 
 #[test]
 fn decision_helpers() {
     assert!(GateDecision::allow().is_allow());
     assert!(!GateDecision::deny("nope").is_allow());
 }
+
+// ---- Wire-shape stability ----
 
 #[test]
 fn request_serializes_to_stable_shape() {
@@ -84,21 +97,15 @@ fn decision_roundtrips_through_json() {
 
 #[test]
 fn obligation_rate_limit_serializes_with_kind_tag() {
-    let o = Obligation::RateLimit {
-        window_secs: 60,
-        max: 100,
-    };
+    let o = Obligation::rate_limit(60, 100);
     let v = serde_json::to_value(&o).unwrap();
     assert_eq!(v["kind"], "rate_limit");
     assert_eq!(v["window_secs"], 60);
     assert_eq!(v["max"], 100);
 }
 
-// `Obligation::Custom` must carry arbitrary JSON. The struct-like variant shape
-// is mandatory here because an internally-tagged newtype variant cannot merge
-// the `kind` discriminator into a non-object payload — a previous newtype shape
-// failed for scalar/array values at runtime instead of compile time, exactly
-// the foot-gun this guards.
+// ---- Obligation::Custom round-trips (ADR-018) ----
+
 fn assert_custom_round_trips(value: serde_json::Value) {
     let original = Obligation::Custom {
         value: value.clone(),
@@ -115,22 +122,22 @@ fn assert_custom_round_trips(value: serde_json::Value) {
 
 #[test]
 fn obligation_custom_round_trips_object() {
-    assert_custom_round_trips(serde_json::json!({"audit_tag": "billing", "weight": 1.5}));
+    assert_custom_round_trips(json!({"audit_tag": "billing", "weight": 1.5}));
 }
 
 #[test]
 fn obligation_custom_round_trips_string() {
-    assert_custom_round_trips(serde_json::json!("just a string"));
+    assert_custom_round_trips(json!("just a string"));
 }
 
 #[test]
 fn obligation_custom_round_trips_number() {
-    assert_custom_round_trips(serde_json::json!(42));
+    assert_custom_round_trips(json!(42));
 }
 
 #[test]
 fn obligation_custom_round_trips_array() {
-    assert_custom_round_trips(serde_json::json!(["a", "b", 3]));
+    assert_custom_round_trips(json!(["a", "b", 3]));
 }
 
 #[test]
@@ -140,24 +147,10 @@ fn obligation_custom_round_trips_null() {
 
 #[test]
 fn obligation_custom_round_trips_bool() {
-    assert_custom_round_trips(serde_json::json!(true));
+    assert_custom_round_trips(json!(true));
 }
 
-// ---- AuditEvent ----
-
-fn sample_req_with_session() -> GateRequest {
-    GateRequest::new(
-        ActorRef::new("user", "ocean"),
-        Namespace::local(),
-        "create",
-        json!({"kind": "concept"}),
-    )
-    .with_context(GateContext {
-        session_id: Some("sess-abc".into()),
-        timestamp: None,
-        source: Some("mcp".into()),
-    })
-}
+// ---- AuditEvent (ADR-018) ----
 
 #[test]
 fn audit_event_roundtrips_through_serde_stable_shape() {
@@ -169,7 +162,6 @@ fn audit_event_roundtrips_through_serde_stable_shape() {
 
     let json = serde_json::to_value(&ev).unwrap();
 
-    // All required fields present with correct values.
     assert_eq!(json["actor"]["kind"], "user");
     assert_eq!(json["actor"]["id"], "ocean");
     assert_eq!(json["namespace"], "local");
@@ -177,15 +169,11 @@ fn audit_event_roundtrips_through_serde_stable_shape() {
     assert_eq!(json["decision"], "allow");
     assert_eq!(json["gate_impl"], "AllowAllGate");
     assert_eq!(json["session_id"], "sess-abc");
-    // deny_reason absent on Allow.
     assert!(json.get("deny_reason").is_none() || json["deny_reason"].is_null());
-    // obligations populated.
     assert_eq!(json["obligations"][0]["kind"], "audit");
     assert_eq!(json["obligations"][0]["tag"], "create.attempt");
-    // timestamp present and non-null.
     assert!(json["timestamp"].is_string());
 
-    // Full round-trip.
     let back: AuditEvent = serde_json::from_value(json).unwrap();
     assert_eq!(back.verb, "create");
     assert_eq!(back.decision, AuditDecision::Allow);
@@ -195,7 +183,7 @@ fn audit_event_roundtrips_through_serde_stable_shape() {
 
 #[test]
 fn audit_event_deny_path_carries_reason() {
-    let req = sample_request(); // anonymous, no session
+    let req = sample_request();
     let decision = GateDecision::deny("forbidden: no write for anonymous");
     let ev = AuditEvent::from_check(&req, &decision, "RegoGate");
 
@@ -204,13 +192,11 @@ fn audit_event_deny_path_carries_reason() {
     assert_eq!(json["decision"], "deny");
     assert_eq!(json["deny_reason"], "forbidden: no write for anonymous");
     assert_eq!(json["gate_impl"], "RegoGate");
-    // obligations is always present on the wire, empty on Deny.
     assert_eq!(
         json["obligations"],
         serde_json::Value::Array(Vec::new()),
         "obligations must be an empty array on Deny, not omitted"
     );
-    // session_id absent when not in context.
     assert!(json.get("session_id").is_none() || json["session_id"].is_null());
 }
 
@@ -222,9 +208,6 @@ fn audit_event_allow_no_obligations() {
     assert_eq!(ev.decision, AuditDecision::Allow);
     assert!(ev.deny_reason.is_none());
     assert!(ev.obligations.is_empty());
-    // obligations is always present on the wire as an empty array — the
-    // public JSON contract does not depend on Rust's `#[serde(default)]`
-    // behavior at the consumer side.
     let json = serde_json::to_value(&ev).unwrap();
     assert_eq!(
         json["obligations"],
@@ -276,70 +259,114 @@ fn allow_all_gate_impl_name_is_overridden() {
     assert_eq!(gate.impl_name(), "AllowAllGate");
 }
 
-// ---- invalid-input boundary tests ----
+// ---- Validation rejection at deserialization boundary ----
 
 #[test]
-fn actor_ref_deserializes_empty_fields() {
-    // Deserialization of empty kind/id is currently permitted by serde;
-    // callers must validate before use. This test documents the current
-    // boundary and will fail if a future validation layer rejects empty fields.
-    let json = r#"{"kind":"","id":""}"#;
-    let a: ActorRef = serde_json::from_str(json).expect("serde should parse empty strings");
-    assert_eq!(a.kind, "");
-    assert_eq!(a.id, "");
+fn deserialize_rejects_empty_actor_kind() {
+    let json = r#"{"kind":"","id":"x"}"#;
+    let err = serde_json::from_str::<ActorRef>(json).unwrap_err();
+    assert!(err.to_string().contains("actor kind must not be empty"));
 }
 
 #[test]
-fn gate_request_deserializes_empty_verb() {
-    // Empty verb is currently accepted by serde — documents the current
-    // boundary so a future validator can catch this.
-    let json = r#"{
-        "actor":{"kind":"user","id":"x"},
-        "namespace":"local",
-        "verb":"",
-        "args":{}
-    }"#;
-    let req: GateRequest = serde_json::from_str(json).expect("serde should parse empty verb");
-    assert_eq!(req.verb, "");
+fn deserialize_rejects_empty_actor_id() {
+    let json = r#"{"kind":"user","id":""}"#;
+    let err = serde_json::from_str::<ActorRef>(json).unwrap_err();
+    assert!(err.to_string().contains("actor id must not be empty"));
 }
 
 #[test]
-fn gate_decision_deny_empty_reason_deserializes() {
-    // Empty deny reason is currently permitted; documents the boundary.
+fn deserialize_rejects_empty_verb() {
+    let json = r#"{"actor":{"kind":"user","id":"x"},"namespace":"local","verb":"","args":{}}"#;
+    let err = serde_json::from_str::<GateRequest>(json).unwrap_err();
+    assert!(err.to_string().contains("verb must not be empty"));
+}
+
+#[test]
+fn deserialize_rejects_empty_deny_reason() {
     let json = r#"{"decision":"deny","reason":""}"#;
-    let d: GateDecision = serde_json::from_str(json).expect("serde should parse empty reason");
-    assert!(!d.is_allow());
+    let err = serde_json::from_str::<GateDecision>(json).unwrap_err();
+    assert!(err.to_string().contains("deny reason must not be empty"));
 }
 
 #[test]
-fn obligation_rate_limit_zero_window_deserializes() {
-    // Zero-duration rate limit is accepted by serde; documents the boundary.
-    let json = r#"{"kind":"rate_limit","window_secs":0,"max":0}"#;
-    let o: Obligation = serde_json::from_str(json).expect("serde should parse zero values");
-    match o {
+fn deserialize_rejects_zero_rate_limit_window() {
+    let json = r#"{"kind":"rate_limit","window_secs":0,"max":10}"#;
+    let err = serde_json::from_str::<Obligation>(json).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("rate limit window_secs must be > 0"));
+}
+
+#[test]
+fn deserialize_rejects_zero_rate_limit_max() {
+    let json = r#"{"kind":"rate_limit","window_secs":60,"max":0}"#;
+    let err = serde_json::from_str::<Obligation>(json).unwrap_err();
+    assert!(err.to_string().contains("rate limit max must be > 0"));
+}
+
+// ---- try_new constructor validation ----
+
+#[test]
+fn actor_ref_try_new_rejects_empty_kind() {
+    assert_eq!(
+        ActorRef::try_new("", "id"),
+        Err(GateValidationError::EmptyActorKind)
+    );
+}
+
+#[test]
+fn actor_ref_try_new_rejects_empty_id() {
+    assert_eq!(
+        ActorRef::try_new("user", ""),
+        Err(GateValidationError::EmptyActorId)
+    );
+}
+
+#[test]
+fn gate_request_try_new_rejects_empty_verb() {
+    let err =
+        GateRequest::try_new(ActorRef::anonymous(), Namespace::local(), "", json!({})).unwrap_err();
+    assert_eq!(err, GateValidationError::EmptyVerb);
+}
+
+#[test]
+fn deny_try_deny_rejects_empty_reason() {
+    let err = GateDecision::try_deny("").unwrap_err();
+    assert_eq!(err, GateValidationError::EmptyDenyReason);
+}
+
+#[test]
+fn rate_limit_try_rejects_zero_window() {
+    let err = Obligation::try_rate_limit(0, 10).unwrap_err();
+    assert_eq!(err, GateValidationError::ZeroRateLimitWindow);
+}
+
+#[test]
+fn rate_limit_try_rejects_zero_max() {
+    let err = Obligation::try_rate_limit(60, 0).unwrap_err();
+    assert_eq!(err, GateValidationError::ZeroRateLimitMax);
+}
+
+#[test]
+fn valid_actor_ref_roundtrips() {
+    let a = ActorRef::new("user", "ocean");
+    let json = serde_json::to_string(&a).unwrap();
+    let back: ActorRef = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.kind, "user");
+    assert_eq!(back.id, "ocean");
+}
+
+#[test]
+fn valid_rate_limit_roundtrips() {
+    let o = Obligation::rate_limit(60, 100);
+    let json = serde_json::to_string(&o).unwrap();
+    let back: Obligation = serde_json::from_str(&json).unwrap();
+    match back {
         Obligation::RateLimit { window_secs, max } => {
-            assert_eq!(window_secs, 0);
-            assert_eq!(max, 0);
+            assert_eq!(window_secs, 60);
+            assert_eq!(max, 100);
         }
         _ => panic!("expected RateLimit"),
     }
-}
-
-#[test]
-fn gate_decision_unknown_kind_rejects() {
-    // Ensures the serde tag discriminant rejects unknown decision kinds.
-    let json = r#"{"decision":"maybe","reason":"nope"}"#;
-    assert!(
-        serde_json::from_str::<GateDecision>(json).is_err(),
-        "unknown decision tag must be rejected"
-    );
-}
-
-#[test]
-fn obligation_unknown_kind_rejects() {
-    let json = r#"{"kind":"unknown_obligation","value":1}"#;
-    assert!(
-        serde_json::from_str::<Obligation>(json).is_err(),
-        "unknown obligation kind must be rejected"
-    );
 }

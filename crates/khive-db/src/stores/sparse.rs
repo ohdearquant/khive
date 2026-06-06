@@ -1,5 +1,7 @@
-//! SQLite-backed `SparseStore` implementation.
+//! SQLite-backed `SparseStore` implementation (ADR-031).
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -103,7 +105,7 @@ pub(crate) fn ensure_sparse_schema(
     conn.execute_batch(&ddl)
 }
 
-/// SQLite-backed sparse vector store scoped to a single namespace and model.
+/// SQLite-backed sparse vector store.
 pub struct SqliteSparseStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
@@ -113,10 +115,6 @@ pub struct SqliteSparseStore {
 
 impl SqliteSparseStore {
     /// Create a new sparse store for the given model key and namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SqliteError` if the backing table cannot be created.
     pub fn new(
         pool: Arc<ConnectionPool>,
         is_file_backed: bool,
@@ -378,8 +376,10 @@ impl SqliteSparseStore {
                     .collect()
                 };
 
-            // Compute sparse dot product for each candidate.
-            let mut scored: Vec<(Uuid, f64)> = Vec::new();
+            // Bounded min-heap for top-k selection (KDB-AUD-003).
+            let mut heap: BinaryHeap<Reverse<ScoredCandidate>> =
+                BinaryHeap::with_capacity(top_k + 1);
+
             for row_result in rows {
                 let (id_str, indices_json, values_blob) = row_result?;
 
@@ -391,42 +391,64 @@ impl SqliteSparseStore {
                     )
                 })?;
 
+                // surface malformed rows as errors instead of silently skipping them
                 let stored_indices: Vec<u32> =
-                    serde_json::from_str(&indices_json).unwrap_or_default();
-                // Deserialize f32 values from little-endian bytes.
-                let stored_values: Vec<f32> = if values_blob.len() % 4 == 0 {
-                    values_blob
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect()
-                } else {
-                    continue;
-                };
+                    serde_json::from_str(&indices_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                                "corrupt sparse row {id_str}: invalid indices JSON: {e}"
+                            )),
+                        )
+                    })?;
 
-                if stored_indices.len() != stored_values.len() {
-                    continue;
+                if values_blob.len() % 4 != 0 {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                            "corrupt sparse row {id_str}: values blob length {} not a multiple of 4",
+                            values_blob.len()
+                        )),
+                    ));
                 }
 
-                // Sparse dot product using merge of sorted index arrays.
+                let stored_values: Vec<f32> = values_blob
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+
+                validate_persisted_sparse(&id_str, &stored_indices, &stored_values)?;
+
                 let score = sparse_dot_product(
                     &query.indices,
                     &query.values,
                     &stored_indices,
                     &stored_values,
                 );
-                scored.push((subject_id, score));
+
+                heap.push(Reverse(ScoredCandidate { score, subject_id }));
+                if heap.len() > top_k {
+                    heap.pop();
+                }
             }
 
-            // Sort descending by score, take top_k, assign 1-based rank.
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(top_k);
+            // Drain heap and sort descending by score, ascending by UUID on tie.
+            let mut top: Vec<_> = heap.into_iter().map(|Reverse(c)| c).collect();
+            top.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.subject_id.cmp(&b.subject_id))
+            });
 
-            let hits = scored
+            let hits = top
                 .into_iter()
                 .enumerate()
-                .map(|(i, (subject_id, score))| SparseSearchHit {
-                    subject_id,
-                    score: DeterministicScore::from_f64(score),
+                .map(|(i, c)| SparseSearchHit {
+                    subject_id: c.subject_id,
+                    score: DeterministicScore::from_f64(c.score),
                     rank: (i + 1) as u32,
                 })
                 .collect();
@@ -447,6 +469,82 @@ impl SqliteSparseStore {
         })
         .await
     }
+}
+
+/// Candidate scored during sparse search, ordered for a min-heap so we can
+/// maintain a bounded top-k set: (score desc, subject_id asc) tie-breaking.
+#[derive(PartialEq)]
+struct ScoredCandidate {
+    score: f64,
+    subject_id: Uuid,
+}
+
+impl Eq for ScoredCandidate {}
+
+impl PartialOrd for ScoredCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min-heap: lower score pops first. On tie, higher UUID pops first
+        // (so lower UUID is retained = deterministic ascending tie-break).
+        match self
+            .score
+            .partial_cmp(&other.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+        {
+            std::cmp::Ordering::Equal => other.subject_id.cmp(&self.subject_id),
+            ord => ord,
+        }
+    }
+}
+
+/// Validate invariants on a deserialized sparse vector from the database.
+/// Returns a storage error describing the corruption instead of silently
+/// skipping the row (KDB-AUD-002).
+fn validate_persisted_sparse(
+    subject_id: &str,
+    indices: &[u32],
+    values: &[f32],
+) -> Result<(), rusqlite::Error> {
+    if indices.len() != values.len() {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "corrupt sparse row {subject_id}: indices len {} != values len {}",
+                indices.len(),
+                values.len()
+            )),
+        ));
+    }
+    for (i, v) in values.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Blob,
+                Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "corrupt sparse row {subject_id}: non-finite value at position {i}: {v}"
+                )),
+            ));
+        }
+    }
+    for window in indices.windows(2) {
+        if window[0] >= window[1] {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Blob,
+                Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "corrupt sparse row {subject_id}: indices not strictly increasing at {} >= {}",
+                    window[0], window[1]
+                )),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Sparse dot product via merge of two sorted index arrays.

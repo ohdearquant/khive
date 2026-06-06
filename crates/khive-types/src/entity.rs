@@ -138,8 +138,12 @@ pub struct Entity {
 }
 
 /// A directed, typed edge between two entities (or cross-substrate nodes).
+///
+/// `weight` must be finite and in `[0.0, 1.0]`. When the `serde` feature is
+/// enabled, deserialization rejects out-of-range or non-finite weights.
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(into = "LinkRaw"))]
 pub struct Link {
     /// Unique edge identifier.
     pub id: Id128,
@@ -169,6 +173,82 @@ impl Link {
     /// - `weight` must be finite and in `[0.0, 1.0]`.
     pub fn is_valid(&self) -> bool {
         self.weight.is_finite() && self.weight >= 0.0 && self.weight <= 1.0
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LinkRaw {
+    id: Id128,
+    namespace: String,
+    source: Id128,
+    target: Id128,
+    relation: EdgeRelation,
+    properties: BTreeMap<String, PropertyValue>,
+    weight: f64,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+    deleted_at: Option<Timestamp>,
+}
+
+#[cfg(feature = "serde")]
+impl From<Link> for LinkRaw {
+    fn from(l: Link) -> Self {
+        Self {
+            id: l.id,
+            namespace: l.namespace,
+            source: l.source,
+            target: l.target,
+            relation: l.relation,
+            properties: l.properties,
+            weight: l.weight,
+            created_at: l.created_at,
+            updated_at: l.updated_at,
+            deleted_at: l.deleted_at,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<LinkRaw> for Link {
+    type Error = String;
+
+    fn try_from(raw: LinkRaw) -> Result<Self, Self::Error> {
+        if !raw.weight.is_finite() {
+            return Err(alloc::format!(
+                "Link weight must be finite, got {}",
+                raw.weight
+            ));
+        }
+        if !(0.0..=1.0).contains(&raw.weight) {
+            return Err(alloc::format!(
+                "Link weight must be in [0.0, 1.0], got {}",
+                raw.weight
+            ));
+        }
+        Ok(Link {
+            id: raw.id,
+            namespace: raw.namespace,
+            source: raw.source,
+            target: raw.target,
+            relation: raw.relation,
+            properties: raw.properties,
+            weight: raw.weight,
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
+            deleted_at: raw.deleted_at,
+        })
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Link {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = LinkRaw::deserialize(deserializer)?;
+        Link::try_from(raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -207,6 +287,8 @@ impl fmt::Display for PropertyValue {
 mod tests {
     use super::*;
     use crate::{Namespace, Timestamp};
+    #[cfg(feature = "serde")]
+    use alloc::string::ToString;
 
     #[test]
     fn entity_with_properties() {
@@ -324,5 +406,86 @@ mod tests {
             deleted_at: None,
         };
         assert_eq!(link.relation, EdgeRelation::Extends);
+        assert!(link.is_valid());
+    }
+
+    #[test]
+    fn link_is_valid_rejects_out_of_range() {
+        let ts = Timestamp::from_secs(1700000000);
+        let link = Link {
+            id: Id128::from_u128(100),
+            namespace: "default".into(),
+            source: Id128::from_u128(1),
+            target: Id128::from_u128(2),
+            relation: EdgeRelation::Extends,
+            properties: BTreeMap::new(),
+            weight: 2.0,
+            created_at: ts,
+            updated_at: ts,
+            deleted_at: None,
+        };
+        assert!(!link.is_valid());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn link_serde_rejects_weight_above_one() {
+        let json = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000064",
+            "namespace": "default",
+            "source": "00000000-0000-0000-0000-000000000001",
+            "target": "00000000-0000-0000-0000-000000000002",
+            "relation": "extends",
+            "properties": {},
+            "weight": 2.0,
+            "created_at": 1700000000000000_u64,
+            "updated_at": 1700000000000000_u64,
+            "deleted_at": null
+        });
+        let result: Result<Link, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("[0.0, 1.0]"),
+            "error should mention range: {err}"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn link_serde_rejects_negative_weight() {
+        let json = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000064",
+            "namespace": "default",
+            "source": "00000000-0000-0000-0000-000000000001",
+            "target": "00000000-0000-0000-0000-000000000002",
+            "relation": "extends",
+            "properties": {},
+            "weight": -0.1,
+            "created_at": 1700000000000000_u64,
+            "updated_at": 1700000000000000_u64,
+            "deleted_at": null
+        });
+        let result: Result<Link, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn link_serde_accepts_valid_weight() {
+        let json = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000064",
+            "namespace": "default",
+            "source": "00000000-0000-0000-0000-000000000001",
+            "target": "00000000-0000-0000-0000-000000000002",
+            "relation": "extends",
+            "properties": {},
+            "weight": 0.75,
+            "created_at": 1700000000000000_u64,
+            "updated_at": 1700000000000000_u64,
+            "deleted_at": null
+        });
+        let link: Link = serde_json::from_value(json).expect("valid weight should deserialize");
+        assert_eq!(link.weight, 0.75);
     }
 }

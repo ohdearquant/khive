@@ -1,9 +1,10 @@
-//! Schema migration system for khive-db.
+//! Schema migration system for the SQLite storage layer.
 //!
-//! FILE SIZE JUSTIFICATION: Contains versioned DDL migrations that must remain
-//! in dependency order within a single file. Each `VersionedMigration` builds on
-//! the schema left by its predecessor; splitting across files would make migration
-//! sequencing harder to verify and introduce ordering bugs during schema evolution.
+//! Two APIs coexist:
+//! - **Legacy per-service migrations** (`ServiceSchemaPlan` / `apply_schema_plan`):
+//!   used by pack-scoped schemas.
+//! - **Versioned migrations** (`MIGRATIONS` / `run_migrations`): the ADR-015
+//!   forward-only migration pipeline for the core tables.
 
 use rusqlite::Connection;
 
@@ -13,25 +14,26 @@ use crate::error::SqliteError;
 // Legacy per-service migration API (preserved for backward compatibility)
 // =============================================================================
 
-/// A single legacy per-service migration step.
+/// A single legacy migration step within a `ServiceSchemaPlan`.
 pub struct Migration {
-    /// Unique identifier for this migration within its service.
+    /// Unique identifier for this migration.
     pub id: &'static str,
-    /// SQL DDL to apply this migration.
+    /// SQL to apply (forward direction).
     pub up_sql: &'static str,
-    /// SQL DDL to reverse this migration (if reversible).
+    /// SQL to revert (optional).
     pub down_sql: Option<&'static str>,
-    /// Optional predicate that returns `true` if this migration is already applied.
+    /// Optional predicate: returns true if migration was already applied
+    /// through a mechanism other than the migration tracker.
     pub is_already_applied: Option<fn(&Connection) -> bool>,
 }
 
-/// Legacy per-service schema plan containing migrations for SQLite and Postgres.
+/// A pack-scoped schema plan containing migrations for SQLite and Postgres.
 pub struct ServiceSchemaPlan {
-    /// Service name used as the namespace key in `_schema_versions`.
+    /// Service name used as a key in the `_schema_versions` tracking table.
     pub service: &'static str,
-    /// Ordered migrations for the SQLite backend.
+    /// SQLite-specific migration steps, applied in order.
     pub sqlite: &'static [Migration],
-    /// Ordered migrations for the Postgres backend (currently unused).
+    /// Postgres-specific migration steps (reserved for future use).
     pub postgres: &'static [Migration],
 }
 
@@ -44,11 +46,7 @@ const SCHEMA_VERSION_TABLE: &str = "\
     );\
 ";
 
-/// Apply a legacy per-service schema plan, recording each step in `_schema_versions`.
-///
-/// # Errors
-///
-/// Returns `SqliteError::Rusqlite` if any migration DDL fails.
+/// Apply a pack-scoped schema plan, tracking each migration in `_schema_versions`.
 pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<(), SqliteError> {
     conn.execute_batch(SCHEMA_VERSION_TABLE)?;
 
@@ -89,7 +87,7 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
 }
 
 // =============================================================================
-// Versioned migration system
+// Versioned migration system (ADR-015)
 // =============================================================================
 
 /// A single forward-only schema migration.
@@ -177,11 +175,14 @@ const V1_UP: &str = "\
 
 /// All known migrations, ordered by ascending version.
 ///
-/// To add a new migration: append a `VersionedMigration` entry with
-/// `version = <last_version + 1>`. The version sequence must be contiguous
-/// (1, 2, 3, ...); `run_migrations` returns an error on gaps.
+/// Append a `VersionedMigration` with `version = <last + 1>`. The sequence
+/// must be contiguous; `run_migrations` returns an error on gaps.
 ///
-/// Per-version design notes are in `docs/migration.md`.
+/// V2/V5 add columns that may already exist from in-process DDL -- the
+/// runner checks column existence before applying. V4 deduplicates
+/// graph_edges triples. V9 rebuilds graph_edges for lifecycle columns.
+/// V13 event observability SQL is computed at runtime to avoid
+/// duplicate-column errors on pre-bootstrapped DBs.
 const V4_DEDUPE_GRAPH_EDGE_TRIPLES: &str = "\
     DELETE FROM graph_edges \
     WHERE rowid NOT IN (\
@@ -374,12 +375,17 @@ const V14_EMBEDDING_MODEL_REGISTRY: &str = "__v14_computed_at_runtime__";
 /// missing `embedding_model`.
 const V16_VECTOR_EMBEDDING_MODEL_TAG: &str = "__v16_computed_at_runtime__";
 
-/// V17: sqlite-vec preserving rebuild — adds `field` and `embedding_model` to
-/// `vec0` virtual tables without data loss. SQL computed at runtime via
-/// `build_v17_preserving_rebuild_sql`. See `docs/migration.md` for details.
+/// V17: sqlite-vec preserving rebuild (ADR-043 §1.1).
+///
+/// Unlike V16 (regular tables), vec0 virtual tables cannot `ALTER TABLE ADD
+/// COLUMN`. V17 does a 6-step copy-with-default rebuild per table: create
+/// temp regular table, copy rows with defaults, drop virtual table,
+/// recreate with full schema, copy back, drop temp. SQL is computed at
+/// runtime via `build_v17_preserving_rebuild_sql`. After V17, all vec0
+/// tables have `field` and `embedding_model`.
 const V17_VECTOR_EMBEDDING_MODEL_TAG_PRESERVING_REBUILD: &str = "__v17_computed_at_runtime__";
 
-/// V15: proposals_open projection table.
+/// V15: proposals_open projection table (ADR-046).
 ///
 /// Maintains a fold-derived view of the four proposal EventKinds so that
 /// `list(kind=proposal, status="open")` is an index scan rather than a full

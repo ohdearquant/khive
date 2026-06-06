@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 
 use super::HnswIndex;
-use crate::error::{Result, RetrievalError};
+use crate::error::{validate_finite_vector, Result, RetrievalError};
 use crate::node::HnswNode;
 use crate::NodeId;
 use rayon::prelude::*;
@@ -75,6 +75,7 @@ impl HnswIndex {
                     actual: vector.len(),
                 });
             }
+            validate_finite_vector(vector)?;
             // Check for duplicates against existing index
             if self.id_to_internal.contains_key(id) {
                 return Err(RetrievalError::hnsw(format!(
