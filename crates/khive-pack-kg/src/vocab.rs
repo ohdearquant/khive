@@ -1,23 +1,11 @@
-//! KG-pack vocabulary — pack-owned entity and note vocabulary.
-//!
-//! Entity kind validation now uses `khive_types::EntityKind` directly.
-//! The runtime accepts any String — validation is the pack's responsibility.
+//! KG-pack vocabulary — pack-owned entity and note kinds.
 
 use core::fmt;
 use std::string::String;
 
 use khive_types::UnknownVariant;
 
-/// Pack-local entity kind extension including `Resource`.
-///
-/// `Resource` is the 9th entity kind: actionable content agents consume — atoms,
-/// domains, skills, tools. Distinct from `Concept` which models abstract ideas
-/// and their graph relationships.
-///
-/// This type is `pub(crate)` because `khive_types::EntityKind` is the canonical
-/// public type re-exported from this pack. This local variant exists solely to
-/// support `Resource` aliasing in `FromStr` and vocabulary tests; it is not part
-/// of the public pack API.
+/// Pack-local entity kind extension adding `Resource` (atoms, domains, skills, tools).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum EntityKind {
     #[default]

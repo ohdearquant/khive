@@ -1,7 +1,4 @@
 //! PackRuntime impl for KgPack plus inventory self-registration.
-//!
-//! Routes each verb to its handler in `handlers`. OSS sharing comes from the
-//! registry/runtime default namespace; cloud isolation from authenticated tokens.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -90,6 +87,7 @@ impl PackRuntime for KgPack {
                 | "org"
                 | "artifact"
                 | "service"
+                | "resource"
         );
 
         match verb {
@@ -134,10 +132,7 @@ mod tests {
 
     use super::*;
 
-    /// KG `create` with a `tenant-a` token stores the entity in `tenant-a`.
-    ///
-    /// An entity created under `tenant-a` is visible to `tenant-a` and opaque
-    /// to `tenant-b` (cross-namespace reads fail closed as NotFound).
+    /// Entity created under `tenant-a` is visible to `tenant-a` and opaque to `tenant-b`.
     #[tokio::test]
     async fn kg_create_entity_honors_caller_namespace() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -201,12 +196,7 @@ mod tests {
         );
     }
 
-    /// OSS default path: two entity creates with no explicit namespace land in
-    /// the same default namespace, preserving the unified single-user graph.
-    ///
-    /// This regression guards that removing the KG pack namespace override does
-    /// not break the OSS common path — the registry/runtime default namespace
-    /// already ensures both entities end up in `local`.
+    /// Two creates with no explicit namespace land in the same `local` namespace.
     #[tokio::test]
     async fn kg_oss_default_namespace_entities_colocate() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");

@@ -1,8 +1,4 @@
 //! EntityTypeRegistry — validates and normalises `(EntityKind, entity_type)` pairs.
-//!
-//! Declares canonical subtypes per kind, resolves aliases, infers kind from bare
-//! subtype strings, and is extensible by external packs via [`EntityTypeRegistry::register`].
-//! Kept in pack-kg (not khive-types) because subtype names are pack-owned vocabulary.
 
 use std::collections::HashMap;
 
@@ -25,7 +21,6 @@ pub struct EntityTypeDef {
 
 /// Static table of built-in subtypes (non-exhaustive; packs may extend).
 ///
-/// Ordered by kind so it is easy to scan visually.
 static BUILTIN_DEFS: &[EntityTypeDef] = &[
     // ── Document ────────────────────────────────────────────────────────────
     EntityTypeDef {
@@ -295,12 +290,7 @@ pub struct ResolvedType {
     pub entity_type: Option<String>,
 }
 
-/// Registry for `(EntityKind, entity_type)` pair validation and alias
-/// normalisation.
-///
-/// Build the default registry with [`EntityTypeRegistry::new`]; the lazily
-/// initialised global is available via [`EntityTypeRegistry::global`].
-/// Extend it with [`EntityTypeRegistry::with_extra`].
+/// Registry for `(EntityKind, entity_type)` pair validation and alias normalisation.
 #[derive(Clone)]
 pub struct EntityTypeRegistry {
     /// `alias_or_name (lowercase) → def index`.  Covers both canonical names
@@ -311,9 +301,6 @@ pub struct EntityTypeRegistry {
 
 impl EntityTypeRegistry {
     /// Build a fresh registry from the supplied definitions.
-    ///
-    /// Panics in debug builds when two definitions share an alias under the
-    /// same `EntityKind` (would produce an ambiguous lookup).
     pub fn new(defs: impl IntoIterator<Item = EntityTypeDef>) -> Self {
         let defs: Vec<EntityTypeDef> = defs.into_iter().collect();
         let mut lookup: HashMap<String, usize> = HashMap::new();
@@ -345,9 +332,6 @@ impl EntityTypeRegistry {
     }
 
     /// Register additional subtypes into an existing registry clone.
-    ///
-    /// Intended for pack initialisation: a pack calls `registry.register(...)`
-    /// on a cloned global to obtain an extended copy for its lifetime.
     pub fn register(&mut self, def: EntityTypeDef) {
         let idx = self.defs.len();
         let canonical_key = format!("{}:{}", def.kind.name(), def.type_name);
@@ -361,22 +345,7 @@ impl EntityTypeRegistry {
         self.defs.push(def);
     }
 
-    /// Validate and normalise a `(kind_str, entity_type)` wire pair.
-    ///
-    /// Semantics:
-    ///
-    /// - `entity_type = None` → accepted for all kinds; `ResolvedType.entity_type`
-    ///   is also `None`.
-    /// - `entity_type = Some(t)` where `t` is a canonical name or alias valid
-    ///   for `kind_str` → normalised to the canonical name.
-    /// - `entity_type = Some(t)` where `t` belongs to a *different* kind →
-    ///   `InvalidInput` listing valid subtypes for the supplied kind.
-    /// - `entity_type = Some(t)` where `t` is not recognised at all →
-    ///   `InvalidInput` listing valid subtypes for the supplied kind.
-    ///
-    /// `kind_str` must already be a canonical kind name (the result of
-    /// `EntityKind::from_str(raw).map(|k| k.name())`).  Callers should
-    /// resolve the kind string first.
+    /// Validate and normalise a `(kind, entity_type)` wire pair.
     pub fn resolve(
         &self,
         kind: EntityKind,
@@ -455,8 +424,6 @@ static GLOBAL_REGISTRY: OnceLock<EntityTypeRegistry> = OnceLock::new();
 
 impl EntityTypeRegistry {
     /// Return a reference to the module-level built-in registry.
-    ///
-    /// Initialised on first access; subsequent calls are zero-cost reads.
     pub fn global() -> &'static EntityTypeRegistry {
         GLOBAL_REGISTRY.get_or_init(EntityTypeRegistry::builtin)
     }

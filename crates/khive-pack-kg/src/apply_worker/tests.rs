@@ -231,9 +231,7 @@ async fn apply_worker_skips_non_approved_proposals() {
     );
 }
 
-/// C2 regression: apply worker must reject proposals whose AddEntity changeset
-/// carries an invalid entity kind.  Direct `create(kind="invalidkind")` correctly
-/// errors; the proposal apply path must enforce the same invariant.
+/// C2 regression: apply worker must reject invalid entity kinds the same way `create` does.
 #[tokio::test]
 async fn apply_worker_rejects_invalid_entity_kind() {
     let (rt, tok) = setup();
@@ -295,11 +293,7 @@ async fn apply_worker_rejects_invalid_entity_kind() {
     );
 }
 
-/// H2 regression: apply worker must NOT mutate the KG when the proposal was
-/// withdrawn after approval but before the worker runs.
-///
-/// Sequence: approve (status='approved') → withdraw (status='withdrawn') →
-/// maybe_apply() → assert no entity created, no ProposalApplied event emitted.
+/// H2 regression: apply worker must not mutate the KG when proposal withdrawn before worker runs.
 #[tokio::test]
 async fn apply_worker_skips_kg_mutation_when_withdrawn_after_approve() {
     let (rt, tok) = setup();
@@ -362,11 +356,7 @@ async fn apply_worker_skips_kg_mutation_when_withdrawn_after_approve() {
     );
 }
 
-/// C3 regression: apply worker must reject proposals whose AddNote changeset
-/// carries an invalid note kind.  Direct `create(kind="badnote")` correctly
-/// errors; the proposal apply path must enforce the same invariant so that
-/// pack-owned note kinds (memory, task, message, scheduled_event) cannot be
-/// bypassed via the proposal mechanism when their owning pack is not loaded.
+/// C3 regression: apply worker must reject invalid note kinds the same way `create` does.
 #[tokio::test]
 async fn apply_worker_rejects_invalid_note_kind() {
     let (rt, tok) = setup();

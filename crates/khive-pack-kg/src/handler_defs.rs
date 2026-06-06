@@ -1,6 +1,4 @@
 //! Static `KG_HANDLERS` table (16 `HandlerDef` entries) and the `verbs` introspection handler.
-//!
-//! All 16 handlers are `Visibility::Verb`. Full rationale in `docs/design.md`.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -660,14 +658,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
     },
 ];
 
-/// Handle the `verbs` introspection verb (ue-help-introspection H5).
-///
-/// Returns all MCP-callable verbs registered on this server — identical to the
-/// list the `request` tool's description advertises. Internal subhandlers
-/// (`Visibility::Subhandler`) are excluded.
-///
-/// Supports optional `category` and `pack` filters so agents can enumerate a
-/// subset of the verb surface without parsing the prose description.
+/// Handle the `verbs` introspection verb — returns all public verbs, with optional category/pack filters.
 pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Value, RuntimeError> {
     #[derive(serde::Deserialize, Default)]
     struct VerbsParams {
@@ -878,9 +869,7 @@ mod tests {
 
     // ── ue-help-introspection C3 regression ──────────────────────────────────
 
-    /// No handler named "thread" should exist in the KG pack.
-    /// This guards against accidentally adding a `thread` Verb-visibility
-    /// handler without a corresponding dispatch arm (C3).
+    /// No handler named "thread" should exist in the KG pack (guards against accidental addition).
     #[test]
     fn no_thread_verb_in_kg_handlers() {
         assert!(
