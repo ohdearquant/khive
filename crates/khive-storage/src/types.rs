@@ -305,6 +305,9 @@ pub struct TextFilter {
 pub enum TextQueryMode {
     Plain,
     Phrase,
+    /// OR-join: each whitespace-separated token is matched independently.
+    /// Semantically equivalent to N Plain probes joined by OR but in one query.
+    AnyTerm,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

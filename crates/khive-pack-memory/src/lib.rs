@@ -1,3 +1,4 @@
+pub(crate) mod ann;
 pub mod config;
 pub mod handlers;
 pub mod rerank;
@@ -13,12 +14,15 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
+use crate::ann::{new_shared, SharedAnn};
 use crate::config::RecallConfig;
 
 pub struct MemoryPack {
     runtime: KhiveRuntime,
     /// Active recall config.
     config: Mutex<RecallConfig>,
+    /// Per-`(namespace, model)` warm ANN indexes.
+    ann: SharedAnn,
 }
 
 impl MemoryPack {
@@ -234,6 +238,7 @@ impl MemoryPack {
         Self {
             runtime,
             config: Mutex::new(RecallConfig::default()),
+            ann: new_shared(),
         }
     }
 }
@@ -278,6 +283,10 @@ impl PackRuntime for MemoryPack {
 
     fn requires(&self) -> &'static [&'static str] {
         <MemoryPack as Pack>::REQUIRES
+    }
+
+    async fn warm(&self) {
+        crate::ann::warm_existing_memory_indexes(&self.runtime, &self.ann).await;
     }
 
     async fn dispatch(

@@ -571,14 +571,32 @@ impl TextSearch for Fts5TextSearch {
         let table = self.table_name.clone();
 
         self.with_reader("fts_search", move |conn| {
-            let sanitized = sanitize_fts5_query(&request.query);
-            if sanitized.is_empty() {
-                return Ok(Vec::new());
-            }
-
             let match_expr = match request.mode {
-                TextQueryMode::Phrase => format!("\"{}\"", sanitized),
-                TextQueryMode::Plain => sanitized,
+                TextQueryMode::AnyTerm => {
+                    // Sanitize each token independently so the OR joiner isn't
+                    // stripped by sanitize_fts5_query's keyword filter.
+                    let parts: Vec<String> = request
+                        .query
+                        .split_whitespace()
+                        .map(sanitize_fts5_query)
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    if parts.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    parts.join(" OR ")
+                }
+                _ => {
+                    let sanitized = sanitize_fts5_query(&request.query);
+                    if sanitized.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    match request.mode {
+                        TextQueryMode::Phrase => format!("\"{}\"", sanitized),
+                        TextQueryMode::Plain => sanitized,
+                        TextQueryMode::AnyTerm => unreachable!(),
+                    }
+                }
             };
 
             // Snippet column index 3 = body in the FTS5 schema.

@@ -12,12 +12,13 @@ use khive_runtime::{
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{
-    Direction, NeighborQuery, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest,
-    VectorSearchHit, VectorSearchRequest,
+    Direction, EdgeFilter, NeighborQuery, PageRequest, TextFilter, TextQueryMode, TextSearchHit,
+    TextSearchRequest, VectorSearchHit, VectorSearchRequest,
 };
 use khive_storage::EdgeRelation;
 use khive_types::SubstrateKind;
 
+use crate::ann::{self, AnnKey};
 use crate::config::{RecallConfig, ScoreBreakdown, WeightedContributions};
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
@@ -538,37 +539,25 @@ impl MemoryPack {
         candidate_limit: u32,
     ) -> Result<Vec<TextSearchHit>, RuntimeError> {
         let terms = recall_text_terms(query);
-        let searcher = self.runtime.text_for_notes(token)?;
-        let mut by_id: HashMap<Uuid, TextSearchHit> = HashMap::new();
-
-        for term in terms {
-            let hits = searcher
-                .search(TextSearchRequest {
-                    query: term,
-                    mode: TextQueryMode::Plain,
-                    filter: Some(TextFilter {
-                        namespaces: vec![ns.to_string()],
-                        kinds: vec![SubstrateKind::Note],
-                        ..TextFilter::default()
-                    }),
-                    top_k: candidate_limit,
-                    snippet_chars: 200,
-                })
-                .await?;
-
-            for hit in hits {
-                by_id
-                    .entry(hit.subject_id)
-                    .and_modify(|old| {
-                        if hit.rank < old.rank {
-                            *old = hit.clone();
-                        }
-                    })
-                    .or_insert(hit);
-            }
+        if terms.is_empty() {
+            return Ok(Vec::new());
         }
-
-        let mut hits: Vec<_> = by_id.into_values().collect();
+        let searcher = self.runtime.text_for_notes(token)?;
+        // Issue #288 opt: single FTS5 MATCH with OR semantics instead of N probes.
+        // AnyTerm mode joins tokens with " OR " after per-token sanitization.
+        let mut hits = searcher
+            .search(TextSearchRequest {
+                query: terms.join(" "),
+                mode: TextQueryMode::AnyTerm,
+                filter: Some(TextFilter {
+                    namespaces: vec![ns.to_string()],
+                    kinds: vec![SubstrateKind::Note],
+                    ..TextFilter::default()
+                }),
+                top_k: candidate_limit,
+                snippet_chars: 200,
+            })
+            .await?;
         hits.sort_by_key(|h| h.rank);
         hits.truncate(candidate_limit as usize);
         Ok(hits)
@@ -667,8 +656,87 @@ impl MemoryPack {
             }
 
             // Phase 2: search each model's vector store with the pre-embedded query.
+            // Warm ANN path: use in-memory Vamana index when ready to avoid the
+            // O(corpus) sqlite-vec brute-force scan. Falls back to exact search
+            // while the background build runs (first request triggers the build).
             let mut results = Vec::with_capacity(query_vecs.len());
             for (model_name, vec) in query_vecs {
+                let key = AnnKey::new(&ns, &model_name);
+
+                match ann::search_loaded(&self.ann, &key, &vec, candidate_limit as usize).await {
+                    Ok(Some(raw_hits)) => {
+                        tracing::debug!(
+                            model = %model_name,
+                            namespace = %ns,
+                            hits = raw_hits.len(),
+                            "memory recall via warm ANN"
+                        );
+                        let hits: Vec<VectorSearchHit> = raw_hits
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, (uuid, score))| VectorSearchHit {
+                                subject_id: uuid,
+                                score: khive_score::DeterministicScore::from_f64(score as f64),
+                                rank: (idx + 1) as u32,
+                            })
+                            .collect();
+                        results.push((model_name, hits));
+                        continue;
+                    }
+                    Ok(None) => {
+                        // ANN cache miss: build synchronously (awaited), then retry search.
+                        // Propagate build errors — do not hide them behind a brute-force response.
+                        let status =
+                            ann::ensure_ann_for_model(&self.runtime, token, &self.ann, &model_name)
+                                .await?;
+                        tracing::debug!(
+                            ?status,
+                            model = %model_name,
+                            namespace = %ns,
+                            "memory ANN ensured on recall miss"
+                        );
+                        match ann::search_loaded(&self.ann, &key, &vec, candidate_limit as usize)
+                            .await?
+                        {
+                            Some(raw_hits) => {
+                                tracing::debug!(
+                                    model = %model_name,
+                                    namespace = %ns,
+                                    hits = raw_hits.len(),
+                                    "memory recall via warm ANN (after build)"
+                                );
+                                let hits: Vec<VectorSearchHit> = raw_hits
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(idx, (uuid, score))| VectorSearchHit {
+                                        subject_id: uuid,
+                                        score: khive_score::DeterministicScore::from_f64(
+                                            score as f64,
+                                        ),
+                                        rank: (idx + 1) as u32,
+                                    })
+                                    .collect();
+                                results.push((model_name, hits));
+                                continue;
+                            }
+                            None => {
+                                // EmptyCorpus or race — fall through to exact sqlite-vec.
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            namespace = %ns,
+                            model = %model_name,
+                            "memory ANN search failed; falling back to exact sqlite-vec"
+                        );
+                        ann::clear_key(&self.ann, &key).await;
+                    }
+                }
+
+                // Exact sqlite-vec fallback: EmptyCorpus, post-error clear, or race.
+                tracing::debug!(model = %model_name, namespace = %ns, "memory recall via exact sqlite-vec");
                 let hits = self
                     .runtime
                     .vectors_for_model(token, &model_name)?
@@ -825,6 +893,21 @@ impl MemoryPack {
                 p.embedding_model.as_deref(),
             )
             .await?;
+
+        // Invalidate ANN for this namespace so the next recall picks up the new
+        // note, then start a background rebuild. Failures are logged but do not
+        // fail the write — exact sqlite-vec fallback covers recall correctness.
+        {
+            let ns = token.namespace().as_str().to_owned();
+            ann::invalidate_namespace(&self.runtime, &self.ann, &ns).await;
+            let affected_models: Vec<String> = match p.embedding_model.as_deref() {
+                Some(model) => vec![model.to_owned()],
+                None => self.runtime.registered_embedding_model_names(),
+            };
+            for model in affected_models {
+                ann::ensure_ann_background(&self.runtime, token, &self.ann, &model).await;
+            }
+        }
 
         let edge_id = if let Some(target_id) = annotates_target {
             self.runtime
@@ -1218,25 +1301,26 @@ impl MemoryPack {
                 }
             }
 
-            // Phase 2: graph-edge check — query inbound `supersedes` for each candidate.
-            // This covers normal khive usage where agents call `link(relation="supersedes")`.
+            // Phase 2: graph-edge check — batch query all inbound `supersedes` edges.
+            // Replaces N serial neighbors() calls with a single query_edges() call.
             let graph = self.runtime.graph(token)?;
             let candidate_ids: Vec<Uuid> = ranked.iter().map(|sn| sn.id).collect();
             let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
-            for id in &candidate_ids {
-                let inbound = graph
-                    .neighbors(
-                        *id,
-                        NeighborQuery {
-                            direction: Direction::In,
-                            relations: Some(vec![EdgeRelation::Supersedes]),
-                            limit: Some(1),
-                            min_weight: None,
+            {
+                let limit = candidate_ids.len().max(1) as u32;
+                let edges = graph
+                    .query_edges(
+                        EdgeFilter {
+                            target_ids: candidate_ids.clone(),
+                            relations: vec![EdgeRelation::Supersedes],
+                            ..EdgeFilter::default()
                         },
+                        vec![],
+                        PageRequest { limit, offset: 0 },
                     )
                     .await?;
-                if !inbound.is_empty() {
-                    superseded_by_edge.insert(*id);
+                for edge in &edges.items {
+                    superseded_by_edge.insert(edge.target_id);
                 }
             }
 
