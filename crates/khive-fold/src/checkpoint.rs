@@ -1,8 +1,4 @@
 //! Generic checkpoint envelope and in-memory store for fold-managed indexes.
-//!
-//! Integrity: `save` hashes `state` via BLAKE3; `load` recomputes and returns
-//! [`FoldError::IntegrityMismatch`] on mismatch. Proof: `proofs/Retrieval/HNSW.lean`.
-//! See [`docs/design.md`](../../docs/design.md) for architecture and failure modes.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -18,9 +14,6 @@ use crate::context::FoldContext;
 use crate::error::FoldError;
 
 /// Generic checkpoint envelope wrapping an arbitrary fold state snapshot.
-///
-/// Carries metadata (ID, timestamp, hash, fold version) alongside the
-/// serializable state so consumers can verify and load the correct snapshot.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Checkpoint<S> {
@@ -33,11 +26,7 @@ pub struct Checkpoint<S> {
     /// Unique identifier for this checkpoint instance.
     pub uuid: Uuid,
 
-    /// BLAKE3 content hash of the canonical JSON serialization of `state`.
-    ///
-    /// Computed by [`CheckpointStore::save`] and verified by
-    /// [`CheckpointStore::load`].  A mismatch returns
-    /// [`FoldError::IntegrityMismatch`].
+    /// BLAKE3 content hash of the state; verified on load.
     pub hash: Hash32,
 
     /// Number of entries processed when this checkpoint was taken.
@@ -55,8 +44,6 @@ pub struct Checkpoint<S> {
 
 impl<S: Serialize> Checkpoint<S> {
     /// Create a new checkpoint, computing the BLAKE3 hash of the state.
-    ///
-    /// Returns `FoldError::Serialization` if `state` cannot be serialized to JSON.
     // REASON: Checkpoint::new requires id, state, uuid, entries_processed, context, and
     // fold_version — each is a semantically distinct field with no natural grouping into
     // a builder or sub-struct without breaking the public API.
@@ -86,9 +73,6 @@ impl<S: Serialize> Checkpoint<S> {
     }
 
     /// Create a checkpoint with a pre-computed hash (for deserialization / testing).
-    ///
-    /// Callers are responsible for ensuring `hash` is consistent with `state`.
-    /// Prefer [`Checkpoint::new`] for production use.
     // REASON: with_hash mirrors the new() parameter set (minus auto-computed hash) for
     // deserialization and testing; same structural constraint as new() above.
     #[allow(clippy::too_many_arguments)]
@@ -116,51 +100,30 @@ impl<S: Serialize> Checkpoint<S> {
 }
 
 /// Trait for checkpoint persistence backends.
-///
-/// The key is the checkpoint `id` string. `load_latest` returns the
-/// checkpoint whose prefix matches — defined as all checkpoints whose
-/// `id` starts with the given prefix, selecting the most recently created.
-/// Ties on `created_at` are broken by `uuid` (lexicographic) for determinism.
 pub trait CheckpointStore<S> {
     /// Persist a checkpoint, computing and storing an integrity hash.
     fn save(&self, checkpoint: Checkpoint<S>) -> Result<(), FoldError>
     where
         S: Clone + Serialize;
 
-    /// Load a checkpoint by its exact `id`, verifying the integrity hash.
-    ///
-    /// Returns `Ok(None)` when no checkpoint with that `id` exists.
-    /// Returns `Err(FoldError::IntegrityMismatch)` if the stored hash does not
-    /// match the recomputed hash of the loaded state.
+    /// Load a checkpoint by exact `id`, verifying the integrity hash.
     fn load(&self, id: &str) -> Result<Option<Checkpoint<S>>, FoldError>
     where
         S: Clone + Serialize;
 
     /// Load the most recently created checkpoint whose `id` starts with `prefix`.
-    ///
-    /// Ties on `created_at` are broken by `uuid` for determinism.
-    /// Returns `None` when no checkpoints match the prefix.
     fn load_latest(&self, prefix: &str) -> Result<Option<Checkpoint<S>>, FoldError>
     where
         S: Clone + Serialize;
 
     /// Delete the checkpoint with the given `id`.
-    ///
-    /// Returns `Err(FoldError::CheckpointNotFound)` if no checkpoint with that
-    /// `id` exists.
     fn delete(&self, id: &str) -> Result<(), FoldError>;
 
     /// List all checkpoint `id` strings currently stored.
-    ///
-    /// The order is unspecified; callers should sort if a stable order is needed.
     fn list(&self) -> Result<Vec<String>, FoldError>;
 }
 
 /// In-memory checkpoint store backed by a `RwLock<HashMap>`.
-///
-/// Suitable for tests and single-process usage where durability is not
-/// required. Production deployments should implement [`CheckpointStore`]
-/// with durable storage (e.g. SQLite via `khive-db`).
 pub struct InMemoryCheckpointStore<S> {
     inner: Arc<RwLock<HashMap<String, Checkpoint<S>>>>,
 }

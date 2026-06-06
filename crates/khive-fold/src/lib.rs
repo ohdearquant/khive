@@ -1,19 +1,4 @@
-//! khive-fold: Cognitive primitives — Fold, Anchor, Objective, Selector.
-//!
-//! Fold, Anchor, Objective, and Selector primitives plus deterministic ordering
-//! and composition combinators. See [`docs/design.md`](../docs/design.md) for
-//! module map, invariants, dependency boundary, and failure modes.
-//!
-//! ```
-//! use khive_fold::{fold_fn, Fold, FoldContext};
-//!
-//! let counter = fold_fn(
-//!     |_ctx| 0usize,
-//!     |count, _entry: &i32, _ctx| count + 1,
-//! );
-//! let result = counter.derive([1, 2, 3, 4, 5].iter(), &FoldContext::new());
-//! assert_eq!(result.state, 5);
-//! ```
+//! Fold, Anchor, Objective, and Selector primitives with deterministic ordering and composition.
 
 // ── Core fold ───────────────────────────────────────────────────────────
 

@@ -2,16 +2,7 @@
 
 use uuid::Uuid;
 
-/// Trait for candidates with stable UUID identifiers.
-///
-/// Implementing this trait enables deterministic tie-breaking when
-/// candidates have equal scores.
-///
-/// # Contract
-///
-/// - `id()` MUST return the same value for the same logical entity
-/// - The UUID SHOULD be globally unique (use `Uuid::new_v4()` or similar)
-/// - The UUID MUST NOT change between calls for the same instance
+/// Stable UUID identifier for deterministic tie-breaking.
 pub trait HasId {
     /// Returns the stable UUID identifier for this candidate.
     fn id(&self) -> Uuid;

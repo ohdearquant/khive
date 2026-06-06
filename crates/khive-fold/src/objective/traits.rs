@@ -114,33 +114,18 @@ fn considered_limit(len: usize, context: &ObjectiveContext) -> usize {
     context.max_candidates.unwrap_or(len).min(len)
 }
 
-/// Trait for objective functions that select from candidates.
-///
-/// An objective function is a measurement operator that collapses a space of
-/// possibilities into a single selection. Objectives are deterministic,
-/// composable, and introspectable.
+/// Deterministic, composable objective function over a candidate set.
 pub trait Objective<T>: Send + Sync {
     /// Evaluate a single candidate.
     fn score(&self, candidate: &T, context: &ObjectiveContext) -> f64;
 
-    /// Precision (inverse variance) estimate for the score of a candidate.
-    ///
-    /// Default is 1.0 (fully trusted). Override when score reliability varies
-    /// across candidates — e.g., an embedding model that returns a confidence
-    /// alongside the similarity score. The effective ranking value used by the
-    /// default `select` / `select_top` implementations is `score * precision`
-    /// (predictive coding: precision-weighted scoring).
-    ///
-    /// When overriding, return values in (0, 1]. Non-finite values are treated
-    /// as 1.0 by the default implementations.
+    /// Precision (inverse variance) of the score estimate; default 1.0 (fully trusted).
     #[inline]
     fn precision(&self, _candidate: &T, _context: &ObjectiveContext) -> f64 {
         1.0
     }
 
-    /// Check if a score passes the threshold.
-    ///
-    /// Non-finite scores never pass.
+    /// Check if a score passes the threshold; non-finite scores never pass.
     #[inline]
     fn passes_score(&self, score: f64, context: &ObjectiveContext) -> bool {
         score.is_finite() && context.min_score.map(|min| score >= min).unwrap_or(true)
@@ -153,10 +138,7 @@ pub trait Objective<T>: Send + Sync {
         self.passes_score(score, context)
     }
 
-    /// Score a batch of candidates and return the passing `(index, score)` pairs.
-    ///
-    /// The default implementation is a scalar fallback. Objectives with SIMD-friendly
-    /// layouts can override this hook for higher throughput.
+    /// Score a batch of candidates and return passing `(index, score)` pairs.
     fn batch_score(&self, candidates: &[T], context: &ObjectiveContext) -> Vec<(usize, f64)> {
         let mut scored = Vec::with_capacity(candidates.len().min(256));
         for (index, candidate) in candidates.iter().enumerate() {
@@ -168,11 +150,7 @@ pub trait Objective<T>: Send + Sync {
         scored
     }
 
-    /// Select candidates from a list, returning all that pass in score-descending order.
-    ///
-    /// Returns an empty vector when no candidates pass the threshold or the input is empty.
-    /// Delegates to `select_top` using the full considered limit so callers get a ranked
-    /// list rather than a single item. Use `.into_iter().next()` for single-best access.
+    /// Select all passing candidates in score-descending order.
     fn select<'a>(&self, candidates: &'a [T], context: &ObjectiveContext) -> Vec<Selection<&'a T>> {
         if candidates.is_empty() {
             return Vec::new();
@@ -181,11 +159,7 @@ pub trait Objective<T>: Send + Sync {
         self.select_top(candidates, n, context)
     }
 
-    /// Select the top N candidates.
-    ///
-    /// Ranking uses `score * precision` (precision-weighted scoring). Small `n` (≤96)
-    /// uses a sorted small-vector path with binary-search insertion. Large `n` uses a
-    /// worst-first heap.
+    /// Select the top N candidates by precision-weighted score.
     fn select_top<'a>(
         &self,
         candidates: &'a [T],
@@ -322,14 +296,7 @@ where
 // Deterministic Objective Extension
 // ============================================================================
 
-/// Extension trait for deterministic selection with UUID tie-breaking.
-///
-/// Provides reproducible ordering when multiple candidates have equal scores.
-/// Requires candidates to implement `HasId` for UUID-based tie-breaking.
-///
-/// Ordering is determined by:
-/// 1. Score (descending) using canonical IEEE-754 total-order ranks
-/// 2. UUID (ascending) for tie-breaking
+/// Extension trait for deterministic selection with UUID tie-breaking on equal scores.
 pub trait DeterministicObjective<T>: Objective<T>
 where
     T: HasId,

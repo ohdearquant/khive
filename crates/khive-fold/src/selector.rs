@@ -72,9 +72,6 @@ pub struct SelectorWeights {
 /// using weights and an optional query for relevance context.
 pub trait Selector<T>: Send + Sync {
     /// Select a budget-constrained subset from `inputs`.
-    ///
-    /// # Errors
-    /// Returns [`FoldError`] if the selection operation fails (implementation-defined).
     fn select(
         &self,
         inputs: Vec<SelectorInput<T>>,

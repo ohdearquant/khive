@@ -168,10 +168,7 @@ pub struct RecencyObjective {
 impl RecencyObjective {
     const MIN_HALF_LIFE: f64 = 1.0;
 
-    /// Create a new recency objective.
-    ///
-    /// # Panics
-    /// Panics if `half_life_seconds` is not positive and finite.
+    /// Create a new recency objective. Panics if `half_life_seconds` is not positive and finite.
     pub fn new(half_life_seconds: f64) -> Self {
         assert!(
             half_life_seconds.is_finite() && half_life_seconds > 0.0,
@@ -182,18 +179,12 @@ impl RecencyObjective {
         }
     }
 
-    /// Create with hour half-life.
-    ///
-    /// # Panics
-    /// Panics if `hours` is not positive and finite.
+    /// Create with hour half-life. Panics if `hours` is not positive and finite.
     pub fn hours(hours: f64) -> Self {
         Self::new(hours * 3600.0)
     }
 
-    /// Create with day half-life.
-    ///
-    /// # Panics
-    /// Panics if `days` is not positive and finite.
+    /// Create with day half-life. Panics if `days` is not positive and finite.
     pub fn days(days: f64) -> Self {
         Self::new(days * 86400.0)
     }
@@ -257,10 +248,7 @@ pub struct RelevanceObjective {
 }
 
 impl RelevanceObjective {
-    /// Create a new relevance objective.
-    ///
-    /// # Panics
-    /// Panics if either weight is negative or non-finite.
+    /// Create a new relevance objective. Panics if either weight is negative or non-finite.
     pub fn new(recency_half_life: f64, recency_weight: f64, salience_weight: f64) -> Self {
         assert!(
             recency_weight.is_finite() && recency_weight >= 0.0,
@@ -277,10 +265,7 @@ impl RelevanceObjective {
         }
     }
 
-    /// Create with default weights (0.5 each).
-    ///
-    /// # Panics
-    /// Panics if `recency_half_life` is not positive and finite (delegated to [`RelevanceObjective::new`]).
+    /// Create with equal weights (0.5 each). Panics if `recency_half_life` is not positive and finite.
     pub fn balanced(recency_half_life: f64) -> Self {
         Self::new(recency_half_life, 0.5, 0.5)
     }

@@ -1,14 +1,4 @@
-//! Anchor: causal structure.
-//!
-//! An anchor is a reference to a source of truth. AnchorGraph tracks the
-//! provenance chain: record → source, composite → records, task → composite,
-//! outcome → task. This enables credit assignment and gap detection.
-//!
-//! # Scope
-//!
-//! This trait is scoped to **in-memory, synchronous** graph traversal. The
-//! caller materializes an [`AnchorGraph`] as `Vec<AnchorRef>` and passes it
-//! by reference; implementations walk the graph without async IO.
+//! `Anchor` and `AnchorGraph`: in-memory causal provenance chains for credit assignment.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
