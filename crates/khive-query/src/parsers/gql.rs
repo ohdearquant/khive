@@ -1,18 +1,4 @@
 //! Hand-written recursive descent parser for GQL subset.
-//!
-//! Grammar:
-//!   query     = 'MATCH' pattern ['WHERE' where_expr] 'RETURN' items ['LIMIT' number]
-//!   pattern   = node_pat (edge_pat node_pat)*
-//!   node_pat  = '(' [var] [':' ident] [props] ')'
-//!   edge_pat  = '-[' [var] [':' rels] [range] ']->' | '<-[' ... ']-' | '-[' ... ']-'
-//!   rels      = ident ('|' ident)*
-//!   range     = '*' number ['..' number]
-//!   props     = '{' key ':' value (',' key ':' value)* '}'
-//!   where_expr = and_expr ('OR' and_expr)*
-//!   and_expr   = condition ('AND' condition)*
-//!   condition  = var '.' prop op value
-//!   items     = item (',' item)*
-//!   item      = var | var '.' prop
 
 use crate::ast::*;
 use crate::error::QueryError;
@@ -517,11 +503,7 @@ impl Parser {
     }
 }
 
-/// Parse a GQL query string into a [`GqlQuery`] AST.
-///
-/// # Errors
-///
-/// Returns [`QueryError::Parse`] if the input is not valid GQL syntax.
+/// Parse a GQL query string into a [`GqlQuery`] AST. Errors on invalid syntax.
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
     let mut parser = Parser::new(input.trim());
     parser.parse_query()

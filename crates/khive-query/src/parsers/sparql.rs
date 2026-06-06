@@ -1,7 +1,4 @@
-//! SPARQL-inspired syntax parser.
-//!
-//! Parses a practical SPARQL subset (`SELECT … WHERE { triples } LIMIT n`) into
-//! the same AST as the GQL parser, so the SQL compiler works unchanged.
+//! SPARQL-inspired syntax parser producing the same AST as the GQL parser.
 
 use crate::ast::*;
 use crate::error::QueryError;
@@ -324,14 +321,7 @@ impl SparqlParser {
     }
 }
 
-/// Reconstruct GQL-style AST from SPARQL triples.
-///
-/// Classifies triples into:
-/// - Kind filters: `?a a :concept` → node kind
-/// - Property filters: `?a :name "LoRA"` → node property
-/// - Edge patterns: `?a :extends ?b` → directed edge between nodes
-///
-/// Then chains edge triples into a path pattern.
+/// Reconstruct GQL-style AST from SPARQL triples, chaining edges into a path pattern.
 fn triples_to_ast(
     triples: Vec<Triple>,
     return_items: Vec<String>,
@@ -542,13 +532,7 @@ fn triples_to_ast(
     })
 }
 
-/// Parse a SPARQL query string into a [`GqlQuery`] AST.
-///
-/// # Errors
-///
-/// Returns [`QueryError::Parse`] if the input is not valid SPARQL syntax, or
-/// [`QueryError::Unsupported`] for unsupported SPARQL features (e.g. `*` paths,
-/// disconnected triple patterns, branching).
+/// Parse a SPARQL query string into a [`GqlQuery`] AST. Errors on invalid or unsupported syntax.
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
     let mut parser = SparqlParser::new(input.trim());
     parser.parse_query()

@@ -2,12 +2,7 @@
 
 use std::collections::HashMap;
 
-/// A SQL parameter value local to the query layer.
-///
-/// Deliberately mirrors the subset of `khive_storage::types::SqlValue` that the
-/// query compiler needs to emit.  The runtime converts these to the storage-layer
-/// `SqlValue` at the query–storage boundary — this keeps the query crate dependent
-/// only on `khive-types`, not on `khive-storage` or `khive-db`.
+/// A SQL parameter value emitted by the query compiler.
 #[derive(Clone, Debug)]
 pub enum QueryValue {
     Null,
@@ -27,9 +22,6 @@ pub struct GqlQuery {
 }
 
 /// A WHERE expression tree supporting AND, OR, and leaf conditions.
-///
-/// Grammar: `where_expr = and_expr ('OR' and_expr)*` where
-/// `and_expr = condition ('AND' condition)*`. AND binds tighter than OR.
 #[derive(Debug, Clone)]
 pub enum WhereExpr {
     /// AND of two sub-expressions.

@@ -1,17 +1,4 @@
-//! Compile GQL AST to parameterized SQL.
-//!
-//! Two compilation paths:
-//! - Fixed-length patterns (all edges *1..1) → JOIN chain
-//! - Variable-length patterns (any edge *N..M where M>1) → recursive CTE
-//!
-//! Synthetic edge paths: relations prefixed `observed_as_*` join against
-//! `event_observations`, not `graph_edges`. Only four known synthetic relations
-//! are accepted; unknown ones are rejected at validation.
-//!
-//! Security invariants:
-//! - Namespace injection: WHERE clause always comes from CompileOptions.scopes, never the query.
-//! - Edge property whitelist: only `relation` and `weight` are queryable edge columns.
-//! - Depth cap: recursive CTE depth capped at MAX_DEPTH; exceeding it errors at validation.
+//! Compile GQL AST to parameterized SQL (JOIN chain or recursive CTE).
 
 use crate::ast::*;
 use crate::error::QueryError;
@@ -25,12 +12,10 @@ const SYNTHETIC_RELATIONS: &[&str] = &[
     "observed_as_signal",
 ];
 
-/// Returns `true` when the relation string is a synthetic observation edge (`observed_as_*`).
 fn is_synthetic(rel: &str) -> bool {
     SYNTHETIC_RELATIONS.contains(&rel)
 }
 
-/// Returns the `role` value that maps to the given synthetic relation.
 fn synthetic_role(rel: &str) -> Option<&'static str> {
     match rel {
         "observed_as_candidate" => Some("candidate"),
@@ -105,11 +90,7 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryVa
     }
 }
 
-/// Identifies node indices that are endpoints of synthetic `observed_as_*` edges.
-///
-/// Returns `(source_indices, target_indices)`:
-/// - `source_indices`: node indices bound to the `events` table (the event source node)
-/// - `target_indices`: node indices bound to the `notes` table (the observed note target node)
+/// Returns `(source_indices, target_indices)` for synthetic `observed_as_*` edge endpoints.
 fn synthetic_endpoint_node_indices(
     elements: &[PatternElement],
 ) -> (
@@ -141,20 +122,7 @@ fn synthetic_endpoint_node_indices(
     (source_set, target_set)
 }
 
-/// Compile fixed-length patterns to a chain of JOINs.
-///
-/// MATCH (a:concept)-[e:introduced_by]->(b:paper) WHERE ... RETURN a, e, b LIMIT 10
-/// →
-/// SELECT a.*, e.*, b.*
-/// FROM entities a
-/// JOIN graph_edges e ON e.source_id = a.id
-/// JOIN entities b ON b.id = e.target_id
-/// WHERE a.kind = 'concept' AND e.relation = 'introduced_by' AND b.kind = 'paper'
-///   AND a.deleted_at IS NULL AND b.deleted_at IS NULL
-/// LIMIT 10
-///
-/// Synthetic `observed_as_*` patterns route the event-source node to the `events`
-/// table instead of `entities`.
+/// Compile fixed-length patterns to a JOIN chain.
 fn compile_fixed_length(
     query: &GqlQuery,
     opts: &CompileOptions,
@@ -525,10 +493,7 @@ fn compile_fixed_length(
     })
 }
 
-/// Compile a `WhereExpr` tree into a SQL fragment, pushing bound parameters into `params`.
-///
-/// Returns `Ok(None)` for `WhereExpr::True` (no fragment needed), or `Ok(Some(sql))` otherwise.
-/// The caller is responsible for wrapping the result in an AND with the structural predicates.
+/// Compile a `WhereExpr` tree into a SQL fragment.
 fn compile_where_expr(
     expr: &WhereExpr,
     var_to_alias: &std::collections::HashMap<String, (String, VarKind)>,
@@ -561,7 +526,6 @@ fn compile_where_expr(
     }
 }
 
-/// Compile a single leaf condition to a SQL predicate string.
 fn compile_single_condition(
     cond: &Condition,
     var_to_alias: &std::collections::HashMap<String, (String, VarKind)>,
@@ -658,11 +622,6 @@ fn compile_single_condition(
     Ok(sql)
 }
 
-/// Returns `true` if the given `WhereExpr` subtree references only the start
-/// variable (`start_var`), only the end variable, or neither — but NOT both.
-///
-/// Used to detect OR nodes whose branches reference different endpoints, which
-/// cannot be correctly compiled by the variable-length leaf-routing approach.
 fn expr_endpoint_set(
     expr: &WhereExpr,
     start_var: Option<&str>,
@@ -683,9 +642,7 @@ fn expr_endpoint_set(
     }
 }
 
-/// Walk the expression tree and return `Err(Unsupported)` if any `Or` node has
-/// branches that span both start and end endpoint variables.  Single-endpoint
-/// ORs (e.g. `a.name='X' OR a.name='Y'`) are fine.
+/// Return `Err(Unsupported)` if any `Or` node spans both endpoint variables.
 fn reject_or_spanning_endpoints(
     expr: &WhereExpr,
     start: &NodePattern,
@@ -727,8 +684,6 @@ fn reject_or_spanning_impl(
     }
 }
 
-/// Compile a leaf condition for the variable-length path, routing it to the correct
-/// alias (`s` for start, `r` for end).
 fn compile_var_len_condition(
     cond: &Condition,
     start_var: Option<&str>,
@@ -794,15 +749,7 @@ fn compile_var_len_condition(
     Ok((sql, col_alias))
 }
 
-/// Walk the `WhereExpr` tree for variable-length patterns, preserving Or/And
-/// connectives and routing each leaf to `start_conditions` or `end_conditions`.
-///
-/// Because `reject_or_spanning_endpoints` has already verified that no `Or` node
-/// straddles both endpoints, every sub-tree roots in at most one endpoint.  When a
-/// sub-tree is purely one endpoint we compile it as a single SQL fragment and push
-/// it directly into that endpoint's condition vec.  The function returns `Ok(None)`
-/// in all handled cases; `Ok(Some(_))` is never produced (the signature reserves it
-/// for `WhereExpr::True` which is a no-op).
+/// Walk the `WhereExpr` tree for variable-length patterns, routing conditions to start or end.
 fn compile_variable_length_where(
     expr: &WhereExpr,
     start_var: Option<&str>,
@@ -878,11 +825,7 @@ fn compile_variable_length_where(
     }
 }
 
-/// Compile a `WhereExpr` sub-tree to a SQL string plus the endpoint alias it
-/// targets (`"s"` or `"r"`).  Returns `Ok(None)` for `WhereExpr::True`.
-///
-/// Used by `compile_variable_length_where` to collect the two sides of an `Or`
-/// before joining them with ` OR `.
+/// Compile a `WhereExpr` sub-tree to a SQL string plus the endpoint alias (`"s"` or `"r"`).
 fn compile_variable_length_where_to_sql(
     expr: &WhereExpr,
     start_var: Option<&str>,
@@ -917,8 +860,6 @@ fn compile_variable_length_where_to_sql(
 }
 
 /// Compile variable-length patterns to a recursive CTE.
-///
-/// Depth is capped at min(requested, 10) — MAJ-2 (parameterized min_depth, not literal).
 fn compile_variable_length(
     query: &GqlQuery,
     opts: &CompileOptions,
@@ -1606,13 +1547,8 @@ mod tests {
         assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
     }
 
-    /// Regression guard for ISSUE #231.
-    ///
-    /// Verifies the full SPARQL subject→predicate→object direction contract:
-    ///   ?a :extends ?b  must compile so that ?a binds `source_id` and ?b binds `target_id`.
-    ///
-    /// A swap (subject→target_id, object→source_id) would cause a query for
-    /// A–extends→B to return rows where B–extends→A, silently returning wrong results.
+    /// Regression guard for ISSUE #231: SPARQL subject→predicate→object direction.
+    /// `?a :extends ?b` must bind ?a to source_id and ?b to target_id, not swapped.
     #[test]
     fn sparql_subject_object_direction_compiles_outbound() {
         use crate::parsers::sparql;

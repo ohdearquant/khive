@@ -1,8 +1,4 @@
-//! AST validation for the GQL/SPARQL query pipeline.
-//!
-//! Normalises edge relation aliases to canonical snake_case, rejects `namespace`
-//! in query strings (scoping is `CompileOptions::scopes` only), and caps traversal
-//! depth at [`MAX_DEPTH`] (10 hops).
+//! AST validation: relation normalization, namespace guard, depth cap.
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -12,9 +8,7 @@ use khive_types::EdgeRelation;
 use crate::ast::{Condition, ConditionValue, GqlQuery, PatternElement};
 use crate::error::QueryError;
 
-/// Closed set of valid synthetic observation relations (observed_as_* family).
-/// Any `observed_as_*` string not in this set is an unknown relation and must
-/// be rejected — the prefix alone does not confer validity.
+/// Valid synthetic relations; unknown `observed_as_*` strings are rejected.
 const SYNTHETIC_RELATIONS: &[&str] = &[
     "observed_as_candidate",
     "observed_as_selected",
@@ -26,22 +20,11 @@ const SYNTHETIC_RELATIONS: &[&str] = &[
 pub const MAX_DEPTH: usize = 10;
 
 /// Validate and normalise an AST in place.
-///
-/// Canonicalizes edge relation strings to their snake_case form (closed set).
-/// Node kind strings pass through unchanged (pack-agnostic).
 pub fn validate(query: &mut GqlQuery) -> Result<(), QueryError> {
     validate_with_warnings(query).map(|_| ())
 }
 
-/// Validate the structural shape of a pattern.
-///
-/// A well-formed pattern must alternate Node/Edge/Node: odd indices are nodes,
-/// even indices (when counting from 1) are edges, and the total length is odd.
-/// A pattern with only a single node (length 1) is also valid.
-///
-/// Called both from `validate_with_warnings` (for parser-produced ASTs) and
-/// from `compile` (public API boundary — protects against hand-constructed ASTs
-/// that skip parsing).
+/// Validate that a pattern alternates Node/Edge/Node correctly.
 pub fn validate_pattern_shape(elements: &[PatternElement]) -> Result<(), QueryError> {
     if elements.is_empty() {
         // Empty pattern: caught separately by the compiler as "empty pattern".
@@ -68,10 +51,6 @@ pub fn validate_pattern_shape(elements: &[PatternElement]) -> Result<(), QueryEr
 }
 
 /// Validate and normalise an AST in place, returning any warnings generated.
-///
-/// Returns an empty `Vec<String>` for forward compatibility; no warning paths
-/// are currently emitted.  The F048 depth-cap path now returns `InvalidInput`
-/// rather than clamping and warning.
 pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, QueryError> {
     let warnings: Vec<String> = Vec::new();
 
