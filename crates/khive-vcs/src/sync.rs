@@ -131,28 +131,8 @@ struct MetaJson {
     content_hash: String,
 }
 
-/// Fetch a remote KG archive, verify its SHA-256 content hash, populate the
-/// local cache, and write `meta.json`.
-///
-/// # Arguments
-///
-/// * `repo_root` — Repository root that owns the `.khive/` tree. The cache
-///   directory `<repo_root>/.khive/kg/remotes/<remote.name>/` is populated on
-///   success.
-/// * `remote` — Remote configuration (URL, git ref, namespace, optional pin).
-/// * `repin` — When `true`, skip pin comparison and return the computed hash
-///   for the caller to write back to `schema.yaml`. When `false` and a pin is
-///   present, a hash mismatch returns [`VcsError::HashMismatch`] via `anyhow`.
-///
-/// # Failure behaviour (fail-closed)
-///
-/// On hash mismatch the function returns an error *before* any cache file is
-/// modified. The staging directory is cleaned up. The error message includes the
-/// remote name, expected hash, and actual hash so the operator can copy the
-/// actual hash into `schema.yaml` to accept the new content, or use `--repin`.
-///
-/// If no pin is present the hash is still computed and written to `meta.json`,
-/// but the sync proceeds regardless.
+/// Fetch a remote KG archive, verify SHA-256, populate `.khive/kg/remotes/`, write `meta.json`.
+/// Fail-closed on hash mismatch; use `repin=true` to update the pin.
 pub async fn run_sync_remote(
     repo_root: &Path,
     remote: &RemoteConfig,
