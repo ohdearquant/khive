@@ -31,6 +31,7 @@ lru = "0.12"
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+khive-db = { version = "0.2.5", path = "../khive-db" }
 khive-pack-kg = { version = "0.2.5", path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }

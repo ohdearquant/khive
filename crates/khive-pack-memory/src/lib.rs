@@ -4,6 +4,7 @@ pub mod handlers;
 pub(crate) mod query_cache;
 pub mod rerank;
 pub mod scoring;
+pub(crate) mod text_gather;
 pub mod tunable;
 
 use std::sync::Mutex;

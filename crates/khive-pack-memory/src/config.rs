@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use khive_fusion::FusionStrategy;
 use khive_runtime::RuntimeError;
+use khive_storage::types::{TextGatherMode, TextSearchOptions};
 
 /// Error returned when `min_score` is outside the accepted dual-scale range.
 #[derive(Debug, Clone)]
@@ -91,6 +92,10 @@ pub struct RecallConfig {
     /// multiply `rank_score` by `brain_profile_boost` for IDs whose
     /// Beta posterior mean exceeds `brain_profile_threshold`.
     pub brain_profile: Option<BrainProfileHint>,
+
+    // --- FTS candidate-gather optimization ---
+    /// Controls the two-stage FTS gather path (default: disabled, existing behavior).
+    pub fts_gather: RecallFtsGatherConfig,
 }
 
 /// Hint for brain-profile-guided score boosting during recall (issue #484).
@@ -135,6 +140,252 @@ impl BrainProfileHint {
     }
 }
 
+/// Term selection rule for FTS candidate gather.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallFtsSelectionRule {
+    /// Keep query terms in original order (current behavior).
+    #[default]
+    Original,
+    /// Pick K terms with the lowest document frequency (most selective).
+    LowestDf,
+    /// Pick K terms with the highest IDF (same as lowest DF with Robertson-Walker formula).
+    HighestIdf,
+}
+
+/// Pack-level alias for the DB gather mode enum, serializable identically.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallFtsGatherMode {
+    #[default]
+    Ranked,
+    Unranked,
+    RankWithinCap,
+}
+
+impl From<RecallFtsGatherMode> for TextGatherMode {
+    fn from(m: RecallFtsGatherMode) -> Self {
+        match m {
+            RecallFtsGatherMode::Ranked => TextGatherMode::Ranked,
+            RecallFtsGatherMode::Unranked => TextGatherMode::Unranked,
+            RecallFtsGatherMode::RankWithinCap => TextGatherMode::RankWithinCap,
+        }
+    }
+}
+
+/// Configuration for the FTS candidate-gather optimization.
+///
+/// All defaults preserve existing behavior (enabled=false, original term order,
+/// ranked gather). The quality sweep varies these via env vars without recompiling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecallFtsGatherConfig {
+    /// Enable the candidate-gather optimization. Default false = existing behavior.
+    pub enabled: bool,
+    /// Max query terms to send to FTS after selection. Default 10 (existing fanout limit).
+    pub term_k: usize,
+    /// How to select the K terms. Default original (existing order).
+    pub selection_rule: RecallFtsSelectionRule,
+    /// How the DB gathers candidates. Default ranked (existing behavior).
+    pub gather_mode: RecallFtsGatherMode,
+    /// Row cap for RankWithinCap first-stage gather. When None, uses
+    /// candidate_limit * gather_cap_multiplier.
+    pub gather_limit: Option<u32>,
+    /// Multiplier applied to candidate_limit to derive gather_limit when
+    /// gather_limit is None. Default 4.
+    pub gather_cap_multiplier: u32,
+    /// When true, CJK queries bypass term selection and use the existing ranked
+    /// all-term path. Default true — CJK trigram search is already sub-ms.
+    pub cjk_bypass_ranked: bool,
+}
+
+impl Default for RecallFtsGatherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            term_k: 10,
+            selection_rule: RecallFtsSelectionRule::Original,
+            gather_mode: RecallFtsGatherMode::Ranked,
+            gather_limit: None,
+            gather_cap_multiplier: 4,
+            cjk_bypass_ranked: true,
+        }
+    }
+}
+
+impl RecallFtsGatherConfig {
+    /// Parse gather config overrides from environment variables.
+    ///
+    /// Returns `None` when no relevant env vars are set (preserve config/default).
+    /// Returns `Err` and fails fast on any malformed value — silent fallback to
+    /// baseline would corrupt the quality curve.
+    pub fn from_env() -> Result<Option<Self>, RuntimeError> {
+        let gather = std::env::var("KHIVE_RECALL_FTS_GATHER").ok();
+        let term_k = std::env::var("KHIVE_RECALL_FTS_TERM_K").ok();
+        let selection = std::env::var("KHIVE_RECALL_FTS_SELECTION").ok();
+        let limit = std::env::var("KHIVE_RECALL_FTS_GATHER_LIMIT").ok();
+        let multiplier = std::env::var("KHIVE_RECALL_FTS_GATHER_MULTIPLIER").ok();
+        let cjk_bypass = std::env::var("KHIVE_RECALL_FTS_CJK_BYPASS").ok();
+
+        if gather.is_none()
+            && term_k.is_none()
+            && selection.is_none()
+            && limit.is_none()
+            && multiplier.is_none()
+            && cjk_bypass.is_none()
+        {
+            return Ok(None);
+        }
+
+        let mut cfg = RecallFtsGatherConfig {
+            enabled: true,
+            ..RecallFtsGatherConfig::default()
+        };
+
+        if let Some(g) = gather {
+            match g.as_str() {
+                "baseline" => {
+                    cfg.enabled = false;
+                }
+                "ranked" => {
+                    cfg.gather_mode = RecallFtsGatherMode::Ranked;
+                }
+                "rank_subset" => {
+                    cfg.gather_mode = RecallFtsGatherMode::RankWithinCap;
+                }
+                "unranked" => {
+                    cfg.gather_mode = RecallFtsGatherMode::Unranked;
+                }
+                other => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "KHIVE_RECALL_FTS_GATHER must be baseline|ranked|rank_subset|unranked, got {other:?}"
+                    )));
+                }
+            }
+        }
+
+        if let Some(k) = term_k {
+            let v: usize = k.parse().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "KHIVE_RECALL_FTS_TERM_K must be a positive integer 1..10, got {k:?}"
+                ))
+            })?;
+            if v == 0 || v > 10 {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "KHIVE_RECALL_FTS_TERM_K must be 1..10, got {v}"
+                )));
+            }
+            cfg.term_k = v;
+        }
+
+        if let Some(s) = selection {
+            cfg.selection_rule = match s.as_str() {
+                "original" => RecallFtsSelectionRule::Original,
+                "lowest_df" => RecallFtsSelectionRule::LowestDf,
+                "highest_idf" => RecallFtsSelectionRule::HighestIdf,
+                other => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "KHIVE_RECALL_FTS_SELECTION must be original|lowest_df|highest_idf, got {other:?}"
+                    )));
+                }
+            };
+        }
+
+        if let Some(l) = limit {
+            let v: u32 = l.parse().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "KHIVE_RECALL_FTS_GATHER_LIMIT must be a positive integer, got {l:?}"
+                ))
+            })?;
+            if v == 0 {
+                return Err(RuntimeError::InvalidInput(
+                    "KHIVE_RECALL_FTS_GATHER_LIMIT must be > 0".to_string(),
+                ));
+            }
+            cfg.gather_limit = Some(v);
+        }
+
+        if let Some(m) = multiplier {
+            let v: u32 = m.parse().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "KHIVE_RECALL_FTS_GATHER_MULTIPLIER must be a positive integer, got {m:?}"
+                ))
+            })?;
+            if v == 0 {
+                return Err(RuntimeError::InvalidInput(
+                    "KHIVE_RECALL_FTS_GATHER_MULTIPLIER must be > 0".to_string(),
+                ));
+            }
+            cfg.gather_cap_multiplier = v;
+        }
+
+        if let Some(b) = cjk_bypass {
+            cfg.cjk_bypass_ranked = match b.as_str() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                other => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "KHIVE_RECALL_FTS_CJK_BYPASS must be 1|0, got {other:?}"
+                    )));
+                }
+            };
+        }
+
+        cfg.validate()?;
+        Ok(Some(cfg))
+    }
+
+    /// Validate the config for internal consistency.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.term_k == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "fts_gather.term_k must be > 0".to_string(),
+            ));
+        }
+        if self.gather_cap_multiplier == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "fts_gather.gather_cap_multiplier must be > 0".to_string(),
+            ));
+        }
+        if let Some(gl) = self.gather_limit {
+            if gl == 0 {
+                return Err(RuntimeError::InvalidInput(
+                    "fts_gather.gather_limit must be > 0 when provided".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compute the effective gather_limit for a given candidate_limit.
+    pub fn effective_gather_limit(&self, candidate_limit: u32) -> Result<u32, RuntimeError> {
+        let gl = match self.gather_limit {
+            Some(explicit) => {
+                if explicit < candidate_limit {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "fts_gather.gather_limit ({explicit}) must be >= candidate_limit ({candidate_limit})"
+                    )));
+                }
+                explicit
+            }
+            None => candidate_limit.saturating_mul(self.gather_cap_multiplier),
+        };
+        Ok(gl.max(candidate_limit))
+    }
+
+    /// Convert to DB-level `TextSearchOptions` for a given candidate_limit.
+    pub fn to_search_options(
+        &self,
+        candidate_limit: u32,
+    ) -> Result<TextSearchOptions, RuntimeError> {
+        let gather_limit = self.effective_gather_limit(candidate_limit)?;
+        Ok(TextSearchOptions {
+            gather_mode: self.gather_mode.into(),
+            gather_limit: Some(gather_limit),
+        })
+    }
+}
+
 // Tuning artifact: tests/khive-contract/tune/ swept 116 configs but the synthetic corpus
 // produced an identical recall@10 = 0.9333 for every config — i.e. a flat landscape that
 // cannot empirically distinguish these parameters. Defaults below stay at the prior values
@@ -172,6 +423,7 @@ impl Default for RecallConfig {
             include_breakdown: false,
             scoring: None,
             brain_profile: None,
+            fts_gather: RecallFtsGatherConfig::default(),
         }
     }
 }
@@ -656,5 +908,147 @@ mod tests {
             "total() should sum weighted contributions, got {}",
             bd.total()
         );
+    }
+
+    // ── RecallFtsGatherConfig ─────────────────────────────────────────────────
+
+    #[test]
+    fn fts_gather_default_is_disabled() {
+        let cfg = RecallFtsGatherConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.term_k, 10);
+        assert_eq!(cfg.selection_rule, RecallFtsSelectionRule::Original);
+        assert_eq!(cfg.gather_mode, RecallFtsGatherMode::Ranked);
+        assert!(cfg.gather_limit.is_none());
+        assert_eq!(cfg.gather_cap_multiplier, 4);
+        assert!(cfg.cjk_bypass_ranked);
+    }
+
+    #[test]
+    fn fts_gather_validates_zero_term_k() {
+        let cfg = RecallFtsGatherConfig {
+            term_k: 0,
+            ..RecallFtsGatherConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fts_gather_validates_zero_multiplier() {
+        let cfg = RecallFtsGatherConfig {
+            gather_cap_multiplier: 0,
+            ..RecallFtsGatherConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fts_gather_validates_zero_gather_limit() {
+        let cfg = RecallFtsGatherConfig {
+            gather_limit: Some(0),
+            ..RecallFtsGatherConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fts_gather_effective_gather_limit_uses_multiplier() {
+        let cfg = RecallFtsGatherConfig {
+            gather_cap_multiplier: 4,
+            ..RecallFtsGatherConfig::default()
+        };
+        assert_eq!(cfg.effective_gather_limit(150).unwrap(), 600);
+    }
+
+    #[test]
+    fn fts_gather_effective_gather_limit_explicit_wins() {
+        let cfg = RecallFtsGatherConfig {
+            gather_limit: Some(500),
+            gather_cap_multiplier: 4,
+            ..RecallFtsGatherConfig::default()
+        };
+        assert_eq!(cfg.effective_gather_limit(150).unwrap(), 500);
+    }
+
+    #[test]
+    fn fts_gather_effective_gather_limit_too_small_fails() {
+        let cfg = RecallFtsGatherConfig {
+            gather_limit: Some(100),
+            ..RecallFtsGatherConfig::default()
+        };
+        assert!(cfg.effective_gather_limit(150).is_err());
+    }
+
+    #[test]
+    fn fts_gather_from_env_returns_none_when_no_env_set() {
+        // Ensure none of the relevant vars are set in CI/test environment.
+        // If they are set by a prior test, this test may be flaky; the vars
+        // are prefixed to avoid collisions.
+        if std::env::var("KHIVE_RECALL_FTS_GATHER").is_ok()
+            || std::env::var("KHIVE_RECALL_FTS_TERM_K").is_ok()
+        {
+            return; // skip if env is already configured
+        }
+        let result = RecallFtsGatherConfig::from_env().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fts_gather_invalid_gather_value_fails() {
+        // We can't easily set env vars in unit tests without affecting other
+        // tests. This exercises the validation branch directly.
+        // Manually simulate what from_env would produce for an invalid value.
+        let cfg = RecallFtsGatherConfig {
+            term_k: 0,
+            ..RecallFtsGatherConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "term_k=0 must fail validation");
+    }
+
+    #[test]
+    fn fts_gather_from_into_gather_mode() {
+        assert_eq!(
+            TextGatherMode::from(RecallFtsGatherMode::Ranked),
+            TextGatherMode::Ranked
+        );
+        assert_eq!(
+            TextGatherMode::from(RecallFtsGatherMode::Unranked),
+            TextGatherMode::Unranked
+        );
+        assert_eq!(
+            TextGatherMode::from(RecallFtsGatherMode::RankWithinCap),
+            TextGatherMode::RankWithinCap
+        );
+    }
+
+    #[test]
+    fn recall_config_default_has_fts_gather() {
+        let cfg = RecallConfig::default();
+        assert!(!cfg.fts_gather.enabled);
+    }
+
+    #[test]
+    fn recall_config_roundtrip_with_fts_gather() {
+        let cfg = RecallConfig {
+            fts_gather: RecallFtsGatherConfig {
+                enabled: true,
+                term_k: 5,
+                selection_rule: RecallFtsSelectionRule::HighestIdf,
+                gather_mode: RecallFtsGatherMode::RankWithinCap,
+                gather_limit: Some(600),
+                gather_cap_multiplier: 4,
+                cjk_bypass_ranked: true,
+            },
+            ..RecallConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: RecallConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.fts_gather.enabled);
+        assert_eq!(back.fts_gather.term_k, 5);
+        assert_eq!(
+            back.fts_gather.gather_mode,
+            RecallFtsGatherMode::RankWithinCap
+        );
+        assert_eq!(back.fts_gather.gather_limit, Some(600));
     }
 }

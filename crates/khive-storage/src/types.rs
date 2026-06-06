@@ -279,6 +279,53 @@ pub struct VectorStoreInfo {
     pub last_rebuild_at: Option<DateTime<Utc>>,
 }
 
+// -- Text gather types (candidate-gather optimization, additive) --
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextGatherMode {
+    /// Current behavior: ORDER BY rank LIMIT top_k.
+    #[default]
+    Ranked,
+    /// Cheap gather without BM25 ranking; uniform text score 1.0.
+    Unranked,
+    /// Gather gather_limit rowids without ranking, then BM25-rank only that subset.
+    RankWithinCap,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TextSearchOptions {
+    pub gather_mode: TextGatherMode,
+    /// Row limit for the cheap first-stage gather in RankWithinCap mode.
+    /// Must be >= top_k. When None, defaults to top_k (no breadth reduction).
+    pub gather_limit: Option<u32>,
+}
+
+impl Default for TextSearchOptions {
+    fn default() -> Self {
+        Self {
+            gather_mode: TextGatherMode::Ranked,
+            gather_limit: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TextTermStatsRequest {
+    pub terms: Vec<String>,
+    pub filter: Option<TextFilter>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TextTermStats {
+    pub term: String,
+    pub sanitized_term: String,
+    pub document_frequency: u64,
+    pub document_count: u64,
+    /// Robertson-Walker IDF: ln(((N - df + 0.5) / (df + 0.5)) + 1)
+    pub inverse_document_frequency: f64,
+}
+
 // -- Text search types --
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

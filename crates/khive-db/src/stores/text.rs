@@ -48,8 +48,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, IndexRebuildScope, TextDocument, TextFilter, TextIndexStats, TextQueryMode,
-    TextSearchHit, TextSearchRequest,
+    BatchWriteSummary, IndexRebuildScope, TextDocument, TextFilter, TextGatherMode, TextIndexStats,
+    TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest, TextTermStats,
+    TextTermStatsRequest,
 };
 use khive_storage::StorageCapability;
 use khive_storage::TextSearch;
@@ -737,6 +738,123 @@ impl TextSearch for Fts5TextSearch {
         .await
     }
 
+    async fn search_with_options(
+        &self,
+        request: TextSearchRequest,
+        options: TextSearchOptions,
+    ) -> Result<Vec<TextSearchHit>, StorageError> {
+        match options.gather_mode {
+            TextGatherMode::Ranked => self.search(request).await,
+            TextGatherMode::Unranked => self.search_unranked(request).await,
+            TextGatherMode::RankWithinCap => {
+                let gather_limit = options
+                    .gather_limit
+                    .unwrap_or(request.top_k)
+                    .max(request.top_k);
+                self.search_rank_within_cap(request, gather_limit).await
+            }
+        }
+    }
+
+    async fn term_stats(
+        &self,
+        request: TextTermStatsRequest,
+    ) -> Result<Vec<TextTermStats>, StorageError> {
+        let table = self.table_name.clone();
+
+        self.with_reader("fts_term_stats", move |conn| {
+            let filter = request.filter.as_ref();
+
+            // Document count uses params starting at ?1 (no MATCH expression).
+            let (count_filter_clause, count_filter_params) = if let Some(f) = filter {
+                build_filter_clause(f, &table, 1)
+            } else {
+                (String::new(), Vec::new())
+            };
+
+            let document_count: u64 = {
+                let count_sql = if count_filter_clause.is_empty() {
+                    format!("SELECT COUNT(*) FROM {table}")
+                } else {
+                    let where_part = count_filter_clause.trim_start_matches(" AND ");
+                    format!("SELECT COUNT(*) FROM {table} WHERE {where_part}")
+                };
+                let mut stmt = conn.prepare(&count_sql)?;
+                for (i, param) in count_filter_params.iter().enumerate() {
+                    param
+                        .to_sql()
+                        .map(|val| stmt.raw_bind_parameter(1 + i, val))
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
+                }
+                let mut rows = stmt.raw_query();
+                match rows.next()? {
+                    Some(row) => {
+                        let c: i64 = row.get(0)?;
+                        c as u64
+                    }
+                    None => 0,
+                }
+            };
+
+            let mut results = Vec::with_capacity(request.terms.len());
+            for term in &request.terms {
+                let sanitized = sanitize_fts5_query(term);
+                if sanitized.is_empty() {
+                    results.push(TextTermStats {
+                        term: term.clone(),
+                        sanitized_term: sanitized,
+                        document_frequency: 0,
+                        document_count,
+                        inverse_document_frequency: 0.0,
+                    });
+                    continue;
+                }
+
+                // Per-term count: MATCH is ?1, so filter params start at ?2.
+                let (term_filter_clause, term_filter_params) = if let Some(f) = filter {
+                    build_filter_clause(f, &table, 2)
+                } else {
+                    (String::new(), Vec::new())
+                };
+
+                let count_sql = format!(
+                    "SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1{term_filter_clause}"
+                );
+                let mut stmt = conn.prepare(&count_sql)?;
+                stmt.raw_bind_parameter(1, &sanitized)?;
+                for (i, param) in term_filter_params.iter().enumerate() {
+                    param
+                        .to_sql()
+                        .map(|val| stmt.raw_bind_parameter(2 + i, val))
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
+                }
+
+                let df: u64 = {
+                    let mut rows = stmt.raw_query();
+                    match rows.next()? {
+                        Some(row) => {
+                            let c: i64 = row.get(0)?;
+                            c as u64
+                        }
+                        None => 0,
+                    }
+                };
+
+                let idf = Fts5TextSearch::bm25_idf(df, document_count);
+                results.push(TextTermStats {
+                    term: term.clone(),
+                    sanitized_term: sanitized,
+                    document_frequency: df,
+                    document_count,
+                    inverse_document_frequency: idf,
+                });
+            }
+
+            Ok(results)
+        })
+        .await
+    }
+
     async fn rebuild(&self, _scope: IndexRebuildScope) -> Result<TextIndexStats, StorageError> {
         let table = self.table_name.clone();
 
@@ -759,6 +877,246 @@ impl TextSearch for Fts5TextSearch {
 }
 
 impl Fts5TextSearch {
+    /// Robertson-Walker BM25 IDF: ln(((N - df + 0.5) / (df + 0.5)) + 1)
+    fn bm25_idf(df: u64, document_count: u64) -> f64 {
+        let n = document_count as f64;
+        let f = df as f64;
+        ((n - f + 0.5) / (f + 0.5) + 1.0).ln()
+    }
+
+    /// Build the OR match expression from a query string (shared logic).
+    fn build_any_term_expr(query: &str) -> Option<String> {
+        let parts: Vec<String> = query
+            .split_whitespace()
+            .map(sanitize_fts5_query)
+            .filter(|t| !t.is_empty())
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" OR "))
+        }
+    }
+
+    /// Gather candidates without BM25 ranking; return with uniform score 1.0.
+    async fn search_unranked(
+        &self,
+        request: TextSearchRequest,
+    ) -> Result<Vec<TextSearchHit>, StorageError> {
+        let table = self.table_name.clone();
+
+        self.with_reader("fts_search_unranked", move |conn| {
+            let match_expr = match request.mode {
+                TextQueryMode::AnyTerm => match Self::build_any_term_expr(&request.query) {
+                    Some(e) => e,
+                    None => return Ok(Vec::new()),
+                },
+                _ => {
+                    let sanitized = sanitize_fts5_query(&request.query);
+                    if sanitized.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    match request.mode {
+                        TextQueryMode::Phrase => format!("\"{}\"", sanitized),
+                        TextQueryMode::Plain => sanitized,
+                        TextQueryMode::AnyTerm => unreachable!(),
+                    }
+                }
+            };
+
+            let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
+                build_filter_clause(filter, &table, 3)
+            } else {
+                (String::new(), Vec::new())
+            };
+
+            // No rank column, no ORDER BY — avoids BM25 computation entirely.
+            let sql = format!(
+                "SELECT subject_id, title \
+                 FROM {table} WHERE {table} MATCH ?1{filter_clause} \
+                 LIMIT ?2",
+            );
+
+            let mut stmt = conn.prepare(&sql)?;
+            stmt.raw_bind_parameter(1, &match_expr)?;
+            stmt.raw_bind_parameter(2, request.top_k as i64)?;
+
+            for (i, param) in filter_params.iter().enumerate() {
+                param
+                    .to_sql()
+                    .map(|val| stmt.raw_bind_parameter(3 + i, val))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
+            }
+
+            let mut results = Vec::new();
+            let mut rows = stmt.raw_query();
+            let mut rank_idx = 0u32;
+
+            while let Some(row) = rows.next()? {
+                let id_str: String = row.get(0)?;
+                let title: String = row.get(1)?;
+
+                let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                rank_idx += 1;
+                results.push(TextSearchHit {
+                    subject_id,
+                    score: DeterministicScore::from_f64(1.0),
+                    rank: rank_idx,
+                    title: if title.is_empty() { None } else { Some(title) },
+                    snippet: None,
+                });
+            }
+
+            Ok(results)
+        })
+        .await
+    }
+
+    /// Two-stage gather: cheap unranked LIMIT gather_limit, then BM25-rank the subset.
+    async fn search_rank_within_cap(
+        &self,
+        request: TextSearchRequest,
+        gather_limit: u32,
+    ) -> Result<Vec<TextSearchHit>, StorageError> {
+        let table = self.table_name.clone();
+
+        self.with_reader("fts_search_rank_within_cap", move |conn| {
+            let match_expr = match request.mode {
+                TextQueryMode::AnyTerm => match Self::build_any_term_expr(&request.query) {
+                    Some(e) => e,
+                    None => return Ok(Vec::new()),
+                },
+                _ => {
+                    let sanitized = sanitize_fts5_query(&request.query);
+                    if sanitized.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    match request.mode {
+                        TextQueryMode::Phrase => format!("\"{}\"", sanitized),
+                        TextQueryMode::Plain => sanitized,
+                        TextQueryMode::AnyTerm => unreachable!(),
+                    }
+                }
+            };
+
+            let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
+                build_filter_clause(filter, &table, 3)
+            } else {
+                (String::new(), Vec::new())
+            };
+
+            // Stage 1: cheap unranked gather of rowids.
+            let gather_sql = format!(
+                "SELECT subject_id FROM {table} WHERE {table} MATCH ?1{filter_clause} LIMIT ?2"
+            );
+
+            let mut stmt = conn.prepare(&gather_sql)?;
+            stmt.raw_bind_parameter(1, &match_expr)?;
+            stmt.raw_bind_parameter(2, gather_limit as i64)?;
+            for (i, param) in filter_params.iter().enumerate() {
+                param
+                    .to_sql()
+                    .map(|val| stmt.raw_bind_parameter(3 + i, val))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
+            }
+
+            let mut gathered_ids: Vec<String> = Vec::new();
+            let mut rows = stmt.raw_query();
+            while let Some(row) = rows.next()? {
+                gathered_ids.push(row.get::<_, String>(0)?);
+            }
+
+            if gathered_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Stage 2: BM25-rank only the gathered subset via subject_id IN (...).
+            let snippet_expr = if request.snippet_chars == 0 {
+                "NULL AS snippet".to_string()
+            } else {
+                let chars = i32::try_from(request.snippet_chars).unwrap_or(i32::MAX);
+                format!("snippet({table}, 3, '', '', '...', {chars})")
+            };
+
+            // Build IN clause for the gathered IDs.
+            let id_placeholders: Vec<String> = gathered_ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", 3 + i))
+                .collect();
+            let in_clause = id_placeholders.join(", ");
+
+            let rank_sql = format!(
+                "SELECT subject_id, rank, title, {snippet_expr} \
+                 FROM {table} WHERE {table} MATCH ?1 AND subject_id IN ({in_clause}) \
+                 ORDER BY rank LIMIT ?2"
+            );
+
+            let mut stmt2 = conn.prepare(&rank_sql)?;
+            stmt2.raw_bind_parameter(1, &match_expr)?;
+            stmt2.raw_bind_parameter(2, request.top_k as i64)?;
+            for (i, id_str) in gathered_ids.iter().enumerate() {
+                stmt2.raw_bind_parameter(3 + i, id_str.as_str())?;
+            }
+
+            let mut hits = Vec::new();
+            let mut rows2 = stmt2.raw_query();
+            let mut rank_idx = 0u32;
+
+            while let Some(row) = rows2.next()? {
+                let id_str: String = row.get(0)?;
+                let fts_rank: f64 = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet: Option<String> = row.get(3)?;
+
+                let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                rank_idx += 1;
+                hits.push((subject_id, fts_rank, rank_idx, title, snippet));
+            }
+
+            // Normalize scores within the ranked subset (same formula as search()).
+            let min_rank = hits.iter().map(|h| h.1).fold(f64::INFINITY, f64::min);
+            let max_rank = hits.iter().map(|h| h.1).fold(f64::NEG_INFINITY, f64::max);
+            let range = max_rank - min_rank;
+
+            let results = hits
+                .into_iter()
+                .map(|(subject_id, raw_rank, rank, title, snippet)| {
+                    let score = if range.abs() < 1e-12 {
+                        1.0
+                    } else {
+                        let t = (max_rank - raw_rank) / range;
+                        0.05 + 0.95 * t
+                    };
+                    TextSearchHit {
+                        subject_id,
+                        score: DeterministicScore::from_f64(score),
+                        rank,
+                        title: if title.is_empty() { None } else { Some(title) },
+                        snippet: snippet.filter(|s| !s.is_empty()),
+                    }
+                })
+                .collect();
+
+            Ok(results)
+        })
+        .await
+    }
+
     /// Move all FTS5 documents from `old_namespace` to `new_namespace` in a
     /// single transaction.
     ///
@@ -1801,5 +2159,237 @@ mod tests {
             "single-hit must score ≈ 1.0, got {}",
             single[0].score.to_f64()
         );
+    }
+
+    // ── search_with_options tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_with_options_default_matches_search() {
+        let store = setup_memory_store("opts_default");
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        store
+            .upsert_document(make_document(id1, "alpha beta", "alpha beta gamma"))
+            .await
+            .unwrap();
+        store
+            .upsert_document(make_document(id2, "delta epsilon", "delta epsilon zeta"))
+            .await
+            .unwrap();
+
+        let req = TextSearchRequest {
+            query: "alpha".to_string(),
+            mode: TextQueryMode::Plain,
+            filter: Some(ns_filter("test_ns")),
+            top_k: 10,
+            snippet_chars: 0,
+        };
+
+        let plain = store.search(req.clone()).await.unwrap();
+        let with_opts = store
+            .search_with_options(req, TextSearchOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            plain.len(),
+            with_opts.len(),
+            "default options must match plain search"
+        );
+        for (p, w) in plain.iter().zip(with_opts.iter()) {
+            assert_eq!(p.subject_id, w.subject_id);
+            assert_eq!(p.rank, w.rank);
+        }
+    }
+
+    #[tokio::test]
+    async fn search_unranked_returns_capped_candidates() {
+        let store = setup_memory_store("unranked_cap");
+
+        for i in 0..10u32 {
+            store
+                .upsert_document(make_document(
+                    Uuid::new_v4(),
+                    &format!("doc {i}"),
+                    &format!("keyword content {i}"),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let hits = store
+            .search_with_options(
+                TextSearchRequest {
+                    query: "keyword".to_string(),
+                    mode: TextQueryMode::Plain,
+                    filter: Some(ns_filter("test_ns")),
+                    top_k: 5,
+                    snippet_chars: 0,
+                },
+                TextSearchOptions {
+                    gather_mode: khive_storage::types::TextGatherMode::Unranked,
+                    gather_limit: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 5, "unranked must cap at top_k");
+        for h in &hits {
+            assert!(
+                (h.score.to_f64() - 1.0).abs() < 1e-10,
+                "unranked hits must have uniform score 1.0, got {}",
+                h.score.to_f64()
+            );
+            assert!(
+                h.snippet.is_none(),
+                "unranked with snippet_chars=0 must have no snippet"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_rank_within_cap_returns_ranked_subset() {
+        let store = setup_memory_store("rank_within_cap");
+
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let bodies = [
+            "rust programming language systems",
+            "rust systems memory safety",
+            "programming language design patterns",
+            "memory management allocation",
+            "systems software engineering",
+        ];
+        for (id, body) in ids.iter().zip(bodies.iter()) {
+            store
+                .upsert_document(make_document(*id, "doc", body))
+                .await
+                .unwrap();
+        }
+
+        let hits = store
+            .search_with_options(
+                TextSearchRequest {
+                    query: "rust".to_string(),
+                    mode: TextQueryMode::Plain,
+                    filter: Some(ns_filter("test_ns")),
+                    top_k: 3,
+                    snippet_chars: 0,
+                },
+                TextSearchOptions {
+                    gather_mode: khive_storage::types::TextGatherMode::RankWithinCap,
+                    gather_limit: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Must return at most top_k (3) hits with BM25-normalized scores.
+        assert!(hits.len() <= 3, "rank_within_cap must cap at top_k");
+        assert!(!hits.is_empty(), "must find at least one 'rust' hit");
+        for h in &hits {
+            let score = h.score.to_f64();
+            assert!(score > 0.0 && score <= 1.0, "scores must be in (0, 1]");
+        }
+        // Ranks must be 1-indexed and contiguous.
+        for (i, h) in hits.iter().enumerate() {
+            assert_eq!(h.rank, (i + 1) as u32, "rank must equal position+1");
+        }
+    }
+
+    // ── term_stats tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn term_stats_returns_df_and_idf_for_fixture() {
+        let store = setup_memory_store("term_stats_fixture");
+
+        // Insert 10 docs: 3 contain "rare_term", 8 contain "common_term".
+        for i in 0..8u32 {
+            store
+                .upsert_document(make_document(
+                    Uuid::new_v4(),
+                    &format!("doc {i}"),
+                    &format!("common_term content number {i}"),
+                ))
+                .await
+                .unwrap();
+        }
+        for i in 0..3u32 {
+            store
+                .upsert_document(make_document(
+                    Uuid::new_v4(),
+                    &format!("rare {i}"),
+                    &format!("rare_term common_term extra {i}"),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let stats = store
+            .term_stats(TextTermStatsRequest {
+                terms: vec!["rare_term".to_string(), "common_term".to_string()],
+                filter: Some(ns_filter("test_ns")),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stats.len(), 2);
+        let rare = stats.iter().find(|s| s.term == "rare_term").unwrap();
+        let common = stats.iter().find(|s| s.term == "common_term").unwrap();
+
+        assert_eq!(rare.document_count, 11, "total doc count must be 11");
+        assert_eq!(rare.document_frequency, 3, "rare_term appears in 3 docs");
+        assert_eq!(
+            common.document_frequency, 11,
+            "common_term appears in all 11 docs"
+        );
+        assert!(
+            rare.inverse_document_frequency > common.inverse_document_frequency,
+            "rarer term must have higher IDF: rare={} common={}",
+            rare.inverse_document_frequency,
+            common.inverse_document_frequency
+        );
+    }
+
+    #[tokio::test]
+    async fn term_stats_empty_terms_returns_empty() {
+        let store = setup_memory_store("term_stats_empty");
+        store
+            .upsert_document(make_document(Uuid::new_v4(), "t", "body"))
+            .await
+            .unwrap();
+
+        let stats = store
+            .term_stats(TextTermStatsRequest {
+                terms: vec![],
+                filter: Some(ns_filter("test_ns")),
+            })
+            .await
+            .unwrap();
+        assert!(stats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn term_stats_missing_term_has_zero_df() {
+        let store = setup_memory_store("term_stats_missing");
+        store
+            .upsert_document(make_document(
+                Uuid::new_v4(),
+                "doc",
+                "only this content exists",
+            ))
+            .await
+            .unwrap();
+
+        let stats = store
+            .term_stats(TextTermStatsRequest {
+                terms: vec!["xyzzy_nonexistent".to_string()],
+                filter: Some(ns_filter("test_ns")),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].document_frequency, 0);
     }
 }

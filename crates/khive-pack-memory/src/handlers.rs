@@ -386,13 +386,13 @@ fn search_source_label(source: SearchSource) -> &'static str {
 /// (~12ms of the 15ms p50 warm path at 10k).  Only diagnostic verbs that surface
 /// snippet text to callers should use `Include`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum TextSnippetPolicy {
+pub(crate) enum TextSnippetPolicy {
     Omit,
     Include { chars: usize },
 }
 
 impl TextSnippetPolicy {
-    fn snippet_chars(self) -> usize {
+    pub(crate) fn snippet_chars(self) -> usize {
         match self {
             Self::Omit => 0,
             Self::Include { chars } => chars.max(1),
@@ -416,6 +416,7 @@ struct RecallCandidateParams<'a> {
     is_cjk: bool,
     scoring_cfg: &'a crate::scoring::ScoringConfig,
     snippet_policy: TextSnippetPolicy,
+    fts_gather: &'a crate::config::RecallFtsGatherConfig,
 }
 
 /// Parameters for the vector (ANN / sqlite-vec) candidate collection leg.
@@ -650,11 +651,10 @@ fn recall_text_terms_with_limit(query: &str, limit: usize) -> Vec<String> {
 impl MemoryPack {
     /// Issue #288: term-fanout FTS search for recall candidates.
     ///
-    /// Breaks the query into individual terms and issues one FTS5 MATCH probe
-    /// per term. Deduplicates by note id, keeping the best rank, and truncates
-    /// to `candidate_limit`. This ensures notes partially matching the query
-    /// appear in `text_candidates` instead of being excluded by the AND
-    /// conjunction semantics of a single-query Plain MATCH.
+    /// When fts_gather.enabled, delegates term selection and gather-mode
+    /// routing to `text_gather::collect_text_hits`. Otherwise uses the
+    /// existing ranked AnyTerm path.
+    #[allow(clippy::too_many_arguments)]
     async fn collect_recall_text_hits(
         &self,
         token: &NamespaceToken,
@@ -662,6 +662,8 @@ impl MemoryPack {
         ns: &str,
         candidate_limit: u32,
         snippet_policy: TextSnippetPolicy,
+        is_cjk: bool,
+        fts_gather: &crate::config::RecallFtsGatherConfig,
     ) -> Result<Vec<TextSearchHit>, RuntimeError> {
         let terms = recall_text_terms(query);
         if terms.is_empty() {
@@ -671,23 +673,39 @@ impl MemoryPack {
         let call_id = PROF_CID.with(|c| c.get());
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
-        // Issue #288 opt: single FTS5 MATCH with OR semantics instead of N probes.
-        // AnyTerm mode joins tokens with " OR " after per-token sanitization.
-        let mut hits = searcher
-            .search(TextSearchRequest {
-                query: terms.join(" "),
-                mode: TextQueryMode::AnyTerm,
-                filter: Some(TextFilter {
-                    namespaces: vec![ns.to_string()],
-                    kinds: vec![SubstrateKind::Note],
-                    ..TextFilter::default()
-                }),
-                top_k: candidate_limit,
-                snippet_chars: snippet_policy.snippet_chars(),
-            })
-            .await?;
-        hits.sort_by_key(|h| h.rank);
-        hits.truncate(candidate_limit as usize);
+
+        let hits = if fts_gather.enabled {
+            crate::text_gather::collect_text_hits(
+                searcher.as_ref(),
+                query,
+                ns,
+                candidate_limit,
+                snippet_policy,
+                is_cjk,
+                fts_gather,
+                &terms,
+            )
+            .await?
+        } else {
+            // Existing path: single OR-joined FTS5 MATCH, ranked.
+            let mut h = searcher
+                .search(TextSearchRequest {
+                    query: terms.join(" "),
+                    mode: TextQueryMode::AnyTerm,
+                    filter: Some(TextFilter {
+                        namespaces: vec![ns.to_string()],
+                        kinds: vec![SubstrateKind::Note],
+                        ..TextFilter::default()
+                    }),
+                    top_k: candidate_limit,
+                    snippet_chars: snippet_policy.snippet_chars(),
+                })
+                .await?;
+            h.sort_by_key(|h| h.rank);
+            h.truncate(candidate_limit as usize);
+            h
+        };
+
         if prof {
             if let Some(t) = t_fts {
                 plog_n(call_id, "fts", t.elapsed().as_micros(), hits.len());
@@ -708,14 +726,22 @@ impl MemoryPack {
             is_cjk,
             scoring_cfg,
             snippet_policy,
+            fts_gather,
         } = opts;
         let ns = token.namespace().as_str().to_string();
 
         // F111 + Issue #288: FTS5 text leg and vector/ANN leg run concurrently.
         // Both futures borrow self/token/ns and are async-runtime-aware, so
         // tokio::try_join! is sufficient — no Send + 'static task boundary needed.
-        let text_fut =
-            self.collect_recall_text_hits(token, query, &ns, candidate_limit, snippet_policy);
+        let text_fut = self.collect_recall_text_hits(
+            token,
+            query,
+            &ns,
+            candidate_limit,
+            snippet_policy,
+            is_cjk,
+            fts_gather,
+        );
         let vector_fut = self.collect_recall_vector_hits(
             token,
             query,
@@ -1285,6 +1311,10 @@ impl MemoryPack {
             }
             t_stage = Some(Instant::now());
         }
+        let effective_fts_gather = crate::config::RecallFtsGatherConfig::from_env()
+            .map_err(|e| RuntimeError::InvalidInput(format!("fts_gather env parse error: {e}")))?
+            .unwrap_or_else(|| cfg.fts_gather.clone());
+
         let candidates = self
             .collect_recall_candidates(
                 query_trimmed,
@@ -1295,6 +1325,7 @@ impl MemoryPack {
                     is_cjk,
                     scoring_cfg: &scoring_cfg,
                     snippet_policy: TextSnippetPolicy::Omit,
+                    fts_gather: &effective_fts_gather,
                 },
             )
             .await?;
@@ -1849,6 +1880,10 @@ impl MemoryPack {
         let scoring_cfg = cfg.scoring.clone().unwrap_or_default();
         let candidate_limit =
             recall_candidate_count(&cfg, limit).min(scoring_cfg.max_recall_candidates as u32);
+        let effective_fts_gather_cand = crate::config::RecallFtsGatherConfig::from_env()
+            .map_err(|e| RuntimeError::InvalidInput(format!("fts_gather env parse error: {e}")))?
+            .unwrap_or_else(|| cfg.fts_gather.clone());
+
         let candidates = self
             .collect_recall_candidates(
                 &p.query,
@@ -1861,6 +1896,7 @@ impl MemoryPack {
                     snippet_policy: TextSnippetPolicy::Include {
                         chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,
                     },
+                    fts_gather: &effective_fts_gather_cand,
                 },
             )
             .await?;
@@ -1948,6 +1984,10 @@ impl MemoryPack {
         let scoring_cfg_fuse = cfg.scoring.clone().unwrap_or_default();
         let candidate_limit =
             recall_candidate_count(&cfg, limit).min(scoring_cfg_fuse.max_recall_candidates as u32);
+        let effective_fts_gather_fuse = crate::config::RecallFtsGatherConfig::from_env()
+            .map_err(|e| RuntimeError::InvalidInput(format!("fts_gather env parse error: {e}")))?
+            .unwrap_or_else(|| cfg.fts_gather.clone());
+
         let candidates = self
             .collect_recall_candidates(
                 &p.query,
@@ -1960,6 +2000,7 @@ impl MemoryPack {
                     snippet_policy: TextSnippetPolicy::Include {
                         chars: RECALL_DIAGNOSTIC_SNIPPET_CHARS,
                     },
+                    fts_gather: &effective_fts_gather_fuse,
                 },
             )
             .await?;
