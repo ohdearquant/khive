@@ -27,11 +27,55 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
+use khive_types::{
+    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack, ParamDef, VerbCategory,
+    Visibility,
+};
 
 pub use entity_type_registry::{EntityTypeDef, EntityTypeRegistry, ResolvedType};
 pub use khive_types::EntityKind;
 pub use vocab::NoteKind;
+
+/// ADR-002 §"Pack-extensible edge endpoints": KG pack extends the base entity→entity
+/// allowlist with person→org and org→org relationship pairs. These are additive only
+/// — the base contract in operations.rs is unchanged.
+static KG_EDGE_RULES: [EdgeEndpointRule; 7] = [
+    EdgeEndpointRule {
+        relation: EdgeRelation::PartOf,
+        source: EndpointKind::EntityOfKind("person"),
+        target: EndpointKind::EntityOfKind("org"),
+    },
+    EdgeEndpointRule {
+        relation: EdgeRelation::InstanceOf,
+        source: EndpointKind::EntityOfKind("person"),
+        target: EndpointKind::EntityOfKind("org"),
+    },
+    EdgeEndpointRule {
+        relation: EdgeRelation::DependsOn,
+        source: EndpointKind::EntityOfKind("org"),
+        target: EndpointKind::EntityOfKind("org"),
+    },
+    EdgeEndpointRule {
+        relation: EdgeRelation::Enables,
+        source: EndpointKind::EntityOfKind("org"),
+        target: EndpointKind::EntityOfKind("org"),
+    },
+    EdgeEndpointRule {
+        relation: EdgeRelation::Contains,
+        source: EndpointKind::EntityOfKind("org"),
+        target: EndpointKind::EntityOfKind("org"),
+    },
+    EdgeEndpointRule {
+        relation: EdgeRelation::PartOf,
+        source: EndpointKind::EntityOfKind("org"),
+        target: EndpointKind::EntityOfKind("org"),
+    },
+    EdgeEndpointRule {
+        relation: EdgeRelation::Precedes,
+        source: EndpointKind::EntityOfKind("org"),
+        target: EndpointKind::EntityOfKind("org"),
+    },
+];
 
 /// KG pack vocabulary declaration.
 pub struct KgPack {
@@ -51,6 +95,7 @@ impl Pack for KgPack {
         "concept", "document", "dataset", "project", "person", "org", "artifact", "service",
     ];
     const HANDLERS: &'static [HandlerDef] = &KG_HANDLERS;
+    const EDGE_RULES: &'static [EdgeEndpointRule] = &KG_EDGE_RULES;
 }
 
 // ADR-060 / ADR-025: Illocutionary classification (Searle 1976)
@@ -811,6 +856,10 @@ impl PackRuntime for KgPack {
 
     fn handlers(&self) -> &'static [HandlerDef] {
         &KG_HANDLERS
+    }
+
+    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
+        <KgPack as Pack>::EDGE_RULES
     }
 
     async fn warm(&self) {

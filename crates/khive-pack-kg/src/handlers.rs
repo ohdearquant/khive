@@ -779,6 +779,14 @@ pub(crate) fn valid_relations_for_entity_pair(src_kind: &str, tgt_kind: &str) ->
         ("artifact", "supersedes", "artifact"),
         ("service", "supersedes", "service"),
         ("dataset", "supersedes", "dataset"),
+        // KG pack extensions (added v0.2.4): person→org and org→org pairs.
+        ("person", "part_of", "org"),
+        ("person", "instance_of", "org"),
+        ("org", "depends_on", "org"),
+        ("org", "enables", "org"),
+        ("org", "contains", "org"),
+        ("org", "part_of", "org"),
+        ("org", "precedes", "org"),
     ];
     let mut relations: Vec<&'static str> = RULES
         .iter()
