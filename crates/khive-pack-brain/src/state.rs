@@ -1,16 +1,4 @@
-// FILE SIZE JUSTIFICATION: state.rs exceeds 1000 LOC because all domain types
-// share a single module to avoid circular imports — BetaPosterior is used by
-// EntityPosteriors, BalancedRecallState, and SectionPosteriorState, and
-// BrainState references all three.  Splitting into sub-modules would require
-// a re-export facade that adds no semantic value.  The inline test section is
-// kept here for direct access to private arithmetic invariants.
-
 //! Brain domain types — posteriors, profile records, bindings, and state snapshots.
-//!
-//! `BetaPosterior` is the shared probabilistic primitive. `BrainState` is the
-//! runtime registry of profiles and their live state. Serializable snapshots
-//! (`BrainStateSnapshot`, `BalancedRecallSnapshot`, `SectionPosteriorSnapshot`)
-//! are used for persistence. `validate_brain_state_snapshot` guards the load path.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -292,9 +280,7 @@ impl EntityPosteriors {
 
 // ── BalancedRecallState ───────────────────────────────────────────────────────
 
-/// State for the `BalancedRecallProfile` — the v1 default profile.
-///
-/// Three-parameter Beta posteriors with informative priors + per-entity LRU.
+/// Live Beta-posterior state for the `balanced-recall-v1` profile.
 pub struct BalancedRecallState {
     /// relevance_weight — prior Beta(7,3): warm-starts expecting 70% success
     pub relevance: BetaPosterior,
@@ -356,11 +342,7 @@ impl BalancedRecallState {
     }
 }
 
-/// Validate all `BetaPosterior` values inside a `BrainStateSnapshot`.
-///
-/// Returns the first validation error encountered, or `Ok(())` when all
-/// posteriors are finite and positive. Call this after deserializing a
-/// persisted snapshot before handing it to `BrainState::from_snapshot`.
+/// Validate all `BetaPosterior` values in a snapshot; returns the first error or `Ok(())`.
 pub fn validate_brain_state_snapshot(snapshot: &BrainStateSnapshot) -> Result<(), String> {
     // Built-in profile scalars.
     let br = &snapshot.balanced_recall;

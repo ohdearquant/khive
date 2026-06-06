@@ -1,7 +1,4 @@
 //! Optional auto-tuning extension trait for packs that expose parameter spaces.
-//!
-//! Packs implementing `PackTunable` advertise their parameter space to brain
-//! and accept projected config values from a live `BalancedRecallState`.
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::RuntimeError;

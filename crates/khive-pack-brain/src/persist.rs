@@ -1,16 +1,4 @@
-//! Brain state persistence — snapshot upsert, event-log append, and namespace-scoped reload.
-//!
-//! The `PersistenceTracker` records which namespaces are loaded and counts dirty
-//! events between snapshots. `ensure_loaded` is the entry point called before
-//! every verb dispatch; it guarantees that the shared `BrainState` reflects the
-//! caller's namespace before any handler runs.
-//!
-//! Namespace isolation (BRAIN-AUD-001): each namespace has its own `BrainState`
-//! snapshot. When `ensure_loaded` is called for a namespace that is not the one
-//! currently in the shared slot, the current state is saved back into the per-namespace
-//! map and the requested namespace's state is swapped in. Namespaces without a
-//! persisted DB snapshot start with a fresh default state; they never inherit
-//! in-memory state from another namespace.
+//! Brain state persistence — snapshot upsert, event-log append, namespace-scoped reload.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -26,11 +14,7 @@ use crate::state::{validate_brain_state_snapshot, BrainState, BrainStateSnapshot
 const SNAPSHOT_PROFILE_ID: &str = "__brain__";
 const DEFAULT_SNAPSHOT_BATCH_SIZE: u64 = 5;
 
-/// Tracks which namespaces have been loaded from the DB and counts dirty events
-/// between full snapshot flushes.
-///
-/// Also owns a per-namespace state map so that in-memory state is isolated between
-/// namespaces even within a single process (BRAIN-AUD-001).
+/// Tracks loaded namespaces and dirty event counts; owns the per-namespace state map.
 pub struct PersistenceTracker {
     /// Namespace currently reflected in the shared `BrainState` slot, if any.
     active_namespace: Option<String>,

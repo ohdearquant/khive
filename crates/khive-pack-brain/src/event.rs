@@ -1,7 +1,4 @@
-//! Brain event interpretation — converts raw `Event` records into feedback signals.
-//!
-//! `interpret` maps every verb+outcome combination to a typed `BrainSignal` that
-//! the fold implementations consume. No mutable state lives here.
+//! Brain event interpretation — maps raw `Event` records to typed `BrainSignal` values.
 
 use std::collections::HashMap;
 

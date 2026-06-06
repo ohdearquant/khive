@@ -1,7 +1,4 @@
 //! Verb handler implementations for `BrainPack`.
-//!
-//! Each method on `BrainPack` implements one `brain.*` verb. The `dispatch`
-//! method in `PackRuntime` routes to these handlers by verb name.
 
 use std::time::Instant;
 
@@ -981,12 +978,7 @@ impl BrainPack {
 
     // ── brain.auto_feedback ───────────────────────────────────────────────
 
-    /// Convenience verb for agents: emit implicit feedback for the first result
-    /// returned by `memory.recall` without requiring a full UUID (#517).
-    ///
-    /// Accepts an 8-char Agent-mode `note_id` prefix (as returned by default
-    /// `memory.recall` output) or a full 36-char UUID. If `results` is empty,
-    /// returns `{"emitted": false, "reason": "no_results"}` without error.
+    /// Emit implicit feedback for the first `memory.recall` result (accepts 8-char prefix or full UUID).
     pub(crate) async fn handle_auto_feedback(
         &self,
         token: &NamespaceToken,
@@ -1041,8 +1033,7 @@ impl BrainPack {
 
     // ── brain.emit (deprecated) ───────────────────────────────────────────
 
-    /// Deprecated: use `brain.feedback`. Kept for backward-compat; routes to
-    /// `handle_feedback` with the same parameters.
+    /// Deprecated alias for `brain.feedback`; routes to `handle_feedback`.
     pub(crate) async fn handle_emit(
         &self,
         token: &NamespaceToken,

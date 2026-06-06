@@ -1,20 +1,4 @@
-//! Fold implementations for brain profiles.
-//!
-//! `BalancedRecallFold` reduces raw events into the three-scalar Beta-posterior
-//! state used by the built-in `balanced-recall-v1` profile.
-//!
-//! `SectionPosteriorFold` reduces events into per-section Beta posteriors.
-//!
-//! Hoare triple for `BalancedRecallFold::reduce`:
-//!   Pre:  state is a valid `BalancedRecallState`; event is a valid `Event`.
-//!   Post: state.total_events is incremented by 1; posteriors are updated
-//!         according to the event signal; entity posterior is updated when a
-//!         target_id is present; all posteriors remain positive and finite.
-//!
-//! Hoare triple for `SectionPosteriorFold::reduce`:
-//!   Pre:  state is a valid `SectionPosteriorState`; event is a valid `Event`.
-//!   Post: section posteriors are updated for the sections named in the event
-//!         payload; total_events is incremented; posteriors remain positive.
+//! Beta-posterior fold implementations for brain profiles.
 
 use khive_fold::{Fold, FoldContext};
 use khive_storage::event::Event;
@@ -24,12 +8,7 @@ use crate::event::{
 };
 use crate::state::{BalancedRecallState, BetaPosterior, SectionPosteriorState, DEFAULT_ESS_CAP};
 
-/// Fold for the `BalancedRecallProfile` state.
-///
-/// The three-scalar Bayesian state lives entirely inside `BalancedRecallProfile` —
-/// brain's `BrainState` holds profile registry metadata; posteriors are opaque to brain.
-///
-/// Deterministic: same events in same order → same `BalancedRecallState`.
+/// Fold for the `balanced-recall-v1` three-scalar Beta-posterior state.
 pub struct BalancedRecallFold {
     entity_capacity: usize,
 }
@@ -157,12 +136,7 @@ impl Fold<Event, BalancedRecallState> for BalancedRecallFold {
     }
 }
 
-/// Fold for section posteriors.
-///
-/// Only processes Feedback events that carry section_signals.
-/// Update rules: useful → alpha += 1, not_useful → beta += 1, wrong → beta += 2.
-/// ESS cap applied per section after each update.
-/// Exploration epoch decrements once per feedback event (floored at 0).
+/// Fold for per-profile section posteriors.
 pub struct SectionPosteriorFold;
 
 impl SectionPosteriorFold {
