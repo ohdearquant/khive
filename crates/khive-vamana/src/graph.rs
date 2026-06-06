@@ -1,9 +1,4 @@
 //! Vamana graph construction and greedy-search implementation.
-//!
-//! Implements the two-pass batch-build algorithm (DiskANN §3) and the
-//! robust-prune heuristic (DiskANN §4). The adjacency list representation
-//! is `Vec<Vec<u32>>` for correctness and build flexibility; see
-//! `docs/persistence.md` for the known trade-off and migration plan.
 
 use std::collections::HashSet;
 
@@ -97,10 +92,6 @@ impl VisitedSet {
 }
 
 /// The Vamana proximity graph over `u32` node IDs.
-///
-/// Adjacency is stored as `Vec<Vec<u32>>` — one sorted neighbor list per node.
-/// This layout is correct and flexible for build-phase pruning. See
-/// `docs/persistence.md` for the measured trade-off versus a CSR flat layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VamanaGraph {
     adjacency: Vec<Vec<u32>>,
@@ -108,12 +99,7 @@ pub struct VamanaGraph {
 }
 
 impl VamanaGraph {
-    /// Create an empty graph with `num_nodes` nodes and the given medoid.
-    ///
-    /// # Errors
-    ///
-    /// Returns `VamanaError::EmptyInput` if `num_nodes == 0`, or
-    /// `VamanaError::InvalidFormat` if `medoid >= num_nodes`.
+    /// Create an empty graph. Errors if `num_nodes == 0` or `medoid >= num_nodes`.
     pub fn new(num_nodes: usize, medoid: u32) -> Result<Self> {
         if num_nodes == 0 {
             return Err(VamanaError::EmptyInput);
@@ -131,10 +117,6 @@ impl VamanaGraph {
     }
 
     /// Build a Vamana graph from `vectors` using the given `config`.
-    ///
-    /// Vectors must be row-major with `config.dimensions` floats per row.
-    /// Non-finite values (`NaN`, `Infinity`) are rejected at the public
-    /// [`VamanaIndex::build`] boundary before this is called internally.
     pub fn build(vectors: &[f32], config: &VamanaConfig) -> Result<Self> {
         config.validate()?;
         let num_vectors = validate_vectors(vectors, config.dimensions)?;
@@ -241,8 +223,6 @@ impl VamanaGraph {
     }
 
     /// Append a new node with no neighbors and return its `u32` ID.
-    ///
-    /// Returns `VamanaError::TooManyVectors` if the ID would exceed `u32::MAX`.
     pub fn add_node(&mut self) -> Result<u32> {
         let new_id = self.adjacency.len();
         if new_id >= u32::MAX as usize {
@@ -283,8 +263,6 @@ impl VamanaGraph {
     }
 
     /// Run greedy beam search from the medoid and return the `k` nearest candidates.
-    ///
-    /// `vectors` must contain at least `self.node_count()` rows of `dimensions` floats.
     pub fn greedy_search(
         &self,
         vectors: &[f32],
@@ -329,8 +307,6 @@ impl VamanaGraph {
     }
 
     /// Apply the DiskANN robust-prune heuristic to select at most `max_degree` neighbors for `node`.
-    ///
-    /// Merges `candidates` with the existing neighbor list before pruning.
     pub fn robust_prune(
         &self,
         vectors: &[f32],

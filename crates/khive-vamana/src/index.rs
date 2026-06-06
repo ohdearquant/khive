@@ -1,9 +1,4 @@
 //! Vamana index: build, search, save/load, and snapshot serialization.
-//!
-//! Non-finite floats (`NaN`, `Infinity`) are rejected at every public boundary
-//! (`build`, `search`, `from_snapshot`) before entering graph construction or
-//! distance computation. The mmap-backed load path is guarded by file-size and
-//! magic checks; see `docs/persistence.md` for the binary layout contract.
 
 use std::{
     fs::{self, File},
@@ -31,10 +26,6 @@ pub const VAMANA_SNAPSHOT_FORMAT: &str = "khive-vamana-index";
 pub const VAMANA_SNAPSHOT_VERSION: u32 = 1;
 
 /// Corpus identity check stored inside a `VamanaSnapshot`.
-///
-/// A snapshot is accepted only when these values match the current vector store.
-/// `kkernel reindex` actively deletes snapshots after re-embedding, giving a
-/// second line of defence against serving stale ANN results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusFingerprint {
     pub vector_count: u64,
@@ -63,10 +54,6 @@ pub struct VamanaIndexSnapshot {
 }
 
 /// Self-validating snapshot of a `VamanaIndex`.
-///
-/// Persisted via `RetrievalPersistence` / `retrieval_snapshots` SQLite BLOB.
-/// The `fingerprint` field must match the live vector corpus before the snapshot
-/// is installed into memory; a mismatch causes a silent rebuild.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VamanaSnapshot {
     pub format: String,
@@ -114,9 +101,6 @@ impl VectorStorage {
 }
 
 /// An in-memory Vamana ANN index over pre-normalized vectors.
-///
-/// Build with [`VamanaIndex::build`], serialize with [`VamanaIndex::to_snapshot`],
-/// and restore with [`VamanaIndex::from_snapshot`] or [`VamanaIndex::load`].
 #[derive(Debug)]
 pub struct VamanaIndex {
     vectors: VectorStorage,
@@ -145,15 +129,7 @@ fn require_finite(values: &[f32], location: &str) -> Result<()> {
 }
 
 impl VamanaIndex {
-    /// Build a Vamana index from a row-major flat vector slice.
-    ///
-    /// `vectors` must contain `N * config.dimensions` finite `f32` values.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `config` is invalid, `vectors` is empty, the length
-    /// is not a multiple of `config.dimensions`, any value is non-finite, or
-    /// `N > u32::MAX`.
+    /// Build from row-major flat slice. Errors if config invalid, empty, wrong length, non-finite, or N > u32::MAX.
     pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<Self> {
         config.validate()?;
         if vectors.is_empty() {
@@ -183,14 +159,7 @@ impl VamanaIndex {
         })
     }
 
-    /// Search for the `k` nearest neighbors of `query`.
-    ///
-    /// Returns a sorted `Vec<(node_id, l2_squared_distance)>` with at most `k` entries.
-    /// If `k == 0`, returns an empty vec immediately.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `query.len() != self.dimensions` or any query value is non-finite.
+    /// Search for `k` nearest neighbors. Errors if dimension mismatch or non-finite query values.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
         if query.len() != self.dimensions {
             return Err(VamanaError::DimensionMismatch {
@@ -220,9 +189,7 @@ impl VamanaIndex {
         Ok(output)
     }
 
-    /// Persist the index to `path` (a directory) using the binary file format.
-    ///
-    /// Writes three files: `metadata.bin`, `graph.bin`, and `vectors.bin`.
+    /// Persist the index to `path` (a directory); writes `metadata.bin`, `graph.bin`, `vectors.bin`.
     pub fn save(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
         write_metadata(&path.join("metadata.bin"), self)?;
@@ -232,8 +199,6 @@ impl VamanaIndex {
     }
 
     /// Load an index from a directory previously written by [`VamanaIndex::save`].
-    ///
-    /// Vectors are memory-mapped; the index holds a live file mapping until dropped.
     pub fn load(path: &Path) -> Result<Self> {
         let meta = read_metadata(&path.join("metadata.bin"))?;
         let config = VamanaConfig {
@@ -276,14 +241,7 @@ impl VamanaIndex {
         })
     }
 
-    /// Compute recall@k by comparing ANN results against exact brute-force search.
-    ///
-    /// Returns the mean fraction of true top-k neighbors found by ANN across all queries.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `queries` is empty, `k == 0`, the length is not a multiple of
-    /// `self.dimensions`, or any query value is non-finite.
+    /// Mean recall@k across `queries` vs. exact brute-force. Errors on empty, bad dim, or non-finite.
     pub fn recall_at_k(&self, queries: &[f32], k: usize) -> Result<f64> {
         if queries.is_empty() {
             return Err(VamanaError::EmptyInput);
@@ -321,8 +279,6 @@ impl VamanaIndex {
     }
 
     /// Serialise this index into a self-validating `VamanaSnapshot`.
-    ///
-    /// `external_ids` must have the same length as `self.num_vectors()`.
     pub fn to_snapshot(
         &self,
         namespace: impl Into<String>,
@@ -366,9 +322,6 @@ impl VamanaIndex {
     }
 
     /// Reconstruct a `VamanaIndex` from a `VamanaSnapshot`.
-    ///
-    /// Returns `VamanaError::InvalidFormat` for any structural inconsistency.
-    /// The caller is responsible for fingerprint validation before calling this.
     pub fn from_snapshot(snapshot: &VamanaSnapshot) -> Result<Self> {
         if snapshot.format != VAMANA_SNAPSHOT_FORMAT {
             return Err(VamanaError::invalid_format(format!(
@@ -1286,7 +1239,4 @@ mod tests {
             "from_snapshot must reject NaN in vectors"
         );
     }
-} // end mod tests
-
-// ---- tempfile dependency shim ----
-// The tempfile crate is used only in tests. Declare it as a dev-dependency below.
+}

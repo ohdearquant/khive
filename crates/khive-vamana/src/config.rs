@@ -1,15 +1,8 @@
 //! Configuration for the Vamana ANN index.
-//!
-//! [`VamanaConfig`] holds the four algorithm parameters and validates them
-//! before any index construction. Production defaults: `dimensions=384`,
-//! `max_degree=64`, `search_list_size=128`, `alpha=1.2`.
 
 use crate::error::{Result, VamanaError};
 
 /// Algorithm parameters for the Vamana index build and search phases.
-///
-/// Validated by [`VamanaConfig::validate`] before any construction or search.
-/// Production defaults: `dimensions=384`, `max_degree=64`, `search_list_size=128`, `alpha=1.2`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VamanaConfig {
     /// Dimensionality of vectors; must be > 0.
@@ -73,9 +66,6 @@ impl VamanaConfig {
     }
 
     /// Construct a config with the given dimensions. Panics on zero dimensions.
-    ///
-    /// Prefer [`try_with_dimensions`](Self::try_with_dimensions) for fallible construction
-    /// in library code.
     pub fn with_dimensions(dimensions: usize) -> Self {
         assert!(dimensions > 0, "dimensions must be > 0");
         Self {

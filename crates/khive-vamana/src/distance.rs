@@ -1,19 +1,8 @@
 //! Distance primitives for the Vamana ANN index.
-//!
-//! Provides L2 squared distance (the Vamana search kernel) and a conversion
-//! from L2² to cosine similarity for unit-normalized vectors.
 
 use crate::error::{Result, VamanaError};
 
-/// Compute the squared L2 distance between two equal-length slices.
-///
-/// This is the crate-internal hot path; callers must guarantee equal lengths.
-/// For a fallible public variant, use [`try_l2_squared`].
-///
-/// # Panics
-///
-/// Panics if `a.len() != b.len()`. This function is `pub(crate)` and its
-/// callers are required to validate lengths before calling it.
+/// Squared L2 distance (hot path). Panics if lengths differ; callers must guarantee equality.
 #[inline]
 pub(crate) fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "l2_squared requires equal-length slices");
@@ -60,8 +49,6 @@ pub(crate) fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Compute squared L2 distance between two slices, returning an error on length mismatch.
-///
-/// Returns `VamanaError::DimensionMismatch` if `a.len() != b.len()`.
 #[inline]
 pub fn try_l2_squared(a: &[f32], b: &[f32]) -> Result<f32> {
     if a.len() != b.len() {
@@ -74,8 +61,6 @@ pub fn try_l2_squared(a: &[f32], b: &[f32]) -> Result<f32> {
 }
 
 /// Convert a squared L2 distance to cosine similarity for unit-normalized vectors.
-///
-/// For unit vectors, `cosine = 1 - l2sq / 2`. The result is in `[-1.0, 1.0]`.
 #[inline]
 pub fn cosine_from_l2sq(l2sq: f32) -> f32 {
     1.0 - (0.5 * l2sq)

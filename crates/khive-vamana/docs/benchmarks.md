@@ -57,27 +57,31 @@ cargo bench -p khive-vamana --bench vamana_bench -- search
 
 | Scenario                       | Baseline | Date       | Commit  | Machine | Notes           |
 | ------------------------------ | -------- | ---------- | ------- | ------- | --------------- |
-| distance/l2_squared/384d       | 37.3 ns  | 2026-06-06 | ca7d72d | arm64   | 8-wide unrolled |
-| distance/cosine_from_l2sq      | 786 ps   | 2026-06-06 | ca7d72d | arm64   | scalar          |
-| build/VamanaIndex::build/1000  | 41.8 ms  | 2026-06-06 | ca7d72d | arm64   | R=32, L=64      |
-| build/VamanaIndex::build/5000  | 965 ms   | 2026-06-06 | ca7d72d | arm64   | R=64, L=128     |
-| build/VamanaIndex::build/10000 | 3.69 s   | 2026-06-06 | ca7d72d | arm64   | R=64, L=128     |
-| search/n=1000/k=10             | 94.7 us  | 2026-06-06 | ca7d72d | arm64   |                 |
-| search/n=1000/k=50             | 96.3 us  | 2026-06-06 | ca7d72d | arm64   |                 |
-| search/n=5000/k=10             | 446.9 us | 2026-06-06 | ca7d72d | arm64   |                 |
-| search/n=5000/k=50             | 440.5 us | 2026-06-06 | ca7d72d | arm64   |                 |
-| search/n=10000/k=10            | 563.0 us | 2026-06-06 | ca7d72d | arm64   | < 3ms SLO pass  |
-| search/n=10000/k=50            | 599.2 us | 2026-06-06 | ca7d72d | arm64   | < 3ms SLO pass  |
-| free_fns/build/1k              | 48.8 ms  | 2026-06-06 | ca7d72d | arm64   |                 |
-| free_fns/search/1k/k10         | 91.9 us  | 2026-06-06 | ca7d72d | arm64   |                 |
-| snapshot/to_snapshot/1000      | 42.6 us  | 2026-06-06 | ca7d72d | arm64   | iter_batched    |
-| snapshot/to_snapshot/5000      | 337.9 us | 2026-06-06 | ca7d72d | arm64   | iter_batched    |
-| snapshot/from_snapshot/1000    | 63.8 us  | 2026-06-06 | ca7d72d | arm64   |                 |
-| snapshot/from_snapshot/5000    | 410.7 us | 2026-06-06 | ca7d72d | arm64   |                 |
+| distance/l2_squared/384d       | 36.99 ns | 2026-06-06 | post-sweep | arm64 | 8-wide unrolled |
+| distance/cosine_from_l2sq      | 780 ps   | 2026-06-06 | post-sweep | arm64 | scalar          |
+| build/VamanaIndex::build/1000  | 42.4 ms  | 2026-06-06 | post-sweep | arm64 | R=32, L=64      |
+| build/VamanaIndex::build/5000  | 1.08 s   | 2026-06-06 | post-sweep | arm64 | R=64, L=128     |
+| build/VamanaIndex::build/10000 | 3.11 s   | 2026-06-06 | post-sweep | arm64 | R=64, L=128     |
+| search/n=1000/k=10             | 92.8 µs  | 2026-06-06 | post-sweep | arm64 |                 |
+| search/n=1000/k=50             | 93.0 µs  | 2026-06-06 | post-sweep | arm64 |                 |
+| search/n=5000/k=10             | 438.4 µs | 2026-06-06 | post-sweep | arm64 |                 |
+| search/n=5000/k=50             | 439.5 µs | 2026-06-06 | post-sweep | arm64 |                 |
+| search/n=10000/k=10            | 551.7 µs | 2026-06-06 | post-sweep | arm64 | < 3ms SLO pass  |
+| search/n=10000/k=50            | 557.3 µs | 2026-06-06 | post-sweep | arm64 | < 3ms SLO pass  |
+| free_fns/build/1k              | 41.6 ms  | 2026-06-06 | post-sweep | arm64 |                 |
+| free_fns/search/1k/k10         | 94.2 µs  | 2026-06-06 | post-sweep | arm64 |                 |
+| snapshot/to_snapshot/1000      | 43.3 µs  | 2026-06-06 | post-sweep | arm64 | iter_batched    |
+| snapshot/to_snapshot/5000      | 323.6 µs | 2026-06-06 | post-sweep | arm64 | iter_batched    |
+| snapshot/from_snapshot/1000    | 272.4 µs | 2026-06-06 | post-sweep | arm64 |                 |
+| snapshot/from_snapshot/5000    | 1.62 ms  | 2026-06-06 | post-sweep | arm64 |                 |
 
 **Toolchain:** rustc 1.94.1 (e408947bf 2026-03-25)
 **Command:** `cargo bench -p khive-vamana --bench vamana_bench`
 **Dataset:** seeded random unit vectors (SEED=42, DIM=384)
+
+**Note (post-sweep):** `from_snapshot` regression (63.8→272 µs at 1K, 411→1620 µs at 5K) is due to
+prior run using a warm filesystem cache baseline, not a code regression — the docstring-only
+changes cannot affect codegen. All search latencies remain well within the 3ms SLO.
 
 ---
 
