@@ -2,18 +2,7 @@
 
 use std::collections::HashMap;
 
-/// Input features available per recall candidate for weighted reranking.
-///
-/// Each field is a normalized scalar in roughly [0, 1] (though `temporal` and
-/// `salience` can technically exceed 1.0 only if the raw salience > 1.0 or age < 0,
-/// neither of which the runtime produces in practice).
-///
-/// Supported feature names (keys in `reranker_weights`):
-/// - `"relevance"` — fused retrieval score (RRF/weighted fusion output)
-/// - `"salience"` — note salience after decay (`salience * exp(-k * age)`)
-/// - `"temporal"` — recency score (`exp(-ln2/half_life * age_days)`)
-/// - `"text_match"` — 1.0 when candidate appeared in FTS text results, else 0.0
-/// - `"vector_match"` — 1.0 when candidate appeared in vector results, else 0.0
+/// Input features per recall candidate for weighted reranking (relevance, salience, temporal, text_match, vector_match).
 #[derive(Debug, Clone)]
 pub struct RerankFeatures {
     /// Fused retrieval score from RRF or weighted fusion.
@@ -28,33 +17,8 @@ pub struct RerankFeatures {
     pub vector_match: bool,
 }
 
-/// Compute a weighted feature-combination rerank score, normalized by the sum of
-/// recognized positive weights.
-///
-/// Returns `Σ(weight × feature_value) / Σ(weight)` over all recognized feature
-/// names whose weight is > 0.  Dividing by the weight sum makes the output
-/// scale-invariant: doubling every weight leaves the score unchanged, which is the
-/// expected behavior for a comparison-stable ranking function.
-///
-/// Unrecognized keys are silently ignored — this lets callers add future feature
-/// names without breaking existing deployments that haven't upgraded yet.  Ignored
-/// keys do NOT contribute to the weight sum.
-///
-/// # Empty weights
-///
-/// When `weights` is empty (or all entries are zero / unrecognized) this returns
-/// `0.0`. The caller (`handle_recall`) uses this case as a passthrough signal: if
-/// `reranker_weights` is empty, skip reranking entirely and fall through to
-/// `compute_score`. The `0.0` return value itself is never used when weights are
-/// absent.
-///
-/// # Score range
-///
-/// Because features are in [0, 1] by construction and the score is normalized by
-/// the positive weight sum, the output is in [0, 1] for any non-negative weight
-/// configuration.  Negative weights are accepted (they reduce scores for the
-/// associated feature) but are excluded from the denominator — only positive
-/// weights normalize the result.
+/// Weighted feature-combination rerank score: `Σ(weight × feature) / Σ(positive_weight)`.
+/// Returns 0.0 when weights are empty or all unrecognized.
 pub fn weighted_rerank(features: &RerankFeatures, weights: &HashMap<String, f64>) -> f64 {
     let mut numerator = 0.0_f64;
     let mut weight_sum = 0.0_f64;

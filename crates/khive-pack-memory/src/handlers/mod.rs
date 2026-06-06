@@ -1,0 +1,9 @@
+//! Memory verb handlers — split by concern.
+
+mod common;
+mod recall;
+mod remember;
+mod sub_handlers;
+mod tests;
+
+pub use common::{recall_text_terms, TextSnippetPolicy};

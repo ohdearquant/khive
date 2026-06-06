@@ -1,24 +1,4 @@
-//! Warm ANN bridge for memory note vector search.
-//!
-//! Wraps `khive_vamana::VamanaIndex` with a per-`(namespace, model)` ID map
-//! (u32 → UUID) to serve as an in-memory cache replacing per-recall sqlite-vec
-//! brute-force O(N) scans.
-//!
-//! On first recall the key is absent; `ensure_ann_background` fires a tokio task
-//! that builds the index from the memory-note sqlite-vec corpus while the caller
-//! falls back to exact sqlite-vec search. Once built all subsequent reads use the
-//! ANN index. An exact fallback also fires whenever ANN search errors.
-//!
-//! Persistence: best-effort snapshots in `retrieval_snapshots` under the key
-//! `{ns}::memory_vamana::{model}` so process restarts do not rebuild cold.
-//! Snapshot fingerprints use a COUNT query scoped to `kind='note'` /
-//! `field='note.content'` vectors so knowledge-atom counts cannot trigger
-//! false-stale rebuilds.
-// FILE SIZE JUSTIFICATION: ann.rs implements the full ANN index lifecycle — build,
-// persist, restore, invalidate, search, and fallback logic — plus the shared state
-// types (SharedAnn, AnnState, AnnKey). These are tightly coupled: split into sub-modules
-// would require re-exporting nearly every type, breaking the intentional encapsulation
-// that lets handlers.rs treat the ANN as a black-box cache.
+//! Warm ANN bridge: wraps `VamanaIndex` per `(namespace, model)` to cache memory-note vector search.
 
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
@@ -58,10 +38,7 @@ pub(crate) struct AnnBridge {
     id_map: Vec<Uuid>,
 }
 
-/// Shared ANN state: per-`(namespace, model)` indexes plus a warming guard so
-/// at most one background build runs per key at a time.
-///
-/// `warming` uses `tokio::sync::Mutex` — non-poisoning, async-compatible.
+/// Shared ANN state: per-`(namespace, model)` indexes with at-most-one-background-build guard.
 pub(crate) struct AnnState {
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
     warming: Mutex<HashSet<AnnKey>>,
@@ -253,10 +230,7 @@ pub(crate) async fn invalidate_namespace(rt: &KhiveRuntime, ann: &SharedAnn, nam
     invalidate_snapshots(rt, namespace).await;
 }
 
-/// Fire-once per-key background warm for `model`. Returns `true` only when it
-/// started a new background task. Returns `false` when the index is already
-/// loaded, a warm is already in flight, the model string is empty, or the
-/// runtime rejects the namespace.
+/// Fire-once per-key background warm for `model`. Returns `true` if a new task was started.
 pub(crate) async fn ensure_ann_background(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -306,11 +280,7 @@ pub(crate) async fn ensure_ann_background(
     true
 }
 
-/// Warm all `(namespace, model)` corpora by loading/building each ANN index.
-///
-/// Iterates every registered embedding model, discovers namespaces that have
-/// memory note vectors for that model, then calls `ensure_ann_for_model` for
-/// each pair. Safe to call at startup — skips already-loaded keys.
+/// Warm all `(namespace, model)` ANN indexes at startup — skips already-loaded keys.
 pub(crate) async fn warm_existing_memory_indexes(rt: &KhiveRuntime, ann: &SharedAnn) {
     let models = rt.registered_embedding_model_names();
     for model in &models {
@@ -361,12 +331,7 @@ pub(crate) async fn warm_existing_memory_indexes(rt: &KhiveRuntime, ann: &Shared
     }
 }
 
-/// Lazy warm-load for a specific `(namespace, model)`. Attempts snapshot restore
-/// first; on miss/stale/corrupt, rebuilds from sqlite-vec corpus and persists.
-/// Uses a double-fingerprint check to discard builds that raced with writes.
-///
-/// Returns `Err` on vector-store, snapshot, or Vamana-build failure so callers
-/// can propagate errors rather than silently falling back to brute-force search.
+/// Lazy warm-load for a specific `(namespace, model)`: snapshot restore or rebuild with double-fingerprint check.
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,

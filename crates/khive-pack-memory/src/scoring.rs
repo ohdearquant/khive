@@ -194,11 +194,7 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
 
 // ── Scoring weights ───────────────────────────────────────────────────────────
 
-/// Weights for the combined memory score (multiplicative model).
-///
-/// Semantic relevance is a **gate** (multiplicative base). Temporal recency
-/// and salience are **boosters** applied on top: `score = w_rel × relevance
-/// × (1 + w_temp × recency) × (1 + w_imp × salience)`.
+/// Weights for the combined memory score: `score = w_rel × relevance × (1 + w_temp × recency) × (1 + w_imp × salience)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScoringWeights {
@@ -222,14 +218,8 @@ impl Default for ScoringWeights {
 
 // ── ScoringConfig ─────────────────────────────────────────────────────────────
 
-/// Complete, fully-tunable scoring configuration for the memory recall pipeline.
-///
-/// All fields are `pub` and serde-friendly so tuning agents can sweep them
-/// without code changes. `Default::default()` reproduces the v1 archive behavior.
-///
-/// DoS caps: `max_recall_candidates ≤ 500`, `default_token_budget ≤ 16000`,
-/// `default_recall_limit ≤ 200`. The handler enforces these caps server-side
-/// even when a caller provides a `ScoringConfig` override.
+/// Complete, tunable scoring configuration for the memory recall pipeline.
+/// DoS caps: max_recall_candidates≤500, default_token_budget≤16000, default_recall_limit≤200.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScoringConfig {
@@ -362,12 +352,7 @@ pub fn contains_cjk(text: &str) -> bool {
     (cjk as f32) / (chars.len() as f32) > 0.15
 }
 
-/// Normalize `min_score` from caller-supplied value.
-///
-/// Accepts:
-/// - `0.0..=1.0` → passes through as-is (fraction form)
-/// - `1.0..=100.0` → divides by 100 (percent form)
-/// - anything else (NaN, Inf, negative, >100) → returns `Err`
+/// Normalize `min_score`: 0–1 passes through, 1–100 divides by 100, others return Err.
 pub fn normalize_min_score(score: f64) -> Result<f32, crate::config::MinScoreError> {
     if !score.is_finite() {
         return Err(crate::config::MinScoreError::NotFinite);
@@ -381,10 +366,7 @@ pub fn normalize_min_score(score: f64) -> Result<f32, crate::config::MinScoreErr
     Err(crate::config::MinScoreError::OutOfRange(score))
 }
 
-/// Returns `true` if the query has enough semantic content to produce meaningful recall.
-///
-/// Rejects: whitespace-only, symbols-only, single-char (except CJK), and
-/// repeated-character gibberish ("aaaa bbbb").
+/// Returns `true` if the query has enough semantic content for meaningful recall.
 pub fn is_meaningful_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -441,9 +423,6 @@ const NORMALIZED_RELEVANCE_CEILING: f32 = 0.82;
 const RRF_SIGNAL_THRESHOLD: f32 = 0.025;
 
 /// Normalize raw-cosine or BM25 scores (single-source) into a calibrated relevance band.
-///
-/// Applies `signal_strength` scaling when the best score is weak — prevents
-/// min-max normalization from inflating truly irrelevant results on small corpora.
 pub fn normalize_rank_fusion_scores(
     scores: Vec<(Uuid, f32)>,
     config: &ScoringConfig,
@@ -493,10 +472,6 @@ pub fn normalize_rank_fusion_scores(
 }
 
 /// Normalize RRF-fused scores (dual-source) into a calibrated relevance band.
-///
-/// Unlike `normalize_rank_fusion_scores`, does NOT apply `signal_strength`:
-/// RRF scores are rank-based and their absolute magnitude carries no signal
-/// about query quality, so the scaling factor would cause cross-query inversions.
 pub fn normalize_rrf_scores(
     scores: Vec<(Uuid, f32)>,
     config: &ScoringConfig,

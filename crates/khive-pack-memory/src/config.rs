@@ -1,8 +1,4 @@
 //! Recall configuration types — scoring weights, decay models, and FTS gather options.
-// FILE SIZE JUSTIFICATION: config.rs holds all tightly-coupled recall configuration types
-// (RecallConfig, DecayModel, RecallFtsGatherConfig, BrainProfileHint) plus their Default,
-// validation, and env-var parsing impls. Splitting would require cross-module type references
-// for the many inter-dependent fields and validation logic that references multiple types.
 
 use std::collections::HashMap;
 
@@ -79,24 +75,11 @@ pub struct RecallConfig {
     pub include_breakdown: bool,
 
     // --- Archive scoring pipeline override ---
-    /// Optional full archive scoring config override. When provided, `handle_recall`
-    /// uses `calculate_score` + all archive pipeline features (MMR, supersedes
-    /// suppression, CJK routing, entity boost) instead of the legacy additive formula.
-    ///
-    /// `ScoringConfig::default()` is used when this is `None` and the caller provides
-    /// entity_names or sets `use_archive_scoring = true`.
+    /// Optional archive scoring config; enables MMR, supersedes suppression, CJK routing, entity boost.
     pub scoring: Option<crate::scoring::ScoringConfig>,
 
-    // --- Brain profile integration (issue #484) ---
-    /// Optional brain profile hint for score boosting.
-    ///
-    /// When set, `handle_recall` fetches the named brain profile's entity
-    /// posteriors and applies a salience multiplier to results whose note id
-    /// or source entity appears in the profile's high-posterior set.
-    ///
-    /// Integration point: after `ranked` is populated, iterate results and
-    /// multiply `rank_score` by `brain_profile_boost` for IDs whose
-    /// Beta posterior mean exceeds `brain_profile_threshold`.
+    // --- Brain profile integration ---
+    /// Optional brain profile hint for post-recall score boosting.
     pub brain_profile: Option<BrainProfileHint>,
 
     // --- FTS candidate-gather optimization ---
@@ -104,25 +87,8 @@ pub struct RecallConfig {
     pub fts_gather: RecallFtsGatherConfig,
 }
 
-/// Hint for brain-profile-guided score boosting during recall (issue #484).
-///
-/// When a `brain_profile` hint is present in `RecallConfig`, the recall handler
-/// will apply `boost` as a rank-score multiplier to results whose associated
-/// entity posterior mean in the named brain profile exceeds `threshold`.
-///
-/// This ties the memory pack's retrieval scoring to the brain pack's Bayesian
-/// entity posteriors, allowing frequently-recalled or explicitly-marked-useful
-/// entities to surface more prominently.
-///
-/// # Wire shape
-/// ```json
-/// "brain_profile": {"profile_id": "balanced-recall-v1", "boost": 1.3, "threshold": 0.6}
-/// ```
-///
-/// # Integration status (issue #484)
-/// The configuration field is live; the runtime lookup requires a cross-pack
-/// call to `brain.profile` which is not yet wired at the handler level.
-/// TODO(#484): wire brain pack handle lookup into recall scoring loop.
+/// Brain-profile hint for score boosting during recall.
+/// Applies `boost` multiplier to results whose profile posterior mean exceeds `threshold`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainProfileHint {
     /// Profile ID to resolve. Passed to `brain.resolve` / `brain.profile`.
@@ -130,9 +96,7 @@ pub struct BrainProfileHint {
     /// Score multiplier applied to matching results. Default 1.3×.
     #[serde(default = "BrainProfileHint::default_boost")]
     pub boost: f64,
-    /// Minimum Beta posterior mean required for a result to receive the boost.
-    /// Posterior mean = alpha / (alpha + beta). Default 0.6 (slightly above
-    /// the uniform prior mean of 0.5).
+    /// Minimum Beta posterior mean required for a result to receive the boost. Default 0.6.
     #[serde(default = "BrainProfileHint::default_threshold")]
     pub threshold: f64,
 }
@@ -179,10 +143,7 @@ impl From<RecallFtsGatherMode> for TextGatherMode {
     }
 }
 
-/// Configuration for the FTS candidate-gather optimization.
-///
-/// All defaults preserve existing behavior (enabled=false, original term order,
-/// ranked gather). The quality sweep varies these via env vars without recompiling.
+/// Configuration for the FTS candidate-gather optimization (default: disabled, existing behavior).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecallFtsGatherConfig {
@@ -194,14 +155,11 @@ pub struct RecallFtsGatherConfig {
     pub selection_rule: RecallFtsSelectionRule,
     /// How the DB gathers candidates. Default ranked (existing behavior).
     pub gather_mode: RecallFtsGatherMode,
-    /// Row cap for RankWithinCap first-stage gather. When None, uses
-    /// candidate_limit * gather_cap_multiplier.
+    /// Row cap for RankWithinCap gather. When None, uses candidate_limit * gather_cap_multiplier.
     pub gather_limit: Option<u32>,
-    /// Multiplier applied to candidate_limit to derive gather_limit when
-    /// gather_limit is None. Default 4.
+    /// Multiplier for gather_limit when gather_limit is None. Default 4.
     pub gather_cap_multiplier: u32,
-    /// When true, CJK queries bypass term selection and use the existing ranked
-    /// all-term path. Default true — CJK trigram search is already sub-ms.
+    /// When true, CJK queries bypass term selection and use the existing ranked all-term path.
     pub cjk_bypass_ranked: bool,
 }
 
@@ -220,11 +178,7 @@ impl Default for RecallFtsGatherConfig {
 }
 
 impl RecallFtsGatherConfig {
-    /// Parse gather config overrides from environment variables.
-    ///
-    /// Returns `None` when no relevant env vars are set (preserve config/default).
-    /// Returns `Err` and fails fast on any malformed value — silent fallback to
-    /// baseline would corrupt the quality curve.
+    /// Parse gather config from env vars. Returns `None` when none are set, `Err` on malformed values.
     pub fn from_env() -> Result<Option<Self>, RuntimeError> {
         let gather = std::env::var("KHIVE_RECALL_FTS_GATHER").ok();
         let term_k = std::env::var("KHIVE_RECALL_FTS_TERM_K").ok();
@@ -435,12 +389,7 @@ impl Default for RecallConfig {
 }
 
 impl RecallConfig {
-    /// Validate that the config is internally consistent.
-    ///
-    /// Rejects:
-    /// - Negative weights (base or reranker)
-    /// - All three base weights summing to zero (no scoring signal)
-    /// - Non-positive temporal half-life
+    /// Validate config consistency: non-negative weights, positive weight sum, positive half-life.
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if !self.relevance_weight.is_finite() || self.relevance_weight < 0.0 {
             return Err(RuntimeError::InvalidInput(
@@ -503,10 +452,6 @@ impl RecallConfig {
     }
 
     /// Deserialize from a JSON value and validate in one step.
-    ///
-    /// Callers that receive untrusted JSON should prefer this over raw
-    /// `serde_json::from_value` + a separate `.validate()` call, so invalid
-    /// config states cannot escape into caller code.
     pub fn try_from_value(v: serde_json::Value) -> Result<Self, RuntimeError> {
         let cfg: Self =
             serde_json::from_value(v).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
@@ -519,20 +464,14 @@ impl RecallConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DecayModel {
-    /// `salience * exp(-decay_factor * age_days)` — uses the note's own decay_factor directly.
-    ///
-    /// Decay formula: `salience * exp(-decay_factor * age_days)`. The note's `decay_factor`
-    /// controls the decay rate; `temporal_half_life_days` is used only by the temporal
-    /// recency score, not here. Default `decay_factor=0.01` gives a ~69-day half-life:
-    /// `exp(-0.01 * 69.3) ≈ 0.5`.
+    /// `salience * exp(-decay_factor * age_days)` — default ~69-day half-life at decay_factor=0.01.
     #[default]
     Exponential,
     /// `salience / (1 + decay_factor * age_days)`
     Hyperbolic,
     /// `salience * half_life / (half_life + age_days)`
     PowerLaw {
-        /// Override half-life (days) for the power-law model.
-        /// Falls back to RecallConfig.temporal_half_life_days when absent.
+        /// Override half-life days for the power-law model.
         half_life_days: f64,
     },
     /// No decay — salience is used as-is.
@@ -540,12 +479,7 @@ pub enum DecayModel {
 }
 
 impl DecayModel {
-    /// Apply decay to a salience value.
-    ///
-    /// - `salience`    — raw salience in [0, 1]
-    /// - `age_days`    — age of the note in days
-    /// - `decay_factor`— per-note decay rate stored on the note (used by Exponential and Hyperbolic)
-    /// - `half_life`   — config half-life, used only by PowerLaw (ignored by Exponential)
+    /// Apply decay to a salience value given age_days, decay_factor, and config half_life.
     pub fn apply(&self, salience: f64, age_days: f64, decay_factor: f64, _half_life: f64) -> f64 {
         match self {
             DecayModel::Exponential => {
