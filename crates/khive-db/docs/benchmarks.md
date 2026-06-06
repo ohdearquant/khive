@@ -63,50 +63,50 @@ cargo bench -p khive-db --features vectors -- storage_backend
 
 ### FTS5 Search (10K corpus, top-20)
 
-| Benchmark                              | Median    |
-| -------------------------------------- | --------- |
-| `fts5_search/anyterm_1term`            | 7.67 ms   |
-| `fts5_search/anyterm_3terms`           | 14.87 ms  |
-| `fts5_search/anyterm_5terms`           | 21.07 ms  |
-| `fts5_search/plain_no_snippet`         | 11.99 ms  |
-| `fts5_search/plain_with_snippet`       | 12.15 ms  |
-| `fts5_search_unranked/anyterm_top20`   | 300.1 µs  |
-| `fts5_rank_within_cap/cap/50`          | 23.71 ms  |
-| `fts5_rank_within_cap/cap/200`         | 21.32 ms  |
-| `fts5_rank_within_cap/cap/500`         | 21.20 ms  |
-| `fts5_term_stats/single_term`          | 6.34 ms   |
-| `fts5_term_stats/five_terms`           | 21.58 ms  |
+| Benchmark                            | Low      | Median   | High     |
+| ------------------------------------ | -------- | -------- | -------- |
+| `fts5_search/anyterm_1term`          | 7.60 ms  | 7.67 ms  | 7.74 ms  |
+| `fts5_search/anyterm_3terms`         | 14.76 ms | 14.87 ms | 15.05 ms |
+| `fts5_search/anyterm_5terms`         | 20.91 ms | 21.07 ms | 21.28 ms |
+| `fts5_search/plain_no_snippet`       | 11.84 ms | 11.99 ms | 12.19 ms |
+| `fts5_search/plain_with_snippet`     | 12.10 ms | 12.15 ms | 12.20 ms |
+| `fts5_search_unranked/anyterm_top20` | 296.7 µs | 300.1 µs | 304.0 µs |
+| `fts5_rank_within_cap/cap/50`        | 23.38 ms | 23.71 ms | 24.10 ms |
+| `fts5_rank_within_cap/cap/200`       | 21.13 ms | 21.32 ms | 21.54 ms |
+| `fts5_rank_within_cap/cap/500`       | 21.05 ms | 21.20 ms | 21.35 ms |
+| `fts5_term_stats/single_term`        | 6.27 ms  | 6.34 ms  | 6.41 ms  |
+| `fts5_term_stats/five_terms`         | 21.37 ms | 21.58 ms | 21.80 ms |
 
 ### FTS5 Upsert
 
-| Benchmark                     | Median    |
-| ----------------------------- | --------- |
-| `fts5_upsert_batch/docs/100`  | 7.19 ms   |
-| `fts5_upsert_batch/docs/500`  | 51.55 ms  |
-| `fts5_upsert_batch/docs/1000` | 153.69 ms |
+| Benchmark                     | Low      | Median    | High      |
+| ----------------------------- | -------- | --------- | --------- |
+| `fts5_upsert_batch/docs/100`  | 7.15 ms  | 7.19 ms   | 7.25 ms   |
+| `fts5_upsert_batch/docs/500`  | 51.42 ms | 51.55 ms  | 51.69 ms  |
+| `fts5_upsert_batch/docs/1000` | 150.5 ms | 153.7 ms  | 158.1 ms  |
 
 ### sqlite-vec Vector Search (10K corpus, 384-dim)
 
-| Benchmark                              | Median   |
-| -------------------------------------- | -------- |
-| `sqlite_vec_search/top_k/10`           | 9.22 ms  |
-| `sqlite_vec_search/top_k/50`           | 9.58 ms  |
-| `sqlite_vec_search/top_k/100`          | 10.60 ms |
+| Benchmark                     | Low      | Median   | High     |
+| ----------------------------- | -------- | -------- | -------- |
+| `sqlite_vec_search/top_k/10`  | 9.11 ms  | 9.22 ms  | 9.38 ms  |
+| `sqlite_vec_search/top_k/50`  | 9.52 ms  | 9.58 ms  | 9.64 ms  |
+| `sqlite_vec_search/top_k/100` | 10.39 ms | 10.60 ms | 10.83 ms |
 
 ### sqlite-vec Batch Insert
 
-| Benchmark                              | Median   |
-| -------------------------------------- | -------- |
-| `sqlite_vec_insert_batch/records/100`  | 5.94 ms  |
-| `sqlite_vec_insert_batch/records/500`  | 12.58 ms |
-| `sqlite_vec_insert_batch/records/1000` | 27.24 ms |
+| Benchmark                              | Low      | Median   | High     |
+| -------------------------------------- | -------- | -------- | -------- |
+| `sqlite_vec_insert_batch/records/100`  | 5.63 ms  | 5.94 ms  | 6.28 ms  |
+| `sqlite_vec_insert_batch/records/500`  | 12.25 ms | 12.58 ms | 12.93 ms |
+| `sqlite_vec_insert_batch/records/1000` | 25.13 ms | 27.24 ms | 29.50 ms |
 
 ### Backend Creation
 
-| Benchmark                         | Median    |
-| --------------------------------- | --------- |
-| `storage_backend_creation/memory` | 20.89 µs  |
-| `storage_backend_creation/file`   | 1.08 ms   |
+| Benchmark                         | Low      | Median   | High     |
+| --------------------------------- | -------- | -------- | -------- |
+| `storage_backend_creation/memory` | 20.22 µs | 20.89 µs | 21.82 µs |
+| `storage_backend_creation/file`   | 1.076 ms | 1.084 ms | 1.093 ms |
 
 ## Regression policy
 
