@@ -86,6 +86,7 @@ pub enum ReturnItem {
 }
 
 impl ReturnItem {
+    /// Returns the variable name bound to this return item.
     pub fn variable(&self) -> &str {
         match self {
             Self::Variable(v) | Self::Property(v, _) => v,
@@ -119,12 +120,14 @@ impl MatchPattern {
     }
 }
 
+/// A single element in the MATCH pattern -- either a node or an edge.
 #[derive(Debug, Clone)]
 pub enum PatternElement {
     Node(NodePattern),
     Edge(EdgePattern),
 }
 
+/// A node binding in the MATCH pattern with optional kind, entity_type, and property filters.
 #[derive(Debug, Clone)]
 pub struct NodePattern {
     pub variable: Option<String>,

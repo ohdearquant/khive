@@ -1,8 +1,10 @@
 //! `kkernel vector` — vector store introspection and housekeeping.
 //!
-//! Implements:
-//! - `kkernel vector capabilities`  — print VectorStoreCapabilities for the active backend
-//! - `kkernel vector sweep`         — run an orphan-sweep to remove stale vector rows
+//! Shipped:
+//! - `kkernel vector capabilities` — print VectorStoreCapabilities for the active backend
+//!
+//! Deferred (returns `NotImplemented`, tracked in #381):
+//! - `kkernel vector sweep` — run an orphan-sweep to remove stale vector rows
 
 use std::path::PathBuf;
 
@@ -12,6 +14,7 @@ use serde::Serialize;
 
 // ── Subcommand tree ────────────────────────────────────────────────────────────
 
+/// Subcommands for `kkernel vector` -- vector store introspection and housekeeping.
 #[derive(Subcommand, Debug)]
 pub enum VectorCommand {
     /// Report the capability flags of the active vector backend.
@@ -36,6 +39,7 @@ pub struct VectorCapabilitiesArgs {
     pub db: Option<PathBuf>,
 }
 
+/// CLI arguments for `kkernel vector sweep`.
 #[derive(clap::Parser, Debug)]
 pub struct VectorSweepArgs {
     /// Namespace to sweep. May be repeated. Empty = all namespaces.

@@ -542,6 +542,13 @@ fn triples_to_ast(
     })
 }
 
+/// Parse a SPARQL query string into a [`GqlQuery`] AST.
+///
+/// # Errors
+///
+/// Returns [`QueryError::Parse`] if the input is not valid SPARQL syntax, or
+/// [`QueryError::Unsupported`] for unsupported SPARQL features (e.g. `*` paths,
+/// disconnected triple patterns, branching).
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
     let mut parser = SparqlParser::new(input.trim());
     parser.parse_query()

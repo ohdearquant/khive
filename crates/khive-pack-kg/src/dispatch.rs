@@ -1,11 +1,7 @@
-// dispatch.rs — PackRuntime impl for KgPack plus inventory self-registration.
-//
-// The `dispatch` method routes each verb to its handler in handlers.rs.
-// The `verbs` introspection verb has no namespace side-effect and is routed
-// before graph dispatch.
-//
-// OSS sharing comes from the registry/runtime default namespace; cloud isolation
-// comes from authenticated token namespace plus backend-file routing.
+//! PackRuntime impl for KgPack plus inventory self-registration.
+//!
+//! Routes each verb to its handler in `handlers`. OSS sharing comes from the
+//! registry/runtime default namespace; cloud isolation from authenticated tokens.
 
 use async_trait::async_trait;
 use serde_json::Value;

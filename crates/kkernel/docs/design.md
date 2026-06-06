@@ -41,7 +41,7 @@
 - Handler `visibility` distinguishes MCP-exposed `Verb` entries from internal
   `Subhandler` entries (e.g. `memory.recall_embed`).
 
-### ADR-023 / ADR-024: Verb namespace contract
+### ADR-023: Verb namespace contract
 
 - The kg substrate pack owns 16 bare verb names (no dot prefix): `create`, `get`,
   `list`, `stats`, `update`, `delete`, `search`, `link`, `neighbors`, `traverse`,

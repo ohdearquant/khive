@@ -1,3 +1,9 @@
+//! SQLite storage backend for the khive knowledge graph runtime.
+//!
+//! Implements the capability traits from `khive-storage` (entities, notes, edges,
+//! events, vectors, FTS5, sparse) backed by a WAL-mode SQLite database with
+//! connection pooling.
+
 pub mod backend;
 pub mod error;
 pub mod extension;

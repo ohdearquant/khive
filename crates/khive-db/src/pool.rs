@@ -296,7 +296,7 @@ impl ConnectionPool {
         &self.config
     }
 
-    /// Compatibility method: returns the writer connection wrapped in Arc<Mutex>.
+    /// Compatibility method: returns the writer connection wrapped in `Arc<Mutex>`.
     ///
     /// WARNING: This exists only for backward compatibility with code that
     /// calls `store.conn()`. New code should use `reader()` and `writer()`.

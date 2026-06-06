@@ -1,10 +1,12 @@
 //! `kkernel engine` — embedding model lifecycle management.
 //!
-//! Implements:
-//! - `kkernel engine list`                     — show all engines and their model history
-//! - `kkernel engine status <engine>`          — per-engine active model and migration state
-//! - `kkernel engine migrate <engine> --to ... / --resume / --abort`
-//! - `kkernel engine drift-check <engine>`     — one-shot drift detection
+//! Shipped:
+//! - `kkernel engine list`   — show all engines and their model history
+//! - `kkernel engine status` — per-engine active model and migration state
+//!
+//! Deferred (returns `NotImplemented`, tracked in #380):
+//! - `kkernel engine migrate`     — model migration (EmbedMigrationWorker)
+//! - `kkernel engine drift-check` — one-shot drift detection (lattice_transport)
 //!
 //! These commands are operator-only. No MCP verbs are exposed.
 
@@ -34,6 +36,7 @@ pub enum EngineCommand {
     DriftCheck(EngineDriftCheckArgs),
 }
 
+/// CLI arguments for `kkernel engine list`.
 #[derive(clap::Parser, Debug)]
 pub struct EngineListArgs {
     /// Print human-readable output instead of JSON.
@@ -101,6 +104,7 @@ pub struct EngineDriftCheckArgs {
 
 // ── Output types ───────────────────────────────────────────────────────────────
 
+/// A single row from the `_embedding_models` table.
 #[derive(Clone, Debug, Serialize)]
 pub struct EngineModelRecord {
     pub engine_name: String,

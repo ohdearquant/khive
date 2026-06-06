@@ -30,6 +30,7 @@ pub struct Entity {
 }
 
 impl Entity {
+    /// Create a new entity with a generated UUID and current timestamp.
     pub fn new(
         namespace: impl Into<String>,
         kind: impl Into<String>,
@@ -53,21 +54,25 @@ impl Entity {
         }
     }
 
+    /// Set the pack-governed entity subtype token.
     pub fn with_entity_type(mut self, t: Option<impl Into<String>>) -> Self {
         self.entity_type = t.map(Into::into);
         self
     }
 
+    /// Set the entity description.
     pub fn with_description(mut self, d: impl Into<String>) -> Self {
         self.description = Some(d.into());
         self
     }
 
+    /// Set the entity properties JSON blob.
     pub fn with_properties(mut self, p: Value) -> Self {
         self.properties = Some(p);
         self
     }
 
+    /// Set the entity tags.
     pub fn with_tags(mut self, t: Vec<String>) -> Self {
         self.tags = t;
         self
@@ -85,17 +90,24 @@ pub struct EntityFilter {
     pub tags_any: Vec<String>,
 }
 
+/// Graph-node CRUD over the entities substrate table.
 #[async_trait]
 pub trait EntityStore: Send + Sync + 'static {
+    /// Insert or update a single entity.
     async fn upsert_entity(&self, entity: Entity) -> StorageResult<()>;
+    /// Insert or update a batch of entities.
     async fn upsert_entities(&self, entities: Vec<Entity>) -> StorageResult<BatchWriteSummary>;
+    /// Fetch an entity by UUID, returning `None` if absent.
     async fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>>;
+    /// Delete an entity by UUID using the specified delete mode.
     async fn delete_entity(&self, id: Uuid, mode: DeleteMode) -> StorageResult<bool>;
+    /// Query entities matching a filter within a namespace, with pagination.
     async fn query_entities(
         &self,
         namespace: &str,
         filter: EntityFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Entity>>;
+    /// Count entities matching a filter within a namespace.
     async fn count_entities(&self, namespace: &str, filter: EntityFilter) -> StorageResult<u64>;
 }

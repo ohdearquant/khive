@@ -379,6 +379,9 @@ struct Candidate {
     expanded: bool,
 }
 
+// REASON: greedy_search_inner requires all eight parameters (vectors, dimensions,
+// adjacency, query, start, k, search_list_size, visited) to avoid bundling them
+// into a struct that would add allocation overhead on the hot search path.
 #[allow(clippy::too_many_arguments)]
 fn greedy_search_inner(
     vectors: &[f32],
@@ -877,6 +880,8 @@ mod tests {
         }
     }
 
+    // REASON: test helper kept for future graph traversal tests that need a
+    // simple chain topology with known distances.
     #[allow(dead_code)]
     fn make_line_graph_test(n: usize) -> (Vec<f32>, VamanaGraph) {
         let vectors = make_line_vectors(n);

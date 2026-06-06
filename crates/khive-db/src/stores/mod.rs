@@ -1,3 +1,5 @@
+//! SQLite-backed store implementations for each storage capability trait.
+
 pub mod entity;
 pub mod event;
 pub mod graph;

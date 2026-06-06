@@ -6,11 +6,8 @@
 
 - `graph_edges` carries a `target_backend` column added in V9 that enables
   backend-specific routing for edge traversal.
-- On conflict (duplicate source/target/relation triple), the upsert should
-  refresh the existing row's weight/metadata (DO UPDATE), not silently ignore
-  the write (DO NOTHING). A known gap: the current V9 upsert path retains
-  weight=1.0 when a caller supplies weight=0.5 on a duplicate edge (see
-  graph_duplicate_edges_refresh_existing_row test, marked CRIT).
+- On conflict (duplicate source/target/relation triple), the upsert uses
+  `ON CONFLICT ... DO UPDATE` to refresh weight/metadata on the existing row.
 
 ### ADR-013: Note Kind Taxonomy
 
@@ -80,7 +77,7 @@
 - V21 creates `knowledge_sections` with a 10-value SectionType enum, FK to
   `knowledge_atoms`, and UNIQUE(atom_id, section_type) (Phase 2).
 
-### ADR-049: Knowledge Lifecycle Status
+### ADR-049: Daemon & Warm Startup
 
 - V22 extends `knowledge_atoms`, `knowledge_sections`, and `knowledge_domains`
   with a `status` column (NOT NULL DEFAULT 'draft'), plus `source_uri` and
@@ -90,13 +87,6 @@
 
 ## Consistency Notes
 
-- **F053 (CRIT)**: `graph_edges` duplicate-upsert path uses DO NOTHING instead
-  of DO UPDATE. On a conflict, the existing edge weight is not refreshed to the
-  caller-supplied value. This diverges from the ADR-009 requirement that a
-  second upsert refreshes weight/metadata. Tracked via the
-  `graph_duplicate_edges_refresh_existing_row` test which asserts the expected
-  (currently failing) behavior.
-
 - **sqlite-vec KNN non-monotonicity** (`stores/vectors.rs`): The IN-subquery
   approach for namespace-scoped KNN can produce non-monotonic results. Tracked
   in MEMORY.md under `project_sqlite_vec_knn_bug.md`.
@@ -104,3 +94,5 @@
 - **`embedding_coverage` stat hardcoded**: `stats()` reports
   `embedding_coverage: 0.0` regardless of actual indexed vector count. This is
   a known lie in the stats implementation, not a data issue.
+
+Last reviewed: 2026-06-06

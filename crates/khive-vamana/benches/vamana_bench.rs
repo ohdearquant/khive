@@ -166,19 +166,22 @@ fn bench_snapshot(c: &mut Criterion) {
                 vector_count: n as u64,
                 dimensions: DIM as u32,
             };
-            let ext_ids: Vec<String> = (0..n).map(|i| format!("id-{i}")).collect();
-            bencher.iter(|| {
-                black_box(
-                    index
-                        .to_snapshot(
-                            "bench-ns",
-                            "bench-model",
-                            black_box(fp),
-                            black_box(ext_ids.clone()),
-                        )
-                        .expect("to_snapshot failed"),
-                )
-            })
+            bencher.iter_batched(
+                || (0..n).map(|i| format!("id-{i}")).collect::<Vec<String>>(),
+                |ext_ids| {
+                    black_box(
+                        index
+                            .to_snapshot(
+                                "bench-ns",
+                                "bench-model",
+                                black_box(fp),
+                                black_box(ext_ids),
+                            )
+                            .expect("to_snapshot failed"),
+                    )
+                },
+                criterion::BatchSize::SmallInput,
+            )
         });
 
         group.bench_with_input(

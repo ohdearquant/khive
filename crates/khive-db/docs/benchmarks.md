@@ -57,24 +57,26 @@ cargo bench -p khive-db --features vectors -- storage_backend
 
 ## Baseline
 
-Measured on: TBD
+Baselines have not been measured yet. Run
+`cargo bench -p khive-db --features vectors` and fill in the table below with
+actual results before using this ledger for regression tracking.
 
 | Benchmark                              | p50 | p95 | Notes |
 | -------------------------------------- | --- | --- | ----- |
-| `fts5_search/anyterm_1term`            | TBD | TBD |       |
-| `fts5_search/anyterm_3terms`           | TBD | TBD |       |
-| `fts5_search/plain_no_snippet`         | TBD | TBD |       |
-| `fts5_search/plain_with_snippet`       | TBD | TBD |       |
-| `fts5_upsert_batch/docs/1000`          | TBD | TBD |       |
-| `sqlite_vec_search/top_k/10`           | TBD | TBD |       |
-| `sqlite_vec_search/top_k/100`          | TBD | TBD |       |
-| `sqlite_vec_insert_batch/records/1000` | TBD | TBD |       |
-| `storage_backend_creation/memory`      | TBD | TBD |       |
-| `storage_backend_creation/file`        | TBD | TBD |       |
+| `fts5_search/anyterm_1term`            | --  | --  |       |
+| `fts5_search/anyterm_3terms`           | --  | --  |       |
+| `fts5_search/plain_no_snippet`         | --  | --  |       |
+| `fts5_search/plain_with_snippet`       | --  | --  |       |
+| `fts5_upsert_batch/docs/1000`          | --  | --  |       |
+| `sqlite_vec_search/top_k/10`           | --  | --  |       |
+| `sqlite_vec_search/top_k/100`          | --  | --  |       |
+| `sqlite_vec_insert_batch/records/1000` | --  | --  |       |
+| `storage_backend_creation/memory`      | --  | --  |       |
+| `storage_backend_creation/file`        | --  | --  |       |
 
 ## Regression policy
 
-- Any hot-path benchmark regressing >15% vs baseline requires investigation
+- Any hot-path benchmark regressing >5% vs baseline requires investigation
   before merge.
 - Run `cargo bench -p khive-db --features vectors` in CI or locally before
   performance-sensitive PRs.

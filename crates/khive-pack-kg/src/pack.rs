@@ -1,8 +1,6 @@
-// pack.rs — KgPack struct, Pack trait impl, and pack-extensible edge endpoint rules.
-//
-// The KG pack extends the base entity→entity allowlist with person→org and
-// org→org relationship pairs. These are additive only — the base contract in
-// operations.rs is unchanged.
+//! KgPack struct, `Pack` trait impl, and pack-extensible edge endpoint rules.
+//!
+//! Extends the base allowlist with person-org and org-org relationship pairs (additive only).
 
 use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack};
 

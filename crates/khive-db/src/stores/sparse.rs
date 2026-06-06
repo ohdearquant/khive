@@ -103,6 +103,7 @@ pub(crate) fn ensure_sparse_schema(
     conn.execute_batch(&ddl)
 }
 
+/// SQLite-backed sparse vector store scoped to a single namespace and model.
 pub struct SqliteSparseStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
@@ -111,6 +112,11 @@ pub struct SqliteSparseStore {
 }
 
 impl SqliteSparseStore {
+    /// Create a new sparse store for the given model key and namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SqliteError` if the backing table cannot be created.
     pub fn new(
         pool: Arc<ConnectionPool>,
         is_file_backed: bool,

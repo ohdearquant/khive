@@ -46,6 +46,7 @@ pub enum EventOutcome {
 }
 
 impl EventOutcome {
+    /// Return the canonical lowercase string for this outcome.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Success => "success",
@@ -121,6 +122,7 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// All 26 event kind variants in declaration order.
     pub const ALL: [Self; 26] = [
         Self::Audit,
         Self::RecallExecuted,
@@ -150,6 +152,7 @@ impl EventKind {
         Self::ProposalWithdrawn,
     ];
 
+    /// Return the canonical snake_case string for this event kind.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Audit => "audit",

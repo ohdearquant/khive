@@ -1,7 +1,35 @@
 # khive-pack-kg Design Notes
 
-This document captures design rationale and invariant proofs that are too long to live inline
-in source code. Source files reference this document with short pointers.
+**Scope**: KG verb pack -- 16 verb handlers for entity/note CRUD, graph traversal,
+hybrid search, event-sourced proposals. First-party pack shipped with the khive binary.
+
+## Primary Links
+
+- Source: [`src/`](../src/)
+  - [`handlers/mod.rs`](../src/handlers/mod.rs) -- 16 verb handlers
+  - [`apply_worker/mod.rs`](../src/apply_worker/mod.rs) -- proposal apply pipeline
+  - [`projection_worker/mod.rs`](../src/projection_worker/mod.rs) -- proposals_open projection
+  - [`dispatch.rs`](../src/dispatch.rs) -- PackRuntime impl + self-registration
+  - [`handler_defs.rs`](../src/handler_defs.rs) -- HandlerDef table (16 entries)
+  - [`vocab.rs`](../src/vocab.rs) -- pack-owned entity/note vocabulary
+  - [`entity_type_registry.rs`](../src/entity_type_registry.rs) -- entity subtype validation
+  - [`pack.rs`](../src/pack.rs) -- KgPack struct + edge endpoint rules
+- Tests: [`tests/integration.rs`](../tests/integration.rs)
+- Benchmarks: none (no `benches/` target)
+
+## ADR References
+
+- [ADR-001: Entity Kind Taxonomy](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)
+- [ADR-002: Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
+- [ADR-013: Note Kind Taxonomy](../../../docs/adr/ADR-013-note-kind-taxonomy.md)
+- [ADR-014: Curation Operations](../../../docs/adr/ADR-014-curation-operations.md)
+- [ADR-017: Pack Standard](../../../docs/adr/ADR-017-pack-standard.md)
+- [ADR-027: Dynamic Pack Loading](../../../docs/adr/ADR-027-dynamic-pack-loading.md)
+- [ADR-038: Bulk Link](../../../docs/adr/ADR-038-bulk-link-operation.md)
+- [ADR-045: Timestamp Normalization](../../../docs/adr/ADR-045-timestamp-normalization.md)
+- [ADR-046: Event-Sourced Proposals](../../../docs/adr/ADR-046-event-sourced-proposals.md)
+- [ADR-048: Resource Entity Kind](../../../docs/adr/ADR-048-knowledge-section-profiles.md)
+- [ADR-050: Namespace Token Contract](../../../docs/adr/ADR-050-namespace-token-contract.md)
 
 ---
 
@@ -14,23 +42,24 @@ in source code. Source files reference this document with short pointers.
 - A 9th kind, `resource`, is a pack-local extension (see `vocab.rs`) for actionable content
   that agents consume (atoms, domains, skills, tools). It is not in the wire-level enum but
   is accepted via `FromStr` aliasing.
-- `benchmark` belongs to `Dataset`, not `Concept` — it evaluates models, it is not a conceptual
+- `benchmark` belongs to `Dataset`, not `Concept` -- it evaluates models, it is not a conceptual
   idea. `entity_type_registry.rs` enforces this at apply-worker and handler boundaries.
 - `model_family` is the canonical type name for the concept kind; `model` is the accepted alias
   to distinguish from a trained model instance (which is an `artifact`).
-- `Person` has no standard subtypes — roles are stored as metadata, not as registered subtypes.
+- `Person` has no standard subtypes -- roles are stored as metadata, not as registered subtypes.
 - Apply worker validates entity kinds against the closed taxonomy before committing any changeset
   step. Proposals cannot bypass taxonomy validation.
 
 ### ADR-002: Edge Ontology (15 relations)
 
-- The pack extends the base entity→entity allowlist with pack-level endpoint rules for person→org
-  and org→org pairs (see `pack.rs` `KG_EDGE_RULES`). These are additive only.
+- The pack extends the base entity-entity allowlist with pack-level endpoint rules for person-org
+  and org-org pairs (see `pack.rs` `KG_EDGE_RULES`). These are additive only.
 - When `runtime.link()` returns an allowlist error, `enrich_allowlist_error` in `handlers.rs`
   fetches entity kinds and appends the valid relations for that endpoint pair to the error message.
 - The sentinel substring matched inside `handlers.rs` is `"not in the base endpoint allowlist"`.
-- Error messages from `parse_relation` enumerate all 15 relations (derived from `EdgeRelation::ALL`),
-  not from a hardcoded string. Tests assert `derived_from` and `precedes` appear in the error.
+- Error messages from `parse_relation` enumerate all 15 relations (derived from
+  `EdgeRelation::ALL`), not from a hardcoded string. Tests assert `derived_from` and `precedes`
+  appear in the error.
 
 ### ADR-004: Note Status Remapping (Option A)
 
@@ -41,13 +70,13 @@ in source code. Source files reference this document with short pointers.
 ### ADR-013: Note Kind Taxonomy
 
 - Five canonical note kinds: `observation`, `insight`, `question`, `decision`, `reference`.
-- Aliases are rejected — only canonical names are accepted via `FromStr`.
+- Aliases are rejected -- only canonical names are accepted via `FromStr`.
 - Validation is enforced in `canonical_note_kind` in `handlers.rs`.
 
 ### ADR-014: UUID-only Operations (substrate inference)
 
 - `update` and `delete` accept an optional `kind` hint. When absent, the substrate is inferred
-  by probing entity → note → edge in order via `infer_kind_from_uuid`.
+  by probing entity -> note -> edge in order via `infer_kind_from_uuid`.
 - `get` resolves across all substrates plus proposal lookup as a final fallback.
 
 ### ADR-025 / ADR-060: Illocutionary Classification
@@ -91,13 +120,13 @@ in source code. Source files reference this document with short pointers.
   (`reviewed_and_emit`), so projection and event log always advance together.
 - `withdraw` similarly runs `withdrawn_and_emit` atomically.
 - Apply worker fires on approval threshold (v1: 1 approve, 0 rejects). It runs a pre-apply
-  CAS (`status: approved → applying`) before touching the KG, closing the apply/withdraw race.
+  CAS (`status: approved -> applying`) before touching the KG, closing the apply/withdraw race.
 - Hard-state proposals (applied/rejected/withdrawn) are retained in `proposals_open` for audit.
   `list(kind=proposal)` returns ALL rows when no status filter is supplied.
 - `get(id=<proposal_id>)` resolves to the `ProposalCreated` event payload (not a projection row).
 - All-or-nothing write budget: if `max_new_entries` is exceeded, `ProposalApplied{Failed}` is
   emitted and status stays `approved` (no KG mutation).
-- Failed applies revert `status: applying → approved` so proposals are not permanently stuck.
+- Failed applies revert `status: applying -> approved` so proposals are not permanently stuck.
 - Self-approval is forbidden except in OSS local mode (single-user, `actor == "local"`).
 - `BUG-6`: `parent_id` is validated against `proposals_open` before creating an amendment.
 
@@ -111,7 +140,7 @@ in source code. Source files reference this document with short pointers.
 
 - The KG pack honors the `NamespaceToken` received from the `VerbRegistry::dispatch` caller.
 - Entity/edge operations use the graph token; note/event operations use the caller token.
-- Cross-namespace reads return `NotFound` (indistinguishable from absence) — fail-closed.
+- Cross-namespace reads return `NotFound` (indistinguishable from absence) -- fail-closed.
 - The dispatch test suite covers: tenant-a creates are visible to tenant-a and opaque to tenant-b;
   OSS default namespace entities co-locate under the `local` namespace.
 
@@ -140,13 +169,13 @@ Packs with confirmed `Subhandler` entries as of this audit:
   `recall_score`
 - `pack-brain`: `brain.state`, `brain.config`, `brain.events`, `brain.emit` (deprecated)
 
-*Source pointer*: `src/handler_defs.rs` — the comment block above `static KG_HANDLERS` summarises this.
+*Source pointer*: `src/handler_defs.rs` -- the comment block above `static KG_HANDLERS` summarises this.
 
 ---
 
 ## Proposal Projection CAS / Event-Insert Proof (`reviewed_and_emit`)
 
-*Source pointer*: `src/projection_worker.rs` — `ProposalsProjectionWorker::reviewed_and_emit`.
+*Source pointer*: `src/projection_worker.rs` -- `ProposalsProjectionWorker::reviewed_and_emit`.
 
 `reviewed_and_emit` atomically runs the CAS UPDATE on `proposals_open` and a conditional
 `ProposalReviewed` event INSERT in a single `BEGIN IMMEDIATE` / `COMMIT` transaction via
@@ -158,9 +187,9 @@ Packs with confirmed `Subhandler` entries as of this audit:
 Since `execute_batch` runs both statements on the same connection with no intervening operations,
 `changes()` at INSERT time is exactly the UPDATE's row count.
 
-- If the UPDATE matched 1 row (this connection won the CAS): `changes() = 1` is true → the INSERT
+- If the UPDATE matched 1 row (this connection won the CAS): `changes() = 1` is true -> the INSERT
   runs.
-- If the UPDATE matched 0 rows (CAS lost): `changes() = 0` → the INSERT is skipped.
+- If the UPDATE matched 0 rows (CAS lost): `changes() = 0` -> the INSERT is skipped.
 
 This replaces the round-3 `updated_at = <now>` subquery guard, which was unsafe under
 same-microsecond concurrent calls: two callers can compute identical `now` values before either
@@ -179,18 +208,18 @@ Return value: `Ok((cas_hit, event_id))`.
 
 ## Message-Filter Scan Cap
 
-*Source pointer*: `src/handlers.rs` `handle_list` — note-substrate branch with `has_msg_filter`.
+*Source pointer*: `src/handlers.rs` `handle_list` -- note-substrate branch with `has_msg_filter`.
 
 When message-specific property filters (`thread_id`, `direction`, `from`, `to`, `read`) are
-active on `list(kind=note)`, the storage layer does not push those predicates to SQL — only
+active on `list(kind=note)`, the storage layer does not push those predicates to SQL -- only
 namespace + kind are indexed. The handler must apply them in-memory after retrieval.
 
 To avoid pathological scans on large note stores, a paginated scan loop caps total rows examined
 at `MAX_SCAN_TOTAL = 10_000`. Pages are fetched in batches of `PAGE_SIZE = 200`.
 
 Alternatives for deep mailboxes:
-- `comm.inbox` — dedicated inbox query with no cap.
-- `comm.thread` — thread-indexed lookup, O(1) per message.
+- `comm.inbox` -- dedicated inbox query with no cap.
+- `comm.thread` -- thread-indexed lookup, O(1) per message.
 
 ---
 
@@ -202,5 +231,26 @@ Alternatives for deep mailboxes:
 - `entity_type_registry.rs` validates `entity_type` at the handler boundary; the apply worker
   also validates at apply time. Both must stay in sync with `EntityKind::ALL`.
 - `KG_EDGE_RULES` in `pack.rs` are additive over the base contract in `operations.rs`.
-  If a new person→org or org→org relation is needed, add it here. Removing existing rules is a
-  breaking change — coordinate with the runtime team.
+  If a new person-org or org-org relation is needed, add it here. Removing existing rules is a
+  breaking change -- coordinate with the runtime team.
+
+---
+
+## Invariants and Failure Modes
+
+- Entity and note kinds are closed sets. Any unrecognized kind string is rejected with an error
+  listing valid values. Proposals bypass the same validation at apply time.
+- Edge weights must be finite numbers in `[0.0, 1.0]`. Out-of-range or non-finite weights are
+  rejected at the handler boundary (not silently clamped).
+- Namespace isolation is enforced at the runtime layer. ID-based operations verify
+  `record.namespace == caller_namespace` after fetching by UUID. Cross-namespace reads return
+  `NotFound` (indistinguishable from absence).
+- Proposal state transitions use CAS (compare-and-swap) guards on `proposals_open` to prevent
+  race conditions between concurrent approve/withdraw/apply operations.
+- The apply worker exclusively owns the `applying` state. Failed applies revert to `approved`.
+- The `changes()` SQL guard (not `updated_at` equality) prevents duplicate event insertion
+  under same-microsecond timestamp collisions.
+
+---
+
+Last reviewed: 2026-06-06

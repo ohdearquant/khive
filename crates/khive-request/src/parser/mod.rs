@@ -1,6 +1,16 @@
+//! Recursive-descent parser for the verb-dispatch DSL (ADR-016).
+
+mod path;
+mod scan;
+
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
+
+pub(crate) use path::{apply_path_segment, split_path};
+pub(crate) use scan::scan_string_end;
+
+use scan::{char_label, find_prev_ref_pos, json_value_contains_prev_ref};
 
 use crate::types::{ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest, MAX_OPS};
 
@@ -63,9 +73,6 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
 }
 
 /// Parse the rest of a chain after the first op has been consumed.
-///
-/// Called when we've seen `first_op` followed by `|`. Parses one or more
-/// `| op` segments and returns a `Chain` request.
 fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedRequest, DslError> {
     let mut ops = vec![first_op];
     while p.peek() == Some('|') {
@@ -223,7 +230,7 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
     })
 }
 
-// ── recursive-descent parser ────────────────────────────────────────────────
+// -- recursive-descent parser -------------------------------------------------
 
 pub(crate) struct Parser<'a> {
     src: &'a [u8],
@@ -352,11 +359,8 @@ impl<'a> Parser<'a> {
     /// Parse an argument value — either a `$prev` reference, an array/object
     /// literal (which may contain `$prev` refs), or a plain JSON literal.
     ///
-    /// A quoted string like `"$prev.id"` is treated identically to the
-    /// unquoted token `$prev.id`. Both resolve to `ArgValue::PrevRef { path: "id" }`.
-    /// To pass the literal string `$prev.id` as a value, escape the leading `$`
-    /// in the JSON string: `"\\$prev.id"` deserializes to `\$prev.id`, which is
-    /// stripped to `$prev.id` and returned as a concrete `ArgValue::Value`.
+    /// A quoted `"$prev.id"` is promoted identically to unquoted `$prev.id`.
+    /// See `docs/protocol.md` for escape semantics.
     fn parse_arg_value(&mut self) -> Result<ArgValue, DslError> {
         self.skip_ws();
         if self.peek() == Some('$') {
@@ -444,8 +448,7 @@ impl<'a> Parser<'a> {
         }
         loop {
             self.skip_ws();
-            // Key must be a quoted string — parse it directly (not via parse_value,
-            // which uses scan_value_end and would greedily consume `:value`).
+            // Key must be a quoted string.
             let key = match self.peek() {
                 Some('"') => {
                     let start = self.pos;
@@ -516,11 +519,8 @@ impl<'a> Parser<'a> {
 
     /// Parse a `$prev` or `$prev.field.path` reference.
     ///
-    /// Grammar: `$prev` optionally followed by a path composed of:
-    /// - dot-separated identifiers: `.field`
-    /// - bracket array indices:     `[N]`
-    ///
-    /// Examples: `$prev`, `$prev.id`, `$prev.items[0].id`, `$prev[0].name`
+    /// Grammar: `$prev` optionally followed by dot-segments (`.field`)
+    /// and/or bracket indices (`[N]`).
     fn parse_prev_ref(&mut self) -> Result<ArgValue, DslError> {
         let start = self.pos;
         // Consume `$`
@@ -613,28 +613,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Check whether a parsed string value is a `$prev` reference written
-    /// inside quotes. Returns `Some(PrevRef)` if so, or `Some(Value(...))` if
-    /// the string is an escaped literal, or `None` if neither.
-    ///
-    /// ## Escape semantics
-    ///
-    /// A string like `"$prev.id"` deserializes to the Rust string `$prev.id`
-    /// and is promoted to `ArgValue::PrevRef { path: "id" }`.
-    ///
-    /// To pass the **literal** string `$prev.id` as a value, write `"\\$prev.id"`
-    /// in the DSL source. That deserializes to `\$prev.id` (one leading backslash).
-    /// This function strips the leading `\` and returns
-    /// `ArgValue::Value(json!("$prev.id"))`.
+    /// inside quotes. Returns `Some(PrevRef)` if so, `Some(Value(...))` for
+    /// escaped literals (`"\\$prev.id"` -> literal `$prev.id`), or `None`.
     ///
     /// `$prevish.id` does NOT match (prefix boundary is `.` or `[` only).
-    ///
-    /// ## Bracket-index validation
-    ///
-    /// Quoted `$prev[...]` strings are routed through the same bracket-body
-    /// validator as unquoted refs: only non-negative integers are accepted inside
-    /// `[...]`. Malformed brackets return `None` (treated as a literal).
+    /// Malformed bracket indices return `None` (treated as literal).
+    /// See `docs/protocol.md` for escape and bracket-index semantics.
     fn string_as_prev_ref(s: &str) -> Option<ArgValue> {
-        // Escape: `\$prev...` → strip the leading backslash, return literal.
+        // Escape: `\$prev...` -> strip the leading backslash, return literal.
         if let Some(rest) = s.strip_prefix('\\') {
             if rest == "$prev" || rest.starts_with("$prev.") || rest.starts_with("$prev[") {
                 return Some(ArgValue::Value(Value::String(rest.to_owned())));
@@ -656,7 +642,6 @@ impl<'a> Parser<'a> {
         }
         // "$prev[N]..." — validate bracket body before promoting.
         if let Some(after_bracket) = s.strip_prefix("$prev[") {
-            // after_bracket is everything after "[", e.g. "0].id" or "-1].id"
             if let Some(close) = after_bracket.find(']') {
                 let index_str = &after_bracket[..close];
                 // Only non-negative integers are valid.
@@ -672,12 +657,11 @@ impl<'a> Parser<'a> {
         None
     }
 
-    /// Walk forward through the input to find the end of a JSON value, respecting
-    /// nested brackets / braces and string literals. The returned index is one
-    /// past the last byte of the value (exclusive).
+    /// Walk forward through the input to find the end of a JSON value,
+    /// respecting nested brackets/braces and string literals.
     fn scan_value_end(&self) -> Result<usize, DslError> {
         let mut i = self.pos;
-        let mut depth_paren: i32 = 0; // `(` from the surrounding op
+        let mut depth_paren: i32 = 0;
         let mut depth_brack: i32 = 0;
         let mut depth_brace: i32 = 0;
         while i < self.src.len() {
@@ -693,7 +677,6 @@ impl<'a> Parser<'a> {
                         if depth_paren == 0 && depth_brace == 0 {
                             return Ok(i);
                         }
-                        // we never opened a paren here; this terminates the value.
                         return Ok(i);
                     }
                     depth_brack -= 1;
@@ -701,9 +684,6 @@ impl<'a> Parser<'a> {
                 '{' => depth_brace += 1,
                 '}' => {
                     if depth_brace == 0 {
-                        // Closing brace outside any open brace — terminates the
-                        // current value (e.g. a string value inside an object literal
-                        // parsed by parse_object_arg).
                         if depth_paren == 0 && depth_brack == 0 {
                             return Ok(i);
                         }
@@ -737,129 +717,5 @@ impl<'a> Parser<'a> {
             return Err(DslError::UnclosedBracket { kind: '{' });
         }
         Ok(i)
-    }
-}
-
-/// Return `true` if the string value is a `$prev` reference written inside JSON
-/// quotes. Used to detect `"$prev.id"` literals in JSON-form input.
-///
-/// Matches exactly `$prev`, strings starting with `$prev.`, or strings starting
-/// with `$prev[` (bracket-index form). Does NOT match `$prevish.id` — the prefix
-/// boundary is `.` or `[` only.
-fn is_prev_ref_string(s: &str) -> bool {
-    s == "$prev" || s.starts_with("$prev.") || s.starts_with("$prev[")
-}
-
-/// Recursively scan a JSON value for any string that is a `$prev` reference.
-///
-/// This covers nested arrays and objects, so `{"ids": ["$prev.id"]}` and
-/// `{"nested": {"id": "$prev[0].id"}}` are both detected.
-fn json_value_contains_prev_ref(v: &Value) -> bool {
-    match v {
-        Value::String(s) => is_prev_ref_string(s),
-        Value::Array(arr) => arr.iter().any(json_value_contains_prev_ref),
-        Value::Object(map) => map.values().any(json_value_contains_prev_ref),
-        _ => false,
-    }
-}
-
-/// A single segment in a `$prev` path — either a field name or an array index.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PathSegment<'a> {
-    Field(&'a str),
-    Index(usize),
-}
-
-/// Split a dotted path that may contain bracket array indices into segments.
-///
-/// `"items[0].id"` → `[Field("items"), Index(0), Field("id")]`
-/// `"[2].name"` → `[Index(2), Field("name")]`
-/// `"plain.path"` → `[Field("plain"), Field("path")]`
-pub(crate) fn split_path(path: &str) -> Vec<PathSegment<'_>> {
-    let mut segments = Vec::new();
-    let mut remaining = path;
-    while !remaining.is_empty() {
-        if let Some(rest) = remaining.strip_prefix('[') {
-            // Array index: `[N]...`
-            if let Some(close) = rest.find(']') {
-                let index_str = &rest[..close];
-                if let Ok(idx) = index_str.parse::<usize>() {
-                    segments.push(PathSegment::Index(idx));
-                    remaining = &rest[close + 1..];
-                    // Strip leading '.' before next segment, if any.
-                    remaining = remaining.strip_prefix('.').unwrap_or(remaining);
-                    continue;
-                }
-            }
-            // Malformed index — treat whole remainder as field (will fail lookup).
-            segments.push(PathSegment::Field(remaining));
-            break;
-        }
-        // Field name — up to next '.' or '['.
-        let end = remaining.find(['.', '[']).unwrap_or(remaining.len());
-        let field = &remaining[..end];
-        if !field.is_empty() {
-            segments.push(PathSegment::Field(field));
-        }
-        remaining = &remaining[end..];
-        // Strip leading '.' separator.
-        remaining = remaining.strip_prefix('.').unwrap_or(remaining);
-    }
-    segments
-}
-
-/// Apply one path segment to a JSON value — field lookup or array index.
-pub(crate) fn apply_path_segment<'a>(cur: &'a Value, seg: PathSegment<'_>) -> Option<&'a Value> {
-    match seg {
-        PathSegment::Field(key) => cur.get(key),
-        PathSegment::Index(idx) => cur.as_array()?.get(idx),
-    }
-}
-
-/// Scan an op's args for any `PrevRef` (or `Array`/`Object` containing one) and
-/// return a representative position (0) if any is found. Used to emit
-/// `PrevRefOutsideChain` at parse time for Single and Parallel modes.
-fn find_prev_ref_pos(op: &ParsedOp) -> Option<usize> {
-    for av in op.args.values() {
-        if arg_value_has_prev_ref(av) {
-            return Some(0);
-        }
-    }
-    None
-}
-
-fn arg_value_has_prev_ref(av: &ArgValue) -> bool {
-    match av {
-        ArgValue::PrevRef { .. } => true,
-        ArgValue::Array(els) => els.iter().any(arg_value_has_prev_ref),
-        ArgValue::Object(pairs) => pairs.iter().any(|(_, v)| arg_value_has_prev_ref(v)),
-        ArgValue::Value(_) => false,
-    }
-}
-
-pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslError> {
-    let mut i = start + 1;
-    while i < src.len() {
-        match src[i] as char {
-            '\\' => {
-                i += 2; // skip escape pair
-                continue;
-            }
-            '"' => return Ok(i + 1),
-            _ => i += 1,
-        }
-    }
-    Err(DslError::UnclosedString)
-}
-
-fn char_label(c: char) -> &'static str {
-    match c {
-        '(' => "'('",
-        ')' => "')'",
-        '[' => "'['",
-        ']' => "']'",
-        '=' => "'='",
-        ',' => "','",
-        _ => "expected char",
     }
 }

@@ -26,6 +26,7 @@ pub struct Note {
 }
 
 impl Note {
+    /// Create a new note with a generated UUID and current timestamp.
     pub fn new(
         namespace: impl Into<String>,
         kind: impl Into<String>,
@@ -49,23 +50,27 @@ impl Note {
         }
     }
 
+    /// Set the note display name.
     pub fn with_name(mut self, n: impl Into<String>) -> Self {
         self.name = Some(n.into());
         self
     }
 
+    /// Set salience, clamped to `[0.0, 1.0]`. Panics in debug on non-finite input.
     pub fn with_salience(mut self, s: f64) -> Self {
         debug_assert!(s.is_finite(), "salience must be finite, got {s}");
         self.salience = Some(s.clamp(0.0, 1.0));
         self
     }
 
+    /// Set decay factor, floored at `0.0`. Panics in debug on non-finite input.
     pub fn with_decay(mut self, d: f64) -> Self {
         debug_assert!(d.is_finite(), "decay_factor must be finite, got {d}");
         self.decay_factor = Some(d.max(0.0));
         self
     }
 
+    /// Set the note properties JSON blob.
     pub fn with_properties(mut self, p: Value) -> Self {
         self.properties = Some(p);
         self
@@ -127,26 +132,35 @@ pub struct NoteFilter {
     pub order_by: Option<(String, SortDir)>,
 }
 
+/// Temporal-referential note CRUD over the notes substrate table.
 #[async_trait]
 pub trait NoteStore: Send + Sync + 'static {
+    /// Insert or update a single note.
     async fn upsert_note(&self, note: Note) -> StorageResult<()>;
+    /// Insert or update a batch of notes.
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary>;
+    /// Fetch a note by UUID, returning `None` if absent.
     async fn get_note(&self, id: Uuid) -> StorageResult<Option<Note>>;
+    /// Delete a note by UUID using the specified delete mode.
     async fn delete_note(&self, id: Uuid, mode: DeleteMode) -> StorageResult<bool>;
+    /// Query notes by namespace and optional kind with pagination.
     async fn query_notes(
         &self,
         namespace: &str,
         kind: Option<&str>,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Query notes with property-based filtering and custom sort.
     async fn query_notes_filtered(
         &self,
         namespace: &str,
         filter: &NoteFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Count notes in a namespace, optionally filtered by kind.
     async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
 
+    /// Fetch multiple notes by UUID in a single call.
     async fn get_notes_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {

@@ -82,6 +82,7 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    /// Construct a [`Driver`](StorageError::Driver) error from a boxable source.
     pub fn driver(
         capability: StorageCapability,
         operation: impl Into<Cow<'static, str>>,
@@ -94,6 +95,7 @@ impl StorageError {
         }
     }
 
+    /// Return the storage capability that produced this error, if applicable.
     pub fn capability(&self) -> Option<StorageCapability> {
         match self {
             Self::NotFound { capability, .. }
@@ -108,6 +110,7 @@ impl StorageError {
         }
     }
 
+    /// Returns `true` for transient errors (pool, timeout, transaction) that may succeed on retry.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,

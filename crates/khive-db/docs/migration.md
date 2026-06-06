@@ -13,12 +13,12 @@ Each migration is a `VersionedMigration` struct with three fields:
 
 The `run_migrations` function:
 
-1. Creates the `_migrations` tracking table if absent
+1. Creates the `_schema_migrations` tracking table if absent
 2. Reads the current DB version (max applied version, or 0)
 3. Applies each migration with `version > current` in order
 4. Each migration runs in its own transaction; failure rolls back that
    migration and leaves the DB at the prior version
-5. Records the applied version, name, and timestamp in `_migrations`
+5. Records the applied version, name, and timestamp in `_schema_migrations`
 
 ## Version numbering
 
@@ -35,6 +35,26 @@ runtime. To add a migration, append a `VersionedMigration` entry with
   idempotent.
 - **Dedup-then-constrain**: Migrations that add unique indexes first
   deduplicate existing rows (keeping the earliest), then create the index.
+
+## Per-version notes
+
+- **V2**: `NOTES_DDL` already includes `name TEXT` for in-process schema
+  creation. The migration runner checks column existence before applying V2 to
+  stay idempotent.
+- **V4**: Deduplicates existing `graph_edges` rows sharing the same
+  `(namespace, source_id, target_id, relation)` triple, then adds a unique
+  index.
+- **V5**: `ENTITIES_DDL` already includes `entity_type TEXT`. Same
+  column-existence guard as V2.
+- **V9**: Adds lifecycle columns (`updated_at`, `deleted_at`) and
+  `target_backend` to `graph_edges` via table rebuild.
+- **V13**: Event observability columns. DDL computed at runtime via
+  `build_v13_event_observability_sql` to avoid duplicate-column errors.
+- **V14**: Embedding model registry (`_embedding_models`). DDL computed at
+  runtime to discover existing `vec_*` tables.
+- **V16**: Adds `embedding_model` column to regular `vec_*` tables.
+- **V17**: Preserving rebuild of `vec0` virtual tables to add `field` and
+  `embedding_model` columns without data loss.
 
 ## Legacy API
 

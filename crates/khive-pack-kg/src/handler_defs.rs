@@ -1,21 +1,15 @@
-// handler_defs.rs — Static KG_HANDLERS table (16 HandlerDef entries) and
-// the `verbs` introspection handler.
-//
-// The HandlerDef table is a single flat array of static data. Splitting it
-// across files would require unsafe static refs or separate crates without any
-// architectural benefit.
-//
+//! Static `KG_HANDLERS` table (16 `HandlerDef` entries) and the `verbs` introspection handler.
+//!
+//! All 16 handlers are `Visibility::Verb`. Full rationale in `docs/design.md`.
+
 // Illocutionary classification (Searle 1976):
-//   Assertive  — retrieves/presents state of affairs
-//   Commissive — commits caller to a persistent change
-//   Declaration — changes institutional status by fiat
+//   Assertive  -- retrieves/presents state of affairs
+//   Commissive -- commits caller to a persistent change
+//   Declaration -- changes institutional status by fiat
 //
 // Verbs 12-14 (propose, review, withdraw) implement the event-sourced proposal
 // lifecycle. Verb 15 (verbs) serves verb discovery. Verb 16 (stats) provides
 // namespace statistics.
-//
-// Visibility audit: all 16 handlers are Visibility::Verb.
-// Full rationale in docs/design.md §"Verb Visibility Audit".
 
 use serde_json::Value;
 

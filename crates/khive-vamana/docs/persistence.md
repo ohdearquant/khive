@@ -12,25 +12,25 @@
 
 ### `metadata.bin`
 
-| Offset | Size | Type | Field |
-|--------|------|------|-------|
-| 0 | 8 | bytes | magic `KHVVAMM1` |
-| 8 | 8 | LE u64 | `num_vectors` |
-| 16 | 8 | LE u64 | `dimensions` |
-| 24 | 8 | LE u64 | `max_degree` |
-| 32 | 8 | LE u64 | `search_list_size` |
-| 40 | 8 | LE f64 | `alpha` |
+| Offset | Size | Type   | Field              |
+| ------ | ---- | ------ | ------------------ |
+| 0      | 8    | bytes  | magic `KHVVAMM1`   |
+| 8      | 8    | LE u64 | `num_vectors`      |
+| 16     | 8    | LE u64 | `dimensions`       |
+| 24     | 8    | LE u64 | `max_degree`       |
+| 32     | 8    | LE u64 | `search_list_size` |
+| 40     | 8    | LE f64 | `alpha`            |
 
 Total: 48 bytes.
 
 ### `graph.bin`
 
-| Offset | Size | Type | Field |
-|--------|------|------|-------|
-| 0 | 8 | bytes | magic `KHVVAMG1` |
-| 8 | 4 | LE u32 | `num_nodes` |
-| 12 | 4 | LE u32 | `medoid` |
-| 16 | varies | per-node records | degree (4 bytes) + neighbors (4 bytes each) |
+| Offset | Size   | Type             | Field                                       |
+| ------ | ------ | ---------------- | ------------------------------------------- |
+| 0      | 8      | bytes            | magic `KHVVAMG1`                            |
+| 8      | 4      | LE u32           | `num_nodes`                                 |
+| 12     | 4      | LE u32           | `medoid`                                    |
+| 16     | varies | per-node records | degree (4 bytes) + neighbors (4 bytes each) |
 
 Each node record: `degree: u32` followed by `degree` neighbor IDs as `u32`.
 
@@ -59,6 +59,7 @@ Raw `f32` values in little-endian IEEE 754 format, row-major:
 ## Validation on load / restore
 
 Both `load` and `from_snapshot` validate:
+
 - Magic bytes and version fields
 - `num_vectors > 0`, `dimensions > 0`
 - `medoid < num_vectors`

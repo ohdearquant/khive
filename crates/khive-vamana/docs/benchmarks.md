@@ -7,25 +7,25 @@
 
 ## Benchmark targets (`benches/vamana_bench.rs`)
 
-| Target | Group | Description |
-|--------|-------|-------------|
-| `distance/l2_squared/384d` | distance | Throughput of 8-wide unrolled L2² on 384-dim vectors |
-| `distance/cosine_from_l2sq` | distance | Scalar cosine conversion |
-| `build/VamanaIndex::build/1000` | build | Full build, N=1000, DIM=384, R=32 |
-| `build/VamanaIndex::build/5000` | build | Full build, N=5000, DIM=384, R=64 |
-| `build/VamanaIndex::build/10000` | build | Full build, N=10000, DIM=384, R=64 |
-| `search/n=1000/k=10` | search | Single-query search latency |
-| `search/n=1000/k=50` | search | Single-query search latency |
-| `search/n=5000/k=10` | search | Single-query search latency |
-| `search/n=5000/k=50` | search | Single-query search latency |
-| `search/n=10000/k=10` | search | Single-query search latency |
-| `search/n=10000/k=50` | search | Single-query search latency |
-| `free_fns/build/1k` | free_fns | `khive_vamana::build` free function |
-| `free_fns/search/1k/k10` | free_fns | `khive_vamana::search` free function |
-| `snapshot/to_snapshot/1000` | snapshot | Snapshot serialization, N=1000 |
-| `snapshot/to_snapshot/5000` | snapshot | Snapshot serialization, N=5000 |
-| `snapshot/from_snapshot/1000` | snapshot | Snapshot restore, N=1000 |
-| `snapshot/from_snapshot/5000` | snapshot | Snapshot restore, N=5000 |
+| Target                           | Group    | Description                                          |
+| -------------------------------- | -------- | ---------------------------------------------------- |
+| `distance/l2_squared/384d`       | distance | Throughput of 8-wide unrolled L2² on 384-dim vectors |
+| `distance/cosine_from_l2sq`      | distance | Scalar cosine conversion                             |
+| `build/VamanaIndex::build/1000`  | build    | Full build, N=1000, DIM=384, R=32                    |
+| `build/VamanaIndex::build/5000`  | build    | Full build, N=5000, DIM=384, R=64                    |
+| `build/VamanaIndex::build/10000` | build    | Full build, N=10000, DIM=384, R=64                   |
+| `search/n=1000/k=10`             | search   | Single-query search latency                          |
+| `search/n=1000/k=50`             | search   | Single-query search latency                          |
+| `search/n=5000/k=10`             | search   | Single-query search latency                          |
+| `search/n=5000/k=50`             | search   | Single-query search latency                          |
+| `search/n=10000/k=10`            | search   | Single-query search latency                          |
+| `search/n=10000/k=50`            | search   | Single-query search latency                          |
+| `free_fns/build/1k`              | free_fns | `khive_vamana::build` free function                  |
+| `free_fns/search/1k/k10`         | free_fns | `khive_vamana::search` free function                 |
+| `snapshot/to_snapshot/1000`      | snapshot | Snapshot serialization, N=1000                       |
+| `snapshot/to_snapshot/5000`      | snapshot | Snapshot serialization, N=5000                       |
+| `snapshot/from_snapshot/1000`    | snapshot | Snapshot restore, N=1000                             |
+| `snapshot/from_snapshot/5000`    | snapshot | Snapshot restore, N=5000                             |
 
 ---
 
@@ -55,9 +55,13 @@ cargo bench -p khive-vamana --bench vamana_bench -- search
 
 ## Baseline table
 
-| Scenario | Baseline | Date | Commit | Machine | Notes |
-|----------|----------|------|--------|---------|-------|
-| (no baseline recorded yet) | — | — | — | — | First ledger entry pending a CI benchmark run |
+| Scenario                   | Baseline | Date | Commit | Machine | Notes                                         |
+| -------------------------- | -------- | ---- | ------ | ------- | --------------------------------------------- |
+| (no baseline recorded yet) | --       | --   | --     | --      | First ledger entry pending a CI benchmark run |
+
+> **Note:** Baselines need measuring. Run
+> `cargo bench -p khive-vamana --bench vamana_bench` on a consistent machine and
+> record the results here before the next release.
 
 ---
 

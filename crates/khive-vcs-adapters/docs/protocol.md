@@ -32,6 +32,7 @@ in `FormatAdapter::warnings()`.
 ## JSON Array Format (P0)
 
 The `JsonFormatAdapter` accepts a JSON array of objects. Dispatch:
+
 - Object with `source`/`from` **and** `target`/`to` keys → edge record
 - All other objects → entity record
 
@@ -42,7 +43,7 @@ ADR-036 §7 calls for streaming; deferred to P1 (requires `impl Read` pipeline w
 
 ## Deferred Formats
 
-| Priority | Format |
-|----------|--------|
-| P1 | BibTeX, Turtle/N-Triples, JSON-LD; streaming JSON parse |
-| P2 | GraphML, GEXF, Markdown |
+| Priority | Format                                                  |
+| -------- | ------------------------------------------------------- |
+| P1       | BibTeX, Turtle/N-Triples, JSON-LD; streaming JSON parse |
+| P2       | GraphML, GEXF, Markdown                                 |

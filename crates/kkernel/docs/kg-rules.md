@@ -34,14 +34,14 @@ message = "Edges must not be self-loops"
 
 ## Fields
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | string | yes | Unique rule identifier (appears in `RuleResult.id`) |
-| `severity` | string | no | `"error"`, `"warning"`, or `"info"` (default: `"warning"`) |
-| `kind` | string | yes | `"entity"` or `"edge"` — substrate the rule applies to |
-| `condition` | string | no | `field=value` equality predicate; `source_id=target_id` is the self-loop sentinel |
-| `require_field` | string | no | Rule fails if this field is absent or empty on matching records |
-| `message` | string | no | Human-readable violation message (`{id}` is replaced with the record ID) |
+| Field           | Type   | Required | Description                                                                       |
+| --------------- | ------ | -------- | --------------------------------------------------------------------------------- |
+| `id`            | string | yes      | Unique rule identifier (appears in `RuleResult.id`)                               |
+| `severity`      | string | no       | `"error"`, `"warning"`, or `"info"` (default: `"warning"`)                        |
+| `kind`          | string | yes      | `"entity"` or `"edge"` — substrate the rule applies to                            |
+| `condition`     | string | no       | `field=value` equality predicate; `source_id=target_id` is the self-loop sentinel |
+| `require_field` | string | no       | Rule fails if this field is absent or empty on matching records                   |
+| `message`       | string | no       | Human-readable violation message (`{id}` is replaced with the record ID)          |
 
 ## Built-in Checks
 

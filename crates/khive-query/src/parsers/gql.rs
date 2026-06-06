@@ -517,6 +517,11 @@ impl Parser {
     }
 }
 
+/// Parse a GQL query string into a [`GqlQuery`] AST.
+///
+/// # Errors
+///
+/// Returns [`QueryError::Parse`] if the input is not valid GQL syntax.
 pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
     let mut parser = Parser::new(input.trim());
     parser.parse_query()

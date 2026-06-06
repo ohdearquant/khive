@@ -59,6 +59,10 @@ Declared in `Cargo.toml` as `[[bench]] name = "parse_bench" harness = false`.
 
 ## Release Baseline
 
+No release baseline has been recorded yet. The crate has not cut a standalone
+release with benchmark regression tracking. Run `cargo bench -p khive-query` and
+record the first baseline before the next release that changes the parser or
+compiler.
+
 | Scenario | Baseline | Date | Commit | Toolchain | Machine |
 | --- | --- | --- | --- | --- | --- |
-| _(not yet recorded)_ | — | — | — | — | — |
