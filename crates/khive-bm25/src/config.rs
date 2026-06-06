@@ -66,11 +66,11 @@ impl Bm25Config {
 
     /// Validate configuration parameters.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.k1 < 0.0 {
-            return Err("k1 must be non-negative");
+        if !self.k1.is_finite() || self.k1 < 0.0 {
+            return Err("k1 must be finite and non-negative");
         }
-        if !(0.0..=1.0).contains(&self.b) {
-            return Err("b must be in range [0.0, 1.0]");
+        if !self.b.is_finite() || !(0.0..=1.0).contains(&self.b) {
+            return Err("b must be finite and in range [0.0, 1.0]");
         }
         Ok(())
     }
@@ -93,6 +93,34 @@ mod tests {
         assert!(Bm25Config::new(-0.1, 0.75).validate().is_err());
         assert!(Bm25Config::new(1.2, -0.1).validate().is_err());
         assert!(Bm25Config::new(1.2, 1.5).validate().is_err());
+    }
+
+    #[test]
+    fn test_config_nan_rejected() {
+        assert!(
+            Bm25Config::new(f64::NAN, 0.75).validate().is_err(),
+            "NaN k1 must be rejected"
+        );
+        assert!(
+            Bm25Config::new(1.2, f64::NAN).validate().is_err(),
+            "NaN b must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_config_inf_rejected() {
+        assert!(
+            Bm25Config::new(f64::INFINITY, 0.75).validate().is_err(),
+            "Inf k1 must be rejected"
+        );
+        assert!(
+            Bm25Config::new(f64::NEG_INFINITY, 0.75).validate().is_err(),
+            "NegInf k1 must be rejected"
+        );
+        assert!(
+            Bm25Config::new(1.2, f64::INFINITY).validate().is_err(),
+            "Inf b must be rejected"
+        );
     }
 
     #[test]

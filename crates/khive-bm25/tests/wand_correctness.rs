@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use khive_score::DeterministicScore;
-
-use super::{Bm25Index, SearchContext, DEFAULT_BLOCK_SIZE};
-use crate::config::Bm25Config;
+use khive_bm25::{Bm25Config, Bm25Index, DeterministicScore, SearchContext, DEFAULT_BLOCK_SIZE};
 
 #[derive(Clone)]
 struct XorShift64 {
@@ -318,8 +315,7 @@ fn sorted_posting_lists_are_maintained_across_mutations() {
     index.index_document("a2", "alpha epsilon").unwrap();
 
     let postings = index
-        .inverted_index
-        .get("alpha")
+        .inverted_index_for_test("alpha")
         .expect("alpha postings should exist");
 
     assert!(postings

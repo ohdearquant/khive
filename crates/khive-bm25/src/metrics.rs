@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
 use parking_lot::Mutex;
 
 /// A single metric event emitted by the BM25 index.
@@ -57,12 +56,11 @@ pub mod names {
 }
 
 /// In-memory sink that records all events. Used in tests.
-#[cfg(test)]
+#[doc(hidden)]
 pub struct RecordingSink {
     events: Mutex<Vec<MetricEvent>>,
 }
 
-#[cfg(test)]
 impl Default for RecordingSink {
     fn default() -> Self {
         Self {
@@ -71,7 +69,6 @@ impl Default for RecordingSink {
     }
 }
 
-#[cfg(test)]
 impl RecordingSink {
     /// Create an empty recording sink.
     pub fn new() -> Self {
@@ -94,7 +91,6 @@ impl RecordingSink {
     }
 }
 
-#[cfg(test)]
 impl MetricsSink for RecordingSink {
     fn record(&self, event: MetricEvent) {
         self.events.lock().push(event);

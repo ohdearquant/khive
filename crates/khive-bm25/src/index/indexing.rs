@@ -63,44 +63,51 @@ impl Bm25Index {
     }
 
     /// Inner `index_document` logic (uninstrumented).
+    ///
+    /// Two-phase design: tokenize and build all replacement state BEFORE
+    /// removing the old document.  This means that if the new text tokenizes
+    /// to zero terms the old document is preserved (not silently deleted), and
+    /// a panicking tokenizer cannot leave the index in a half-mutated state.
     fn index_document_inner(&mut self, doc_id: impl Into<DocumentId>, text: &str) -> Result<()> {
         let doc_id: DocumentId = doc_id.into();
         // Check if this is a re-index (bypass budget for existing docs)
         let is_reindex = self.contains_document(&doc_id);
 
-        // Remove existing document if present
-        if is_reindex {
-            self.remove_document(&doc_id);
-        }
-
-        // Tokenize using instance tokenizer
+        // Phase 1: tokenize and compute term frequencies BEFORE any mutation.
         let tokens = self.tokenizer.tokenize(text);
         let doc_length = tokens.len();
 
         if doc_length == 0 {
-            // Don't index empty documents
+            // Don't index empty documents; preserve existing document if re-indexing.
             return Ok(());
         }
 
-        // Budget check for new documents only (re-index bypasses)
+        // Count term frequencies (collected before any mutation).
+        let mut term_freqs: BTreeMap<String, u32> = BTreeMap::new();
+        for token in &tokens {
+            *term_freqs.entry(token.clone()).or_insert(0) += 1;
+        }
+
+        // Budget check for new documents only (re-index bypasses).
+        // Performed after tokenization but before any mutation.
         if !is_reindex {
             if let Some(limit) = self.config.memory_budget {
                 let current = self.memory_usage();
                 let cost = self.estimate_document_cost(text);
-                if current + cost > limit {
+                if current.saturating_add(cost) > limit {
                     return Err(RetrievalError::budget_exceeded(current, cost, limit));
                 }
             }
         }
 
-        // Get or assign internal u32 ID
-        let internal_id = self.get_or_assign_internal_id(&doc_id);
-
-        // Count term frequencies
-        let mut term_freqs: BTreeMap<String, u32> = BTreeMap::new();
-        for token in &tokens {
-            *term_freqs.entry(token.clone()).or_insert(0) += 1;
+        // Phase 2: all replacement state is ready — now mutate.
+        // Remove the old document only after we know the replacement is non-empty.
+        if is_reindex {
+            self.remove_document(&doc_id);
         }
+
+        // Get or assign internal u32 ID
+        let internal_id = self.get_or_assign_internal_id(&doc_id)?;
 
         // Update inverted index with sorted insertion to maintain doc_id order.
         // WAND requires posting lists sorted by doc_id for binary-search seeks.
@@ -122,7 +129,10 @@ impl Bm25Index {
         // Update document metadata
         self.doc_lengths.insert(internal_id, doc_length);
         self.set_doc_length_fast(internal_id, doc_length);
-        self.total_tokens += doc_length;
+        // Saturating add: total_tokens is used only for avgdl; saturating at
+        // usize::MAX means avgdl will be imprecise at extreme scale but will
+        // not panic or overflow.
+        self.total_tokens = self.total_tokens.saturating_add(doc_length);
 
         // IDF cache auto-invalidates on the next search when it detects
         // that doc_count() has changed. No per-term eviction needed.

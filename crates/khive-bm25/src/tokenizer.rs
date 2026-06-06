@@ -1,46 +1,7 @@
 //! Tokenization for BM25.
 //!
-//! Provides a pluggable tokenizer system with a simple default implementation.
-//!
-//! # RETRIEVAL-10: Advanced Tokenization (Deferred)
-//!
-//! The following advanced tokenization features are **intentionally deferred**
-//! to future iterations:
-//!
-//! | Feature | Status | Rationale |
-//! |---------|--------|-----------|
-//! | CJK segmentation | Deferred | Requires jieba/mecab integration |
-//! | Arabic normalization | Deferred | Requires ICU or custom rules |
-//! | Stemming | Deferred | Language-specific (Snowball, Porter) |
-//! | Lemmatization | Deferred | Requires NLP models |
-//! | Stop word removal | Deferred | Language and domain specific |
-//! | N-gram support | Deferred | Memory/performance tradeoffs |
-//!
-//! **Current scope**: English whitespace tokenization with optional lowercase
-//! and minimum length filtering. This covers the primary use case.
-//!
-//! **Extension point**: Implement the [`Tokenizer`] trait for custom tokenization.
-//! The trait is designed to be language-agnostic and composable.
-//!
-//! # Examples
-//!
-//! Using the default SimpleTokenizer:
-//! ```rust
-//! use khive_bm25::{Tokenizer, SimpleTokenizer};
-//!
-//! let tokenizer = SimpleTokenizer::default();
-//! let tokens = tokenizer.tokenize("Hello, World!");
-//! assert_eq!(tokens, vec!["hello", "world"]);
-//! ```
-//!
-//! Custom tokenizer with minimum length:
-//! ```rust
-//! use khive_bm25::{Tokenizer, SimpleTokenizer};
-//!
-//! let tokenizer = SimpleTokenizer::new(true, 3);
-//! let tokens = tokenizer.tokenize("I am a cat");
-//! assert_eq!(tokens, vec!["cat"]); // "I", "am", "a" filtered out (< 3 chars)
-//! ```
+//! Pluggable tokenizer trait with a simple English whitespace default.
+//! See `docs/tokenization.md` for deferred features (CJK, stemming, stop words).
 
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
