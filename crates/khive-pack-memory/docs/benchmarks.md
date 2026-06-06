@@ -6,6 +6,7 @@
 |------|------|---------|
 | `e2e_recall` | `benches/e2e_recall.rs` | End-to-end recall latency across FTS-gather and fusion strategies using a stripped real-corpus DB fixture |
 | `fts_gather` | `benches/fts_gather.rs` | Latency and quality (recall@10, candidate-pool recall) of the FTS candidate-gather leg across term-selection and gather-mode configurations |
+| `memory_bench` | `benches/memory_bench.rs` | Criterion suite — `remember` baseline write, `remember_with_source` annotation path, `recall` scaling over 10/100/500 seeded memories (FTS-only, no embedder), `recall_with_min_score` filter path |
 
 ## Run Commands
 
@@ -21,6 +22,11 @@ sqlite3 "file:$HOME/.khive/khive-graph.db?mode=ro" \
   > crates/khive-pack-memory/tests/fixtures/memory_corpus_local.jsonl
 
 cargo test -p khive-pack-memory --release bench_fts_gather_real_corpus -- --ignored --nocapture
+
+# Criterion verb-level benchmarks (no external fixture required)
+cd crates && cargo bench -p khive-pack-memory --bench memory_bench
+# Smoke-test mode (compile + single iteration, no timing):
+cd crates && cargo bench -p khive-pack-memory --bench memory_bench -- --test
 ```
 
 ## Dataset / Fixture Shape
@@ -43,8 +49,16 @@ The FTS OR-match set is dominated by near-zero-IDF terms (English stopwords such
 
 ## Baseline Results
 
-| Scenario | Baseline | Date | Commit | Machine |
-|----------|----------|------|--------|---------|
-| (not yet recorded) | — | — | — | — |
+### `memory_bench` (Criterion, FTS-only, no embedder, in-memory SQLite)
 
-Results should be recorded here after each performance-relevant PR that touches the recall pipeline.
+**Toolchain:** rustc 1.94.1 (e408947bf 2026-03-25)
+**Machine:** arm64 (Apple Silicon), macOS Darwin 25.5.0
+
+| Scenario | Low | Median | High | Outliers |
+| --- | --- | --- | --- | --- |
+| remember/baseline | 6.932 ms | 7.545 ms | 8.248 ms | 1/20 (5%) |
+| remember_with_source/with_annotation | 2.944 ms | 3.339 ms | 3.782 ms | — |
+| recall/n_memories/10 | 905.1 µs | 1.014 ms | 1.129 ms | 1/20 (5%) |
+| recall/n_memories/100 | 1.013 ms | 1.122 ms | 1.270 ms | 3/20 (15%) |
+| recall/n_memories/500 | 2.467 ms | 2.786 ms | 3.058 ms | — |
+| recall_with_min_score/min_score_0_3 | 780.8 µs | 866.9 µs | 995.0 µs | 1/20 (5%) |

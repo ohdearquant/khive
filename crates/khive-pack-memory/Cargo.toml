@@ -37,6 +37,7 @@ tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
+criterion = { workspace = true }
 
 [[test]]
 name = "integration"
@@ -48,4 +49,8 @@ harness = false
 
 [[bench]]
 name = "fts_gather"
+harness = false
+
+[[bench]]
+name = "memory_bench"
 harness = false

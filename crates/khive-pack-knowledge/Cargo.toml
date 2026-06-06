@@ -32,6 +32,15 @@ khive-pack-kg = { version = "0.2.5", path = "../khive-pack-kg" }
 khive-storage = { version = "0.2.5", path = "../khive-storage" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "knowledge_bench"
+harness = false
+
+[[bench]]
+name = "search_latency"
+harness = false
 
 [[test]]
 name = "integration"
