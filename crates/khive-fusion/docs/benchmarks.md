@@ -57,12 +57,36 @@ outside the measured path and document the change here.
 A >10% wall-time regression in `rrf` or `weighted` at the 2×150-item scenario
 requires a comment in the PR explaining the cause before merge.
 
-## Baseline Table
+## Baseline (2026-06-06, post-sweep)
 
-| Scenario | Metric | Baseline | Date | Commit | Machine |
-|----------|--------|----------|------|--------|---------|
-| rrf/2src/150items | time/iter | (not yet recorded) | — | — | — |
-| weighted/2src/150items | time/iter | (not yet recorded) | — | — | — |
-| union/2src/150items | time/iter | (not yet recorded) | — | — | — |
-| fuse_dispatcher/Rrf | time/iter | (not yet recorded) | — | — | — |
-| fuse_dispatcher/Weighted | time/iter | (not yet recorded) | — | — | — |
+**Toolchain:** rustc 1.94.1 (e408947bf 2026-03-25)
+**Machine:** arm64 (Apple Silicon), macOS Darwin 25.5.0
+
+### RRF Fusion
+
+| Scenario         | Low      | Median   | High     | Outliers |
+| ---------------- | -------- | -------- | -------- | -------- |
+| rrf/2src/50items | 3.249 µs | 3.267 µs | 3.299 µs | 2/50 (4%) |
+| rrf/2src/150     | 9.582 µs | 9.851 µs | 10.35 µs | 2/50 (4%) |
+| rrf/2src/500     | 35.81 µs | 39.90 µs | 45.05 µs | 10/50 (20%) |
+| rrf/3src/150     | 14.62 µs | 14.66 µs | 14.71 µs | 6/50 (12%) |
+| rrf/3src/500     | 50.28 µs | 51.08 µs | 52.25 µs | 10/50 (20%) |
+
+### Weighted Fusion
+
+| Scenario              | Low      | Median    | High      | Outliers |
+| --------------------- | -------- | --------- | --------- | -------- |
+| weighted/2src/50items | 5.212 µs | 5.862 µs  | 6.733 µs  | 3/50 (6%) |
+| weighted/2src/150     | 14.38 µs | 16.22 µs  | 18.29 µs  | 2/50 (4%) |
+| weighted/2src/500     | 46.73 µs | 50.22 µs  | 55.31 µs  | 9/50 (18%) |
+| weighted/3src/150     | 21.57 µs | 24.10 µs  | 26.97 µs  | 11/50 (22%) |
+| weighted/3src/500     | 85.55 µs | 105.95 µs | 126.76 µs | 11/50 (22%) |
+
+### Union Fusion
+
+| Scenario            | Low      | Median   | High     | Outliers |
+| ------------------- | -------- | -------- | -------- | -------- |
+| union/2src/50items  | 2.295 µs | 2.429 µs | 2.626 µs | 8/50 (16%) |
+| union/2src/150      | 7.296 µs | 7.886 µs | 8.671 µs | 3/50 (6%) |
+| union/2src/500      | 25.27 µs | 26.39 µs | 27.89 µs | 10/50 (20%) |
+| union/3src/150      | 10.11 µs | 10.31 µs | 10.69 µs | 2/50 (4%) |
