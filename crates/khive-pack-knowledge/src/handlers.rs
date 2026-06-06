@@ -1,13 +1,4 @@
-//! Verb handlers for the knowledge pack.
-//!
-//! Three verbs are implemented:
-//!
-//! - `learn` — register a concept entity with domain/tags (sugar over
-//!   `create(kind="concept")`).
-//! - `cite` — link a concept to a paper/source via `introduced_by`
-//!   (sugar over `link(relation="introduced_by")`).
-//! - `topic` — list concepts filtered by domain or tag (sugar over
-//!   `search(kind="concept")` with a properties filter).
+//! Concept-tier verb handlers: `learn`, `cite`, `topic`.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -57,12 +48,10 @@ pub(crate) async fn resolve_uuid(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LearnParams {
-    /// Name of the concept.  Optional: when absent and `content` is supplied,
-    /// a name is auto-generated from the first ~60 chars of `content`.
+    /// Concept name; auto-derived from `content` first ~60 chars when absent.
     #[serde(default)]
     name: Option<String>,
-    /// Optional free-text description.  Also accepted as `content` to match
-    /// the `memory.remember` param shape (agent-UX consistency — issue #488).
+    /// Free-text description; also accepted as `content` for UX consistency.
     #[serde(default, alias = "content")]
     description: Option<String>,
     /// Research domain (e.g. "attention", "inference").
@@ -76,11 +65,8 @@ struct LearnParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CiteParams {
-    /// UUID or 8-char prefix of the concept being introduced.
     concept_id: String,
-    /// UUID or 8-char prefix of the paper/source entity.
     source_id: String,
-    /// Edge weight (default 1.0 — definitional).
     #[serde(default)]
     weight: Option<f64>,
 }
@@ -88,13 +74,10 @@ struct CiteParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TopicParams {
-    /// Domain to filter by (matches `properties.domain`).
     #[serde(default)]
     domain: Option<String>,
-    /// Free-text search query applied in addition to any filter.
     #[serde(default)]
     query: Option<String>,
-    /// Result limit (default 20, max 100).
     #[serde(default)]
     limit: Option<u32>,
 }
@@ -103,8 +86,6 @@ struct TopicParams {
 
 impl KnowledgePack {
     /// Register a concept entity with optional domain and tags.
-    ///
-    /// Returns the created entity with short `id` and full UUID.
     pub(crate) async fn handle_learn(
         &self,
         token: &NamespaceToken,
@@ -184,9 +165,7 @@ impl KnowledgePack {
         }))
     }
 
-    /// Link a concept to the paper/source that introduced it.
-    ///
-    /// Direction: concept →[introduced_by]→ source.
+    /// Link a concept to the paper/source that introduced it (`introduced_by` edge).
     pub(crate) async fn handle_cite(
         &self,
         token: &NamespaceToken,
@@ -219,25 +198,7 @@ impl KnowledgePack {
         }))
     }
 
-    /// List concept entities, optionally filtered by domain.
-    ///
-    /// When `query` is provided, a hybrid search is run and results are
-    /// domain-filtered post-retrieval.  Without `query`, all concepts in the
-    /// namespace are listed (up to `limit`).
-    ///
-    /// Both paths emit the same base item shape:
-    ///   `{id, full_id, name, description, tags}`
-    /// The search path additionally includes `score` and `snippet` when present.
-    ///
-    /// ## `total` semantics
-    ///
-    /// **Listing path** (`query` absent): `total` is the true pre-limit count of
-    /// all matching entities in the namespace, usable as a pagination signal.
-    ///
-    /// **Search path** (`query` present): `total` is the post-filter count of the
-    /// candidate window fetched from the search index (`limit * 4` candidates).
-    /// It is bounded by that window and does NOT reflect the full corpus count.
-    /// Use it as a relevance indicator, not a pagination total.
+    /// List concept entities, optionally filtered by domain or free-text query.
     pub(crate) async fn handle_topic(
         &self,
         token: &NamespaceToken,

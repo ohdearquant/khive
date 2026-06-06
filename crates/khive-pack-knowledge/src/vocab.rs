@@ -1,9 +1,4 @@
-//! Static verb descriptor table for the knowledge pack.
-//!
-//! `KNOWLEDGE_HANDLERS` is the authoritative list of the 18 verbs exposed by this
-//! pack. It is referenced by the `Pack` trait impl in `lib.rs` and by `PackRuntime`
-//! so that the MCP server can advertise the full verb catalog without loading any
-//! handler logic.
+//! Static verb descriptor table for the knowledge pack (18 verbs).
 
 use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
 

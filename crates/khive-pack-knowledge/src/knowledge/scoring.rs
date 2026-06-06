@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::matching;
 use super::schema::{Atom, SearchParams};
-use super::{
+use super::util::{
     D_COVERAGE_ALPHA, D_EXPAND_DISCOUNT, D_W_BIGRAM, D_W_CONTENT, D_W_DESCRIPTION,
     D_W_EXACT_NAME, D_W_NAME, D_W_TAGS, STOP_WORDS,
 };
