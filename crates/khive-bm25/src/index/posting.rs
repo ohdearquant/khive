@@ -4,15 +4,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Structure-of-Arrays posting list for memory-efficient storage.
-///
-/// Stores doc_ids (`Vec<u32>`) and term_freqs (`Vec<u8>`) in separate
-/// contiguous arrays, achieving exactly 5 bytes per posting with no
-/// alignment padding waste (vs 8 bytes for AoS `struct { u32, u8 }`).
-///
-/// At 200K postings this saves ~600 KB; at 1M postings, ~3 MB.
-///
-/// Both arrays are always the same length and sorted by doc_id.
+/// SoA posting list: parallel doc_ids and term_freqs arrays, sorted by doc_id.
 #[derive(Debug, Clone, Default, Serialize)]
 #[doc(hidden)]
 pub struct PostingList {
@@ -130,13 +122,7 @@ pub(crate) struct TermBlockMaxMeta {
     pub(crate) blocks: Vec<BlockMaxBlock>,
 }
 
-/// Lazily rebuilt block-max metadata cache.
-///
-/// `built_epoch` is `None` when the cache is stale (needs rebuild), or
-/// `Some(epoch)` when the cache was built for the given epoch value.
-/// Using `Option<u64>` avoids the sentinel-collision bug where
-/// `postings_epoch == u64::MAX` would equal the old `STALE_BLOCK_MAX_EPOCH`
-/// sentinel after `wrapping_add(1)` cycles through all u64 values.
+/// Lazily rebuilt block-max metadata cache keyed by postings epoch.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BlockMaxState {
     pub(crate) built_epoch: Option<u64>,

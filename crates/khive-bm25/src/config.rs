@@ -1,6 +1,4 @@
-//! BM25 configuration types.
-//!
-//! Invariants are enforced at deserialization via `#[serde(try_from)]`.
+//! BM25 configuration types. Invariants enforced at deserialization via `#[serde(try_from)]`.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,34 +25,15 @@ impl TryFrom<RawBm25Config> for Bm25Config {
     }
 }
 
-/// BM25 configuration parameters.
-///
-/// Default values (k1=1.2, b=0.75) work well for most use cases.
-/// Invariants (k1 finite and >= 0, b finite and in [0,1]) are enforced at
-/// construction and deserialization boundaries.
+/// BM25 configuration parameters. Defaults: k1=1.2, b=0.75.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawBm25Config")]
 pub struct Bm25Config {
-    /// Term saturation parameter.
-    ///
-    /// Higher values = diminishing returns for repeated terms.
-    /// Range: typically 1.2-2.0
-    /// Default: 1.2
+    /// Term saturation parameter (default 1.2, typically 1.2-2.0).
     pub k1: f64,
-
-    /// Length normalization parameter.
-    ///
-    /// - 0 = no length normalization (favor longer docs)
-    /// - 1 = full length normalization (favor shorter docs)
-    ///
-    /// Range: 0.0-1.0, Default: 0.75
+    /// Length normalization parameter (default 0.75, range 0.0-1.0).
     pub b: f64,
-
-    /// Maximum memory budget in bytes for the index.
-    /// If None, no memory limit is enforced (default).
-    /// If Some(limit), `index_document()` calls that would exceed the budget
-    /// are rejected with `RetrievalError::BudgetExceeded`. Re-indexing an
-    /// existing document bypasses the budget check.
+    /// Optional memory budget in bytes; rejects new docs that would exceed it.
     #[serde(default)]
     pub memory_budget: Option<usize>,
 }
@@ -79,19 +58,14 @@ impl Bm25Config {
         }
     }
 
-    /// Create a validated BM25 configuration, returning an error if parameters
-    /// are invalid (non-finite, negative k1, or b outside [0, 1]).
+    /// Create a validated BM25 configuration, returning an error if parameters are invalid.
     pub fn try_new(k1: f64, b: f64) -> Result<Self, &'static str> {
         let config = Self::new(k1, b);
         config.validate()?;
         Ok(config)
     }
 
-    /// Set memory budget in bytes.
-    ///
-    /// When set, `index_document()` calls that would cause the estimated
-    /// memory usage to exceed this limit are rejected with `BudgetExceeded`.
-    /// Re-indexing an existing document bypasses the budget check.
+    /// Set memory budget in bytes; new docs that would exceed it are rejected.
     #[must_use]
     pub fn with_memory_budget(mut self, budget: usize) -> Self {
         self.memory_budget = Some(budget);

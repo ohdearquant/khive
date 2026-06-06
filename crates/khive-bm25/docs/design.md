@@ -11,9 +11,13 @@
 - A memory budget (`Bm25Config::memory_budget`) is optional; when set, `index_document` rejects
   insertions that would exceed the limit while bypassing the check for re-indexing existing docs.
 
-## Consistency Notes
+## Module Structure
 
-- The `search/mod.rs` file exceeds 700 lines (including ~334 lines of inline SIMD parity tests).
-  The tests require `pub(super)` access to the simd scoring helpers and are co-located by design.
-  Production code is ~714 lines — marginally over the 700-line target but documented in-file.
-- No code-vs-ADR discrepancies were found for ADR-003 during the June 2026 sweep.
+The `search/` module is split into focused files:
+
+- `mod.rs` — re-exports only
+- `engine.rs` — BMW search engine and brute-force fallback
+- `context.rs` — search context and block scoring
+- `idf.rs` — IDF computation
+- `simd.rs` — NEON/SSE2 SIMD scoring
+- `helpers.rs` — posting list utilities

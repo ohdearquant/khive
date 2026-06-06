@@ -6,17 +6,7 @@ use std::sync::RwLock;
 
 use super::posting::{BlockMaxBlock, PostingList, TermBlockMaxMeta};
 
-/// IDF cache keyed by document frequency (`df`) rather than term string.
-///
-/// IDF depends on two inputs: `df` (document frequency of a term) and `N`
-/// (total document count). Multiple terms sharing the same `df` produce
-/// identical IDF values, so keying by `df` (a `usize`) is both more compact
-/// and more correct than keying by term string.
-///
-/// When `N` changes (any add/remove), the entire cache is invalidated by
-/// comparing `cached_doc_count` against the current `doc_count()`. This
-/// eliminates the stale-IDF bug where targeted per-term eviction left
-/// entries computed with the old `N` in the cache.
+/// IDF cache keyed by document frequency; invalidated when doc_count changes.
 #[derive(Debug, Default)]
 pub(crate) struct IdfCache {
     /// The `N` (total document count) for which cached values are valid.
@@ -35,10 +25,7 @@ impl Clone for IdfCache {
     }
 }
 
-/// Compute IDF from document frequency using the Robertson-Walker variant.
-///
-/// **PROOF CORRESPONDENCE**: `khive.Retrieval.BM25.idf_nonneg`
-/// With +1 inside ln(), IDF(t) >= 0 for all terms regardless of document frequency.
+/// Robertson-Walker IDF: always non-negative via `+1` inside `ln()`.
 #[inline]
 pub(crate) fn idf_from_doc_freq(doc_freq: usize, doc_count: usize) -> f64 {
     let n = doc_count as f64;
@@ -47,9 +34,6 @@ pub(crate) fn idf_from_doc_freq(doc_freq: usize, doc_count: usize) -> f64 {
 }
 
 /// Compute a single-term BM25 contribution for a posting.
-///
-/// **PROOF CORRESPONDENCE**: `khive.Retrieval.BM25.tf_bounded`
-/// TF saturation: tf * (k1 + 1) / (tf + k1 * ...) < k1 + 1 for all tf >= 0.
 #[inline]
 pub(crate) fn bm25_term_score(
     idf: f64,
@@ -69,14 +53,7 @@ pub(crate) fn bm25_term_score(
     idf * (numerator / denominator)
 }
 
-/// Pre-computed BM25 scoring constants for a single term.
-///
-/// Eliminates redundant arithmetic in the tight per-posting scoring loop.
-/// The BM25 formula per posting is:
-///   score = idf * (tf * (k1+1)) / (tf + k1 * (1 - b + b * dl/avgdl))
-///
-/// Pre-computing `k1_plus_1`, `k1_times_one_minus_b`, and `k1_times_b_over_avgdl`
-/// reduces the per-posting work to: 1 multiply, 1 FMA, 1 add, 1 divide, 1 multiply.
+/// Pre-computed BM25 scoring constants for one term; eliminates hot-loop arithmetic.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Bm25TermScorer {
     pub(crate) idf: f64,

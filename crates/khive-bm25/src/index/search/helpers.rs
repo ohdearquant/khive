@@ -116,16 +116,7 @@ pub(super) fn advance_all_cursors_on_pivot(cursors: &mut Vec<TermCursor<'_>>, pi
     sort_and_prune_terminated(cursors);
 }
 
-/// Advance one cursor past the current block when the block-level upper
-/// bound is below the threshold.
-///
-/// Selects the cursor whose current block ends **earliest** (minimum
-/// `last_doc`) among the pivot cursors. This minimizes skip distance and
-/// is the correct BMW cursor selection strategy -- advancing past the
-/// smallest block boundary guarantees forward progress with minimal
-/// overshoot. The seek target is that earliest block end + 1, bounded
-/// by the smallest doc_id among non-pivot cursors so we do not overshoot
-/// documents that other cursors still reference.
+/// Advance the pivot cursor with the earliest block end past its current block.
 pub(super) fn advance_one_cursor_past_block(
     cursors: &mut Vec<TermCursor<'_>>,
     pivot_len: usize,

@@ -56,23 +56,7 @@ pub(super) mod arc_str_vec_serde {
     }
 }
 
-/// BM25 (Okapi BM25) keyword index.
-///
-/// An in-memory inverted index for keyword search with BM25 scoring.
-/// Supports incremental updates (add/remove documents) and efficient search.
-///
-/// `search()` takes `&self` to allow concurrent reads; the IDF cache and block-max
-/// metadata use `RwLock` for interior mutability (RETRIEVAL-08). IDF cache
-/// auto-invalidates on doc-count change; block-max metadata uses an epoch counter.
-/// See `docs/algorithm.md` for full thread-safety rationale and design alternatives.
-///
-/// Custom tokenizers can be set via [`with_tokenizer`](Self::with_tokenizer).
-///
-/// # Deserialization Safety
-///
-/// Implements custom `Deserialize` that validates structural invariants and rebuilds
-/// all derived caches (`doc_lengths_vec`, `doc_lengths_f32`, `forward_index`) after
-/// loading from JSON to prevent panics in the SIMD search paths.
+/// In-memory BM25 inverted index. Custom `Deserialize` rebuilds derived caches.
 #[derive(Serialize)]
 pub struct Bm25Index {
     /// Term -> posting list (SoA layout: separate doc_id and term_freq arrays).
@@ -86,14 +70,7 @@ pub struct Bm25Index {
     /// Forward map: external DocumentId -> internal u32 ID.
     pub(crate) id_to_internal: HashMap<DocumentId, u32>,
 
-    /// Reverse map: internal u32 ID -> shared string slice.
-    ///
-    /// Uses `Arc<str>` instead of `DocumentId` (which wraps `String`) so that
-    /// `resolve_internal_id` can hand out a clone in O(1) — an atomic refcount
-    /// increment — rather than a heap allocation + memcpy of the UUID string.
-    /// All search hot-path callers only need `AsRef<str>` / `Deref<Target=str>`,
-    /// which `Arc<str>` satisfies.  The serde wire format is identical to the
-    /// old `DocumentId` representation (both serialize as a bare JSON string).
+    /// Reverse map: internal u32 ID -> `Arc<str>` for O(1) refcount clone on search.
     #[serde(with = "arc_str_vec_serde")]
     pub(crate) internal_to_id: Vec<Arc<str>>,
 
@@ -116,28 +93,16 @@ pub struct Bm25Index {
     #[serde(skip, default)]
     pub(crate) block_max_state: RwLock<BlockMaxState>,
 
-    /// IDF cache keyed by document frequency (`df`), auto-invalidated when
-    /// `doc_count()` changes. See [`IdfCache`] for design rationale.
+    /// IDF cache keyed by df, auto-invalidated on doc_count change.
     #[serde(skip, default)]
     pub(crate) idf_cache: IdfCache,
-
-    /// Vec-indexed document lengths for O(1) hot-path access during scoring.
-    /// Indexed by internal u32 doc_id. Rebuilt from `doc_lengths` on
-    /// deserialization. This avoids HashMap lookups in the tight scoring loop.
+    /// Vec-indexed doc lengths for O(1) hot-path access (rebuilt on deserialization).
     #[serde(skip, default)]
     pub(crate) doc_lengths_vec: Vec<usize>,
-
-    /// Pre-converted f32 document lengths for SIMD batch scoring.
-    /// Maintained in parallel with `doc_lengths_vec`. Avoids per-scoring
-    /// `usize -> f32` conversion in the tight NEON batch loop.
+    /// Pre-converted f32 doc lengths for SIMD batch scoring.
     #[serde(skip, default)]
     pub(crate) doc_lengths_f32: Vec<f32>,
-
-    /// Configuration parameters.
     pub(crate) config: Bm25Config,
-
-    /// Tokenizer for text processing.
-    /// Defaults to SimpleTokenizer. Skip serialization as tokenizers may not be serializable.
     #[serde(skip, default = "default_tokenizer")]
     pub(crate) tokenizer: BoxedTokenizer,
 
@@ -281,12 +246,7 @@ impl<'de> serde::Deserialize<'de> for Bm25Index {
 }
 
 impl Bm25Index {
-    /// Create a new empty BM25 index with the given configuration.
-    ///
-    /// # Panics
-    ///
-    /// Panics if config validation fails (k1 < 0 or b outside [0, 1]).
-    /// Use [`Bm25Index::try_new`] to handle invalid config as an error.
+    /// Create a new empty BM25 index. Panics on invalid config; use `try_new` for an error.
     pub fn new(config: Bm25Config) -> Self {
         if let Err(e) = config.validate() {
             panic!("invalid BM25 config: {e}");
@@ -320,11 +280,7 @@ impl Bm25Index {
         Ok(Self::new(config))
     }
 
-    /// Create a new BM25 index with a custom tokenizer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if config validation fails (k1 < 0 or b outside [0, 1]).
+    /// Create a new BM25 index with a custom tokenizer. Panics on invalid config.
     pub fn with_tokenizer(config: Bm25Config, tokenizer: BoxedTokenizer) -> Self {
         if let Err(e) = config.validate() {
             panic!("invalid BM25 config: {e}");
@@ -349,10 +305,7 @@ impl Bm25Index {
         }
     }
 
-    /// Set the tokenizer.
-    ///
-    /// Note: This does not re-tokenize existing documents.
-    /// Clear and re-index if you need consistent tokenization.
+    /// Set the tokenizer. Does not re-tokenize existing documents.
     pub fn set_tokenizer(&mut self, tokenizer: BoxedTokenizer) {
         self.tokenizer = tokenizer;
     }
@@ -363,10 +316,6 @@ impl Bm25Index {
     }
 
     /// Attach a metrics sink (builder pattern).
-    ///
-    /// The sink receives [`MetricEvent`]s from `search` and `index_document`
-    /// operations. Pass an `Arc<dyn MetricsSink>` to share a single sink
-    /// across multiple indices.
     #[must_use]
     pub fn with_metrics(mut self, sink: Arc<dyn MetricsSink>) -> Self {
         self.metrics = Some(sink);
@@ -374,8 +323,6 @@ impl Bm25Index {
     }
 
     /// Set or replace the metrics sink at runtime.
-    ///
-    /// Pass `Some(sink)` to enable metrics, or `None` to disable.
     pub fn set_metrics(&mut self, sink: Option<Arc<dyn MetricsSink>>) {
         self.metrics = sink;
     }
@@ -385,9 +332,7 @@ impl Bm25Index {
         self.doc_lengths.len()
     }
 
-    /// Get the average document length (in tokens).
-    ///
-    /// Returns 0.0 if no documents are indexed.
+    /// Get the average document length (in tokens). Returns 0.0 for empty index.
     pub fn avg_doc_length(&self) -> f64 {
         let count = self.doc_count();
         if count == 0 {
@@ -403,10 +348,6 @@ impl Bm25Index {
     }
 
     /// Get or assign an internal u32 ID for a `DocumentId`.
-    ///
-    /// Returns `Err(RetrievalError::IdSpaceExhausted)` if the u32 ID space
-    /// is fully consumed (more than `u32::MAX` unique document IDs assigned
-    /// over the lifetime of this index).
     pub(crate) fn get_or_assign_internal_id(&mut self, doc_id: &DocumentId) -> Result<u32> {
         if let Some(&id) = self.id_to_internal.get(doc_id) {
             return Ok(id);
@@ -427,10 +368,7 @@ impl Bm25Index {
         Ok(id)
     }
 
-    /// Resolve an internal u32 ID back to an `Arc<str>`.
-    ///
-    /// Returns a cheaply cloneable shared reference.  Callers in the search
-    /// hot path can `Arc::clone` this without any heap allocation.
+    /// Resolve an internal u32 ID to an `Arc<str>` (refcount clone, no allocation).
     #[inline]
     pub(crate) fn resolve_internal_id(&self, internal_id: u32) -> Option<Arc<str>> {
         self.internal_to_id
@@ -514,22 +452,7 @@ impl Bm25Index {
         }
     }
 
-    /// Rebuild `forward_index` from the inverted index if it appears empty.
-    ///
-    /// Called after deserialization to restore the forward map so that
-    /// `remove_document` can operate in O(|terms_in_doc|) instead of
-    /// falling back to the O(|vocabulary|) full scan.
-    ///
-    /// This mirrors the `ensure_doc_lengths_vec` pattern: the forward index is
-    /// not stored on disk (it is fully derivable from the inverted index), but
-    /// it must be populated before any removal takes place.
-    ///
-    /// **Correctness note**: this method returns early only when the forward
-    /// index is empty *or* the inverted index is empty. It does NOT treat
-    /// "non-empty" as "complete" — use [`ensure_forward_index_complete`] when
-    /// completeness must be guaranteed (e.g. after deserialization + partial
-    /// insert). The deserialization path calls `ensure_forward_index_complete`
-    /// instead of this method.
+    /// Rebuild `forward_index` from inverted index if empty; no-op when populated.
     pub fn ensure_forward_index(&mut self) {
         if !self.forward_index.is_empty() || self.inverted_index.is_empty() {
             return;
@@ -546,17 +469,7 @@ impl Bm25Index {
         }
     }
 
-    /// Rebuild `forward_index` ensuring it is complete for all live documents.
-    ///
-    /// Unlike [`ensure_forward_index`], this checks whether every document in
-    /// `doc_lengths` is present in the forward index — not merely whether the
-    /// forward index is non-empty.  This is the correct guard to use after
-    /// deserialization, where "non-empty" could mean only newly-inserted docs
-    /// are tracked while pre-serde docs are missing.
-    ///
-    /// If the forward index is already complete (every key in `doc_lengths`
-    /// has an entry), this is a no-op. Otherwise the entire forward index is
-    /// rebuilt from the inverted index.
+    /// Rebuild `forward_index` for all docs; stronger than `ensure_forward_index`.
     pub fn ensure_forward_index_complete(&mut self) {
         if self.inverted_index.is_empty() {
             return;
@@ -606,20 +519,13 @@ impl Bm25Index {
             .unwrap_or(true)
     }
 
-    /// Return the sorted doc_ids for a term's posting list.
-    ///
-    /// Returns `None` if the term has no postings. Used by integration tests to
-    /// verify that posting lists are kept in sorted order after mutations.
+    /// Return the posting list for a term, or `None` if absent (for tests).
     #[doc(hidden)]
     pub fn inverted_index_for_test(&self, term: &str) -> Option<PostingList> {
         self.inverted_index.get(term).cloned()
     }
 
-    /// Invalidate block-max metadata after a corpus mutation.
-    ///
-    /// Bumps the postings epoch so that the next WAND search lazily rebuilds
-    /// block-max metadata. The IDF cache self-invalidates on the next search
-    /// when it detects that `doc_count()` has changed.
+    /// Bump postings epoch to lazily invalidate block-max metadata.
     #[inline]
     pub(crate) fn invalidate_block_max_after_mutation(&mut self) {
         self.postings_epoch = self.postings_epoch.wrapping_add(1);

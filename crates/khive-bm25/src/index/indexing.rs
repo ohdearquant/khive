@@ -7,26 +7,7 @@ use crate::error::{Result, RetrievalError};
 use crate::metrics::{self, MetricEvent, MetricValue};
 
 impl Bm25Index {
-    /// Index a document.
-    ///
-    /// Tokenizes the text and adds it to the inverted index.
-    /// If the document already exists, it will be re-indexed (old version removed first,
-    /// budget check bypassed for re-indexing).
-    ///
-    /// # Arguments
-    ///
-    /// * `doc_id` - Unique document identifier (accepts `String`, `&str`, or
-    ///   [`DocumentId`] directly via [`Into<DocumentId>`]).
-    /// * `text` - Document text to index
-    ///
-    /// # Errors
-    ///
-    /// Returns `RetrievalError::BudgetExceeded` if a memory budget is configured
-    /// and the new document would cause the index to exceed it. Re-indexing an
-    /// existing document bypasses the budget check.
-    ///
-    /// Emits `bm25.index_document.duration_ms`, `bm25.index_document.count`,
-    /// and `bm25.index.size` metrics when a sink is attached.
+    /// Index a document. Re-indexes if already present; budget check skipped for re-index.
     pub fn index_document(&mut self, doc_id: impl Into<DocumentId>, text: &str) -> Result<()> {
         let start = std::time::Instant::now();
 
@@ -62,12 +43,7 @@ impl Bm25Index {
         result
     }
 
-    /// Inner `index_document` logic (uninstrumented).
-    ///
-    /// Two-phase design: tokenize and build all replacement state BEFORE
-    /// removing the old document.  This means that if the new text tokenizes
-    /// to zero terms the old document is preserved (not silently deleted), and
-    /// a panicking tokenizer cannot leave the index in a half-mutated state.
+    /// Inner `index_document` logic: tokenize first, mutate second (prevents half-mutated state).
     fn index_document_inner(&mut self, doc_id: impl Into<DocumentId>, text: &str) -> Result<()> {
         let doc_id: DocumentId = doc_id.into();
         // Check if this is a re-index (bypass budget for existing docs)
@@ -143,9 +119,7 @@ impl Bm25Index {
         Ok(())
     }
 
-    /// Remove a document from the index.
-    ///
-    /// Returns true if the document was found and removed, false otherwise.
+    /// Remove a document; returns `true` if found and removed.
     pub fn remove_document(&mut self, doc_id: &str) -> bool {
         // Look up internal ID
         let internal_id = match self.id_to_internal.get(doc_id).copied() {

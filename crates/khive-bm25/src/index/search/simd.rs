@@ -1,29 +1,10 @@
-//! SIMD batch BM25 scoring functions.
-//!
-//! Provides 4-wide (NEON/scalar) and 8-wide (AVX2/scalar) batch scoring
-//! implementations. See `docs/simd.md` for platform support and dispatch strategy.
+//! SIMD batch BM25 scoring: 4-wide NEON/scalar and 8-wide AVX2/scalar implementations.
 
 // ---------------------------------------------------------------------------
 // SIMD batch BM25 scoring (4-wide)
 // ---------------------------------------------------------------------------
 
-/// Batch-score 4 postings using ARM NEON SIMD intrinsics.
-///
-/// Computes the BM25 formula for 4 documents simultaneously:
-/// ```text
-/// score[i] = idf * (tf[i] * k1_plus_1) / (tf[i] + denom_base + denom_dl_factor * doc_len[i])
-/// ```
-///
-/// Term frequencies are provided as `u8` (clamped at indexing time) and
-/// widened to f32 for SIMD arithmetic. All scoring arithmetic is done in
-/// f32 for SIMD throughput. The caller is responsible for converting the
-/// results back to f64 for accumulation.
-///
-/// # Safety
-///
-/// Uses `std::arch::aarch64` NEON intrinsics which require the target to
-/// be an AArch64 CPU. This function is gated by `#[cfg(target_arch = "aarch64")]`
-/// and is only called on ARM64 hardware.
+/// Batch-score 4 postings using ARM NEON. Safety: aarch64 only; NEON is baseline on ARMv8-A.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 // SAFETY: Callers only reach this helper on aarch64, and the fixed-size array
@@ -66,10 +47,7 @@ pub(super) unsafe fn score_batch_neon(
     result
 }
 
-/// Scalar fallback for batch scoring (4-wide).
-///
-/// Computes the same BM25 formula as `score_batch_neon` but using plain
-/// scalar f32 arithmetic. Used when no SIMD path is available.
+/// 4-wide scalar BM25 scoring fallback (non-aarch64).
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub(super) fn score_batch_scalar_4(
@@ -90,10 +68,7 @@ pub(super) fn score_batch_scalar_4(
     result
 }
 
-/// Scalar fallback for batch scoring (8-wide).
-///
-/// Computes BM25 scores for 8 postings using plain scalar f32 arithmetic.
-/// Used on x86_64 when AVX2 is not available at runtime.
+/// 8-wide scalar BM25 scoring fallback (non-aarch64).
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub(super) fn score_batch_scalar_8(
@@ -118,26 +93,7 @@ pub(super) fn score_batch_scalar_8(
 // AVX2 batch BM25 scoring (8-wide, x86_64 only)
 // ---------------------------------------------------------------------------
 
-/// Batch-score 8 postings using AVX2 SIMD intrinsics (256-bit, 8 x f32).
-///
-/// Computes the BM25 formula for 8 documents simultaneously:
-/// ```text
-/// score[i] = idf * (tf[i] * k1_plus_1) / (tf[i] + denom_base + denom_dl_factor * doc_len[i])
-/// ```
-///
-/// The u8 term frequencies are widened to i32 via `_mm256_cvtepu8_epi32`
-/// (requires only the low 64 bits of a 128-bit register), then converted
-/// to f32 via `_mm256_cvtepi32_ps`.
-///
-/// Uses full-precision `_mm256_div_ps` for the division. While approximate
-/// reciprocal (`_mm256_rcp_ps` + Newton-Raphson) would save ~5 cycles, the
-/// division is not the bottleneck here -- memory access to doc_lengths is.
-/// Full precision keeps scoring deterministic with the scalar path.
-///
-/// # Safety
-///
-/// Requires the `avx2` target feature. The caller must verify AVX2 support
-/// at runtime via `is_x86_feature_detected!("avx2")` before calling.
+/// Batch-score 8 postings using AVX2. Safety: requires avx2 runtime detection.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -186,18 +142,7 @@ pub(super) unsafe fn score_batch_avx2(
     result
 }
 
-/// AVX2 + FMA variant: uses fused multiply-add for the denominator.
-///
-/// `denom = tf + fma(denom_dl_factor, doc_len, denom_base)`
-///
-/// FMA provides a single-rounding result (vs two roundings for mul+add),
-/// which may produce slightly different scores from the non-FMA path
-/// (within f32 ULP). The performance difference is marginal since div_ps
-/// dominates, but FMA is free when available and reduces instruction count.
-///
-/// # Safety
-///
-/// Requires both `avx2` and `fma` target features.
+/// Batch-score 8 postings using AVX2+FMA. Safety: requires avx2+fma runtime detection.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[inline]
@@ -238,20 +183,13 @@ pub(super) unsafe fn score_batch_avx2_fma(
     result
 }
 
-/// Function pointer type for 8-wide batch scoring on x86_64.
-///
-/// Resolved once per term based on runtime CPU feature detection,
-/// avoiding repeated `is_x86_feature_detected!` checks in the hot loop.
+/// 8-wide scoring function pointer; resolved once per term for hot-loop dispatch.
 #[cfg(target_arch = "x86_64")]
 // SAFETY: Values of this type are only produced by `select_score_batch_8`,
 // which pairs each unsafe target-feature function with matching CPU detection.
 pub(super) type ScoreBatch8Fn = unsafe fn(&[u8; 8], &[f32; 8], f32, f32, f32, f32) -> [f32; 8];
 
-/// Select the best 8-wide scoring function for the current CPU.
-///
-/// Priority: AVX2+FMA > AVX2 > scalar fallback.
-/// Called once per term, the returned function pointer is used for all
-/// batches within that term's posting list.
+/// Select best 8-wide scorer: AVX2+FMA > AVX2 > scalar.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(super) fn select_score_batch_8() -> ScoreBatch8Fn {
@@ -265,9 +203,7 @@ pub(super) fn select_score_batch_8() -> ScoreBatch8Fn {
     }
 }
 
-/// Dispatch batch scoring to the appropriate 4-wide implementation.
-///
-/// On aarch64 uses NEON SIMD; on other architectures uses scalar f32.
+/// 4-wide batch scorer: NEON on aarch64, scalar otherwise.
 #[inline]
 pub(super) fn score_batch_4(
     term_freqs: &[u8; 4],

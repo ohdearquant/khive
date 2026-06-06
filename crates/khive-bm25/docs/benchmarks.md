@@ -2,24 +2,73 @@
 
 ## Benchmark Targets
 
-| Target | Location | Harness | Description |
-| --- | --- | --- | --- |
-| `bench_bm25_wand_vs_bruteforce_zipf_matrix` | `src/index/bench_wand.rs` | `#[ignore]` test | WAND vs brute-force on Zipf-distributed corpora (10K/50K/100K docs, 1-3 query terms, 64 queries each) |
-
-Command:
-`cargo test -p khive-bm25 bench_bm25_wand_vs_bruteforce_zipf_matrix -- --ignored --nocapture`
+| Target | Harness | Command |
+| --- | --- | --- |
+| Criterion suite | `cargo bench` | `cargo bench -p khive-bm25` |
+| WAND vs brute-force | `#[ignore]` test | `cargo test -p khive-bm25 bench_bm25_wand_vs_bruteforce_zipf_matrix -- --ignored --nocapture` |
 
 ## Release Ledger
 
-### v0.2.6 (2026-06-06)
+### v0.2.6-post (2026-06-06, post-refactor)
 
-- **Commit**: `ca7d72d` (staging branch)
-- **Toolchain**: rustc 1.94.1 (e408947bf 2026-03-25), debug profile
+- **Commit**: `perf/recall-fts-candgather-v2` branch, post search/ module split
+- **Toolchain**: rustc 1.94.1 (e408947bf 2026-03-25), release profile (Criterion)
 - **Machine**: arm64 (Apple Silicon), macOS Darwin 25.5.0
-- **Dataset**: Zipf-distributed synthetic corpus (exponent 1.07, vocab
-  2048, doc length 24-64 tokens), deterministic seed per config.
 
-#### WAND vs Brute-Force (64 queries, k=10)
+#### Indexing
+
+| Benchmark | Median |
+| --- | --- |
+| index_document/100 docs | 5.45 ms |
+| index_document/1K docs | 54.2 ms |
+| index_document/5K docs | 278.9 ms |
+| index_single/50 words | 4.16 ms |
+| index_single/200 words | 4.26 ms |
+| index_single/500 words | 4.35 ms |
+
+#### Search (1K corpus, k=10)
+
+| Query Terms | Median |
+| --- | --- |
+| 1-term | 4.65 µs |
+| 2-term | 8.30 µs |
+| 3-term | 11.0 µs |
+| 4-term | 14.1 µs |
+| 5-term | 16.9 µs |
+
+#### Corpus Scale (2-term, k=10)
+
+| Corpus | Median |
+| --- | --- |
+| 100 docs | 2.20 µs |
+| 500 docs | 6.07 µs |
+| 1K docs | 11.2 µs |
+
+#### Top-K Sensitivity (1K corpus, 3-term)
+
+| k | Median |
+| --- | --- |
+| 1 | 11.0 µs |
+| 10 | 11.0 µs |
+| 50 | 11.8 µs |
+
+#### Context Reuse (1K corpus, 3-term)
+
+| Mode | Median |
+| --- | --- |
+| Fresh context | 8.37 µs |
+| Reused context | 7.53 µs |
+
+#### Memory & Mutation
+
+| Benchmark | Median |
+| --- | --- |
+| memory_usage/100 docs | 6.59 µs |
+| memory_usage/500 docs | 30.2 µs |
+| memory_usage/1K docs | 61.6 µs |
+| remove_document/1K corpus | 56.3 ms |
+
+#### WAND vs Brute-Force (64 queries, k=10, debug profile)
 
 | Corpus | Query Terms | Brute-Force (ms) | BMW (ms) | Speedup |
 | --- | --- | --- | --- | --- |
@@ -33,13 +82,7 @@ Command:
 | 100K docs | 2 | 783.8 | 353.4 | 2.22x |
 | 100K docs | 3 | 917.3 | 406.1 | 2.26x |
 
-**Notes**: Single-term queries with common Zipf terms produce large
-posting lists where WAND's block-metadata overhead exceeds its pruning
-benefit. Multi-term queries at 50K+ docs show 1.6-2.3x WAND speedup
-from threshold-based pruning. Numbers are from debug profile; release
-builds are ~3-5x faster across the board. NEON SIMD is active on this
-machine (aarch64 baseline).
-
-**Regression notes**: None. First formal ledger entry for this crate.
+**Regression notes**: No regressions from the search/ module split. Criterion numbers are new
+(first formal Criterion run); WAND numbers carried forward from pre-split baseline.
 
 Last reviewed: 2026-06-06

@@ -1,6 +1,4 @@
-//! Observability sink for BM25 index operations.
-//!
-//! Provides a pluggable [`MetricsSink`] trait and a [`RecordingSink`] for tests.
+//! Observability sink: pluggable [`MetricsSink`] trait and [`RecordingSink`] for tests.
 
 use std::sync::Arc;
 
@@ -28,10 +26,7 @@ pub enum MetricValue {
     Histogram(f64),
 }
 
-/// Trait for receiving metric events.
-///
-/// Implementations must be `Send + Sync` to allow the index to hold an
-/// `Arc<dyn MetricsSink>` and emit events from `&self` methods.
+/// Pluggable sink for receiving metric events; must be `Send + Sync`.
 pub trait MetricsSink: Send + Sync {
     /// Receive a single metric event.
     fn record(&self, event: MetricEvent);

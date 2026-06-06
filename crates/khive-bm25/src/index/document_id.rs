@@ -1,20 +1,6 @@
 //! Typed document identifier for BM25 index operations.
 
-/// Typed document identifier for BM25 index operations.
-///
-/// Wire format: plain JSON string (serde transparent).
-///
-/// # ID Bridging (Hybrid Search)
-///
-/// When combining BM25 keyword results with HNSW vector results in hybrid
-/// search, the ID types differ: BM25 uses `DocumentId` (string-based) while
-/// HNSW uses `EmbeddingId` (128-bit UUID-based). Bridging strategies include:
-///
-/// 1. String-based fusion: convert both ID types to `String` before fusion.
-/// 2. DocumentId fusion: convert `EmbeddingId` to `DocumentId` via its
-///    display representation, then fuse using `DocumentId`.
-/// 3. Application-level mapping: maintain a lookup table mapping between
-///    `EmbeddingId` and `DocumentId` in the application layer.
+/// Typed document identifier; wire format is a plain JSON string (serde transparent).
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -113,10 +99,7 @@ impl PartialEq<String> for DocumentId {
 mod document_id_wire_format {
     use super::DocumentId;
 
-    /// Frozen wire-format fixture: DocumentId must serialize as a bare JSON string.
-    ///
-    /// Wire format: `"some-document-identifier"` (not `{"0":"..."}` or any other shape).
-    /// This is enforced by `#[serde(transparent)]` in the macro expansion.
+    /// DocumentId must serialize as a bare JSON string (enforced by serde transparent).
     #[test]
     fn document_id_serializes_as_plain_string() {
         let id = DocumentId::new("some-document-identifier");
