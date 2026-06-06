@@ -240,10 +240,19 @@ pub struct KhiveRuntime {
     /// construction; packs may add more via [`PackRuntime::register_embedders`].
     embedder_registry: Arc<std::sync::RwLock<crate::embedder_registry::EmbedderRegistry>>,
     default_embedder_name: Arc<str>,
-    /// Pack-extensible edge endpoint rules, shared across clones via `Arc<RwLock<_>>`.
-    /// Installed once by the transport after the `VerbRegistry` is built.
-    /// Empty until installed — base edge relation rules still apply on their own.
+    /// Pack-extensible edge endpoint rules (ADR-031). Shared across clones
+    /// via `Arc<RwLock<_>>`; installed once by the transport after the
+    /// `VerbRegistry` is built. Empty until installed
     edge_rules: Arc<RwLock<Vec<EdgeEndpointRule>>>,
+    /// Pack-aggregated valid entity and note kind strings.
+    ///
+    /// Installed by the transport layer after building the `VerbRegistry`.
+    /// When non-empty, `create_entity`, `create_note_inner`, and `import_kg`
+    /// reject kinds not in these sets. When empty (no packs loaded, e.g.
+    /// bare runtime in unit tests), kind validation is skipped — the pack
+    /// handler layer is the primary enforcement point.
+    valid_entity_kinds: Arc<RwLock<Vec<String>>>,
+    valid_note_kinds: Arc<RwLock<Vec<String>>>,
 }
 
 impl KhiveRuntime {
@@ -280,6 +289,8 @@ impl KhiveRuntime {
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
+            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
+            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -304,6 +315,8 @@ impl KhiveRuntime {
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
+            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
+            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -327,6 +340,8 @@ impl KhiveRuntime {
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
             edge_rules: Arc::new(RwLock::new(Vec::new())),
+            valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
+            valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -525,15 +540,79 @@ impl KhiveRuntime {
         }
     }
 
-    /// Install the pack-aggregated edge endpoint rules.
+    /// Install the pack-aggregated edge endpoint rules (ADR-031).
     ///
     /// Called by the transport layer after the `VerbRegistry` is built so
-    /// that runtime-layer edge validation can consult pack rules in addition
-    /// to the base edge contract. Idempotent: later calls overwrite the previous
-    /// rule set.
+    /// that runtime-layer edge validation (in `validate_edge_relation_endpoints`)
+    /// can consult pack rules in addition to the ADR-002 base contract. Idempotent:
+    /// later calls overwrite the previous rule set.
     pub fn install_edge_rules(&self, rules: Vec<EdgeEndpointRule>) {
         if let Ok(mut guard) = self.edge_rules.write() {
             *guard = rules;
+        }
+    }
+
+    /// Install the pack-aggregated valid entity and note kinds (ADR-001, ADR-013, ADR-017).
+    ///
+    /// Called by the transport layer after the `VerbRegistry` is built so that
+    /// runtime-layer entity/note creation and import validate kind strings against
+    /// the merged pack vocabulary. Idempotent: later calls overwrite previous sets.
+    ///
+    /// When no kinds are installed (empty lists), kind validation is skipped at
+    /// the runtime layer. The pack handler layer remains the primary enforcement
+    /// point; this provides defense-in-depth for direct Rust callers and import.
+    pub fn install_kind_registry(
+        &self,
+        entity_kinds: Vec<String>,
+        note_kinds: Vec<String>,
+    ) {
+        if let Ok(mut guard) = self.valid_entity_kinds.write() {
+            *guard = entity_kinds;
+        }
+        if let Ok(mut guard) = self.valid_note_kinds.write() {
+            *guard = note_kinds;
+        }
+    }
+
+    /// Validate that `kind` is a pack-registered entity kind.
+    ///
+    /// Returns `Ok(())` when no kinds are installed (bare runtime without packs).
+    /// Returns `InvalidInput` when kinds are installed and `kind` is not among them.
+    pub(crate) fn validate_entity_kind(&self, kind: &str) -> crate::RuntimeResult<()> {
+        let guard = self.valid_entity_kinds.read().map_err(|_| {
+            crate::RuntimeError::Internal("entity kind registry lock poisoned".into())
+        })?;
+        if guard.is_empty() {
+            return Ok(());
+        }
+        if guard.iter().any(|k| k == kind) {
+            Ok(())
+        } else {
+            Err(crate::RuntimeError::InvalidInput(format!(
+                "unknown entity kind {kind:?}; valid: {}",
+                guard.join(", ")
+            )))
+        }
+    }
+
+    /// Validate that `kind` is a pack-registered note kind.
+    ///
+    /// Returns `Ok(())` when no kinds are installed (bare runtime without packs).
+    /// Returns `InvalidInput` when kinds are installed and `kind` is not among them.
+    pub(crate) fn validate_note_kind(&self, kind: &str) -> crate::RuntimeResult<()> {
+        let guard = self.valid_note_kinds.read().map_err(|_| {
+            crate::RuntimeError::Internal("note kind registry lock poisoned".into())
+        })?;
+        if guard.is_empty() {
+            return Ok(());
+        }
+        if guard.iter().any(|k| k == kind) {
+            Ok(())
+        } else {
+            Err(crate::RuntimeError::InvalidInput(format!(
+                "unknown note kind {kind:?}; valid: {}",
+                guard.join(", ")
+            )))
         }
     }
 

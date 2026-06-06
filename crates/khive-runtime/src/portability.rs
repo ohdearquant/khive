@@ -207,10 +207,11 @@ impl KhiveRuntime {
 
         let ns = token.namespace().as_str().to_owned();
 
-        // Import entities.
+        // Import entities — validate kind against pack registry.
         let store = self.entities(token)?;
         let mut entities_imported = 0usize;
         for ee in &archive.entities {
+            self.validate_entity_kind(&ee.kind)?;
             let created_micros = ee.created_at.timestamp_micros();
             let updated_micros = ee.updated_at.timestamp_micros();
             let entity = khive_storage::entity::Entity {
@@ -246,6 +247,7 @@ impl KhiveRuntime {
         let mut edges_imported = 0usize;
         let mut edges_skipped = 0usize;
         for ee in &archive.edges {
+            crate::operations::validate_edge_weight(ee.weight)?;
             let source_ok = match self.get_entity(token, ee.source).await {
                 Ok(_) => true,
                 Err(RuntimeError::NotFound(_)) => false,

@@ -266,10 +266,24 @@ fn merge_dependency_kind(
     Some(obj)
 }
 
-/// Valid `dependency_kind` values for `depends_on` edges.
+/// Valid `dependency_kind` values for `depends_on` edges (ADR-002).
 const VALID_DEPENDENCY_KINDS: &[&str] = &["build", "runtime", "data", "artifact", "tooling"];
 
-/// Validate governed edge metadata keys.
+/// Validate that an edge weight is finite and within `[0.0, 1.0]`.
+///
+/// Rejects NaN, infinities, negative values, and values exceeding 1.0.
+/// Used by `link` and `import_kg` to enforce the weight invariant consistently
+/// across all edge creation paths.
+pub(crate) fn validate_edge_weight(weight: f64) -> RuntimeResult<()> {
+    if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "edge weight must be finite and in [0.0, 1.0], got {weight}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate governed edge metadata keys (ADR-002 §Edge Metadata).
 ///
 /// Currently enforces:
 /// - `dependency_kind` is only valid on `depends_on` edges.
@@ -316,6 +330,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
+        self.validate_entity_kind(kind)?;
         let ns = token.namespace().as_str();
         let mut entity = Entity::new(ns, kind, name).with_entity_type(entity_type);
         if let Some(d) = description {
@@ -737,12 +752,7 @@ impl KhiveRuntime {
         weight: f64,
         metadata: Option<serde_json::Value>,
     ) -> RuntimeResult<Edge> {
-        // Reject non-finite or out-of-range weight before any storage write.
-        if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "link weight must be a finite value in [0.0, 1.0]; got {weight}"
-            )));
-        }
+        validate_edge_weight(weight)?;
         self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
         let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
@@ -1114,9 +1124,10 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
     ) -> RuntimeResult<Note> {
+        self.validate_note_kind(kind)?;
         let ns = token.namespace().as_str();
 
-        // Validate all annotates targets before any write (atomicity: no partial writes).
+        // Validate all annotates targets before any write (ADR-024:295 atomicity).
         for &target_id in &annotates {
             if !self.substrate_exists_in_ns(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(
