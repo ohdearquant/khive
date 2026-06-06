@@ -21,7 +21,7 @@ pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslErro
 }
 
 /// Human-readable label for a delimiter character in error messages.
-pub(super) fn char_label(c: char) -> &'static str {
+pub(crate) fn char_label(c: char) -> &'static str {
     match c {
         '(' => "'('",
         ')' => "')'",
@@ -40,7 +40,7 @@ pub(super) fn is_prev_ref_string(s: &str) -> bool {
 }
 
 /// Recursively scan a JSON value for any string that is a `$prev` reference.
-pub(super) fn json_value_contains_prev_ref(v: &Value) -> bool {
+pub(crate) fn json_value_contains_prev_ref(v: &Value) -> bool {
     match v {
         Value::String(s) => is_prev_ref_string(s),
         Value::Array(arr) => arr.iter().any(json_value_contains_prev_ref),
@@ -51,7 +51,7 @@ pub(super) fn json_value_contains_prev_ref(v: &Value) -> bool {
 
 /// Scan an op's args for any `PrevRef` and return a representative position
 /// if found. Used to emit `PrevRefOutsideChain` for Single and Parallel modes.
-pub(super) fn find_prev_ref_pos(op: &ParsedOp) -> Option<usize> {
+pub(crate) fn find_prev_ref_pos(op: &ParsedOp) -> Option<usize> {
     for av in op.args.values() {
         if arg_value_has_prev_ref(av) {
             return Some(0);

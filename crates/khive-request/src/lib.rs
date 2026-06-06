@@ -1,12 +1,4 @@
-//! `khive-request` — transport-agnostic request-DSL parser.
-//!
-//! Parses the function-call DSL string into a [`ParsedRequest`] / [`ParsedOp`] AST
-//! that transports dispatch through `khive_runtime::VerbRegistry`. Supports
-//! single ops, parallel batches `[...]`, sequential chains `op1 | op2($prev)`,
-//! and raw JSON form.
-//!
-//! See `docs/protocol.md` for the full DSL grammar, JSON form, `$prev` path
-//! semantics, escape rules, and write-key conflict detection contract.
+//! `khive-request` — transport-agnostic DSL parser for verb-dispatch requests.
 
 mod conflict;
 mod parser;

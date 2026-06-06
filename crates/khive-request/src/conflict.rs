@@ -5,24 +5,7 @@ use crate::types::{ArgValue, ParsedOp};
 #[cfg(test)]
 use crate::types::{DslError, ExecutionMode, ParsedRequest};
 
-/// Extract write-conflict keys from a single op for preflight conflict detection.
-///
-/// Keys are substrate-prefixed to avoid false positives between different substrates:
-/// - Entity write ops (`update`, `delete`, `merge`): `entity:<uuid>`
-/// - Edge write ops (`link`): `edge-natural:<source_id>:<target_id>:<relation>`
-///   — `link` creates an edge record, NOT an entity write, so source/target entity
-///   IDs must NOT be used as entity-level keys.
-///
-/// Only concrete `ArgValue::Value(String)` args are checked; `$prev` refs are skipped.
-///
-/// # Why `create` is excluded
-///
-/// `create` generates its UUID server-side and the ID is not statically known at parse
-/// time, so there is no key to conflict on. The existing DB-level serialization handles
-/// concurrent creates safely (unique constraint on the generated UUID).
-///
-/// This function is `pub` so the MCP server can call it directly without the full
-/// `check_write_key_conflicts` batch-level function.
+/// Extract substrate-prefixed write-conflict keys from one op for parallel-batch preflight.
 pub fn write_keys_for_op_pub(op: &ParsedOp) -> Vec<String> {
     let mut keys = Vec::new();
     match op.tool.as_str() {
@@ -59,29 +42,7 @@ pub fn write_keys_for_op_pub(op: &ParsedOp) -> Vec<String> {
     keys
 }
 
-/// Check a parsed batch for write-key conflicts (parallel-batch preflight).
-///
-/// Write operations (`update`, `delete`, `merge`, `link`) target specific UUIDs.
-/// If two ops in the same parallel (or single-op) batch write to the same UUID,
-/// the batch is rejected before any op is dispatched.
-///
-/// Chain mode is excluded: sequential ops intentionally build on prior results
-/// and the runtime resolves `$prev` references between them.
-///
-/// The checked keys per verb:
-/// - `update` / `delete`: `id`
-/// - `merge`:             `into_id`, `from_id`
-/// - `link`:              `source_id`, `target_id`, `relation`
-///
-/// Only concrete `ArgValue::Value(String)` arguments are checked; `$prev`
-/// references are skipped because their target is not known until dispatch time.
-///
-/// # Not the transport-level conflict contract
-///
-/// This function returns a single batch-level [`DslError::WriteKeyConflict`] for
-/// the first conflict found. It is a parse-time preflight helper, not a per-op
-/// envelope. The MCP server builds per-op envelopes using [`write_keys_for_op_pub`]
-/// directly. Do not expose this function as an MCP-level conflict API.
+/// Scan a parsed batch for write-key conflicts; skips chain mode (sequential by design).
 #[cfg(test)]
 pub(crate) fn check_write_key_conflicts(req: &ParsedRequest) -> Result<(), DslError> {
     // Chain mode is sequentially ordered; skip conflict detection.
@@ -105,9 +66,6 @@ pub(crate) fn check_write_key_conflicts(req: &ParsedRequest) -> Result<(), DslEr
     Ok(())
 }
 
-// INLINE TEST JUSTIFICATION: These tests call check_write_key_conflicts,
-// which is pub(crate) and not reachable from the integration test crate in
-// tests/. All public-API tests live in tests/parser.rs.
 #[cfg(test)]
 mod tests {
     use super::*;

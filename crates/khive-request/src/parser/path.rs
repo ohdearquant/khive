@@ -9,11 +9,7 @@ pub(crate) enum PathSegment<'a> {
     Index(usize),
 }
 
-/// Split a dotted path that may contain bracket array indices into segments.
-///
-/// `"items[0].id"` -> `[Field("items"), Index(0), Field("id")]`
-/// `"[2].name"` -> `[Index(2), Field("name")]`
-/// `"plain.path"` -> `[Field("plain"), Field("path")]`
+/// Split a dotted path with optional bracket array indices into `PathSegment`s.
 pub(crate) fn split_path(path: &str) -> Vec<PathSegment<'_>> {
     let mut segments = Vec::new();
     let mut remaining = path;

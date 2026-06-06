@@ -3,21 +3,13 @@ use std::fmt;
 
 use serde_json::Value;
 
-/// Hard cap on operations per request. Keeping batches bounded prevents
-/// unbounded memory growth and ensures latency stays predictable.
+/// Hard cap on operations per request.
 pub const MAX_OPS: usize = 100;
 
-/// These names are reserved at the request-envelope level and rejected if they
-/// appear inside verb args in either function-call or JSON form.
+/// Names reserved at the request-envelope level; rejected if they appear inside verb args.
 pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
 
-/// Execution mode for a [`ParsedRequest`].
-///
-/// - `Single`: one operation, no batching.
-/// - `Parallel`: operations separated by `,` inside `[...]`; run concurrently,
-///   results in input order.
-/// - `Chain`: operations separated by `|`; run sequentially, each op may
-///   reference the prior op's result via `$prev` / `$prev.field.path`.
+/// Execution mode: `Single` (one op), `Parallel` (`[...]`), or `Chain` (`op | op`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionMode {
     /// One operation, no batching or chaining.
@@ -28,33 +20,16 @@ pub enum ExecutionMode {
     Chain,
 }
 
-/// An argument value in a [`ParsedOp`].
-///
-/// Most arguments are concrete JSON values. In chain ops, arguments may
-/// reference the preceding op's result via `$prev` or `$prev.dotted.path`.
-/// Substitution happens at dispatch time, not at parse time, because the
-/// prior result isn't known until runtime.
-///
-/// `$prev` references may also appear inside array or object literals, which is
-/// why `Array` and `Object` variants exist alongside the flat `PrevRef` variant.
-/// The dispatcher resolves these recursively before calling the verb handler.
+/// An argument value in a [`ParsedOp`]: concrete JSON, a `$prev` path ref, or a nested container.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArgValue {
     /// A concrete JSON value (no `$prev` references anywhere inside).
     Value(Value),
-    /// A `$prev` or `$prev.field.path` reference — chain mode only.
-    ///
-    /// `path` is the dot-separated field path after `$prev`. Empty string means
-    /// the whole prior result (`$prev` with no field selector).
+    /// A `$prev` or `$prev.field.path` back-reference (chain mode only); empty `path` = whole result.
     PrevRef { path: String },
-    /// An array literal whose elements may themselves be `ArgValue`s (including
-    /// nested `PrevRef` or further `Array`/`Object`).  Used when at least one
-    /// element contains a `$prev` reference; pure-JSON arrays are still
-    /// represented as `Value(Value::Array(_))` for efficiency.
+    /// Array literal with at least one `$prev` element; pure-JSON arrays fold to `Value(Array)`.
     Array(Vec<ArgValue>),
-    /// An object literal whose values may themselves be `ArgValue`s.  Used when
-    /// at least one value contains a `$prev` reference; pure-JSON objects are
-    /// still represented as `Value(Value::Object(_))`.
+    /// Object literal with at least one `$prev` value; pure-JSON objects fold to `Value(Object)`.
     Object(Vec<(String, ArgValue)>),
 }
 
@@ -72,13 +47,7 @@ impl ArgValue {
         matches!(self, ArgValue::PrevRef { .. })
     }
 
-    /// Resolve a `$prev` reference against a preceding op's result.
-    ///
-    /// Returns the extracted field value, or `None` if the path doesn't
-    /// exist in `prev_result`. Non-`PrevRef` variants return `None`.
-    ///
-    /// Path segments may include array indices: `$prev.items[0].id` or
-    /// `$prev[0].name`. Bracket indices are parsed as `usize`.
+    /// Resolve a `$prev` reference against a preceding op's result, returning `None` on miss.
     pub fn resolve_prev<'a>(&self, prev_result: &'a Value) -> Option<&'a Value> {
         let ArgValue::PrevRef { path } = self else {
             return None;
@@ -93,13 +62,7 @@ impl ArgValue {
         Some(cur)
     }
 
-    /// Recursively resolve all `$prev` references within this value.
-    ///
-    /// - `PrevRef`: resolved via `resolve_prev`.
-    /// - `Array`/`Object`: each element/value is resolved recursively.
-    /// - `Value`: returned as-is (no `$prev` anywhere inside).
-    ///
-    /// Returns `None` if any `$prev` path is missing from `prev_result`.
+    /// Recursively resolve all `$prev` refs within this value; returns `None` if any path is absent.
     pub fn resolve_all<'a>(&'a self, prev_result: &'a Value) -> Option<Value> {
         match self {
             ArgValue::Value(v) => Some(v.clone()),
@@ -122,24 +85,14 @@ impl ArgValue {
     }
 }
 
-/// A single parsed operation: tool name + named argument bag.
-///
-/// Arguments may be concrete [`ArgValue::Value`]s or `$prev` references
-/// ([`ArgValue::PrevRef`]) that the dispatcher resolves against the prior op's
-/// result (chain mode only).
+/// A single parsed operation: tool name plus named argument bag.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedOp {
     pub tool: String,
     pub args: BTreeMap<String, ArgValue>,
 }
 
-/// Result of parsing a `request` input string.
-///
-/// The `mode` field tells the dispatcher how to execute the operations:
-/// - `Single`: dispatch the one op, wrap in a single-element envelope.
-/// - `Parallel`: dispatch all ops concurrently via `join_all`, collect in order.
-/// - `Chain`: dispatch ops sequentially; substitute `$prev` references between
-///   ops; abort remaining ops when any op or substitution fails.
+/// Result of parsing a `request` input: a list of ops and their execution mode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedRequest {
     pub ops: Vec<ParsedOp>,
@@ -306,7 +259,7 @@ impl fmt::Display for DslError {
                 write!(
                     f,
                     "argument {arg_name:?} in verb {verb:?} is reserved for the request \
-                     envelope (ADR-045); pass it at the envelope level, not inside verb args"
+                     envelope; pass it at the envelope level, not inside verb args"
                 )
             }
         }
