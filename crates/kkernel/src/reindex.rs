@@ -427,8 +427,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                 if do_atoms {
                     knowledge_atoms_indexed =
                         Some(v.get("atoms_indexed").and_then(|n| n.as_u64()).unwrap_or(0));
-                    knowledge_atoms_failed =
-                        v.get("failed").and_then(|n| n.as_u64()).unwrap_or(0);
+                    knowledge_atoms_failed = v.get("failed").and_then(|n| n.as_u64()).unwrap_or(0);
                     knowledge_ann_failed = v
                         .get("ann_failed")
                         .and_then(|b| b.as_bool())
@@ -441,7 +440,6 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                             .unwrap_or(0),
                     );
                 }
-
             }
             Err(e) => {
                 tracing::error!(error = %e, "knowledge reindex failed");
@@ -688,6 +686,7 @@ mod tests {
             entities_processed: 0,
             notes_processed: 0,
             knowledge_atoms_indexed: Some(0),
+            knowledge_sections_indexed: None,
             knowledge_atoms_failed: k_failed,
             knowledge_pass_errored: k_errored,
             knowledge_ann_failed: false,
@@ -720,6 +719,7 @@ mod tests {
             entities_processed: 0,
             notes_processed: 0,
             knowledge_atoms_indexed: Some(10),
+            knowledge_sections_indexed: None,
             knowledge_atoms_failed: 0,
             knowledge_pass_errored: false,
             knowledge_ann_failed: true,
