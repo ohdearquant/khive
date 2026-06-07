@@ -1,0 +1,13 @@
+{
+  "name": "memory",
+  "description": "Persistent agent memory for khive — remember durable context and recall it with decay-aware ranking.",
+  "version": "0.2.2",
+  "author": {
+    "name": "Ocean (HaiyangLi)",
+    "url": "https://github.com/ohdearquant"
+  },
+  "homepage": "https://github.com/ohdearquant/khive",
+  "repository": "https://github.com/ohdearquant/khive",
+  "license": "Apache-2.0",
+  "keywords": ["memory", "recall", "agents", "mcp", "knowledge-management"]
+}
