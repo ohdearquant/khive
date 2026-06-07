@@ -82,7 +82,7 @@ No language SDK to learn.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-mcp       — Rust binary (stdio MCP server)            │
+│  kkernel mcp      — stdio MCP server (the `kkernel` binary)   │
 │  khived           — persistent daemon (ADR-049): warm runtime │
 │                     auto-spawned on first request             │
 │  1 tool: `request` (ADR-020 + ADR-027) — parses DSL,         │
@@ -119,28 +119,29 @@ HTTP gateway, CLI, and visual frontend are planned for future releases.
 
 ## Crates
 
-| Crate                  | Purpose                                                                                                |
-| ---------------------- | ------------------------------------------------------------------------------------------------------ |
-| `khive-types`          | Domain types, Pack trait, closed enums                                                                 |
-| `khive-score`          | Deterministic i64 fixed-point scoring                                                                  |
-| `khive-storage`        | Trait-only capability surface (zero implementations)                                                   |
-| `khive-db`             | SQLite backend: entity/note/edge tables, FTS5 TextSearch, current sqlite-vec VectorStore compatibility |
-| `khive-retrieval`      | Hybrid retrieval primitives                                                                            |
-| `khive-fusion`         | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                  |
-| `khive-bm25`           | BM25 keyword index                                                                                     |
-| `khive-hnsw`           | HNSW vector index                                                                                      |
-| `khive-vamana`         | Vamana ANN index used by knowledge search                                                              |
-| `khive-query`          | SPARQL / GQL → SQL compiler                                                                            |
-| `khive-runtime`        | Service API + VerbRegistry + PackRuntime trait                                                         |
-| `khive-request`        | Request DSL parser (function-call, JSON; pipe / LNDL planned). Transport-agnostic AST.                 |
-| `khive-pack-kg`        | KG pack: vocabulary, verb handlers, kind validation                                                    |
-| `khive-pack-gtd`       | GTD pack: task lifecycle over the notes substrate                                                      |
-| `khive-pack-memory`    | Memory pack: salience-weighted remember/recall with decay                                              |
-| `khive-pack-brain`     | Brain pack: Bayesian user profiles, feedback, resolution                                               |
-| `khive-pack-comm`      | Comm pack: threaded messaging with inbox                                                               |
-| `khive-pack-schedule`  | Schedule pack: reminders and scheduled verb execution                                                  |
-| `khive-pack-knowledge` | Knowledge pack: atom-based KB with embedding rerank search                                             |
-| `khive-mcp`            | Stdio MCP binary — single `request` tool dispatching through the VerbRegistry                          |
+| Crate                  | Purpose                                                                                                   |
+| ---------------------- | --------------------------------------------------------------------------------------------------------- |
+| `khive-types`          | Domain types, Pack trait, closed enums                                                                    |
+| `khive-score`          | Deterministic i64 fixed-point scoring                                                                     |
+| `khive-storage`        | Trait-only capability surface (zero implementations)                                                      |
+| `khive-db`             | SQLite backend: entity/note/edge tables, FTS5 TextSearch, current sqlite-vec VectorStore compatibility    |
+| `khive-retrieval`      | Hybrid retrieval primitives                                                                               |
+| `khive-fusion`         | RRF, weighted, union, vector-only, and keyword-only fusion strategies                                     |
+| `khive-bm25`           | BM25 keyword index                                                                                        |
+| `khive-hnsw`           | HNSW vector index                                                                                         |
+| `khive-vamana`         | Vamana ANN index used by knowledge search                                                                 |
+| `khive-query`          | SPARQL / GQL → SQL compiler                                                                               |
+| `khive-runtime`        | Service API + VerbRegistry + PackRuntime trait                                                            |
+| `khive-request`        | Request DSL parser (function-call, JSON; pipe / LNDL planned). Transport-agnostic AST.                    |
+| `khive-pack-kg`        | KG pack: vocabulary, verb handlers, kind validation                                                       |
+| `khive-pack-gtd`       | GTD pack: task lifecycle over the notes substrate                                                         |
+| `khive-pack-memory`    | Memory pack: salience-weighted remember/recall with decay                                                 |
+| `khive-pack-brain`     | Brain pack: Bayesian user profiles, feedback, resolution                                                  |
+| `khive-pack-comm`      | Comm pack: threaded messaging with inbox                                                                  |
+| `khive-pack-schedule`  | Schedule pack: reminders and scheduled verb execution                                                     |
+| `khive-pack-knowledge` | Knowledge pack: atom-based KB with embedding rerank search                                                |
+| `khive-mcp`            | MCP server library — single `request` tool dispatching through the VerbRegistry (served by `kkernel mcp`) |
+| `kkernel`              | The single shipped binary — `kkernel mcp` serves MCP; admin subcommands (exec, reindex, db, …)            |
 
 Dependency direction (storage stack): `types → score → storage → db → query → runtime → packs → mcp`.
 Side input: `request → mcp` (the DSL parser is consumed only at the MCP dispatch boundary;
@@ -173,17 +174,21 @@ warm, and Claude Code discovers the `request` tool with the full 63-verb catalog
 If you prefer Rust tooling or need to build from source:
 
 ```bash
-cargo install khive-mcp                        # from crates.io
+cargo install kkernel                          # from crates.io — installs the `kkernel` binary
 # or:
 git clone https://github.com/ohdearquant/khive.git && cd khive
-cd crates && cargo build --release -p khive-mcp
+cd crates && cargo build --release -p kkernel
 ```
 
-Then point your MCP config at the binary directly:
+Then point your MCP config at the binary's `mcp` subcommand:
 
 ```json
-{ "mcpServers": { "khive": { "command": "khive-mcp" } } }
+{ "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
 ```
+
+`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request`
+surface. The npm package installs a thin `khive` (and a `khive-mcp` compatibility)
+shim that forwards to `kkernel mcp` — the Cargo path invokes `kkernel` directly.
 
 ### Usage
 
