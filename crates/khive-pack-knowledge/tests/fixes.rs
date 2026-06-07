@@ -109,7 +109,7 @@ async fn w5_search_excludes_deprecated_by_default() {
                 "slug": "dep-atom",
                 "name": "Deprecated Atom",
                 "description": "retrieval augmented content unique term xyzqwerty — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
-                "content": "retrieval unique xyzqwerty deprecated content"
+                "content": "retrieval unique xyzqwerty deprecated content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -147,7 +147,7 @@ async fn w5_search_includes_deprecated_when_explicitly_requested() {
                 "slug": "dep-atom",
                 "name": "Deprecated Atom",
                 "description": "retrieval augmented content unique qwertyzyx — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
-                "content": "retrieval unique qwertyzyx deprecated content"
+                "content": "retrieval unique qwertyzyx deprecated content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -186,13 +186,13 @@ async fn w5_status_multiplier_verified_beats_draft() {
                     "slug": "veri-atom",
                     "name": "Verified Atom",
                     "description": "neural network learning gradient descent unique zzzxxx — covering concepts techniques algorithms implementations applications use cases and design patterns in",
-                    "content": "neural network gradient descent unique zzzxxx learning"
+                    "content": "neural network gradient descent unique zzzxxx learning dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "draft-atom",
                     "name": "Draft Atom",
                     "description": "neural network learning gradient unique zzzxxx — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
-                    "content": "neural network gradient unique zzzxxx learning"
+                    "content": "neural network gradient unique zzzxxx learning dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
             ]
         }),
@@ -246,8 +246,8 @@ async fn w5_list_excludes_deprecated_by_default() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "vis-atom", "name": "Visible Atom" },
-                { "slug": "dep-atom", "name": "Hidden Deprecated Atom" },
+                { "slug": "vis-atom", "name": "Visible Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "dep-atom", "name": "Hidden Deprecated Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -289,7 +289,7 @@ async fn w1_atom_with_type_domain_tag_returns_kind_domain_in_search() {
                 "name": "Retrieval Domain",
                 "description": "domain organizing retrieval technique families xyzabc — covering concepts techniques algorithms implementations applications use cases and design patterns in detail",
                 "tags": ["type:domain", "retrieval"],
-                "content": "retrieval domain techniques xyzabc organization"
+                "content": "retrieval domain techniques xyzabc organization dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -359,7 +359,7 @@ async fn w8_editing_verified_section_transitions_to_reviewed() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "edit-atom", "name": "Edit Atom", "content": "original" }] }),
+        json!({ "atoms": [{ "slug": "edit-atom", "name": "Edit Atom", "content": "original dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -398,7 +398,7 @@ async fn w8_editing_verified_section_transitions_to_reviewed() {
         "knowledge.edit",
         json!({
             "id": "edit-atom",
-            "sections": [{ "section_type": "overview", "content": "Updated content after edit — this text is long enough to satisfy the 80-character minimum section length requirement." }]
+            "sections": [{ "section_type": "overview", "content": "Updated content after edit — this text is long enough to satisfy the 80-character minimum section length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
         }),
     )
     .await
@@ -426,7 +426,7 @@ async fn w8_editing_non_verified_section_leaves_status_unchanged() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "edit-atom2", "name": "Edit Atom 2", "content": "original" }] }),
+        json!({ "atoms": [{ "slug": "edit-atom2", "name": "Edit Atom 2", "content": "original dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -464,7 +464,7 @@ async fn w8_editing_non_verified_section_leaves_status_unchanged() {
         "knowledge.edit",
         json!({
             "id": "edit-atom2",
-            "sections": [{ "section_type": "examples", "content": "Updated examples content — this text is long enough to satisfy the 80-character minimum section length requirement." }]
+            "sections": [{ "section_type": "examples", "content": "Updated examples content — this text is long enough to satisfy the 80-character minimum section length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
         }),
     )
     .await
@@ -495,7 +495,7 @@ async fn w9_challenge_increments_dispute_count() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "challenge-atom", "name": "Challengeable Atom" }] }),
+        json!({ "atoms": [{ "slug": "challenge-atom", "name": "Challengeable Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -505,7 +505,7 @@ async fn w9_challenge_increments_dispute_count() {
         "knowledge.edit",
         json!({
             "id": "challenge-atom",
-            "sections": [{ "section_type": "overview", "content": "Section content for challenge test — this text is sufficiently long to satisfy the 80-character minimum." }]
+            "sections": [{ "section_type": "overview", "content": "Section content for challenge test — this text is sufficiently long to satisfy the 80-character minimum. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
         }),
     )
     .await
@@ -536,7 +536,7 @@ async fn w9_challenge_on_atom_with_no_prior_dispute_count_starts_at_one() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "fresh-atom", "name": "Fresh Atom" }] }),
+        json!({ "atoms": [{ "slug": "fresh-atom", "name": "Fresh Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -544,7 +544,7 @@ async fn w9_challenge_on_atom_with_no_prior_dispute_count_starts_at_one() {
         "knowledge.edit",
         json!({
             "id": "fresh-atom",
-            "sections": [{ "section_type": "formalism", "content": "Formalism content for fresh-atom challenge test — this text satisfies the 80-character minimum length requirement." }]
+            "sections": [{ "section_type": "formalism", "content": "Formalism content for fresh-atom challenge test — this text satisfies the 80-character minimum length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
         }),
     )
     .await
@@ -575,7 +575,7 @@ async fn w9_adjudicate_decrements_dispute_count() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "adjud-atom", "name": "Adjudicate Atom" }] }),
+        json!({ "atoms": [{ "slug": "adjud-atom", "name": "Adjudicate Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -583,7 +583,7 @@ async fn w9_adjudicate_decrements_dispute_count() {
         "knowledge.edit",
         json!({
             "id": "adjud-atom",
-            "sections": [{ "section_type": "core_model", "content": "Core model content for adjudication test — this text satisfies the 80-character minimum length requirement." }]
+            "sections": [{ "section_type": "core_model", "content": "Core model content for adjudication test — this text satisfies the 80-character minimum length requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }]
         }),
     )
     .await
@@ -628,13 +628,13 @@ async fn w9_double_challenge_is_rejected() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "dbl-chal", "name": "Double Challenge" }] }),
+        json!({ "atoms": [{ "slug": "dbl-chal", "name": "Double Challenge", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
     f.dispatch(
         "knowledge.edit",
-        json!({ "id": "dbl-chal", "sections": [{ "section_type": "overview", "content": "Some content for double-challenge test — this text is sufficiently long to satisfy the 80-character minimum." }] }),
+        json!({ "id": "dbl-chal", "sections": [{ "section_type": "overview", "content": "Some content for double-challenge test — this text is sufficiently long to satisfy the 80-character minimum. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("edit");
@@ -660,7 +660,7 @@ async fn w9_challenge_missing_section_is_rejected() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "no-sec", "name": "No Section" }] }),
+        json!({ "atoms": [{ "slug": "no-sec", "name": "No Section", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -679,13 +679,13 @@ async fn w9_adjudicate_non_disputed_section_is_rejected() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "adj-nodis", "name": "Not Disputed" }] }),
+        json!({ "atoms": [{ "slug": "adj-nodis", "name": "Not Disputed", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
     f.dispatch(
         "knowledge.edit",
-        json!({ "id": "adj-nodis", "sections": [{ "section_type": "overview", "content": "Content for adjudicate-non-disputed test — this text is long enough to satisfy the 80-character minimum requirement." }] }),
+        json!({ "id": "adj-nodis", "sections": [{ "section_type": "overview", "content": "Content for adjudicate-non-disputed test — this text is long enough to satisfy the 80-character minimum requirement. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("edit");
@@ -709,7 +709,7 @@ async fn w10_import_with_atlas_id_sets_source_uri() {
     let md_path = dir.join("atlas-doc.md");
     std::fs::write(
         &md_path,
-        "atlas_id: ATLAS-001\n\n# Atlas Doc\n\nContent about retrieval.\n",
+        "atlas_id: ATLAS-001\n\n# Atlas Doc\n\nContent about retrieval covering dense sparse vector search ranking fusion embedding reranking latency gradient transformer attention nearest neighbor index corpus benchmark pipeline cosine.\n",
     )
     .expect("write md");
 
@@ -744,7 +744,7 @@ async fn w10_import_with_references_section_sets_source_type_paper() {
     let md_path = dir.join("paper-doc.md");
     std::fs::write(
         &md_path,
-        "# Paper Doc\n\nContent about machine learning.\n\n## References\n\n1. Smith et al. 2023\n2. Jones et al. 2022\n",
+        "# Paper Doc\n\nContent about machine learning covering dense sparse vector search ranking fusion embedding reranking latency gradient transformer attention nearest neighbor index corpus benchmark pipeline cosine.\n\n## References\n\n1. Smith et al. 2023\n2. Jones et al. 2022\n",
     )
     .expect("write md");
 
@@ -779,7 +779,7 @@ async fn w10_import_without_references_sets_source_type_imported() {
     let md_path = dir.join("plain-doc.md");
     std::fs::write(
         &md_path,
-        "# Plain Doc\n\nContent without any references section.\n",
+        "# Plain Doc\n\nContent without any references section covering dense sparse vector search ranking fusion embedding reranking latency gradient transformer attention nearest neighbor index corpus benchmark pipeline cosine.\n",
     )
     .expect("write md");
 
@@ -816,7 +816,7 @@ async fn s4_upsert_atoms_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_atoms",
         "ns-alpha",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name" }] }),
+        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert alpha");
@@ -824,7 +824,7 @@ async fn s4_upsert_atoms_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_atoms",
         "ns-beta",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "Beta Name" }] }),
+        json!({ "atoms": [{ "slug": "shared-slug", "name": "Beta Name", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert beta");
@@ -833,7 +833,7 @@ async fn s4_upsert_atoms_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_atoms",
         "ns-alpha",
-        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name Updated" }] }),
+        json!({ "atoms": [{ "slug": "shared-slug", "name": "Alpha Name Updated", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("update alpha");
@@ -868,7 +868,7 @@ async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_domains",
         "ns-alpha",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain" }] }),
+        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert alpha domain");
@@ -876,7 +876,7 @@ async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_domains",
         "ns-beta",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Beta Domain" }] }),
+        json!({ "domains": [{ "slug": "shared-domain", "name": "Beta Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert beta domain");
@@ -884,7 +884,7 @@ async fn s4_upsert_domains_update_does_not_affect_other_namespace() {
     f.dispatch_ns(
         "knowledge.upsert_domains",
         "ns-alpha",
-        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain Updated" }] }),
+        json!({ "domains": [{ "slug": "shared-domain", "name": "Alpha Domain Updated", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("update alpha domain");
@@ -971,9 +971,9 @@ async fn f1_fuse_ann_hits_produces_valid_scores_via_search() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rrf-a", "name": "RRF Alpha", "description": "reciprocal rank fusion scoring method — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "content": "rrf fusion scoring alpha" },
-                { "slug": "rrf-b", "name": "RRF Beta",  "description": "reciprocal rank fusion scoring method beta — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "rrf fusion scoring beta" },
-                { "slug": "rrf-c", "name": "RRF Gamma", "description": "reciprocal rank fusion scoring method gamma — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "rrf fusion scoring gamma" },
+                { "slug": "rrf-a", "name": "RRF Alpha", "description": "reciprocal rank fusion scoring method — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —", "content": "rrf fusion scoring alpha dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rrf-b", "name": "RRF Beta",  "description": "reciprocal rank fusion scoring method beta — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "rrf fusion scoring beta dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rrf-c", "name": "RRF Gamma", "description": "reciprocal rank fusion scoring method gamma — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "rrf fusion scoring gamma dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1021,7 +1021,7 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
                 "slug": "rrf-single",
                 "name": "Single Result",
                 "description": "unique sentinel zzzyyyxxx term for exact match — covering concepts techniques algorithms implementations applications use cases and design patterns in",
-                "content": "unique sentinel zzzyyyxxx exact match content"
+                "content": "unique sentinel zzzyyyxxx exact match content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -1061,7 +1061,7 @@ async fn upsert_finalizing_existing_atom_promotes_draft_to_reviewed() {
     // First insert: a non-finalized atom defaults to status='draft'.
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "lifecycle-atom", "name": "Lifecycle", "content": "body" }] }),
+        json!({ "atoms": [{ "slug": "lifecycle-atom", "name": "Lifecycle", "content": "body dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("insert draft");
@@ -1082,7 +1082,7 @@ async fn upsert_finalizing_existing_atom_promotes_draft_to_reviewed() {
     // status to 'reviewed', mirroring the V22 finalized=1 => reviewed backfill.
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "lifecycle-atom", "name": "Lifecycle", "content": "body", "finalized": true }] }),
+        json!({ "atoms": [{ "slug": "lifecycle-atom", "name": "Lifecycle", "content": "body dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
     )
     .await
     .expect("finalize upsert");
@@ -1105,7 +1105,7 @@ async fn upsert_finalizing_does_not_demote_verified() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "verified-atom", "name": "V", "content": "b", "finalized": true }] }),
+        json!({ "atoms": [{ "slug": "verified-atom", "name": "V", "content": "b dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
     )
     .await
     .expect("insert");
@@ -1118,7 +1118,7 @@ async fn upsert_finalizing_does_not_demote_verified() {
     // Re-upsert with finalized=true again: must NOT demote verified -> reviewed.
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "verified-atom", "name": "V2", "content": "b2", "finalized": true }] }),
+        json!({ "atoms": [{ "slug": "verified-atom", "name": "V2", "content": "b2 dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true }] }),
     )
     .await
     .expect("re-upsert");
@@ -1148,7 +1148,7 @@ async fn fts_query_special_characters_do_not_crash() {
                 "slug": "tenant-isolation",
                 "name": "Tenant Isolation",
                 "description": "multi-tenant isolation handles Bob's tenant — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
-                "content": "multi-tenant isolation and Bob's data separation"
+                "content": "multi-tenant isolation and Bob's data separation dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -1177,7 +1177,7 @@ async fn fts_operator_matrix_does_not_crash() {
                 "slug": "fts-matrix-anchor",
                 "name": "FTS Matrix Anchor",
                 "description": "tenant isolation multi-concept search operator regression anchor — covering concepts techniques algorithms implementations applications use cases and design patterns in",
-                "content": "tenant isolation operator regression matrix anchor"
+                "content": "tenant isolation operator regression matrix anchor dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
             }]
         }),
     )
@@ -1259,8 +1259,8 @@ async fn stats_embedding_coverage_counts_atom_vectors() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "covered", "name": "Covered", "content": "has vector" },
-                { "slug": "uncovered", "name": "Uncovered", "content": "no vector" }
+                { "slug": "covered", "name": "Covered", "content": "has vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "uncovered", "name": "Uncovered", "content": "no vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }
             ]
         }),
     )
@@ -1324,19 +1324,19 @@ async fn search_scores_are_normalized_without_rank_inversion() {
                     "slug": "norm-high",
                     "name": "Normalization High",
                     "description": "normalization unique qzxqzx alpha scoring — covering concepts techniques algorithms implementations applications use cases and design patterns in detail —",
-                    "content": "normalization unique qzxqzx scoring alpha gamma delta epsilon"
+                    "content": "normalization unique qzxqzx scoring alpha gamma delta epsilon dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "norm-mid",
                     "name": "Normalization Mid",
                     "description": "normalization unique qzxqzx beta — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering",
-                    "content": "normalization unique qzxqzx beta scoring"
+                    "content": "normalization unique qzxqzx beta scoring dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "norm-low",
                     "name": "Normalization Low",
                     "description": "normalization unique qzxqzx — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts",
-                    "content": "normalization qzxqzx"
+                    "content": "normalization qzxqzx dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
             ]
         }),
@@ -1400,8 +1400,8 @@ async fn search_defaults_to_embedding_rerank_when_embedder_configured() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "rerank-a", "name": "Cosine Alpha", "description": "cosine similarity embedding rerank vector score unique uuuvvv — covering concepts techniques algorithms implementations applications use cases and design patterns", "content": "cosine similarity embedding rerank vector" },
-                { "slug": "rerank-b", "name": "Cosine Beta",  "description": "cosine similarity embedding rerank unique uuuvvv beta — covering concepts techniques algorithms implementations applications use cases and design patterns in", "content": "cosine similarity embedding rerank" },
+                { "slug": "rerank-a", "name": "Cosine Alpha", "description": "cosine similarity embedding rerank vector score unique uuuvvv — covering concepts techniques algorithms implementations applications use cases and design patterns", "content": "cosine similarity embedding rerank vector dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "rerank-b", "name": "Cosine Beta",  "description": "cosine similarity embedding rerank unique uuuvvv beta — covering concepts techniques algorithms implementations applications use cases and design patterns in", "content": "cosine similarity embedding rerank dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1469,7 +1469,7 @@ async fn search_rerank_false_is_explicit_opt_out() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "optout-a", "name": "Opt Out Alpha", "description": "explicit opt out rerank false test unique wwwxxx — covering concepts techniques algorithms implementations applications use cases and design patterns", "content": "opt out rerank test" },
+                { "slug": "optout-a", "name": "Opt Out Alpha", "description": "explicit opt out rerank false test unique wwwxxx — covering concepts techniques algorithms implementations applications use cases and design patterns", "content": "opt out rerank test dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1501,7 +1501,7 @@ async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "decompose-guard", "name": "Decompose Guard", "description": "multi-concept search decompose tenant isolation guard — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "multi-concept tenant isolation decompose guard" },
+                { "slug": "decompose-guard", "name": "Decompose Guard", "description": "multi-concept search decompose tenant isolation guard — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "content": "multi-concept tenant isolation decompose guard dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )

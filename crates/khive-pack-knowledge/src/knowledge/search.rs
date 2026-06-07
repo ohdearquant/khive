@@ -788,7 +788,7 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
     let atom_rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT id, slug, name, description, tags, finalized, status FROM knowledge_atoms WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
+                "SELECT id, slug, name, content, tags, finalized, status FROM knowledge_atoms WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
             ),
             params,
             label: None,
@@ -807,7 +807,7 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
         if let Some(row) = atom_rows_by_id.get(&hit.id) {
             hit.slug = row_str(row, "slug").unwrap_or_default();
             hit.name = row_str(row, "name").unwrap_or_default();
-            hit.description = row_str(row, "description");
+            hit.description = row_str(row, "content");
             hit.tags = row_str(row, "tags");
             hit.finalized = row_bool(row, "finalized");
             hit.status = row_str(row, "status");

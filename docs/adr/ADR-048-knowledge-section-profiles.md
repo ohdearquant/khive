@@ -12,7 +12,7 @@ compose/suggest, hooks, lint, export, and observability phases.
 
 | Area                                                          | Status   | Shipped behavior                                                                                                                                                                                                        |
 | ------------------------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| V21 `knowledge_sections`                                      | shipped  | Dedicated section rows with 10-value `SectionType`, `UNIQUE(atom_id, section_type)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers.                                                          |
+| `knowledge_sections`                                          | shipped  | Dedicated section rows with 10-value `SectionType`, `content_hash` + `UNIQUE(atom_id, content_hash)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers. 80-char minimum content.                |
 | V22 lifecycle/source fields                                   | shipped  | Status/source columns on atoms, status columns on sections/domains, status indexes, and finalized atom backfill to `reviewed`.                                                                                          |
 | `knowledge.edit`                                              | shipped  | Upserts named sections only, keeps sibling sections untouched, preserves stable section ids, clears `embedding=NULL`, and downgrades edited verified sections to `reviewed`.                                            |
 | `knowledge.import`                                            | shipped  | Supports `atlas_md` files/directories with `chunk_strategy=section                                                                                                                                                      |
@@ -35,6 +35,23 @@ keyed by `(atom_id, section_type)`: `knowledge.edit` upserts only the specified 
 preserves sibling sections, clears stale section embeddings, and downgrades edited verified
 sections to reviewed. `knowledge.import` supports `atlas_md` file/directory import and,
 with the default section chunk strategy, parses section headings into section rows.
+
+### Atom and section content constraints
+
+The `knowledge_atoms` table stores atom body text in a single `content` column. There is
+no separate `description` column — content **is** the atom's description. The
+`knowledge.upsert_atoms` verb accepts `content` (with `description` as a legacy synonym;
+the fuller of the two wins). Atom content must be **at least 20 words**; shorter content
+is rejected at write time as a stub.
+
+`knowledge_sections.content` must be **at least 80 characters**; shorter section content is
+rejected as a stub. Each section row carries a `content_hash` column holding the first 16
+hex characters of `sha256(content)`. The uniqueness key is `UNIQUE(atom_id, content_hash)`
+— multiple sections of the same `section_type` are legitimate as long as their content
+differs, and exact-duplicate content for a given atom is rejected by the hash constraint
+rather than by section type. `knowledge.edit` resolves the target section by
+`(atom_id, section_type)` ordered by `sort_order, created_at` and performs an explicit
+insert-or-update (no `ON CONFLICT(section_type)`).
 
 Section lifecycle governance is explicit. `knowledge.challenge` marks an eligible section
 as disputed and increments the atom dispute counter. `knowledge.adjudicate` requires a

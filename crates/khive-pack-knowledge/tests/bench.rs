@@ -73,11 +73,10 @@ fn benchmark_knowledge_search_warm_latency() {
                 json!({
                     "slug": format!("bench-atom-{i}"),
                     "name": format!("Bench Atom {i}"),
-                    "description": format!(
-                        "knowledge retrieval embedding reranking benchmark atom {i} tensor neural"
-                    ),
                     "content": format!(
-                        "dense sparse retrieval corpus benchmark search latency atom {i} gradient"
+                        "knowledge retrieval embedding reranking benchmark atom {i} tensor neural \
+                         dense sparse retrieval corpus search latency gradient descent transformer \
+                         attention mechanism vector index nearest neighbor approximate ranking fusion"
                     ),
                 })
             })
@@ -202,7 +201,7 @@ async fn bench_infrastructure_smoke_test() {
             "knowledge.upsert_atoms",
             json!({
                 "atoms": [
-                    { "slug": "bench-smoke", "name": "Bench Smoke", "content": "benchmark smoke test atom" }
+                    { "slug": "bench-smoke", "name": "Bench Smoke", "content": "benchmark smoke test atom covering retrieval embedding reranking dense sparse corpus search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline" }
                 ]
             }),
         )

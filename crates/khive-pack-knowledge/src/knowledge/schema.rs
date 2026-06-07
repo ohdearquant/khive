@@ -168,9 +168,8 @@ pub(crate) struct Atom {
     pub namespace: String,
     pub slug: String,
     pub name: String,
-    /// Description text — the canonical content for this atom.  Downstream
-    /// callers access it via `atom.content`; the `description` SQL column is
-    /// the source and this field is its single Rust representation.
+    /// The atom's content text (also serves as its description). Backed by the
+    /// `content` column in `knowledge_atoms`.
     pub content: String,
     /// JSON array string e.g. `["rag","retrieval"]`
     pub tags: String,
@@ -222,13 +221,13 @@ pub(crate) struct Domain {
 pub(crate) struct AtomInput {
     pub slug: String,
     pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    // REASON: accepted from callers for API backward-compatibility; content now
-    // lives in knowledge_sections and is not written to knowledge_atoms.
-    #[allow(dead_code)]
+    /// The atom's content text (>= 20 words). Also accepted under the legacy
+    /// key `description`, normalized to `content` before validation.
     #[serde(default)]
     pub content: Option<String>,
+    /// Legacy alias for `content`; folded into `content` at handler entry.
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     #[serde(default)]

@@ -41,8 +41,8 @@ pub(super) fn is_stop(w: &str) -> bool {
 /// Minimum section content length in bytes.
 pub(super) const MIN_SECTION_CONTENT_LEN: usize = 80;
 
-/// Minimum atom description length in words.
-pub(super) const MIN_ATOM_DESCRIPTION_WORDS: usize = 20;
+/// Minimum atom content length in words.
+pub(super) const MIN_ATOM_CONTENT_WORDS: usize = 20;
 
 /// Compute sha256(content)[:16] as a hex string for dedup keying.
 pub(super) fn content_hash(content: &str) -> String {
@@ -64,13 +64,13 @@ pub(super) fn validate_section_content(content: &str) -> Result<(), RuntimeError
     Ok(())
 }
 
-/// Validate that atom description meets the 20-word minimum.
-pub(super) fn validate_atom_description(description: &str) -> Result<(), RuntimeError> {
-    let word_count = description.split_whitespace().count();
-    if word_count < MIN_ATOM_DESCRIPTION_WORDS {
+/// Validate that atom content meets the 20-word minimum.
+pub(super) fn validate_atom_content(content: &str) -> Result<(), RuntimeError> {
+    let word_count = content.split_whitespace().count();
+    if word_count < MIN_ATOM_CONTENT_WORDS {
         return Err(RuntimeError::InvalidInput(format!(
-            "atom description must be at least {} words (got {})",
-            MIN_ATOM_DESCRIPTION_WORDS, word_count
+            "atom content must be at least {} words (got {})",
+            MIN_ATOM_CONTENT_WORDS, word_count
         )));
     }
     Ok(())
@@ -129,7 +129,7 @@ pub(super) fn atom_from_row(row: &khive_storage::types::SqlRow) -> Option<Atom> 
         namespace: row_str(row, "namespace")?,
         slug: row_str(row, "slug")?,
         name: row_str(row, "name")?,
-        content: row_str(row, "description").unwrap_or_default(),
+        content: row_str(row, "content").unwrap_or_default(),
         tags: row_str(row, "tags").unwrap_or_else(|| "[]".into()),
         properties: row_str(row, "properties"),
         status: row_str(row, "status"),
@@ -164,7 +164,6 @@ pub(super) fn atom_to_json(atom: &Atom) -> Value {
         "namespace": atom.namespace,
         "slug": atom.slug,
         "name": atom.name,
-        "description": atom.content,
         "content": atom.content,
         "tags": serde_json::from_str::<Value>(&atom.tags).unwrap_or(Value::Array(vec![])),
         "properties": atom.properties.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),

@@ -172,7 +172,7 @@ async fn learn_content_without_name_auto_generates_name() {
     let resp = f
         .dispatch(
             "knowledge.learn",
-            json!({ "content": "Some long description about X that keeps going and going beyond sixty characters easily" }),
+            json!({ "content": "Some long description about X that keeps going and going beyond sixty characters easily dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }),
         )
         .await
         .expect("learn with content only should succeed");
@@ -528,7 +528,7 @@ async fn upsert_atoms_creates_new_atoms() {
             "knowledge.upsert_atoms",
             json!({
                 "atoms": [
-                    { "slug": "rag", "name": "RAG", "description": "Retrieval-Augmented Generation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating." },
+                    { "slug": "rag", "name": "RAG", "description": "Retrieval-Augmented Generation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
                     { "slug": "lora", "name": "LoRA", "description": "Low-Rank Adaptation of LLMs — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "tags": ["fine-tuning", "adapter"] },
                     { "slug": "flash-attention", "name": "FlashAttention", "description": "Memory-efficient attention — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques", "tags": ["attention"] },
                 ]
@@ -548,7 +548,7 @@ async fn upsert_atoms_updates_on_second_call() {
     // First insert.
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "rag", "name": "RAG", "content": "original content" }] }),
+        json!({ "atoms": [{ "slug": "rag", "name": "RAG", "content": "original content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("first upsert");
@@ -557,7 +557,7 @@ async fn upsert_atoms_updates_on_second_call() {
     let resp = f
         .dispatch(
             "knowledge.upsert_atoms",
-            json!({ "atoms": [{ "slug": "rag", "name": "RAG updated", "content": "updated content" }] }),
+            json!({ "atoms": [{ "slug": "rag", "name": "RAG updated", "content": "updated content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
         )
         .await
         .expect("second upsert");
@@ -590,7 +590,7 @@ async fn upsert_atoms_rejects_empty_slug() {
     let err = f
         .dispatch(
             "knowledge.upsert_atoms",
-            json!({ "atoms": [{ "slug": "  ", "name": "Bad" }] }),
+            json!({ "atoms": [{ "slug": "  ", "name": "Bad", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
         )
         .await
         .unwrap_err();
@@ -623,7 +623,7 @@ async fn upsert_domains_creates_and_updates() {
             "knowledge.upsert_domains",
             json!({
                 "domains": [
-                    { "slug": "retrieval", "name": "Retrieval updated", "members": ["rag", "dense-retrieval", "bm25"] }
+                    { "slug": "retrieval", "name": "Retrieval updated", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "members": ["rag", "dense-retrieval", "bm25"] }
                 ]
             }),
         )
@@ -698,9 +698,9 @@ async fn list_atoms_returns_all_atoms() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "a1", "name": "Alpha" },
-                { "slug": "a2", "name": "Beta" },
-                { "slug": "a3", "name": "Gamma" },
+                { "slug": "a1", "name": "Alpha", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "a2", "name": "Beta", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "a3", "name": "Gamma", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -722,13 +722,13 @@ async fn list_domains_returns_only_domains() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "a1", "name": "Alpha" }] }),
+        json!({ "atoms": [{ "slug": "a1", "name": "Alpha", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert atom");
     f.dispatch(
         "knowledge.upsert_domains",
-        json!({ "domains": [{ "slug": "d1", "name": "Domain1" }] }),
+        json!({ "domains": [{ "slug": "d1", "name": "Domain1", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert domain");
@@ -749,7 +749,7 @@ async fn list_respects_limit_and_offset() {
     for i in 0..10 {
         f.dispatch(
             "knowledge.upsert_atoms",
-            json!({ "atoms": [{ "slug": format!("a{i}"), "name": format!("Atom{i}") }] }),
+            json!({ "atoms": [{ "slug": format!("a{i}"), "name": format!("Atom{i}"), "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
         )
         .await
         .expect("upsert");
@@ -787,7 +787,7 @@ async fn delete_atoms_soft_deletes_by_slug() {
     let f = pack(rt());
     f.dispatch(
         "knowledge.upsert_atoms",
-        json!({ "atoms": [{ "slug": "to-delete", "name": "Will be gone" }] }),
+        json!({ "atoms": [{ "slug": "to-delete", "name": "Will be gone", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert");
@@ -841,8 +841,8 @@ async fn stats_reflects_current_corpus() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "a1", "name": "Alpha", "finalized": true },
-                { "slug": "a2", "name": "Beta", "finalized": false },
+                { "slug": "a1", "name": "Alpha", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": true },
+                { "slug": "a2", "name": "Beta", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "finalized": false },
             ]
         }),
     )
@@ -851,7 +851,7 @@ async fn stats_reflects_current_corpus() {
 
     f.dispatch(
         "knowledge.upsert_domains",
-        json!({ "domains": [{ "slug": "d1", "name": "Domain1" }] }),
+        json!({ "domains": [{ "slug": "d1", "name": "Domain1", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
     )
     .await
     .expect("upsert domain");
@@ -953,7 +953,7 @@ async fn fold_respects_min_score_filter() {
 async fn seed_search_corpus(f: &Fixture) {
     let atoms = json!({
         "atoms": [
-            { "slug": "rag",             "name": "RAG",               "description": "Retrieval-Augmented Generation combines retrieval with generation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating text" },
+            { "slug": "rag",             "name": "RAG",               "description": "Retrieval-Augmented Generation combines retrieval with generation — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["retrieval", "rag"], "content": "RAG retrieves relevant passages before generating text dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             { "slug": "lora",            "name": "LoRA",              "description": "Low-Rank Adaptation of large language models — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["fine-tuning", "adapter"] },
             { "slug": "flash-attention", "name": "FlashAttention",    "description": "Memory-efficient attention using tiling — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering", "tags": ["attention", "gpu"] },
             { "slug": "gqa",             "name": "GQA",               "description": "Grouped Query Attention reduces KV cache — covering concepts techniques algorithms implementations applications use cases and design patterns in detail", "tags": ["attention", "inference"] },
@@ -1234,12 +1234,12 @@ async fn compose_returns_markdown_for_atoms() {
                 {
                     "slug": "rag-overview",
                     "name": "RAG Overview",
-                    "content": "Retrieval-augmented generation combines retrieval with generation."
+                    "content": "Retrieval-augmented generation combines retrieval with generation. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 },
                 {
                     "slug": "dense-retrieval",
                     "name": "Dense Retrieval",
-                    "content": "Dense retrieval uses vector embeddings to find relevant documents."
+                    "content": "Dense retrieval uses vector embeddings to find relevant documents. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
                 }
             ]
         }),
@@ -1277,7 +1277,7 @@ async fn compose_returns_markdown_for_domain() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "atom-a", "name": "Atom A", "content": "content of atom a" }
+                { "slug": "atom-a", "name": "Atom A", "content": "content of atom a dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }
             ]
         }),
     )
@@ -1290,7 +1290,7 @@ async fn compose_returns_markdown_for_domain() {
             "domains": [
                 {
                     "slug": "test-domain",
-                    "name": "Test Domain",
+                    "name": "Test Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
                     "members": ["atom-a"]
                 }
             ]
@@ -1412,8 +1412,8 @@ async fn compose_accepts_mix_of_domain_ids_and_atom_ids() {
         "knowledge.upsert_atoms",
         json!({
             "atoms": [
-                { "slug": "direct-atom", "name": "Direct Atom", "content": "directly specified atom content" },
-                { "slug": "member-atom", "name": "Member Atom", "content": "member atom from domain" },
+                { "slug": "direct-atom", "name": "Direct Atom", "content": "directly specified atom content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
+                { "slug": "member-atom", "name": "Member Atom", "content": "member atom from domain dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" },
             ]
         }),
     )
@@ -1425,7 +1425,7 @@ async fn compose_accepts_mix_of_domain_ids_and_atom_ids() {
         "knowledge.upsert_domains",
         json!({
             "domains": [
-                { "slug": "mix-domain", "name": "Mix Domain", "members": ["member-atom"] }
+                { "slug": "mix-domain", "name": "Mix Domain", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity", "members": ["member-atom"] }
             ]
         }),
     )
