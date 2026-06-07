@@ -44,7 +44,54 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
 /// Build a fully-configured server from parsed args (without serving).
 pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
-    let db_path = match args.db.as_deref() {
+    let (cli_namespace_explicit, cli_namespace) =
+        resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let config = resolve_runtime_config(RuntimeConfigInputs {
+        db: args.db.as_deref(),
+        config: args.config.as_deref(),
+        namespace: cli_namespace,
+        namespace_explicit: cli_namespace_explicit,
+        no_embed: args.no_embed,
+        packs: if args.pack.is_empty() {
+            None
+        } else {
+            Some(args.pack.clone())
+        },
+    })?;
+
+    let runtime = KhiveRuntime::new(config)?;
+    KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Inputs for [`resolve_runtime_config`] — the subset of serve-time arguments
+/// that determine the resolved [`RuntimeConfig`]. Callers other than
+/// `kkernel mcp` (e.g. `kkernel reindex`) supply these directly so they resolve
+/// the SAME engines, db path, and actor namespace the MCP server would.
+pub struct RuntimeConfigInputs<'a> {
+    /// Raw `--db` / `KHIVE_DB` value (`:memory:` sentinel honored).
+    pub db: Option<&'a str>,
+    /// Explicit `--config` / `KHIVE_CONFIG` path (else home-fallback search).
+    pub config: Option<&'a std::path::Path>,
+    /// Pre-resolved default namespace.
+    pub namespace: khive_runtime::Namespace,
+    /// Whether the namespace came from an explicit CLI flag (skips config tier).
+    pub namespace_explicit: bool,
+    /// Disable embedding entirely (still resolves actor namespace from config).
+    pub no_embed: bool,
+    /// Packs to register. `None` falls back to `RuntimeConfig::default().packs`.
+    pub packs: Option<Vec<String>>,
+}
+
+/// Resolve a [`RuntimeConfig`] from serve-time inputs, applying the SAME
+/// config-file / env / actor-namespace precedence as `kkernel mcp`.
+///
+/// Extracted from `build_server` so `kkernel reindex` reuses the exact engine
+/// and db resolution — otherwise an admin reindex writes vectors for the
+/// default/env model set while the MCP server serves recall from the
+/// config-file `[[engines]]` set.
+pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result<RuntimeConfig> {
+    let db_path = match inputs.db {
         Some(":memory:") => None,
         Some(path) => Some(PathBuf::from(path)),
         None => {
@@ -53,39 +100,27 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
         }
     };
 
-    let (cli_namespace_explicit, cli_namespace) =
-        resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let packs = if args.pack.is_empty() {
-        RuntimeConfig::default().packs
-    } else {
-        args.pack.clone()
-    };
+    let packs = inputs
+        .packs
+        .unwrap_or_else(|| RuntimeConfig::default().packs);
 
     let base_config = RuntimeConfig {
         db_path,
-        default_namespace: cli_namespace,
+        default_namespace: inputs.namespace,
         packs,
         ..RuntimeConfig::default()
     };
 
-    let config = if args.no_embed {
+    if inputs.no_embed {
         let no_embed_base = RuntimeConfig {
             embedding_model: None,
             additional_embedding_models: vec![],
             ..base_config
         };
-        resolve_actor_from_config(
-            args.config.as_deref(),
-            no_embed_base,
-            cli_namespace_explicit,
-        )?
+        resolve_actor_from_config(inputs.config, no_embed_base, inputs.namespace_explicit)
     } else {
-        resolve_config(args.config.as_deref(), base_config, cli_namespace_explicit)?
-    };
-
-    let runtime = KhiveRuntime::new(config)?;
-    KhiveMcpServer::new(runtime).map_err(|e| anyhow::anyhow!("{e}"))
+        resolve_config(inputs.config, base_config, inputs.namespace_explicit)
+    }
 }
 
 /// Resolve the full config (embedding engines + actor namespace) from file or env.
@@ -158,5 +193,78 @@ fn resolve_actor_from_config(
             })
         }
         None => Ok(base),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_runtime::Namespace;
+    use serial_test::serial;
+    use std::io::Write;
+
+    fn write_config(dir: &std::path::Path, body: &str) -> PathBuf {
+        let path = dir.join("khive.toml");
+        let mut f = std::fs::File::create(&path).expect("create config file");
+        f.write_all(body.as_bytes()).expect("write config");
+        path
+    }
+
+    // The resolver MUST honor config-file `[[engines]]` over RuntimeConfig
+    // defaults — otherwise `kkernel reindex` embeds for the wrong model set
+    // versus what `kkernel mcp` serves recall from. Regression for PR #8
+    // blocker.
+    #[test]
+    #[serial]
+    fn resolver_uses_config_file_engines_over_defaults() {
+        // Ensure env vars cannot leak into either branch.
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+
+        let default_cfg = RuntimeConfig::default();
+        let default_primary = format!("{:?}", default_cfg.embedding_model);
+        // Default ships a non-empty additional-engine list (the multilingual
+        // model). The single-engine config file below must override it.
+        assert!(
+            !default_cfg.additional_embedding_models.is_empty(),
+            "precondition: default config has additional engines"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A single non-default engine that differs from the default primary.
+        let path = write_config(
+            dir.path(),
+            r#"
+[[engines]]
+name = "primary"
+model = "bge-small-en-v1.5"
+default = true
+"#,
+        );
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            no_embed: false,
+            packs: None,
+        })
+        .expect("resolve config");
+
+        let resolved_primary = format!("{:?}", resolved.embedding_model);
+        assert_ne!(
+            resolved_primary, default_primary,
+            "resolved primary engine must come from the config file, not the default"
+        );
+        assert!(
+            resolved.embedding_model.is_some(),
+            "config-file engine must resolve to a primary embedding model"
+        );
+        assert!(
+            resolved.additional_embedding_models.is_empty(),
+            "config file declares one engine; additional list must be empty (not the default's)"
+        );
+        assert_eq!(resolved.db_path, None, ":memory: must map to in-memory db");
     }
 }

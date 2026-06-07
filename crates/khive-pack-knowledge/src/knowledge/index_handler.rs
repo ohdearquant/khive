@@ -24,7 +24,7 @@ impl KnowledgeHandlers {
 
         if runtime.default_embedder_name().is_empty() {
             return Ok(
-                json!({ "indexed": 0, "skipped": 0, "total": 0, "reason": "no embedding model configured" }),
+                json!({ "indexed": 0, "skipped": 0, "failed": 0, "total": 0, "reason": "no embedding model configured" }),
             );
         }
 
@@ -84,6 +84,7 @@ impl KnowledgeHandlers {
         let total = atoms.len();
         let mut indexed = 0usize;
         let mut skipped = 0usize;
+        let mut failed = 0usize;
 
         let mut ann_vectors: Vec<f32> = Vec::new();
         let mut ann_ids: Vec<uuid::Uuid> = Vec::new();
@@ -120,38 +121,70 @@ impl KnowledgeHandlers {
 
             let embeddings = match runtime.embed_batch(&texts).await {
                 Ok(e) => e,
-                Err(_) => {
-                    skipped += staged.len();
+                Err(e) => {
+                    tracing::warn!(
+                        batch_size = staged.len(),
+                        error = %e,
+                        "embed_batch failed; atoms cannot be recalled until reindexed"
+                    );
+                    failed += staged.len();
                     continue;
                 }
             };
             if embeddings.len() != staged.len() {
-                skipped += staged.len();
+                tracing::warn!(
+                    expected = staged.len(),
+                    got = embeddings.len(),
+                    "embed_batch returned wrong number of vectors; atoms cannot be recalled until reindexed"
+                );
+                failed += staged.len();
                 continue;
             }
 
-            if let Ok(vectors) = runtime.vectors(token) {
-                let ns_str = token.namespace().as_str();
-                if !insert_only {
-                    for (id, _) in &staged {
-                        let _ = vectors.delete(*id).await;
+            // Track which atoms in this chunk had their vector persisted, so a
+            // failed insert is reported as `failed` rather than silently counted
+            // as `indexed`. A failed vector write means recall cannot retrieve
+            // that atom — that is a failure, not a success.
+            let mut chunk_ok: Vec<bool> = vec![true; staged.len()];
+            match runtime.vectors(token) {
+                Ok(vectors) => {
+                    let ns_str = token.namespace().as_str();
+                    if !insert_only {
+                        for (id, _) in &staged {
+                            let _ = vectors.delete(*id).await;
+                        }
+                    }
+                    for (i, ((id, _), emb)) in staged.iter().zip(embeddings.iter()).enumerate() {
+                        if let Err(e) = vectors
+                            .insert(
+                                *id,
+                                SubstrateKind::Entity,
+                                ns_str,
+                                "knowledge.atom",
+                                vec![emb.clone()],
+                            )
+                            .await
+                        {
+                            tracing::warn!(id = %id, error = %e, "knowledge vector insert failed");
+                            chunk_ok[i] = false;
+                            failed += 1;
+                        }
                     }
                 }
-                for ((id, _), emb) in staged.iter().zip(embeddings.iter()) {
-                    let _ = vectors
-                        .insert(
-                            *id,
-                            SubstrateKind::Entity,
-                            ns_str,
-                            "knowledge.atom",
-                            vec![emb.clone()],
-                        )
-                        .await;
+                Err(e) => {
+                    tracing::warn!(error = %e, "knowledge vector store unavailable");
+                    for ok in chunk_ok.iter_mut() {
+                        *ok = false;
+                    }
+                    failed += staged.len();
                 }
             }
 
             if rebuild_ann {
-                for ((id, _), emb) in staged.iter().zip(embeddings.iter()) {
+                for (i, ((id, _), emb)) in staged.iter().zip(embeddings.iter()).enumerate() {
+                    if !chunk_ok[i] {
+                        continue;
+                    }
                     if ann_dim == 0 {
                         ann_dim = emb.len();
                     }
@@ -162,7 +195,7 @@ impl KnowledgeHandlers {
                 }
             }
 
-            indexed += staged.len();
+            indexed += chunk_ok.iter().filter(|ok| **ok).count();
         }
 
         // Any vector write invalidates the existing snapshot — the corpus has changed.
@@ -172,25 +205,36 @@ impl KnowledgeHandlers {
         }
 
         let mut ann_count: Option<usize> = None;
+        let mut ann_failed = false;
         let is_full_corpus = p.ids.is_none();
         if rebuild_ann && is_full_corpus && !ann_vectors.is_empty() && ann_dim > 0 {
             match vamana::AnnBridge::build(ann_vectors, ann_dim, ann_ids) {
                 Ok(bridge) => {
                     ann_count = Some(bridge.num_vectors());
                     let model_name = runtime.default_embedder_name();
-                    if let Some(fp) = vamana::compute_fingerprint(runtime, token, model_name).await
-                    {
-                        if let Err(e) =
-                            vamana::persist_snapshot(runtime, &ns, model_name, &bridge, fp).await
-                        {
-                            tracing::error!(error = %e, "failed to persist Vamana snapshot");
+                    match vamana::compute_fingerprint(runtime, token, model_name).await {
+                        Some(fp) => {
+                            if let Err(e) =
+                                vamana::persist_snapshot(runtime, &ns, model_name, &bridge, fp)
+                                    .await
+                            {
+                                tracing::error!(error = %e, "failed to persist Vamana snapshot");
+                                ann_failed = true;
+                            }
+                        }
+                        None => {
+                            tracing::warn!(
+                                "failed to compute corpus fingerprint; Vamana snapshot will not be persisted"
+                            );
+                            ann_failed = true;
                         }
                     }
                     let key = vamana::AnnKey::new(&ns, model_name);
                     vamana::insert_ann_if_absent(ann, key, bridge).await;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to build Vamana ANN index");
+                    tracing::error!(error = %e, "failed to build Vamana ANN index");
+                    ann_failed = true;
                 }
             }
         }
@@ -198,8 +242,10 @@ impl KnowledgeHandlers {
         Ok(json!({
             "indexed": indexed,
             "skipped": skipped,
+            "failed": failed,
             "total": total,
             "ann_vectors": ann_count,
+            "ann_failed": ann_failed,
         }))
     }
 }

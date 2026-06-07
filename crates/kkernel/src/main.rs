@@ -10,7 +10,8 @@
 //! - `kg`      — KG validation, init, hook management
 //! - `engine`  — embedding model lifecycle: list/status/migrate/drift-check
 //! - `vector`  — vector store capabilities and orphan sweep
-//! - `reindex` — rebuild embedding vectors for entities and notes
+//! - `reindex` — rebuild embedding vectors for entities, notes, and the
+//!   knowledge corpus (fans out across every configured engine)
 //! - `exec`    — run a verb DSL expression through the pack registry
 //! - `mcp`     — serve the MCP `request` surface (stdio / daemon / transports)
 //! - `backend` — inspect registered backends (`list`, `info <name>`)
@@ -68,7 +69,8 @@ enum Command {
     #[command(subcommand)]
     Vector(vector::VectorCommand),
 
-    /// Re-embed all entities and notes using the configured embedding model.
+    /// Re-embed entities, notes, and the knowledge corpus, fanning out across
+    /// every configured embedding engine (resolved like `kkernel mcp`).
     Reindex(reindex::ReindexArgs),
 
     /// Execute a verb DSL expression (same syntax as MCP `request` tool).
@@ -342,10 +344,16 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
 }
 
 fn init_tracing(level: &str) {
-    // Tracing goes to stderr — stdout is reserved for JSON results.
+    // Tracing goes to stderr — stdout is reserved for JSON / MCP results.
+    //
+    // Silence the benign `lattice_inference` tokenizer warning ("tokenizer and
+    // model vocab sizes differ" — the multilingual paraphrase model carries a
+    // handful of extra reserved tokens) while honoring the caller's level for
+    // everything else.
+    let filter = format!("{level},lattice_inference=error");
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(level)
+        .with_env_filter(filter)
         .with_ansi(false)
         .init();
 }
