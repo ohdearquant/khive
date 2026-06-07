@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral-contract tests for the khive-mcp binary (GitHub issue #21).
+"""Behavioral-contract tests for the MCP surface, served by `kkernel mcp` (GitHub issue #21).
 
 CONTRACT vs SMOKE
 -----------------
@@ -33,7 +33,8 @@ How to run
 Each test function is named `test_<contract>` and prints [pass] / [FAIL].
 Exit code is 0 if every test passes, 1 if any fail.
 
-The KHIVE_MCP_BINARY env var overrides the default binary path.
+The KKERNEL_BINARY env var overrides the default binary path. The server is the
+`mcp` subcommand of the unified kkernel binary.
 """
 
 import json
@@ -184,7 +185,7 @@ def _tool_expect_error(proc: subprocess.Popen, name: str, args: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _start_server(db_path: str) -> subprocess.Popen:
-    """Spawn a fresh khive-mcp process backed by a temp SQLite file."""
+    """Spawn a fresh `kkernel mcp` process backed by a temp SQLite file."""
     env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
     proc = subprocess.Popen(
         [BINARY, "mcp", "--db", db_path, "--no-embed", "--log", "error"],
