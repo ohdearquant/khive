@@ -121,14 +121,16 @@ always wins over any config `[actor] id`.
 
 **Fail-closed.** By default reindex returns a **non-zero exit** if any requested
 engine failed, the knowledge pass errored, any knowledge atom vector insert
-failed, or the Vamana ANN build/snapshot persist failed — a partial rebuild
-leaves stale recall/search state, so automation must not see success. Pass
-`--best-effort` to downgrade failures to a warning and exit 0. The report (JSON
-and `--human`) always reports attempted/indexed/failed counts honestly
-(`errors_skipped`, `knowledge_atoms_failed`, `knowledge_pass_errored`,
-`knowledge_ann_failed`). Note: `knowledge_ann_failed` is a distinct failure
-dimension from `knowledge_atoms_failed` — atom vectors may have persisted
-successfully while the ANN rebuild or snapshot persist failed.
+failed, the Vamana ANN build/snapshot persist failed, or any knowledge section
+embed/write failed — a partial rebuild leaves stale recall/search state, so
+automation must not see success. Pass `--best-effort` to downgrade failures to a
+warning and exit 0. The report (JSON and `--human`) always reports
+attempted/indexed/failed counts honestly (`errors_skipped`,
+`knowledge_atoms_failed`, `knowledge_pass_errored`, `knowledge_ann_failed`,
+`knowledge_sections_failed`). Note: `knowledge_ann_failed` and
+`knowledge_sections_failed` are distinct failure dimensions from
+`knowledge_atoms_failed` — atom vectors may have persisted successfully while the
+ANN rebuild/snapshot persist or the section embed/write failed.
 
 **Multi-engine semantics.** Entities and notes embed with **every registered
 engine** (e.g. `all-minilm-l6-v2` + `paraphrase-multilingual-minilm-l12-v2`),

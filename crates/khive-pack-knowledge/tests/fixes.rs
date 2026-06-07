@@ -1969,4 +1969,44 @@ mod embed_failure_tests {
             "no sections must be indexed on embed error: {result:?}"
         );
     }
+
+    /// Regression: `--keep-existing` (drop_existing=false) paginates the
+    /// `embedding IS NULL` set. A failed section stays NULL, so without advancing
+    /// the offset past stuck rows the loop re-selects the same page forever and
+    /// never returns a `sections_failed` report (fail-closed bypassed). With
+    /// batch_size=1 over two persistently-failing sections, the old code looped;
+    /// this test must TERMINATE and report both as sections_failed.
+    #[tokio::test]
+    async fn section_keep_existing_failures_terminate_and_report() {
+        let f = fixture_with_two_sections(rt_with_fake(AlwaysFailProvider)).await;
+        let rt = f.rt.clone();
+        let token = rt
+            .authorize(khive_types::Namespace::local())
+            .expect("authorize");
+
+        let result = khive_pack_knowledge::reindex_knowledge(
+            &rt,
+            &token,
+            khive_pack_knowledge::KnowledgeReindexOptions {
+                atoms: false,
+                sections: true,
+                drop_existing: false,
+                rebuild_ann: false,
+                batch_size: Some(1),
+            },
+        )
+        .await
+        .expect("reindex_knowledge must terminate, not loop");
+
+        assert_eq!(
+            result["sections_failed"].as_u64().unwrap_or(0),
+            2,
+            "keep-existing must attempt each section once and report both failed: {result:?}"
+        );
+        assert_eq!(
+            result["sections_indexed"].as_u64().unwrap_or(u64::MAX),
+            0,
+            "no sections indexed when every embed fails: {result:?}"
+        );
+    }
 }

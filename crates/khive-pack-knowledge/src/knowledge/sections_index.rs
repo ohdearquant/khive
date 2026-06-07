@@ -63,13 +63,17 @@ pub(crate) async fn embed_sections(
     let mut offset = 0i64;
 
     loop {
-        // When keeping existing vectors we filter on `embedding IS NULL`; embedded
-        // rows leave the set, so the page offset stays 0. A full re-embed has a
-        // stable result set, so we paginate with a moving offset.
+        let skipped_before = skipped;
+        let failed_before = failed;
+        // When keeping existing vectors we filter on `embedding IS NULL`. Embedded
+        // rows leave the set; rows that fail or are skipped stay NULL, so we must
+        // advance the offset past THEM each pass (see the offset update below) —
+        // otherwise a full page of persistent failures would re-select forever.
+        // A full re-embed has a stable result set, so we paginate by row count.
         let (filter, query_offset) = if drop_existing {
             ("", offset)
         } else {
-            (" AND s.embedding IS NULL", 0)
+            (" AND s.embedding IS NULL", offset)
         };
         let query = format!(
             "SELECT s.id AS id, s.heading AS heading, s.content AS content, \
@@ -166,7 +170,16 @@ pub(crate) async fn embed_sections(
         if n < page as usize {
             break;
         }
-        offset += n as i64;
+        // drop_existing: stable result set → paginate by full page.
+        // keep-existing: embedded rows leave the `embedding IS NULL` set, so only
+        // the rows still NULL after this pass (failed + skipped) need to be
+        // stepped over; advancing by exactly that count attempts each row once
+        // and guarantees termination.
+        offset += if drop_existing {
+            n as i64
+        } else {
+            (skipped - skipped_before + failed - failed_before) as i64
+        };
     }
 
     Ok((indexed, skipped, failed))
