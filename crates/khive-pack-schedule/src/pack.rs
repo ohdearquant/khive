@@ -87,12 +87,14 @@ impl PackRuntime for SchedulePack {
         &self,
         verb: &str,
         params: Value,
-        _registry: &VerbRegistry,
+        registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
             "schedule.remind" => handlers::handle_remind(self.runtime(), token, params).await,
-            "schedule.schedule" => handlers::handle_schedule(self.runtime(), token, params).await,
+            "schedule.schedule" => {
+                handlers::handle_schedule(self.runtime(), token, registry, params).await
+            }
             "schedule.agenda" => handlers::handle_agenda(self.runtime(), token, params).await,
             "schedule.cancel" => handlers::handle_cancel(self.runtime(), token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(

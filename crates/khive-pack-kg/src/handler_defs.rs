@@ -84,12 +84,23 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 16] = [
         description: "Fetch any record by UUID",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[ParamDef {
-            name: "id",
-            param_type: "uuid",
-            required: true,
-            description: "UUID of the entity, note, or edge to fetch.",
-        }],
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "UUID of the entity, note, or edge to fetch.",
+            },
+            ParamDef {
+                name: "include_deleted",
+                param_type: "bool",
+                required: false,
+                description:
+                    "If true, return soft-deleted entities (with deleted_at populated). Default false. \
+                     Requires a full UUID — short prefix resolution filters deleted records; \
+                     the delete response always returns the full UUID for this purpose.",
+            },
+        ],
     },
     // Assertive: retrieves and presents filtered records
     HandlerDef {

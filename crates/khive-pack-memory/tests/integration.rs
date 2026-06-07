@@ -2543,6 +2543,67 @@ async fn recall_tags_filter_any_all_and_no_filter() {
     );
 }
 
+/// B7: raw_score must be present (possibly null) in every result returned by
+/// memory.recall, including when tag filters narrow the result set with tag_mode="all".
+/// The field is null for text-only hits (no vector index) and a float for vector hits.
+#[tokio::test]
+async fn recall_raw_score_field_always_present_with_tag_filter() {
+    let registry = make_registry(make_runtime());
+
+    registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "raw score presence check alpha beta gamma delta epsilon",
+                "salience": 0.9,
+                "tags": ["team:alpha", "project:khive"]
+            }),
+        )
+        .await
+        .expect("remember tagged memory");
+
+    registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "raw score presence check alpha beta gamma delta epsilon",
+                "salience": 0.9,
+                "tags": ["team:alpha", "project:khive"]
+            }),
+        )
+        .await
+        .expect("remember second tagged memory");
+
+    for tag_mode in &["any", "all"] {
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": "raw score presence check alpha beta gamma",
+                    "limit": 20,
+                    "tags": ["team:alpha", "project:khive"],
+                    "tag_mode": tag_mode
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("recall tag_mode={tag_mode} failed: {e}"));
+
+        let hits = result.as_array().expect("results must be an array");
+        assert!(
+            !hits.is_empty(),
+            "tag_mode={tag_mode}: expected at least one result"
+        );
+        for (i, hit) in hits.iter().enumerate() {
+            let obj = hit.as_object().expect("each hit must be a JSON object");
+            assert!(
+                obj.contains_key("raw_score"),
+                "tag_mode={tag_mode} result[{i}] missing raw_score field; got keys: {:?}",
+                obj.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 /// #515 metadata: memory.recall handler must advertise tags and tag_mode params.
 #[test]
 fn recall_handler_metadata_advertises_tags_and_tag_mode() {

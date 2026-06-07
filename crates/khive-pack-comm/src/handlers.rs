@@ -84,7 +84,11 @@ pub(crate) async fn handle_inbox(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
-    let limit = p.limit.unwrap_or(20).clamp(1, 200) as usize;
+    let raw_limit = p.limit.unwrap_or(20);
+    if raw_limit == 0 {
+        return Ok(json!({ "messages": [], "count": 0 }));
+    }
+    let limit = raw_limit.clamp(1, 200) as usize;
 
     let status = match p.status.as_deref().unwrap_or("unread") {
         s @ ("unread" | "read" | "all") => s,

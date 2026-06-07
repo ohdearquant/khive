@@ -110,4 +110,9 @@ pub trait EntityStore: Send + Sync + 'static {
     ) -> StorageResult<Page<Entity>>;
     /// Count entities in a namespace matching the given filter.
     async fn count_entities(&self, namespace: &str, filter: EntityFilter) -> StorageResult<u64>;
+    /// Fetch an entity by UUID regardless of soft-deletion state.
+    ///
+    /// Returns the entity row even when `deleted_at` is set. Callers use this
+    /// to distinguish "soft-deleted" from "never existed".
+    async fn get_entity_including_deleted(&self, id: Uuid) -> StorageResult<Option<Entity>>;
 }

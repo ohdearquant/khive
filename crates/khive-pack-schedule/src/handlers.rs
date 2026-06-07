@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlValue};
 
@@ -149,15 +149,15 @@ fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
 /// Validate that `action` is parseable DSL via `khive_request::parse_request`.
 ///
 /// This catches garbage like `"x"` or `"bogus-not-a-valid-verb()"` at write
-/// time rather than at trigger time, when nobody is watching.
-fn validate_action(action: &str) -> Result<(), RuntimeError> {
+/// time rather than at trigger time, when nobody is watching. Returns the
+/// parsed request so callers can inspect the verb names without re-parsing.
+fn validate_action(action: &str) -> Result<khive_request::ParsedRequest, RuntimeError> {
     khive_request::parse_request(action).map_err(|e| {
         RuntimeError::InvalidInput(format!(
             "schedule.action: invalid DSL ({e}); \
              provide a valid verb call (e.g. \"remind(content=\\\"hello\\\")\")"
         ))
-    })?;
-    Ok(())
+    })
 }
 
 // ── param structs ────────────────────────────────────────────────────────────
@@ -265,6 +265,7 @@ pub(crate) async fn handle_remind(
 pub(crate) async fn handle_schedule(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    registry: &VerbRegistry,
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: ScheduleParams = deser(params)?;
@@ -280,7 +281,25 @@ pub(crate) async fn handle_schedule(
     }
     // Validate DSL parseability at write time (C4). Garbage like "x" or
     // "bogus-not-a-valid-verb()" is rejected before it enters storage.
-    validate_action(p.action.trim())?;
+    let parsed = validate_action(p.action.trim())?;
+    // Validate that each verb in the action string is registered. This catches
+    // nonexistent verbs at schedule-creation time rather than at trigger time
+    // when nobody is watching.
+    //
+    // The DSL allows bare verb names (e.g. "remind(...)") as shorthand for
+    // pack-prefixed verbs (e.g. "schedule.remind(...)"). Try the bare form
+    // first, then the "schedule.{verb}" form, so both are accepted.
+    for op in &parsed.ops {
+        let qualified = format!("schedule.{}", op.tool);
+        if registry.describe_verb(&op.tool).is_err() && registry.describe_verb(&qualified).is_err()
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "schedule.action: verb {:?} is not registered; \
+                 provide a valid verb call (e.g. \"schedule.remind(content=\\\"hello\\\")\")",
+                op.tool
+            )));
+        }
+    }
 
     // Validate RFC 3339 and reject past timestamps (C3).
     // Preserve the caller's original string as `trigger_at` so the
