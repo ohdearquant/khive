@@ -21,8 +21,8 @@ pub mod stores;
 pub use backend::StorageBackend;
 pub use error::SqliteError;
 pub use migrations::{
-    query_embedding_models, run_migrations, EmbeddingModelRegistryRecord, Migration,
-    ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
+    inspect_schema_version, query_embedding_models, read_schema_version, run_migrations,
+    EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
 };
 pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, WriterGuard};
 pub use sql_bridge::SqlBridge;
