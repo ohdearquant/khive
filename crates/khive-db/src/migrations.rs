@@ -235,7 +235,7 @@ pub struct EmbeddingModelRegistryRecord {
 
 /// Query the `_embedding_models` registry.
 ///
-/// Opens the database at `db` (defaults to `~/.khive/khive-graph.db`) and
+/// Opens the database at `db` (defaults to `~/.khive/khive.db`) and
 /// returns all registry rows, optionally filtered by `engine_name`.
 /// Returns an empty vec if the database or table does not exist.
 pub fn query_embedding_models(
@@ -246,7 +246,7 @@ pub fn query_embedding_models(
         std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".khive/khive-graph.db")
+            .join(".khive/khive.db")
     });
     if !path.exists() {
         return Ok(Vec::new());

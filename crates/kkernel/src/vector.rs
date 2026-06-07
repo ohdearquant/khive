@@ -34,7 +34,7 @@ pub struct VectorCapabilitiesArgs {
     #[arg(long)]
     pub engine: Option<String>,
 
-    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    /// Database path (defaults to `~/.khive/khive.db`).
     #[arg(long)]
     pub db: Option<PathBuf>,
 }
@@ -58,7 +58,7 @@ pub struct VectorSweepArgs {
     #[arg(long)]
     pub engine: Option<String>,
 
-    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    /// Database path (defaults to `~/.khive/khive.db`).
     #[arg(long)]
     pub db: Option<PathBuf>,
 }

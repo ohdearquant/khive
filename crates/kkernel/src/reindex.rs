@@ -23,7 +23,7 @@ const MAX_EMBED_BYTES: usize = 32_768;
 /// Arguments for `kkernel reindex` — rebuilds embedding vectors for all entities and notes.
 #[derive(Parser, Debug)]
 pub struct ReindexArgs {
-    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    /// Database path (defaults to `~/.khive/khive.db`).
     #[arg(long)]
     pub db: Option<PathBuf>,
 

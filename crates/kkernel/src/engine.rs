@@ -43,7 +43,7 @@ pub struct EngineListArgs {
     #[arg(long)]
     pub human: bool,
 
-    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    /// Database path (defaults to `~/.khive/khive.db`).
     #[arg(long)]
     pub db: Option<PathBuf>,
 }
@@ -57,7 +57,7 @@ pub struct EngineStatusArgs {
     #[arg(long)]
     pub human: bool,
 
-    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    /// Database path (defaults to `~/.khive/khive.db`).
     #[arg(long)]
     pub db: Option<PathBuf>,
 }
@@ -79,7 +79,7 @@ pub struct EngineMigrateArgs {
     #[arg(long, conflicts_with_all = &["to", "resume"])]
     pub abort: bool,
 
-    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    /// Database path (defaults to `~/.khive/khive.db`).
     #[arg(long)]
     pub db: Option<PathBuf>,
 }
@@ -97,7 +97,7 @@ pub struct EngineDriftCheckArgs {
     #[arg(long)]
     pub human: bool,
 
-    /// Database path (defaults to `~/.khive/khive-graph.db`).
+    /// Database path (defaults to `~/.khive/khive.db`).
     #[arg(long)]
     pub db: Option<PathBuf>,
 }
@@ -212,7 +212,7 @@ fn cmd_engine_drift_check(_args: EngineDriftCheckArgs) -> Result<()> {
 
 /// Query `_embedding_models` via `KhiveRuntime::list_embedding_models`.
 ///
-/// When `db` is `None` the default path (`~/.khive/khive-graph.db`) is used.
+/// When `db` is `None` the default path (`~/.khive/khive.db`) is used.
 /// If the default file does not yet exist, returns an empty vec without creating
 /// it — preserving the pre-existing behaviour of `khive_db::query_embedding_models`.
 async fn fetch_model_records(
@@ -226,7 +226,7 @@ async fn fetch_model_records(
             let default = std::env::var("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .join(".khive/khive-graph.db");
+                .join(".khive/khive.db");
             if default.exists() {
                 Some(default)
             } else {
@@ -267,7 +267,7 @@ mod tests {
     use tempfile::TempDir;
 
     // Engine tests must be hermetic: with `db: None` the command resolves to the
-    // operator's real `~/.khive/khive-graph.db` and runs migration writes against
+    // operator's real `~/.khive/khive.db` and runs migration writes against
     // it. Always point tests at a throwaway temp DB (codex #531). Keep the
     // returned TempDir alive for the test's duration.
     fn temp_db() -> (TempDir, Option<std::path::PathBuf>) {
