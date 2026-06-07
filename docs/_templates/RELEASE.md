@@ -43,7 +43,7 @@
 ## Install
 
 ```bash
-cargo install khive-mcp@{VERSION}
+cargo install kkernel@{VERSION}
 ```
 
 ## MCP configuration
@@ -52,8 +52,8 @@ cargo install khive-mcp@{VERSION}
 {
   "mcpServers": {
     "khive": {
-      "command": "khive-mcp",
-      "args": []
+      "command": "kkernel",
+      "args": ["mcp"]
     }
   }
 }

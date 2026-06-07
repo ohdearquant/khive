@@ -19,13 +19,13 @@ Add `presentation="agent"` (default, compact) or `"verbose"` (full UUIDs + ISO t
 `request` call to control response shape (ADR-045). `"human"` is accepted but over MCP is identical
 to verbose JSON — readable prose is a CLI-layer concern, not an MCP-layer one.
 
-| Verb                                                                                                     | What it does                                                                                    |
-| -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Verb                                                                                             | What it does                                                                                                                                                                                              |
+| ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `gtd.assign(title, priority?, status?, assignee?, due?, depends_on?, context_entity_id?, tags?)` | Create a task. Defaults: `status=inbox`, `priority=p2`. `depends_on` is an array of UUIDs that creates real `depends_on` graph edges. `context_entity_id` links the task to a KG entity at creation time. |
-| `gtd.next(limit?, assignee?)`                                                                            | Actionable tasks (status in `{next, active}`), sorted by priority (p0 first) then most-recent.  |
-| `gtd.complete(id, result?, status?)`                                                                     | Mark done (or `status="cancelled"`). Records `completed_at`. Terminal — no further transitions. |
-| `gtd.tasks(status?, assignee?, priority?, limit?, offset?)`                                              | Filtered listing.                                                                               |
-| `gtd.transition(id, status, note?)`                                                                      | Explicit GTD state change with lifecycle validation.                                            |
+| `gtd.next(limit?, assignee?)`                                                                    | Actionable tasks (status in `{next, active}`), sorted by priority (p0 first) then most-recent.                                                                                                            |
+| `gtd.complete(id, result?, status?)`                                                             | Mark done (or `status="cancelled"`). Records `completed_at`. Terminal — no further transitions.                                                                                                           |
+| `gtd.tasks(status?, assignee?, priority?, limit?, offset?)`                                      | Filtered listing.                                                                                                                                                                                         |
+| `gtd.transition(id, status, note?)`                                                              | Explicit GTD state change with lifecycle validation.                                                                                                                                                      |
 
 Statuses accept canonical names _or_ aliases: `in_progress → active`, `todo → inbox`,
 `blocked → waiting`, `later → someday`, `finished → done`.
@@ -48,15 +48,15 @@ Statuses accept canonical names _or_ aliases: `in_progress → active`, `todo �
 ## Prerequisites
 
 This plugin provides skills only — it does **not** bundle an MCP server. You must install the
-`khive-mcp` binary and register it as an MCP server in your harness **before** using any of the
+`kkernel` binary and register it as an MCP server in your harness **before** using any of the
 skills below.
 
 ```bash
 # Install the binary
-cargo install khive-mcp
+cargo install kkernel
 
 # Register in your harness (Claude Code example)
-claude mcp add --transport stdio khive -- khive-mcp --pack gtd
+claude mcp add --transport stdio khive -- kkernel mcp --pack gtd
 ```
 
 Or add to your project's `.mcp.json`:
@@ -65,15 +65,15 @@ Or add to your project's `.mcp.json`:
 {
   "mcpServers": {
     "khive": {
-      "command": "khive-mcp",
-      "args": ["--pack", "gtd"]
+      "command": "kkernel",
+      "args": ["mcp", "--pack", "gtd"]
     }
   }
 }
 ```
 
 Install the `kg` pack alongside if you want knowledge graph verbs in the same session:
-`"args": ["--pack", "kg", "--pack", "gtd"]`
+`"args": ["mcp", "--pack", "kg", "--pack", "gtd"]`
 
 ## Install
 

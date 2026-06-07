@@ -12,10 +12,10 @@ to a source entity or note.
 All verbs are dispatched through the single MCP `request` tool
 ([ADR-016](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)).
 
-| Verb                                                                                                                                                                                          | What it does                                                              |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `memory.remember(content, salience?, decay_factor?, memory_type?, source_id?, embedding_model?, tags?)`                                                                                       | Store a memory note with salience and decay metadata.                     |
-| `memory.recall(query, limit?, top_k?, min_score?, score_floor?, min_salience?, memory_type?, fusion_strategy?, embedding_model?, include_breakdown?, entity_names?, full_content?, tags?, tag_mode?)` | Search memory notes only, then rank by relevance, salience, and recency.  |
+| Verb                                                                                                                                                                                                  | What it does                                                             |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `memory.remember(content, salience?, decay_factor?, memory_type?, source_id?, embedding_model?, tags?)`                                                                                               | Store a memory note with salience and decay metadata.                    |
+| `memory.recall(query, limit?, top_k?, min_score?, score_floor?, min_salience?, memory_type?, fusion_strategy?, embedding_model?, include_breakdown?, entity_names?, full_content?, tags?, tag_mode?)` | Search memory notes only, then rank by relevance, salience, and recency. |
 
 Memory types (`memory_type` values):
 
@@ -45,15 +45,15 @@ accepts an array of entity name strings and applies a 1.3× boost to matching me
 ## Prerequisites
 
 This plugin provides skills only — it does **not** bundle an MCP server. You must install the
-`khive-mcp` binary and register it as an MCP server in your harness **before** using any of the
+`kkernel` binary and register it as an MCP server in your harness **before** using any of the
 skills below.
 
 ```bash
 # Install the binary
-cargo install khive-mcp
+cargo install kkernel
 
 # Register in your harness (Claude Code example)
-claude mcp add --transport stdio khive -- khive-mcp --pack memory
+claude mcp add --transport stdio khive -- kkernel mcp --pack memory
 ```
 
 Or add to your project's `.mcp.json`:
@@ -62,8 +62,8 @@ Or add to your project's `.mcp.json`:
 {
   "mcpServers": {
     "khive": {
-      "command": "khive-mcp",
-      "args": ["--pack", "memory"]
+      "command": "kkernel",
+      "args": ["mcp", "--pack", "memory"]
     }
   }
 }

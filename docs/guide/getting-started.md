@@ -16,8 +16,11 @@ through 63 verbs across 7 packs, dispatched through a single MCP tool.
 ### From crates.io (Rust)
 
 ```bash
-cargo install khive-mcp
+cargo install kkernel
 ```
+
+`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request`
+surface.
 
 ### From npm
 
@@ -27,13 +30,15 @@ npm install -g khive
 npm install -g @khive-ai/cli
 ```
 
+The npm package installs `khive` / `khive-mcp` shims that forward to `kkernel mcp`.
+
 ### From source
 
 ```bash
 git clone https://github.com/ohdearquant/khive
 cd khive
 cargo build --workspace --release
-# Binary at crates/target/release/khive-mcp
+# Binary at crates/target/release/kkernel
 ```
 
 ## Connect to your MCP client
@@ -46,8 +51,8 @@ Add to your MCP configuration (`.claude/settings.json` or equivalent):
 {
   "mcpServers": {
     "khive": {
-      "command": "khive-mcp",
-      "args": []
+      "command": "kkernel",
+      "args": ["mcp"]
     }
   }
 }
@@ -61,8 +66,8 @@ Add to `claude_desktop_config.json`:
 {
   "mcpServers": {
     "khive": {
-      "command": "khive-mcp",
-      "args": []
+      "command": "kkernel",
+      "args": ["mcp"]
     }
   }
 }

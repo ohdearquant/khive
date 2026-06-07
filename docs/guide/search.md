@@ -181,7 +181,7 @@ patterns.
 
 - **Cold start**: the first search in a session loads the ANN index and
   embedding model. The daemon keeps these warm for subsequent calls.
-- **Daemon**: khive auto-spawns `khive-mcp --daemon` on first request. The
+- **Daemon**: khive auto-spawns `kkernel mcp --daemon` on first request. The
   daemon keeps indexes hot across sessions.
 - **Vector search without embeddings**: if running with `--no-embed`, only FTS
   results are returned (no vector similarity).
