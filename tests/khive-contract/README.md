@@ -44,7 +44,7 @@ The client looks for the `kkernel` binary in this order:
 
 1. `binary=` argument to `KhiveMcpSession`
 2. `KKERNEL_BINARY` environment variable (`KHIVE_MCP_BINARY` is accepted as a deprecated alias)
-3. `<repo-root>/crates/target/release/kkernel`
+3. `<repo-root>/crates/target/release/kkernel`, then `<repo-root>/crates/target/debug/kkernel`
 
 The session invokes it as `kkernel mcp …`. If the binary is missing, build it first:
 
