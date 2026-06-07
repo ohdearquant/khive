@@ -8,26 +8,73 @@ mod vocab;
 pub use pack::KnowledgePack;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use serde_json::Value;
+use serde_json::{json, Value};
 
-/// Reindex the knowledge corpus for `token`'s namespace: embed atoms with the
-/// default embedder and (optionally) rebuild the Vamana ANN snapshot.
+/// Options for [`reindex_knowledge`].
+#[derive(Debug, Clone, Copy)]
+pub struct KnowledgeReindexOptions {
+    /// Embed atoms (and rebuild the atom Vamana ANN).
+    pub atoms: bool,
+    /// Embed sections into `knowledge_sections.embedding` (ADR-051).
+    pub sections: bool,
+    /// Re-embed everything; when false, only fill missing vectors.
+    pub drop_existing: bool,
+    /// Rebuild the atom Vamana ANN snapshot (only meaningful with `atoms`).
+    pub rebuild_ann: bool,
+    /// Records per embedding batch.
+    pub batch_size: Option<u32>,
+}
+
+/// Reindex the knowledge corpus for `token`'s namespace: embed atoms and/or
+/// sections with the default embedder and (optionally) rebuild the atom Vamana
+/// ANN snapshot.
 ///
-/// Library entry for `kkernel reindex` — equivalent to the `knowledge.index`
-/// verb over the full corpus, callable without an MCP server. Knowledge search
-/// is single-model (it retrieves via the default embedder's ANN), so this does
-/// not fan out across registered models the way entity/note reindex does.
+/// Library entry for `kkernel reindex` — callable without an MCP server.
+/// Knowledge is single-model (search retrieves via the default embedder's ANN),
+/// so this does not fan out across registered models the way entity/note
+/// reindex does. Returns `{atoms_indexed, sections_indexed, failed, ann_failed}`.
 pub async fn reindex_knowledge(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
-    rebuild_ann: bool,
-    batch_size: Option<u32>,
+    opts: KnowledgeReindexOptions,
 ) -> Result<Value, RuntimeError> {
-    let ann = knowledge::vamana::new_shared();
-    let mut params = serde_json::Map::new();
-    params.insert("rebuild_ann".into(), Value::Bool(rebuild_ann));
-    if let Some(bs) = batch_size {
-        params.insert("batch_size".into(), Value::from(bs));
+    let mut atoms_indexed = 0u64;
+    let mut failed = 0u64;
+    let mut ann_failed = false;
+    if opts.atoms {
+        let ann = knowledge::vamana::new_shared();
+        let mut params = serde_json::Map::new();
+        params.insert("rebuild_ann".into(), Value::Bool(opts.rebuild_ann));
+        params.insert("insert_only".into(), Value::Bool(!opts.drop_existing));
+        if let Some(bs) = opts.batch_size {
+            params.insert("batch_size".into(), Value::from(bs));
+        }
+        let result =
+            knowledge::KnowledgeHandlers::index(runtime, token, Value::Object(params), &ann)
+                .await?;
+        atoms_indexed = result.get("indexed").and_then(|n| n.as_u64()).unwrap_or(0);
+        // Preserve the index handler's fail-closed accounting so the caller can
+        // exit non-zero on partial atom/ANN failure (kkernel reindex contract).
+        failed = result.get("failed").and_then(|n| n.as_u64()).unwrap_or(0);
+        ann_failed = result
+            .get("ann_failed")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
     }
-    knowledge::KnowledgeHandlers::index(runtime, token, Value::Object(params), &ann).await
+
+    let mut sections_indexed = 0u64;
+    if opts.sections {
+        let batch = opts.batch_size.unwrap_or(500) as usize;
+        let (indexed, _skipped) =
+            knowledge::sections_index::embed_sections(runtime, token, opts.drop_existing, batch)
+                .await?;
+        sections_indexed = indexed as u64;
+    }
+
+    Ok(json!({
+        "atoms_indexed": atoms_indexed,
+        "sections_indexed": sections_indexed,
+        "failed": failed,
+        "ann_failed": ann_failed,
+    }))
 }
