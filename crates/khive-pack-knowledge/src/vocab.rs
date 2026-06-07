@@ -350,6 +350,12 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
                 description: "Section type to challenge",
             },
             ParamDef {
+                name: "content_hash",
+                param_type: "string",
+                required: false,
+                description: "content_hash (from knowledge.edit) disambiguating which same-type section to challenge; required when more than one eligible section of section_type exists",
+            },
+            ParamDef {
                 name: "reason",
                 param_type: "string",
                 required: false,
@@ -374,6 +380,12 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
                 param_type: "string",
                 required: true,
                 description: "Section type to adjudicate",
+            },
+            ParamDef {
+                name: "content_hash",
+                param_type: "string",
+                required: false,
+                description: "content_hash (from knowledge.edit) disambiguating which same-type disputed section to resolve; required when more than one disputed section of section_type exists",
             },
             ParamDef {
                 name: "resolution",
