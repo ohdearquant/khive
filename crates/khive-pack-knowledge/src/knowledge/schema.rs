@@ -442,6 +442,11 @@ pub(crate) struct ChallengeParams {
     pub atom_id: String,
     /// Section type to challenge.
     pub section_type: String,
+    /// Disambiguator when an atom has multiple same-type sections
+    /// (`content_hash` from `knowledge.edit`). Required if more than one
+    /// eligible section of `section_type` exists.
+    #[serde(default)]
+    pub content_hash: Option<String>,
     /// Optional challenge reason.
     #[serde(default)]
     pub reason: Option<String>,
@@ -453,6 +458,11 @@ pub(crate) struct AdjudicateParams {
     pub atom_id: String,
     /// Section type to adjudicate.
     pub section_type: String,
+    /// Disambiguator when an atom has multiple same-type disputed sections
+    /// (`content_hash` from `knowledge.edit`). Required if more than one
+    /// disputed section of `section_type` exists.
+    #[serde(default)]
+    pub content_hash: Option<String>,
     /// Resolution: "accept" (keep disputed, mark reviewed) or "reject" (revert to reviewed).
     pub resolution: String,
 }

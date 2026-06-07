@@ -681,6 +681,91 @@ async fn w9_adjudicate_non_disputed_section_is_rejected() {
     assert!(err.is_err(), "adjudicate on non-disputed section must fail");
 }
 
+#[tokio::test]
+async fn w9_challenge_disambiguates_same_type_siblings() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{ "slug": "sib-atom", "name": "Sibling Atom", "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }] }),
+    )
+    .await
+    .expect("upsert");
+
+    // Two distinct-content overview sections are valid siblings under
+    // UNIQUE(atom_id, content_hash), so section_type alone no longer targets one.
+    let edit = f
+        .dispatch(
+            "knowledge.edit",
+            json!({ "id": "sib-atom", "sections": [
+                { "section_type": "overview", "content": "First overview variant — long enough to clear the 80-character minimum. dense sparse retrieval corpus benchmark search latency gradient transformer attention vector index" },
+                { "section_type": "overview", "content": "Second overview variant — also long enough to clear the 80-character minimum. ranking fusion pipeline embedding rerank cosine similarity nearest neighbor corpus benchmark" }
+            ] }),
+        )
+        .await
+        .expect("edit two siblings");
+    let sections = edit["sections"].as_array().expect("sections array");
+    assert_eq!(sections.len(), 2, "two distinct overviews must be siblings");
+    let hash0 = sections[0]["content_hash"]
+        .as_str()
+        .expect("content_hash")
+        .to_string();
+
+    // Without a disambiguator the challenge is ambiguous and must be rejected.
+    let ambiguous = f
+        .dispatch(
+            "knowledge.challenge",
+            json!({ "atom_id": "sib-atom", "section_type": "overview" }),
+        )
+        .await;
+    assert!(
+        ambiguous.is_err(),
+        "ambiguous same-type challenge without content_hash must be rejected"
+    );
+
+    // Targeting by content_hash disputes exactly one section.
+    let res = f
+        .dispatch(
+            "knowledge.challenge",
+            json!({ "atom_id": "sib-atom", "section_type": "overview", "content_hash": hash0 }),
+        )
+        .await
+        .expect("targeted challenge ok");
+    assert_eq!(
+        res["disputed"].as_i64(),
+        Some(1),
+        "exactly one section disputed"
+    );
+    let atom = f
+        .dispatch("knowledge.get", json!({ "id": "sib-atom" }))
+        .await
+        .expect("get");
+    assert_eq!(
+        atom["properties"]["dispute_count"].as_i64(),
+        Some(1),
+        "dispute_count increments once, not once per sibling"
+    );
+
+    // The other sibling is still the only eligible overview now, so an un-hashed
+    // challenge resolves it and the counter advances to 2.
+    let res2 = f
+        .dispatch(
+            "knowledge.challenge",
+            json!({ "atom_id": "sib-atom", "section_type": "overview" }),
+        )
+        .await
+        .expect("second sibling is independently challengeable");
+    assert_eq!(res2["disputed"].as_i64(), Some(1));
+    let atom2 = f
+        .dispatch("knowledge.get", json!({ "id": "sib-atom" }))
+        .await
+        .expect("get2");
+    assert_eq!(
+        atom2["properties"]["dispute_count"].as_i64(),
+        Some(2),
+        "each sibling disputes independently"
+    );
+}
+
 // ── W10: import populates source_uri / source_type ────────────────────────────
 
 #[tokio::test]

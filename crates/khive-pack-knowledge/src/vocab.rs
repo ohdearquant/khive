@@ -14,7 +14,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 18] = [
                 name: "atoms",
                 param_type: "array<object>",
                 required: true,
-                description: "List of atoms: {slug, name, content, description?, tags?, properties?, finalized?}",
+                description: "List of atoms: {slug, name, content, tags?, properties?, finalized?}",
             },
             ParamDef {
                 name: "chunk_size",
