@@ -85,6 +85,14 @@ pub struct DaemonResponseFrame {
     /// dispatch rather than execute under a different runtime/config.
     #[serde(default)]
     pub config_mismatch: bool,
+    /// The `config_id` the daemon dispatched under, echoed back so the client
+    /// can positively confirm the result came from a matching runtime. A
+    /// pre-`config_id` daemon omits this field (deserializes to `None`), which
+    /// the client treats as a mismatch and falls back to local dispatch — this
+    /// closes the upgrade window where a new restricted client could otherwise
+    /// trust a still-warm legacy daemon's broader registry.
+    #[serde(default)]
+    pub served_config_id: Option<String>,
 }
 
 // ── framing ───────────────────────────────────────────────────────────────────
@@ -170,6 +178,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
         }
     };
 
+    let served_config_id = Some(dispatcher.config_id().to_string());
     let resp = if frame.namespace != dispatcher.namespace() {
         DaemonResponseFrame {
             ok: false,
@@ -177,6 +186,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             error: None,
             namespace_mismatch: true,
             config_mismatch: false,
+            served_config_id,
         }
     } else if frame.config_id != dispatcher.config_id() {
         DaemonResponseFrame {
@@ -185,6 +195,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             error: None,
             namespace_mismatch: false,
             config_mismatch: true,
+            served_config_id,
         }
     } else {
         match dispatcher
@@ -197,6 +208,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 error: None,
                 namespace_mismatch: false,
                 config_mismatch: false,
+                served_config_id,
             },
             Err(e) => DaemonResponseFrame {
                 ok: false,
@@ -204,6 +216,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 error: Some(e),
                 namespace_mismatch: false,
                 config_mismatch: false,
+                served_config_id,
             },
         }
     };

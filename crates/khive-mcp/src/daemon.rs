@@ -61,8 +61,17 @@ async fn try_forward(frame: &DaemonRequestFrame) -> Option<DaemonResponseFrame> 
     serde_json::from_slice::<DaemonResponseFrame>(&resp).ok()
 }
 
-fn map_response(resp: DaemonResponseFrame) -> Option<Result<String, McpError>> {
+fn map_response(
+    resp: DaemonResponseFrame,
+    expected_config_id: &str,
+) -> Option<Result<String, McpError>> {
     if resp.namespace_mismatch || resp.config_mismatch {
+        return None;
+    }
+    // Fail closed: only trust a result the daemon positively confirms it served
+    // under our exact config. A legacy daemon omits `served_config_id` (→ None)
+    // and a config-drifted daemon echoes a different id — both fall back local.
+    if resp.served_config_id.as_deref() != Some(expected_config_id) {
         return None;
     }
     if resp.ok {
@@ -103,7 +112,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     }
 
     if let Some(resp) = try_forward(frame).await {
-        return map_response(resp);
+        return map_response(resp, &frame.config_id);
     }
 
     if spawn_daemon().is_err() {
@@ -114,7 +123,9 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         if UnixStream::connect(&sock).await.is_ok() {
-            return try_forward(frame).await.and_then(map_response);
+            return try_forward(frame)
+                .await
+                .and_then(|resp| map_response(resp, &frame.config_id));
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -178,6 +189,8 @@ mod tests {
 
     // ── map_response (pure, MCP-specific) ─────────────────────────────────────
 
+    const CFG: &str = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
     #[test]
     fn map_response_namespace_mismatch_yields_none() {
         let resp = DaemonResponseFrame {
@@ -186,8 +199,9 @@ mod tests {
             error: None,
             namespace_mismatch: true,
             config_mismatch: false,
+            served_config_id: Some(CFG.to_string()),
         };
-        assert!(map_response(resp).is_none());
+        assert!(map_response(resp, CFG).is_none());
     }
 
     #[test]
@@ -198,8 +212,41 @@ mod tests {
             error: None,
             namespace_mismatch: false,
             config_mismatch: true,
+            served_config_id: Some(CFG.to_string()),
         };
-        assert!(map_response(resp).is_none());
+        assert!(map_response(resp, CFG).is_none());
+    }
+
+    #[test]
+    fn map_response_legacy_daemon_missing_echo_yields_none() {
+        // A pre-config_id daemon omits served_config_id (→ None). Even on an
+        // ok=true result the client MUST fall back to local dispatch.
+        let resp = DaemonResponseFrame {
+            ok: true,
+            result: Some("served-by-broad-registry".to_string()),
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: None,
+        };
+        assert!(map_response(resp, CFG).is_none());
+    }
+
+    #[test]
+    fn map_response_echo_drift_yields_none() {
+        // A daemon serving under a different config (echo != expected) is not
+        // trusted, even without an explicit config_mismatch flag.
+        let resp = DaemonResponseFrame {
+            ok: true,
+            result: Some("served-by-other-config".to_string()),
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id: Some(
+                "packs=[kg,gtd];db=/x;embed=none;extra=[];backend=main".to_string(),
+            ),
+        };
+        assert!(map_response(resp, CFG).is_none());
     }
 
     #[test]
@@ -210,8 +257,9 @@ mod tests {
             error: None,
             namespace_mismatch: false,
             config_mismatch: false,
+            served_config_id: Some(CFG.to_string()),
         };
-        match map_response(resp) {
+        match map_response(resp, CFG) {
             Some(Ok(s)) => assert_eq!(s, "the-result"),
             other => panic!("expected Some(Ok(\"the-result\")), got {other:?}"),
         }
@@ -225,8 +273,9 @@ mod tests {
             error: None,
             namespace_mismatch: false,
             config_mismatch: false,
+            served_config_id: Some(CFG.to_string()),
         };
-        match map_response(resp) {
+        match map_response(resp, CFG) {
             Some(Ok(s)) => assert_eq!(s, ""),
             other => panic!("expected Some(Ok(\"\")), got {other:?}"),
         }
@@ -240,8 +289,9 @@ mod tests {
             error: Some("boom: bad verb".to_string()),
             namespace_mismatch: false,
             config_mismatch: false,
+            served_config_id: Some(CFG.to_string()),
         };
-        match map_response(resp) {
+        match map_response(resp, CFG) {
             Some(Err(McpError { message, .. })) => {
                 assert!(message.contains("boom: bad verb"));
             }
@@ -257,8 +307,9 @@ mod tests {
             error: None,
             namespace_mismatch: false,
             config_mismatch: false,
+            served_config_id: Some(CFG.to_string()),
         };
-        match map_response(resp) {
+        match map_response(resp, CFG) {
             Some(Err(McpError { message, .. })) => {
                 assert!(!message.is_empty());
             }
@@ -328,6 +379,11 @@ mod tests {
         assert!(resp.ok, "valid op must succeed; error={:?}", resp.error);
         assert!(!resp.namespace_mismatch);
         assert!(!resp.config_mismatch);
+        assert_eq!(
+            resp.served_config_id.as_deref(),
+            Some(config_id.as_str()),
+            "daemon must echo the config it served under"
+        );
 
         let reference_result = reference
             .dispatch_request_local(RequestParams {
