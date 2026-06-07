@@ -1,0 +1,17 @@
+# Winning config from khive recall param-tuning grid search
+# run_date = "2026-05-25"
+# recall_at_10 = 0.9333
+# mrr = 0.9500
+# mean_latency_ms = 0.29
+
+[recall]
+relevance_weight = 0.7
+salience_weight = 0.2
+temporal_weight = 0.1
+temporal_half_life_days = 14.0
+decay_model = "hyperbolic"
+candidate_multiplier = 10
+# candidate_limit = null  (use multiplier only)
+fuse_strategy = {weighted = {weights = [1.0, 0.0]}}
+min_score = 0.0
+min_salience = 0.0
